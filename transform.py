@@ -18,7 +18,7 @@ by the harness sandbox:
     every `quantizationfail run`)
 
 The harness discovers the model architecture from
-`reference_weights/gemma-4-26b-it-4bit/config.json` (passed
+`reference_weights/gemma-4-26B-A4B-it-qat-4bit/config.json` (passed
 through into `weights/config.json` with `model_file` pointing
 back at the participant's modifiable model.py).
 """
@@ -28,7 +28,7 @@ import json
 import shutil
 from pathlib import Path
 
-REFERENCE = Path("quantizationfail/reference_weights/gemma-4-26b-a4b-it-4bit")
+REFERENCE = Path("quantizationfail/reference_weights/gemma-4-26B-A4B-it-qat-4bit")
 OUTPUT = Path("weights")
 
 

@@ -37,7 +37,7 @@ This is one point in a large space. The challenge is finding the best schema in 
 
 Score = `peak_ram_GB × bandwidth_GB_per_token × seconds_per_token`. Lower is better. Correctness is a hard gate — submissions that fail it do not appear on the leaderboard.
 
-The baseline uses [`mlx-community/gemma-4-26b-it-4bit`](https://huggingface.co/mlx-community/gemma-4-26b-it-4bit) — the standard 4-bit MLX checkpoint, **not** the QAT variant — on an Apple M5 Max 128 GB, pinned at `mlx==0.31.1`, `mlx-lm==0.21.0`. Baseline bandwidth and score will be published once the reference harness measurement is complete.
+The baseline uses [`mlx-community/gemma-4-26B-A4B-it-qat-4bit`](https://huggingface.co/mlx-community/gemma-4-26B-A4B-it-qat-4bit) — the 4-bit QAT MLX checkpoint — on an Apple M5 Max 128 GB, pinned at `mlx==0.31.1`, `mlx-lm==0.21.0`. Baseline bandwidth and score will be published once the reference harness measurement is complete.
 
 ---
 
@@ -67,6 +67,7 @@ This single command:
 5. Measures decode latency — wall-clock seconds per token, averaged over a 512-token decode run
 6. Computes score — `peak_ram_GB × bandwidth_GB_per_token × seconds_per_token`
 7. Appends one row to `results.tsv` with timestamp, git commit, peak RAM, bandwidth, tok/s, score, correctness status, and your note
+8. Writes `score.json` for finite passing runs
 
 To submit to the leaderboard:
 
@@ -145,7 +146,7 @@ Gemma 4 is Apache 2.0 licensed — no license gate required. Download the refere
 quantizationfail weights
 ```
 
-This downloads `mlx-community/gemma-4-26b-it-4bit` to `reference_weights/` and computes the reference content hash. Do not substitute the QAT variant — it has different quantization structure and will not match the reference hidden states.
+This downloads `mlx-community/gemma-4-26B-A4B-it-qat-4bit` to `reference_weights/` and computes the reference content hash. Do not substitute a different Gemma checkpoint — it will not match the reference hidden states.
 
 ### Clone the benchmark
 
@@ -250,8 +251,8 @@ Yes. If your schema reads blocks sequentially and the Metal counters reflect the
 **Can my transform be lossy?**  
 No. The transform must be mathematically lossless. Hidden states at every layer must match the reference exactly within IEEE 754 bfloat16 numerical tolerance. Approximations that trade correctness for bandwidth do not qualify — the bandwidth win must come entirely from the representation and compute schema, not from degrading the model.
 
-**Can I use the QAT checkpoint as my baseline?**  
-No. The reference checkpoint is `mlx-community/gemma-4-26b-it-4bit` — the standard 4-bit MLX checkpoint. QAT variants have different quantization structure and will fail the correctness gate against the reference hidden states.
+**Can I use a non-QAT checkpoint as my baseline?**  
+No. The reference checkpoint is `mlx-community/gemma-4-26B-A4B-it-qat-4bit`. Other variants have different quantization structure and will fail the correctness gate against the reference hidden states.
 
 **Does my offline transform have to be fast?**  
 No. Transform time is not scored. It runs once. It can take hours or days.

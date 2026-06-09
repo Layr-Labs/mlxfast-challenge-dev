@@ -23,7 +23,8 @@ python transform.py
 quantizationfail run --note "my schema v1"
 ```
 
-Results append to `results.tsv`. The harness re-verifies that your `transform.py` is reproducible on every run.
+Results append to `results.tsv`; finite passing runs also write `score.json`.
+The harness re-verifies that your `transform.py` is reproducible on every run.
 
 ## The modifiable surface
 
@@ -38,7 +39,7 @@ You can edit exactly four files:
 
 Plus:
 
-- `transform.py` — your offline weight transform. Pure function of `inferencefail/reference_weights/`.
+- `transform.py` — your offline weight transform. Pure function of `quantizationfail/reference_weights/`.
 - `weights/` — the output of `transform.py`. The harness reads from here.
 
 The frozen `mlx_models/gemma4/__init__.py` is the only wiring point. It patches the upstream `mlx_lm.models.gemma4` and `mlx_lm.models.switch_layers` modules with the classes from your 4 files, then re-exports the patched module as `mlx_models.gemma4`. You don't edit `__init__.py`.
@@ -67,7 +68,7 @@ All three axes are measured independently. Correctness is a hard gate — failin
 
 - `quantizationfail/` — the frozen CLI + harness. Installed as the `quantizationfail` (or short alias `qfail`) command. The CLI verifies the harness's content hash on every run.
 - `mlx_models/gemma4/` — the 4 modifiable files plus the frozen `__init__.py` that wires them.
-- `inferencefail/reference_weights/` — the reference 4-bit checkpoint, downloaded by `quantizationfail weights`.
+- `quantizationfail/reference_weights/` — the reference 4-bit checkpoint, downloaded by `quantizationfail weights`.
 - `transform.py` — your offline weight transform.
 - `weights/` — the output of your transform. The harness loads from here.
 - `results.tsv` — your local experiment log.

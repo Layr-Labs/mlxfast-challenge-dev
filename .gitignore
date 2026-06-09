@@ -28,6 +28,10 @@ weights/*
 # Local results log
 results.tsv
 
+# Benchmark contract outputs
+score.json
+score.json.tmp
+
 # IDE
 .vscode/
 .idea/

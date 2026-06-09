@@ -18,6 +18,7 @@ Subcommands:
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -48,12 +49,18 @@ def run(
     secret: str = typer.Option("", "--secret", help="Server-supplied secret for prompt seed (default: local deterministic)"),
     skip_transform_verify: bool = typer.Option(False, "--skip-transform-verify", help="Skip the sandboxed transform.py re-run (faster, less safe)"),
     weights: Path = typer.Option(constants.PARTICIPANT_WEIGHTS_DIR, "--weights", "-w", help="Path to the participant's transformed weights"),
+    score_path: Path = typer.Option(constants.SCORE_FILE, "--score-path", help="Path to write JSON score output"),
 ):
-    """Run the harness: correctness + bandwidth + latency. Appends to results.tsv."""
+    """Run the harness: correctness + bandwidth + latency.
+
+    Appends to results.tsv and writes score.json for finite passing runs.
+    """
     from . import _harness_runner
     from . import _sandbox
 
     _self_hash.verify()
+    if score_path:
+        score_path.unlink(missing_ok=True)
 
     if not skip_transform_verify:
         if constants.TRANSFORM_SCRIPT.exists():
@@ -84,6 +91,7 @@ def run(
         raise typer.Exit(1)
 
     _append_to_results_tsv(report)
+    _write_score_json(report, score_path)
     _print_report_table(report, harness_seconds=elapsed)
 
 
@@ -139,7 +147,7 @@ def weights(
 ):
     """Download the reference Gemma 4 26B 4-bit weights.
 
-    Downloads mlx-community/gemma-4-26b-it-4bit to
+    Downloads mlx-community/gemma-4-26B-A4B-it-qat-4bit to
     quantizationfail/reference_weights/. This is a one-time ~18 GB
     download. Idempotent.
     """
@@ -267,6 +275,65 @@ def _append_to_results_tsv(report: dict) -> None:
     ])
     with open(results, "a") as f:
         f.write(row + "\n")
+
+
+def _write_score_json(report: dict, score_path: Path) -> None:
+    """Write score.json in the benchmark.json contract format."""
+    if "raw" in report:
+        return
+
+    score = _finite_float(report.get("score"))
+    passed = report.get("passed", "0") in ("1", True, "true", "True")
+    if not passed or score is None:
+        return
+
+    payload = {
+        "score": score,
+        "metrics": {
+            "peak_ram_gb": _float_metric(report, "peak_ram_gb"),
+            "bandwidth_gb_per_token": _float_metric(report, "bandwidth_gb_per_tok"),
+            "seconds_per_token": _float_metric(report, "sec_per_tok"),
+            "passed_correctness": passed,
+            "num_layers": _int_metric(report, "num_layers"),
+            "first_failing_layer": _optional_int_metric(report, "first_failing_layer"),
+            "max_abs_diff": _float_metric(report, "max_abs_diff"),
+            "bandwidth_source": report.get("bandwidth_source", ""),
+            "commit": report.get("commit", ""),
+            "timestamp": report.get("timestamp", ""),
+            "harness_hash": report.get("harness_hash", ""),
+        },
+    }
+    score_path.parent.mkdir(parents=True, exist_ok=True)
+    score_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _finite_float(value: object) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _float_metric(report: dict, key: str) -> float:
+    value = report.get(key, "")
+    if value in ("", "-"):
+        return 0.0
+    return float(value)
+
+
+def _int_metric(report: dict, key: str) -> int:
+    value = report.get(key, "")
+    if value in ("", "-"):
+        return 0
+    return int(value)
+
+
+def _optional_int_metric(report: dict, key: str) -> Optional[int]:
+    value = report.get(key, "")
+    if value in ("", "-"):
+        return None
+    return int(value)
 
 
 def _print_report_table(report: dict, harness_seconds: float) -> None:

@@ -26,10 +26,8 @@ MLX_LM_MAX_VERSION = "0.32.0"
 
 # Reference model. The harness downloads this to
 # `quantizationfail/reference_weights/` on first run.
-# The challenge refers to `mlx-community/gemma-4-26b-it-4bit` —
-# the standard 4-bit MLX checkpoint, not the QAT variant.
-REFERENCE_MODEL_REPO = "mlx-community/gemma-4-26b-a4b-it-4bit"
-REFERENCE_MODEL_DIRNAME = "gemma-4-26b-a4b-it-4bit"
+REFERENCE_MODEL_REPO = "mlx-community/gemma-4-26B-A4B-it-qat-4bit"
+REFERENCE_MODEL_DIRNAME = "gemma-4-26B-A4B-it-qat-4bit"
 
 # Modifiable surface. The harness loads these by file path from the
 # participant's working directory (not from site-packages).
@@ -40,6 +38,7 @@ MODEL_FILE = MODIFIABLE_DIR / "model.py"
 PARTICIPANT_WEIGHTS_DIR = Path("weights")
 TRANSFORM_SCRIPT = Path("transform.py")
 RESULTS_FILE = Path("results.tsv")
+SCORE_FILE = Path("score.json")
 
 # Reference weights (managed by `quantizationfail weights`).
 REFERENCE_WEIGHTS_DIR = Path("quantizationfail/reference_weights")

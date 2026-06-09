@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "name": "quantizationfail-challenge",
+  "description": "Optimize Gemma 4 26B MoE inference by transforming weights offline and reducing memory bandwidth without failing the correctness gate.",
+  "category": "python",
+  "direction": "-",
+  "editablePaths": [
+    "transform.py",
+    "mlx_models/gemma4/linear.py",
+    "mlx_models/gemma4/experts.py",
+    "mlx_models/gemma4/model.py",
+    "mlx_models/gemma4/weights.py"
+  ],
+  "setupCommand": ["bash", "-lc", "./setup.sh"],
+  "benchmarkCommand": ["bash", "-lc", "./benchmark.sh"],
+  "scorePath": "score.json"
+}
