@@ -11,7 +11,7 @@ will get the same score as the published baseline.
 Replace `main()` with your actual transform. Constraints enforced
 by the harness sandbox:
 
-  - Only reads from `inferencefail/reference_weights/`
+  - Only reads from `quantizationfail/reference_weights/`
   - Only writes to `weights/`
   - No network, no subprocess, no env reads, no clock reads
   - Same inputs must produce byte-equal output (re-verified on
@@ -28,7 +28,7 @@ import json
 import shutil
 from pathlib import Path
 
-REFERENCE = Path("inferencefail/reference_weights/gemma-4-26b-it-4bit")
+REFERENCE = Path("quantizationfail/reference_weights/gemma-4-26b-a4b-it-4bit")
 OUTPUT = Path("weights")
 
 

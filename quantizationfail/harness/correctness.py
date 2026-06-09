@@ -15,13 +15,27 @@ Implementation strategy:
   4. At every DecoderLayer, capture the output hidden state.
   5. Compare with allclose using CORRECTNESS_EPSILON.
 
+mlx has no `register_forward_hook` (torch idiom) and method-binding
+tricks on `nn.Module` subclasses don't work because the model code
+calls `layer(x, ...)` which uses a metaclass-bound `__call__`, not
+a per-instance `__call__`.
+
+We work around this by manually iterating the model's layers and
+calling each one. We use the model's own helper methods
+(`_make_masks`, `_get_per_layer_inputs`, `_project_per_layer_inputs`)
+for the per-layer setup, then capture the output of each layer call
+in our own loop.
+
+This is model-specific (it knows the Gemma 4 architecture) but
+cleaner than fighting mlx's module system.
+
 A pass means every layer is within tolerance. A fail reports the
 first diverging layer and the magnitude of the difference.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 import mlx.core as mx
 
@@ -47,54 +61,94 @@ class CorrectnessResult:
         }
 
 
+def _run_layers_capturing(inner_model, tokens: mx.array, cache=None):
+    """Manually run inner_model's layers and capture h after each.
+
+    Returns a list of mx.array, one per layer, holding the hidden
+    state at the output of that layer (before the final norm).
+
+    Works for Gemma 4 TextModel (gemma4_text.Gemma4TextModel). The
+    inner_model must have:
+      - embed_tokens
+      - embed_scale
+      - hidden_size_per_layer_input (int, may be 0)
+      - previous_kvs (list[int])
+      - layers (list[DecoderLayer])
+      - _make_masks, _get_per_layer_inputs, _project_per_layer_inputs
+    """
+    # 1. Embed.
+    input_embeddings = inner_model.embed_tokens(tokens)
+    h = input_embeddings * inner_model.embed_scale
+
+    # 2. Per-layer inputs (if applicable).
+    if inner_model.hidden_size_per_layer_input:
+        per_layer_inputs = inner_model._get_per_layer_inputs(tokens, input_embeddings)
+        per_layer_inputs = inner_model._project_per_layer_inputs(h, per_layer_inputs)
+        per_layer_inputs = [per_layer_inputs[:, :, i, :] for i in range(len(inner_model.layers))]
+    else:
+        per_layer_inputs = [None] * len(inner_model.layers)
+
+    # 3. Cache.
+    if cache is None:
+        cache = [None] * len(inner_model.layers)
+    else:
+        cache = list(cache) + [None] * (len(inner_model.layers) - len(cache))
+
+    # 4. Build masks.
+    masks = inner_model._make_masks(h, cache)
+
+    # 5. Iterate layers, capture h.
+    intermediates: List[mx.array] = []
+    kvs_offsets = [(None, None)] * len(inner_model.layers)
+    for idx, (layer, c, mask, prev_idx, pli) in enumerate(zip(
+        inner_model.layers, cache, masks, inner_model.previous_kvs, per_layer_inputs
+    )):
+        kvs, offset = kvs_offsets[prev_idx]
+        h, kvs, offset = layer(
+            h, mask, c,
+            per_layer_input=pli,
+            shared_kv=kvs,
+            offset=offset,
+        )
+        kvs_offsets[idx] = (kvs, offset)
+        intermediates.append(h)
+
+    return intermediates
+
+
 def _capture_intermediates(model, tokens: mx.array) -> List[mx.array]:
     """Run the model and capture the hidden state at the output of
-    every DecoderLayer. We use forward hooks that read the input
-    and output of each layer.
-
-    Returns a list of length num_hidden_layers, where element i is
-    the output of layer i (before the final norm/lm_head).
+    every DecoderLayer. Returns a list of length num_hidden_layers.
     """
-    intermediates: List[mx.array] = []
-    handles = []
+    # The model may be nested up to two levels deep:
+    #   gemma4.Model
+    #     .language_model = gemma4_text.Model
+    #       .model = Gemma4TextModel    (has embed_tokens, layers, etc.)
+    # Drill down to the innermost one that has embed_tokens, walking
+    # through any sub-module that itself contains a sub-module with
+    # embed_tokens.
+    def _find_with_embed_tokens(mod, depth=0):
+        if depth > 3:
+            return None
+        if hasattr(mod, "embed_tokens"):
+            return mod
+        for attr in ("model", "language_model", "text_model"):
+            if hasattr(mod, attr):
+                found = _find_with_embed_tokens(getattr(mod, attr), depth + 1)
+                if found is not None:
+                    return found
+        return None
 
-    def make_hook(idx):
-        def hook(module, inputs, output):
-            # DecoderLayer returns (h, shared_kv, offset) or just h
-            # depending on the model. The hidden state is the first
-            # element.
-            if isinstance(output, tuple):
-                h = output[0]
-            else:
-                h = output
-            intermediates.append((idx, h))
+    inner = _find_with_embed_tokens(model)
+    if inner is None:
+        raise RuntimeError(
+            f"Cannot find embed_tokens on model of type {type(model).__name__}"
+        )
 
-        return hook
-
-    layers = model.layers
-    for i, layer in enumerate(layers):
-        handles.append(layer.register_forward_hook(make_hook(i)))
-
-    try:
-        # Use a fresh cache to avoid KV state leaking between runs.
-        cache = model.make_cache() if hasattr(model, "make_cache") else None
-        # The model may be the top-level wrapper (gemma4.Model) or
-        # the inner text model (gemma4_text.Model). Try both.
-        if hasattr(model, "language_model"):
-            inner = model.language_model
-        else:
-            inner = model
-        if cache is not None:
-            _ = inner(tokens, cache=cache)
-        else:
-            _ = inner(tokens)
-        mx.eval([h for _, h in intermediates])
-    finally:
-        for h in handles:
-            h.remove()
-
-    intermediates.sort(key=lambda x: x[0])
-    return [h for _, h in intermediates]
+    cache = inner.make_cache() if hasattr(inner, "make_cache") else None
+    intermediates = _run_layers_capturing(inner, tokens, cache=cache)
+    mx.eval(intermediates)
+    return intermediates
 
 
 def check(
@@ -130,7 +184,6 @@ def check(
     for i, (ref_h, sub_h) in enumerate(zip(ref_intermediates, sub_intermediates)):
         diff = mx.abs(ref_h - sub_h)
         abs_diff = float(mx.max(diff))
-        # Relative diff: avoid div by zero on tiny reference values.
         ref_abs = mx.abs(ref_h)
         rel = mx.where(ref_abs > 1e-6, diff / ref_abs, mx.zeros_like(diff))
         rel_diff = float(mx.max(rel))

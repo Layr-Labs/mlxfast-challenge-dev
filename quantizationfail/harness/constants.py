@@ -28,8 +28,8 @@ MLX_LM_MAX_VERSION = "0.32.0"
 # `quantizationfail/reference_weights/` on first run.
 # The challenge refers to `mlx-community/gemma-4-26b-it-4bit` —
 # the standard 4-bit MLX checkpoint, not the QAT variant.
-REFERENCE_MODEL_REPO = "mlx-community/gemma-4-26b-it-4bit"
-REFERENCE_MODEL_DIRNAME = "gemma-4-26b-it-4bit"
+REFERENCE_MODEL_REPO = "mlx-community/gemma-4-26b-a4b-it-4bit"
+REFERENCE_MODEL_DIRNAME = "gemma-4-26b-a4b-it-4bit"
 
 # Modifiable surface. The harness loads these by file path from the
 # participant's working directory (not from site-packages).

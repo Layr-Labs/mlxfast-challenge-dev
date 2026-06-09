@@ -21,7 +21,6 @@ import argparse
 import json
 import os
 import random
-import resource
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -121,23 +120,26 @@ def _versions() -> tuple[str, str]:
 
 
 def _seed_prompt(vocab_size: int, length: int, seed: int) -> mx.array:
-    """Generate a random prompt of `length` tokens, seeded by `seed`."""
+    """Generate a random prompt of `length` tokens, seeded by `seed`.
+
+    Returns shape (1, length) so embed_tokens gives (1, length, hidden).
+    """
     rng = np.random.default_rng(seed)
-    tokens = rng.integers(0, vocab_size, size=length).astype(np.int32)
+    tokens = rng.integers(0, vocab_size, size=(1, length)).astype(np.int32)
     return mx.array(tokens)
 
 
-def _peak_rss_gb() -> float:
-    """Return peak resident set size in GB.
+def _peak_gpu_memory_gb() -> float:
+    """Return peak GPU memory usage in GB.
 
-    We use ru_maxrss from getrusage, which on macOS is in bytes
-    and on Linux is in kilobytes. The harness runs in a subprocess
-    so this measures the harness's peak, not the parent's.
+    Uses mx.get_peak_memory() which tracks GPU memory allocations
+    through MLX's caching allocator. This is the standard approach
+    used by mlx_lm.stream_generate() and mlx_lm.benchmark.py.
+
+    The caller must call mx.reset_peak_memory() before the measured
+    section and mx.get_peak_memory() after eval completes.
     """
-    rusage = resource.getrusage(resource.RUSAGE_SELF)
-    if sys.platform == "darwin":
-        return rusage.ru_maxrss / (1024**3)
-    return (rusage.ru_maxrss * 1024) / (1024**3)
+    return mx.get_peak_memory() / (1024**3)
 
 
 def _load_models(weights_path: Path):
@@ -159,18 +161,11 @@ def _load_models(weights_path: Path):
         str(constants.REFERENCE_WEIGHTS_DIR / constants.REFERENCE_MODEL_DIRNAME)
     )
 
-    # Submission: build the model from the modifiable surface.
-    # The shadow package has already been imported by the harness
-    # runner before this point, so mlx_lm.models.gemma4 is patched.
-    sub_model_args = _upstream_gemma4.ModelArgs.from_dict(
-        _load_config_dict(weights_path)
-    )
-    sub_model = _upstream_gemma4.Model(sub_model_args)
-
-    # Load weights via the participant's load_weights function.
-    from mlx_models.gemma4 import load_weights as _sub_load_weights
-
-    _sub_load_weights(sub_model, weights_path)
+    # Submission: use mlx_lm.load, which honors config.json's
+    # `model_file` pointer to import the participant's modifiable
+    # model class. This is the canonical load path and handles all
+    # the sanitize / quantize edge cases.
+    sub_model, sub_tokenizer = mlx_lm.load(str(weights_path))
 
     sub_model.eval()
     mx.eval(sub_model.parameters())
@@ -186,10 +181,13 @@ def _load_config_dict(weights_path: Path) -> dict:
         return json.load(f)
 
 
-def _measure_latency(model, prompt: mx.array, num_tokens: int) -> float:
-    """Decode `num_tokens` tokens, return wall-clock seconds per token."""
-    import mlx_lm.sample_utils as sample_utils
+def _measure_latency_and_memory(model, prompt: mx.array, num_tokens: int) -> tuple[float, float]:
+    """Decode `num_tokens` tokens, return (seconds_per_token, peak_ram_gb).
 
+    Resets the MLX peak memory counter before the decode loop, then
+    reads peak memory after eval. This ensures peak RAM captures only
+    the decode phase, not prefill or warmup.
+    """
     cache = model.make_cache() if hasattr(model, "make_cache") else None
     inner = model.language_model if hasattr(model, "language_model") else model
 
@@ -199,6 +197,9 @@ def _measure_latency(model, prompt: mx.array, num_tokens: int) -> float:
     else:
         _ = inner(prompt)
     mx.eval(inner.parameters())
+
+    # Reset peak memory counter before measuring decode.
+    mx.reset_peak_memory()
 
     # Decode loop
     t0 = time.perf_counter()
@@ -212,7 +213,11 @@ def _measure_latency(model, prompt: mx.array, num_tokens: int) -> float:
         next_tok = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True)
     mx.eval(next_tok)
     elapsed = time.perf_counter() - t0
-    return elapsed / num_tokens
+
+    seconds_per_token = elapsed / num_tokens
+    peak_ram_gb = _peak_gpu_memory_gb()
+
+    return seconds_per_token, peak_ram_gb
 
 
 def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
@@ -268,11 +273,13 @@ def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
 
         # Measure.
         bw = bandwidth.measure(sub_model, prompt, constants.DECODE_LENGTH)
-        spt = _measure_latency(sub_model, prompt, constants.DECODE_LENGTH)
-        peak = _peak_rss_gb() * (1024**3)  # back to bytes for score.compute
+        spt, peak_gb = _measure_latency_and_memory(
+            sub_model, prompt, constants.DECODE_LENGTH
+        )
+        peak_bytes = int(peak_gb * (1024**3))
 
         sr = score.compute(
-            peak_ram_bytes=int(peak),
+            peak_ram_bytes=peak_bytes,
             bandwidth_gb_per_token=bw.gb_per_token,
             seconds_per_token=spt,
             passed_correctness=True,

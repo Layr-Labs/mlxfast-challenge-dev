@@ -24,8 +24,8 @@ What you should NOT change:
 """
 from __future__ import annotations
 
-from mlx_lm.models.gemma4_text import Model as _UpstreamModel
-from mlx_lm.models.gemma4_text import ModelArgs as _UpstreamModelArgs
+from mlx_lm.models.gemma4 import Model as _UpstreamModel
+from mlx_lm.models.gemma4 import ModelArgs as _UpstreamModelArgs
 
 
 class ModelArgs(_UpstreamModelArgs):
