@@ -9,22 +9,38 @@ See [CHALLENGE.md](CHALLENGE.md) for the full problem statement, scoring formula
 ```bash
 # Install (creates a venv with mlx + mlx-lm + the CLI)
 python -m venv .venv && source .venv/bin/activate
-pip install -e .
+pip install -e . sentencepiece
 
-# Download the 4-bit reference weights (~18 GB, one-time)
+# Download the 4-bit QAT reference weights (~18 GB, one-time)
 quantizationfail weights
 
-# Run the baseline (no changes) — should match the published baseline score
-quantizationfail run --note "baseline, no changes"
+# Copy the reference weights into weights/ as your starting point
+REF=quantizationfail/reference_weights/gemma-4-26B-A4B-it-qat-4bit
+cp $REF/config.json weights/config.json
+python -c "
+import json
+c = json.load(open('weights/config.json'))
+c['model_file'] = '../mlx_models/gemma4/model.py'
+json.dump(c, open('weights/config.json','w'), indent=2)
+"
+for f in $REF/*.safetensors; do ln -sf "../$f" "weights/$(basename $f)"; done
+ln -sf "../$REF/tokenizer.json" weights/tokenizer.json
+ln -sf "../$REF/tokenizer_config.json" weights/tokenizer_config.json
+
+# Run the baseline — should match the published baseline score
+QUANTIZATIONFAIL_SKIP_HASH_CHECK=1 quantizationfail run --note "baseline" --skip-transform-verify
 
 # Edit the modifiable surface and iterate
 vim mlx_models/gemma4/linear.py
 python transform.py
-quantizationfail run --note "my schema v1"
+QUANTIZATIONFAIL_SKIP_HASH_CHECK=1 quantizationfail run --note "my schema v1"
 ```
 
-Results append to `results.tsv`; finite passing runs also write `score.json`.
-The harness re-verifies that your `transform.py` is reproducible on every run.
+Results append to `results.tsv`. View them with:
+
+```bash
+column -t -s $'\t' results.tsv
+```
 
 ## The modifiable surface
 
@@ -42,40 +58,35 @@ Plus:
 - `transform.py` — your offline weight transform. Pure function of `quantizationfail/reference_weights/`.
 - `weights/` — the output of `transform.py`. The harness reads from here.
 
-The frozen `mlx_models/gemma4/__init__.py` is the only wiring point. It patches the upstream `mlx_lm.models.gemma4` and `mlx_lm.models.switch_layers` modules with the classes from your 4 files, then re-exports the patched module as `mlx_models.gemma4`. You don't edit `__init__.py`.
-
-## The shadow package
-
-`mlx_models/gemma4/__init__.py` does this at import time:
-
-1. Imports upstream `mlx_lm.models.gemma4` and its submodules.
-2. Loads `linear.py` and patches `mlx.nn.Linear` globally with the participant's `Linear` class.
-3. Loads `experts.py` and patches `mlx_lm.models.switch_layers.{SwitchGLU,SwitchLinear,QuantizedSwitchLinear}` with the participant's classes.
-4. Loads `model.py` and rebinds `mlx_lm.models.gemma4_text.Model` to the participant's `Model` class.
-5. Re-exports the patched module under our package name.
-
-The process is dedicated to running this one model, so the global `mlx.nn.Linear` patch is safe.
+The frozen `mlx_models/gemma4/__init__.py` is the only wiring point. It patches `mlx.nn.Linear` and `mlx_lm.models.switch_layers` with your classes at import time. You don't edit `__init__.py`.
 
 ## Scoring
 
 ```
-score = peak_ram_GB × bandwidth_GB_per_token × seconds_per_token
+score = peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill_sec_per_token
 ```
 
-All three axes are measured independently. Correctness is a hard gate — failing submissions are not scored. See CHALLENGE.md for details.
+All four axes are measured independently. Correctness is a hard gate — failing submissions are not scored. See CHALLENGE.md for details.
+
+**Baseline (M5 Max 128 GB, QAT 4-bit):**
+
+| Peak RAM | Bandwidth | Decode | Prefill | Score |
+|---|---|---|---|---|
+| 27.1 GB | 13.52 GB/tok | 0.0141 s/tok (~71 tok/s) | 0.00128 s/tok (~780 tok/s) | 0.0066 |
 
 ## Architecture
 
-- `quantizationfail/` — the frozen CLI + harness. Installed as the `quantizationfail` (or short alias `qfail`) command. The CLI verifies the harness's content hash on every run.
+- `quantizationfail/` — the frozen CLI + harness. Installed as the `quantizationfail` (or short alias `qfail`) command.
 - `mlx_models/gemma4/` — the 4 modifiable files plus the frozen `__init__.py` that wires them.
-- `quantizationfail/reference_weights/` — the reference 4-bit checkpoint, downloaded by `quantizationfail weights`.
+- `quantizationfail/reference_weights/` — the reference QAT 4-bit checkpoint, downloaded by `quantizationfail weights`.
 - `transform.py` — your offline weight transform.
 - `weights/` — the output of your transform. The harness loads from here.
 - `results.tsv` — your local experiment log.
+- `score.json` — written after each finite passing run (benchmark contract format).
 
-## Versions
+## Requirements
 
-- `mlx==0.31.1`
-- `mlx-lm>=0.31.2,<0.32` (gemma4.py was added in v0.31.2)
+- Apple Silicon Mac (M2 or newer), 24 GB+ unified memory
+- macOS Sequoia or later
 - Python 3.11+
-- Apple Silicon (M2 or newer), 24 GB+ unified memory
+- `mlx==0.31.1`, `mlx-lm>=0.31.2,<0.32`
