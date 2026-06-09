@@ -247,24 +247,17 @@ def verify_transform(
 def _append_to_results_tsv(report: dict) -> None:
     """Append a row to results.tsv in the participant's working directory."""
     results = constants.RESULTS_FILE
-    if not results.exists():
-        header = "\t".join([
-            "timestamp", "commit", "note", "peak_ram_gb",
-            "bandwidth_gb_per_tok", "sec_per_tok", "score", "passed",
-            "num_layers", "first_failing_layer", "max_abs_diff",
-            "bandwidth_source", "harness_hash",
-        ])
-        results.write_text(header + "\n")
+    _COLUMNS = [
+        "timestamp", "commit", "note", "peak_ram_gb",
+        "bandwidth_gb_per_tok", "decode_sec_per_tok", "prefill_sec_per_tok",
+        "score", "passed", "num_layers", "first_failing_layer", "max_abs_diff",
+        "bandwidth_source", "harness_hash",
+    ]
 
-    row = "\t".join([
-        str(report.get(k, ""))
-        for k in [
-            "timestamp", "commit", "note", "peak_ram_gb",
-            "bandwidth_gb_per_tok", "sec_per_tok", "score", "passed",
-            "num_layers", "first_failing_layer", "max_abs_diff",
-            "bandwidth_source", "harness_hash",
-        ]
-    ])
+    if not results.exists():
+        results.write_text("\t".join(_COLUMNS) + "\n")
+
+    row = "\t".join([str(report.get(k, "")) for k in _COLUMNS])
     with open(results, "a") as f:
         f.write(row + "\n")
 
@@ -294,7 +287,8 @@ def _print_report_table(report: dict, harness_seconds: float) -> None:
         ("Score", score_s),
         ("Peak RAM (GB)", report.get("peak_ram_gb", "?")),
         ("Bandwidth (GB/tok)", report.get("bandwidth_gb_per_tok", "?")),
-        ("Seconds/token", report.get("sec_per_tok", "?")),
+        ("Decode sec/token", report.get("decode_sec_per_tok", "?")),
+        ("Prefill sec/token", report.get("prefill_sec_per_tok", "?")),
         ("Layers checked", report.get("num_layers", "?")),
         ("First failing layer", report.get("first_failing_layer", "-")),
         ("Max abs diff", report.get("max_abs_diff", "?")),

@@ -45,8 +45,16 @@ RESULTS_FILE = Path("results.tsv")
 REFERENCE_WEIGHTS_DIR = Path("quantizationfail/reference_weights")
 TOKENIZER_DIR = Path("quantizationfail/tokenizer")
 
-# Measurement parameters. The challenge spec says 512-token decode runs.
+# Measurement parameters.
+# DECODE_LENGTH: number of autoregressive tokens measured per run.
+# PREFILL_PROMPT_LENGTH: length of the prompt used for the prefill
+#   latency measurement. Longer than the correctness seed prompt so
+#   that prefill timing is dominated by the actual computation rather
+#   than framework overhead.
+# PROMPT_SEED_PREFIX_LENGTH: length of the seed prompt used for the
+#   correctness gate and as the starting context for decode timing.
 DECODE_LENGTH = 512
+PREFILL_PROMPT_LENGTH = 512
 PROMPT_SEED_PREFIX_LENGTH = 32
 
 # Numerical tolerance for the correctness gate. The spec calls for

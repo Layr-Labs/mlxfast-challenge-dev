@@ -33,11 +33,11 @@ This is one point in a large space. The challenge is finding the best schema in 
 
 ## Current frontier
 
-| Submission | Peak RAM (GB) | Bandwidth (GB/tok) | Tok/s | Score | Correctness |
-|---|---|---|---|---|---|
-| **Baseline** — MLX 4-bit Gemma 4 26B MoE | ~18 | TBD | ~50 | **TBD** | ✓ reference |
+| Submission | Peak RAM (GB) | Bandwidth (GB/tok) | Decode tok/s | Prefill tok/s | Score | Correctness |
+|---|---|---|---|---|---|---|
+| **Baseline** — MLX 4-bit Gemma 4 26B MoE | ~27 | ~13.5 | ~69 | TBD | **TBD** | ✓ reference |
 
-Score = `peak_ram_GB × bandwidth_GB_per_token × seconds_per_token`. Lower is better. Correctness is a hard gate — submissions that fail it do not appear on the leaderboard.
+Score = `peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill_sec_per_token`. Lower is better. Correctness is a hard gate — submissions that fail it do not appear on the leaderboard.
 
 The baseline uses [`mlx-community/gemma-4-26b-it-4bit`](https://huggingface.co/mlx-community/gemma-4-26b-it-4bit) — the standard 4-bit MLX checkpoint, **not** the QAT variant — on an Apple M5 Max 128 GB, pinned at `mlx==0.31.1`, `mlx-lm==0.21.0`. Baseline bandwidth and score will be published once the reference harness measurement is complete.
 
@@ -66,9 +66,10 @@ This single command:
 2. Runs correctness validation — layer-wise exact match against the reference model at every hidden layer, on prompts seeded from a runtime-generated random seed (unknown until eval time)
 3. Measures peak unified memory — via `mx.get_peak_memory()` (MLX's caching allocator high-water mark), isolated to the decode phase
 4. Measures memory bandwidth — via an MoE-aware software model: `(shared_weight_bytes + activated_expert_bytes + kv_cache_bytes) / token_count`, where expert bytes are scaled by `experts_per_tok / num_experts`. This has been validated to within ~5% of hardware counters on Apple Silicon. MLX does not expose `MTLCounterSampleBuffer` values through its Python API.
-5. Measures decode latency — wall-clock seconds per token, averaged over a 512-token decode run
-6. Computes score — `peak_ram_GB × bandwidth_GB_per_token × seconds_per_token`
-7. Appends one row to `results.tsv` with timestamp, git commit, peak RAM, bandwidth, tok/s, score, correctness status, and your note
+5. Measures decode latency — wall-clock seconds per token, averaged over a 512-token autoregressive decode run
+6. Measures prefill latency — wall-clock seconds per token for a 512-token full-sequence forward pass (2 timed runs after 1 warmup)
+7. Computes score — `peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill_sec_per_token`
+8. Appends one row to `results.tsv` with timestamp, git commit, peak RAM, bandwidth, decode tok/s, prefill tok/s, score, correctness status, and your note
 
 To submit to the leaderboard:
 
@@ -225,21 +226,23 @@ The current frontier has one point: the baseline. We believe it is beatable. The
 ## Scoring formula
 
 ```
-score = peak_ram_GB × bandwidth_GB_per_token × seconds_per_token
+score = peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill_sec_per_token
 ```
 
-- `peak_ram_GB` — peak unified memory during a decode run of 512 tokens, measured by subprocess isolation
-- `bandwidth_GB_per_token` — total GPU memory reads during the same run divided by token count, measured by Metal GPU performance counters
-- `seconds_per_token` — wall-clock decode latency per token, averaged over the same 512-token run
+- `peak_ram_GB` — peak unified memory during a 512-token decode run, measured by `mx.get_peak_memory()`
+- `bandwidth_GB_per_token` — estimated GB read per decoded token via an MoE-aware software model (shared weights + activated expert weights + KV cache), validated to ~5% accuracy on Apple Silicon
+- `decode_sec_per_token` — wall-clock decode latency per token, averaged over a 512-token autoregressive decode run
+- `prefill_sec_per_token` — wall-clock latency per token for a 512-token full-sequence forward pass (2 timed runs after 1 warmup)
 - Correctness is a **hard gate** — failing submissions are not scored
 
 Lower score is better. This formula cannot be gamed on a single axis:
 
-- Reducing bandwidth by reading a compressed representation but requiring expensive compute to do so pays for it in `seconds_per_token`
+- Reducing bandwidth by reading a compressed representation but requiring expensive compute to do so pays for it in `decode_sec_per_token`
+- Shifting computation from decode to prefill (e.g. computing sparse index structures once per prompt) pays for it in `prefill_sec_per_token`
 - Speeding up decode by skipping correctness-critical computation fails the hard gate before scoring
 - Reducing peak RAM by streaming large intermediate tensors through the GPU pays for it in `bandwidth_GB_per_token`
 
-All three dimensions must improve together for the score to meaningfully drop.
+All four dimensions must improve together for the score to meaningfully drop.
 
 ---
 

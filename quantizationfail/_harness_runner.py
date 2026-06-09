@@ -80,21 +80,15 @@ def run_in_subprocess(
             values = json.loads(payload)
             header = constants.RESULTS_FILE.read_text().splitlines()[0].split("\t") if constants.RESULTS_FILE.exists() else []
             # If the header hasn't been written yet, return a raw dict.
-            if len(values) == len([
+            _COLUMNS = [
                 "timestamp", "commit", "note", "peak_ram_gb",
-                "bandwidth_gb_per_tok", "sec_per_tok", "score", "passed",
+                "bandwidth_gb_per_tok", "decode_sec_per_tok",
+                "prefill_sec_per_tok", "score", "passed",
                 "num_layers", "first_failing_layer", "max_abs_diff",
                 "bandwidth_source", "harness_hash",
-            ]):
-                return dict(zip(
-                    [
-                        "timestamp", "commit", "note", "peak_ram_gb",
-                        "bandwidth_gb_per_tok", "sec_per_tok", "score", "passed",
-                        "num_layers", "first_failing_layer", "max_abs_diff",
-                        "bandwidth_source", "harness_hash",
-                    ],
-                    values,
-                ))
+            ]
+            if len(values) == len(_COLUMNS):
+                return dict(zip(_COLUMNS, values))
             return {"raw": values}
 
     # Harness didn't produce a result line. Something went wrong.

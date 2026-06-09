@@ -40,7 +40,8 @@ class RunReport:
     note: str
     peak_ram_gb: float
     bandwidth_gb_per_token: float
-    seconds_per_token: float
+    decode_seconds_per_token: float
+    prefill_seconds_per_token: float
     score: float
     passed_correctness: bool
     num_layers: int
@@ -60,7 +61,8 @@ class RunReport:
                 self.note,
                 f"{self.peak_ram_gb:.4f}",
                 f"{self.bandwidth_gb_per_token:.6f}",
-                f"{self.seconds_per_token:.6f}",
+                f"{self.decode_seconds_per_token:.6f}",
+                f"{self.prefill_seconds_per_token:.6f}",
                 f"{self.score:.6f}" if self.score != float("inf") else "inf",
                 "1" if self.passed_correctness else "0",
                 str(self.num_layers),
@@ -80,7 +82,8 @@ class RunReport:
                 "note",
                 "peak_ram_gb",
                 "bandwidth_gb_per_tok",
-                "sec_per_tok",
+                "decode_sec_per_tok",
+                "prefill_sec_per_tok",
                 "score",
                 "passed",
                 "num_layers",
@@ -270,6 +273,48 @@ def _measure_latency_and_memory(model, prompt: mx.array, num_tokens: int) -> tup
     return seconds_per_token, peak_ram_gb
 
 
+def _measure_prefill_latency(model, prompt: mx.array) -> float:
+    """Measure prefill seconds-per-token for a full prompt forward pass.
+
+    Prefill processes the entire prompt in parallel (one forward call
+    with the full sequence), which is the dominant cost for long-context
+    use cases and reflects the per-token cost of any schema that
+    requires setup work proportional to sequence length.
+
+    A transform that shifts computation from the decode phase to the
+    prefill phase — e.g. computing sparse representations per prompt —
+    will show up here rather than in decode_seconds_per_token.
+
+    Returns:
+      Wall-clock seconds per prompt token, averaged over two timed
+      runs (after one warmup). A fresh KV cache is created for each
+      run so results are comparable across submissions with different
+      cache layouts.
+    """
+    inner = model.language_model if hasattr(model, "language_model") else model
+    prompt_len = prompt.shape[-1]
+
+    def _prefill_once():
+        cache = inner.make_cache() if hasattr(inner, "make_cache") else None
+        if cache is not None:
+            out = inner(prompt, cache=cache)
+        else:
+            out = inner(prompt)
+        mx.eval(out)
+
+    # Warmup — load weights, fill caches, JIT compile.
+    _prefill_once()
+
+    # Two timed runs, take the mean.
+    times = []
+    for _ in range(2):
+        t0 = time.perf_counter()
+        _prefill_once()
+        times.append(time.perf_counter() - t0)
+
+    return (sum(times) / len(times)) / prompt_len
+
+
 def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
     """The main harness entry point.
 
@@ -310,7 +355,8 @@ def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
                 note=note,
                 peak_ram_gb=0.0,
                 bandwidth_gb_per_token=0.0,
-                seconds_per_token=0.0,
+                decode_seconds_per_token=0.0,
+                prefill_seconds_per_token=0.0,
                 score=float("inf"),
                 passed_correctness=False,
                 num_layers=correctness_result.num_layers,
@@ -321,17 +367,28 @@ def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
                 mlx_lm_version=mlx_lm_v,
             )
 
-        # Measure.
+        # Build the prefill prompt (longer than the correctness seed).
+        prefill_prompt = _seed_prompt(
+            vocab_size,
+            constants.PREFILL_PROMPT_LENGTH,
+            seed ^ 0xDEADBEEF,  # distinct seed from correctness prompt
+        )
+
+        # Measure decode latency and peak RAM.
         bw = bandwidth.measure(sub_model, prompt, constants.DECODE_LENGTH)
-        spt, peak_gb = _measure_latency_and_memory(
+        decode_spt, peak_gb = _measure_latency_and_memory(
             sub_model, prompt, constants.DECODE_LENGTH
         )
         peak_bytes = int(peak_gb * (1024**3))
 
+        # Measure prefill latency.
+        prefill_spt = _measure_prefill_latency(sub_model, prefill_prompt)
+
         sr = score.compute(
             peak_ram_bytes=peak_bytes,
             bandwidth_gb_per_token=bw.gb_per_token,
-            seconds_per_token=spt,
+            decode_seconds_per_token=decode_spt,
+            prefill_seconds_per_token=prefill_spt,
             passed_correctness=True,
             note=note,
         )
@@ -342,7 +399,8 @@ def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
             note=note,
             peak_ram_gb=sr.peak_ram_gb,
             bandwidth_gb_per_token=sr.bandwidth_gb_per_token,
-            seconds_per_token=sr.seconds_per_token,
+            decode_seconds_per_token=sr.decode_seconds_per_token,
+            prefill_seconds_per_token=sr.prefill_seconds_per_token,
             score=sr.score,
             passed_correctness=True,
             num_layers=correctness_result.num_layers,
@@ -360,7 +418,8 @@ def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
             note=note,
             peak_ram_gb=0.0,
             bandwidth_gb_per_token=0.0,
-            seconds_per_token=0.0,
+            decode_seconds_per_token=0.0,
+            prefill_seconds_per_token=0.0,
             score=float("inf"),
             passed_correctness=False,
             num_layers=0,
@@ -405,7 +464,8 @@ def main():
         f"[{status}] score={report.score:.4f} "
         f"ram={report.peak_ram_gb:.2f}GB "
         f"bw={report.bandwidth_gb_per_token:.4f}GB/tok "
-        f"sec/tok={report.seconds_per_token:.4f}"
+        f"decode={report.decode_seconds_per_token:.4f}s/tok "
+        f"prefill={report.prefill_seconds_per_token:.4f}s/tok"
     )
     if not report.passed_correctness:
         if report.first_failing_layer is not None:
