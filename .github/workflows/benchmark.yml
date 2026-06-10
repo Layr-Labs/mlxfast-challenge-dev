@@ -1,5 +1,8 @@
 name: benchmark
 
+# Runs for: fork PRs (self-serve scoring), pushes to main (post-promotion re-validation),
+# and workflow_dispatch (Yukon dispatches on yukon/baseline/* and yukon/submissions/*
+# branches it constructs, then reads the score from the uploaded artifact).
 on:
   pull_request:
   push:
@@ -30,25 +33,22 @@ jobs:
 
       # Participant submissions come from forks; same-repo PRs are maintainers
       # and may touch the harness/CI, so the guard only polices fork PRs.
-      - name: Enforce modifiable surface
+      - name: Enforce modifiable surface (fork PRs)
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/enforce-modifiable-surface.sh
+
+      # Yukon already enforces editablePaths server-side when it builds candidate
+      # branches; re-checking here is defense in depth against orchestrator bugs.
+      - name: Enforce modifiable surface (yukon candidate branches)
+        if: github.event_name == 'workflow_dispatch' && startsWith(github.ref_name, 'yukon/submissions/')
+        env:
+          HEAD_SHA: ${{ github.sha }}
         run: |
-          # The allowlist comes from the BASE branch so a PR can't grant itself access.
-          allowed="$(git show "${BASE_SHA}:benchmark.json" \
-            | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["editablePaths"]))')"
-          changed="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
-          bad=0
-          while IFS= read -r f; do
-            [[ -z "${f}" ]] && continue
-            if ! grep -qxF "${f}" <<<"${allowed}"; then
-              echo "::error file=${f}::${f} is outside the modifiable surface (see editablePaths in benchmark.json)"
-              bad=1
-            fi
-          done <<<"${changed}"
-          exit "${bad}"
+          BASE_SHA="$(git merge-base origin/main "${HEAD_SHA}")" \
+            .github/scripts/enforce-modifiable-surface.sh
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -74,51 +74,16 @@ jobs:
       - name: Setup
         run: ./setup.sh
 
-      - name: Verify the sandbox blocks network
-        run: |
-          if sandbox-exec -f .github/sandbox/deny-network.sb \
-              curl -fsS --max-time 10 https://example.com -o /dev/null 2>/dev/null; then
-            echo "::error::sandbox-exec did not block network access; refusing to run the benchmark"
-            exit 1
-          fi
-          echo "Network egress is blocked inside the sandbox."
-
-      # Offline phase: transform.py and the benchmark run with no network and no sudo.
-      # The proxy vars point at a closed local port so anything that ignores the
-      # sandbox profile still fails fast instead of hanging.
+      # Offline phase: benchmark.sh self-sandboxes — it proves the Seatbelt
+      # profile (tools/deny-network.sb) blocks egress, then re-execs itself
+      # under sandbox-exec with no network and no sudo.
       - name: Benchmark (offline)
         env:
-          HF_HUB_OFFLINE: "1"
-          TRANSFORMERS_OFFLINE: "1"
           QUANTIZATIONFAIL_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
-        run: |
-          sandbox-exec -f .github/sandbox/deny-network.sb env \
-            http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 \
-            HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
-            ./benchmark.sh
+        run: ./benchmark.sh
 
       - name: Report score
-        run: |
-          python3 - <<'EOF'
-          import json, os
-          payload = json.load(open("score.json"))
-          metrics = payload.get("metrics", {})
-          lines = [
-              "## quantizationfail benchmark",
-              "",
-              f"**Score: `{payload['score']}`** (lower is better)",
-              "",
-              "| metric | value |",
-              "|---|---|",
-          ]
-          # The metrics schema evolves with the harness; report whatever it emits.
-          lines += [f"| {k} | {v} |" for k, v in sorted(metrics.items())]
-          lines.append("")
-          summary = "\n".join(lines)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write(summary)
-          print(summary)
-          EOF
+        run: .github/scripts/report-score.py
 
       - name: Upload score artifacts
         if: always()
@@ -135,30 +100,7 @@ jobs:
       - name: Comment score on PR
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         continue-on-error: true
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        with:
-          script: |
-            const fs = require('fs');
-            const payload = JSON.parse(fs.readFileSync('score.json', 'utf8'));
-            const metrics = payload.metrics || {};
-            const marker = '<!-- quantizationfail-benchmark -->';
-            const body = [
-              marker,
-              '## quantizationfail benchmark',
-              '',
-              `**Score: \`${payload.score}\`** (lower is better)`,
-              '',
-              '| metric | value |',
-              '|---|---|',
-              // The metrics schema evolves with the harness; report whatever it emits.
-              ...Object.keys(metrics).sort().map(k => `| ${k} | ${metrics[k]} |`),
-            ].join('\n');
-            const { owner, repo } = context.repo;
-            const issue_number = context.issue.number;
-            const comments = await github.rest.issues.listComments({ owner, repo, issue_number });
-            const existing = comments.data.find(c => c.body && c.body.startsWith(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-            } else {
-              await github.rest.issues.createComment({ owner, repo, issue_number, body });
-            }
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: .github/scripts/comment-score.sh
