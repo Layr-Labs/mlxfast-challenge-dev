@@ -285,7 +285,8 @@ def _write_score_json(report: dict, score_path: Path) -> None:
         "metrics": {
             "peak_ram_gb": _float_metric(report, "peak_ram_gb"),
             "bandwidth_gb_per_token": _float_metric(report, "bandwidth_gb_per_tok"),
-            "seconds_per_token": _float_metric(report, "sec_per_tok"),
+            "decode_seconds_per_token": _float_metric(report, "decode_sec_per_tok"),
+            "prefill_seconds_per_token": _float_metric(report, "prefill_sec_per_tok"),
             "passed_correctness": passed,
             "num_layers": _int_metric(report, "num_layers"),
             "first_failing_layer": _optional_int_metric(report, "first_failing_layer"),
