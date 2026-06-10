@@ -1,8 +1,11 @@
 name: benchmark
 
-# Runs for: fork PRs (self-serve scoring), pushes to main (post-promotion re-validation),
-# and workflow_dispatch (Yukon dispatches on yukon/baseline/* and yukon/submissions/*
-# branches it constructs, then reads the score from the uploaded artifact).
+# Runs for: same-repo PRs (maintainers), pushes to main (post-promotion
+# re-validation), and workflow_dispatch (Yukon dispatches on yukon/baseline/*
+# and yukon/submissions/* branches it constructs, then reads the score from
+# the uploaded artifact). Fork PRs never run: macOS runner minutes are
+# expensive and a fork could drain them by spamming PRs; participants submit
+# through Yukon instead.
 on:
   pull_request:
   push:
@@ -18,6 +21,8 @@ permissions:
 
 jobs:
   benchmark:
+    # No fork PRs — see the note on the triggers above.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # MLX requires Apple Silicon; the baseline peaks at ~27 GB RAM, so the
     # 48 GB tier is the smallest Blacksmith Mac that fits.
     runs-on: blacksmith-12vcpu-macos-latest
@@ -30,15 +35,6 @@ jobs:
         with:
           # Full history so the modifiable-surface guard can diff against the base.
           fetch-depth: 0
-
-      # Participant submissions come from forks; same-repo PRs are maintainers
-      # and may touch the harness/CI, so the guard only polices fork PRs.
-      - name: Enforce modifiable surface (fork PRs)
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: .github/scripts/enforce-modifiable-surface.sh
 
       # Yukon already enforces editablePaths server-side when it builds candidate
       # branches; re-checking here is defense in depth against orchestrator bugs.
@@ -92,10 +88,9 @@ jobs:
             results.tsv
           if-no-files-found: ignore
 
-      # Fork PRs get a read-only token, so the comment is best-effort and
-      # same-repo only; the step summary and artifact carry the score everywhere.
+      # Best-effort: the artifact is the durable copy of the score.
       - name: Comment score on PR
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name == 'pull_request'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
