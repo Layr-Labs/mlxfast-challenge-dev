@@ -1,0 +1,82 @@
+name: benchmark
+
+# Dispatch-only: Yukon dispatches on yukon/baseline/* and yukon/submissions/*
+# branches it constructs, then reads the score from the uploaded artifact.
+# Maintainers can dispatch manually on any branch (e.g. on main to warm the
+# weights cache). No PR or push triggers: macOS runner minutes are expensive,
+# and nothing should be able to burn them without an explicit dispatch.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    # MLX requires Apple Silicon; the baseline peaks at ~27 GB RAM, so the
+    # 48 GB tier is the smallest Blacksmith Mac that fits.
+    runs-on: blacksmith-12vcpu-macos-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Full history so the modifiable-surface guard can diff against the base.
+          fetch-depth: 0
+
+      # Yukon already enforces editablePaths server-side when it builds candidate
+      # branches; re-checking here is defense in depth against orchestrator bugs.
+      - name: Enforce modifiable surface (yukon candidate branches)
+        if: startsWith(github.ref_name, 'yukon/submissions/')
+        env:
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          BASE_SHA="$(git merge-base origin/main "${HEAD_SHA}")" \
+            .github/scripts/enforce-modifiable-surface.sh
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      # Blacksmith transparently serves actions/cache from colocated storage.
+      # The reference checkpoint never changes, so the key is static.
+      - name: Cache reference weights (~18 GB)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: quantizationfail/reference_weights
+          key: reference-weights-gemma-4-26B-A4B-it-qat-4bit-v1
+
+      - name: Cache pip downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/Library/Caches/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      # Online phase: installs the venv and, only on a weights cache miss,
+      # downloads the reference checkpoint (`quantizationfail weights` is idempotent).
+      - name: Setup
+        run: ./setup.sh
+
+      # Offline phase: benchmark.sh self-sandboxes — it proves the Seatbelt
+      # profile (tools/deny-network.sb) blocks egress, then re-execs itself
+      # under sandbox-exec with no network and no sudo.
+      - name: Benchmark (offline)
+        env:
+          QUANTIZATIONFAIL_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
+        run: ./benchmark.sh
+
+      - name: Upload score artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: |
+            score.json
+            results.tsv
+          if-no-files-found: ignore
