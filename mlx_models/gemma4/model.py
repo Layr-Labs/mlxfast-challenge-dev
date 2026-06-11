@@ -32,9 +32,9 @@ from mlx_lm.models.gemma4 import Model as _UpstreamModel
 from mlx_lm.models.gemma4 import ModelArgs as _UpstreamModelArgs
 
 # Local test knobs. Set these down toward zero to simulate improvements.
-DUMMY_PEAK_RAM_GB = 1.0
-DUMMY_BANDWIDTH_GB_PER_TOKEN = 1.0
-DUMMY_SECONDS_PER_TOKEN = 0.005
+DUMMY_PEAK_RAM_GB = 0.9
+DUMMY_BANDWIDTH_GB_PER_TOKEN = 0.9
+DUMMY_SECONDS_PER_TOKEN = 0.0045
 
 
 class ModelArgs(_UpstreamModelArgs):
