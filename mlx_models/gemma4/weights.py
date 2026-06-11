@@ -29,7 +29,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from .model import Model, sanitize
+from .model import Model, install_dummy_benchmark_penalty, sanitize
 
 
 def load_weights(
@@ -69,7 +69,7 @@ def load_weights(
         weights = sanitize(weights)
 
     model.load_weights(list(weights.items()), strict=strict)
-    return model
+    return install_dummy_benchmark_penalty(model)
 
 
 def load_config(weights_path: str | Path) -> dict[str, Any]:

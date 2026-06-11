@@ -20,7 +20,7 @@ jobs:
     # MLX requires Apple Silicon; the baseline peaks at ~27 GB RAM, so the
     # 48 GB tier is the smallest Blacksmith Mac that fits.
     runs-on: blacksmith-12vcpu-macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
