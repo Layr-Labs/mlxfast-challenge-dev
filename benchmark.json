@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "name": "quantizationfail-challenge",
+  "name": "mlxfast-challenge-dev",
   "description": "Optimize Gemma 4 26B MoE inference by transforming weights offline and reducing memory bandwidth without failing the correctness gate.",
   "category": "python",
   "direction": "-",
