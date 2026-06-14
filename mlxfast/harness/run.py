@@ -1,6 +1,6 @@
 """Main harness entry point. FROZEN.
 
-This is the function the CLI's `quantizationfail run` calls. It:
+This is the function the CLI's `mlxfast run` calls. It:
 
   1. Verifies the modifiable surface exists and is loadable.
   2. Loads the reference model (no modifiable surface involvement).
@@ -440,7 +440,7 @@ def hashlib_sha256(s: str) -> int:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="quantizationfail harness")
+    parser = argparse.ArgumentParser(description="mlxfast harness")
     parser.add_argument("--weights", type=Path, default=constants.PARTICIPANT_WEIGHTS_DIR)
     parser.add_argument("--note", type=str, default="")
     parser.add_argument("--secret", type=str, default="")

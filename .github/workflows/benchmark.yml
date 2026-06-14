@@ -48,7 +48,7 @@ jobs:
       - name: Cache reference weights (~18 GB)
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: quantizationfail/reference_weights
+          path: mlxfast/reference_weights
           key: reference-weights-gemma-4-26B-A4B-it-qat-4bit-v1
 
       - name: Cache pip downloads
@@ -59,7 +59,7 @@ jobs:
           restore-keys: pip-${{ runner.os }}-
 
       # Online phase: installs the venv and, only on a weights cache miss,
-      # downloads the reference checkpoint (`quantizationfail weights` is idempotent).
+      # downloads the reference checkpoint (`mlxfast weights` is idempotent).
       - name: Setup
         run: ./setup.sh
 
@@ -68,7 +68,7 @@ jobs:
       # under sandbox-exec with no network and no sudo.
       - name: Benchmark (offline)
         env:
-          QUANTIZATIONFAIL_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
+          MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
         run: ./benchmark.sh
 
       - name: Upload score artifacts

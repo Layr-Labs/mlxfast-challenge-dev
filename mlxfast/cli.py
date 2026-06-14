@@ -1,4 +1,4 @@
-"""quantizationfail CLI.
+"""mlxfast CLI.
 
 Subcommands:
   - run       Run the harness on the current weights/ and modifiable
@@ -7,8 +7,8 @@ Subcommands:
              hashes and upload to the leaderboard server. (Stub:
              prints what it would send.)
   - weights   Download the reference weights to
-             quantizationfail/reference_weights/. Idempotent.
-  - login     Store the API key in ~/.config/quantizationfail/.
+             mlxfast/reference_weights/. Idempotent.
+  - login     Store the API key in ~/.config/mlxfast/.
              (Stub.)
   - clone     Initialize a local working directory from the
              challenge template. (Stub: prints a hint.)
@@ -34,7 +34,7 @@ from . import _self_hash
 from .harness import constants
 
 app = typer.Typer(
-    name="quantizationfail",
+    name="mlxfast",
     help="Benchmark arena for memory-bandwidth-optimal LLM inference",
     no_args_is_help=True,
     add_completion=False,
@@ -103,7 +103,7 @@ def submit(
     """Package and submit to the leaderboard server.
 
     STUB: in this build, prints what it would send. The real server
-    endpoint is configured via QUANTIZATIONFAIL_API_URL.
+    endpoint is configured via MLXFAST_API_URL.
     """
     from . import _sandbox
 
@@ -126,10 +126,10 @@ def submit(
 
     payload = _build_submission_payload(weights, note)
 
-    api_url = os.environ.get("QUANTIZATIONFAIL_API_URL", "")
+    api_url = os.environ.get("MLXFAST_API_URL", "")
     if not api_url:
         console.print(
-            f"[yellow]QUANTIZATIONFAIL_API_URL is not set.[/yellow]\n"
+            f"[yellow]MLXFAST_API_URL is not set.[/yellow]\n"
             f"Submission payload (would POST to {{api_url}}/submit):\n"
         )
         console.print_json(data=payload)
@@ -148,7 +148,7 @@ def weights(
     """Download the reference Gemma 4 26B 4-bit weights.
 
     Downloads mlx-community/gemma-4-26B-A4B-it-qat-4bit to
-    quantizationfail/reference_weights/. This is a one-time ~18 GB
+    mlxfast/reference_weights/. This is a one-time ~18 GB
     download. Idempotent.
     """
     target = constants.REFERENCE_WEIGHTS_DIR / constants.REFERENCE_MODEL_DIRNAME
@@ -186,16 +186,16 @@ def weights(
 
 @app.command()
 def login(
-    api_key: str = typer.Argument(..., help="API key from quantizationfail.com/account"),
+    api_key: str = typer.Argument(..., help="API key from mlxfast.com/account"),
 ):
     """Store the API key for submissions. STUB in this build."""
-    cred_dir = Path.home() / ".config" / "quantizationfail"
+    cred_dir = Path.home() / ".config" / "mlxfast"
     cred_dir.mkdir(parents=True, exist_ok=True)
     cred_file = cred_dir / "credentials"
     cred_file.write_text(json.dumps({"api_key": api_key, "stored_at": time.time()}))
     cred_file.chmod(0o600)
     console.print(f"[green]Credentials stored at {cred_file}.[/green]")
-    console.print(f"[yellow]Note: server endpoint not yet wired. Set QUANTIZATIONFAIL_API_URL when the server is live.[/yellow]")
+    console.print(f"[yellow]Note: server endpoint not yet wired. Set MLXFAST_API_URL when the server is live.[/yellow]")
 
 
 @app.command()
@@ -214,7 +214,7 @@ def clone():
         for m in missing:
             console.print(f"  - {m}")
         console.print(
-            f"\n[yellow]Run this in a fresh clone of the quantizationfail-challenge repo.[/yellow]"
+            f"\n[yellow]Run this in a fresh clone of the mlxfast-challenge repo.[/yellow]"
         )
         raise typer.Exit(1)
     console.print(f"[green]Already initialized at {cwd}.[/green]")
@@ -234,7 +234,7 @@ def verify_transform(
         console.print(
             f"[red]Reference weights not found at "
             f"{constants.REFERENCE_WEIGHTS_DIR / constants.REFERENCE_MODEL_DIRNAME}.[/red]\n"
-            f"Run `quantizationfail weights` first."
+            f"Run `mlxfast weights` first."
         )
         raise typer.Exit(1)
 

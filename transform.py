@@ -11,11 +11,11 @@ will get the same score as the published baseline.
 Replace `main()` with your actual transform. Constraints enforced
 by the harness sandbox:
 
-  - Only reads from `quantizationfail/reference_weights/`
+  - Only reads from `mlxfast/reference_weights/`
   - Only writes to `weights/`
   - No network, no subprocess, no env reads, no clock reads
   - Same inputs must produce byte-equal output (re-verified on
-    every `quantizationfail run`)
+    every `mlxfast run`)
 
 The harness discovers the model architecture from
 `reference_weights/gemma-4-26B-A4B-it-qat-4bit/config.json` (passed
@@ -28,7 +28,7 @@ import json
 import shutil
 from pathlib import Path
 
-REFERENCE = Path("quantizationfail/reference_weights/gemma-4-26B-A4B-it-qat-4bit")
+REFERENCE = Path("mlxfast/reference_weights/gemma-4-26B-A4B-it-qat-4bit")
 OUTPUT = Path("weights")
 
 

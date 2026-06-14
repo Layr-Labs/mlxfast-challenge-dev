@@ -45,9 +45,9 @@ fi
 "${python}" -m pip install --upgrade pip setuptools wheel
 "${python}" -m pip install -e . "huggingface_hub>=0.23"
 
-if [[ "${QUANTIZATIONFAIL_SKIP_WEIGHTS_DOWNLOAD:-0}" == "1" || "${SKIP_MODEL_DOWNLOAD:-0}" == "1" ]]; then
+if [[ "${MLXFAST_SKIP_WEIGHTS_DOWNLOAD:-0}" == "1" || "${SKIP_MODEL_DOWNLOAD:-0}" == "1" ]]; then
   echo "setup.sh: skipping reference weight download"
   exit 0
 fi
 
-"${python}" -m quantizationfail.cli weights
+"${python}" -m mlxfast.cli weights

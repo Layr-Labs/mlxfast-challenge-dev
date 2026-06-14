@@ -3,7 +3,7 @@
 This file is the source of truth for what versions the harness was
 designed against. The CLI verifies the harness's own content hash
 against an expected value at startup, so any modification here will
-cause `quantizationfail run` to refuse to run (a soft safety check —
+cause `mlxfast run` to refuse to run (a soft safety check —
 the real one is the server's re-computation).
 
 When the model or mlx-lm version is bumped, the harness hash changes
@@ -25,7 +25,7 @@ MLX_LM_MIN_VERSION = "0.31.2"
 MLX_LM_MAX_VERSION = "0.32.0"
 
 # Reference model. The harness downloads this to
-# `quantizationfail/reference_weights/` on first run.
+# `mlxfast/reference_weights/` on first run.
 REFERENCE_MODEL_REPO = "mlx-community/gemma-4-26B-A4B-it-qat-4bit"
 REFERENCE_MODEL_DIRNAME = "gemma-4-26B-A4B-it-qat-4bit"
 
@@ -40,9 +40,9 @@ TRANSFORM_SCRIPT = Path("transform.py")
 RESULTS_FILE = Path("results.tsv")
 SCORE_FILE = Path("score.json")
 
-# Reference weights (managed by `quantizationfail weights`).
-REFERENCE_WEIGHTS_DIR = Path("quantizationfail/reference_weights")
-TOKENIZER_DIR = Path("quantizationfail/tokenizer")
+# Reference weights (managed by `mlxfast weights`).
+REFERENCE_WEIGHTS_DIR = Path("mlxfast/reference_weights")
+TOKENIZER_DIR = Path("mlxfast/tokenizer")
 
 # Measurement parameters.
 # DECODE_LENGTH: number of autoregressive tokens measured per run.
@@ -78,7 +78,7 @@ def harness_root() -> Path:
     This is the path the self-hash check verifies. If a participant
     edits anything in here, the CLI will refuse to run.
     """
-    return _harness_dir().parent  # quantizationfail/
+    return _harness_dir().parent  # mlxfast/
 
 
 def compute_harness_hash() -> str:
@@ -96,4 +96,4 @@ def compute_harness_hash() -> str:
 # Set by the server when the participant installs the harness wheel.
 # If unset (local dev), the CLI accepts any harness hash — useful for
 # iterating on the harness itself, dangerous for leaderboard integrity.
-EXPECTED_HARNESS_HASH = os.environ.get("QUANTIZATIONFAIL_EXPECTED_HARNESS_HASH", "")
+EXPECTED_HARNESS_HASH = os.environ.get("MLXFAST_EXPECTED_HARNESS_HASH", "")

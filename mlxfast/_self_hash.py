@@ -1,12 +1,12 @@
 """Harness tamper detection. FROZEN.
 
-The CLI runs this on every `quantizationfail run` to verify that
+The CLI runs this on every `mlxfast run` to verify that
 the installed harness matches the hash the server expects. If a
-participant has modified any file in `quantizationfail/`, the hash
+participant has modified any file in `mlxfast/`, the hash
 will not match and the CLI refuses to run.
 
 For local development, the hash check is bypassed by setting
-QUANTIZATIONFAIL_SKIP_HASH_CHECK=1 in the environment. The leaderboard
+MLXFAST_SKIP_HASH_CHECK=1 in the environment. The leaderboard
 submission path NEVER sets this.
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ def verify() -> None:
 
     Raises SystemExit if they don't match.
     """
-    if os.environ.get("QUANTIZATIONFAIL_SKIP_HASH_CHECK") == "1":
+    if os.environ.get("MLXFAST_SKIP_HASH_CHECK") == "1":
         return
 
     expected = constants.EXPECTED_HARNESS_HASH
@@ -41,7 +41,7 @@ def verify() -> None:
             f"The harness has been modified. This is fine for local\n"
             f"experimentation if you are iterating on the harness\n"
             f"itself, but local results will not match the leaderboard.\n"
-            f"To skip this check, set QUANTIZATIONFAIL_SKIP_HASH_CHECK=1.",
+            f"To skip this check, set MLXFAST_SKIP_HASH_CHECK=1.",
             file=sys.stderr,
         )
         sys.exit(2)

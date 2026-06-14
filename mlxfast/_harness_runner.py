@@ -1,6 +1,6 @@
 """Harness subprocess runner.
 
-The harness (`quantizationfail run`) executes the actual model
+The harness (`mlxfast run`) executes the actual model
 loading and measurement in a clean subprocess. The subprocess:
 
   - Has a fresh Python interpreter, so the global `mlx.nn.Linear`
@@ -11,7 +11,7 @@ loading and measurement in a clean subprocess. The subprocess:
     hash), not from the participant's repo.
 
 This module is the bridge: the CLI calls `run_in_subprocess`,
-which spawns a fresh Python that imports `quantizationfail.harness.run`
+which spawns a fresh Python that imports `mlxfast.harness.run`
 and calls `run(weights, note, secret)`. The result is returned as
 JSON via stdout.
 """
@@ -39,14 +39,14 @@ os.chdir({cwd!r})
 # `import mlx_models.gemma4` resolves to their modifiable surface.
 sys.path.insert(0, {cwd!r})
 
-from quantizationfail.harness import run as harness_run
+from mlxfast.harness import run as harness_run
 
 report = harness_run.run(
     weights_path=__import__("pathlib").Path({weights!r}),
     note={note!r},
     secret={secret!r},
 )
-print("__QUANTIZATIONFAIL_RESULT__" + json.dumps(report.to_tsv_row().split("\\t")))
+print("__MLXFAST_RESULT__" + json.dumps(report.to_tsv_row().split("\\t")))
 '''
 
 
@@ -73,10 +73,10 @@ def run_in_subprocess(
         timeout=3600,  # 1 hour hard cap
     )
 
-    # The harness prints "__QUANTIZATIONFAIL_RESULT__<json>" on success.
+    # The harness prints "__MLXFAST_RESULT__<json>" on success.
     for line in proc.stdout.splitlines():
-        if line.startswith("__QUANTIZATIONFAIL_RESULT__"):
-            payload = line.removeprefix("__QUANTIZATIONFAIL_RESULT__")
+        if line.startswith("__MLXFAST_RESULT__"):
+            payload = line.removeprefix("__MLXFAST_RESULT__")
             values = json.loads(payload)
             header = constants.RESULTS_FILE.read_text().splitlines()[0].split("\t") if constants.RESULTS_FILE.exists() else []
             # If the header hasn't been written yet, return a raw dict.

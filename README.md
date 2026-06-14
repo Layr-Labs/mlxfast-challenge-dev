@@ -1,4 +1,4 @@
-# quantizationfail
+# mlxfast
 
 A benchmark arena for memory-bandwidth-optimal LLM inference. Run Gemma 4 26B MoE without materializing the full expert weights.
 
@@ -12,10 +12,10 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e . sentencepiece
 
 # Download the 4-bit QAT reference weights (~18 GB, one-time)
-quantizationfail weights
+mlxfast weights
 
 # Copy the reference weights into weights/ as your starting point
-REF=quantizationfail/reference_weights/gemma-4-26B-A4B-it-qat-4bit
+REF=mlxfast/reference_weights/gemma-4-26B-A4B-it-qat-4bit
 cp $REF/config.json weights/config.json
 python -c "
 import json
@@ -28,12 +28,12 @@ ln -sf "../$REF/tokenizer.json" weights/tokenizer.json
 ln -sf "../$REF/tokenizer_config.json" weights/tokenizer_config.json
 
 # Run the baseline — should match the published baseline score
-QUANTIZATIONFAIL_SKIP_HASH_CHECK=1 quantizationfail run --note "baseline" --skip-transform-verify
+MLXFAST_SKIP_HASH_CHECK=1 mlxfast run --note "baseline" --skip-transform-verify
 
 # Edit the modifiable surface and iterate
 vim mlx_models/gemma4/linear.py
 python transform.py
-QUANTIZATIONFAIL_SKIP_HASH_CHECK=1 quantizationfail run --note "my schema v1"
+MLXFAST_SKIP_HASH_CHECK=1 mlxfast run --note "my schema v1"
 ```
 
 Results append to `results.tsv`. View them with:
@@ -55,7 +55,7 @@ You can edit exactly four files:
 
 Plus:
 
-- `transform.py` — your offline weight transform. Pure function of `quantizationfail/reference_weights/`.
+- `transform.py` — your offline weight transform. Pure function of `mlxfast/reference_weights/`.
 - `weights/` — the output of `transform.py`. The harness reads from here.
 
 The frozen `mlx_models/gemma4/__init__.py` is the only wiring point. It patches `mlx.nn.Linear` and `mlx_lm.models.switch_layers` with your classes at import time. You don't edit `__init__.py`.
@@ -76,9 +76,9 @@ All four axes are measured independently. Correctness is a hard gate — failing
 
 ## Architecture
 
-- `quantizationfail/` — the frozen CLI + harness. Installed as the `quantizationfail` (or short alias `qfail`) command.
+- `mlxfast/` — the frozen CLI + harness. Installed as the `mlxfast` (or short alias `qfail`) command.
 - `mlx_models/gemma4/` — the 4 modifiable files plus the frozen `__init__.py` that wires them.
-- `quantizationfail/reference_weights/` — the reference QAT 4-bit checkpoint, downloaded by `quantizationfail weights`.
+- `mlxfast/reference_weights/` — the reference QAT 4-bit checkpoint, downloaded by `mlxfast weights`.
 - `transform.py` — your offline weight transform.
 - `weights/` — the output of your transform. The harness loads from here.
 - `results.tsv` — your local experiment log.
