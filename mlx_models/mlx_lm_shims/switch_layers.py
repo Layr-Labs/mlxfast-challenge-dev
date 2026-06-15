@@ -43,8 +43,7 @@ SLOT_BANK_SIZE: int = 128
 
 Each record holds gate_proj + up_proj + down_proj for one expert.
 At mxfp4 4-bit, each record is roughly 13 MB for the default DS4-Flash dims.
-128 slots ≈ 1.66 GB wired; 50% cache-hit rate with 256 experts halves SSD
-reads vs the default 32-slot bank.  Safe on 24 GB machines.
+128 slots ≈ 1.66 GB wired; good hit rate for autoregressive decode.
 
 Raise for fewer SSD reads; lower if you observe memory pressure.
 """
@@ -55,9 +54,12 @@ Raise for fewer SSD reads; lower if you observe memory pressure.
 # ---------------------------------------------------------------------------
 
 class ExpertSlotBank:
-    """Fixed-capacity LRU cache of expert weight records in Metal memory.
+    """Fixed-capacity LRU cache of expert weight records.
 
     Records are loaded from per-layer binary files via os.pread on cache miss.
+    Weights are stored as lazy mx.arrays; Metal is allocated only when they are
+    consumed by gather_qmm, so cached-but-idle records hold no Metal memory.
+
     File descriptors are kept open for the lifetime of the bank.
 
     Args:
@@ -159,11 +161,18 @@ _SLOT_BANK: Optional[ExpertSlotBank] = None
 def configure_streaming(experts_dir: str, capacity: int = SLOT_BANK_SIZE) -> ExpertSlotBank:
     """Create and configure the global slot bank. Call once after model load.
 
+    Idempotent: if a bank is already configured for the same experts_dir it is
+    reused rather than replaced. This prevents the second model load in the
+    harness (both ref and sub call _load_participant_model) from discarding the
+    first bank and leaking its file descriptors.
+
     Args:
         experts_dir: Path to the directory containing manifest.json and layer_NN.bin.
         capacity: Slot bank size (default: SLOT_BANK_SIZE).
     """
     global _SLOT_BANK
+    if _SLOT_BANK is not None and _SLOT_BANK._experts_dir == experts_dir:
+        return _SLOT_BANK
     _SLOT_BANK = ExpertSlotBank(capacity)
     _SLOT_BANK.configure(experts_dir)
     return _SLOT_BANK
@@ -273,9 +282,6 @@ class StreamingSwitchGLU(nn.Module):
         down_w = mx.stack([r["down_proj"]["weight"] for r in records])
         down_s = mx.stack([r["down_proj"]["scales"] for r in records])
 
-        # Force Metal allocation of the stacked tensors before gather_qmm.
-        mx.eval(gate_w, gate_s, up_w, up_s, down_w, down_s)
-
         # Remap sorted expert indices → dense [0, len(unique)).
         remap = {e: i for i, e in enumerate(unique)}
         dense_idx = mx.array(
@@ -315,19 +321,19 @@ class StreamingSwitchGLU(nn.Module):
         # Reshape to (*batch, K, hidden).
         result = x_out.reshape(*batch, K, x.shape[-1])
 
-        # Force evaluation and release Metal buffers immediately.
-        # Without this, the stacked expert tensors (gate_w, up_w, down_w ...)
-        # freed from each layer stay in MLX's wired buffer cache.  With 256
-        # unique experts per layer during a 512-token prefill, 43 layers ×
-        # ~3 GB of stacked tensors × 2 (individual records + stacks) would
-        # accumulate ~250 GB of wired Metal memory before the OS could reclaim
-        # it — causing OOM on even a 64 GB machine.
-        mx.eval(result)
-        # Explicitly drop the large local arrays before clearing so their
-        # Metal buffers are in the cache when we flush it.
-        del gate_w, gate_s, up_w, up_s, down_w, down_s
-        del x_gate, x_up, x_act, x_out, records
-        mx.clear_cache()
+        if N > 1:
+            # Prefill: force eval + clear cache to prevent ~3 GB per-layer
+            # stacked-tensor accumulation (43 layers × ~3 GB = ~129 GB without
+            # this).  mx.clear_cache() releases Metal buffers to the OS so the
+            # next layer can allocate fresh ones without OOM.
+            mx.eval(result)
+            del gate_w, gate_s, up_w, up_s, down_w, down_s
+            del x_gate, x_up, x_act, x_out, records
+            mx.clear_cache()
+        # During decode (N == 1) return the lazy tensor.  The computation
+        # graph keeps stacked tensors alive (~78 MB × 43 layers = 3.4 GB max)
+        # which fits comfortably in Metal.  The next layer's tolist() sync
+        # will batch this layer's GPU ops with its own, reducing roundtrips.
         return result
 
 

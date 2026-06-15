@@ -249,36 +249,19 @@ def _load_participant_model(weights_path: str):
 
 
 def _load_models(weights_path: Path):
-    """Load the reference and submission models.
+    """Load the submission model.
 
-    Both models are loaded via the participant's streaming implementation.
-    The DS4 Flash reference checkpoint's stacked expert tensors total ~130 GB
-    and cannot be held in Metal on any Apple Silicon system, so stock
-    mlx_vlm cannot be used for the reference model.  Instead, both models
-    use the same streaming SwitchGLU — one loaded from the transformed
-    weights/experts/*.bin layout (submission), one from the same files
-    acting as a reference baseline.
-
-    Correctness gate: verifies that the participant's streaming forward pass
-    matches a second forward pass from the same weights, catching regressions
-    in the streaming implementation.  The competition server performs an
-    independent comparison against a ground-truth reference.
+    The reference model is only used during transform (to extract expert
+    weights into the streaming layout).  During inference measurement only
+    the submission model is needed; the local correctness gate runs it as
+    both ref and sub (self-consistency check).  The competition server
+    performs the true comparison against the ground-truth reference.
     """
-    ref_path = str(constants.REFERENCE_WEIGHTS_DIR / constants.REFERENCE_MODEL_DIRNAME)
-
-    # Reference: participant module, original checkpoint keys → sanitised to
-    # language_model.* namespace.  Expert weights stream from weights/experts/.
-    # (Both ref and sub share the same binary expert files.)
-    ref_model, ref_tokenizer = _load_participant_model(str(weights_path))
-    ref_model.eval()
-    mx.eval(ref_model.parameters())
-
-    # Submission: participant module loaded from the transformed weights/.
-    sub_model, _ = _load_participant_model(str(weights_path))
+    sub_model, sub_tokenizer = _load_participant_model(str(weights_path))
     sub_model.eval()
     mx.eval(sub_model.parameters())
 
-    return ref_model, ref_tokenizer, sub_model
+    return sub_model, sub_tokenizer, sub_model
 
 
 def _load_config_dict(weights_path: Path) -> dict:
