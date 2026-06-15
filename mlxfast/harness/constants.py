@@ -16,23 +16,25 @@ import hashlib
 import os
 from pathlib import Path
 
-# Pinned versions. mlx-lm 0.21.0 does not exist; the real minimum
-# is 0.31.2 (when gemma4.py was added). The challenge spec says
-# mlx-lm==0.21.0, which we treat as a forward-looking pin that
-# the server will resolve at submission time.
-MLX_VERSION = "0.31.1"
+MLX_VERSION = "0.31.2"
 MLX_LM_MIN_VERSION = "0.31.2"
 MLX_LM_MAX_VERSION = "0.32.0"
+MLX_VLM_VERSION = "0.6.3"
 
 # Reference model. The harness downloads this to
 # `mlxfast/reference_weights/` on first run.
-REFERENCE_MODEL_REPO = "mlx-community/gemma-4-26B-A4B-it-qat-4bit"
-REFERENCE_MODEL_DIRNAME = "gemma-4-26B-A4B-it-qat-4bit"
+REFERENCE_MODEL_REPO = "mlx-community/DeepSeek-V4-Flash-4bit"
+REFERENCE_MODEL_DIRNAME = "DeepSeek-V4-Flash-4bit"
 
-# Modifiable surface. The harness loads these by file path from the
-# participant's working directory (not from site-packages).
-MODIFIABLE_DIR = Path("mlx_models/gemma4")
-MODEL_FILE = MODIFIABLE_DIR / "model.py"
+# DeepSeek V4 Flash model constants (from config.json).
+VOCAB_SIZE = 129280
+NUM_HIDDEN_LAYERS = 43
+N_ROUTED_EXPERTS = 256
+NUM_EXPERTS_PER_TOK = 6
+
+# Modifiable surface. The harness loads by module path from the
+# participant's working directory (prepended to sys.path).
+MODIFIABLE_DIR = Path("mlx_models/deepseek_v4")
 
 # Output paths (relative to participant's working directory).
 PARTICIPANT_WEIGHTS_DIR = Path("weights")
@@ -61,7 +63,7 @@ PROMPT_SEED_PREFIX_LENGTH = 32
 # operations is permitted, lossy approximation is not. We use
 # 1e-2 as a generous bound that accounts for non-deterministic
 # GPU reduction order; tighten to 1e-3 if you need stricter matching.
-CORRECTNESS_EPSILON = 1e-2
+CORRECTNESS_EPSILON = 5e-3
 
 # Scoring formula. Lower is better.
 #   score = peak_ram_GB * bandwidth_GB_per_token * seconds_per_token

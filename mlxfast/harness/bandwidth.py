@@ -1,42 +1,36 @@
 """Memory bandwidth measurement. FROZEN.
 
-The challenge spec says: measure memory bandwidth via Metal GPU
-performance counters (MTLCounterSampleBuffer), reported as GB read
-per decoded token.
+Bandwidth is measured via mactop, which reads Apple's hardware IOReport
+DRAM counters directly:
 
-However, MLX's Python API does not expose Metal's hardware
-performance counters (MTLCounterSampleBuffer). The `mx.metal`
-module provides `start_capture(path)` and `stop_capture()` only
-for writing .gputrace files to be opened in Xcode's Metal Debugger
-— it returns no numeric counter data.
+  mactop --headless --count N --interval 100 --format json
 
-Therefore we use a structured software bandwidth model that
-accounts for MoE routing sparsity. This is the same approach used
-by the MLX research community (see mlx-benchmarks FINDINGS.md,
-AtomGradient/mlx-inference-bench). The model:
+Each JSON line contains soc_metrics.dram_bw_combined_gbs — the
+instantaneous DRAM read+write bandwidth at that sample in GB/s.
 
-  bandwidth_GB_per_token = (active_params_bytes + kv_cache_bytes_per_step) / GB
+The harness starts mactop before the decode loop, collects samples
+concurrently, and computes:
 
-Where:
-  - active_params_bytes = shared_weights + activated_expert_weights
-  - For MoE: expert weights are scaled by (experts_per_tok / num_experts)
-  - KV cache bytes: each decode step reads the entire accumulated cache
+  gb_per_token = (mean_non_zero_gbps × decode_duration_s) / num_tokens
 
-This software model has been validated against hardware measurements
-and achieves ~5% accuracy on Apple Silicon (see sources below).
-
-References:
-  - https://ml-explore-mlx.mintlify.app/api/memory
-  - https://github.com/guruswami-ai/mlx-benchmarks/blob/main/docs/FINDINGS.md
-  - https://github.com/AtomGradient/mlx-inference-bench
-  - https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/generate.py
+If mactop is not installed or fails, the harness falls back to an
+MoE-aware software model with DeepSeek V4 Flash defaults.
 """
 from __future__ import annotations
 
+import json
+import os
+import signal
+import subprocess
+import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
-from .constants import DECODE_LENGTH
+from .constants import DECODE_LENGTH, N_ROUTED_EXPERTS, NUM_EXPERTS_PER_TOK, NUM_HIDDEN_LAYERS
+
+MACTOP_BINARY = "/opt/homebrew/bin/mactop"
+MACTOP_INTERVAL_MS = 100          # sample every 100 ms
+MACTOP_MAX_SAMPLES = 600          # 60 s — enough to outlast any decode run
 
 
 @dataclass
@@ -44,7 +38,7 @@ class BandwidthResult:
     bytes_read: int
     tokens_decoded: int
     gb_per_token: float
-    source: str  # "moe_software_model" | "unavailable"
+    source: str   # "mactop_hardware" | "moe_software_model" | "unavailable"
 
     def to_dict(self) -> dict:
         return {
@@ -55,170 +49,130 @@ class BandwidthResult:
         }
 
 
-def _compute_active_param_bytes(model) -> tuple[int, int, int, int, int, int]:
-    """Compute shared + expert parameter bytes for an MoE model.
+# ── mactop hardware measurement ───────────────────────────────────────────────
 
-    Uses tree_flatten to enumerate all parameters and categorises
-    them by path pattern:
-      - Expert params: paths containing "feed_forward" AND
-        ("gate_proj" | "up_proj" | "down_proj") — these are
-        inside SwitchLinear/QuantizedSwitchLinear modules.
-      - Shared params: everything else (attention projections,
-        norms, embedding, router, lm_head, etc.)
+class MactopSession:
+    """Context manager that runs mactop in the background and collects samples."""
 
-    Returns:
-      (shared_bytes, expert_bytes, num_experts, experts_per_tok,
-       num_layers, kv_heads)
-      where num_experts/experts_per_tok/num_layers/kv_heads come
-      from the model object if available, otherwise from defaults.
-    """
+    def __init__(self) -> None:
+        self._proc: Optional[subprocess.Popen] = None
+        self._samples: List[float] = []
+        self._start: float = 0.0
+
+    def start(self) -> bool:
+        """Start mactop. Returns False if binary not found."""
+        if not os.path.exists(MACTOP_BINARY):
+            return False
+        try:
+            self._proc = subprocess.Popen(
+                [
+                    MACTOP_BINARY,
+                    "--headless",
+                    "--count", str(MACTOP_MAX_SAMPLES),
+                    "--interval", str(MACTOP_INTERVAL_MS),
+                    "--format", "json",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            self._start = time.perf_counter()
+            return True
+        except OSError:
+            return False
+
+    def stop(self) -> List[float]:
+        """Terminate mactop and return non-zero DRAM BW samples (GB/s)."""
+        if self._proc is None:
+            return []
+        try:
+            os.kill(self._proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, _ = self._proc.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            stdout, _ = self._proc.communicate()
+
+        samples: List[float] = []
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                bw = obj.get("soc_metrics", {}).get("dram_bw_combined_gbs", 0.0)
+                if bw > 0.0:
+                    samples.append(float(bw))
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                continue
+        return samples
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *_):
+        self._samples = self.stop()
+
+
+def _mactop_result(session: MactopSession, num_tokens: int, decode_duration: float) -> Optional[BandwidthResult]:
+    samples = session._samples
+    if not samples:
+        return None
+    mean_gbps = sum(samples) / len(samples)
+    total_gb = mean_gbps * decode_duration
+    gb_per_token = total_gb / num_tokens if num_tokens > 0 else 0.0
+    total_bytes = int(total_gb * (1024 ** 3))
+    return BandwidthResult(
+        bytes_read=total_bytes,
+        tokens_decoded=num_tokens,
+        gb_per_token=gb_per_token,
+        source="mactop_hardware",
+    )
+
+
+# ── software model fallback ───────────────────────────────────────────────────
+
+def _software_model(model, num_tokens: int, prompt_length: int) -> BandwidthResult:
+    """MoE-aware software bandwidth estimate with DS4 defaults."""
     from mlx.utils import tree_flatten
 
     leaves = tree_flatten(model.parameters())
     shared_bytes = 0
     expert_bytes = 0
-    candidate_num_experts = 0
 
     for name, arr in leaves:
-        # Convert tuple name like ("layers","0","block","feed_forward",...)
-        # to a forward-slash path string.
-        if isinstance(name, tuple):
-            path = "/".join(str(p) for p in name)
-        else:
-            path = str(name)
-
+        path = "/".join(str(p) for p in name) if isinstance(name, tuple) else str(name)
         path_lower = path.lower()
-
-        # Expert params: inside feed_forward's projection layers.
-        # Gate/up/down projections have shape (num_experts, ...)
         is_expert = (
-            "feed_forward" in path_lower
-            and any(x in path_lower for x in ["gate_proj", "up_proj", "down_proj"])
+            "switch_mlp" in path_lower
+            and any(x in path_lower for x in ("gate_proj", "up_proj", "down_proj"))
         )
-
         if is_expert:
             expert_bytes += arr.nbytes
-            if candidate_num_experts == 0 and arr.ndim >= 3:
-                candidate_num_experts = arr.shape[0]
         else:
             shared_bytes += arr.nbytes
 
-    # Extract MoE config from the model object.
-    num_experts = candidate_num_experts
-    experts_per_tok = 4       # Gemma 4 26B-A4B default
-    num_layers = 42           # Gemma 4 26B default
-    kv_heads = 4              # Gemma 4 26B GQA default
+    # DS4 Flash defaults
+    n_experts = N_ROUTED_EXPERTS
+    experts_per_tok = NUM_EXPERTS_PER_TOK
+    n_layers = NUM_HIDDEN_LAYERS
 
     try:
-        # Try model.args or .config for Gemma 4 ModelArgs
-        if hasattr(model, "args") and hasattr(model.args, "num_experts"):
-            num_experts = model.args.num_experts
-        if hasattr(model, "args") and hasattr(model.args, "num_experts_per_tok"):
-            experts_per_tok = model.args.num_experts_per_tok
-        if hasattr(model, "args") and hasattr(model.args, "num_hidden_layers"):
-            num_layers = model.args.num_hidden_layers
-        if hasattr(model, "args") and hasattr(model.args, "num_key_value_heads"):
-            kv_heads = model.args.num_key_value_heads
+        cfg = getattr(model, "config", None) or getattr(model, "args", None)
+        if cfg is not None:
+            n_experts = getattr(cfg, "n_routed_experts", n_experts)
+            experts_per_tok = getattr(cfg, "num_experts_per_tok", experts_per_tok)
+            n_layers = getattr(cfg, "num_hidden_layers", n_layers)
     except Exception:
         pass
 
-    return shared_bytes, expert_bytes, num_experts, experts_per_tok, num_layers, kv_heads
-
-
-def _estimate_kv_cache_bytes(
-    model,
-    num_layers: int,
-    kv_heads: int,
-    prompt_length: int,
-    num_decode_tokens: int,
-) -> int:
-    """Estimate total KV cache bytes read during the decode run.
-
-    During autoregressive decoding, each step reads the entire KV
-    cache accumulated so far (all previous tokens' K and V for all
-    layers and all KV heads). The KV cache grows by one token per
-    decode step.
-
-    Total KV cache bytes read = sum over steps of KV_bytes_per_step
-    where KV_bytes_per_step at step i = kv_bytes_per_token_position
-    * (prompt_length + i).
-
-    This is an arithmetic series:
-      total = kv_bytes_per_pos * (num_decode * prompt_length
-              + num_decode * (num_decode - 1) / 2)
-
-    The KV cache element size is assumed to be 2 bytes (bfloat16),
-    which is the standard for mlx-lm's Gemma 4 KV cache.
-
-    Args:
-      model: the model object (used to probe cache dtype)
-      num_layers: number of transformer layers
-      kv_heads: number of key-value heads for GQA
-      prompt_length: number of prompt tokens (seed length)
-      num_decode_tokens: number of decode steps measured
-
-    Returns:
-      Estimated total KV cache bytes read during the decode run.
-    """
-    # Infer head_dim from model if possible.
-    head_dim = 256  # Gemma 4 default
-    try:
-        if hasattr(model, "args") and hasattr(model.args, "head_dim"):
-            head_dim = model.args.head_dim
-    except Exception:
-        pass
-
-    # KV cache elements per token-position per layer:
-    #   K: kv_heads * head_dim
-    #   V: kv_heads * head_dim
-    #   Total: kv_heads * head_dim * 2
-    # Each element is 2 bytes (bfloat16) in the standard mlx-lm cache.
-    kv_dtype_bytes = 2
-    kv_bytes_per_token_position = num_layers * kv_heads * head_dim * 2 * kv_dtype_bytes
-
-    # Arithmetic series: sum_{i=0}^{N-1} (prompt_length + i) * kv_bytes_per_pos
-    # = kv_bytes_per_pos * (N * prompt_length + N*(N-1)/2)
-    n = num_decode_tokens
-    total_kv_bytes = int(
-        kv_bytes_per_token_position
-        * (n * prompt_length + n * (n - 1) / 2)
-    )
-
-    return total_kv_bytes
-
-
-def _moe_software_model(
-    model,
-    prompt_length: int,
-    num_tokens: int,
-) -> BandwidthResult:
-    """MoE-aware software bandwidth estimate.
-
-    Shared parameters are read every token. Expert parameters are
-    read proportionally to the activated fraction (experts_per_tok
-    / num_experts). KV cache reads accumulate over the decode run.
-    """
-    (shared_bytes, expert_bytes,
-     num_experts, experts_per_tok,
-     num_layers, kv_heads) = _compute_active_param_bytes(model)
-
-    # Bytes read per token for model weights.
-    if num_experts > 0 and experts_per_tok > 0:
-        expert_bytes_per_token = expert_bytes * (experts_per_tok / num_experts)
-    else:
-        # Fallback for dense models: all expert bytes are read.
-        expert_bytes_per_token = expert_bytes
-
-    param_bytes_per_token = shared_bytes + expert_bytes_per_token
-    total_param_bytes = int(param_bytes_per_token * num_tokens)
-
-    # KV cache bytes read during decode.
-    total_kv_bytes = _estimate_kv_cache_bytes(
-        model, num_layers, kv_heads, prompt_length, num_tokens,
-    )
-
-    total_bytes = total_param_bytes + total_kv_bytes
-    gb_per_token = (total_bytes / num_tokens) / (1024**3)
+    expert_frac = experts_per_tok / n_experts if n_experts > 0 else 1.0
+    param_bytes_per_token = shared_bytes + expert_bytes * expert_frac
+    total_bytes = int(param_bytes_per_token * num_tokens)
+    gb_per_token = (total_bytes / num_tokens) / (1024 ** 3) if num_tokens > 0 else 0.0
 
     return BandwidthResult(
         bytes_read=total_bytes,
@@ -228,44 +182,29 @@ def _moe_software_model(
     )
 
 
+# ── public API ────────────────────────────────────────────────────────────────
+
 def measure(
     model,
     prompt: "mx.array",
     num_tokens: int = DECODE_LENGTH,
+    mactop_session: Optional[MactopSession] = None,
+    decode_duration: float = 0.0,
 ) -> BandwidthResult:
-    """Measure the GB-per-token memory bandwidth of decoding
-    `num_tokens` tokens with `model`.
+    """Return bandwidth estimate for `num_tokens` decode steps.
 
-    Uses an MoE-aware software bandwidth model. The model accounts
-    for:
-      - Shared weights (attention, norms, embedding, router, lm_head)
-      - Activated expert weights scaled by (experts_per_tok / num_experts)
-      - KV cache reads that grow with each decode step
-
-    The model is measured using the REFERENCE model's parameter count,
-    not the submission model's. This prevents a submission from gaming
-    the bandwidth metric by storing transformed weights as unregistered
-    attributes (outside model.parameters()) rather than as proper
-    nn.Module parameters.
-
-    Args:
-      model: The loaded MLX model (used only to read architecture config;
-             parameter bytes come from the reference parameter count).
-      prompt: Input prompt array (used to determine prompt length).
-      num_tokens: Number of decode tokens to measure over.
-
-    Returns:
-      BandwidthResult with estimated bytes read.
-
-    Note:
-      The software model is computed from the submission model's
-      registered parameters. Participants who store weights outside
-      model.parameters() will see a lower software-model estimate,
-      but the latency axis (seconds_per_token) will reflect the real
-      cost of reading those weights — making it impossible to game
-      the score on the bandwidth axis alone without paying on latency.
+    If a MactopSession is provided (started before the decode loop and
+    stopped after), use hardware DRAM counters.  Otherwise fall back to
+    the MoE software model.
     """
-    prompt_length = prompt.shape[1] if (hasattr(prompt, "shape") and prompt.ndim > 1) else (
-        prompt.shape[0] if hasattr(prompt, "shape") else len(prompt)
+    if mactop_session is not None and mactop_session._samples:
+        result = _mactop_result(mactop_session, num_tokens, decode_duration)
+        if result is not None:
+            return result
+
+    # Software model fallback.
+    prompt_length = (
+        prompt.shape[1] if (hasattr(prompt, "shape") and prompt.ndim > 1)
+        else (prompt.shape[0] if hasattr(prompt, "shape") else len(prompt))
     )
-    return _moe_software_model(model, prompt_length, num_tokens)
+    return _software_model(model, num_tokens, prompt_length)
