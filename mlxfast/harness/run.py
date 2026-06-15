@@ -418,6 +418,8 @@ def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
             mactop_session,
             constants.DECODE_LENGTH,
             decode_duration=decode_spt * constants.DECODE_LENGTH,
+            model=sub_model,
+            experts_manifest_path=str(weights_path / "experts" / "manifest.json"),
         )
 
         # Measure prefill latency.
