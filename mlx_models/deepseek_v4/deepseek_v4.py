@@ -108,7 +108,3 @@ class Model(nn.Module):
                 switch._layer_idx = layer_idx
                 moe_layers.append((layer_idx, switch))
 
-        # Wire cross-layer prefetch metadata.
-        for i, (layer_idx, switch) in enumerate(moe_layers):
-            if i + 1 < len(moe_layers):
-                switch._next_moe_layer_idx = moe_layers[i + 1][0]
