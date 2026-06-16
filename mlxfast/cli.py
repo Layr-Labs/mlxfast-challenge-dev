@@ -271,17 +271,21 @@ def _append_to_results_tsv(report: dict) -> None:
 
 
 def _write_score_json(report: dict, score_path: Path) -> None:
-    """Write score.json in the benchmark.json contract format."""
+    """Write score.json in the benchmark.json contract format.
+
+    Always written — even for failed or errored runs — so CI can
+    distinguish a correctness failure from a missing-file harness error.
+    Failed runs use score=null so Yukon/CI can detect them.
+    """
     if "raw" in report:
         return
 
     score = _finite_float(report.get("score"))
     passed = report.get("passed", "0") in ("1", True, "true", "True")
-    if not passed or score is None:
-        return
 
     payload = {
-        "score": score,
+        "score": score,  # null for failed/errored runs
+        "passed": passed,
         "metrics": {
             "peak_ram_gb": _float_metric(report, "peak_ram_gb"),
             "bandwidth_gb_per_token": _float_metric(report, "bandwidth_gb_per_tok"),
@@ -292,6 +296,7 @@ def _write_score_json(report: dict, score_path: Path) -> None:
             "first_failing_layer": _optional_int_metric(report, "first_failing_layer"),
             "max_abs_diff": _float_metric(report, "max_abs_diff"),
             "bandwidth_source": report.get("bandwidth_source", ""),
+            "error": report.get("error") or "",
             "commit": report.get("commit", ""),
             "timestamp": report.get("timestamp", ""),
             "harness_hash": report.get("harness_hash", ""),
