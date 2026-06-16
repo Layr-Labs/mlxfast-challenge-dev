@@ -90,8 +90,14 @@ def compute_harness_hash() -> str:
     so that modifying any part of the harness changes the hash.
     """
     h = hashlib.sha256()
-    # Include the version pins so changing them changes the hash.
-    h.update(f"mlx={MLX_VERSION}\nmlx-lm>={MLX_LM_MIN_VERSION}\n".encode())
+    # Include all version pins so changing any of them changes the hash.
+    h.update(
+        f"mlx={MLX_VERSION}\n"
+        f"mlx-lm>={MLX_LM_MIN_VERSION}\n"
+        f"mlx-lm<{MLX_LM_MAX_VERSION}\n"
+        f"mlx-vlm={MLX_VLM_VERSION}\n"
+        .encode()
+    )
     for path in sorted(harness_root().rglob("*.py")):
         h.update(path.read_bytes())
     return h.hexdigest()
