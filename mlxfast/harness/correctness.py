@@ -151,11 +151,10 @@ def check(
         max_abs = max(max_abs, h_diff)
         max_rel = max(max_rel, h_rel)
 
-        # Layer 3: top-K logit set match.
-        ref_topk = set(mx.argpartition(-ref_logits, kth=CORRECTNESS_TOP_K - 1)
-                       [:CORRECTNESS_TOP_K].tolist())
-        sub_topk = set(mx.argpartition(-sub_logits, kth=CORRECTNESS_TOP_K - 1)
-                       [:CORRECTNESS_TOP_K].tolist())
+        # Layer 3: top-K logit set match. Use argsort for stable ordering so
+        # equal-logit tokens produce a deterministic set on GPU.
+        ref_topk = set(mx.argsort(-ref_logits)[:CORRECTNESS_TOP_K].tolist())
+        sub_topk = set(mx.argsort(-sub_logits)[:CORRECTNESS_TOP_K].tolist())
 
         step_failed = (
             ref_next != sub_next          # Layer 1
