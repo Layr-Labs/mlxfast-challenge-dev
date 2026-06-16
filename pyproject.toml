@@ -17,8 +17,16 @@ authors = [
 # it lives in the participant's working directory and is loaded by path
 # at runtime via the shadow package.
 dependencies = [
-  "mlx==0.31.1",
-  "mlx-lm>=0.31.2,<0.32",
+  # MLX ships a tiny frontend wheel plus a separate compiled backend. On macOS
+  # the Metal backend (mlx-metal) is pulled in automatically; on Linux the base
+  # wheel carries no backend, so the CPU backend must be requested via the
+  # [cpu] extra (-> mlx-cpu, manylinux x86_64/aarch64). transform.py's dense
+  # copy is pure I/O and runs fine on the CPU backend -- no GPU needed -- which
+  # is what lets the transform run on a Linux runner while the benchmark
+  # harness uses Metal on macOS. mlx-lm is only used by that macOS harness.
+  "mlx==0.31.1; sys_platform == 'darwin'",
+  "mlx[cpu]==0.31.1; sys_platform == 'linux'",
+  "mlx-lm>=0.31.2,<0.32; sys_platform == 'darwin'",
   "safetensors>=0.4",
   "numpy>=1.24",
   "typer>=0.12",

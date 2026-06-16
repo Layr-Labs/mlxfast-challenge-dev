@@ -9,18 +9,20 @@ from pathlib import Path
 
 
 def source_hash() -> str:
-    """Hash all participant-editable source files: transform.py + mlx_models/**/*.py."""
+    """Hash the file that determines weights/: transform.py only.
+
+    The transformed weights are a pure function of transform.py and the
+    reference checkpoint — NOT of the participant's inference code in
+    mlx_models/.  Hashing only transform.py means an mlx_models-only
+    submission reuses the cached weights/ (no re-transform), which is what
+    lets the macOS benchmark runner skip the reference checkpoint entirely.
+    """
     h = hashlib.sha256()
-    paths = [Path("transform.py"), *sorted(Path("mlx_models").rglob("*.py"))]
-    for path in paths:
-        if not path.exists():
-            h.update(str(path).encode())
-            h.update(b"\0MISSING\0")
-            continue
-        h.update(str(path).encode())
-        h.update(b"\0")
+    path = Path("transform.py")
+    if not path.exists():
+        h.update(b"\0MISSING\0")
+    else:
         h.update(path.read_bytes())
-        h.update(b"\0")
     return h.hexdigest()
 
 

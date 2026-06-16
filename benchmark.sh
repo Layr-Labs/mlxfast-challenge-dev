@@ -58,20 +58,23 @@ if [[ ! -f "${BENCHMARK_HELPER}" ]]; then
   exit 1
 fi
 
-if [[ ! -f "${REFERENCE_DIR}/config.json" ]]; then
-  cat >&2 <<EOF
-benchmark.sh: reference weights not found at ${REFERENCE_DIR}.
-Run ./setup.sh, or set MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 only after
-placing the reference checkpoint there.
-EOF
-  exit 1
-fi
-
 mkdir -p weights
 wanted_hash="$("${PYTHON}" "${BENCHMARK_HELPER}" source-hash)"
 current_hash="$(cat "${SOURCE_HASH_PATH}" 2>/dev/null || true)"
 
 if [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f weights/config.json || "${current_hash}" != "${wanted_hash}" ]]; then
+  # Only a (re)transform needs the reference checkpoint. When weights/ is
+  # already present with a matching source hash -- e.g. restored from cache on
+  # the benchmark runner in the split CI pipeline -- we skip this branch
+  # entirely and never require the reference.
+  if [[ ! -f "${REFERENCE_DIR}/config.json" ]]; then
+    cat >&2 <<EOF
+benchmark.sh: reference weights not found at ${REFERENCE_DIR}, needed to (re)run transform.py.
+Run ./setup.sh, or set MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 only after placing the reference checkpoint there.
+(If you expected cached weights/, the source hash did not match -- transform.py changed since the cache was built.)
+EOF
+    exit 1
+  fi
   echo "benchmark.sh: regenerating weights from transform.py"
   find weights -mindepth 1 ! -name .gitkeep -exec rm -rf {} +
   "${PYTHON}" transform.py

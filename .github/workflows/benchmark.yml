@@ -1,10 +1,9 @@
 name: benchmark
 
-# Dispatch-only: Yukon dispatches on yukon/baseline/* and submissions/*
-# branches it constructs, then reads the score from the uploaded artifact.
-# Maintainers can dispatch manually on any branch (e.g. on main to warm the
-# weights cache). No PR or push triggers: macOS runner minutes are expensive,
-# and nothing should be able to burn them without an explicit dispatch.
+# Dispatch-only: Yukon dispatches on yukon/baseline/* and submissions/* branches
+# it constructs, then reads the score from the uploaded artifact. Maintainers can
+# dispatch manually on any branch. No PR/push triggers: runner minutes (esp.
+# macOS) are expensive, and nothing should burn them without an explicit dispatch.
 on:
   workflow_dispatch:
 
@@ -15,19 +14,27 @@ concurrency:
 permissions:
   contents: read
 
+# Two-step pipeline. The transform needs the reference checkpoint AND its output
+# on disk at once (~154 GB + ~141 GB ≈ 295 GB), which exceeds the 250 GB macOS
+# runner; and MLX is what reads/writes the weights. So:
+#   1) transform  — runs on a 750 GB Linux runner (MLX installs via mlx[cpu]),
+#      producing weights/, and publishes it to the Actions cache.
+#   2) benchmark  — runs on the Apple-Silicon macOS runner (Metal), restoring
+#      weights/ from the cache (≤141 GB, fits 250 GB) and measuring performance.
+# The cache, keyed on transform.py only, is the cross-OS handoff: an
+# mlx_models-only submission is a cache hit, so step 1 is a no-op and step 2 just
+# benchmarks. Correctness checking is currently disabled (perf-only), so no
+# reference is needed on the macOS side.
+#
+# NOTE: weights/ is ~141 GB — well above the 25 GB default Actions-cache quota.
+# This requires a cache-size increase from Blacksmith (support@blacksmith.sh);
+# without it the cache save/restore will fail.
+
 jobs:
-  benchmark:
-    # MLX requires Apple Silicon. DS4-Flash peaks at ~8 GB GPU RAM during
-    # inference, but transform.py reads/writes ~141 GB of weights so the
-    # runner needs ample disk (≥300 GB) and RAM (≥32 GB). 12 vCPU is the
-    # largest macOS SKU Blacksmith offers (there is no 16 vCPU macOS tier).
-    runs-on: blacksmith-12vcpu-macos-15
-    # Decode: 512 tokens × ~0.5 s/tok = ~4 min. Prefill + correctness + setup
-    # + possible transform (~10 min on NVMe) + cache restore bring total to
-    # ~45 min on a warm cache, ~60 min when transform must re-run. A cold
-    # first run (empty sticky disks) also pays the reference download, so
-    # allow generous headroom.
-    timeout-minutes: 120
+  # ── Step 1: transform on Linux (750 GB disk fits reference + output) ──────────
+  transform:
+    runs-on: blacksmith-16vcpu-ubuntu-2404  # 16 vCPU, 64 GB RAM, 750 GB disk
+    timeout-minutes: 150
     permissions:
       contents: read
     steps:
@@ -36,8 +43,8 @@ jobs:
           # Full history so the modifiable-surface guard can diff against the base.
           fetch-depth: 0
 
-      # Yukon already enforces editablePaths server-side when it builds candidate
-      # branches; re-checking here is defense in depth against orchestrator bugs.
+      # Yukon enforces editablePaths server-side; re-check here (fail fast, before
+      # the expensive transform) as defense in depth against orchestrator bugs.
       - name: Enforce modifiable surface (yukon candidate branches)
         if: startsWith(github.ref_name, 'submissions/')
         env:
@@ -50,6 +57,51 @@ jobs:
         with:
           python-version: "3.12"
 
+      # weights/ is a deterministic function of transform.py (NOT mlx_models), so
+      # key the cache on transform.py alone. On a hit, every step below is skipped
+      # and the existing cache is the handoff to the benchmark job.
+      - name: Probe transformed-weights cache
+        id: probe
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: weights
+          key: ds4-weights-v1-${{ hashFiles('transform.py') }}
+          lookup-only: true
+
+      # Cache miss => transform.py changed (or first run). Install deps and pull
+      # the reference checkpoint. On Linux setup.sh installs mlx[cpu] (CPU backend)
+      # and downloads the reference; it skips the macOS-only mactop/Homebrew steps.
+      - name: Install deps + download reference
+        if: steps.probe.outputs.cache-hit != 'true'
+        run: ./setup.sh
+
+      - name: Transform (MLX CPU backend) + seed source hash
+        if: steps.probe.outputs.cache-hit != 'true'
+        run: |
+          .venv/bin/python transform.py
+          .venv/bin/python tools/benchmark_contract.py source-hash > weights/.benchmark-source.sha256
+
+      - name: Publish transformed weights to cache
+        if: steps.probe.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: weights
+          key: ds4-weights-v1-${{ hashFiles('transform.py') }}
+
+  # ── Step 2: benchmark on macOS (Metal; only needs weights/, ≤141 GB) ──────────
+  benchmark:
+    needs: transform
+    runs-on: blacksmith-12vcpu-macos-15  # Apple Silicon; 250 GB disk (no 16 vCPU macOS tier)
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
       - name: Cache pip downloads
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -57,43 +109,25 @@ jobs:
           key: pip-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: pip-${{ runner.os }}-
 
-      # Install venv and tooling; skip the HF weight download — sticky disks
-      # handle weight persistence so we control the download explicitly below.
+      # macOS: setup.sh installs mactop + MLX (Metal backend). Skip the weight
+      # download — the benchmark only needs the transformed weights/ (below), not
+      # the reference checkpoint (correctness is disabled, so no reference run).
       - name: Install dependencies
         run: MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
 
-      # Sticky disks mount a persistent Ceph-backed ext4 volume in ~3 seconds
-      # regardless of size — far faster than restoring 141 GB from cache.
-      # The disk commits after the job and is reused on the next run.
-      # Both disks are always mounted: reference weights stay resident so
-      # transform.py can re-run whenever participant source files change
-      # (benchmark.sh detects this via its source-hash check).
-      - name: Mount transformed weights disk (~141 GB)
-        uses: useblacksmith/stickydisk@v1
+      # The transform job produced weights/ (incl. .benchmark-source.sha256), so
+      # benchmark.sh reuses it without re-transforming and never needs the
+      # reference checkpoint here.
+      - name: Restore transformed weights from cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          key: ${{ github.repository }}-ds4-weights
           path: weights
+          key: ds4-weights-v1-${{ hashFiles('transform.py') }}
+          fail-on-cache-miss: true
 
-      - name: Mount reference weights disk (~141 GB)
-        uses: useblacksmith/stickydisk@v1
-        with:
-          key: ${{ github.repository }}-ds4-reference
-          path: mlxfast/reference_weights/DeepSeek-V4-Flash-4bit
-
-      # On the very first run the reference disk is empty — download the
-      # checkpoint so benchmark.sh can run transform.py.
-      - name: Download reference weights (first run only)
-        run: |
-          if [[ ! -f mlxfast/reference_weights/DeepSeek-V4-Flash-4bit/config.json ]]; then
-            .venv/bin/python -m mlxfast.cli weights
-          fi
-
-      # Offline phase: benchmark.sh self-sandboxes — it proves the Seatbelt
-      # profile (tools/deny-network.sb) blocks egress, then re-execs itself
-      # under sandbox-exec with no network and no sudo.
-      # benchmark.sh skips transform when weights/ is populated with the
-      # correct source hash; otherwise it re-runs transform.py first.
-      - name: Benchmark (offline)
+      # Offline phase: benchmark.sh proves the Seatbelt profile (tools/deny-network.sb)
+      # blocks egress, then re-execs itself under sandbox-exec with no network.
+      - name: Benchmark (offline, perf-only)
         env:
           MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
         run: ./benchmark.sh

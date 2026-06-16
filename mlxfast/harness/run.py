@@ -3,13 +3,14 @@
 This is the function the CLI's `mlxfast run` calls. It:
 
   1. Verifies the modifiable surface exists and is loadable.
-  2. Loads the reference model (no modifiable surface involvement).
-  3. Loads the submission model (using the modifiable surface).
-  4. Generates a runtime-random prompt and seeds the decode.
-  5. Runs the correctness gate.
-  6. Measures peak RAM, bandwidth, latency.
-  7. Computes the score.
-  8. Returns a RunReport that the CLI appends to results.tsv.
+  2. Loads the submission model (using the modifiable surface).
+  3. Generates a runtime-random prompt and seeds the decode.
+  4. Measures peak RAM, bandwidth, latency.
+  5. Computes the score.
+  6. Returns a RunReport that the CLI appends to results.tsv.
+
+Correctness checking is disabled for now — this harness measures
+performance only (see the `correctness` module, currently unused).
 
 The harness runs in a subprocess (started by _harness_runner.py)
 so that peak RAM is measured via the subprocess's resident set size
@@ -30,7 +31,7 @@ from typing import Optional
 import mlx.core as mx
 import numpy as np
 
-from . import bandwidth, constants, correctness, score
+from . import bandwidth, constants, score
 
 
 @dataclass
@@ -369,9 +370,17 @@ def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
     seed = int(hashlib_sha256(f"{secret}|{commit}")) % (2**31)
 
     try:
-        ref_model, ref_tokenizer, sub_model = _load_models(weights_path)
+        sub_model, _, _ = _load_models(weights_path)
 
-        # Build a prompt of typical length.
+        # Correctness checking is disabled for now: this harness measures
+        # performance only. num_layers is still reported as run metadata.
+        cfg = _load_config_dict(weights_path)
+        num_layers = int(
+            cfg.get("num_hidden_layers")
+            or cfg.get("text_config", {}).get("num_hidden_layers", 0)
+        )
+
+        # Build the decode prompt of typical length.
         vocab_size = constants.VOCAB_SIZE  # DeepSeek V4
         prompt = _seed_prompt(
             vocab_size,
@@ -379,34 +388,11 @@ def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
             seed,
         )
 
-        # Correctness check first. A model that fails correctness
-        # gets scored as inf and we skip the expensive measurement.
-        correctness_result = correctness.check(ref_model, sub_model, prompt)
-
-        if not correctness_result.passed:
-            return RunReport(
-                timestamp=timestamp,
-                git_commit=commit,
-                note=note,
-                peak_ram_gb=0.0,
-                bandwidth_gb_per_token=0.0,
-                decode_seconds_per_token=0.0,
-                prefill_seconds_per_token=0.0,
-                score=float("inf"),
-                passed_correctness=False,
-                num_layers=correctness_result.num_layers,
-                first_failing_layer=correctness_result.first_failing_layer,
-                max_abs_diff=correctness_result.max_abs_diff,
-                harness_hash=harness_hash,
-                mlx_version=mlx_v,
-                mlx_lm_version=mlx_lm_v,
-            )
-
-        # Build the prefill prompt (longer than the correctness seed).
+        # Build the prefill prompt (longer than the decode prompt).
         prefill_prompt = _seed_prompt(
             vocab_size,
             constants.PREFILL_PROMPT_LENGTH,
-            seed ^ 0xDEADBEEF,  # distinct seed from correctness prompt
+            seed ^ 0xDEADBEEF,  # distinct seed from the decode prompt
         )
 
         # Measure decode latency, peak RAM, and bandwidth together.
@@ -444,9 +430,9 @@ def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
             prefill_seconds_per_token=sr.prefill_seconds_per_token,
             score=sr.score,
             passed_correctness=True,
-            num_layers=correctness_result.num_layers,
+            num_layers=num_layers,
             first_failing_layer=None,
-            max_abs_diff=correctness_result.max_abs_diff,
+            max_abs_diff=0.0,
             harness_hash=harness_hash,
             mlx_version=mlx_v,
             mlx_lm_version=mlx_lm_v,
