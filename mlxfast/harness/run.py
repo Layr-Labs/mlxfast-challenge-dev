@@ -207,6 +207,11 @@ def _force_sanitize_load(load_fn):
             config["quantization"] = remapped
         return config
 
+    # Scope: we patch only the mlx_vlm.utils module's own reference to
+    # safetensors.safe_open.  Code that imports safe_open directly via
+    # `from safetensors import safe_open` holds an independent reference
+    # and is unaffected.  The wrapper only strips `format: mlx` metadata,
+    # so it is harmless for tokenizer files which don't have that key.
     _vu.safetensors.safe_open = _SafeOpenNoFormatMeta
     _vu.load_config = _patched_load_config
     try:
@@ -235,6 +240,10 @@ def _load_participant_model(weights_path: str):
 
     participant_mod = importlib.import_module("mlx_models.deepseek_v4.deepseek_v4")
 
+    # Thread-safety note: this sys.modules swap is not thread-safe.
+    # The harness runs in a single-threaded subprocess so no concurrent
+    # model loads can race here.  Re-entrancy is also not possible because
+    # mlx_vlm.load does not call itself recursively.
     _orig = sys.modules.get("mlx_vlm.models.deepseek_v4")
     sys.modules["mlx_vlm.models.deepseek_v4"] = participant_mod
     try:
