@@ -18,17 +18,29 @@ permissions:
 # on disk at once (~154 GB + ~141 GB ≈ 295 GB), which exceeds the 250 GB macOS
 # runner; and MLX is what reads/writes the weights. So:
 #   1) transform  — runs on a 750 GB Linux runner (MLX installs via mlx[cpu]),
-#      producing weights/, and publishes it to the Actions cache.
-#   2) benchmark  — runs on the Apple-Silicon macOS runner (Metal), restoring
-#      weights/ from the cache (≤141 GB, fits 250 GB) and measuring performance.
-# The cache, keyed on transform.py only, is the cross-OS handoff: an
-# mlx_models-only submission is a cache hit, so step 1 is a no-op and step 2 just
-# benchmarks. Correctness checking is currently disabled (perf-only), so no
-# reference is needed on the macOS side.
+#      producing weights/ and uploading it to R2.
+#   2) benchmark  — runs on the Apple-Silicon macOS runner (Metal), downloading
+#      weights/ from R2 (≤141 GB, fits 250 GB) and measuring performance.
 #
-# NOTE: weights/ is ~141 GB — well above the 25 GB default Actions-cache quota.
-# This requires a cache-size increase from Blacksmith (support@blacksmith.sh);
-# without it the cache save/restore will fail.
+# R2 is the single persistence layer (no sticky disks, no Actions-cache quota):
+#   - transformed weights, keyed on transform.py: ds4-weights/<hash>/  (+ .complete)
+#   - the reference checkpoint, static & self-seeding: ds4-reference/   (+ .complete)
+# An mlx_models-only submission finds the weights object present, so the transform
+# job skips and the benchmark job just downloads. Correctness is disabled
+# (perf-only), so no reference is needed on the macOS side.
+#
+# SECURITY: both jobs run participant-editable code (transform.py / the model),
+# so R2 credentials are scoped to ONLY the aws steps via step-level env — never
+# job/workflow level, and never `aws configure set` (which would persist them to
+# ~/.aws on disk). The transform.py and benchmark.sh steps run with no secret env,
+# so untrusted code can't read or log the keys. (mlxfast.cli is frozen/trusted,
+# so running it alongside credentials is fine.)
+#
+# Secrets (repository secrets): R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and
+# R2_BUCKET_ENDPOINT (full URL incl. bucket, e.g.
+# https://<acct>.r2.cloudflarestorage.com/<bucket>). The account-level endpoint
+# and bucket name are derived from it. aws CLI is preinstalled on the
+# GitHub/Blacksmith Ubuntu + macOS images.
 
 jobs:
   # ── Step 1: transform on Linux (750 GB disk fits reference + output) ──────────
@@ -58,55 +70,82 @@ jobs:
           python-version: "3.12"
 
       # weights/ is a deterministic function of transform.py (NOT mlx_models), so
-      # key the cache on transform.py alone. On a hit, every step below is skipped
-      # and the existing cache is the handoff to the benchmark job.
-      - name: Probe transformed-weights cache
+      # key the R2 object on transform.py alone. A ".complete" marker (written
+      # last) means a full upload exists — on a hit, every step below is skipped.
+      - name: Check R2 for transformed weights
         id: probe
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: weights
-          key: ds4-weights-v1-${{ hashFiles('transform.py') }}
-          lookup-only: true
-
-      # Everything below runs only on a weights-cache miss (transform.py changed
-      # or first run). The reference checkpoint never changes, so it lives on a
-      # persistent Linux sticky disk (Ceph-backed, mounts in ~3 s, no 25 GB cache
-      # quota) — downloaded once and reused on every transform, independent of
-      # whether the weights cache works.
-      - name: Mount reference weights disk (~154 GB)
-        if: steps.probe.outputs.cache-hit != 'true'
-        uses: useblacksmith/stickydisk@v1
-        with:
-          key: ${{ github.repository }}-ds4-reference
-          path: mlxfast/reference_weights/DeepSeek-V4-Flash-4bit
-
-      # Install deps only (mlx[cpu] CPU backend on Linux; skips macOS-only
-      # mactop/Homebrew). The reference download is handled explicitly below.
-      - name: Install dependencies
-        if: steps.probe.outputs.cache-hit != 'true'
-        run: MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
-
-      # First run only: the sticky disk is empty, so download the reference.
-      # On every later run it's already resident — no 154 GB re-download.
-      - name: Download reference (first run only)
-        if: steps.probe.outputs.cache-hit != 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
         run: |
-          if [[ ! -f mlxfast/reference_weights/DeepSeek-V4-Flash-4bit/config.json ]]; then
-            .venv/bin/python -m mlxfast.cli weights
+          BUCKET="${R2_BUCKET_ENDPOINT##*/}"
+          ENDPOINT="${R2_BUCKET_ENDPOINT%/*}"
+          PREFIX="ds4-weights/${{ hashFiles('transform.py') }}"
+          if aws s3 ls "s3://${BUCKET}/${PREFIX}/.complete" --endpoint-url "${ENDPOINT}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Everything below runs only when the weights object is absent (transform.py
+      # changed or first run). Install deps only (mlx[cpu] CPU backend on Linux;
+      # skips macOS-only mactop/Homebrew); we acquire the reference explicitly next.
+      - name: Install dependencies
+        if: steps.probe.outputs.exists != 'true'
+        run: MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
+
+      # Reference checkpoint via R2: pull it if present, else download once from HF
+      # and seed R2 so later transforms skip the ~154 GB HF download. mlxfast.cli
+      # is frozen/trusted, so running it with credentials in scope is fine.
+      - name: Fetch reference (R2, else HF then seed R2)
+        if: steps.probe.outputs.exists != 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+        run: |
+          BUCKET="${R2_BUCKET_ENDPOINT##*/}"
+          ENDPOINT="${R2_BUCKET_ENDPOINT%/*}"
+          REF_DIR="mlxfast/reference_weights/DeepSeek-V4-Flash-4bit"
+          REF_PREFIX="ds4-reference/DeepSeek-V4-Flash-4bit"
+          if aws s3 ls "s3://${BUCKET}/ds4-reference/.complete" --endpoint-url "${ENDPOINT}" >/dev/null 2>&1; then
+            echo "Reference present in R2 — pulling."
+            aws s3 sync "s3://${BUCKET}/${REF_PREFIX}/" "${REF_DIR}/" --endpoint-url "${ENDPOINT}" --only-show-errors
+          else
+            echo "Reference not in R2 — downloading from HF, then seeding R2 (one-time)."
+            .venv/bin/python -m mlxfast.cli weights
+            aws s3 sync "${REF_DIR}/" "s3://${BUCKET}/${REF_PREFIX}/" --endpoint-url "${ENDPOINT}" --exclude ".cache/*" --only-show-errors
+            printf 'ok\n' | aws s3 cp - "s3://${BUCKET}/ds4-reference/.complete" --endpoint-url "${ENDPOINT}"
+          fi
+          if [[ ! -f "${REF_DIR}/config.json" ]]; then
+            echo "::error::reference checkpoint missing after fetch"; exit 1
+          fi
+
+      # NOTE: transform.py is participant-editable (untrusted) — this step has NO
+      # R2 secrets in its env.
       - name: Transform (MLX CPU backend) + seed source hash
-        if: steps.probe.outputs.cache-hit != 'true'
+        if: steps.probe.outputs.exists != 'true'
         run: |
           .venv/bin/python transform.py
           .venv/bin/python tools/benchmark_contract.py source-hash > weights/.benchmark-source.sha256
 
-      - name: Publish transformed weights to cache
-        if: steps.probe.outputs.cache-hit != 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: weights
-          key: ds4-weights-v1-${{ hashFiles('transform.py') }}
+      - name: Upload transformed weights to R2
+        if: steps.probe.outputs.exists != 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+        run: |
+          BUCKET="${R2_BUCKET_ENDPOINT##*/}"
+          ENDPOINT="${R2_BUCKET_ENDPOINT%/*}"
+          PREFIX="ds4-weights/${{ hashFiles('transform.py') }}"
+          aws s3 sync weights/ "s3://${BUCKET}/${PREFIX}/" --endpoint-url "${ENDPOINT}" --only-show-errors
+          # Write the completion marker LAST so a partial upload is never treated as a hit.
+          printf 'ok\n' | aws s3 cp - "s3://${BUCKET}/${PREFIX}/.complete" --endpoint-url "${ENDPOINT}"
 
   # ── Step 2: benchmark on macOS (Metal; only needs weights/, ≤141 GB) ──────────
   benchmark:
@@ -135,18 +174,28 @@ jobs:
       - name: Install dependencies
         run: MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
 
-      # The transform job produced weights/ (incl. .benchmark-source.sha256), so
-      # benchmark.sh reuses it without re-transforming and never needs the
-      # reference checkpoint here.
-      - name: Restore transformed weights from cache
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: weights
-          key: ds4-weights-v1-${{ hashFiles('transform.py') }}
-          fail-on-cache-miss: true
+      # Download weights/ (incl. .benchmark-source.sha256) from R2, so benchmark.sh
+      # reuses it without re-transforming and never needs the reference here.
+      # Credentials are scoped to THIS step only; benchmark.sh below has none.
+      - name: Download transformed weights from R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+        run: |
+          BUCKET="${R2_BUCKET_ENDPOINT##*/}"
+          ENDPOINT="${R2_BUCKET_ENDPOINT%/*}"
+          PREFIX="ds4-weights/${{ hashFiles('transform.py') }}"
+          aws s3 sync "s3://${BUCKET}/${PREFIX}/" weights/ --endpoint-url "${ENDPOINT}" --only-show-errors
+          if [[ ! -f weights/config.json ]]; then
+            echo "::error::weights not found in R2 at s3://${BUCKET}/${PREFIX}/ — the transform job may have failed."
+            exit 1
+          fi
 
       # Offline phase: benchmark.sh proves the Seatbelt profile (tools/deny-network.sb)
       # blocks egress, then re-execs itself under sandbox-exec with no network.
+      # No R2 secrets in this step's env — untrusted model code can't read them.
       - name: Benchmark (offline, perf-only)
         env:
           MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
