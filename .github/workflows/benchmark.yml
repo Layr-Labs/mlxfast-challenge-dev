@@ -19,12 +19,15 @@ jobs:
   benchmark:
     # MLX requires Apple Silicon. DS4-Flash peaks at ~8 GB GPU RAM during
     # inference, but transform.py reads/writes ~141 GB of weights so the
-    # runner needs ample disk (≥300 GB) and RAM (≥32 GB).
-    runs-on: blacksmith-16vcpu-macos-15
+    # runner needs ample disk (≥300 GB) and RAM (≥32 GB). 12 vCPU is the
+    # largest macOS SKU Blacksmith offers (there is no 16 vCPU macOS tier).
+    runs-on: blacksmith-12vcpu-macos-15
     # Decode: 512 tokens × ~0.5 s/tok = ~4 min. Prefill + correctness + setup
     # + possible transform (~10 min on NVMe) + cache restore bring total to
-    # ~45 min on a warm cache, ~60 min when transform must re-run.
-    timeout-minutes: 90
+    # ~45 min on a warm cache, ~60 min when transform must re-run. A cold
+    # first run (empty sticky disks) also pays the reference download, so
+    # allow generous headroom.
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
