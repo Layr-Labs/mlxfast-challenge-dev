@@ -68,12 +68,32 @@ jobs:
           key: ds4-weights-v1-${{ hashFiles('transform.py') }}
           lookup-only: true
 
-      # Cache miss => transform.py changed (or first run). Install deps and pull
-      # the reference checkpoint. On Linux setup.sh installs mlx[cpu] (CPU backend)
-      # and downloads the reference; it skips the macOS-only mactop/Homebrew steps.
-      - name: Install deps + download reference
+      # Everything below runs only on a weights-cache miss (transform.py changed
+      # or first run). The reference checkpoint never changes, so it lives on a
+      # persistent Linux sticky disk (Ceph-backed, mounts in ~3 s, no 25 GB cache
+      # quota) — downloaded once and reused on every transform, independent of
+      # whether the weights cache works.
+      - name: Mount reference weights disk (~154 GB)
         if: steps.probe.outputs.cache-hit != 'true'
-        run: ./setup.sh
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ github.repository }}-ds4-reference
+          path: mlxfast/reference_weights/DeepSeek-V4-Flash-4bit
+
+      # Install deps only (mlx[cpu] CPU backend on Linux; skips macOS-only
+      # mactop/Homebrew). The reference download is handled explicitly below.
+      - name: Install dependencies
+        if: steps.probe.outputs.cache-hit != 'true'
+        run: MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
+
+      # First run only: the sticky disk is empty, so download the reference.
+      # On every later run it's already resident — no 154 GB re-download.
+      - name: Download reference (first run only)
+        if: steps.probe.outputs.cache-hit != 'true'
+        run: |
+          if [[ ! -f mlxfast/reference_weights/DeepSeek-V4-Flash-4bit/config.json ]]; then
+            .venv/bin/python -m mlxfast.cli weights
+          fi
 
       - name: Transform (MLX CPU backend) + seed source hash
         if: steps.probe.outputs.cache-hit != 'true'
