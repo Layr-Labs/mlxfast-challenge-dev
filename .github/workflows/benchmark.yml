@@ -17,10 +17,14 @@ permissions:
 
 jobs:
   benchmark:
-    # MLX requires Apple Silicon; the baseline peaks at ~27 GB RAM, so the
-    # 48 GB tier is the smallest Blacksmith Mac that fits.
-    runs-on: blacksmith-12vcpu-macos-latest
-    timeout-minutes: 15
+    # MLX requires Apple Silicon. DS4-Flash peaks at ~8 GB GPU RAM during
+    # inference, but transform.py reads/writes ~141 GB of weights so the
+    # runner needs ample disk (≥300 GB) and RAM (≥32 GB).
+    runs-on: blacksmith-16vcpu-macos-15
+    # Decode: 512 tokens × ~0.5 s/tok = ~4 min. Prefill + correctness + setup
+    # + possible transform (~10 min on NVMe) + cache restore bring total to
+    # ~45 min on a warm cache, ~60 min when transform must re-run.
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -43,14 +47,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Blacksmith transparently serves actions/cache from colocated storage.
-      # The reference checkpoint never changes, so the key is static.
-      - name: Cache reference weights (~18 GB)
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: quantizationfail/reference_weights
-          key: reference-weights-gemma-4-26B-A4B-it-qat-4bit-v1
-
       - name: Cache pip downloads
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -58,17 +54,45 @@ jobs:
           key: pip-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: pip-${{ runner.os }}-
 
-      # Online phase: installs the venv and, only on a weights cache miss,
-      # downloads the reference checkpoint (`quantizationfail weights` is idempotent).
-      - name: Setup
-        run: ./setup.sh
+      # Install venv and tooling; skip the HF weight download — sticky disks
+      # handle weight persistence so we control the download explicitly below.
+      - name: Install dependencies
+        run: MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
+
+      # Sticky disks mount a persistent Ceph-backed ext4 volume in ~3 seconds
+      # regardless of size — far faster than restoring 141 GB from cache.
+      # The disk commits after the job and is reused on the next run.
+      # Both disks are always mounted: reference weights stay resident so
+      # transform.py can re-run whenever participant source files change
+      # (benchmark.sh detects this via its source-hash check).
+      - name: Mount transformed weights disk (~141 GB)
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ github.repository }}-ds4-weights
+          path: weights
+
+      - name: Mount reference weights disk (~141 GB)
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ github.repository }}-ds4-reference
+          path: mlxfast/reference_weights/DeepSeek-V4-Flash-4bit
+
+      # On the very first run the reference disk is empty — download the
+      # checkpoint so benchmark.sh can run transform.py.
+      - name: Download reference weights (first run only)
+        run: |
+          if [[ ! -f mlxfast/reference_weights/DeepSeek-V4-Flash-4bit/config.json ]]; then
+            .venv/bin/python -m mlxfast.cli weights
+          fi
 
       # Offline phase: benchmark.sh self-sandboxes — it proves the Seatbelt
       # profile (tools/deny-network.sb) blocks egress, then re-execs itself
       # under sandbox-exec with no network and no sudo.
+      # benchmark.sh skips transform when weights/ is populated with the
+      # correct source hash; otherwise it re-runs transform.py first.
       - name: Benchmark (offline)
         env:
-          QUANTIZATIONFAIL_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
+          MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
         run: ./benchmark.sh
 
       - name: Upload score artifacts

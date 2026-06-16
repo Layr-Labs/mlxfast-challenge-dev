@@ -3,16 +3,16 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "quantizationfail-challenge"
+name = "mlxfast-challenge"
 version = "0.1.0"
 description = "Benchmark arena for memory-bandwidth-optimal LLM inference"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [
-  { name = "quantizationfail" },
+  { name = "mlxfast" },
 ]
-# The CLI and harness are installed as the `quantizationfail` command.
+# The CLI and harness are installed as the `mlxfast` command.
 # The modifiable surface (mlx_models/gemma4/*.py) is NOT installed —
 # it lives in the participant's working directory and is loaded by path
 # at runtime via the shadow package.
@@ -34,8 +34,8 @@ dev = [
 ]
 
 [project.scripts]
-quantizationfail = "quantizationfail.cli:app"
-qfail = "quantizationfail.cli:app"
+mlxfast = "mlxfast.cli:app"
+qfail = "mlxfast.cli:app"
 
 [tool.setuptools]
 include-package-data = true
@@ -45,11 +45,11 @@ include-package-data = true
 # but is NOT imported from site-packages — the harness loads it
 # from the participant's working directory.
 [tool.setuptools.packages.find]
-include = ["quantizationfail*"]
+include = ["mlxfast*"]
 exclude = ["mlx_models*", "weights*", "tests*"]
 
 [tool.setuptools.package-data]
-quantizationfail = ["harness/*.py", "_templates/*.py"]
+mlxfast = ["harness/*.py", "_templates/*.py"]
 
 [tool.black]
 line-length = 100

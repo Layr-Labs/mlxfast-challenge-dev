@@ -7,12 +7,12 @@ set -euo pipefail
 # needed) so transform.py and the harness never see the network — locally or
 # in CI. The proxy vars point at a closed local port so anything that ignores
 # the profile fails fast instead of hanging.
-SANDBOX_PROFILE="${QUANTIZATIONFAIL_SANDBOX_PROFILE:-tools/deny-network.sb}"
+SANDBOX_PROFILE="${MLXFAST_SANDBOX_PROFILE:-tools/deny-network.sb}"
 
-if [[ "${QUANTIZATIONFAIL_IN_SANDBOX:-0}" != "1" && "${QUANTIZATIONFAIL_NO_SANDBOX:-0}" != "1" ]]; then
+if [[ "${MLXFAST_IN_SANDBOX:-0}" != "1" && "${MLXFAST_NO_SANDBOX:-0}" != "1" ]]; then
   if ! command -v sandbox-exec >/dev/null 2>&1; then
     echo "benchmark.sh: sandbox-exec not found (the benchmark requires macOS)." >&2
-    echo "Set QUANTIZATIONFAIL_NO_SANDBOX=1 to skip the offline sandbox; scores" >&2
+    echo "Set MLXFAST_NO_SANDBOX=1 to skip the offline sandbox; scores" >&2
     echo "produced that way are not comparable to sandboxed runs." >&2
     exit 1
   fi
@@ -23,7 +23,7 @@ if [[ "${QUANTIZATIONFAIL_IN_SANDBOX:-0}" != "1" && "${QUANTIZATIONFAIL_NO_SANDB
   fi
   echo "benchmark.sh: network egress is blocked; re-running inside the sandbox"
   exec sandbox-exec -f "${SANDBOX_PROFILE}" env \
-    QUANTIZATIONFAIL_IN_SANDBOX=1 \
+    MLXFAST_IN_SANDBOX=1 \
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
     http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 \
     HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
@@ -32,8 +32,8 @@ fi
 
 VENV_DIR="${VENV_DIR:-.venv}"
 PYTHON="${PYTHON:-${VENV_DIR}/bin/python}"
-SCORE_PATH="${QUANTIZATIONFAIL_SCORE_PATH:-score.json}"
-REFERENCE_DIR="quantizationfail/reference_weights/gemma-4-26B-A4B-it-qat-4bit"
+SCORE_PATH="${MLXFAST_SCORE_PATH:-score.json}"
+REFERENCE_DIR="mlxfast/reference_weights/DeepSeek-V4-Flash-4bit"
 SOURCE_HASH_PATH="weights/.benchmark-source.sha256"
 BENCHMARK_HELPER="tools/benchmark_contract.py"
 
@@ -61,7 +61,7 @@ fi
 if [[ ! -f "${REFERENCE_DIR}/config.json" ]]; then
   cat >&2 <<EOF
 benchmark.sh: reference weights not found at ${REFERENCE_DIR}.
-Run ./setup.sh, or set QUANTIZATIONFAIL_SKIP_WEIGHTS_DOWNLOAD=1 only after
+Run ./setup.sh, or set MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 only after
 placing the reference checkpoint there.
 EOF
   exit 1
@@ -71,7 +71,7 @@ mkdir -p weights
 wanted_hash="$("${PYTHON}" "${BENCHMARK_HELPER}" source-hash)"
 current_hash="$(cat "${SOURCE_HASH_PATH}" 2>/dev/null || true)"
 
-if [[ "${QUANTIZATIONFAIL_FORCE_TRANSFORM:-0}" == "1" || ! -f weights/config.json || "${current_hash}" != "${wanted_hash}" ]]; then
+if [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f weights/config.json || "${current_hash}" != "${wanted_hash}" ]]; then
   echo "benchmark.sh: regenerating weights from transform.py"
   find weights -mindepth 1 ! -name .gitkeep -exec rm -rf {} +
   "${PYTHON}" transform.py
@@ -88,13 +88,13 @@ rm -f "${SCORE_PATH}"
 
 run_args=(run --skip-transform-verify)
 if [[ "$#" -eq 0 ]]; then
-  run_args+=(--note "${QUANTIZATIONFAIL_NOTE:-benchmark.json run}")
+  run_args+=(--note "${MLXFAST_NOTE:-benchmark.json run}")
 else
   run_args+=("$@")
 fi
 run_args+=(--score-path "${SCORE_PATH}")
 
-"${PYTHON}" -m quantizationfail.cli "${run_args[@]}"
+"${PYTHON}" -m mlxfast.cli "${run_args[@]}"
 
 if [[ ! -s "${SCORE_PATH}" ]]; then
   echo "benchmark.sh: benchmark did not produce ${SCORE_PATH}" >&2

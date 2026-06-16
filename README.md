@@ -1,64 +1,66 @@
-# quantizationfail
+# mlxfast — DeepSeek V4 Flash
 
-A benchmark arena for memory-bandwidth-optimal LLM inference. Run Gemma 4 26B MoE without materializing the full expert weights.
+A benchmark arena for memory-bandwidth-optimal LLM inference on Apple Silicon.
+Run DeepSeek V4 Flash without loading all 256 experts into RAM — and beat the baseline score.
 
 See [CHALLENGE.md](CHALLENGE.md) for the full problem statement, scoring formula, and approach space.
 
 ## Quickstart
 
 ```bash
-# Install (creates a venv with mlx + mlx-lm + the CLI)
-python -m venv .venv && source .venv/bin/activate
-pip install -e . sentencepiece
+# Install Homebrew/mactop if needed, then Python deps and weights
+./setup.sh
 
-# Download the 4-bit QAT reference weights (~18 GB, one-time)
-quantizationfail weights
-
-# Copy the reference weights into weights/ as your starting point
-REF=quantizationfail/reference_weights/gemma-4-26B-A4B-it-qat-4bit
-cp $REF/config.json weights/config.json
-python -c "
-import json
-c = json.load(open('weights/config.json'))
-c['model_file'] = '../mlx_models/gemma4/model.py'
-json.dump(c, open('weights/config.json','w'), indent=2)
-"
-for f in $REF/*.safetensors; do ln -sf "../$f" "weights/$(basename $f)"; done
-ln -sf "../$REF/tokenizer.json" weights/tokenizer.json
-ln -sf "../$REF/tokenizer_config.json" weights/tokenizer_config.json
+# Split expert weights onto SSD (baseline transform, runs once)
+python transform.py
 
 # Run the baseline — should match the published baseline score
-QUANTIZATIONFAIL_SKIP_HASH_CHECK=1 quantizationfail run --note "baseline" --skip-transform-verify
+mlxfast run --note "baseline"
 
 # Edit the modifiable surface and iterate
-vim mlx_models/gemma4/linear.py
-python transform.py
-QUANTIZATIONFAIL_SKIP_HASH_CHECK=1 quantizationfail run --note "my schema v1"
+vim mlx_models/mlx_lm_shims/switch_layers.py
+python transform.py   # only if you changed weight layout
+mlxfast run --note "my approach v1"
 ```
 
-Results append to `results.tsv`. View them with:
+Results append to `results.tsv`:
 
 ```bash
 column -t -s $'\t' results.tsv
 ```
 
+## Why this challenge exists
+
+DeepSeek V4 Flash has 256 routed experts per layer, 6 activated per token.
+At 4-bit quantisation the full expert stack is ~30 GB — more than most Apple
+Silicon machines can hold. The baseline ships with SSD streaming: only the 6
+activated experts per token are loaded into Metal memory, keeping peak RAM
+under ~6 GB.
+
+That baseline is functional but naive. Expert reads block the forward pass,
+there is no prefetching, no cross-layer reuse, and the weights are stored in
+their original 4-bit form. Every one of these is an optimisation target.
+
 ## The modifiable surface
 
-You can edit exactly four files:
+Unlike typical inference benchmarks, the entire model execution pipeline is
+in scope. You can modify any file under `mlx_models/`:
 
-| File | Role |
+| Path | What it controls |
 |---|---|
-| `mlx_models/gemma4/linear.py` | The `Linear` class used everywhere — attention projections, MLP gate/up/down, etc. The primary compute target. |
-| `mlx_models/gemma4/experts.py` | The MoE expert block (`SwitchGLU` + `QuantizedSwitchLinear`). The dominant bandwidth target in 26B-A4B. |
-| `mlx_models/gemma4/model.py` | The top-level `Model` class. Layer structure, attention pattern, MoE activation. |
-| `mlx_models/gemma4/weights.py` | The `load_weights(model, weights_path)` function. How safetensors are read and mapped onto the model. |
+| `mlx_models/mlx_lm_shims/switch_layers.py` | Expert streaming: slot bank, loading, dispatch. **Primary target.** |
+| `mlx_models/deepseek_v4/language.py` | All layer logic: MoE routing, attention, shared experts, hyper connections. |
+| `mlx_models/deepseek_v4/deepseek_v4.py` | Top-level model: forward dispatch, streaming configuration. |
+| `mlx_models/deepseek_v4/hyper_connection.py` | HyperConnection + fused Metal kernel. |
+| `mlx_models/cache.py` | KV cache implementations (RotatingKVCache, QuantizedKVCache, …). |
+| `mlx_models/turboquant.py` | TurboQuant KV cache Metal kernels. |
+| `mlx_models/speculative/drafters/deepseek_v4_mtp/` | MTP speculative decoding drafter. |
+| `mlx_models/mlx_lm_shims/mla.py` | MultiLinear / QuantizedMultiLinear (MLA attention projections). |
 
 Plus:
 
-- `transform.py` — your offline weight transform. Pure function of `quantizationfail/reference_weights/`.
-- `weights/` — the output of `transform.py`. The harness reads from here.
-
-The frozen `mlx_models/gemma4/__init__.py` is the only wiring point. It patches `mlx.nn.Linear` and `mlx_lm.models.switch_layers` with your classes at import time. You don't edit `__init__.py`.
+- `transform.py` — offline weight transform. Deterministic function of the reference weights.
+- `weights/` — output of `transform.py`. The harness loads from here.
 
 ## Scoring
 
@@ -66,27 +68,39 @@ The frozen `mlx_models/gemma4/__init__.py` is the only wiring point. It patches 
 score = peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill_sec_per_token
 ```
 
-All four axes are measured independently. Correctness is a hard gate — failing submissions are not scored. See CHALLENGE.md for details.
+Bandwidth is measured via **mactop hardware DRAM counters** — not a software model.
+Correctness is a hard gate. See CHALLENGE.md for the full correctness specification.
 
-**Baseline (M5 Max 128 GB, QAT 4-bit):**
+**Baseline (TBD — reference M5 Max 128 GB):**
 
 | Peak RAM | Bandwidth | Decode | Prefill | Score |
 |---|---|---|---|---|
-| 27.1 GB | 13.52 GB/tok | 0.0141 s/tok (~71 tok/s) | 0.00128 s/tok (~780 tok/s) | 0.0066 |
+| TBD | TBD | TBD | TBD | TBD |
 
 ## Architecture
 
-- `quantizationfail/` — the frozen CLI + harness. Installed as the `quantizationfail` (or short alias `qfail`) command.
-- `mlx_models/gemma4/` — the 4 modifiable files plus the frozen `__init__.py` that wires them.
-- `quantizationfail/reference_weights/` — the reference QAT 4-bit checkpoint, downloaded by `quantizationfail weights`.
-- `transform.py` — your offline weight transform.
-- `weights/` — the output of your transform. The harness loads from here.
-- `results.tsv` — your local experiment log.
-- `score.json` — written after each finite passing run (benchmark contract format).
+```
+mlx_models/                  modifiable surface — the full DS4-Flash pipeline
+  deepseek_v4/               core model (language, attention, MoE, hyper connections)
+  mlx_lm_shims/              expert dispatch + MLA primitives (SwitchGLU, MultiLinear)
+  speculative/               MTP speculative decoding drafter
+  base.py / cache.py         shared model infrastructure and KV cache
+  turboquant.py              TurboQuant KV cache kernels
+transform.py                 offline weight transform (optional)
+weights/                     transformed weights (harness loads from here)
+  experts/
+    manifest.json            expert record layout
+    layer_NN.bin             per-layer expert binaries (expert-major, fixed record size)
+reference_weights/           original 4-bit checkpoint (frozen, read-only)
+harness/                     frozen measurement and validation code
+results.tsv                  local experiment log
+score.json                   written after each finite passing run
+```
 
 ## Requirements
 
-- Apple Silicon Mac (M2 or newer), 24 GB+ unified memory
+- Apple Silicon Mac, 24 GB+ unified memory (M2 or newer)
 - macOS Sequoia or later
 - Python 3.11+
-- `mlx==0.31.1`, `mlx-lm>=0.31.2,<0.32`
+- `mlx>=0.31.2`, `mlx-vlm==0.6.3`, `mlx-lm>=0.31.3`
+- [mactop](https://github.com/metaspartan/mactop) — installed by `./setup.sh` via Homebrew when missing

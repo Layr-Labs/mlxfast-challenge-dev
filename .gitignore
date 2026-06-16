@@ -17,9 +17,9 @@ venv/
 .venv/
 env/
 
-# The reference weights are large and downloaded by `quantizationfail weights`
-quantizationfail/reference_weights/
-!quantizationfail/reference_weights/.gitkeep
+# The reference weights are large and downloaded by `mlxfast weights`
+mlxfast/reference_weights/
+!mlxfast/reference_weights/.gitkeep
 
 # The participant's transformed weights — gitignored by default, opt in if you want
 weights/*

@@ -3,7 +3,7 @@
 This file is the source of truth for what versions the harness was
 designed against. The CLI verifies the harness's own content hash
 against an expected value at startup, so any modification here will
-cause `quantizationfail run` to refuse to run (a soft safety check —
+cause `mlxfast run` to refuse to run (a soft safety check —
 the real one is the server's re-computation).
 
 When the model or mlx-lm version is bumped, the harness hash changes
@@ -16,23 +16,25 @@ import hashlib
 import os
 from pathlib import Path
 
-# Pinned versions. mlx-lm 0.21.0 does not exist; the real minimum
-# is 0.31.2 (when gemma4.py was added). The challenge spec says
-# mlx-lm==0.21.0, which we treat as a forward-looking pin that
-# the server will resolve at submission time.
-MLX_VERSION = "0.31.1"
+MLX_VERSION = "0.31.2"
 MLX_LM_MIN_VERSION = "0.31.2"
 MLX_LM_MAX_VERSION = "0.32.0"
+MLX_VLM_VERSION = "0.6.3"
 
 # Reference model. The harness downloads this to
-# `quantizationfail/reference_weights/` on first run.
-REFERENCE_MODEL_REPO = "mlx-community/gemma-4-26B-A4B-it-qat-4bit"
-REFERENCE_MODEL_DIRNAME = "gemma-4-26B-A4B-it-qat-4bit"
+# `mlxfast/reference_weights/` on first run.
+REFERENCE_MODEL_REPO = "mlx-community/DeepSeek-V4-Flash-4bit"
+REFERENCE_MODEL_DIRNAME = "DeepSeek-V4-Flash-4bit"
 
-# Modifiable surface. The harness loads these by file path from the
-# participant's working directory (not from site-packages).
-MODIFIABLE_DIR = Path("mlx_models/gemma4")
-MODEL_FILE = MODIFIABLE_DIR / "model.py"
+# DeepSeek V4 Flash model constants (from config.json).
+VOCAB_SIZE = 129280
+NUM_HIDDEN_LAYERS = 43
+N_ROUTED_EXPERTS = 256
+NUM_EXPERTS_PER_TOK = 6
+
+# Modifiable surface. The harness loads by module path from the
+# participant's working directory (prepended to sys.path).
+MODIFIABLE_DIR = Path("mlx_models/deepseek_v4")
 
 # Output paths (relative to participant's working directory).
 PARTICIPANT_WEIGHTS_DIR = Path("weights")
@@ -40,9 +42,9 @@ TRANSFORM_SCRIPT = Path("transform.py")
 RESULTS_FILE = Path("results.tsv")
 SCORE_FILE = Path("score.json")
 
-# Reference weights (managed by `quantizationfail weights`).
-REFERENCE_WEIGHTS_DIR = Path("quantizationfail/reference_weights")
-TOKENIZER_DIR = Path("quantizationfail/tokenizer")
+# Reference weights (managed by `mlxfast weights`).
+REFERENCE_WEIGHTS_DIR = Path("mlxfast/reference_weights")
+TOKENIZER_DIR = Path("mlxfast/tokenizer")
 
 # Measurement parameters.
 # DECODE_LENGTH: number of autoregressive tokens measured per run.
@@ -61,7 +63,7 @@ PROMPT_SEED_PREFIX_LENGTH = 32
 # operations is permitted, lossy approximation is not. We use
 # 1e-2 as a generous bound that accounts for non-deterministic
 # GPU reduction order; tighten to 1e-3 if you need stricter matching.
-CORRECTNESS_EPSILON = 1e-2
+CORRECTNESS_EPSILON = 5e-3
 
 # Scoring formula. Lower is better.
 #   score = peak_ram_GB * bandwidth_GB_per_token * seconds_per_token
@@ -78,7 +80,7 @@ def harness_root() -> Path:
     This is the path the self-hash check verifies. If a participant
     edits anything in here, the CLI will refuse to run.
     """
-    return _harness_dir().parent  # quantizationfail/
+    return _harness_dir().parent  # mlxfast/
 
 
 def compute_harness_hash() -> str:
@@ -96,4 +98,4 @@ def compute_harness_hash() -> str:
 # Set by the server when the participant installs the harness wheel.
 # If unset (local dev), the CLI accepts any harness hash — useful for
 # iterating on the harness itself, dangerous for leaderboard integrity.
-EXPECTED_HARNESS_HASH = os.environ.get("QUANTIZATIONFAIL_EXPECTED_HARNESS_HASH", "")
+EXPECTED_HARNESS_HASH = os.environ.get("MLXFAST_EXPECTED_HARNESS_HASH", "")

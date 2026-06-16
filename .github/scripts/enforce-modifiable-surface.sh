@@ -14,7 +14,16 @@ changed="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
 bad=0
 while IFS= read -r f; do
   [[ -z "${f}" ]] && continue
-  if ! grep -qxF "${f}" <<<"${allowed}"; then
+  ok=0
+  while IFS= read -r allowed_path; do
+    [[ -z "${allowed_path}" ]] && continue
+    # Exact match OR file is inside an allowed directory prefix.
+    if [[ "${f}" == "${allowed_path}" || "${f}" == "${allowed_path}/"* ]]; then
+      ok=1
+      break
+    fi
+  done <<<"${allowed}"
+  if [[ "${ok}" == "0" ]]; then
     echo "::error file=${f}::${f} is outside the modifiable surface (see editablePaths in benchmark.json)"
     bad=1
   fi

@@ -1,4 +1,4 @@
-# Metrics Research: Correct Primitives for the quantizationfail Harness
+# Metrics Research: Correct Primitives for the mlxfast Harness
 
 **Date**: 2026-06-09  
 **Status**: Research complete — findings ready for implementation

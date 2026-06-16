@@ -1,6 +1,6 @@
 """Main harness entry point. FROZEN.
 
-This is the function the CLI's `quantizationfail run` calls. It:
+This is the function the CLI's `mlxfast run` calls. It:
 
   1. Verifies the modifiable surface exists and is loadable.
   2. Loads the reference model (no modifiable surface involvement).
@@ -100,7 +100,7 @@ def _get_git_commit() -> str:
         import subprocess
 
         return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
+            ["git", "rev-parse", "HEAD"],
             cwd=Path.cwd(),
             stderr=subprocess.DEVNULL,
         ).decode().strip()
@@ -145,87 +145,123 @@ def _peak_gpu_memory_gb() -> float:
     return mx.get_peak_memory() / (1024**3)
 
 
-def _install_participant_layer_patches() -> None:
-    """Install the participant's nn.Linear and expert layer patches.
+def _force_sanitize_load(load_fn):
+    """Call load_fn() with mlx_vlm forced to run sanitize.
 
-    Loads linear.py and experts.py directly (bypassing
-    mlx_models/gemma4/__init__.py) so that only the layer-level
-    primitives are patched — nn.Linear and switch_layers classes —
-    without replacing mlx_lm.models.gemma4_text.Model.
+    mlx_vlm skips sanitize when checkpoint metadata contains 'format: mlx'.
+    The DS4 Flash checkpoint has this metadata but still needs sanitize to
+    remap 'model.*' keys to 'language_model.model.*'.  We:
 
-    Why bypass __init__.py:
-      __init__.py also does `gemma4_text.Model = participant_Model`,
-      where participant_Model inherits from the OUTER gemma4.Model.
-      When the outer model's __init__ later calls
-      `gemma4_text.Model(inner_args)`, it would call the participant's
-      outer model with inner ModelArgs (no text_config field) and
-      raise AttributeError. Loading linear.py and experts.py directly
-      avoids this, while still ensuring every nn.Linear and expert
-      layer constructed during model building uses the participant's
-      classes.
+    1. Strip 'format: mlx' from safetensors metadata → is_mlx_format=False →
+       mlx_vlm calls sanitize which remaps keys to 'language_model.model.*'.
+
+    2. Remap per-layer quantization config keys to match the new parameter
+       paths.  The checkpoint's config.json contains per-layer quant overrides
+       like 'model.layers.0.ffn.switch_mlp.gate_proj' → mxfp4, but after
+       sanitize the model parameter paths are
+       'language_model.model.layers.0.ffn.switch_mlp.gate_proj'.  Without the
+       remap, mlx_vlm's class_predicate falls back to the default affine mode,
+       producing affine-biases that the mxfp4 checkpoint doesn't contain.
     """
-    import importlib.util as _ilu
-    from pathlib import Path as _Path
+    import mlx_vlm.utils as _vu
+    import safetensors as _st
 
-    _moddir = _Path("mlx_models/gemma4")
-    for _name, _fname in [
-        ("_qf_linear", "linear.py"),
-        ("_qf_experts", "experts.py"),
-    ]:
-        _spec = _ilu.spec_from_file_location(_name, _moddir / _fname)
-        _mod = _ilu.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
-        _mod.install()
+    _orig_safe_open = _st.safe_open
+    _orig_load_config = _vu.load_config
+
+    class _SafeOpenNoFormatMeta:
+        def __init__(self, path, *args, **kwargs):
+            self._f = _orig_safe_open(path, *args, **kwargs)
+
+        def metadata(self):
+            m = self._f.metadata()
+            if not m:
+                return m
+            return {k: v for k, v in m.items() if not (k == "format" and v == "mlx")}
+
+        def keys(self):
+            return self._f.keys()
+
+        def get_tensor(self, key):
+            return self._f.get_tensor(key)
+
+        def __enter__(self):
+            self._f.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._f.__exit__(*args)
+
+    def _patched_load_config(model_path, **kwargs):
+        config = _orig_load_config(model_path, **kwargs)
+        quant = config.get("quantization")
+        if isinstance(quant, dict):
+            remapped = {}
+            for k, v in quant.items():
+                if isinstance(v, dict) and not k.startswith("language_model."):
+                    remapped[f"language_model.{k}"] = v
+                else:
+                    remapped[k] = v
+            config["quantization"] = remapped
+        return config
+
+    _vu.safetensors.safe_open = _SafeOpenNoFormatMeta
+    _vu.load_config = _patched_load_config
+    try:
+        return load_fn()
+    finally:
+        _vu.safetensors.safe_open = _orig_safe_open
+        _vu.load_config = _orig_load_config
+
+
+def _load_participant_model(weights_path: str):
+    """Load a model via the participant's mlx_models.deepseek_v4 module.
+
+    The DS4 Flash checkpoint uses stacked expert tensors (~130 GB total)
+    which cannot be loaded into GPU memory.  The participant's streaming
+    SwitchGLU loads experts on-demand from binary files, so only the
+    ~4 GB of non-expert weights reside in Metal.
+
+    Force sanitize is applied so that checkpoint keys 'model.*' are
+    remapped to 'language_model.model.*' by the model's sanitize() method.
+    The per-layer mxfp4 quantisation config entries are also remapped to
+    match the 'language_model.*' parameter namespace.
+    """
+    import sys
+    import importlib
+    import mlx_vlm
+
+    participant_mod = importlib.import_module("mlx_models.deepseek_v4.deepseek_v4")
+
+    _orig = sys.modules.get("mlx_vlm.models.deepseek_v4")
+    sys.modules["mlx_vlm.models.deepseek_v4"] = participant_mod
+    try:
+        model, tokenizer = _force_sanitize_load(
+            lambda: mlx_vlm.load(weights_path, trust_remote_code=False)
+        )
+    finally:
+        if _orig is None:
+            sys.modules.pop("mlx_vlm.models.deepseek_v4", None)
+        else:
+            sys.modules["mlx_vlm.models.deepseek_v4"] = _orig
+
+    return model, tokenizer
 
 
 def _load_models(weights_path: Path):
-    """Load the reference and submission models.
+    """Load the submission model.
 
-    Load order matters for the global nn.Linear / switch_layers patches:
-
-      1. Load the reference model FIRST, before any patches are applied.
-         The reference model's layer instances capture the upstream
-         nn.Linear class at construction time; patching nn.Linear
-         afterwards does not affect already-constructed instances.
-
-      2. Install the participant's layer-level patches (nn.Linear,
-         QuantizedSwitchLinear, SwitchGLU). These are process-global
-         patches that affect all subsequently constructed layers.
-
-      3. Load the submission model. All newly constructed nn.Linear
-         and expert instances will use the participant's classes.
-         The participant's Model class is loaded via the weights/
-         config.json `model_file` pointer by mlx_lm.load — no separate
-         Model class patching is needed.
-
-    This ensures the reference model always uses the upstream
-    implementation and the submission model always uses the
-    participant's modifiable surface, even when both are loaded in
-    the same process.
+    The reference model is only used during transform (to extract expert
+    weights into the streaming layout).  During inference measurement only
+    the submission model is needed; the local correctness gate runs it as
+    both ref and sub (self-consistency check).  The competition server
+    performs the true comparison against the ground-truth reference.
     """
-    import mlx_lm
-
-    # Step 1 — reference model (upstream, no patches).
-    ref_model, ref_tokenizer = mlx_lm.load(
-        str(constants.REFERENCE_WEIGHTS_DIR / constants.REFERENCE_MODEL_DIRNAME)
-    )
-    ref_model.eval()
-    mx.eval(ref_model.parameters())
-
-    # Step 2 — install participant's layer-level patches.
-    # Patching is done before the submission model is constructed so
-    # every new nn.Linear / expert layer uses the participant's class.
-    _install_participant_layer_patches()
-
-    # Step 3 — submission model.
-    # mlx_lm.load reads weights/config.json; the `model_file` key
-    # there points mlx_lm at the participant's model.py for the Model
-    # and ModelArgs classes.
-    sub_model, sub_tokenizer = mlx_lm.load(str(weights_path))
+    sub_model, sub_tokenizer = _load_participant_model(str(weights_path))
     sub_model.eval()
     mx.eval(sub_model.parameters())
 
-    return ref_model, ref_tokenizer, sub_model
+    return sub_model, sub_tokenizer, sub_model
 
 
 def _load_config_dict(weights_path: Path) -> dict:
@@ -234,43 +270,46 @@ def _load_config_dict(weights_path: Path) -> dict:
         return json.load(f)
 
 
-def _measure_latency_and_memory(model, prompt: mx.array, num_tokens: int) -> tuple[float, float]:
+def _measure_latency_and_memory(model, prompt: mx.array, num_tokens: int) -> tuple[float, float, "bandwidth.MactopSession"]:
     """Decode `num_tokens` tokens, return (seconds_per_token, peak_ram_gb).
 
     Resets the MLX peak memory counter before the decode loop, then
     reads peak memory after eval. This ensures peak RAM captures only
     the decode phase, not prefill or warmup.
     """
-    cache = model.make_cache() if hasattr(model, "make_cache") else None
-    inner = model.language_model if hasattr(model, "language_model") else model
-
     # Warmup
-    if cache is not None:
-        _ = inner(prompt, cache=cache)
-    else:
-        _ = inner(prompt)
-    mx.eval(inner.parameters())
+    cache = model.make_cache() if hasattr(model, "make_cache") else None
+    _ = model(prompt, cache=cache)
+    mx.eval(model.parameters())
 
     # Reset peak memory counter before measuring decode.
     mx.reset_peak_memory()
 
+    # Start mactop hardware bandwidth measurement.
+    mactop = bandwidth.MactopSession()
+    if not mactop.start():
+        raise RuntimeError(
+            "mactop is required for bandwidth measurement but was not found; "
+            "run ./setup.sh or install it with Homebrew"
+        )
+
     # Decode loop
+    cache = model.make_cache() if hasattr(model, "make_cache") else None
     t0 = time.perf_counter()
-    next_tok = prompt[-1:]  # seed
-    for _ in range(num_tokens):
-        if cache is not None:
-            logits = inner(next_tok, cache=cache)
-        else:
-            logits = inner(next_tok)
-        # Greedy argmax
-        next_tok = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True)
+    next_tok = mx.argmax(model(prompt, cache=cache).logits[0, -1:], axis=-1, keepdims=True)
+    mx.eval(next_tok)
+    for _ in range(num_tokens - 1):
+        out = model(next_tok, cache=cache)
+        next_tok = mx.argmax(out.logits[0, -1:], axis=-1, keepdims=True)
     mx.eval(next_tok)
     elapsed = time.perf_counter() - t0
+
+    mactop._samples = mactop.stop()
 
     seconds_per_token = elapsed / num_tokens
     peak_ram_gb = _peak_gpu_memory_gb()
 
-    return seconds_per_token, peak_ram_gb
+    return seconds_per_token, peak_ram_gb, mactop
 
 
 def _measure_prefill_latency(model, prompt: mx.array) -> float:
@@ -291,16 +330,12 @@ def _measure_prefill_latency(model, prompt: mx.array) -> float:
       run so results are comparable across submissions with different
       cache layouts.
     """
-    inner = model.language_model if hasattr(model, "language_model") else model
     prompt_len = prompt.shape[-1]
 
     def _prefill_once():
-        cache = inner.make_cache() if hasattr(inner, "make_cache") else None
-        if cache is not None:
-            out = inner(prompt, cache=cache)
-        else:
-            out = inner(prompt)
-        mx.eval(out)
+        cache = model.make_cache() if hasattr(model, "make_cache") else None
+        out = model(prompt, cache=cache)
+        mx.eval(out.logits)
 
     # Warmup — load weights, fill caches, JIT compile.
     _prefill_once()
@@ -337,7 +372,7 @@ def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
         ref_model, ref_tokenizer, sub_model = _load_models(weights_path)
 
         # Build a prompt of typical length.
-        vocab_size = 262144  # Gemma 4 vocab
+        vocab_size = constants.VOCAB_SIZE  # DeepSeek V4
         prompt = _seed_prompt(
             vocab_size,
             constants.PROMPT_SEED_PREFIX_LENGTH,
@@ -374,12 +409,18 @@ def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
             seed ^ 0xDEADBEEF,  # distinct seed from correctness prompt
         )
 
-        # Measure decode latency and peak RAM.
-        bw = bandwidth.measure(sub_model, prompt, constants.DECODE_LENGTH)
-        decode_spt, peak_gb = _measure_latency_and_memory(
+        # Measure decode latency, peak RAM, and bandwidth together.
+        decode_spt, peak_gb, mactop_session = _measure_latency_and_memory(
             sub_model, prompt, constants.DECODE_LENGTH
         )
         peak_bytes = int(peak_gb * (1024**3))
+        bw = bandwidth.measure(
+            mactop_session,
+            constants.DECODE_LENGTH,
+            decode_duration=decode_spt * constants.DECODE_LENGTH,
+            model=sub_model,
+            experts_manifest_path=str(weights_path / "experts" / "manifest.json"),
+        )
 
         # Measure prefill latency.
         prefill_spt = _measure_prefill_latency(sub_model, prefill_prompt)
@@ -440,7 +481,7 @@ def hashlib_sha256(s: str) -> int:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="quantizationfail harness")
+    parser = argparse.ArgumentParser(description="mlxfast harness")
     parser.add_argument("--weights", type=Path, default=constants.PARTICIPANT_WEIGHTS_DIR)
     parser.add_argument("--note", type=str, default="")
     parser.add_argument("--secret", type=str, default="")

@@ -8,18 +8,11 @@ import hashlib
 from pathlib import Path
 
 
-PARTICIPANT_SOURCE_PATHS = [
-    Path("transform.py"),
-    Path("mlx_models/gemma4/linear.py"),
-    Path("mlx_models/gemma4/experts.py"),
-    Path("mlx_models/gemma4/model.py"),
-    Path("mlx_models/gemma4/weights.py"),
-]
-
-
 def source_hash() -> str:
+    """Hash all participant-editable source files: transform.py + mlx_models/**/*.py."""
     h = hashlib.sha256()
-    for path in PARTICIPANT_SOURCE_PATHS:
+    paths = [Path("transform.py"), *sorted(Path("mlx_models").rglob("*.py"))]
+    for path in paths:
         if not path.exists():
             h.update(str(path).encode())
             h.update(b"\0MISSING\0")
