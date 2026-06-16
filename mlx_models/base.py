@@ -200,7 +200,7 @@ def scaled_dot_product_attention(
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
     if isinstance(cache, TurboQuantKVCache):
-        if sinks is not None:
+        if sinks is not None and bool(mx.any(sinks)):
             raise ValueError("TurboQuant KV cache does not support attention sinks.")
         if queries.shape[-2] == 1:
             return cache.decode_attention(
