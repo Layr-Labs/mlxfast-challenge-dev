@@ -25,7 +25,7 @@ import mlx.core as mx
 
 from .constants import CORRECTNESS_EPSILON
 
-CORRECTNESS_STEPS = 64      # decode steps to check (full 256 is slow; 64 is sufficient)
+CORRECTNESS_STEPS = 256     # decode steps to check (spec §4.2 specifies 256)
 CORRECTNESS_TOP_K = 10      # top-K logit set size for Layer 3
 
 
