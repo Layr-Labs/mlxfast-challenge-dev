@@ -302,7 +302,7 @@ def _measure_latency_and_memory(model, prompt: mx.array, num_tokens: int) -> tup
     for _ in range(num_tokens - 1):
         out = model(next_tok, cache=cache)
         next_tok = mx.argmax(out.logits[0, -1:], axis=-1, keepdims=True)
-    mx.eval(next_tok)
+        mx.eval(next_tok)
     elapsed = time.perf_counter() - t0
 
     mactop._samples = mactop.stop()
