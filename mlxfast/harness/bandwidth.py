@@ -278,6 +278,14 @@ def measure(
     if model is not None:
         sw = _moe_software_estimate(model, experts_manifest_path, num_tokens)
         if sw is not None:
+            import warnings
+            warnings.warn(
+                "mactop produced no samples; using inaccurate software bandwidth "
+                "estimate. Install mactop (brew install mactop) for accurate "
+                "hardware DRAM measurements. Software estimate excludes KV cache, "
+                "activation traffic, and does not account for expert cache hits.",
+                stacklevel=2,
+            )
             return sw
 
     raise RuntimeError(
