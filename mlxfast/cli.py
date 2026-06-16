@@ -145,10 +145,10 @@ def submit(
 def weights(
     force: bool = typer.Option(False, "--force", help="Re-download even if present"),
 ):
-    """Download the reference Gemma 4 26B 4-bit weights.
+    """Download the reference DeepSeek-V4-Flash 4-bit weights.
 
-    Downloads mlx-community/gemma-4-26B-A4B-it-qat-4bit to
-    mlxfast/reference_weights/. This is a one-time ~18 GB
+    Downloads mlx-community/DeepSeek-V4-Flash-4bit to
+    mlxfast/reference_weights/. This is a one-time ~141 GB
     download. Idempotent.
     """
     target = constants.REFERENCE_WEIGHTS_DIR / constants.REFERENCE_MODEL_DIRNAME
