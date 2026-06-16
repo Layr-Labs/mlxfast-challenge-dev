@@ -97,9 +97,10 @@ class MactopSession:
             return False
 
     def stop(self) -> List[float]:
-        """Terminate mactop and return non-zero DRAM BW samples (GB/s)."""
+        """Terminate mactop, store and return non-zero DRAM BW samples (GB/s)."""
         if self._proc is None:
-            return []
+            self._samples = []
+            return self._samples
         try:
             os.kill(self._proc.pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -119,6 +120,7 @@ class MactopSession:
                     bw = obj.get("soc_metrics", {}).get("dram_bw_combined_gbs", 0.0)
                     if bw > 0.0:
                         samples.append(float(bw))
+                self._samples = samples
                 return samples
         except (json.JSONDecodeError, TypeError, AttributeError):
             pass
@@ -134,6 +136,7 @@ class MactopSession:
                     samples.append(float(bw))
             except (json.JSONDecodeError, TypeError, AttributeError):
                 continue
+        self._samples = samples
         return samples
 
     def __enter__(self):
@@ -141,7 +144,7 @@ class MactopSession:
         return self
 
     def __exit__(self, *_):
-        self._samples = self.stop()
+        self.stop()
 
 
 def measure_idle_bandwidth(duration_s: float = 3.0) -> float:
