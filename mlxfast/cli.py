@@ -203,10 +203,10 @@ def clone():
     """Initialize a local working directory from the challenge template. STUB."""
     cwd = Path.cwd()
     required = [
-        constants.MODIFIABLE_DIR / "model.py",
-        constants.MODIFIABLE_DIR / "linear.py",
-        constants.MODIFIABLE_DIR / "weights.py",
-        constants.MODIFIABLE_DIR / "experts.py",
+        constants.MODIFIABLE_DIR / "deepseek_v4.py",
+        constants.MODIFIABLE_DIR / "language.py",
+        constants.MODIFIABLE_DIR / "config.py",
+        constants.MODIFIABLE_DIR / "hyper_connection.py",
     ]
     missing = [p for p in required if not p.exists()]
     if missing:
