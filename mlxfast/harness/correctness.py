@@ -10,6 +10,12 @@ Three independent layers per the challenge spec:
     hidden state (post-norm, pre-lm_head) must agree within
     CORRECTNESS_EPSILON (absolute).
 
+    Note: the spec (§4.2) specifies checking at each of the 43 layer
+    boundaries, but capturing intermediate hidden states requires
+    model-level hooks that are not available in the base interface.
+    The local harness checks only the final hidden state.  The server
+    performs the full per-layer comparison.
+
   Layer 3 — Top-K logit set: the set of the K highest-probability
     token IDs must match exactly at every step.
 
