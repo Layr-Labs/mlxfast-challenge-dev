@@ -54,36 +54,32 @@ jobs:
           key: pip-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: pip-${{ runner.os }}-
 
-      # Install venv and tooling; skip the HF weight download — we handle
-      # caching below so we know whether to download at all.
+      # Install venv and tooling; skip the HF weight download — sticky disks
+      # handle weight persistence so we control the download explicitly below.
       - name: Install dependencies
         run: MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
 
-      # Primary cache: the fully-transformed weights/ directory (~141 GB).
-      # Key covers transform.py + all mlx_models sources so any participant
-      # change invalidates it and triggers a fresh transform on the next step.
-      # Blacksmith serves this from colocated NVMe storage (~5–10 min restore).
-      - name: Cache transformed weights (~141 GB)
-        id: weights-cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      # Sticky disks mount a persistent Ceph-backed ext4 volume in ~3 seconds
+      # regardless of size — far faster than restoring 141 GB from cache.
+      # The disk commits after the job and is reused on the next run.
+      # Both disks are always mounted: reference weights stay resident so
+      # transform.py can re-run whenever participant source files change
+      # (benchmark.sh detects this via its source-hash check).
+      - name: Mount transformed weights disk (~141 GB)
+        uses: useblacksmith/stickydisk@v1
         with:
+          key: ${{ github.repository }}-ds4-weights
           path: weights
-          key: ds4-weights-${{ hashFiles('transform.py', 'mlx_models/**') }}-v1
 
-      # Secondary cache: the raw DS4-Flash HF checkpoint (~141 GB).
-      # Only restored on a transformed-weights cache miss, since transform.py
-      # needs the reference checkpoint. Static key — the checkpoint never changes.
-      - name: Cache reference weights (~141 GB)
-        if: steps.weights-cache.outputs.cache-hit != 'true'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Mount reference weights disk (~141 GB)
+        uses: useblacksmith/stickydisk@v1
         with:
+          key: ${{ github.repository }}-ds4-reference
           path: mlxfast/reference_weights/DeepSeek-V4-Flash-4bit
-          key: ds4-reference-weights-v1
 
-      # Download reference weights only when both caches miss (first ever run
-      # or reference cache evicted). benchmark.sh will then run transform.py.
-      - name: Download reference weights (on cache miss)
-        if: steps.weights-cache.outputs.cache-hit != 'true'
+      # On the very first run the reference disk is empty — download the
+      # checkpoint so benchmark.sh can run transform.py.
+      - name: Download reference weights (first run only)
         run: |
           if [[ ! -f mlxfast/reference_weights/DeepSeek-V4-Flash-4bit/config.json ]]; then
             .venv/bin/python -m mlxfast.cli weights
@@ -92,8 +88,8 @@ jobs:
       # Offline phase: benchmark.sh self-sandboxes — it proves the Seatbelt
       # profile (tools/deny-network.sb) blocks egress, then re-execs itself
       # under sandbox-exec with no network and no sudo.
-      # benchmark.sh skips transform when weights/ exists with the correct
-      # source hash; otherwise it runs transform.py first.
+      # benchmark.sh skips transform when weights/ is populated with the
+      # correct source hash; otherwise it re-runs transform.py first.
       - name: Benchmark (offline)
         env:
           MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
