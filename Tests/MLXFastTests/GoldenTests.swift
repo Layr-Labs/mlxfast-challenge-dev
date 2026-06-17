@@ -1,0 +1,63 @@
+import Foundation
+import Testing
+@testable import MLXFastCore
+
+@Test
+func loadGoldenCasesAcceptsValidFixture() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "hidden-0",
+          "prompt_tokens": [1, 2, 3],
+          "expected_tokens": \(expected)
+        }
+      ]
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    let cases = try loadGoldenCases(from: path.path)
+
+    #expect(cases.count == 1)
+    #expect(cases[0].name == "hidden-0")
+    #expect(cases[0].promptTokens == [1, 2, 3])
+    #expect(cases[0].expectedTokens.count == MLXFastConstants.correctnessSteps)
+}
+
+@Test
+func loadGoldenCasesRejectsOutOfRangeToken() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "bad",
+          "prompt_tokens": [\(MLXFastConstants.vocabSize)],
+          "expected_tokens": \(expected)
+        }
+      ]
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try loadGoldenCases(from: path.path)
+    }
+}
+
+private func temporaryDirectory() throws -> URL {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+        UUID().uuidString,
+        isDirectory: true
+    )
+    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
+}
