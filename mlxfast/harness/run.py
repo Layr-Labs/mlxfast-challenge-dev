@@ -191,7 +191,8 @@ def _force_sanitize_load(load_fn):
             return self
 
         def __exit__(self, *args):
-            return self._f.__exit__(*args)
+            self._f.__exit__(*args)
+            return False  # never suppress exceptions from the outer with-block
 
     def _patched_load_config(model_path, **kwargs):
         config = _orig_load_config(model_path, **kwargs)
@@ -206,6 +207,11 @@ def _force_sanitize_load(load_fn):
             config["quantization"] = remapped
         return config
 
+    # Scope: we patch only the mlx_vlm.utils module's own reference to
+    # safetensors.safe_open.  Code that imports safe_open directly via
+    # `from safetensors import safe_open` holds an independent reference
+    # and is unaffected.  The wrapper only strips `format: mlx` metadata,
+    # so it is harmless for tokenizer files which don't have that key.
     _vu.safetensors.safe_open = _SafeOpenNoFormatMeta
     _vu.load_config = _patched_load_config
     try:
@@ -234,6 +240,10 @@ def _load_participant_model(weights_path: str):
 
     participant_mod = importlib.import_module("mlx_models.deepseek_v4.deepseek_v4")
 
+    # Thread-safety note: this sys.modules swap is not thread-safe.
+    # The harness runs in a single-threaded subprocess so no concurrent
+    # model loads can race here.  Re-entrancy is also not possible because
+    # mlx_vlm.load does not call itself recursively.
     _orig = sys.modules.get("mlx_vlm.models.deepseek_v4")
     sys.modules["mlx_vlm.models.deepseek_v4"] = participant_mod
     try:
@@ -271,20 +281,51 @@ def _load_config_dict(weights_path: Path) -> dict:
         return json.load(f)
 
 
-def _measure_latency_and_memory(model, prompt: mx.array, num_tokens: int) -> tuple[float, float, "bandwidth.MactopSession"]:
-    """Decode `num_tokens` tokens, return (seconds_per_token, peak_ram_gb).
+def _check_architecture_invariants(weights_path: Path) -> None:
+    """Verify frozen config fields match the reference DeepSeek V4 Flash values.
 
-    Resets the MLX peak memory counter before the decode loop, then
-    reads peak memory after eval. This ensures peak RAM captures only
-    the decode phase, not prefill or warmup.
+    Raises RuntimeError if any field is missing or has a wrong value.
+    This prevents participants from changing model architecture (e.g. fewer
+    experts) to get an artificially better score.
     """
-    # Warmup
+    cfg = _load_config_dict(weights_path)
+
+    # Fields whose values must exactly match the reference checkpoint.
+    required = {
+        "num_hidden_layers": constants.NUM_HIDDEN_LAYERS,
+        "n_routed_experts": constants.N_ROUTED_EXPERTS,
+        "num_experts_per_tok": constants.NUM_EXPERTS_PER_TOK,
+        "vocab_size": constants.VOCAB_SIZE,
+    }
+    errors = []
+    for field, expected in required.items():
+        actual = cfg.get(field)
+        if actual is None:
+            errors.append(f"  {field}: MISSING (expected {expected})")
+        elif int(actual) != expected:
+            errors.append(f"  {field}: {actual} (expected {expected})")
+    if errors:
+        raise RuntimeError(
+            "Architecture invariant check failed — config.json has wrong values:\n"
+            + "\n".join(errors)
+        )
+
+
+def _measure_latency_and_memory(model, prompt: mx.array, num_tokens: int) -> tuple[float, int, "bandwidth.MactopSession"]:
+    """Decode `num_tokens` tokens, return (seconds_per_token, peak_ram_bytes).
+
+    Resets the MLX peak memory counter before any forward pass so that
+    warmup allocations (KV cache, slot bank, expert stacks) are included
+    in the peak. Decode reuses these buffers without re-allocating them,
+    so resetting after warmup would report near-zero peak.
+    """
+    # Reset before any forward pass — captures the true allocation peak.
+    mx.reset_peak_memory()
+
+    # Warmup — allocates KV cache, slot bank, expert stacks.
     cache = model.make_cache() if hasattr(model, "make_cache") else None
     _ = model(prompt, cache=cache)
     mx.eval(model.parameters())
-
-    # Reset peak memory counter before measuring decode.
-    mx.reset_peak_memory()
 
     # Start mactop hardware bandwidth measurement.
     mactop = bandwidth.MactopSession()
@@ -302,15 +343,19 @@ def _measure_latency_and_memory(model, prompt: mx.array, num_tokens: int) -> tup
     for _ in range(num_tokens - 1):
         out = model(next_tok, cache=cache)
         next_tok = mx.argmax(out.logits[0, -1:], axis=-1, keepdims=True)
-    mx.eval(next_tok)
+        mx.eval(next_tok)
     elapsed = time.perf_counter() - t0
 
     mactop._samples = mactop.stop()
 
     seconds_per_token = elapsed / num_tokens
-    peak_ram_gb = _peak_gpu_memory_gb()
+    peak_ram_bytes = mx.get_peak_memory()
 
-    return seconds_per_token, peak_ram_gb, mactop
+    # Attach actual elapsed so bandwidth.measure() uses the real mactop
+    # sample window rather than a value derived from mean decode_spt.
+    mactop._elapsed = elapsed
+
+    return seconds_per_token, peak_ram_bytes, mactop
 
 
 def _measure_prefill_latency(model, prompt: mx.array) -> float:
@@ -367,10 +412,30 @@ def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
     harness_hash = constants.compute_harness_hash()
 
     # Seed the prompt.
-    seed = int(hashlib_sha256(f"{secret}|{commit}")) % (2**31)
+    seed = int(hashlib_sha256(f"{secret}|{commit}")) % (2**63)
 
     try:
-        sub_model, _, _ = _load_models(weights_path)
+        # Verify frozen architecture fields before loading to prevent
+        # participants from changing num_experts, num_layers, etc.
+        _check_architecture_invariants(weights_path)
+
+        # When no transform.py exists the server must verify weight provenance
+        # via a pinned reference hash.  Locally we can only warn; the server
+        # will reject any submission whose weights hash doesn't match.
+        if not constants.TRANSFORM_SCRIPT.exists():
+            import warnings
+            warnings.warn(
+                "No transform.py found. Weight provenance cannot be verified "
+                "locally. The server will compare weights/ against the pinned "
+                "reference hash and reject mismatches.",
+                stacklevel=2,
+            )
+
+        # Measure idle DRAM baseline before model loads so background
+        # system traffic (display, kernel tasks) can be subtracted.
+        idle_gbps = bandwidth.measure_idle_bandwidth(duration_s=3.0)
+
+        ref_model, ref_tokenizer, sub_model = _load_models(weights_path)
 
         # Correctness checking is disabled for now: this harness measures
         # performance only. num_layers is still reported as run metadata.
@@ -395,21 +460,21 @@ def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
             seed ^ 0xDEADBEEF,  # distinct seed from the decode prompt
         )
 
+        # Measure prefill latency first (cold slot-bank) so that prefill
+        # pays its true disk-read cost rather than benefiting from experts
+        # already cached by the decode phase.
+        prefill_spt = _measure_prefill_latency(sub_model, prefill_prompt)
+
         # Measure decode latency, peak RAM, and bandwidth together.
-        decode_spt, peak_gb, mactop_session = _measure_latency_and_memory(
+        decode_spt, peak_bytes, mactop_session = _measure_latency_and_memory(
             sub_model, prompt, constants.DECODE_LENGTH
         )
-        peak_bytes = int(peak_gb * (1024**3))
         bw = bandwidth.measure(
             mactop_session,
             constants.DECODE_LENGTH,
-            decode_duration=decode_spt * constants.DECODE_LENGTH,
-            model=sub_model,
-            experts_manifest_path=str(weights_path / "experts" / "manifest.json"),
+            decode_duration=getattr(mactop_session, "_elapsed", decode_spt * constants.DECODE_LENGTH),
+            idle_gbps=idle_gbps,
         )
-
-        # Measure prefill latency.
-        prefill_spt = _measure_prefill_latency(sub_model, prefill_prompt)
 
         sr = score.compute(
             peak_ram_bytes=peak_bytes,
@@ -460,10 +525,10 @@ def run(weights_path: Path, note: str, secret: str = "") -> RunReport:
 
 
 def hashlib_sha256(s: str) -> int:
-    """SHA-256 of a string, returned as an int (truncated to 31 bits)."""
+    """SHA-256 of a string, returned as an int (truncated to 63 bits)."""
     import hashlib
 
-    return int.from_bytes(hashlib.sha256(s.encode()).digest()[:4], "big")
+    return int.from_bytes(hashlib.sha256(s.encode()).digest()[:8], "big")
 
 
 def main():

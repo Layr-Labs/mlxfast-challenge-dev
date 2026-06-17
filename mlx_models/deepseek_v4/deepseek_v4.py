@@ -87,17 +87,35 @@ class Model(nn.Module):
             )
         filtered = [(k, v) for k, v in weights if not _is_expert_weight(k)]
         result = super().load_weights(filtered, strict=strict)
-        # After weights are loaded, configure SSD streaming if the experts
-        # directory exists.
         experts_dir = Path("weights") / "experts"
-        if experts_dir.exists():
-            self._configure_streaming(str(experts_dir))
+        ref_dir = self._find_reference_dir()
+        if ref_dir is not None:
+            self._configure_safetensors_streaming(ref_dir, str(experts_dir))
         return result
 
-    def _configure_streaming(self, experts_dir: str) -> None:
-        """Wire the global slot bank and set layer indices on every SwitchGLU."""
-        from mlx_models.mlx_lm_shims.switch_layers import configure_streaming
-        configure_streaming(experts_dir)
+    @staticmethod
+    def _find_reference_dir() -> Optional[str]:
+        """Return the path to the HF reference weights directory, or None."""
+        candidates = [
+            Path("mlxfast") / "reference_weights" / "DeepSeek-V4-Flash-4bit",
+            Path("reference_weights") / "DeepSeek-V4-Flash-4bit",
+            Path("weights") / "reference",
+        ]
+        for p in candidates:
+            if (p / "model.safetensors.index.json").exists():
+                return str(p)
+        return None
+
+    def _configure_safetensors_streaming(
+        self, reference_dir: str, experts_dir: str
+    ) -> None:
+        """Wire the global slot bank (safetensors mode) and set layer indices."""
+        from mlx_models.mlx_lm_shims.switch_layers import configure_safetensors_streaming
+        configure_safetensors_streaming(reference_dir, experts_dir)
+        self._assign_layer_indices()
+
+    def _assign_layer_indices(self) -> None:
+        """Set _layer_idx on every StreamingSwitchGLU in the model."""
 
         # Collect all MoE switch layers in order.
         moe_layers: list[tuple[int, object]] = []
@@ -108,7 +126,3 @@ class Model(nn.Module):
                 switch._layer_idx = layer_idx
                 moe_layers.append((layer_idx, switch))
 
-        # Wire cross-layer prefetch metadata.
-        for i, (layer_idx, switch) in enumerate(moe_layers):
-            if i + 1 < len(moe_layers):
-                switch._next_moe_layer_idx = moe_layers[i + 1][0]

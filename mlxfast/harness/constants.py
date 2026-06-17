@@ -84,13 +84,21 @@ def harness_root() -> Path:
 
 
 def compute_harness_hash() -> str:
-    """SHA-256 of every .py file under harness/ + the version pin
-    constants. The CLI computes this on each run and compares to the
-    EXPECTED_HARNESS_HASH env var or a server-supplied manifest."""
+    """SHA-256 of every .py file under the mlxfast/ package + version pins.
+
+    Covers harness/, cli.py, _harness_runner.py, _sandbox.py, _self_hash.py
+    so that modifying any part of the harness changes the hash.
+    """
     h = hashlib.sha256()
-    # Include the version pins so changing them changes the hash.
-    h.update(f"mlx={MLX_VERSION}\nmlx-lm>={MLX_LM_MIN_VERSION}\n".encode())
-    for path in sorted(_harness_dir().rglob("*.py")):
+    # Include all version pins so changing any of them changes the hash.
+    h.update(
+        f"mlx={MLX_VERSION}\n"
+        f"mlx-lm>={MLX_LM_MIN_VERSION}\n"
+        f"mlx-lm<{MLX_LM_MAX_VERSION}\n"
+        f"mlx-vlm={MLX_VLM_VERSION}\n"
+        .encode()
+    )
+    for path in sorted(harness_root().rglob("*.py")):
         h.update(path.read_bytes())
     return h.hexdigest()
 

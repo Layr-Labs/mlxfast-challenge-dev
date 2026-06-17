@@ -24,8 +24,8 @@ dependencies = [
   # copy is pure I/O and runs fine on the CPU backend -- no GPU needed -- which
   # is what lets the transform run on a Linux runner while the benchmark
   # harness uses Metal on macOS. mlx-lm is only used by that macOS harness.
-  "mlx==0.31.1; sys_platform == 'darwin'",
-  "mlx[cpu]==0.31.1; sys_platform == 'linux'",
+  "mlx==0.31.2; sys_platform == 'darwin'",
+  "mlx[cpu]==0.31.2; sys_platform == 'linux'",
   "mlx-lm>=0.31.2,<0.32; sys_platform == 'darwin'",
   "safetensors>=0.4",
   "numpy>=1.24",

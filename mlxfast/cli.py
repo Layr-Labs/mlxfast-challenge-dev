@@ -145,10 +145,10 @@ def submit(
 def weights(
     force: bool = typer.Option(False, "--force", help="Re-download even if present"),
 ):
-    """Download the reference Gemma 4 26B 4-bit weights.
+    """Download the reference DeepSeek-V4-Flash 4-bit weights.
 
-    Downloads mlx-community/gemma-4-26B-A4B-it-qat-4bit to
-    mlxfast/reference_weights/. This is a one-time ~18 GB
+    Downloads mlx-community/DeepSeek-V4-Flash-4bit to
+    mlxfast/reference_weights/. This is a one-time ~141 GB
     download. Idempotent.
     """
     target = constants.REFERENCE_WEIGHTS_DIR / constants.REFERENCE_MODEL_DIRNAME
@@ -203,10 +203,10 @@ def clone():
     """Initialize a local working directory from the challenge template. STUB."""
     cwd = Path.cwd()
     required = [
-        constants.MODIFIABLE_DIR / "model.py",
-        constants.MODIFIABLE_DIR / "linear.py",
-        constants.MODIFIABLE_DIR / "weights.py",
-        constants.MODIFIABLE_DIR / "experts.py",
+        constants.MODIFIABLE_DIR / "deepseek_v4.py",
+        constants.MODIFIABLE_DIR / "language.py",
+        constants.MODIFIABLE_DIR / "config.py",
+        constants.MODIFIABLE_DIR / "hyper_connection.py",
     ]
     missing = [p for p in required if not p.exists()]
     if missing:
@@ -271,17 +271,21 @@ def _append_to_results_tsv(report: dict) -> None:
 
 
 def _write_score_json(report: dict, score_path: Path) -> None:
-    """Write score.json in the benchmark.json contract format."""
+    """Write score.json in the benchmark.json contract format.
+
+    Always written — even for failed or errored runs — so CI can
+    distinguish a correctness failure from a missing-file harness error.
+    Failed runs use score=null so Yukon/CI can detect them.
+    """
     if "raw" in report:
         return
 
     score = _finite_float(report.get("score"))
     passed = report.get("passed", "0") in ("1", True, "true", "True")
-    if not passed or score is None:
-        return
 
     payload = {
-        "score": score,
+        "score": score,  # null for failed/errored runs
+        "passed": passed,
         "metrics": {
             "peak_ram_gb": _float_metric(report, "peak_ram_gb"),
             "bandwidth_gb_per_token": _float_metric(report, "bandwidth_gb_per_tok"),
@@ -292,6 +296,7 @@ def _write_score_json(report: dict, score_path: Path) -> None:
             "first_failing_layer": _optional_int_metric(report, "first_failing_layer"),
             "max_abs_diff": _float_metric(report, "max_abs_diff"),
             "bandwidth_source": report.get("bandwidth_source", ""),
+            "error": report.get("error") or "",
             "commit": report.get("commit", ""),
             "timestamp": report.get("timestamp", ""),
             "harness_hash": report.get("harness_hash", ""),
@@ -380,10 +385,10 @@ def _build_submission_payload(weights: Path, note: str) -> dict:
 
     modifiable_hashes = {}
     for f in [
-        constants.MODIFIABLE_DIR / "model.py",
-        constants.MODIFIABLE_DIR / "linear.py",
-        constants.MODIFIABLE_DIR / "weights.py",
-        constants.MODIFIABLE_DIR / "experts.py",
+        constants.MODIFIABLE_DIR / "deepseek_v4.py",
+        constants.MODIFIABLE_DIR / "language.py",
+        constants.MODIFIABLE_DIR / "config.py",
+        constants.MODIFIABLE_DIR / "hyper_connection.py",
     ]:
         if f.exists():
             modifiable_hashes[str(f)] = _hash_file(f)

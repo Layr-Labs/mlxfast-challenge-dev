@@ -61,14 +61,20 @@ OUTPUT = Path("{output}").resolve()
 # sys.path is fully populated (by the interpreter startup) and we
 # can enumerate stdlib + site-packages directories.
 #
-# Empty-string entries mean "cwd" — that is the participant's working
-# directory, which must NOT be an allowed read source.
+# Empty-string entries and "." mean cwd — the participant's working
+# directory, which must NOT be an allowed read source.  We also
+# explicitly exclude the resolved cwd itself so that absolute-path
+# entries that happen to equal cwd are rejected too.
+_CWD = Path(".").resolve()
 _ALLOWED_READ_ROOTS = set()
 for _sp in sys.path:
-    if _sp and _sp != ".":
-        _candidate = Path(_sp).resolve()
-        if _candidate.is_dir():
-            _ALLOWED_READ_ROOTS.add(_candidate)
+    if not _sp or _sp == ".":
+        continue
+    _candidate = Path(_sp).resolve()
+    if _candidate == _CWD or _CWD in _candidate.parents:
+        continue
+    if _candidate.is_dir():
+        _ALLOWED_READ_ROOTS.add(_candidate)
 
 def _is_within(path, parent):
     try:
@@ -138,12 +144,20 @@ def _audit_hook(event, args):
         # Block loading new native libraries. Extensions already loaded
         # before the hook was installed are in ctypes' internal cache and
         # will not trigger dlopen again.
+        # Residual risk (A-043): libraries imported before this hook was
+        # installed (e.g. numpy, mlx) retain their function pointers and
+        # can still call C code.  This is accepted: those libraries are
+        # part of the approved Python environment and are not under
+        # participant control.
         sys.stderr.write(
             f"BLOCKED: ctypes.dlopen({{args[0] if args else '?'}})\\n"
         )
         sys.exit(3)
     elif event == "ctypes.call_function":
         sys.stderr.write("BLOCKED: ctypes.call_function\\n")
+        sys.exit(3)
+    elif event == "os.sendfile":
+        sys.stderr.write("BLOCKED: os.sendfile\\n")
         sys.exit(3)
 
 sys.addaudithook(_audit_hook)
@@ -152,8 +166,10 @@ sys.addaudithook(_audit_hook)
 # host-specific paths from it.
 os.environ.clear()
 
-# Freeze every attribute on the time module — this blocks time.time(),
-# time.monotonic(), time.time_ns(), time.gmtime(), time.sleep(), etc.
+# Block only clock functions that return wall-clock time and could be used
+# to seed an RNG or introduce non-determinism.  Performance counters and
+# sleep() are harmless: they don't affect output, and some internal numpy/
+# mlx routines call perf_counter() for logging.
 import time as _time
 class _FrozenAttr:
     def __getattr__(self, name):
@@ -164,9 +180,8 @@ class _FrozenAttr:
         sys.exit(3)
 _frozen = _FrozenAttr()
 for _name in (
-    "time", "monotonic", "perf_counter", "process_time",
-    "time_ns", "monotonic_ns", "perf_counter_ns",
-    "gmtime", "localtime", "mktime", "sleep",
+    "time", "time_ns",
+    "gmtime", "localtime", "mktime",
 ):
     try:
         setattr(_time, _name, _frozen)

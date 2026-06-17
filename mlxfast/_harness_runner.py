@@ -36,7 +36,7 @@ import os
 os.chdir({cwd!r})
 
 # Add the participant's working directory to sys.path so
-# `import mlx_models.gemma4` resolves to their modifiable surface.
+# `import mlx_models.deepseek_v4` resolves to their modifiable surface.
 sys.path.insert(0, {cwd!r})
 
 from mlxfast.harness import run as harness_run

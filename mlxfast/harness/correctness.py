@@ -10,6 +10,12 @@ Three independent layers per the challenge spec:
     hidden state (post-norm, pre-lm_head) must agree within
     CORRECTNESS_EPSILON (absolute).
 
+    Note: the spec (§4.2) specifies checking at each of the 43 layer
+    boundaries, but capturing intermediate hidden states requires
+    model-level hooks that are not available in the base interface.
+    The local harness checks only the final hidden state.  The server
+    performs the full per-layer comparison.
+
   Layer 3 — Top-K logit set: the set of the K highest-probability
     token IDs must match exactly at every step.
 
@@ -25,7 +31,7 @@ import mlx.core as mx
 
 from .constants import CORRECTNESS_EPSILON
 
-CORRECTNESS_STEPS = 64      # decode steps to check (full 256 is slow; 64 is sufficient)
+CORRECTNESS_STEPS = 256     # decode steps to check (spec §4.2 specifies 256)
 CORRECTNESS_TOP_K = 10      # top-K logit set size for Layer 3
 
 
@@ -151,11 +157,10 @@ def check(
         max_abs = max(max_abs, h_diff)
         max_rel = max(max_rel, h_rel)
 
-        # Layer 3: top-K logit set match.
-        ref_topk = set(mx.argpartition(-ref_logits, kth=CORRECTNESS_TOP_K - 1)
-                       [:CORRECTNESS_TOP_K].tolist())
-        sub_topk = set(mx.argpartition(-sub_logits, kth=CORRECTNESS_TOP_K - 1)
-                       [:CORRECTNESS_TOP_K].tolist())
+        # Layer 3: top-K logit set match. Use argsort for stable ordering so
+        # equal-logit tokens produce a deterministic set on GPU.
+        ref_topk = set(mx.argsort(-ref_logits)[:CORRECTNESS_TOP_K].tolist())
+        sub_topk = set(mx.argsort(-sub_logits)[:CORRECTNESS_TOP_K].tolist())
 
         step_failed = (
             ref_next != sub_next          # Layer 1

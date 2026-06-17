@@ -391,8 +391,11 @@ FROZEN_CONFIG_FIELDS = [
     "model_type", "num_hidden_layers", "hidden_size", "n_routed_experts",
     "num_experts_per_tok", "n_shared_experts", "num_attention_heads",
     "num_key_value_heads", "vocab_size", "moe_intermediate_size",
-    "intermediate_size", "head_dim", "q_lora_rank",
+    "head_dim", "q_lora_rank",
 ]
+# Note: `intermediate_size` is NOT included — the reference DS4 Flash
+# config.json does not contain this field (it uses `moe_intermediate_size`).
+# The ModelConfig dataclass defaults intermediate_size=18432.
 ```
 
 ### 6.4 Peak RAM: harness-controlled measurement

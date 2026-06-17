@@ -235,10 +235,12 @@ class HyperConnection(nn.Module):
         z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
         mixes = z @ self.fn.T
 
+        _KERNEL_DTYPES = (mx.float16, mx.bfloat16)
         use_ops = (
             self.training
             or mx.default_device() != mx.gpu
             or not mx.metal.is_available()
+            or x.dtype not in _KERNEL_DTYPES
         )
         hc_func = _hc_ops if use_ops else _hc_kernel
 
