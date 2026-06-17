@@ -202,71 +202,21 @@ def _mactop_result(
     )
 
 
-def _moe_software_estimate(
-    model,
-    experts_manifest_path: str,
-    num_tokens: int,
-) -> Optional[BandwidthResult]:
-    """MoE-aware software bandwidth estimate used as mactop fallback.
-
-    Counts bytes actually read per decode token:
-      - Non-expert model weights (resident in Metal, from model.parameters())
-      - Activated expert weights: NUM_EXPERTS_PER_TOK × record_size × num_moe_layers
-        where record_size comes from the expert manifest (exact on-disk size).
-
-    This is correct for streaming MoE: expert weights are filtered from
-    model.parameters() so they are not double-counted here.
-    """
-    from .constants import NUM_EXPERTS_PER_TOK, NUM_HIDDEN_LAYERS
-    try:
-        from mlx.utils import tree_flatten
-    except ImportError:
-        return None
-
-    # Non-expert model weights resident in Metal.
-    leaves = tree_flatten(model.parameters())
-    non_expert_bytes = sum(arr.nbytes for _, arr in leaves)
-
-    # Activated expert bytes per token from the manifest record_size.
-    expert_bytes = 0
-    try:
-        with open(experts_manifest_path) as f:
-            manifest = json.load(f)
-        record_size: int = manifest["record_size"]
-        expert_bytes = NUM_EXPERTS_PER_TOK * record_size * NUM_HIDDEN_LAYERS
-    except (FileNotFoundError, KeyError, TypeError):
-        pass  # manifest unavailable — omit expert bandwidth
-
-    total_bytes = non_expert_bytes + expert_bytes
-    gb_per_token = total_bytes / (1024 ** 3)
-    return BandwidthResult(
-        bytes_read=total_bytes,
-        tokens_decoded=num_tokens,
-        gb_per_token=gb_per_token,
-        source="moe_software_model",
-    )
-
-
 # ── public API ────────────────────────────────────────────────────────────────
 
 def measure(
     mactop_session: MactopSession,
     num_tokens: int = DECODE_LENGTH,
     decode_duration: float = 0.0,
-    model=None,
-    experts_manifest_path: str = "",
     idle_gbps: float = 0.0,
 ) -> BandwidthResult:
-    """Return bandwidth for `num_tokens` decode steps.
+    """Return bandwidth for `num_tokens` decode steps measured via mactop hardware
+    DRAM counters.
 
-    Primary: mactop hardware DRAM counters (captures all traffic including
-    expert SSD reads via page cache — correct for MoE without any special
-    formula). idle_gbps is subtracted per-sample to remove background DRAM
-    traffic (display, kernel tasks) from the measurement.
+    idle_gbps is subtracted per-sample to remove background DRAM traffic
+    (display, kernel tasks) from the measurement.
 
-    Fallback: MoE-aware software model using non-expert model.parameters()
-    bytes plus activated-expert bytes from the expert manifest.  Used only
-    when mactop produces no samples.  Requires model and experts_manifest_path.
+    Raises RuntimeError if mactop produces no non-zero samples.
     """
     if mactop_session is None:
         raise TypeError("mactop_session is required")
@@ -275,21 +225,8 @@ def measure(
     if result is not None:
         return result
 
-    if model is not None:
-        sw = _moe_software_estimate(model, experts_manifest_path, num_tokens)
-        if sw is not None:
-            import warnings
-            warnings.warn(
-                "mactop produced no samples; using inaccurate software bandwidth "
-                "estimate. Install mactop (brew install mactop) for accurate "
-                "hardware DRAM measurements. Software estimate excludes KV cache, "
-                "activation traffic, and does not account for expert cache hits.",
-                stacklevel=2,
-            )
-            return sw
-
     raise RuntimeError(
-        "mactop produced no non-zero DRAM bandwidth samples and no "
-        "software fallback is available; install mactop and ensure "
+        "mactop produced no non-zero DRAM bandwidth samples; "
+        "install mactop (brew install mactop) and ensure "
         "hardware counters are available"
     )

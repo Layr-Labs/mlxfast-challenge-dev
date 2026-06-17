@@ -281,6 +281,22 @@ def main() -> None:
         for layer_idx in range(n_layers):
             buf = bytearray(n_experts * record_size)
 
+            # ── optimisation for stacked format ──────────────────────────
+            # When experts are stored as stacked tensors (axis 0 = 256
+            # experts), the naive loop below would read the SAME stacked
+            # tensor from disk 256 times — once per expert.  Cache each
+            # stacked tensor once per layer and slice in memory.
+            stacked_cache: dict[str, np.ndarray] = {}
+            if _STACKED_KEYS:
+                for (l, e, proj, ttype), (shard_name, key) in expert_keys.items():
+                    if l != layer_idx or e != 0:
+                        continue
+                    if key not in stacked_cache:
+                        arr = handles[shard_name].get_tensor(key)
+                        if ttype == "weight" and arr.dtype == np.uint8:
+                            arr = arr.view(np.uint32)
+                        stacked_cache[key] = arr
+
             for expert_idx in range(n_experts):
                 rec_start = expert_idx * record_size
                 for proj in projs:
@@ -297,12 +313,14 @@ def main() -> None:
                                 f"proj={proj} type={ttype}"
                             )
                         shard_name, key = entry
-                        arr = handles[shard_name].get_tensor(key)
-                        # Stacked format: slice expert axis.
-                        if key in _STACKED_KEYS:
-                            arr = arr[expert_idx]
-                        if ttype == "weight" and arr.dtype == np.uint8:
-                            arr = arr.view(np.uint32)
+                        # Use in-memory cache for stacked tensors, read from
+                        # disk for per-expert tensors.
+                        if key in stacked_cache:
+                            arr = stacked_cache[key][expert_idx]
+                        else:
+                            arr = handles[shard_name].get_tensor(key)
+                            if ttype == "weight" and arr.dtype == np.uint8:
+                                arr = arr.view(np.uint32)
                         raw = arr.tobytes()
                         start = rec_start + meta["offset_in_record"]
                         buf[start : start + len(raw)] = raw
