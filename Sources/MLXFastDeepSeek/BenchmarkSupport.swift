@@ -20,14 +20,24 @@ public enum BenchmarkPreflight {
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> BenchmarkPreflightReport {
         let requiredFiles = [
-            "\(weightsPath)/config.json": "transformed config",
-            "\(weightsPath)/model.safetensors.index.json": "dense safetensors index",
-            "\(weightsPath)/experts/manifest.json": "expert manifest",
-            goldenPath: "correctness golden file",
+            ("\(weightsPath)/config.json", "transformed config"),
+            ("\(weightsPath)/model.safetensors.index.json", "dense safetensors index"),
+            ("\(weightsPath)/experts/manifest.json", "expert manifest"),
+            (goldenPath, "correctness golden file"),
         ]
-        for (path, description) in requiredFiles.sorted(by: { $0.key < $1.key }) {
+        for (path, description) in requiredFiles {
             try requireFile(path, description: description)
         }
+
+        _ = try loadGoldenCases(from: goldenPath)
+        _ = try DeepSeekConfig.load(from: weightsPath)
+
+        let denseStore = try DenseTensorStore(weightsPath: weightsPath)
+        try denseStore.validateReadableByteRanges()
+
+        let expertBank = try ExpertSlotBank(manifestPath: "\(weightsPath)/experts/manifest.json")
+        try expertBank.validateReadableByteRanges()
+
         return BenchmarkPreflightReport(
             weightsPath: weightsPath,
             goldenPath: goldenPath,

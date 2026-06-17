@@ -175,6 +175,27 @@ public final class ExpertSlotBank {
         )
     }
 
+    public func validateReadableByteRanges(fileManager: FileManager = .default) throws {
+        let baseURL = URL(fileURLWithPath: manifest.referencePath)
+        let recordsByShard = Dictionary(grouping: manifest.expertTensors) { $0.shard }
+        for shard in recordsByShard.keys.sorted() {
+            let shardPath = baseURL.appendingPathComponent(shard).path
+            let attributes = try fileManager.attributesOfItem(atPath: shardPath)
+            guard let fileSize = attributes[.size] as? NSNumber else {
+                throw MLXFastError.invalidInput("expert shard size is unavailable: \(shardPath)")
+            }
+            let byteCount = fileSize.intValue
+            for record in recordsByShard[shard, default: []] {
+                let end = record.byteOffset + record.byteLength
+                guard record.byteOffset >= 0, record.byteLength > 0, end <= byteCount else {
+                    throw MLXFastError.invalidInput(
+                        "expert tensor \(record.name) byte range \(record.byteOffset)..<\(end) exceeds shard size \(byteCount)"
+                    )
+                }
+            }
+        }
+    }
+
     public var cachedTensorNames: [String] {
         lru
     }

@@ -59,6 +59,26 @@ public final class DenseTensorStore {
         )
     }
 
+    public func validateReadableByteRanges(fileManager: FileManager = .default) throws {
+        let recordsByShard = Dictionary(grouping: recordsByName.values) { $0.shard }
+        for shard in recordsByShard.keys.sorted() {
+            let shardPath = URL(fileURLWithPath: weightsPath).appendingPathComponent(shard).path
+            let attributes = try fileManager.attributesOfItem(atPath: shardPath)
+            guard let fileSize = attributes[.size] as? NSNumber else {
+                throw MLXFastError.invalidInput("dense shard size is unavailable: \(shardPath)")
+            }
+            let byteCount = fileSize.intValue
+            for record in recordsByShard[shard, default: []] {
+                let end = record.byteOffset + record.byteLength
+                guard record.byteOffset >= 0, record.byteLength > 0, end <= byteCount else {
+                    throw MLXFastError.invalidInput(
+                        "dense tensor \(record.name) byte range \(record.byteOffset)..<\(end) exceeds shard size \(byteCount)"
+                    )
+                }
+            }
+        }
+    }
+
     private static func loadRecords(weightsPath: String) throws -> [String: DenseTensorRecord] {
         let weightsURL = URL(fileURLWithPath: weightsPath)
         try requireFile(
