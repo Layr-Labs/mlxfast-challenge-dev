@@ -6,7 +6,8 @@ REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/DeepSeek-V4-
 REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-main}"
 REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-https://huggingface.co/${REFERENCE_MODEL_REPO}/resolve/${REFERENCE_REVISION}}"
 REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-170}"
-REFERENCE_FILES=(
+SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
+REFERENCE_METADATA_FILES=(
   "README.md"
   "chat_template.jinja"
   "config.json"
@@ -15,11 +16,6 @@ REFERENCE_FILES=(
   "tokenizer.json"
   "tokenizer_config.json"
 )
-
-for ((shard_index = 1; shard_index <= 33; shard_index++)); do
-  printf -v shard_name "model-%05d-of-00033.safetensors" "${shard_index}"
-  REFERENCE_FILES+=("${shard_name}")
-done
 
 load_homebrew_shellenv() {
   local candidate
@@ -182,11 +178,25 @@ download_reference_file() {
   touch "${marker_path}"
 }
 
+list_reference_shards() {
+  local index_path="$1"
+
+  if [[ ! -x "${SWIFT_BIN}" ]]; then
+    echo "setup.sh: Swift binary missing at ${SWIFT_BIN}; build failed or MLXFAST_SWIFT_BIN is wrong" >&2
+    return 1
+  fi
+
+  "${SWIFT_BIN}" checkpoint-shards --index "${index_path}"
+}
+
 download_reference_weights() {
   local reference_dir="$1"
   local parent_dir
   local partial_dir
   local file
+  local index_path
+  local shard_list
+  local shard_files=()
 
   if [[ -f "${reference_dir}/config.json" ]]; then
     echo "setup.sh: reference weights already present at ${reference_dir}"
@@ -215,7 +225,7 @@ EOF
   mkdir -p "${partial_dir}"
 
   echo "setup.sh: downloading ${REFERENCE_MODEL_REPO} from ${REFERENCE_BASE_URL}"
-  for file in "${REFERENCE_FILES[@]}"; do
+  for file in "${REFERENCE_METADATA_FILES[@]}"; do
     download_reference_file "${file}" "${partial_dir}/${file}"
   done
 
@@ -223,6 +233,29 @@ EOF
     echo "setup.sh: downloaded checkpoint is missing config.json" >&2
     return 1
   fi
+  index_path="${partial_dir}/model.safetensors.index.json"
+  if [[ ! -f "${index_path}" ]]; then
+    echo "setup.sh: downloaded checkpoint is missing model.safetensors.index.json" >&2
+    return 1
+  fi
+
+  if ! shard_list="$(list_reference_shards "${index_path}")"; then
+    return 1
+  fi
+  while IFS= read -r file; do
+    if [[ -n "${file}" ]]; then
+      shard_files+=("${file}")
+    fi
+  done <<< "${shard_list}"
+  if [[ "${#shard_files[@]}" -eq 0 ]]; then
+    echo "setup.sh: checkpoint index did not list any safetensors shards" >&2
+    return 1
+  fi
+
+  echo "setup.sh: checkpoint index lists ${#shard_files[@]} safetensors shard(s)"
+  for file in "${shard_files[@]}"; do
+    download_reference_file "${file}" "${partial_dir}/${file}"
+  done
 
   find "${partial_dir}" -name "*.complete" -type f -delete
   mv "${partial_dir}" "${reference_dir}"

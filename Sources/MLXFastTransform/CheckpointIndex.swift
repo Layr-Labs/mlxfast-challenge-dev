@@ -54,3 +54,24 @@ extension CheckpointIndex {
         return CheckpointIndex(raw: ["weight_map": weightMap], weightMap: weightMap)
     }
 }
+
+public enum CheckpointIndexTools {
+    public static func safetensorShardNames(from indexPath: String) throws -> [String] {
+        let index = try CheckpointIndex.load(from: URL(fileURLWithPath: indexPath))
+        let shards = Set(index.weightMap.values)
+        guard !shards.isEmpty else {
+            throw MLXFastError.invalidInput("checkpoint index contains no shard names: \(indexPath)")
+        }
+        for shard in shards.sorted() {
+            guard !shard.isEmpty else {
+                throw MLXFastError.invalidInput("checkpoint index contains an empty shard name: \(indexPath)")
+            }
+            guard shard.hasSuffix(".safetensors") else {
+                throw MLXFastError.invalidInput(
+                    "checkpoint index maps tensors to unsupported shard \(shard); expected safetensors"
+                )
+            }
+        }
+        return shards.sorted()
+    }
+}

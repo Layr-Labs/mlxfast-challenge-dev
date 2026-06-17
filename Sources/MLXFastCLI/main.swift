@@ -32,6 +32,9 @@ struct MLXFastCLI {
             case "benchmark":
                 try runBenchmark(options)
                 return 0
+            case "checkpoint-shards":
+                try runCheckpointShards(options)
+                return 0
             default:
                 fputs("mlxfast-swift: unknown command '\(command)'\n\n", stderr)
                 printUsage()
@@ -151,6 +154,16 @@ struct MLXFastCLI {
         print("wrote \(scorePath)")
     }
 
+    private static func runCheckpointShards(_ options: ParsedOptions) throws {
+        let indexPath = options.value(for: "--index", default: "")
+        guard !indexPath.isEmpty else {
+            throw MLXFastError.invalidInput("checkpoint-shards requires --index PATH")
+        }
+        for shard in try CheckpointIndexTools.safetensorShardNames(from: indexPath) {
+            print(shard)
+        }
+    }
+
     private static func printUsage() {
         print(
             """
@@ -159,6 +172,7 @@ struct MLXFastCLI {
               mlxfast-swift correctness [--weights PATH] [--golden PATH]
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--weights PATH] [--golden PATH] [--score-path PATH]
+              mlxfast-swift checkpoint-shards --index PATH
 
             Swift-only DeepSeek V4 Flash harness entrypoint.
             """
