@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Run a source-faithful benchmark and emit the benchmark.json scorePath.
+# Run the Swift benchmark and emit the benchmark.json scorePath.
 set -euo pipefail
 
 # The benchmark always runs offline. Unless already inside the sandbox, prove
 # the Seatbelt profile blocks egress, then re-exec under sandbox-exec (no sudo
-# needed) so transform.py and the harness never see the network — locally or
+# needed) so transform/runtime code never sees the network — locally or
 # in CI. The proxy vars point at a closed local port so anything that ignores
 # the profile fails fast instead of hanging.
 SANDBOX_PROFILE="${MLXFAST_SANDBOX_PROFILE:-tools/deny-network.sb}"
@@ -30,74 +30,44 @@ if [[ "${MLXFAST_IN_SANDBOX:-0}" != "1" && "${MLXFAST_NO_SANDBOX:-0}" != "1" ]];
     "$0" "$@"
 fi
 
-VENV_DIR="${VENV_DIR:-.venv}"
-PYTHON="${PYTHON:-${VENV_DIR}/bin/python}"
 SCORE_PATH="${MLXFAST_SCORE_PATH:-score.json}"
-REFERENCE_DIR="mlxfast/reference_weights/DeepSeek-V4-Flash-4bit"
-SOURCE_HASH_PATH="weights/.benchmark-source.sha256"
-BENCHMARK_HELPER="tools/benchmark_contract.py"
+WEIGHTS_PATH="${MLXFAST_WEIGHTS_PATH:-weights}"
+GOLDEN_PATH="${MLXFAST_CORRECTNESS_GOLDEN_PATH:-correctness_golden.json}"
+REFERENCE_PATH="${MLXFAST_REFERENCE_DIR:-reference_weights/DeepSeek-V4-Flash-4bit}"
+SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
+MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
 
-resolve_python() {
-  if [[ "${PYTHON}" == */* ]]; then
-    [[ -x "${PYTHON}" ]] && printf '%s\n' "${PYTHON}"
-    return 0
-  fi
-
-  command -v "${PYTHON}" 2>/dev/null || true
-}
-
-resolved_python="$(resolve_python)"
-if [[ -z "${resolved_python}" ]]; then
-  echo "benchmark.sh: ${PYTHON} not found; run ./setup.sh first" >&2
-  exit 1
-fi
-PYTHON="${resolved_python}"
-
-if [[ ! -f "${BENCHMARK_HELPER}" ]]; then
-  echo "benchmark.sh: missing ${BENCHMARK_HELPER}" >&2
-  exit 1
+if [[ ! -x "${SWIFT_BIN}" ]]; then
+  echo "benchmark.sh: Swift release binary missing; building"
+  mkdir -p .build/clang-module-cache
+  export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}"
+  swift build -c release
 fi
 
-mkdir -p weights
-wanted_hash="$("${PYTHON}" "${BENCHMARK_HELPER}" source-hash)"
-current_hash="$(cat "${SOURCE_HASH_PATH}" 2>/dev/null || true)"
+if [[ ! -f "${MLX_METALLIB}" ]]; then
+  echo "benchmark.sh: MLX metallib missing at ${MLX_METALLIB}; run ./setup.sh before ranked benchmark runs" >&2
+fi
 
-if [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f weights/config.json || "${current_hash}" != "${wanted_hash}" ]]; then
-  # Only a (re)transform needs the reference checkpoint. When weights/ is
-  # already present with a matching source hash -- e.g. restored from cache on
-  # the benchmark runner in the split CI pipeline -- we skip this branch
-  # entirely and never require the reference.
-  if [[ ! -f "${REFERENCE_DIR}/config.json" ]]; then
-    cat >&2 <<EOF
-benchmark.sh: reference weights not found at ${REFERENCE_DIR}, needed to (re)run transform.py.
-Run ./setup.sh, or set MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 only after placing the reference checkpoint there.
-(If you expected cached weights/, the source hash did not match -- transform.py changed since the cache was built.)
-EOF
-    exit 1
+if [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f "${WEIGHTS_PATH}/config.json" ]]; then
+  if [[ -f "${REFERENCE_PATH}/config.json" ]]; then
+    echo "benchmark.sh: regenerating weights with Swift transform"
+    if ! "${SWIFT_BIN}" transform --reference "${REFERENCE_PATH}" --output "${WEIGHTS_PATH}"; then
+      echo "benchmark.sh: Swift transform failed; benchmark will emit a failed score" >&2
+    fi
+  else
+    echo "benchmark.sh: reference weights missing at ${REFERENCE_PATH}; benchmark will emit a failed score" >&2
   fi
-  echo "benchmark.sh: regenerating weights from transform.py"
-  find weights -mindepth 1 ! -name .gitkeep -exec rm -rf {} +
-  "${PYTHON}" transform.py
-  if [[ ! -f weights/config.json ]]; then
-    echo "benchmark.sh: transform.py did not produce weights/config.json" >&2
-    exit 1
-  fi
-  printf '%s\n' "${wanted_hash}" > "${SOURCE_HASH_PATH}"
 else
-  echo "benchmark.sh: reusing weights/ for unchanged participant source"
+  echo "benchmark.sh: reusing ${WEIGHTS_PATH}/"
 fi
 
 rm -f "${SCORE_PATH}"
 
-run_args=(run --skip-transform-verify)
-if [[ "$#" -eq 0 ]]; then
-  run_args+=(--note "${MLXFAST_NOTE:-benchmark.json run}")
-else
-  run_args+=("$@")
-fi
-run_args+=(--score-path "${SCORE_PATH}")
-
-"${PYTHON}" -m mlxfast.cli "${run_args[@]}"
+"${SWIFT_BIN}" benchmark \
+  --weights "${WEIGHTS_PATH}" \
+  --golden "${GOLDEN_PATH}" \
+  --score-path "${SCORE_PATH}" \
+  "$@"
 
 if [[ ! -s "${SCORE_PATH}" ]]; then
   echo "benchmark.sh: benchmark did not produce ${SCORE_PATH}" >&2

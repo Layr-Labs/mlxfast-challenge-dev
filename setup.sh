@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Bootstrap system tools, Python dependencies, and the reference weights.
+# Bootstrap system tools and build the Swift-only DeepSeek harness.
 set -euo pipefail
-
-VENV_DIR="${VENV_DIR:-.venv}"
 
 load_homebrew_shellenv() {
   local candidate
@@ -67,6 +65,15 @@ ensure_mactop() {
     return 0
   fi
 
+  if [[ -n "${MLXFAST_MACTOP_BIN:-}" ]]; then
+    if [[ -x "${MLXFAST_MACTOP_BIN}" ]]; then
+      echo "setup.sh: using mactop at ${MLXFAST_MACTOP_BIN}"
+      return 0
+    fi
+    echo "setup.sh: MLXFAST_MACTOP_BIN is set but not executable: ${MLXFAST_MACTOP_BIN}" >&2
+    return 1
+  fi
+
   if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "setup.sh: skipping mactop install; mactop is only available on macOS"
     return 0
@@ -86,52 +93,58 @@ ensure_mactop() {
   fi
 }
 
-find_python() {
-  local candidate
-
-  if [[ -n "${PYTHON_BIN:-}" ]]; then
-    if command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
-      command -v "${PYTHON_BIN}"
-      return 0
-    fi
-    echo "setup.sh: PYTHON_BIN=${PYTHON_BIN} was not found" >&2
-    return 1
+ensure_swift_toolchain() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "setup.sh: this Swift harness targets macOS on Apple Silicon" >&2
+    exit 1
   fi
 
-  for candidate in python3.11 python3 python; do
-    if ! command -v "${candidate}" >/dev/null 2>&1; then
-      continue
-    fi
-    if "${candidate}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
-      command -v "${candidate}"
-      return 0
-    fi
-  done
+  if ! command -v swift >/dev/null 2>&1; then
+    echo "setup.sh: swift was not found; install Xcode command line tools" >&2
+    exit 1
+  fi
 
-  return 1
+  if ! command -v xcodebuild >/dev/null 2>&1; then
+    echo "setup.sh: xcodebuild was not found; install Xcode" >&2
+    exit 1
+  fi
 }
 
 ensure_mactop
 
-host_python="$(find_python || true)"
-if [[ -z "${host_python}" ]]; then
-  echo "setup.sh: Python 3.11+ is required" >&2
-  exit 1
+ensure_swift_toolchain
+
+echo "setup.sh: building Swift harness"
+mkdir -p .build/clang-module-cache
+export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}"
+swift build -c release
+
+if [[ "${MLXFAST_SKIP_MLX_METALLIB:-0}" == "1" ]]; then
+  echo "setup.sh: skipping mlx.metallib build"
+else
+  echo "setup.sh: building mlx.metallib for MLX Swift runtime"
+  tools/build-mlx-metallib.sh
 fi
 
-"${host_python}" -m venv "${VENV_DIR}"
-python="${VENV_DIR}/bin/python"
-if [[ ! -x "${python}" ]]; then
-  echo "setup.sh: virtualenv Python not found at ${python}" >&2
-  exit 1
-fi
-
-"${python}" -m pip install --upgrade pip setuptools wheel
-"${python}" -m pip install -e . "huggingface_hub>=0.23"
+REFERENCE_DIR="${MLXFAST_REFERENCE_DIR:-reference_weights/DeepSeek-V4-Flash-4bit}"
 
 if [[ "${MLXFAST_SKIP_WEIGHTS_DOWNLOAD:-0}" == "1" || "${SKIP_MODEL_DOWNLOAD:-0}" == "1" ]]; then
   echo "setup.sh: skipping reference weight download"
   exit 0
 fi
 
-"${python}" -m mlxfast.cli weights
+if [[ -f "${REFERENCE_DIR}/config.json" ]]; then
+  echo "setup.sh: reference weights already present at ${REFERENCE_DIR}"
+  exit 0
+fi
+
+cat >&2 <<EOF
+setup.sh: reference weights are not present at ${REFERENCE_DIR}.
+
+The Swift-only harness no longer bootstraps Python just to download weights.
+Place the DeepSeek V4 Flash checkpoint there, or rerun with:
+
+  MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
+
+EOF
+exit 1

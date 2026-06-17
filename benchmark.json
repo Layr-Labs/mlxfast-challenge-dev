@@ -2,11 +2,11 @@
   "schemaVersion": 1,
   "name": "mlxfast-challenge-dev",
   "description": "Optimize DeepSeek-V4-Flash MoE inference by transforming weights offline and reducing memory bandwidth without failing the correctness gate.",
-  "category": "python",
+  "category": "swift",
   "direction": "-",
   "editablePaths": [
-    "transform.py",
-    "mlx_models"
+    "Sources/MLXFastDeepSeek",
+    "Sources/MLXFastTransform"
   ],
   "setupCommand": ["bash", "-lc", "./setup.sh"],
   "benchmarkCommand": ["bash", "-lc", "./benchmark.sh"],

@@ -8,26 +8,24 @@ See [CHALLENGE.md](CHALLENGE.md) for the full problem statement, scoring formula
 ## Quickstart
 
 ```bash
-# Install Homebrew/mactop if needed, then Python deps and weights
+# Build the Swift harness, MLX metallib, and install mactop if needed
 ./setup.sh
 
-# Split expert weights onto SSD (baseline transform, runs once)
-python transform.py
+# Split dense weights into weights/ and write the expert streaming manifest
+.build/release/mlxfast-swift transform
 
-# Run the baseline — should match the published baseline score
-mlxfast run --note "baseline"
+# Run the Darkbloom-compatible benchmark entrypoint
+./benchmark.sh
 
-# Edit the modifiable surface and iterate
-vim mlx_models/mlx_lm_shims/switch_layers.py
-python transform.py   # only if you changed weight layout
-mlxfast run --note "my approach v1"
+# Or call the Swift CLI directly
+.build/release/mlxfast-swift preflight
+.build/release/mlxfast-swift benchmark --score-path score.json
+
+# If required model artifacts are missing, the benchmark emits a valid failed
+# score.json instead of a ranked score.
 ```
 
-Results append to `results.tsv`:
-
-```bash
-column -t -s $'\t' results.tsv
-```
+The benchmark writes `score.json` in the format consumed by Darkbloom.
 
 ## Why this challenge exists
 
@@ -44,23 +42,16 @@ their original 4-bit form. Every one of these is an optimisation target.
 ## The modifiable surface
 
 Unlike typical inference benchmarks, the entire model execution pipeline is
-in scope. You can modify any file under `mlx_models/`:
+in scope. Submissions should focus on the Swift targets listed in
+`benchmark.json`:
 
 | Path | What it controls |
 |---|---|
-| `mlx_models/mlx_lm_shims/switch_layers.py` | Expert streaming: slot bank, loading, dispatch. **Primary target.** |
-| `mlx_models/deepseek_v4/language.py` | All layer logic: MoE routing, attention, shared experts, hyper connections. |
-| `mlx_models/deepseek_v4/deepseek_v4.py` | Top-level model: forward dispatch, streaming configuration. |
-| `mlx_models/deepseek_v4/hyper_connection.py` | HyperConnection + fused Metal kernel. |
-| `mlx_models/cache.py` | KV cache implementations (RotatingKVCache, QuantizedKVCache, …). |
-| `mlx_models/turboquant.py` | TurboQuant KV cache Metal kernels. |
-| `mlx_models/speculative/drafters/deepseek_v4_mtp/` | MTP speculative decoding drafter. |
-| `mlx_models/mlx_lm_shims/mla.py` | MultiLinear / QuantizedMultiLinear (MLA attention projections). |
+| `Sources/MLXFastDeepSeek/` | DeepSeek V4 Flash runtime, MLX Swift array bridge, dense/expert loading, SSD streaming, decode/prefill logic. **Primary target.** |
+| `Sources/MLXFastTransform/` | Offline weight transform from frozen reference safetensors into benchmark-ready `weights/`. |
 
-Plus:
-
-- `transform.py` — offline weight transform. Deterministic function of the reference weights.
-- `weights/` — output of `transform.py`. The harness loads from here.
+The repository is Swift-only: setup, transform, correctness, and benchmark all
+run through the Swift package.
 
 ## Scoring
 
@@ -80,27 +71,24 @@ Correctness is a hard gate. See CHALLENGE.md for the full correctness specificat
 ## Architecture
 
 ```
-mlx_models/                  modifiable surface — the full DS4-Flash pipeline
-  deepseek_v4/               core model (language, attention, MoE, hyper connections)
-  mlx_lm_shims/              expert dispatch + MLA primitives (SwitchGLU, MultiLinear)
-  speculative/               MTP speculative decoding drafter
-  base.py / cache.py         shared model infrastructure and KV cache
-  turboquant.py              TurboQuant KV cache kernels
-transform.py                 offline weight transform (optional)
+Sources/
+  MLXFastCLI/                Swift command-line entrypoint
+  MLXFastCore/               score.json, golden cases, shared contracts
+  MLXFastTransform/          Swift offline weight transform
+  MLXFastDeepSeek/           DeepSeek V4 Flash Swift runtime
 weights/                     transformed weights (harness loads from here)
   experts/
-    manifest.json            expert record layout
-    layer_NN.bin             per-layer expert binaries (expert-major, fixed record size)
+    manifest.json            byte ranges for streamed expert tensors
 reference_weights/           original 4-bit checkpoint (frozen, read-only)
-harness/                     frozen measurement and validation code
-results.tsv                  local experiment log
-score.json                   written after each finite passing run
+correctness_golden.json      fixed greedy-token correctness cases
+score.json                   written after each benchmark run
 ```
 
 ## Requirements
 
 - Apple Silicon Mac, 24 GB+ unified memory (M2 or newer)
 - macOS Sequoia or later
-- Python 3.11+
-- `mlx>=0.31.2`, `mlx-vlm==0.6.3`, `mlx-lm>=0.31.3`
-- [mactop](https://github.com/metaspartan/mactop) — installed by `./setup.sh` via Homebrew when missing
+- Swift 6 / Xcode command line tools
+- Xcode Metal Toolchain, installable with `xcodebuild -downloadComponent MetalToolchain`
+- CMake, used by `tools/build-mlx-metallib.sh` to build `mlx.metallib`
+- [mactop](https://github.com/metaspartan/mactop) — installed by `./setup.sh` via Homebrew when missing, or supplied with `MLXFAST_MACTOP_BIN=/path/to/mactop`
