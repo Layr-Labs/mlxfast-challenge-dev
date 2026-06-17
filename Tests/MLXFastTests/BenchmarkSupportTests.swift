@@ -54,6 +54,32 @@ func mactopBandwidthRejectsNoUsableNetSamples() {
 }
 
 @Test
+func decodeTimingPlanStartsAfterSeedPrefill() throws {
+    let plan = try DecodeTimingPlan(seedTokenCount: 32, decodeSteps: 4)
+    var offsets: [Int] = []
+    for step in 0..<plan.decodeSteps {
+        offsets.append(try plan.positionOffset(forDecodedStep: step))
+    }
+
+    #expect(offsets == [32, 33, 34, 35])
+}
+
+@Test
+func decodeTimingPlanRejectsInvalidRanges() throws {
+    #expect(throws: MLXFastError.self) {
+        _ = try DecodeTimingPlan(seedTokenCount: 0, decodeSteps: 4)
+    }
+    #expect(throws: MLXFastError.self) {
+        _ = try DecodeTimingPlan(seedTokenCount: 32, decodeSteps: 0)
+    }
+
+    let plan = try DecodeTimingPlan(seedTokenCount: 32, decodeSteps: 4)
+    #expect(throws: MLXFastError.self) {
+        _ = try plan.positionOffset(forDecodedStep: 4)
+    }
+}
+
+@Test
 func mactopLocatorUsesExplicitExecutableOverride() throws {
     let directory = try temporaryDirectory()
     let executable = directory.appendingPathComponent("mactop")

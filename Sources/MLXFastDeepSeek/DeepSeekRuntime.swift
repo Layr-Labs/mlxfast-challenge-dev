@@ -234,6 +234,10 @@ public enum DeepSeekRuntime {
         guard !seedTokens.isEmpty else {
             throw MLXFastError.invalidInput("benchmark decode seed must not be empty")
         }
+        let timingPlan = try DecodeTimingPlan(
+            seedTokenCount: seedTokens.count,
+            decodeSteps: MLXFastConstants.benchmarkDecodeSteps
+        )
 
         let warmupCache = DeepSeekModelCache(config: weightCache.config)
         let warmupLogits = try DeepSeekModel.logits(
@@ -245,28 +249,26 @@ public enum DeepSeekRuntime {
         _ = try DeepSeekCorrectness.greedyToken(from: warmupLogits)
         Memory.clearCache()
 
+        let cache = DeepSeekModelCache(config: weightCache.config)
+        var logits = try DeepSeekModel.logits(
+            inputIDs: inputIDsArray(seedTokens),
+            weightCache: weightCache,
+            cache: cache,
+            positionOffset: 0
+        )
+        var token = try DeepSeekCorrectness.greedyToken(from: logits)
+
         let session = try MactopSession.start()
         let start = DispatchTime.now().uptimeNanoseconds
         do {
-            let cache = DeepSeekModelCache(config: weightCache.config)
-            var logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray(seedTokens),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: 0
-            )
-            var token = try DeepSeekCorrectness.greedyToken(from: logits)
-            var generated = 1
-
-            while generated < MLXFastConstants.benchmarkDecodeSteps {
+            for decodedStep in 0..<timingPlan.decodeSteps {
                 logits = try DeepSeekModel.logits(
                     inputIDs: inputIDsArray([token]),
                     weightCache: weightCache,
                     cache: cache,
-                    positionOffset: seedTokens.count + generated - 1
+                    positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
                 )
                 token = try DeepSeekCorrectness.greedyToken(from: logits)
-                generated += 1
             }
 
             let elapsed = secondsSince(start)
@@ -275,10 +277,10 @@ public enum DeepSeekRuntime {
                 samples: samples,
                 idleGBPerSecond: idleGBPerSecond,
                 decodeElapsedSeconds: elapsed,
-                decodedTokens: MLXFastConstants.benchmarkDecodeSteps
+                decodedTokens: timingPlan.decodeSteps
             )
             return DecodeMeasurement(
-                secondsPerToken: elapsed / Double(MLXFastConstants.benchmarkDecodeSteps),
+                secondsPerToken: elapsed / Double(timingPlan.decodeSteps),
                 bandwidthGBPerToken: bandwidth
             )
         } catch {
@@ -468,5 +470,30 @@ public enum DeepSeekRuntime {
             actualToken: nil,
             error: error
         )
+    }
+}
+
+struct DecodeTimingPlan: Equatable {
+    let seedTokenCount: Int
+    let decodeSteps: Int
+
+    init(seedTokenCount: Int, decodeSteps: Int) throws {
+        guard seedTokenCount > 0 else {
+            throw MLXFastError.invalidInput("benchmark decode seed must not be empty")
+        }
+        guard decodeSteps > 0 else {
+            throw MLXFastError.invalidInput("benchmark decode steps must be positive")
+        }
+        self.seedTokenCount = seedTokenCount
+        self.decodeSteps = decodeSteps
+    }
+
+    func positionOffset(forDecodedStep step: Int) throws -> Int {
+        guard step >= 0 && step < decodeSteps else {
+            throw MLXFastError.invalidInput(
+                "decode step \(step) is outside benchmark range 0..<\(decodeSteps)"
+            )
+        }
+        return seedTokenCount + step
     }
 }
