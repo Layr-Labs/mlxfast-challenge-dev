@@ -54,6 +54,10 @@ public final class DeepSeekLocalKVCache {
 
         return DeepSeekCachedKV(kv: combined, keyOffset: combinedStart)
     }
+
+    func arraysForMaterialization() -> [MLXArray] {
+        kv.map { [$0] } ?? []
+    }
 }
 
 public struct DeepSeekPoolingWindow {
@@ -147,6 +151,10 @@ public final class DeepSeekPoolingCache {
             .expandedDimensions(axis: 1)
         return poolIndex .< queryIndex.floorDivide(Int32(ratio))
     }
+
+    func arraysForMaterialization() -> [MLXArray] {
+        [bufferedKV, bufferedGate, pooled].compactMap { $0 }
+    }
 }
 
 public final class DeepSeekLayerCache {
@@ -158,6 +166,12 @@ public final class DeepSeekLayerCache {
         self.local = local
         self.pooled = pooled
         self.indexPooled = indexPooled
+    }
+
+    func arraysForMaterialization() -> [MLXArray] {
+        local.arraysForMaterialization()
+            + (pooled?.arraysForMaterialization() ?? [])
+            + (indexPooled?.arraysForMaterialization() ?? [])
     }
 }
 
@@ -171,6 +185,16 @@ public final class DeepSeekModelCache {
                 pooled: ratio == 0 ? nil : DeepSeekPoolingCache(ratio: ratio),
                 indexPooled: ratio == 4 ? DeepSeekPoolingCache(ratio: ratio) : nil
             )
+        }
+    }
+
+    func arraysForMaterialization() -> [MLXArray] {
+        layers.flatMap { $0.arraysForMaterialization() }
+    }
+
+    func materializeCachedState() {
+        for array in arraysForMaterialization() {
+            eval(array)
         }
     }
 }

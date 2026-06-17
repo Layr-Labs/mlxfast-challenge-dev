@@ -257,6 +257,7 @@ public enum DeepSeekRuntime {
             positionOffset: 0
         )
         var token = try DeepSeekCorrectness.greedyToken(from: logits)
+        cache.materializeCachedState()
 
         let session = try MactopSession.start()
         let start = DispatchTime.now().uptimeNanoseconds
