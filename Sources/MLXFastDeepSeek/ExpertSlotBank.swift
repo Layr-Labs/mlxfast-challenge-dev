@@ -106,6 +106,17 @@ public struct ExpertManifest: Codable, Equatable {
             guard record.byteOffset >= 0, record.byteLength > 0 else {
                 throw MLXFastError.invalidInput("invalid byte range for expert tensor \(record.name)")
             }
+            let dtype = try TensorDType.parse(record.dtype)
+            let expectedByteLength = try expectedTensorByteCount(
+                name: record.name,
+                dtype: dtype,
+                shape: record.shape
+            )
+            guard record.byteLength == expectedByteLength else {
+                throw MLXFastError.invalidInput(
+                    "expert tensor \(record.name) byte length \(record.byteLength) does not match dtype \(record.dtype) and shape \(record.shape) expected \(expectedByteLength)"
+                )
+            }
             guard record.dataOffsets.count == 2, record.dataOffsets[1] >= record.dataOffsets[0] else {
                 throw MLXFastError.invalidInput("invalid data_offsets for expert tensor \(record.name)")
             }

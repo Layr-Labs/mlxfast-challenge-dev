@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+@testable import MLXFastCore
 @testable import MLXFastDeepSeek
 
 @Test
@@ -76,6 +77,37 @@ func expertSlotBankMaterializesFirstAxisSlice() throws {
 
     #expect(slice.shape == [2])
     #expect(try slice.uint8Values() == [2, 3])
+}
+
+@Test
+func expertSlotBankRejectsByteLengthMismatch() throws {
+    let root = try temporaryDirectory()
+    let reference = root.appendingPathComponent("reference", isDirectory: true)
+    let experts = root.appendingPathComponent("weights/experts", isDirectory: true)
+    try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: experts, withIntermediateDirectories: true)
+
+    let shard = reference.appendingPathComponent("model-00001.safetensors")
+    try Data([1]).write(to: shard)
+
+    let tensorName = "model.layers.0.ffn.switch_mlp.0.gate_proj.weight"
+    try manifestJSON(
+        referencePath: reference.path,
+        records: [
+            record(name: tensorName, shard: shard.lastPathComponent, offset: 0, length: 1, shape: [2]),
+        ]
+    ).write(
+        to: experts.appendingPathComponent("manifest.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    #expect(throws: MLXFastError.self) {
+        _ = try ExpertSlotBank(
+            manifestPath: experts.appendingPathComponent("manifest.json").path,
+            capacity: 1
+        )
+    }
 }
 
 @Test

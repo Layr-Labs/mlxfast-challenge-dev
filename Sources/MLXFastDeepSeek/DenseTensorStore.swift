@@ -69,6 +69,17 @@ public final class DenseTensorStore {
             }
             let byteCount = fileSize.intValue
             for record in recordsByShard[shard, default: []] {
+                let dtype = try TensorDType.parse(record.dtype)
+                let expectedByteLength = try expectedTensorByteCount(
+                    name: record.name,
+                    dtype: dtype,
+                    shape: record.shape
+                )
+                guard record.byteLength == expectedByteLength else {
+                    throw MLXFastError.invalidInput(
+                        "dense tensor \(record.name) byte length \(record.byteLength) does not match dtype \(record.dtype) and shape \(record.shape) expected \(expectedByteLength)"
+                    )
+                }
                 let end = record.byteOffset + record.byteLength
                 guard record.byteOffset >= 0, record.byteLength > 0, end <= byteCount else {
                     throw MLXFastError.invalidInput(

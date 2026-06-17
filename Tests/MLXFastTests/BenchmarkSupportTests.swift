@@ -73,6 +73,7 @@ func mactopLocatorUsesExplicitExecutableOverride() throws {
 @Test
 func benchmarkPreflightAcceptsRequiredArtifacts() throws {
     let fixture = try makePreflightFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     let report = try BenchmarkPreflight.check(
         weightsPath: fixture.weights.path,
@@ -88,6 +89,7 @@ func benchmarkPreflightAcceptsRequiredArtifacts() throws {
 @Test
 func benchmarkPreflightRejectsMissingExpertManifest() throws {
     let fixture = try makePreflightFixture(writeManifest: false)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
         _ = try BenchmarkPreflight.check(
@@ -101,6 +103,7 @@ func benchmarkPreflightRejectsMissingExpertManifest() throws {
 @Test
 func benchmarkPreflightRejectsMalformedGolden() throws {
     let fixture = try makePreflightFixture(goldenContents: "{}")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: Error.self) {
         _ = try BenchmarkPreflight.check(
@@ -114,6 +117,7 @@ func benchmarkPreflightRejectsMalformedGolden() throws {
 @Test
 func benchmarkPreflightRejectsMissingSemanticTensor() throws {
     let fixture = try makePreflightFixture(omitDenseTensorName: DeepSeekWeightNames.finalNorm[0])
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
         _ = try BenchmarkPreflight.check(
@@ -127,6 +131,7 @@ func benchmarkPreflightRejectsMissingSemanticTensor() throws {
 @Test
 func benchmarkPreflightRejectsUnreadableExpertByteRange() throws {
     let fixture = try makePreflightFixture(expertByteLengthOverride: 1_000_000)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
         _ = try BenchmarkPreflight.check(
@@ -138,6 +143,7 @@ func benchmarkPreflightRejectsUnreadableExpertByteRange() throws {
 }
 
 private struct PreflightFixture {
+    let root: URL
     let weights: URL
     let golden: URL
     let mactop: URL
@@ -205,7 +211,7 @@ private func makePreflightFixture(
         ofItemAtPath: mactop.path
     )
 
-    return PreflightFixture(weights: weights, golden: golden, mactop: mactop)
+    return PreflightFixture(root: directory, weights: weights, golden: golden, mactop: mactop)
 }
 
 private func minimalDeepSeekConfigJSON() -> String {
@@ -435,12 +441,17 @@ private func writeSafetensors(_ path: URL, tensors: [TensorFixture]) throws {
     var object: [String: Any] = [:]
     var cursor = 0
     for tensor in tensors.sorted(by: { $0.name < $1.name }) {
+        let byteCount = try expectedTensorByteCount(
+            name: tensor.name,
+            dtype: TensorDType.parse(tensor.dtype),
+            shape: tensor.shape
+        )
         object[tensor.name] = [
             "dtype": tensor.dtype,
             "shape": tensor.shape,
-            "data_offsets": [cursor, cursor + tensor.data.count],
+            "data_offsets": [cursor, cursor + byteCount],
         ]
-        cursor += tensor.data.count
+        cursor += byteCount
     }
 
     var header = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
@@ -452,10 +463,13 @@ private func writeSafetensors(_ path: URL, tensors: [TensorFixture]) throws {
     var headerLength = UInt64(header.count).littleEndian
     output.append(Data(bytes: &headerLength, count: 8))
     output.append(header)
-    for tensor in tensors.sorted(by: { $0.name < $1.name }) {
-        output.append(tensor.data)
-    }
     try output.write(to: path)
+
+    let handle = try FileHandle(forWritingTo: path)
+    defer {
+        try? handle.close()
+    }
+    try handle.truncate(atOffset: UInt64(output.count + cursor))
 }
 
 private func arrayJSON(_ values: [Int]) -> String {

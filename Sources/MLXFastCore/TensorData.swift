@@ -43,10 +43,7 @@ public struct MaterializedTensor: Equatable {
     public let bytes: Data
 
     public init(name: String, dtype: TensorDType, shape: [Int], bytes: Data) throws {
-        guard shape.allSatisfy({ $0 >= 0 }) else {
-            throw MLXFastError.invalidInput("tensor \(name) has negative dimension in shape \(shape)")
-        }
-        let expectedByteCount = shape.reduce(1, *) * dtype.byteWidth
+        let expectedByteCount = try expectedTensorByteCount(name: name, dtype: dtype, shape: shape)
         guard expectedByteCount == bytes.count else {
             throw MLXFastError.invalidInput(
                 "tensor \(name) byte count \(bytes.count) does not match dtype \(dtype.rawValue) and shape \(shape) expected \(expectedByteCount)"
@@ -102,6 +99,25 @@ public struct MaterializedTensor: Equatable {
             }
         }
     }
+}
+
+public func expectedTensorByteCount(name: String, dtype: TensorDType, shape: [Int]) throws -> Int {
+    guard shape.allSatisfy({ $0 >= 0 }) else {
+        throw MLXFastError.invalidInput("tensor \(name) has negative dimension in shape \(shape)")
+    }
+    var elements = 1
+    for dimension in shape {
+        let result = elements.multipliedReportingOverflow(by: dimension)
+        guard !result.overflow else {
+            throw MLXFastError.invalidInput("tensor \(name) shape \(shape) element count overflows Int")
+        }
+        elements = result.partialValue
+    }
+    let bytes = elements.multipliedReportingOverflow(by: dtype.byteWidth)
+    guard !bytes.overflow else {
+        throw MLXFastError.invalidInput("tensor \(name) byte count overflows Int for dtype \(dtype.rawValue) and shape \(shape)")
+    }
+    return bytes.partialValue
 }
 
 public func materializeTensor(

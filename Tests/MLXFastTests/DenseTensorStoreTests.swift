@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+@testable import MLXFastCore
 @testable import MLXFastDeepSeek
 @testable import MLXFastTransform
 
@@ -45,6 +46,38 @@ func denseTensorStoreLoadsMetadataAndReadsBytes() throws {
     #expect(tensor.dtype == .u8)
     #expect(tensor.shape == [3])
     #expect(try tensor.uint8Values() == [3, 4, 5])
+}
+
+@Test
+func denseTensorStoreRejectsByteLengthMismatch() throws {
+    let root = try temporaryDirectory()
+    let weights = root.appendingPathComponent("weights", isDirectory: true)
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+
+    let shardName = "model-00001.safetensors"
+    let tensorName = "model.embed_tokens.weight"
+    try writeSafetensors(
+        weights.appendingPathComponent(shardName),
+        tensors: [
+            TensorFixture(name: tensorName, dtype: "U8", shape: [2], data: Data([1])),
+        ]
+    )
+    try """
+    {
+      "weight_map": {
+        "\(tensorName)": "\(shardName)"
+      }
+    }
+    """.write(
+        to: weights.appendingPathComponent("model.safetensors.index.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let store = try DenseTensorStore(weightsPath: weights.path)
+    #expect(throws: MLXFastError.self) {
+        try store.validateReadableByteRanges()
+    }
 }
 
 private struct TensorFixture {
