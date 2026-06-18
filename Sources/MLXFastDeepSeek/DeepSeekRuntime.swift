@@ -35,6 +35,35 @@ public struct CorrectnessReport: Codable, Equatable {
         case goldenHash = "golden_hash"
         case error
     }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(passed, forKey: .passed)
+        try container.encode(checkedSteps, forKey: .checkedSteps)
+        try container.encode(caseCount, forKey: .caseCount)
+        if let firstFailingCase {
+            try container.encode(firstFailingCase, forKey: .firstFailingCase)
+        } else {
+            try container.encodeNil(forKey: .firstFailingCase)
+        }
+        if let firstFailingStep {
+            try container.encode(firstFailingStep, forKey: .firstFailingStep)
+        } else {
+            try container.encodeNil(forKey: .firstFailingStep)
+        }
+        if let expectedToken {
+            try container.encode(expectedToken, forKey: .expectedToken)
+        } else {
+            try container.encodeNil(forKey: .expectedToken)
+        }
+        if let actualToken {
+            try container.encode(actualToken, forKey: .actualToken)
+        } else {
+            try container.encodeNil(forKey: .actualToken)
+        }
+        try container.encode(goldenHash, forKey: .goldenHash)
+        try container.encode(error, forKey: .error)
+    }
 }
 
 public struct BenchmarkOptions: Equatable {
@@ -50,15 +79,14 @@ public struct BenchmarkOptions: Equatable {
 public enum DeepSeekRuntime {
     public static func runCorrectness(_ options: CorrectnessOptions) throws -> CorrectnessReport {
         do {
-            let cases = try loadGoldenCases(from: options.goldenPath)
-            let goldenHash = try fileSHA256(options.goldenPath)
+            let golden = try loadGoldenFixture(from: options.goldenPath)
             let config = try DeepSeekConfig.load(from: options.weightsPath)
             let loader = try DeepSeekWeightLoader(weightsPath: options.weightsPath)
             let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
             return runCorrectness(
-                cases: cases,
+                cases: golden.cases,
                 weightCache: weightCache,
-                goldenHash: goldenHash
+                goldenHash: golden.sha256
             )
         } catch {
             return failedCorrectnessReport(checkedSteps: 0, error: "\(error)")
@@ -72,15 +100,14 @@ public enum DeepSeekRuntime {
                 weightsPath: options.weightsPath,
                 goldenPath: options.goldenPath
             )
-            let goldenHash = try fileSHA256(options.goldenPath)
-            let cases = try loadGoldenCases(from: options.goldenPath)
+            let golden = try loadGoldenFixture(from: options.goldenPath)
             let config = try DeepSeekConfig.load(from: options.weightsPath)
             let correctnessLoader = try DeepSeekWeightLoader(weightsPath: options.weightsPath)
             let correctnessCache = DeepSeekRuntimeWeightCache(loader: correctnessLoader, config: config)
             let correctness = runCorrectness(
-                cases: cases,
+                cases: golden.cases,
                 weightCache: correctnessCache,
-                goldenHash: goldenHash
+                goldenHash: golden.sha256
             )
             correctnessReport = correctness
             guard correctness.passed else {
@@ -96,7 +123,7 @@ public enum DeepSeekRuntime {
                 expertStreamingConfig: ExpertStreamingConfig(recordsMetrics: true)
             )
             let benchmarkCache = DeepSeekRuntimeWeightCache(loader: benchmarkLoader, config: config)
-            let promptPlan = try BenchmarkPrompt.plan(from: cases)
+            let promptPlan = try BenchmarkPrompt.plan(from: golden.cases)
             let idleSamples = try MactopSession.measureIdleSamples()
             guard !idleSamples.isEmpty else {
                 throw MLXFastError.invalidInput("mactop idle measurement produced no samples")
@@ -431,12 +458,6 @@ public enum DeepSeekRuntime {
         let data = output.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    }
-
-    private static func fileSHA256(_ path: String) throws -> String {
-        let data = try Data(contentsOf: URL(fileURLWithPath: path))
-        let digest = SHA256.hash(data: data)
-        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     private static func generateGreedyCached(

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Testing
 @testable import MLXFastCore
 
@@ -27,6 +28,12 @@ func loadGoldenCasesAcceptsValidFixture() throws {
     #expect(cases[0].name == "hidden-0")
     #expect(cases[0].promptTokens == [1, 2, 3])
     #expect(cases[0].expectedTokens.count == MLXFastConstants.correctnessSteps)
+
+    let fixture = try loadGoldenFixture(from: path.path)
+    let digest = SHA256.hash(data: try Data(contentsOf: path))
+    let expectedHash = digest.map { String(format: "%02x", $0) }.joined()
+    #expect(fixture.cases == cases)
+    #expect(fixture.sha256 == expectedHash)
 }
 
 @Test

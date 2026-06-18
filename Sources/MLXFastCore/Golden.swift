@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public struct GoldenCase: Codable, Equatable {
@@ -23,10 +24,27 @@ private struct GoldenFile: Decodable {
     let cases: [GoldenCase]
 }
 
+public struct GoldenFixture: Equatable {
+    public let cases: [GoldenCase]
+    public let sha256: String
+
+    public init(cases: [GoldenCase], sha256: String) {
+        self.cases = cases
+        self.sha256 = sha256
+    }
+}
+
 public func loadGoldenCases(
     from path: String,
     requiredSteps: Int = MLXFastConstants.correctnessSteps
 ) throws -> [GoldenCase] {
+    try loadGoldenFixture(from: path, requiredSteps: requiredSteps).cases
+}
+
+public func loadGoldenFixture(
+    from path: String,
+    requiredSteps: Int = MLXFastConstants.correctnessSteps
+) throws -> GoldenFixture {
     try requireFile(path, description: "correctness golden file")
 
     let data = try Data(contentsOf: URL(fileURLWithPath: path))
@@ -58,7 +76,9 @@ public func loadGoldenCases(
         try validateTokens(testCase.expectedTokens, field: "\(testCase.name).expected_tokens")
     }
 
-    return decoded.cases
+    let digest = SHA256.hash(data: data)
+    let hash = digest.map { String(format: "%02x", $0) }.joined()
+    return GoldenFixture(cases: decoded.cases, sha256: hash)
 }
 
 private func validateTokens(_ tokens: [Int], field: String) throws {

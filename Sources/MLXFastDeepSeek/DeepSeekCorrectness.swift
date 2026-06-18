@@ -75,6 +75,24 @@ public enum DeepSeekCorrectness {
         for step in 0..<steps {
             let expectedToken = step < expected.count ? expected[step] : nil
             let actualToken = step < actual.count ? actual[step] : nil
+            guard let expectedToken else {
+                return CorrectnessTokenComparison(
+                    passed: false,
+                    checkedSteps: step + 1,
+                    firstFailingStep: step,
+                    expectedToken: nil,
+                    actualToken: actualToken
+                )
+            }
+            guard let actualToken else {
+                return CorrectnessTokenComparison(
+                    passed: false,
+                    checkedSteps: step + 1,
+                    firstFailingStep: step,
+                    expectedToken: expectedToken,
+                    actualToken: nil
+                )
+            }
             if actualToken != expectedToken {
                 return CorrectnessTokenComparison(
                     passed: false,

@@ -46,6 +46,17 @@ func deepSeekCorrectnessComparesExpectedTokenSequences() {
     #expect(expectedShort.firstFailingStep == 1)
     #expect(expectedShort.expectedToken == nil)
     #expect(expectedShort.actualToken == 5)
+
+    let bothShort = DeepSeekCorrectness.compareTokens(
+        expected: [4],
+        actual: [4],
+        steps: 2
+    )
+    #expect(!bothShort.passed)
+    #expect(bothShort.checkedSteps == 2)
+    #expect(bothShort.firstFailingStep == 1)
+    #expect(bothShort.expectedToken == nil)
+    #expect(bothShort.actualToken == nil)
 }
 
 @Test
@@ -61,6 +72,33 @@ func deepSeekCorrectnessGeneratesGreedyTokensWithGrowingContext() throws {
 
     #expect(generated == [2, 3, 4])
     #expect(contexts == [[10, 11], [10, 11, 2], [10, 11, 2, 3]])
+}
+
+@Test
+func correctnessReportEncodesStableFailureFields() throws {
+    let report = CorrectnessReport(
+        passed: true,
+        checkedSteps: 256,
+        caseCount: 1,
+        firstFailingCase: nil,
+        firstFailingStep: nil,
+        expectedToken: nil,
+        actualToken: nil,
+        goldenHash: "abc123",
+        error: ""
+    )
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(report)
+    let raw = String(decoding: data, as: UTF8.self)
+
+    #expect(raw.contains("\"first_failing_case\" : null"))
+    #expect(raw.contains("\"first_failing_step\" : null"))
+    #expect(raw.contains("\"expected_token\" : null"))
+    #expect(raw.contains("\"actual_token\" : null"))
+    #expect(raw.contains("\"checked_steps\" : 256"))
+    #expect(raw.contains("\"case_count\" : 1"))
+    #expect(raw.contains("\"golden_hash\" : \"abc123\""))
 }
 
 @Test
