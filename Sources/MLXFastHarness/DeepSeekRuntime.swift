@@ -26,6 +26,38 @@ public struct GoldenGenerationOptions: Equatable {
     }
 }
 
+public struct GoldenCasePrompt: Equatable {
+    public let name: String
+    public let promptTokens: [Int]
+
+    public init(name: String, promptTokens: [Int]) {
+        self.name = name
+        self.promptTokens = promptTokens
+    }
+}
+
+public struct GoldenBenchmarkPrompt: Equatable {
+    public let name: String
+    public let promptTokens: [Int]
+
+    public init(name: String, promptTokens: [Int]) {
+        self.name = name
+        self.promptTokens = promptTokens
+    }
+}
+
+public struct GoldenFixtureGenerationOptions: Equatable {
+    public let weightsPath: String
+    public let cases: [GoldenCasePrompt]
+    public let benchmark: GoldenBenchmarkPrompt
+
+    public init(weightsPath: String, cases: [GoldenCasePrompt], benchmark: GoldenBenchmarkPrompt) {
+        self.weightsPath = weightsPath
+        self.cases = cases
+        self.benchmark = benchmark
+    }
+}
+
 public struct CorrectnessReport: Codable, Equatable {
     public let passed: Bool
     public let checkedSteps: Int
@@ -165,15 +197,10 @@ public enum DeepSeekRuntime {
             expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: true)
         )
         let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
-        let expectedTokens = try generateGreedyCachedTokens(
-            promptTokens: options.promptTokens,
-            weightCache: weightCache,
-            steps: MLXFastConstants.correctnessSteps
-        )
-        return GoldenCase(
+        return try generateGoldenCase(
             name: options.caseName,
             promptTokens: options.promptTokens,
-            expectedTokens: expectedTokens
+            weightCache: weightCache
         )
     }
 
@@ -184,13 +211,67 @@ public enum DeepSeekRuntime {
             expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: true)
         )
         let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
-        guard options.promptTokens.count >= MLXFastConstants.benchmarkPrefillPromptTokens else {
+        return try generateBenchmarkGolden(
+            name: options.caseName,
+            promptTokens: options.promptTokens,
+            weightCache: weightCache
+        )
+    }
+
+    public static func generateGoldenFixture(_ options: GoldenFixtureGenerationOptions) throws -> GoldenFixturePayload {
+        guard !options.cases.isEmpty else {
+            throw MLXFastError.invalidInput("golden prompt file must contain at least one case")
+        }
+        let config = try DeepSeekConfig.load(from: options.weightsPath)
+        let loader = try DeepSeekWeightLoader(
+            weightsPath: options.weightsPath,
+            expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: true)
+        )
+        let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
+        let cases = try options.cases.map { prompt in
+            try generateGoldenCase(
+                name: prompt.name,
+                promptTokens: prompt.promptTokens,
+                weightCache: weightCache
+            )
+        }
+        let benchmark = try generateBenchmarkGolden(
+            name: options.benchmark.name,
+            promptTokens: options.benchmark.promptTokens,
+            weightCache: weightCache
+        )
+        return GoldenFixturePayload(cases: cases, benchmark: benchmark)
+    }
+
+    private static func generateGoldenCase(
+        name: String,
+        promptTokens: [Int],
+        weightCache: DeepSeekRuntimeWeightCache
+    ) throws -> GoldenCase {
+        let expectedTokens = try generateGreedyCachedTokens(
+            promptTokens: promptTokens,
+            weightCache: weightCache,
+            steps: MLXFastConstants.correctnessSteps
+        )
+        return GoldenCase(
+            name: name,
+            promptTokens: promptTokens,
+            expectedTokens: expectedTokens
+        )
+    }
+
+    private static func generateBenchmarkGolden(
+        name: String,
+        promptTokens: [Int],
+        weightCache: DeepSeekRuntimeWeightCache
+    ) throws -> BenchmarkGolden {
+        guard promptTokens.count >= MLXFastConstants.benchmarkPrefillPromptTokens else {
             throw MLXFastError.invalidInput(
-                "benchmark golden prompt has \(options.promptTokens.count) tokens; need at least \(MLXFastConstants.benchmarkPrefillPromptTokens)"
+                "benchmark golden prompt has \(promptTokens.count) tokens; need at least \(MLXFastConstants.benchmarkPrefillPromptTokens)"
             )
         }
 
-        let prefillTokens = Array(options.promptTokens.prefix(MLXFastConstants.benchmarkPrefillPromptTokens))
+        let prefillTokens = Array(promptTokens.prefix(MLXFastConstants.benchmarkPrefillPromptTokens))
         let expectedPrefillToken = try generateGreedyCachedTokens(
             promptTokens: prefillTokens,
             weightCache: weightCache,
@@ -202,7 +283,7 @@ public enum DeepSeekRuntime {
             weightCache: weightCache
         )
         return BenchmarkGolden(
-            name: options.caseName,
+            name: name,
             prefillPromptTokens: prefillTokens,
             expectedPrefillToken: expectedPrefillToken,
             decodeSeedTokens: decodeSeedTokens,

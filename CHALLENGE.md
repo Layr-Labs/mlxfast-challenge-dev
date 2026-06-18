@@ -64,6 +64,30 @@ prefill prompt, expected prefill token, 32-token decode seed, expected seed
 token, and expected tokens emitted by the timed decode loop. The benchmark only
 accepts a speed score when those hidden token IDs match.
 
+The organizer can generate that hidden fixture from a private prompt manifest:
+
+```bash
+.build/release/mlxfast-swift make-golden \
+  --prompt-file private_prompts.json \
+  --output correctness_golden.json
+```
+
+The private manifest contains named correctness prompts and one named benchmark
+prompt:
+
+```json
+{
+  "version": 1,
+  "cases": [
+    {"name": "hidden-0", "prompt_tokens": [1, 2, 3]}
+  ],
+  "benchmark": {"name": "timed-hidden", "prompt_tokens": [1, 2, 3]}
+}
+```
+
+The arrays above are abbreviated. The benchmark prompt must contain at least 512
+token IDs.
+
 For local development only, participants can generate a self-consistent fixture
 from their current transformed weights:
 

@@ -162,7 +162,7 @@ struct MLXFastCLI {
     }
 
     private static func runMakeGolden(_ options: ParsedOptions) throws {
-        try options.validate(valueOptions: ["--weights", "--output", "--name", "--prompt-tokens"])
+        try options.validate(valueOptions: ["--weights", "--output", "--name", "--prompt-tokens", "--prompt-file"])
         let weightsPath = options.value(
             for: "--weights",
             default: environmentValue(
@@ -171,26 +171,33 @@ struct MLXFastCLI {
             )
         )
         let outputPath = options.value(for: "--output", default: "local_correctness_golden.json")
-        let caseName = options.value(for: "--name", default: "local-self-check")
-        let promptTokens = try parsePromptTokens(
-            options.value(for: "--prompt-tokens", default: "")
-        )
-
-        let testCase = try DeepSeekRuntime.generateGoldenCase(
-            GoldenGenerationOptions(
-                weightsPath: weightsPath,
-                caseName: caseName,
-                promptTokens: promptTokens
+        let promptFile = options.value(for: "--prompt-file", default: "")
+        let payload: GoldenFixturePayload
+        if !promptFile.isEmpty {
+            if options.contains("--name") || options.contains("--prompt-tokens") {
+                throw MLXFastError.invalidInput("--prompt-file cannot be combined with --name or --prompt-tokens")
+            }
+            payload = try DeepSeekRuntime.generateGoldenFixture(
+                promptGenerationOptions(weightsPath: weightsPath, promptFile: promptFile)
             )
-        )
-        let benchmark = try DeepSeekRuntime.generateBenchmarkGolden(
-            GoldenGenerationOptions(
-                weightsPath: weightsPath,
-                caseName: "\(caseName)-benchmark",
-                promptTokens: promptTokens
+        } else {
+            let caseName = options.value(for: "--name", default: "local-self-check")
+            let promptTokens = try parsePromptTokens(
+                options.value(for: "--prompt-tokens", default: "")
             )
-        )
-        let payload = GoldenOutput(cases: [testCase], benchmark: benchmark)
+            payload = try DeepSeekRuntime.generateGoldenFixture(
+                GoldenFixtureGenerationOptions(
+                    weightsPath: weightsPath,
+                    cases: [
+                        GoldenCasePrompt(name: caseName, promptTokens: promptTokens),
+                    ],
+                    benchmark: GoldenBenchmarkPrompt(
+                        name: "\(caseName)-benchmark",
+                        promptTokens: promptTokens
+                    )
+                )
+            )
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(payload)
@@ -218,6 +225,7 @@ struct MLXFastCLI {
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--weights PATH] [--golden PATH] [--score-path PATH]
               mlxfast-swift make-golden [--weights PATH] [--output PATH] [--name NAME] [--prompt-tokens TOKENS]
+              mlxfast-swift make-golden [--weights PATH] [--output PATH] --prompt-file PATH
               mlxfast-swift checkpoint-shards --index PATH
 
             Swift-only DeepSeek V4 Flash harness entrypoint.
@@ -254,12 +262,96 @@ struct MLXFastCLI {
             return token
         }
     }
+
+    private static func promptGenerationOptions(
+        weightsPath: String,
+        promptFile: String
+    ) throws -> GoldenFixtureGenerationOptions {
+        let data = try Data(contentsOf: URL(fileURLWithPath: promptFile))
+        let input = try JSONDecoder().decode(GoldenPromptInput.self, from: data)
+        guard input.version == 1 else {
+            throw MLXFastError.invalidInput("golden prompt file version must be 1")
+        }
+        guard !input.cases.isEmpty else {
+            throw MLXFastError.invalidInput("golden prompt file must contain at least one case")
+        }
+        guard let benchmark = input.benchmark else {
+            throw MLXFastError.invalidInput("golden prompt file must contain a benchmark prompt")
+        }
+
+        var names = Set<String>()
+        let cases = try input.cases.map { testCase in
+            try validatePromptName(testCase.name, field: "golden prompt case name")
+            guard names.insert(testCase.name).inserted else {
+                throw MLXFastError.invalidInput("duplicate golden prompt case name \(testCase.name)")
+            }
+            try validatePromptTokens(testCase.promptTokens, field: "\(testCase.name).prompt_tokens")
+            return GoldenCasePrompt(name: testCase.name, promptTokens: testCase.promptTokens)
+        }
+        try validatePromptName(benchmark.name, field: "benchmark prompt name")
+        try validatePromptTokens(benchmark.promptTokens, field: "\(benchmark.name).prompt_tokens")
+
+        return GoldenFixtureGenerationOptions(
+            weightsPath: weightsPath,
+            cases: cases,
+            benchmark: GoldenBenchmarkPrompt(
+                name: benchmark.name,
+                promptTokens: benchmark.promptTokens
+            )
+        )
+    }
+
+    private static func validatePromptName(_ name: String, field: String) throws {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            throw MLXFastError.invalidInput("\(field) must not be empty")
+        }
+        guard name == trimmedName else {
+            throw MLXFastError.invalidInput("\(field) must not have leading or trailing whitespace")
+        }
+        guard !name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+            throw MLXFastError.invalidInput("\(field) must not contain control characters")
+        }
+    }
+
+    private static func validatePromptTokens(_ tokens: [Int], field: String) throws {
+        guard !tokens.isEmpty else {
+            throw MLXFastError.invalidInput("\(field) must contain at least one token")
+        }
+        for (index, token) in tokens.enumerated() {
+            guard token >= 0, token < MLXFastConstants.vocabSize else {
+                throw MLXFastError.invalidInput(
+                    "\(field)[\(index)]=\(token) is outside DeepSeek vocab range 0..<\(MLXFastConstants.vocabSize)"
+                )
+            }
+        }
+    }
 }
 
-private struct GoldenOutput: Encodable {
-    let version = 1
-    let cases: [GoldenCase]
-    let benchmark: BenchmarkGolden
+private struct GoldenPromptInput: Decodable {
+    let version: Int?
+    let cases: [GoldenPromptCaseInput]
+    let benchmark: GoldenBenchmarkPromptInput?
+}
+
+private struct GoldenPromptCaseInput: Decodable {
+    let name: String
+    let promptTokens: [Int]
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case promptTokens = "prompt_tokens"
+    }
+}
+
+private struct GoldenBenchmarkPromptInput: Decodable {
+    let name: String
+    let promptTokens: [Int]
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case promptTokens = "prompt_tokens"
+    }
 }
 
 private struct ParsedOptions {
@@ -303,6 +395,10 @@ private struct ParsedOptions {
 
     func value(for name: String, default defaultValue: String) -> String {
         values[name] ?? defaultValue
+    }
+
+    func contains(_ name: String) -> Bool {
+        values[name] != nil || flags.contains(name)
     }
 
     func validate(valueOptions: Set<String>, flagOptions: Set<String> = []) throws {

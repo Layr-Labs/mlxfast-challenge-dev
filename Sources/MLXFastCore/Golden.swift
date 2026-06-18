@@ -53,6 +53,18 @@ public struct BenchmarkGolden: Codable, Equatable {
     }
 }
 
+public struct GoldenFixturePayload: Codable, Equatable {
+    public let version: Int
+    public let cases: [GoldenCase]
+    public let benchmark: BenchmarkGolden
+
+    public init(version: Int = 1, cases: [GoldenCase], benchmark: BenchmarkGolden) {
+        self.version = version
+        self.cases = cases
+        self.benchmark = benchmark
+    }
+}
+
 private struct GoldenFile: Decodable {
     let version: Int?
     let cases: [GoldenCase]
