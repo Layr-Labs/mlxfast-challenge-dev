@@ -195,7 +195,7 @@ final class MactopSession: @unchecked Sendable {
 
     static func measureIdleSamples(
         sampleCount: Int = 30,
-        timeoutSeconds: TimeInterval = 10,
+        timeoutSeconds: TimeInterval = 45,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> [Double] {
         precondition(sampleCount > 0)
@@ -216,7 +216,7 @@ final class MactopSession: @unchecked Sendable {
         session.capture(session.errorOutput.fileHandleForReading, intoErrorBuffer: true)
         try process.run()
 
-        let sampleWindowSeconds = min(timeoutSeconds, max(1, Double(sampleCount) * 0.1 + 1))
+        let sampleWindowSeconds = timeoutSeconds
         let deadline = Date().addingTimeInterval(sampleWindowSeconds)
         while process.isRunning && Date() < deadline {
             Thread.sleep(forTimeInterval: min(0.05, deadline.timeIntervalSinceNow))
