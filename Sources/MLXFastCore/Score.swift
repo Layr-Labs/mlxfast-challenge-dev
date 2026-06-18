@@ -64,6 +64,9 @@ public struct ScoreMetrics: Codable, Equatable {
     public let commit: String
     public let timestamp: String
     public let harnessHash: String
+    public let weightsHash: String
+    public let weightsByteCount: Int
+    public let weightsFileCount: Int
     public let runtime: String
 
     enum CodingKeys: String, CodingKey {
@@ -94,6 +97,9 @@ public struct ScoreMetrics: Codable, Equatable {
         case commit
         case timestamp
         case harnessHash = "harness_hash"
+        case weightsHash = "weights_hash"
+        case weightsByteCount = "weights_byte_count"
+        case weightsFileCount = "weights_file_count"
         case runtime
     }
 
@@ -125,6 +131,9 @@ public struct ScoreMetrics: Codable, Equatable {
         commit: String,
         timestamp: String,
         harnessHash: String,
+        weightsHash: String = "",
+        weightsByteCount: Int = 0,
+        weightsFileCount: Int = 0,
         runtime: String
     ) {
         self.peakRamGB = peakRamGB
@@ -154,7 +163,45 @@ public struct ScoreMetrics: Codable, Equatable {
         self.commit = commit
         self.timestamp = timestamp
         self.harnessHash = harnessHash
+        self.weightsHash = weightsHash
+        self.weightsByteCount = weightsByteCount
+        self.weightsFileCount = weightsFileCount
         self.runtime = runtime
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.peakRamGB = try container.decode(Double.self, forKey: .peakRamGB)
+        self.bandwidthGBPerToken = try container.decode(Double.self, forKey: .bandwidthGBPerToken)
+        self.decodeSecondsPerToken = try container.decode(Double.self, forKey: .decodeSecondsPerToken)
+        self.prefillSecondsPerToken = try container.decode(Double.self, forKey: .prefillSecondsPerToken)
+        self.passedCorrectness = try container.decode(Bool.self, forKey: .passedCorrectness)
+        self.numLayers = try container.decode(Int.self, forKey: .numLayers)
+        self.checkedSteps = try container.decode(Int.self, forKey: .checkedSteps)
+        self.caseCount = try container.decode(Int.self, forKey: .caseCount)
+        self.expertCacheHits = try container.decode(UInt64.self, forKey: .expertCacheHits)
+        self.expertCacheMisses = try container.decode(UInt64.self, forKey: .expertCacheMisses)
+        self.expertCacheEvictions = try container.decode(UInt64.self, forKey: .expertCacheEvictions)
+        self.expertBytesRead = try container.decode(UInt64.self, forKey: .expertBytesRead)
+        self.expertReadSeconds = try container.decode(Double.self, forKey: .expertReadSeconds)
+        self.expertPeakCachedTensors = try container.decode(UInt64.self, forKey: .expertPeakCachedTensors)
+        self.expertHitRate = try container.decode(Double.self, forKey: .expertHitRate)
+        self.firstFailingLayer = try container.decodeIfPresent(Int.self, forKey: .firstFailingLayer)
+        self.firstFailingCase = try container.decodeIfPresent(String.self, forKey: .firstFailingCase)
+        self.firstFailingStep = try container.decodeIfPresent(Int.self, forKey: .firstFailingStep)
+        self.expectedToken = try container.decodeIfPresent(Int.self, forKey: .expectedToken)
+        self.actualToken = try container.decodeIfPresent(Int.self, forKey: .actualToken)
+        self.maxAbsDiff = try container.decode(Double.self, forKey: .maxAbsDiff)
+        self.goldenHash = try container.decode(String.self, forKey: .goldenHash)
+        self.bandwidthSource = try container.decode(String.self, forKey: .bandwidthSource)
+        self.error = try container.decode(String.self, forKey: .error)
+        self.commit = try container.decode(String.self, forKey: .commit)
+        self.timestamp = try container.decode(String.self, forKey: .timestamp)
+        self.harnessHash = try container.decode(String.self, forKey: .harnessHash)
+        self.weightsHash = try container.decodeIfPresent(String.self, forKey: .weightsHash) ?? ""
+        self.weightsByteCount = try container.decodeIfPresent(Int.self, forKey: .weightsByteCount) ?? 0
+        self.weightsFileCount = try container.decodeIfPresent(Int.self, forKey: .weightsFileCount) ?? 0
+        self.runtime = try container.decode(String.self, forKey: .runtime)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -206,6 +253,9 @@ public struct ScoreMetrics: Codable, Equatable {
         try container.encode(commit, forKey: .commit)
         try container.encode(timestamp, forKey: .timestamp)
         try container.encode(harnessHash, forKey: .harnessHash)
+        try container.encode(weightsHash, forKey: .weightsHash)
+        try container.encode(weightsByteCount, forKey: .weightsByteCount)
+        try container.encode(weightsFileCount, forKey: .weightsFileCount)
         try container.encode(runtime, forKey: .runtime)
     }
 }

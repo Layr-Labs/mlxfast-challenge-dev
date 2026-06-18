@@ -32,6 +32,9 @@ The benchmark writes `score.json` in the format consumed by Darkbloom.
 `correctness_golden.json` is also not tracked in the public repo; the benchmark
 operator supplies it, or points the harness at it with
 `MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json`.
+`benchmark.sh` also writes `score.json.sha256` and `benchmark-integrity.json`,
+which record the score file hash, golden hash, transformed `weights/` hash, and
+transform source hash for run auditing.
 
 Full model setup needs a large local or mounted SSD. The reference checkpoint is
 `mlx-community/DeepSeek-V4-Flash-4bit`, with 33 safetensors shards totaling about
@@ -79,7 +82,8 @@ in `editablePaths` for the Yukon backend. Generated `weights/`, reference
 checkpoints, golden files, local scores, repository metadata, symlinks, and macOS
 metadata files are not submitted. The default source archive input cap is
 256 MiB; override it with `MLXFAST_MAX_SUBMISSION_BYTES` or
-`mlxfast-swift submit --max-bytes`.
+`mlxfast-swift submit --max-bytes`. The submit report includes the generated zip
+SHA-256 hash.
 
 ## Scoring
 

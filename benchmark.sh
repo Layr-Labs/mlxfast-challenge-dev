@@ -10,6 +10,30 @@ SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
 SANDBOX_PROFILE="${MLXFAST_SANDBOX_PROFILE:-tools/deny-network.sb}"
 SOURCE_HASH_PATH="${WEIGHTS_PATH}/.benchmark-source.sha256"
+INTEGRITY_PATH="${MLXFAST_INTEGRITY_PATH:-benchmark-integrity.json}"
+
+json_string() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_number_or_null() {
+  local value="$1"
+  if [[ -z "${value}" ]]; then
+    printf 'null'
+  else
+    printf '%s' "${value}"
+  fi
+}
+
+score_metric_string() {
+  local key="$1"
+  sed -n "s/.*\"${key}\" : \"\\([^\"]*\\)\".*/\\1/p" "${SCORE_PATH}" | head -n 1
+}
+
+score_metric_number() {
+  local key="$1"
+  sed -n "s/.*\"${key}\" : \\([0-9][0-9]*\\).*/\\1/p" "${SCORE_PATH}" | head -n 1
+}
 
 source_hash() {
   local paths=(
@@ -137,3 +161,28 @@ if [[ ! -s "${SCORE_PATH}" ]]; then
   echo "benchmark.sh: benchmark did not produce ${SCORE_PATH}" >&2
   exit 1
 fi
+
+score_hash="$(shasum -a 256 "${SCORE_PATH}" | awk '{print $1}')"
+printf '%s  %s\n' "${score_hash}" "${SCORE_PATH}" > "${SCORE_PATH}.sha256"
+
+weights_hash="$(score_metric_string weights_hash)"
+weights_file_count="$(score_metric_number weights_file_count)"
+weights_byte_count="$(score_metric_number weights_byte_count)"
+golden_hash=""
+if [[ -f "${GOLDEN_PATH}" ]]; then
+  golden_hash="$(shasum -a 256 "${GOLDEN_PATH}" | awk '{print $1}')"
+fi
+
+cat > "${INTEGRITY_PATH}" <<EOF
+{
+  "score_path": "$(json_string "${SCORE_PATH}")",
+  "score_sha256": "$(json_string "${score_hash}")",
+  "weights_path": "$(json_string "${WEIGHTS_PATH}")",
+  "weights_sha256": "$(json_string "${weights_hash}")",
+  "weights_file_count": $(json_number_or_null "${weights_file_count}"),
+  "weights_byte_count": $(json_number_or_null "${weights_byte_count}"),
+  "golden_path": "$(json_string "${GOLDEN_PATH}")",
+  "golden_sha256": "$(json_string "${golden_hash}")",
+  "transform_source_sha256": "$(json_string "${wanted_hash}")"
+}
+EOF

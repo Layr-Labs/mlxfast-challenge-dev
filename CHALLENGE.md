@@ -21,7 +21,8 @@ The benchmark entrypoint:
    oracle in `correctness_golden.json`.
 5. Measures prefill latency, 512-step greedy decode latency, MLX peak memory, and
    `mactop` hardware DRAM bandwidth.
-6. Writes `score.json` in the Darkbloom-compatible schema.
+6. Writes `score.json` in the Darkbloom-compatible schema, plus
+   `score.json.sha256` and `benchmark-integrity.json` audit sidecars.
 
 If required artifacts are missing, the harness writes a failed `score.json`
 rather than producing a ranked score.
@@ -84,7 +85,8 @@ golden fixtures, and local scores are harness/operator files, not submission
 surface. `mlxfast-swift submit` packages only `editablePaths`, rejects symlinks
 and generated/model artifact paths, skips macOS metadata files, and applies a
 256 MiB default source archive input cap. Override the cap with
-`MLXFAST_MAX_SUBMISSION_BYTES` or `mlxfast-swift submit --max-bytes`.
+`MLXFAST_MAX_SUBMISSION_BYTES` or `mlxfast-swift submit --max-bytes`. The submit
+report includes the generated zip SHA-256 hash.
 
 `mlxfast-swift verify-transform` is an organizer/debug check for deterministic
 transform output. It re-runs the submitted transform and compares the generated

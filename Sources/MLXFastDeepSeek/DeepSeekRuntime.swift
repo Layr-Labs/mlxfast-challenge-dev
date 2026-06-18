@@ -236,10 +236,15 @@ public enum DeepSeekRuntime {
     public static func benchmark(_ options: BenchmarkOptions) -> ScorePayload {
         var correctnessReport: CorrectnessReport?
         var benchmarkLoader: DeepSeekWeightLoader?
+        var transformedWeightsDigest: DirectoryDigest?
         do {
             _ = try BenchmarkPreflight.check(
                 weightsPath: options.weightsPath,
                 goldenPath: options.goldenPath
+            )
+            transformedWeightsDigest = try directoryDigest(
+                rootPath: options.weightsPath,
+                ignoredRelativePaths: [".benchmark-source.sha256", ".gitkeep"]
             )
             let golden = try loadGoldenFixture(from: options.goldenPath)
             let config = try DeepSeekConfig.load(from: options.weightsPath)
@@ -258,7 +263,8 @@ public enum DeepSeekRuntime {
                 return failedScore(
                     error: correctness.error.isEmpty ? "correctness gate failed" : correctness.error,
                     correctness: correctness,
-                    passedCorrectness: false
+                    passedCorrectness: false,
+                    weightsDigest: transformedWeightsDigest
                 )
             }
 
@@ -303,7 +309,8 @@ public enum DeepSeekRuntime {
                     error: "computed score was not finite",
                     correctness: correctnessReport,
                     passedCorrectness: true,
-                    expertStats: expertStats
+                    expertStats: expertStats,
+                    weightsDigest: transformedWeightsDigest
                 )
             }
 
@@ -338,6 +345,9 @@ public enum DeepSeekRuntime {
                     commit: commitIdentifier(),
                     timestamp: ISO8601DateFormatter().string(from: Date()),
                     harnessHash: harnessHash(),
+                    weightsHash: transformedWeightsDigest?.sha256 ?? "",
+                    weightsByteCount: transformedWeightsDigest?.byteCount ?? 0,
+                    weightsFileCount: transformedWeightsDigest?.fileCount ?? 0,
                     runtime: "swift"
                 )
             )
@@ -350,14 +360,16 @@ public enum DeepSeekRuntime {
                 firstFailingCase: "benchmark",
                 firstFailingStep: mismatch.step,
                 expectedToken: mismatch.expectedToken,
-                actualToken: mismatch.actualToken
+                actualToken: mismatch.actualToken,
+                weightsDigest: transformedWeightsDigest
             )
         } catch {
             return failedScore(
                 error: "\(error)",
                 correctness: correctnessReport,
                 passedCorrectness: correctnessReport?.passed == true,
-                expertStats: expertStats(from: benchmarkLoader)
+                expertStats: expertStats(from: benchmarkLoader),
+                weightsDigest: transformedWeightsDigest
             )
         }
     }
@@ -589,7 +601,8 @@ public enum DeepSeekRuntime {
         firstFailingCase explicitFirstFailingCase: String? = nil,
         firstFailingStep explicitFirstFailingStep: Int? = nil,
         expectedToken explicitExpectedToken: Int? = nil,
-        actualToken explicitActualToken: Int? = nil
+        actualToken explicitActualToken: Int? = nil,
+        weightsDigest: DirectoryDigest? = nil
     ) -> ScorePayload {
         let expertStats = explicitExpertStats ?? correctness?.expertStreamingStats ?? .zero
         return ScorePayload(
@@ -623,6 +636,9 @@ public enum DeepSeekRuntime {
                 commit: commitIdentifier(),
                 timestamp: ISO8601DateFormatter().string(from: Date()),
                 harnessHash: harnessHash(),
+                weightsHash: weightsDigest?.sha256 ?? "",
+                weightsByteCount: weightsDigest?.byteCount ?? 0,
+                weightsFileCount: weightsDigest?.fileCount ?? 0,
                 runtime: "swift"
             )
         )
@@ -683,6 +699,95 @@ public enum DeepSeekRuntime {
             hasher.update(data: data)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private struct DirectoryDigest: Equatable {
+        let fileCount: Int
+        let byteCount: Int
+        let sha256: String
+    }
+
+    private static func directoryDigest(
+        rootPath: String,
+        ignoredRelativePaths: Set<String>
+    ) throws -> DirectoryDigest {
+        let root = URL(fileURLWithPath: rootPath).standardizedFileURL
+        let rootPrefix = root.path + "/"
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        ) else {
+            throw MLXFastError.missingFile("directory not found at \(root.path)")
+        }
+
+        var files: [(relativePath: String, url: URL)] = []
+        for case let url as URL in enumerator {
+            let standardized = url.standardizedFileURL
+            let path = standardized.path
+            guard path.hasPrefix(rootPrefix) else {
+                throw MLXFastError.invalidInput("path escaped digest root: \(path)")
+            }
+            let relativePath = String(path.dropFirst(rootPrefix.count))
+            if ignoredRelativePaths.contains(relativePath) {
+                continue
+            }
+
+            let values = try standardized.resourceValues(
+                forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]
+            )
+            if values.isSymbolicLink == true {
+                throw MLXFastError.invalidInput("directory digest rejects symlink \(relativePath)")
+            }
+            if values.isDirectory == true {
+                continue
+            }
+            guard values.isRegularFile == true else {
+                throw MLXFastError.invalidInput("directory digest rejects non-regular file \(relativePath)")
+            }
+            files.append((relativePath: relativePath, url: standardized))
+        }
+
+        var treeHasher = SHA256()
+        var byteCount = 0
+        for file in files.sorted(by: { $0.relativePath < $1.relativePath }) {
+            let size = try fileSizeByteCount(
+                from: FileManager.default.attributesOfItem(atPath: file.url.path),
+                path: file.url.path
+            )
+            guard byteCount <= Int.max - size else {
+                throw MLXFastError.invalidInput("directory digest byte count exceeds Int range")
+            }
+            byteCount += size
+            let digest = try fileDigest(file.url)
+            treeHasher.update(data: Data(file.relativePath.utf8))
+            treeHasher.update(data: Data([0]))
+            treeHasher.update(data: Data(digest))
+            treeHasher.update(data: Data([0]))
+        }
+
+        return DirectoryDigest(
+            fileCount: files.count,
+            byteCount: byteCount,
+            sha256: treeHasher.finalize().map { String(format: "%02x", $0) }.joined()
+        )
+    }
+
+    private static func fileDigest(_ url: URL) throws -> SHA256.Digest {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer {
+            try? handle.close()
+        }
+
+        var hasher = SHA256()
+        let chunkSize = 8 * 1024 * 1024
+        while true {
+            let data = handle.readData(ofLength: chunkSize)
+            if data.isEmpty {
+                return hasher.finalize()
+            }
+            hasher.update(data: data)
+        }
     }
 
     private static func runProcess(_ executable: String, arguments: [String]) throws -> String {

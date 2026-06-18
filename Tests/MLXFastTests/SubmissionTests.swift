@@ -38,6 +38,7 @@ func submissionPackagesEditableFilesAndSkipsMacMetadata() throws {
 
     #expect(report.fileCount == 1)
     #expect(report.byteCount == "public enum A {}\n".utf8.count)
+    #expect(report.archiveSha256.count == 64)
     #expect(FileManager.default.fileExists(atPath: archive.path))
 }
 
@@ -185,6 +186,7 @@ func submissionAllowsUnlimitedSourceByteCountWhenExplicitlyConfigured() throws {
     )
 
     #expect(report.byteCount == 4)
+    #expect(report.archiveSha256.count == 64)
 }
 
 private func makeSubmissionWorkspace(editablePaths: [String]) throws -> URL {

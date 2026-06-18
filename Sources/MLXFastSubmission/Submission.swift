@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import MLXFastCore
 
@@ -13,6 +14,7 @@ public struct SubmissionArchiveReport: Codable, Equatable {
     public let editablePaths: [String]
     public let fileCount: Int
     public let byteCount: Int
+    public let archiveSha256: String
 }
 
 public enum SubmissionSupport {
@@ -63,13 +65,15 @@ public enum SubmissionSupport {
             archivePath: archiveURL.path,
             workingDirectory: contractRoot
         )
+        let archiveSha256 = try fileSHA256(archiveURL)
 
         return SubmissionArchiveReport(
             contractPath: URL(fileURLWithPath: contractPath).standardizedFileURL.path,
             archivePath: archiveURL.path,
             editablePaths: contract.editablePaths,
             fileCount: files.count,
-            byteCount: byteCount
+            byteCount: byteCount,
+            archiveSha256: archiveSha256
         )
     }
 
@@ -351,6 +355,23 @@ public enum SubmissionSupport {
                 encoding: .utf8
             ) ?? ""
             throw MLXFastError.invalidInput("zip failed with status \(process.terminationStatus): \(error)")
+        }
+    }
+
+    private static func fileSHA256(_ url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer {
+            try? handle.close()
+        }
+
+        var hasher = SHA256()
+        let chunkSize = 8 * 1024 * 1024
+        while true {
+            let data = handle.readData(ofLength: chunkSize)
+            if data.isEmpty {
+                return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+            }
+            hasher.update(data: data)
         }
     }
 }

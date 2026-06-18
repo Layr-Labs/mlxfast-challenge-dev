@@ -29,6 +29,22 @@ jobs:
           swift --version
           xcodebuild -version
 
+      - name: Enforce contestant modifiable surface
+        if: startsWith(github.head_ref, 'submissions/') || startsWith(github.ref_name, 'submissions/')
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            export BASE_SHA="${PR_BASE_SHA}"
+            export HEAD_SHA="${PR_HEAD_SHA}"
+          else
+            export BASE_SHA="$(git merge-base origin/main "${HEAD_SHA}")"
+          fi
+          .github/scripts/enforce-modifiable-surface.sh
+
       - name: Shell syntax
         run: |
           bash -n setup.sh

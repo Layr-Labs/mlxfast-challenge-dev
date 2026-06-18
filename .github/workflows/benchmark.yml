@@ -50,5 +50,7 @@ jobs:
           name: benchmark-results-${{ github.run_id }}
           path: |
             score.json
+            score.json.sha256
+            benchmark-integrity.json
             results.tsv
           if-no-files-found: ignore
