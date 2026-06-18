@@ -112,6 +112,102 @@ func loadGoldenCasesRejectsDuplicateCaseNames() throws {
     }
 }
 
+@Test
+func loadGoldenCasesRejectsNamesWithSurroundingWhitespace() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": " ambiguous ",
+          "prompt_tokens": [1],
+          "expected_tokens": \(expected)
+        }
+      ]
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try loadGoldenCases(from: path.path)
+    }
+}
+
+@Test
+func loadGoldenCasesRejectsNamesWithControlCharacters() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "bad\\nname",
+          "prompt_tokens": [1],
+          "expected_tokens": \(expected)
+        }
+      ]
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try loadGoldenCases(from: path.path)
+    }
+}
+
+@Test
+func loadGoldenCasesRejectsWrongExpectedTokenCount() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps + 1)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "wrong-count",
+          "prompt_tokens": [1],
+          "expected_tokens": \(expected)
+        }
+      ]
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try loadGoldenCases(from: path.path)
+    }
+}
+
+@Test
+func loadGoldenCasesRejectsNonPositiveRequiredSteps() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = [7]
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "bad-steps",
+          "prompt_tokens": [1],
+          "expected_tokens": \(expected)
+        }
+      ]
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try loadGoldenCases(from: path.path, requiredSteps: 0)
+    }
+}
+
 private func temporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent(
         UUID().uuidString,

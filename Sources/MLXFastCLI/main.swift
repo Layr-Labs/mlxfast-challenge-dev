@@ -47,6 +47,7 @@ struct MLXFastCLI {
     }
 
     private static func runTransform(_ options: ParsedOptions) throws {
+        try options.validate(valueOptions: ["--reference", "--output"])
         let referencePath = options.value(
             for: "--reference",
             default: environmentValue(
@@ -72,6 +73,7 @@ struct MLXFastCLI {
     }
 
     private static func runCorrectness(_ options: ParsedOptions) throws -> Int {
+        try options.validate(valueOptions: ["--weights", "--golden"])
         let weightsPath = options.value(
             for: "--weights",
             default: environmentValue(
@@ -99,6 +101,7 @@ struct MLXFastCLI {
     }
 
     private static func runPreflight(_ options: ParsedOptions) throws {
+        try options.validate(valueOptions: ["--weights", "--golden"])
         let weightsPath = options.value(
             for: "--weights",
             default: environmentValue(
@@ -126,6 +129,7 @@ struct MLXFastCLI {
     }
 
     private static func runBenchmark(_ options: ParsedOptions) throws {
+        try options.validate(valueOptions: ["--weights", "--golden", "--score-path"])
         let weightsPath = options.value(
             for: "--weights",
             default: environmentValue(
@@ -155,6 +159,7 @@ struct MLXFastCLI {
     }
 
     private static func runCheckpointShards(_ options: ParsedOptions) throws {
+        try options.validate(valueOptions: ["--index"])
         let indexPath = options.value(for: "--index", default: "")
         guard !indexPath.isEmpty else {
             throw MLXFastError.invalidInput("checkpoint-shards requires --index PATH")
@@ -188,6 +193,8 @@ struct MLXFastCLI {
 private struct ParsedOptions {
     private var values: [String: String] = [:]
     private var flags: Set<String> = []
+    private var positionals: [String] = []
+    private var duplicates: Set<String> = []
 
     init(_ arguments: [String]) {
         var index = 0
@@ -197,18 +204,28 @@ private struct ParsedOptions {
                 if let separator = argument.firstIndex(of: "=") {
                     let key = String(argument[..<separator])
                     let value = String(argument[argument.index(after: separator)...])
+                    recordOption(key)
                     values[key] = value
                     index += 1
                 } else if index + 1 < arguments.count && !arguments[index + 1].hasPrefix("--") {
+                    recordOption(argument)
                     values[argument] = arguments[index + 1]
                     index += 2
                 } else {
+                    recordOption(argument)
                     flags.insert(argument)
                     index += 1
                 }
             } else {
+                positionals.append(argument)
                 index += 1
             }
+        }
+    }
+
+    private mutating func recordOption(_ name: String) {
+        if values[name] != nil || flags.contains(name) {
+            duplicates.insert(name)
         }
     }
 
@@ -216,7 +233,26 @@ private struct ParsedOptions {
         values[name] ?? defaultValue
     }
 
-    func contains(_ name: String) -> Bool {
-        flags.contains(name) || values[name] != nil
+    func validate(valueOptions: Set<String>, flagOptions: Set<String> = []) throws {
+        if let duplicate = duplicates.first {
+            throw MLXFastError.invalidInput("duplicate option \(duplicate)")
+        }
+        for name in values.keys where !valueOptions.contains(name) {
+            throw MLXFastError.invalidInput("unknown option \(name)")
+        }
+        for (name, value) in values where value.isEmpty {
+            throw MLXFastError.invalidInput("\(name) requires a non-empty value")
+        }
+        for flag in flags {
+            if valueOptions.contains(flag) {
+                throw MLXFastError.invalidInput("\(flag) requires a value")
+            }
+            if !flagOptions.contains(flag) {
+                throw MLXFastError.invalidInput("unknown option \(flag)")
+            }
+        }
+        if let positional = positionals.first {
+            throw MLXFastError.invalidInput("unexpected argument \(positional)")
+        }
     }
 }

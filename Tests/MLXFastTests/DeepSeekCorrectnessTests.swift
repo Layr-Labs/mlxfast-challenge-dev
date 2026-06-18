@@ -1,5 +1,7 @@
 import Foundation
+import CryptoKit
 import MLX
+import MLXFastCore
 @testable import MLXFastDeepSeek
 import Testing
 
@@ -117,6 +119,43 @@ func deepSeekRuntimeCorrectnessReportsMissingArtifacts() throws {
     #expect(report.checkedSteps == 0)
     #expect(report.firstFailingCase == nil)
     #expect(report.error.contains("correctness golden file"))
+}
+
+@Test
+func deepSeekRuntimeCorrectnessReportsGoldenMetadataWhenWeightsAreMissing() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let goldenPath = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "valid-golden",
+          "prompt_tokens": [1],
+          "expected_tokens": \(expected)
+        }
+      ]
+    }
+    """
+    try json.write(to: goldenPath, atomically: true, encoding: .utf8)
+
+    let report = try DeepSeekRuntime.runCorrectness(
+        CorrectnessOptions(
+            weightsPath: directory.appendingPathComponent("missing-weights").path,
+            goldenPath: goldenPath.path
+        )
+    )
+
+    let digest = SHA256.hash(data: try Data(contentsOf: goldenPath))
+    let expectedHash = digest.map { String(format: "%02x", $0) }.joined()
+    #expect(!report.passed)
+    #expect(report.checkedSteps == 0)
+    #expect(report.caseCount == 1)
+    #expect(report.goldenHash == expectedHash)
+    #expect(report.firstFailingCase == nil)
 }
 
 @Test

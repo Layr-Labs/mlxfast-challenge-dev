@@ -45,6 +45,9 @@ public func loadGoldenFixture(
     from path: String,
     requiredSteps: Int = MLXFastConstants.correctnessSteps
 ) throws -> GoldenFixture {
+    guard requiredSteps > 0 else {
+        throw MLXFastError.invalidInput("correctness required steps must be positive")
+    }
     try requireFile(path, description: "correctness golden file")
 
     let data = try Data(contentsOf: URL(fileURLWithPath: path))
@@ -58,8 +61,20 @@ public func loadGoldenFixture(
 
     var names = Set<String>()
     for testCase in decoded.cases {
-        if testCase.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let caseNameDescription = String(reflecting: testCase.name)
+        let trimmedName = testCase.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedName.isEmpty {
             throw MLXFastError.invalidInput("correctness golden case name must not be empty")
+        }
+        if testCase.name != trimmedName {
+            throw MLXFastError.invalidInput(
+                "correctness golden case name \(caseNameDescription) must not have leading or trailing whitespace"
+            )
+        }
+        if testCase.name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) {
+            throw MLXFastError.invalidInput(
+                "correctness golden case name \(caseNameDescription) must not contain control characters"
+            )
         }
         guard names.insert(testCase.name).inserted else {
             throw MLXFastError.invalidInput("duplicate correctness golden case name \(testCase.name)")
@@ -67,9 +82,9 @@ public func loadGoldenFixture(
         if testCase.promptTokens.isEmpty {
             throw MLXFastError.invalidInput("\(testCase.name).prompt_tokens must not be empty")
         }
-        if testCase.expectedTokens.count < requiredSteps {
+        if testCase.expectedTokens.count != requiredSteps {
             throw MLXFastError.invalidInput(
-                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need at least \(requiredSteps)"
+                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need exactly \(requiredSteps)"
             )
         }
         try validateTokens(testCase.promptTokens, field: "\(testCase.name).prompt_tokens")

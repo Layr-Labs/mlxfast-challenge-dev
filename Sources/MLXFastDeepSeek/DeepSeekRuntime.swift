@@ -78,8 +78,10 @@ public struct BenchmarkOptions: Equatable {
 
 public enum DeepSeekRuntime {
     public static func runCorrectness(_ options: CorrectnessOptions) throws -> CorrectnessReport {
+        var loadedGolden: GoldenFixture?
         do {
             let golden = try loadGoldenFixture(from: options.goldenPath)
+            loadedGolden = golden
             let config = try DeepSeekConfig.load(from: options.weightsPath)
             let loader = try DeepSeekWeightLoader(weightsPath: options.weightsPath)
             let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
@@ -89,7 +91,12 @@ public enum DeepSeekRuntime {
                 goldenHash: golden.sha256
             )
         } catch {
-            return failedCorrectnessReport(checkedSteps: 0, error: "\(error)")
+            return failedCorrectnessReport(
+                checkedSteps: 0,
+                caseCount: loadedGolden?.cases.count ?? 0,
+                goldenHash: loadedGolden?.sha256 ?? "",
+                error: "\(error)"
+            )
         }
     }
 
@@ -196,17 +203,11 @@ public enum DeepSeekRuntime {
         goldenHash: String
     ) -> CorrectnessReport {
         var checkedSteps = 0
+        var currentCase: GoldenCase?
         do {
             for testCase in cases {
-                let actualTokens = try generateGreedyCached(
-                    promptTokens: testCase.promptTokens,
-                    steps: MLXFastConstants.correctnessSteps,
-                    weightCache: weightCache
-                )
-                let comparison = DeepSeekCorrectness.compareTokens(
-                    expected: testCase.expectedTokens,
-                    actual: actualTokens
-                )
+                currentCase = testCase
+                let comparison = try compareGreedyCached(testCase: testCase, weightCache: weightCache)
                 if !comparison.passed {
                     return CorrectnessReport(
                         passed: false,
@@ -226,6 +227,7 @@ public enum DeepSeekRuntime {
             return failedCorrectnessReport(
                 checkedSteps: checkedSteps,
                 caseCount: cases.count,
+                firstFailingCase: currentCase?.name,
                 goldenHash: goldenHash,
                 error: "\(error)"
             )
@@ -460,37 +462,48 @@ public enum DeepSeekRuntime {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    private static func generateGreedyCached(
-        promptTokens: [Int],
-        steps: Int,
+    private static func compareGreedyCached(
+        testCase: GoldenCase,
         weightCache: DeepSeekRuntimeWeightCache
-    ) throws -> [Int] {
-        guard !promptTokens.isEmpty else {
+    ) throws -> CorrectnessTokenComparison {
+        let steps = MLXFastConstants.correctnessSteps
+        guard !testCase.promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("greedy correctness prompt must not be empty")
         }
-        guard steps >= 0 else {
-            throw MLXFastError.invalidInput("greedy correctness steps must be non-negative")
-        }
-        guard steps > 0 else {
-            return []
+        guard testCase.expectedTokens.count == steps else {
+            throw MLXFastError.invalidInput(
+                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need exactly \(steps)"
+            )
         }
 
         let config = weightCache.config
         let cache = DeepSeekModelCache(config: config)
-        var generated: [Int] = []
-        generated.reserveCapacity(steps)
 
         var logits = try DeepSeekModel.logits(
-            inputIDs: inputIDsArray(promptTokens),
+            inputIDs: inputIDsArray(testCase.promptTokens),
             weightCache: weightCache,
             cache: cache,
             positionOffset: 0
         )
         var token = try DeepSeekCorrectness.greedyToken(from: logits)
-        generated.append(token)
 
-        while generated.count < steps {
-            let positionOffset = promptTokens.count + generated.count - 1
+        for step in 0..<steps {
+            let expectedToken = testCase.expectedTokens[step]
+            if token != expectedToken {
+                return CorrectnessTokenComparison(
+                    passed: false,
+                    checkedSteps: step + 1,
+                    firstFailingStep: step,
+                    expectedToken: expectedToken,
+                    actualToken: token
+                )
+            }
+
+            if step == steps - 1 {
+                break
+            }
+
+            let positionOffset = testCase.promptTokens.count + step
             logits = try DeepSeekModel.logits(
                 inputIDs: inputIDsArray([token]),
                 weightCache: weightCache,
@@ -498,10 +511,15 @@ public enum DeepSeekRuntime {
                 positionOffset: positionOffset
             )
             token = try DeepSeekCorrectness.greedyToken(from: logits)
-            generated.append(token)
         }
 
-        return generated
+        return CorrectnessTokenComparison(
+            passed: true,
+            checkedSteps: steps,
+            firstFailingStep: nil,
+            expectedToken: nil,
+            actualToken: nil
+        )
     }
 
     private static func inputIDsArray(_ tokens: [Int]) throws -> MLXArray {
@@ -522,6 +540,7 @@ public enum DeepSeekRuntime {
     private static func failedCorrectnessReport(
         checkedSteps: Int,
         caseCount: Int = 0,
+        firstFailingCase: String? = nil,
         goldenHash: String = "",
         error: String
     ) -> CorrectnessReport {
@@ -529,7 +548,7 @@ public enum DeepSeekRuntime {
             passed: false,
             checkedSteps: checkedSteps,
             caseCount: caseCount,
-            firstFailingCase: nil,
+            firstFailingCase: firstFailingCase,
             firstFailingStep: nil,
             expectedToken: nil,
             actualToken: nil,
