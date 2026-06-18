@@ -14,6 +14,18 @@ public struct CorrectnessOptions: Equatable {
     }
 }
 
+public struct GoldenGenerationOptions: Equatable {
+    public let weightsPath: String
+    public let caseName: String
+    public let promptTokens: [Int]
+
+    public init(weightsPath: String, caseName: String, promptTokens: [Int]) {
+        self.weightsPath = weightsPath
+        self.caseName = caseName
+        self.promptTokens = promptTokens
+    }
+}
+
 public struct CorrectnessReport: Codable, Equatable {
     public let passed: Bool
     public let checkedSteps: Int
@@ -146,6 +158,25 @@ public struct BenchmarkOptions: Equatable {
 }
 
 public enum DeepSeekRuntime {
+    public static func generateGoldenCase(_ options: GoldenGenerationOptions) throws -> GoldenCase {
+        let config = try DeepSeekConfig.load(from: options.weightsPath)
+        let loader = try DeepSeekWeightLoader(
+            weightsPath: options.weightsPath,
+            expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: true)
+        )
+        let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
+        let expectedTokens = try generateGreedyCachedTokens(
+            promptTokens: options.promptTokens,
+            weightCache: weightCache,
+            steps: MLXFastConstants.correctnessSteps
+        )
+        return GoldenCase(
+            name: options.caseName,
+            promptTokens: options.promptTokens,
+            expectedTokens: expectedTokens
+        )
+    }
+
     public static func runCorrectness(_ options: CorrectnessOptions) throws -> CorrectnessReport {
         var loadedGolden: GoldenFixture?
         var loader: DeepSeekWeightLoader?
@@ -624,6 +655,44 @@ public enum DeepSeekRuntime {
                     weightCache: weightCache,
                     cache: cache,
                     positionOffset: testCase.promptTokens.count + step - 1
+                )
+            }
+            return try DeepSeekCorrectness.greedyToken(from: logits)
+        }
+    }
+
+    private static func generateGreedyCachedTokens(
+        promptTokens: [Int],
+        weightCache: DeepSeekRuntimeWeightCache,
+        steps: Int
+    ) throws -> [Int] {
+        guard !promptTokens.isEmpty else {
+            throw MLXFastError.invalidInput("greedy correctness prompt must not be empty")
+        }
+
+        let config = weightCache.config
+        let cache = DeepSeekModelCache(config: config)
+
+        return try DeepSeekCorrectness.generateGreedyTokens(
+            steps: steps
+        ) { step, previousToken in
+            let logits: MLXArray
+            if step == 0 {
+                logits = try DeepSeekModel.logits(
+                    inputIDs: inputIDsArray(promptTokens),
+                    weightCache: weightCache,
+                    cache: cache,
+                    positionOffset: 0
+                )
+            } else {
+                guard let previousToken else {
+                    throw MLXFastError.invalidInput("missing previous token for greedy correctness step \(step)")
+                }
+                logits = try DeepSeekModel.logits(
+                    inputIDs: inputIDsArray([previousToken]),
+                    weightCache: weightCache,
+                    cache: cache,
+                    positionOffset: promptTokens.count + step - 1
                 )
             }
             return try DeepSeekCorrectness.greedyToken(from: logits)

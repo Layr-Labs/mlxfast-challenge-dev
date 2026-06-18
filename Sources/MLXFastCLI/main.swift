@@ -32,6 +32,9 @@ struct MLXFastCLI {
             case "benchmark":
                 try runBenchmark(options)
                 return 0
+            case "make-golden":
+                try runMakeGolden(options)
+                return 0
             case "checkpoint-shards":
                 try runCheckpointShards(options)
                 return 0
@@ -158,6 +161,36 @@ struct MLXFastCLI {
         print("wrote \(scorePath)")
     }
 
+    private static func runMakeGolden(_ options: ParsedOptions) throws {
+        try options.validate(valueOptions: ["--weights", "--output", "--name", "--prompt-tokens"])
+        let weightsPath = options.value(
+            for: "--weights",
+            default: environmentValue(
+                "MLXFAST_WEIGHTS_PATH",
+                fallback: MLXFastConstants.defaultWeightsPath
+            )
+        )
+        let outputPath = options.value(for: "--output", default: "local_correctness_golden.json")
+        let caseName = options.value(for: "--name", default: "local-self-check")
+        let promptTokens = try parsePromptTokens(
+            options.value(for: "--prompt-tokens", default: "")
+        )
+
+        let testCase = try DeepSeekRuntime.generateGoldenCase(
+            GoldenGenerationOptions(
+                weightsPath: weightsPath,
+                caseName: caseName,
+                promptTokens: promptTokens
+            )
+        )
+        let payload = GoldenOutput(cases: [testCase])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(payload)
+        try data.write(to: URL(fileURLWithPath: outputPath), options: .atomic)
+        print("wrote \(outputPath)")
+    }
+
     private static func runCheckpointShards(_ options: ParsedOptions) throws {
         try options.validate(valueOptions: ["--index"])
         let indexPath = options.value(for: "--index", default: "")
@@ -177,6 +210,7 @@ struct MLXFastCLI {
               mlxfast-swift correctness [--weights PATH] [--golden PATH]
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--weights PATH] [--golden PATH] [--score-path PATH]
+              mlxfast-swift make-golden [--weights PATH] [--output PATH] [--name NAME] [--prompt-tokens TOKENS]
               mlxfast-swift checkpoint-shards --index PATH
 
             Swift-only DeepSeek V4 Flash harness entrypoint.
@@ -188,6 +222,36 @@ struct MLXFastCLI {
         let value = ProcessInfo.processInfo.environment[name] ?? ""
         return value.isEmpty ? fallback : value
     }
+
+    private static func parsePromptTokens(_ raw: String) throws -> [Int] {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens)
+        }
+
+        let pieces = trimmed.split { character in
+            character == "," || character == " " || character == "\n" || character == "\t"
+        }
+        guard !pieces.isEmpty else {
+            throw MLXFastError.invalidInput("--prompt-tokens must contain at least one token")
+        }
+        return try pieces.enumerated().map { index, piece in
+            guard let token = Int(piece) else {
+                throw MLXFastError.invalidInput("--prompt-tokens[\(index)] is not an integer: \(piece)")
+            }
+            guard token >= 0, token < MLXFastConstants.vocabSize else {
+                throw MLXFastError.invalidInput(
+                    "--prompt-tokens[\(index)]=\(token) is outside DeepSeek vocab range 0..<\(MLXFastConstants.vocabSize)"
+                )
+            }
+            return token
+        }
+    }
+}
+
+private struct GoldenOutput: Encodable {
+    let version = 1
+    let cases: [GoldenCase]
 }
 
 private struct ParsedOptions {

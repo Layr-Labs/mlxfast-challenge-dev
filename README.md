@@ -22,6 +22,11 @@ See [CHALLENGE.md](CHALLENGE.md) for the full problem statement, scoring formula
 .build/release/mlxfast-swift preflight
 .build/release/mlxfast-swift benchmark --score-path score.json
 
+# Local-only smoke loop when you do not have the organizer golden.
+# This records the current model's greedy output; it is not the scoring oracle.
+.build/release/mlxfast-swift make-golden --output local_correctness_golden.json
+MLXFAST_CORRECTNESS_GOLDEN_PATH=local_correctness_golden.json ./benchmark.sh
+
 # If required model artifacts are missing, the benchmark emits a valid failed
 # score.json instead of a ranked score.
 ```
@@ -31,6 +36,10 @@ The benchmark writes `score.json` in the format consumed by Darkbloom.
 `correctness_golden.json` is also not tracked in the public repo; the benchmark
 operator supplies it, or points the harness at it with
 `MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json`.
+For local development only, `mlxfast-swift make-golden` can create a
+self-consistent golden from the current model and transformed weights. That file
+lets participants exercise the harness locally, but it is not accepted as the
+hidden scoring oracle.
 
 Full model setup needs a large local or mounted SSD. The reference checkpoint is
 `mlx-community/DeepSeek-V4-Flash-4bit`, with 33 safetensors shards totaling about
@@ -68,6 +77,15 @@ in scope. Submissions should focus on the Swift targets listed in
 The repository is Swift-only: setup, transform, correctness, and benchmark all
 run through the Swift package. The correctness gate, benchmark timing, and score
 emission live in frozen harness code outside the participant-editable surface.
+
+The baseline transform intentionally does **not** duplicate routed expert weights.
+It copies dense tensors into `weights/` and writes `weights/experts/manifest.json`
+with byte ranges that point back into the frozen reference safetensors. That keeps
+the default disk footprint within the 250 GB Blacksmith Apple-Silicon runner cap:
+the reference checkpoint plus a full rewritten expert repack would exceed that
+limit. Participants can still change both `MLXFastTransform` and `MLXFastModel`
+to introduce a custom on-disk expert representation, as long as the transformed
+`weights/` remain self-consistent and the trusted correctness gate passes.
 
 ## Scoring
 

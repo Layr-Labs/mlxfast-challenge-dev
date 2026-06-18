@@ -59,6 +59,18 @@ correctness_golden.json
 Use `MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json` when the
 file is provisioned outside the repository root.
 
+For local development only, participants can generate a self-consistent fixture
+from their current transformed weights:
+
+```bash
+.build/release/mlxfast-swift make-golden --output local_correctness_golden.json
+MLXFAST_CORRECTNESS_GOLDEN_PATH=local_correctness_golden.json ./benchmark.sh
+```
+
+This local fixture is useful for exercising the full harness and catching
+obvious regressions, but it is not the organizer-owned hidden golden used for
+scoring.
+
 ## Editable Surface
 
 The active implementation is Swift-only:
@@ -73,6 +85,15 @@ The active implementation is Swift-only:
 | `tools/build-mlx-metallib.sh` | Local MLX Metal library build helper. |
 
 There is no Python harness path.
+
+The default Swift transform uses an expert byte-range manifest rather than
+rewriting all routed experts into new expert-major files. This is deliberate: on
+Blacksmith's 250 GB Apple-Silicon runners, keeping the reference checkpoint and a
+full rewritten expert copy at the same time would exceed available disk. The
+manifest baseline is still part of the optimization surface. Submissions may
+extend both `MLXFastTransform` and `MLXFastModel` to produce and consume a custom
+expert layout, provided the generated `weights/` are deterministic from the
+frozen reference checkpoint and pass the trusted correctness gate.
 
 ## Correctness Gate
 
@@ -103,6 +124,7 @@ swift test
 MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test
 swift build -c release
 .build/release/mlxfast-swift transform
+.build/release/mlxfast-swift make-golden --output local_correctness_golden.json
 .build/release/mlxfast-swift correctness
 .build/release/mlxfast-swift preflight
 .build/release/mlxfast-swift benchmark --score-path score.json

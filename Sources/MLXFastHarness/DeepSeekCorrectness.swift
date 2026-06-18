@@ -113,6 +113,25 @@ public enum DeepSeekCorrectness {
         )
     }
 
+    public static func generateGreedyTokens(
+        steps: Int = MLXFastConstants.correctnessSteps,
+        nextToken: (_ step: Int, _ previousToken: Int?) throws -> Int
+    ) throws -> [Int] {
+        guard steps >= 0 else {
+            throw MLXFastError.invalidInput("greedy correctness steps must be non-negative")
+        }
+
+        var previousToken: Int?
+        var generated: [Int] = []
+        generated.reserveCapacity(steps)
+        for step in 0..<steps {
+            let token = try nextToken(step, previousToken)
+            generated.append(token)
+            previousToken = token
+        }
+        return generated
+    }
+
     public static func compareGreedyTokens(
         expected: [Int],
         steps: Int = MLXFastConstants.correctnessSteps,

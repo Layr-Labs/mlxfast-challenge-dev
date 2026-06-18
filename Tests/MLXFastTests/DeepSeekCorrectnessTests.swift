@@ -77,6 +77,19 @@ func deepSeekCorrectnessGeneratesGreedyTokensWithGrowingContext() throws {
 }
 
 @Test
+func deepSeekCorrectnessGeneratesGreedyTokensFromPreviousToken() throws {
+    var calls: [(Int, Int?)] = []
+    let generated = try DeepSeekCorrectness.generateGreedyTokens(steps: 3) { step, previousToken in
+        calls.append((step, previousToken))
+        return (previousToken ?? 10) + step
+    }
+
+    #expect(generated == [10, 11, 13])
+    #expect(calls.map(\.0) == [0, 1, 2])
+    #expect(calls.map(\.1) == [nil, 10, 11])
+}
+
+@Test
 func deepSeekCorrectnessComparesGeneratedGreedyTokens() throws {
     var calls: [(Int, Int?)] = []
     let comparison = try DeepSeekCorrectness.compareGreedyTokens(

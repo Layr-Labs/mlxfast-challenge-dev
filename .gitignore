@@ -20,6 +20,7 @@ results.tsv
 score.json
 score.json.tmp
 correctness_golden.json
+local_correctness_golden.json
 
 # IDE
 .vscode/
