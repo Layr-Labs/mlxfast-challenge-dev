@@ -76,7 +76,10 @@ run through the Swift package.
 
 `mlxfast-swift submit` reads `benchmark.json` and archives only the paths listed
 in `editablePaths` for the Yukon backend. Generated `weights/`, reference
-checkpoints, golden files, and local scores are not submitted.
+checkpoints, golden files, local scores, repository metadata, symlinks, and macOS
+metadata files are not submitted. The default source archive input cap is
+256 MiB; override it with `MLXFAST_MAX_SUBMISSION_BYTES` or
+`mlxfast-swift submit --max-bytes`.
 
 ## Scoring
 

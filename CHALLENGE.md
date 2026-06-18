@@ -81,7 +81,10 @@ The active editable surface is Swift-only and is defined by `benchmark.json`:
 `Sources/MLXFastCore/`, `Sources/MLXFastHarness/`, `Sources/MLXFastCLI/`,
 scripts, tests, `benchmark.json`, generated `weights/`, reference checkpoints,
 golden fixtures, and local scores are harness/operator files, not submission
-surface. `mlxfast-swift submit` packages only `editablePaths`.
+surface. `mlxfast-swift submit` packages only `editablePaths`, rejects symlinks
+and generated/model artifact paths, skips macOS metadata files, and applies a
+256 MiB default source archive input cap. Override the cap with
+`MLXFAST_MAX_SUBMISSION_BYTES` or `mlxfast-swift submit --max-bytes`.
 
 `mlxfast-swift verify-transform` is an organizer/debug check for deterministic
 transform output. It re-runs the submitted transform and compares the generated

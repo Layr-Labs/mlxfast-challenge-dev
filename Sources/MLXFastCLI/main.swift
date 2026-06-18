@@ -3,6 +3,7 @@ import Foundation
 import MLXFastCore
 import MLXFastDeepSeek
 import MLXFastHarness
+import MLXFastSubmission
 import MLXFastTransform
 
 let exitCode = MLXFastCLI.run(arguments: Array(CommandLine.arguments.dropFirst()))
@@ -109,7 +110,11 @@ private enum MLXFastCLI {
                 fallback: "\(MLXFastConstants.defaultMaxTransformedWeightsBytes)"
             )
         )
-        let maxByteCount = try parseMaxByteCount(maxBytesRaw)
+        let maxByteCount = try parseMaxByteCount(
+            maxBytesRaw,
+            defaultByteCount: MLXFastConstants.defaultMaxTransformedWeightsBytes,
+            optionName: "--max-bytes"
+        )
         let report = try TransformVerifier.verify(
             TransformVerificationOptions(
                 referencePath: referencePath,
@@ -297,12 +302,25 @@ private enum MLXFastCLI {
     }
 
     private static func runSubmit(_ options: ParsedOptions) throws {
-        try options.validate(valueOptions: ["--contract", "--output"])
+        try options.validate(valueOptions: ["--contract", "--output", "--max-bytes"])
         let contractPath = options.value(for: "--contract", default: "benchmark.json")
         let outputPath = options.value(for: "--output", default: "mlxfast-submission.zip")
+        let maxBytesRaw = options.value(
+            for: "--max-bytes",
+            default: environmentValue(
+                "MLXFAST_MAX_SUBMISSION_BYTES",
+                fallback: "\(MLXFastConstants.defaultMaxSubmissionSourceBytes)"
+            )
+        )
+        let maxByteCount = try parseMaxByteCount(
+            maxBytesRaw,
+            defaultByteCount: MLXFastConstants.defaultMaxSubmissionSourceBytes,
+            optionName: "--max-bytes"
+        )
         let report = try SubmissionSupport.packageEditablePaths(
             contractPath: contractPath,
-            outputPath: outputPath
+            outputPath: outputPath,
+            maxByteCount: maxByteCount
         )
 
         let encoder = JSONEncoder()
@@ -325,7 +343,7 @@ private enum MLXFastCLI {
               mlxfast-swift checkpoint-shards --index PATH
               mlxfast-swift login --api-key KEY
               mlxfast-swift clone [--contract benchmark.json]
-              mlxfast-swift submit [--contract benchmark.json] [--output mlxfast-submission.zip]
+              mlxfast-swift submit [--contract benchmark.json] [--output mlxfast-submission.zip] [--max-bytes N]
 
             Swift-only DeepSeek V4 Flash harness entrypoint.
             """
@@ -337,17 +355,23 @@ private enum MLXFastCLI {
         return value.isEmpty ? fallback : value
     }
 
-    private static func parseMaxByteCount(_ raw: String) throws -> Int? {
+    private static func parseMaxByteCount(
+        _ raw: String,
+        defaultByteCount: Int?,
+        optionName: String
+    ) throws -> Int? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
-            return MLXFastConstants.defaultMaxTransformedWeightsBytes
+            return defaultByteCount
         }
         let lowercased = trimmed.lowercased()
         if lowercased == "0" || lowercased == "none" || lowercased == "unlimited" {
             return nil
         }
         guard let value = Int(trimmed), value > 0 else {
-            throw MLXFastError.invalidInput("--max-bytes must be a positive byte count, 0, none, or unlimited")
+            throw MLXFastError.invalidInput(
+                "\(optionName) must be a positive byte count, 0, none, or unlimited"
+            )
         }
         return value
     }

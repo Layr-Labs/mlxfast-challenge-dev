@@ -1,30 +1,31 @@
 import Foundation
 import MLXFastCore
 
-struct ChallengeContract: Decodable, Equatable {
-    let schemaVersion: Int
-    let name: String
-    let editablePaths: [String]
+public struct ChallengeContract: Decodable, Equatable {
+    public let schemaVersion: Int
+    public let name: String
+    public let editablePaths: [String]
 }
 
-struct SubmissionArchiveReport: Codable, Equatable {
-    let contractPath: String
-    let archivePath: String
-    let editablePaths: [String]
-    let fileCount: Int
-    let byteCount: Int
+public struct SubmissionArchiveReport: Codable, Equatable {
+    public let contractPath: String
+    public let archivePath: String
+    public let editablePaths: [String]
+    public let fileCount: Int
+    public let byteCount: Int
 }
 
-enum SubmissionSupport {
-    static func ensureWorkspace(contractPath: String) throws -> ChallengeContract {
+public enum SubmissionSupport {
+    public static func ensureWorkspace(contractPath: String) throws -> ChallengeContract {
         let contract = try loadContract(at: contractPath)
         _ = try editableFiles(from: contract, contractPath: contractPath)
         return contract
     }
 
-    static func packageEditablePaths(
+    public static func packageEditablePaths(
         contractPath: String,
-        outputPath: String
+        outputPath: String,
+        maxByteCount: Int? = MLXFastConstants.defaultMaxSubmissionSourceBytes
     ) throws -> SubmissionArchiveReport {
         let contract = try loadContract(at: contractPath)
         let files = try editableFiles(from: contract, contractPath: contractPath)
@@ -32,11 +33,26 @@ enum SubmissionSupport {
             throw MLXFastError.invalidInput("benchmark.json editablePaths did not select any files")
         }
 
-        let archiveURL = URL(fileURLWithPath: outputPath).standardizedFileURL
+        let archiveURL = try validateArchiveOutputPath(
+            outputPath,
+            contractPath: contractPath,
+            editablePaths: contract.editablePaths
+        )
+        let byteCount = try totalByteCount(files)
+        if let maxByteCount, byteCount > maxByteCount {
+            throw MLXFastError.invalidInput(
+                "submission source files total \(byteCount) bytes; limit is \(maxByteCount)"
+            )
+        }
+
         if let parent = archiveURL.deletingLastPathComponentIfPresent() {
             try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
         }
         if FileManager.default.fileExists(atPath: archiveURL.path) {
+            let values = try archiveURL.resourceValues(forKeys: [.isDirectoryKey])
+            guard values.isDirectory != true else {
+                throw MLXFastError.invalidInput("submission archive output is a directory: \(archiveURL.path)")
+            }
             try FileManager.default.removeItem(at: archiveURL)
         }
 
@@ -47,12 +63,6 @@ enum SubmissionSupport {
             archivePath: archiveURL.path,
             workingDirectory: contractRoot
         )
-        let byteCount = try files.reduce(0) { partial, file in
-            partial + (try fileSizeByteCount(
-                from: FileManager.default.attributesOfItem(atPath: file.absoluteURL.path),
-                path: file.absoluteURL.path
-            ))
-        }
 
         return SubmissionArchiveReport(
             contractPath: URL(fileURLWithPath: contractPath).standardizedFileURL.path,
@@ -63,7 +73,7 @@ enum SubmissionSupport {
         )
     }
 
-    static func storeCredentials(apiKey: String) throws -> String {
+    public static func storeCredentials(apiKey: String) throws -> String {
         let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             throw MLXFastError.invalidInput("login requires a non-empty API key")
@@ -91,6 +101,18 @@ enum SubmissionSupport {
         let absoluteURL: URL
     }
 
+    private static let reservedSubmissionPathPrefixes: Set<String> = [
+        ".build",
+        ".git",
+        ".github",
+        ".swiftpm",
+        "correctness_golden.json",
+        "mlxfast-submission.zip",
+        "reference_weights",
+        "score.json",
+        "weights",
+    ]
+
     private static func loadContract(at path: String) throws -> ChallengeContract {
         try requireFile(path, description: "benchmark contract")
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
@@ -104,8 +126,13 @@ enum SubmissionSupport {
         guard !contract.editablePaths.isEmpty else {
             throw MLXFastError.invalidInput("benchmark.json editablePaths must not be empty")
         }
+
+        var seen: Set<String> = []
         for path in contract.editablePaths {
             try validateRelativeContractPath(path, field: "editablePaths")
+            guard seen.insert(path).inserted else {
+                throw MLXFastError.invalidInput("benchmark.json editablePaths contains duplicate path \(path)")
+            }
         }
         return contract
     }
@@ -129,6 +156,9 @@ enum SubmissionSupport {
             if values.isSymbolicLink == true {
                 throw MLXFastError.invalidInput("editable path \(editablePath) must not be a symlink")
             }
+            if shouldIgnoreMetadataFile(editablePath) {
+                continue
+            }
             if values.isRegularFile == true {
                 files.append(EditableFile(relativePath: editablePath, absoluteURL: rootURL))
                 continue
@@ -138,7 +168,16 @@ enum SubmissionSupport {
             }
             files.append(contentsOf: try regularFilesUnder(rootURL, root: root))
         }
-        return files.sorted { $0.relativePath < $1.relativePath }
+        let sortedFiles = files.sorted { $0.relativePath < $1.relativePath }
+        var seenFiles: Set<String> = []
+        for file in sortedFiles {
+            guard seenFiles.insert(file.relativePath).inserted else {
+                throw MLXFastError.invalidInput(
+                    "benchmark.json editablePaths selects duplicate file \(file.relativePath)"
+                )
+            }
+        }
+        return sortedFiles
     }
 
     private static func regularFilesUnder(_ directory: URL, root: URL) throws -> [EditableFile] {
@@ -163,12 +202,18 @@ enum SubmissionSupport {
                 )
             }
             if values.isDirectory == true {
+                if shouldIgnoreMetadataDirectory(relativePath) {
+                    enumerator.skipDescendants()
+                }
                 continue
             }
             guard values.isRegularFile == true else {
                 throw MLXFastError.invalidInput(
                     "editable path \(relativePath) must be a regular file"
                 )
+            }
+            if shouldIgnoreMetadataFile(relativePath) {
+                continue
             }
             files.append(EditableFile(relativePath: relativePath, absoluteURL: standardized))
         }
@@ -182,12 +227,17 @@ enum SubmissionSupport {
         guard !path.hasPrefix("/") else {
             throw MLXFastError.invalidInput("benchmark.json \(field) path \(path) must be relative")
         }
-        guard !path.contains("\0"), !path.contains("\n") else {
+        guard !path.contains("\0"), !path.contains("\n"), !path.contains("\\") else {
             throw MLXFastError.invalidInput("benchmark.json \(field) path \(path) contains invalid characters")
         }
         let components = path.split(separator: "/", omittingEmptySubsequences: false)
         guard !components.contains(""), !components.contains("."), !components.contains("..") else {
             throw MLXFastError.invalidInput("benchmark.json \(field) path \(path) is not normalized")
+        }
+        guard !isReservedSubmissionPath(path) else {
+            throw MLXFastError.invalidInput(
+                "benchmark.json \(field) path \(path) selects generated or repository metadata"
+            )
         }
     }
 
@@ -210,6 +260,64 @@ enum SubmissionSupport {
                 "benchmark.json editable path \(relativePath) escapes repository root"
             )
         }
+    }
+
+    private static func validateArchiveOutputPath(
+        _ outputPath: String,
+        contractPath: String,
+        editablePaths: [String]
+    ) throws -> URL {
+        let archiveURL = URL(fileURLWithPath: outputPath).standardizedFileURL
+        guard archiveURL.pathExtension.lowercased() == "zip" else {
+            throw MLXFastError.invalidInput("submission archive output must end in .zip")
+        }
+
+        let root = URL(fileURLWithPath: contractPath).standardizedFileURL.deletingLastPathComponent()
+        let archivePath = archiveURL.path
+        for editablePath in editablePaths {
+            let editableURL = root.appendingPathComponent(editablePath).standardizedFileURL
+            let editableRootPath = editableURL.path
+            guard archivePath != editableRootPath,
+                  !archivePath.hasPrefix(editableRootPath + "/") else {
+                throw MLXFastError.invalidInput(
+                    "submission archive output must not be inside editable path \(editablePath)"
+                )
+            }
+        }
+        return archiveURL
+    }
+
+    private static func totalByteCount(_ files: [EditableFile]) throws -> Int {
+        var total = 0
+        for file in files {
+            let size = try fileSizeByteCount(
+                from: FileManager.default.attributesOfItem(atPath: file.absoluteURL.path),
+                path: file.absoluteURL.path
+            )
+            guard total <= Int.max - size else {
+                throw MLXFastError.invalidInput("submission source files exceed Int range")
+            }
+            total += size
+        }
+        return total
+    }
+
+    private static func isReservedSubmissionPath(_ path: String) -> Bool {
+        for reserved in reservedSubmissionPathPrefixes {
+            if path == reserved || path.hasPrefix(reserved + "/") {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func shouldIgnoreMetadataDirectory(_ path: String) -> Bool {
+        URL(fileURLWithPath: path).lastPathComponent == "__MACOSX"
+    }
+
+    private static func shouldIgnoreMetadataFile(_ path: String) -> Bool {
+        let name = URL(fileURLWithPath: path).lastPathComponent
+        return name == ".DS_Store" || name.hasPrefix("._")
     }
 
     private static func runZip(
