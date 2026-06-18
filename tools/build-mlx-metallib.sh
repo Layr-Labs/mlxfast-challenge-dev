@@ -17,13 +17,39 @@ JSON_SOURCE="${MLX_SWIFT_CHECKOUT}/Source/Cmlx/json"
 FMT_SOURCE="${MLX_SWIFT_CHECKOUT}/Source/Cmlx/fmt"
 CMAKE_BUILD_DIR="${MLXFAST_MLX_METAL_BUILD_DIR:-.build/mlx-metal}"
 
+find_cmake() {
+  local candidate
+  if [[ -n "${MLXFAST_CMAKE_BIN:-}" ]]; then
+    if [[ -x "${MLXFAST_CMAKE_BIN}" ]]; then
+      printf '%s\n' "${MLXFAST_CMAKE_BIN}"
+      return 0
+    fi
+    echo "build-mlx-metallib.sh: MLXFAST_CMAKE_BIN is set but not executable: ${MLXFAST_CMAKE_BIN}" >&2
+    return 1
+  fi
+
+  if candidate="$(command -v cmake 2>/dev/null)"; then
+    printf '%s\n' "${candidate}"
+    return 0
+  fi
+
+  for candidate in /opt/homebrew/bin/cmake /usr/local/bin/cmake; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 metal_toolchain_identifier() {
   xcodebuild -showComponent MetalToolchain 2>/dev/null \
     | awk -F': ' '/Toolchain Identifier/ { print $2; exit }' \
     || true
 }
 
-if ! command -v cmake >/dev/null 2>&1; then
+CMAKE_BIN="$(find_cmake)" || {
   cat >&2 <<EOF
 build-mlx-metallib.sh: cmake was not found.
 
@@ -33,7 +59,7 @@ Install CMake, then retry:
 
 EOF
   exit 1
-fi
+}
 
 METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER:-$(metal_toolchain_identifier)}"
 
@@ -70,7 +96,7 @@ done
 
 JOBS="${MLXFAST_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 
-cmake \
+"${CMAKE_BIN}" \
   -S "${MLX_SOURCE}" \
   -B "${CMAKE_BUILD_DIR}" \
   -DCMAKE_BUILD_TYPE=Release \
@@ -82,7 +108,7 @@ cmake \
   -DFETCHCONTENT_SOURCE_DIR_JSON="${ROOT_DIR}/${JSON_SOURCE}" \
   -DFETCHCONTENT_SOURCE_DIR_FMT="${ROOT_DIR}/${FMT_SOURCE}"
 
-cmake --build "${CMAKE_BUILD_DIR}" --target mlx-metallib --parallel "${JOBS}"
+"${CMAKE_BIN}" --build "${CMAKE_BUILD_DIR}" --target mlx-metallib --parallel "${JOBS}"
 
 METALLIB_PATH=$(find "${CMAKE_BUILD_DIR}" -name mlx.metallib -print -quit)
 if [[ -z "${METALLIB_PATH}" || ! -f "${METALLIB_PATH}" ]]; then
