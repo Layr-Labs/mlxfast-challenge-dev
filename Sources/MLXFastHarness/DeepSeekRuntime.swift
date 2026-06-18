@@ -177,6 +177,40 @@ public enum DeepSeekRuntime {
         )
     }
 
+    public static func generateBenchmarkGolden(_ options: GoldenGenerationOptions) throws -> BenchmarkGolden {
+        let config = try DeepSeekConfig.load(from: options.weightsPath)
+        let loader = try DeepSeekWeightLoader(
+            weightsPath: options.weightsPath,
+            expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: true)
+        )
+        let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
+        guard options.promptTokens.count >= MLXFastConstants.benchmarkPrefillPromptTokens else {
+            throw MLXFastError.invalidInput(
+                "benchmark golden prompt has \(options.promptTokens.count) tokens; need at least \(MLXFastConstants.benchmarkPrefillPromptTokens)"
+            )
+        }
+
+        let prefillTokens = Array(options.promptTokens.prefix(MLXFastConstants.benchmarkPrefillPromptTokens))
+        let expectedPrefillToken = try generateGreedyCachedTokens(
+            promptTokens: prefillTokens,
+            weightCache: weightCache,
+            steps: 1
+        )[0]
+        let decodeSeedTokens = Array(prefillTokens.prefix(MLXFastConstants.benchmarkDecodeSeedTokens))
+        let decodeTokens = try generateBenchmarkDecodeTokens(
+            seedTokens: decodeSeedTokens,
+            weightCache: weightCache
+        )
+        return BenchmarkGolden(
+            name: options.caseName,
+            prefillPromptTokens: prefillTokens,
+            expectedPrefillToken: expectedPrefillToken,
+            decodeSeedTokens: decodeSeedTokens,
+            expectedDecodeSeedToken: decodeTokens.seedToken,
+            expectedDecodeTokens: decodeTokens.timedTokens
+        )
+    }
+
     public static func runCorrectness(_ options: CorrectnessOptions) throws -> CorrectnessReport {
         var loadedGolden: GoldenFixture?
         var loader: DeepSeekWeightLoader?
@@ -241,7 +275,7 @@ public enum DeepSeekRuntime {
             )
             benchmarkLoader = runtimeBenchmarkLoader
             let benchmarkCache = DeepSeekRuntimeWeightCache(loader: runtimeBenchmarkLoader, config: config)
-            let promptPlan = try BenchmarkPrompt.plan(from: golden.cases)
+            let promptPlan = try BenchmarkPrompt.plan(from: golden)
             let idleSamples = try MactopSession.measureIdleSamples()
             guard !idleSamples.isEmpty else {
                 throw MLXFastError.invalidInput("mactop idle measurement produced no samples")
@@ -249,20 +283,51 @@ public enum DeepSeekRuntime {
             let idleGBPerSecond = idleSamples.reduce(0, +) / Double(idleSamples.count)
 
             Memory.peakMemory = 0
-            let prefillSecondsPerToken = try measurePrefillSecondsPerToken(
+            let prefill = try measurePrefillSecondsPerToken(
+                caseName: promptPlan.name,
                 promptTokens: promptPlan.prefillTokens,
+                expectedToken: promptPlan.expectedPrefillToken,
                 weightCache: benchmarkCache
             )
+            if let mismatch = prefill.mismatch {
+                return failedScore(
+                    error: mismatch.error,
+                    correctness: correctnessReport,
+                    passedCorrectness: true,
+                    expertStats: expertStats(from: runtimeBenchmarkLoader),
+                    firstFailingCase: mismatch.caseName,
+                    firstFailingStep: mismatch.firstFailingStep,
+                    expectedToken: mismatch.expectedToken,
+                    actualToken: mismatch.actualToken
+                )
+            }
             let decode = try measureDecode(
                 seedTokens: promptPlan.decodeSeedTokens,
                 weightCache: benchmarkCache,
                 idleGBPerSecond: idleGBPerSecond
             )
+            let decodeValidation = BenchmarkOutputValidator.compareDecode(
+                plan: promptPlan,
+                seedToken: decode.seedToken,
+                generatedTokens: decode.generatedTokens
+            )
+            guard decodeValidation.passed else {
+                return failedScore(
+                    error: decodeValidation.error,
+                    correctness: correctnessReport,
+                    passedCorrectness: true,
+                    expertStats: expertStats(from: runtimeBenchmarkLoader),
+                    firstFailingCase: decodeValidation.caseName,
+                    firstFailingStep: decodeValidation.firstFailingStep,
+                    expectedToken: decodeValidation.expectedToken,
+                    actualToken: decodeValidation.actualToken
+                )
+            }
             let peakRamGB = Double(Memory.peakMemory) / Double(1 << 30)
             let score = peakRamGB
                 * decode.bandwidthGBPerToken
                 * decode.secondsPerToken
-                * prefillSecondsPerToken
+                * prefill.secondsPerToken
             let expertStats = expertStats(from: runtimeBenchmarkLoader)
 
             guard score.isFinite, score >= 0 else {
@@ -281,7 +346,7 @@ public enum DeepSeekRuntime {
                     peakRamGB: peakRamGB,
                     bandwidthGBPerToken: decode.bandwidthGBPerToken,
                     decodeSecondsPerToken: decode.secondsPerToken,
-                    prefillSecondsPerToken: prefillSecondsPerToken,
+                    prefillSecondsPerToken: prefill.secondsPerToken,
                     passedCorrectness: true,
                     numLayers: config.numHiddenLayers,
                     checkedSteps: correctness.checkedSteps,
@@ -385,14 +450,28 @@ public enum DeepSeekRuntime {
     }
 
     private struct DecodeMeasurement {
+        let seedToken: Int
+        let generatedTokens: [Int]
         let secondsPerToken: Double
         let bandwidthGBPerToken: Double
     }
 
+    private struct PrefillMeasurement {
+        let secondsPerToken: Double
+        let mismatch: BenchmarkTokenValidation?
+    }
+
+    private struct BenchmarkDecodeTokens {
+        let seedToken: Int
+        let timedTokens: [Int]
+    }
+
     private static func measurePrefillSecondsPerToken(
+        caseName: String,
         promptTokens: [Int],
+        expectedToken: Int,
         weightCache: DeepSeekRuntimeWeightCache
-    ) throws -> Double {
+    ) throws -> PrefillMeasurement {
         guard !promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("benchmark prefill prompt must not be empty")
         }
@@ -412,7 +491,15 @@ public enum DeepSeekRuntime {
                 positionOffset: 0
             )
             eval(logits)
-            _ = try DeepSeekCorrectness.greedyToken(from: logits)
+            let token = try DeepSeekCorrectness.greedyToken(from: logits)
+            let validation = BenchmarkOutputValidator.comparePrefill(
+                caseName: caseName,
+                expectedToken: expectedToken,
+                actualToken: token
+            )
+            if !validation.passed {
+                return PrefillMeasurement(secondsPerToken: 0, mismatch: validation)
+            }
             let elapsed = secondsSince(start)
             Memory.clearCache()
 
@@ -425,7 +512,10 @@ public enum DeepSeekRuntime {
             throw MLXFastError.invalidInput("benchmark prefill needs at least one timed run")
         }
         let meanElapsed = timedElapsed.reduce(0, +) / Double(timedElapsed.count)
-        return meanElapsed / Double(promptTokens.count)
+        return PrefillMeasurement(
+            secondsPerToken: meanElapsed / Double(promptTokens.count),
+            mismatch: nil
+        )
     }
 
     private static func measureDecode(
@@ -459,7 +549,10 @@ public enum DeepSeekRuntime {
             positionOffset: 0
         )
         var token = try DeepSeekCorrectness.greedyToken(from: logits)
+        let seedToken = token
         cache.materializeCachedState()
+        var generatedTokens: [Int] = []
+        generatedTokens.reserveCapacity(timingPlan.decodeSteps)
 
         let session = try MactopSession.start()
         let start = DispatchTime.now().uptimeNanoseconds
@@ -472,6 +565,7 @@ public enum DeepSeekRuntime {
                     positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
                 )
                 token = try DeepSeekCorrectness.greedyToken(from: logits)
+                generatedTokens.append(token)
             }
 
             let elapsed = secondsSince(start)
@@ -483,6 +577,8 @@ public enum DeepSeekRuntime {
                 decodedTokens: timingPlan.decodeSteps
             )
             return DecodeMeasurement(
+                seedToken: seedToken,
+                generatedTokens: generatedTokens,
                 secondsPerToken: elapsed / Double(timingPlan.decodeSteps),
                 bandwidthGBPerToken: bandwidth
             )
@@ -504,7 +600,11 @@ public enum DeepSeekRuntime {
         error: String,
         correctness: CorrectnessReport?,
         passedCorrectness: Bool,
-        expertStats explicitExpertStats: ExpertStreamingStats? = nil
+        expertStats explicitExpertStats: ExpertStreamingStats? = nil,
+        firstFailingCase explicitFirstFailingCase: String? = nil,
+        firstFailingStep explicitFirstFailingStep: Int? = nil,
+        expectedToken explicitExpectedToken: Int? = nil,
+        actualToken explicitActualToken: Int? = nil
     ) -> ScorePayload {
         let expertStats = explicitExpertStats ?? correctness?.expertStreamingStats ?? .zero
         return ScorePayload(
@@ -527,10 +627,10 @@ public enum DeepSeekRuntime {
                 expertPeakCachedTensors: expertStats.peakCachedTensors,
                 expertHitRate: expertStats.hitRate,
                 firstFailingLayer: nil,
-                firstFailingCase: correctness?.firstFailingCase,
-                firstFailingStep: correctness?.firstFailingStep,
-                expectedToken: correctness?.expectedToken,
-                actualToken: correctness?.actualToken,
+                firstFailingCase: explicitFirstFailingCase ?? correctness?.firstFailingCase,
+                firstFailingStep: explicitFirstFailingStep ?? correctness?.firstFailingStep,
+                expectedToken: explicitExpectedToken ?? correctness?.expectedToken,
+                actualToken: explicitActualToken ?? correctness?.actualToken,
                 maxAbsDiff: 0,
                 goldenHash: correctness?.goldenHash ?? "",
                 bandwidthSource: "",
@@ -697,6 +797,44 @@ public enum DeepSeekRuntime {
             }
             return try DeepSeekCorrectness.greedyToken(from: logits)
         }
+    }
+
+    private static func generateBenchmarkDecodeTokens(
+        seedTokens: [Int],
+        weightCache: DeepSeekRuntimeWeightCache
+    ) throws -> BenchmarkDecodeTokens {
+        guard !seedTokens.isEmpty else {
+            throw MLXFastError.invalidInput("benchmark decode seed must not be empty")
+        }
+        let timingPlan = try DecodeTimingPlan(
+            seedTokenCount: seedTokens.count,
+            decodeSteps: MLXFastConstants.benchmarkDecodeSteps
+        )
+        let cache = DeepSeekModelCache(config: weightCache.config)
+        var logits = try DeepSeekModel.logits(
+            inputIDs: inputIDsArray(seedTokens),
+            weightCache: weightCache,
+            cache: cache,
+            positionOffset: 0
+        )
+        var token = try DeepSeekCorrectness.greedyToken(from: logits)
+        let seedToken = token
+        cache.materializeCachedState()
+
+        var timedTokens: [Int] = []
+        timedTokens.reserveCapacity(timingPlan.decodeSteps)
+        for decodedStep in 0..<timingPlan.decodeSteps {
+            logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray([token]),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
+            )
+            token = try DeepSeekCorrectness.greedyToken(from: logits)
+            timedTokens.append(token)
+        }
+
+        return BenchmarkDecodeTokens(seedToken: seedToken, timedTokens: timedTokens)
     }
 
     private static func inputIDsArray(_ tokens: [Int]) throws -> MLXArray {

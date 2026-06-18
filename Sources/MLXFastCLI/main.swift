@@ -183,7 +183,14 @@ struct MLXFastCLI {
                 promptTokens: promptTokens
             )
         )
-        let payload = GoldenOutput(cases: [testCase])
+        let benchmark = try DeepSeekRuntime.generateBenchmarkGolden(
+            GoldenGenerationOptions(
+                weightsPath: weightsPath,
+                caseName: "\(caseName)-benchmark",
+                promptTokens: promptTokens
+            )
+        )
+        let payload = GoldenOutput(cases: [testCase], benchmark: benchmark)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(payload)
@@ -252,6 +259,7 @@ struct MLXFastCLI {
 private struct GoldenOutput: Encodable {
     let version = 1
     let cases: [GoldenCase]
+    let benchmark: BenchmarkGolden
 }
 
 private struct ParsedOptions {

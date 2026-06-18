@@ -15,31 +15,136 @@ public struct BenchmarkPreflightReport: Codable, Equatable {
 }
 
 public struct BenchmarkPromptPlan: Equatable {
+    public let name: String
     public let prefillTokens: [Int]
+    public let expectedPrefillToken: Int
     public let decodeSeedTokens: [Int]
+    public let expectedDecodeSeedToken: Int
+    public let expectedDecodeTokens: [Int]
 
-    public init(prefillTokens: [Int], decodeSeedTokens: [Int]) {
+    public init(
+        name: String,
+        prefillTokens: [Int],
+        expectedPrefillToken: Int,
+        decodeSeedTokens: [Int],
+        expectedDecodeSeedToken: Int,
+        expectedDecodeTokens: [Int]
+    ) {
+        self.name = name
         self.prefillTokens = prefillTokens
+        self.expectedPrefillToken = expectedPrefillToken
         self.decodeSeedTokens = decodeSeedTokens
+        self.expectedDecodeSeedToken = expectedDecodeSeedToken
+        self.expectedDecodeTokens = expectedDecodeTokens
     }
 }
 
 public enum BenchmarkPrompt {
-    public static func plan(from cases: [GoldenCase]) throws -> BenchmarkPromptPlan {
-        guard let testCase = cases.first else {
-            throw MLXFastError.invalidInput("benchmark requires at least one golden case")
+    public static func plan(from fixture: GoldenFixture) throws -> BenchmarkPromptPlan {
+        guard let benchmark = fixture.benchmark else {
+            throw MLXFastError.invalidInput("golden file must contain a benchmark block for scoring")
         }
-        let required = MLXFastConstants.benchmarkPrefillPromptTokens
-        guard testCase.promptTokens.count >= required else {
-            throw MLXFastError.invalidInput(
-                "\(testCase.name).prompt_tokens has \(testCase.promptTokens.count) tokens; benchmark prefill needs at least \(required)"
+        return BenchmarkPromptPlan(
+            name: benchmark.name,
+            prefillTokens: benchmark.prefillPromptTokens,
+            expectedPrefillToken: benchmark.expectedPrefillToken,
+            decodeSeedTokens: benchmark.decodeSeedTokens,
+            expectedDecodeSeedToken: benchmark.expectedDecodeSeedToken,
+            expectedDecodeTokens: benchmark.expectedDecodeTokens
+        )
+    }
+}
+
+public struct BenchmarkTokenValidation: Equatable {
+    public let passed: Bool
+    public let caseName: String
+    public let firstFailingStep: Int?
+    public let expectedToken: Int?
+    public let actualToken: Int?
+    public let error: String
+
+    public init(
+        passed: Bool,
+        caseName: String,
+        firstFailingStep: Int?,
+        expectedToken: Int?,
+        actualToken: Int?,
+        error: String
+    ) {
+        self.passed = passed
+        self.caseName = caseName
+        self.firstFailingStep = firstFailingStep
+        self.expectedToken = expectedToken
+        self.actualToken = actualToken
+        self.error = error
+    }
+}
+
+public enum BenchmarkOutputValidator {
+    public static func comparePrefill(
+        caseName: String,
+        expectedToken: Int,
+        actualToken: Int
+    ) -> BenchmarkTokenValidation {
+        guard actualToken == expectedToken else {
+            return BenchmarkTokenValidation(
+                passed: false,
+                caseName: caseName,
+                firstFailingStep: 0,
+                expectedToken: expectedToken,
+                actualToken: actualToken,
+                error: "benchmark prefill token mismatch"
+            )
+        }
+        return BenchmarkTokenValidation(
+            passed: true,
+            caseName: caseName,
+            firstFailingStep: nil,
+            expectedToken: nil,
+            actualToken: nil,
+            error: ""
+        )
+    }
+
+    public static func compareDecode(
+        plan: BenchmarkPromptPlan,
+        seedToken: Int,
+        generatedTokens: [Int]
+    ) -> BenchmarkTokenValidation {
+        guard seedToken == plan.expectedDecodeSeedToken else {
+            return BenchmarkTokenValidation(
+                passed: false,
+                caseName: plan.name,
+                firstFailingStep: nil,
+                expectedToken: plan.expectedDecodeSeedToken,
+                actualToken: seedToken,
+                error: "benchmark decode seed token mismatch"
             )
         }
 
-        let prefillTokens = Array(testCase.promptTokens.prefix(required))
-        return BenchmarkPromptPlan(
-            prefillTokens: prefillTokens,
-            decodeSeedTokens: Array(prefillTokens.prefix(MLXFastConstants.benchmarkDecodeSeedTokens))
+        let comparison = DeepSeekCorrectness.compareTokens(
+            expected: plan.expectedDecodeTokens,
+            actual: generatedTokens,
+            steps: MLXFastConstants.benchmarkDecodeSteps
+        )
+        guard comparison.passed else {
+            return BenchmarkTokenValidation(
+                passed: false,
+                caseName: plan.name,
+                firstFailingStep: comparison.firstFailingStep,
+                expectedToken: comparison.expectedToken,
+                actualToken: comparison.actualToken,
+                error: "benchmark decode token mismatch"
+            )
+        }
+
+        return BenchmarkTokenValidation(
+            passed: true,
+            caseName: plan.name,
+            firstFailingStep: nil,
+            expectedToken: nil,
+            actualToken: nil,
+            error: ""
         )
     }
 }
@@ -60,8 +165,8 @@ public enum BenchmarkPreflight {
             try requireFile(path, description: description)
         }
 
-        let cases = try loadGoldenCases(from: goldenPath)
-        _ = try BenchmarkPrompt.plan(from: cases)
+        let fixture = try loadGoldenFixture(from: goldenPath)
+        _ = try BenchmarkPrompt.plan(from: fixture)
         let config = try DeepSeekConfig.load(from: weightsPath)
 
         let denseStore = try DenseTensorStore(weightsPath: weightsPath)

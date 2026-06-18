@@ -59,6 +59,11 @@ correctness_golden.json
 Use `MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json` when the
 file is provisioned outside the repository root.
 
+That hidden fixture also contains the scored benchmark oracle: the 512-token
+prefill prompt, expected prefill token, 32-token decode seed, expected seed
+token, and expected tokens emitted by the timed decode loop. The benchmark only
+accepts a speed score when those hidden token IDs match.
+
 For local development only, participants can generate a self-consistent fixture
 from their current transformed weights:
 
@@ -104,6 +109,11 @@ token in the failed report.
 
 The gate is intended as a first-stage filter: an implementation that fails it is
 not eligible for the longer benchmark.
+
+The timed benchmark path is validated separately against the hidden benchmark
+oracle in the same golden fixture. The harness checks the prefill token, decode
+seed token, and tokens generated inside the timed decode loop before accepting a
+score.
 
 ## Score
 

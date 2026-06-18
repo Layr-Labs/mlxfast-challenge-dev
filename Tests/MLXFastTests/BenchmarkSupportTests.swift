@@ -81,31 +81,119 @@ func decodeTimingPlanRejectsInvalidRanges() throws {
 }
 
 @Test
-func benchmarkPromptPlanUsesFirstGoldenPromptForPrefillAndDecodeSeed() throws {
-    let prompt = Array(0..<MLXFastConstants.benchmarkPrefillPromptTokens + 8)
-    let plan = try BenchmarkPrompt.plan(from: [
-        GoldenCase(
+func benchmarkPromptPlanUsesGoldenBenchmarkBlock() throws {
+    let prefill = Array(0..<MLXFastConstants.benchmarkPrefillPromptTokens)
+    let seed = Array(prefill.prefix(MLXFastConstants.benchmarkDecodeSeedTokens))
+    let expectedDecode = Array(repeating: 7, count: MLXFastConstants.benchmarkDecodeSteps)
+    let fixture = GoldenFixture(
+        cases: [
+            GoldenCase(
+                name: "correctness",
+                promptTokens: [1],
+                expectedTokens: Array(repeating: 8, count: MLXFastConstants.correctnessSteps)
+            ),
+        ],
+        benchmark: BenchmarkGolden(
             name: "benchmark",
-            promptTokens: prompt,
-            expectedTokens: Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+            prefillPromptTokens: prefill,
+            expectedPrefillToken: 3,
+            decodeSeedTokens: seed,
+            expectedDecodeSeedToken: 4,
+            expectedDecodeTokens: expectedDecode
         ),
-    ])
+        sha256: "hash"
+    )
 
-    #expect(plan.prefillTokens == Array(prompt.prefix(MLXFastConstants.benchmarkPrefillPromptTokens)))
-    #expect(plan.decodeSeedTokens == Array(prompt.prefix(MLXFastConstants.benchmarkDecodeSeedTokens)))
+    let plan = try BenchmarkPrompt.plan(from: fixture)
+
+    #expect(plan.name == "benchmark")
+    #expect(plan.prefillTokens == prefill)
+    #expect(plan.expectedPrefillToken == 3)
+    #expect(plan.decodeSeedTokens == seed)
+    #expect(plan.expectedDecodeSeedToken == 4)
+    #expect(plan.expectedDecodeTokens == expectedDecode)
 }
 
 @Test
-func benchmarkPromptPlanRejectsShortFirstGoldenPrompt() {
+func benchmarkPromptPlanRejectsMissingBenchmarkBlock() {
     #expect(throws: MLXFastError.self) {
-        _ = try BenchmarkPrompt.plan(from: [
-            GoldenCase(
-                name: "short",
-                promptTokens: [1],
-                expectedTokens: Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
-            ),
-        ])
+        _ = try BenchmarkPrompt.plan(from: GoldenFixture(cases: [], benchmark: nil, sha256: "hash"))
     }
+}
+
+@Test
+func benchmarkOutputValidatorAcceptsMatchingTokens() {
+    let plan = validBenchmarkPlan()
+
+    let prefill = BenchmarkOutputValidator.comparePrefill(
+        caseName: plan.name,
+        expectedToken: plan.expectedPrefillToken,
+        actualToken: plan.expectedPrefillToken
+    )
+    let decode = BenchmarkOutputValidator.compareDecode(
+        plan: plan,
+        seedToken: plan.expectedDecodeSeedToken,
+        generatedTokens: plan.expectedDecodeTokens
+    )
+
+    #expect(prefill.passed)
+    #expect(decode.passed)
+}
+
+@Test
+func benchmarkOutputValidatorRejectsPrefillMismatch() {
+    let plan = validBenchmarkPlan()
+
+    let result = BenchmarkOutputValidator.comparePrefill(
+        caseName: plan.name,
+        expectedToken: plan.expectedPrefillToken,
+        actualToken: plan.expectedPrefillToken + 1
+    )
+
+    #expect(!result.passed)
+    #expect(result.caseName == plan.name)
+    #expect(result.firstFailingStep == 0)
+    #expect(result.expectedToken == plan.expectedPrefillToken)
+    #expect(result.actualToken == plan.expectedPrefillToken + 1)
+    #expect(result.error == "benchmark prefill token mismatch")
+}
+
+@Test
+func benchmarkOutputValidatorRejectsDecodeSeedMismatch() {
+    let plan = validBenchmarkPlan()
+
+    let result = BenchmarkOutputValidator.compareDecode(
+        plan: plan,
+        seedToken: plan.expectedDecodeSeedToken + 1,
+        generatedTokens: plan.expectedDecodeTokens
+    )
+
+    #expect(!result.passed)
+    #expect(result.caseName == plan.name)
+    #expect(result.firstFailingStep == nil)
+    #expect(result.expectedToken == plan.expectedDecodeSeedToken)
+    #expect(result.actualToken == plan.expectedDecodeSeedToken + 1)
+    #expect(result.error == "benchmark decode seed token mismatch")
+}
+
+@Test
+func benchmarkOutputValidatorRejectsTimedDecodeMismatch() {
+    let plan = validBenchmarkPlan()
+    var actual = plan.expectedDecodeTokens
+    actual[17] += 1
+
+    let result = BenchmarkOutputValidator.compareDecode(
+        plan: plan,
+        seedToken: plan.expectedDecodeSeedToken,
+        generatedTokens: actual
+    )
+
+    #expect(!result.passed)
+    #expect(result.caseName == plan.name)
+    #expect(result.firstFailingStep == 17)
+    #expect(result.expectedToken == plan.expectedDecodeTokens[17])
+    #expect(result.actualToken == actual[17])
+    #expect(result.error == "benchmark decode token mismatch")
 }
 
 @Test
@@ -215,7 +303,7 @@ func benchmarkPreflightRejectsMalformedGolden() throws {
 
 @Test
 func benchmarkPreflightRejectsShortBenchmarkPrompt() throws {
-    let fixture = try makePreflightFixture(goldenContents: validGoldenJSON(promptTokens: [1]))
+    let fixture = try makePreflightFixture(goldenContents: validGoldenJSON(benchmarkPrefillTokens: [1]))
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
@@ -340,10 +428,16 @@ private func minimalDeepSeekConfigJSON() -> String {
 }
 
 private func validGoldenJSON(
-    promptTokens: [Int] = Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens)
+    promptTokens: [Int] = Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens),
+    benchmarkPrefillTokens: [Int]? = nil
 ) -> String {
     let prompt = arrayJSON(promptTokens)
     let expected = arrayJSON(Array(repeating: 7, count: MLXFastConstants.correctnessSteps))
+    let benchmarkPromptTokens = benchmarkPrefillTokens
+        ?? Array(repeating: 2, count: MLXFastConstants.benchmarkPrefillPromptTokens)
+    let benchmarkPrompt = arrayJSON(benchmarkPromptTokens)
+    let decodeSeed = arrayJSON(Array(benchmarkPromptTokens.prefix(MLXFastConstants.benchmarkDecodeSeedTokens)))
+    let expectedDecode = arrayJSON(Array(repeating: 9, count: MLXFastConstants.benchmarkDecodeSteps))
     return """
     {
       "version": 1,
@@ -353,9 +447,28 @@ private func validGoldenJSON(
           "prompt_tokens": \(prompt),
           "expected_tokens": \(expected)
         }
-      ]
+      ],
+      "benchmark": {
+        "name": "benchmark",
+        "prefill_prompt_tokens": \(benchmarkPrompt),
+        "expected_prefill_token": 8,
+        "decode_seed_tokens": \(decodeSeed),
+        "expected_decode_seed_token": 10,
+        "expected_decode_tokens": \(expectedDecode)
+      }
     }
     """
+}
+
+private func validBenchmarkPlan() -> BenchmarkPromptPlan {
+    BenchmarkPromptPlan(
+        name: "benchmark",
+        prefillTokens: Array(repeating: 2, count: MLXFastConstants.benchmarkPrefillPromptTokens),
+        expectedPrefillToken: 8,
+        decodeSeedTokens: Array(repeating: 2, count: MLXFastConstants.benchmarkDecodeSeedTokens),
+        expectedDecodeSeedToken: 10,
+        expectedDecodeTokens: Array(repeating: 9, count: MLXFastConstants.benchmarkDecodeSteps)
+    )
 }
 
 private func requiredDenseTensorFixtures() -> [TensorFixture] {

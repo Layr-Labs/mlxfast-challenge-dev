@@ -19,17 +19,54 @@ public struct GoldenCase: Codable, Equatable {
     }
 }
 
+public struct BenchmarkGolden: Codable, Equatable {
+    public let name: String
+    public let prefillPromptTokens: [Int]
+    public let expectedPrefillToken: Int
+    public let decodeSeedTokens: [Int]
+    public let expectedDecodeSeedToken: Int
+    public let expectedDecodeTokens: [Int]
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case prefillPromptTokens = "prefill_prompt_tokens"
+        case expectedPrefillToken = "expected_prefill_token"
+        case decodeSeedTokens = "decode_seed_tokens"
+        case expectedDecodeSeedToken = "expected_decode_seed_token"
+        case expectedDecodeTokens = "expected_decode_tokens"
+    }
+
+    public init(
+        name: String,
+        prefillPromptTokens: [Int],
+        expectedPrefillToken: Int,
+        decodeSeedTokens: [Int],
+        expectedDecodeSeedToken: Int,
+        expectedDecodeTokens: [Int]
+    ) {
+        self.name = name
+        self.prefillPromptTokens = prefillPromptTokens
+        self.expectedPrefillToken = expectedPrefillToken
+        self.decodeSeedTokens = decodeSeedTokens
+        self.expectedDecodeSeedToken = expectedDecodeSeedToken
+        self.expectedDecodeTokens = expectedDecodeTokens
+    }
+}
+
 private struct GoldenFile: Decodable {
     let version: Int?
     let cases: [GoldenCase]
+    let benchmark: BenchmarkGolden?
 }
 
 public struct GoldenFixture: Equatable {
     public let cases: [GoldenCase]
+    public let benchmark: BenchmarkGolden?
     public let sha256: String
 
-    public init(cases: [GoldenCase], sha256: String) {
+    public init(cases: [GoldenCase], benchmark: BenchmarkGolden?, sha256: String) {
         self.cases = cases
+        self.benchmark = benchmark
         self.sha256 = sha256
     }
 }
@@ -61,21 +98,7 @@ public func loadGoldenFixture(
 
     var names = Set<String>()
     for testCase in decoded.cases {
-        let caseNameDescription = String(reflecting: testCase.name)
-        let trimmedName = testCase.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmedName.isEmpty {
-            throw MLXFastError.invalidInput("correctness golden case name must not be empty")
-        }
-        if testCase.name != trimmedName {
-            throw MLXFastError.invalidInput(
-                "correctness golden case name \(caseNameDescription) must not have leading or trailing whitespace"
-            )
-        }
-        if testCase.name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) {
-            throw MLXFastError.invalidInput(
-                "correctness golden case name \(caseNameDescription) must not contain control characters"
-            )
-        }
+        try validateName(testCase.name, field: "correctness golden case name")
         guard names.insert(testCase.name).inserted else {
             throw MLXFastError.invalidInput("duplicate correctness golden case name \(testCase.name)")
         }
@@ -90,18 +113,67 @@ public func loadGoldenFixture(
         try validateTokens(testCase.promptTokens, field: "\(testCase.name).prompt_tokens")
         try validateTokens(testCase.expectedTokens, field: "\(testCase.name).expected_tokens")
     }
+    if let benchmark = decoded.benchmark {
+        try validateBenchmarkGolden(benchmark)
+    }
 
     let digest = SHA256.hash(data: data)
     let hash = digest.map { String(format: "%02x", $0) }.joined()
-    return GoldenFixture(cases: decoded.cases, sha256: hash)
+    return GoldenFixture(cases: decoded.cases, benchmark: decoded.benchmark, sha256: hash)
+}
+
+private func validateBenchmarkGolden(_ benchmark: BenchmarkGolden) throws {
+    try validateName(benchmark.name, field: "benchmark golden name")
+    if benchmark.prefillPromptTokens.count != MLXFastConstants.benchmarkPrefillPromptTokens {
+        throw MLXFastError.invalidInput(
+            "\(benchmark.name).benchmark.prefill_prompt_tokens has \(benchmark.prefillPromptTokens.count) tokens; need exactly \(MLXFastConstants.benchmarkPrefillPromptTokens)"
+        )
+    }
+    if benchmark.decodeSeedTokens.count != MLXFastConstants.benchmarkDecodeSeedTokens {
+        throw MLXFastError.invalidInput(
+            "\(benchmark.name).benchmark.decode_seed_tokens has \(benchmark.decodeSeedTokens.count) tokens; need exactly \(MLXFastConstants.benchmarkDecodeSeedTokens)"
+        )
+    }
+    if benchmark.expectedDecodeTokens.count != MLXFastConstants.benchmarkDecodeSteps {
+        throw MLXFastError.invalidInput(
+            "\(benchmark.name).benchmark.expected_decode_tokens has \(benchmark.expectedDecodeTokens.count) tokens; need exactly \(MLXFastConstants.benchmarkDecodeSteps)"
+        )
+    }
+    try validateTokens(benchmark.prefillPromptTokens, field: "\(benchmark.name).benchmark.prefill_prompt_tokens")
+    try validateToken(benchmark.expectedPrefillToken, field: "\(benchmark.name).benchmark.expected_prefill_token")
+    try validateTokens(benchmark.decodeSeedTokens, field: "\(benchmark.name).benchmark.decode_seed_tokens")
+    try validateToken(benchmark.expectedDecodeSeedToken, field: "\(benchmark.name).benchmark.expected_decode_seed_token")
+    try validateTokens(benchmark.expectedDecodeTokens, field: "\(benchmark.name).benchmark.expected_decode_tokens")
+}
+
+private func validateName(_ name: String, field: String) throws {
+    let nameDescription = String(reflecting: name)
+    let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmedName.isEmpty {
+        throw MLXFastError.invalidInput("\(field) must not be empty")
+    }
+    if name != trimmedName {
+        throw MLXFastError.invalidInput(
+            "\(field) \(nameDescription) must not have leading or trailing whitespace"
+        )
+    }
+    if name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) {
+        throw MLXFastError.invalidInput(
+            "\(field) \(nameDescription) must not contain control characters"
+        )
+    }
 }
 
 private func validateTokens(_ tokens: [Int], field: String) throws {
     for (index, token) in tokens.enumerated() {
-        if token < 0 || token >= MLXFastConstants.vocabSize {
-            throw MLXFastError.invalidInput(
-                "\(field)[\(index)]=\(token) is outside DeepSeek vocab range 0..<\(MLXFastConstants.vocabSize)"
-            )
-        }
+        try validateToken(token, field: "\(field)[\(index)]")
+    }
+}
+
+private func validateToken(_ token: Int, field: String) throws {
+    if token < 0 || token >= MLXFastConstants.vocabSize {
+        throw MLXFastError.invalidInput(
+            "\(field)=\(token) is outside DeepSeek vocab range 0..<\(MLXFastConstants.vocabSize)"
+        )
     }
 }

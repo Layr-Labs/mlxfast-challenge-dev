@@ -33,7 +33,85 @@ func loadGoldenCasesAcceptsValidFixture() throws {
     let digest = SHA256.hash(data: try Data(contentsOf: path))
     let expectedHash = digest.map { String(format: "%02x", $0) }.joined()
     #expect(fixture.cases == cases)
+    #expect(fixture.benchmark == nil)
     #expect(fixture.sha256 == expectedHash)
+}
+
+@Test
+func loadGoldenFixtureAcceptsBenchmarkBlock() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let prefill = Array(repeating: 2, count: MLXFastConstants.benchmarkPrefillPromptTokens)
+    let seed = Array(repeating: 3, count: MLXFastConstants.benchmarkDecodeSeedTokens)
+    let decode = Array(repeating: 4, count: MLXFastConstants.benchmarkDecodeSteps)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "hidden-0",
+          "prompt_tokens": [1, 2, 3],
+          "expected_tokens": \(expected)
+        }
+      ],
+      "benchmark": {
+        "name": "timed-hidden",
+        "prefill_prompt_tokens": \(prefill),
+        "expected_prefill_token": 5,
+        "decode_seed_tokens": \(seed),
+        "expected_decode_seed_token": 6,
+        "expected_decode_tokens": \(decode)
+      }
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    let fixture = try loadGoldenFixture(from: path.path)
+
+    #expect(fixture.benchmark == BenchmarkGolden(
+        name: "timed-hidden",
+        prefillPromptTokens: prefill,
+        expectedPrefillToken: 5,
+        decodeSeedTokens: seed,
+        expectedDecodeSeedToken: 6,
+        expectedDecodeTokens: decode
+    ))
+}
+
+@Test
+func loadGoldenFixtureRejectsWrongBenchmarkDecodeCount() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let prefill = Array(repeating: 2, count: MLXFastConstants.benchmarkPrefillPromptTokens)
+    let seed = Array(repeating: 3, count: MLXFastConstants.benchmarkDecodeSeedTokens)
+    let decode = Array(repeating: 4, count: MLXFastConstants.benchmarkDecodeSteps - 1)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "hidden-0",
+          "prompt_tokens": [1, 2, 3],
+          "expected_tokens": \(expected)
+        }
+      ],
+      "benchmark": {
+        "name": "timed-hidden",
+        "prefill_prompt_tokens": \(prefill),
+        "expected_prefill_token": 5,
+        "decode_seed_tokens": \(seed),
+        "expected_decode_seed_token": 6,
+        "expected_decode_tokens": \(decode)
+      }
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try loadGoldenFixture(from: path.path)
+    }
 }
 
 @Test
