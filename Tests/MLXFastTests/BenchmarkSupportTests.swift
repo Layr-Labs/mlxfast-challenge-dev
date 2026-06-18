@@ -80,30 +80,35 @@ func decodeTimingPlanRejectsInvalidRanges() throws {
 }
 
 @Test
-func benchmarkPromptPlanUsesFirstGoldenPromptForPrefillAndDecodeSeed() throws {
-    let prompt = Array(0..<MLXFastConstants.benchmarkPrefillPromptTokens + 8)
-    let plan = try BenchmarkPrompt.plan(from: [
-        GoldenCase(
-            name: "benchmark",
-            promptTokens: prompt,
-            expectedTokens: Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
-        ),
-    ])
+func benchmarkPromptPlanUsesHiddenBenchmarkOracle() throws {
+    let prefill = Array(0..<MLXFastConstants.benchmarkPrefillPromptTokens)
+    let seed = Array(0..<MLXFastConstants.benchmarkDecodeSeedTokens)
+    let decode = Array(repeating: 9, count: MLXFastConstants.benchmarkDecodeSteps)
+    let plan = try BenchmarkPrompt.plan(from: BenchmarkGolden(
+        prefillPromptTokens: prefill,
+        expectedPrefillToken: 17,
+        decodeSeedTokens: seed,
+        expectedDecodeSeedToken: 23,
+        expectedDecodeTokens: decode
+    ))
 
-    #expect(plan.prefillTokens == Array(prompt.prefix(MLXFastConstants.benchmarkPrefillPromptTokens)))
-    #expect(plan.decodeSeedTokens == Array(prompt.prefix(MLXFastConstants.benchmarkDecodeSeedTokens)))
+    #expect(plan.prefillTokens == prefill)
+    #expect(plan.expectedPrefillToken == 17)
+    #expect(plan.decodeSeedTokens == seed)
+    #expect(plan.expectedDecodeSeedToken == 23)
+    #expect(plan.expectedDecodeTokens == decode)
 }
 
 @Test
-func benchmarkPromptPlanRejectsShortFirstGoldenPrompt() {
+func benchmarkPromptPlanRejectsMalformedBenchmarkOracle() {
     #expect(throws: MLXFastError.self) {
-        _ = try BenchmarkPrompt.plan(from: [
-            GoldenCase(
-                name: "short",
-                promptTokens: [1],
-                expectedTokens: Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
-            ),
-        ])
+        _ = try BenchmarkPrompt.plan(from: BenchmarkGolden(
+            prefillPromptTokens: [1],
+            expectedPrefillToken: 7,
+            decodeSeedTokens: Array(repeating: 1, count: MLXFastConstants.benchmarkDecodeSeedTokens),
+            expectedDecodeSeedToken: 7,
+            expectedDecodeTokens: Array(repeating: 7, count: MLXFastConstants.benchmarkDecodeSteps)
+        ))
     }
 }
 
@@ -215,6 +220,32 @@ func benchmarkPreflightRejectsMalformedGolden() throws {
 @Test
 func benchmarkPreflightRejectsShortBenchmarkPrompt() throws {
     let fixture = try makePreflightFixture(goldenContents: validGoldenJSON(promptTokens: [1]))
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    #expect(throws: MLXFastError.self) {
+        _ = try BenchmarkPreflight.check(
+            weightsPath: fixture.weights.path,
+            goldenPath: fixture.golden.path,
+            environment: ["MLXFAST_MACTOP_BIN": fixture.mactop.path]
+        )
+    }
+}
+
+@Test
+func benchmarkPreflightRejectsMissingBenchmarkOracle() throws {
+    let expected = arrayJSON(Array(repeating: 7, count: MLXFastConstants.correctnessSteps))
+    let fixture = try makePreflightFixture(goldenContents: """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "preflight",
+          "prompt_tokens": [1],
+          "expected_tokens": \(expected)
+        }
+      ]
+    }
+    """)
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
@@ -343,6 +374,8 @@ private func validGoldenJSON(
 ) -> String {
     let prompt = arrayJSON(promptTokens)
     let expected = arrayJSON(Array(repeating: 7, count: MLXFastConstants.correctnessSteps))
+    let seed = arrayJSON(Array(promptTokens.prefix(MLXFastConstants.benchmarkDecodeSeedTokens)))
+    let decode = arrayJSON(Array(repeating: 9, count: MLXFastConstants.benchmarkDecodeSteps))
     return """
     {
       "version": 1,
@@ -352,7 +385,14 @@ private func validGoldenJSON(
           "prompt_tokens": \(prompt),
           "expected_tokens": \(expected)
         }
-      ]
+      ],
+      "benchmark": {
+        "prefill_prompt_tokens": \(prompt),
+        "expected_prefill_token": 8,
+        "decode_seed_tokens": \(seed),
+        "expected_decode_seed_token": 7,
+        "expected_decode_tokens": \(decode)
+      }
     }
     """
 }

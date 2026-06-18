@@ -144,7 +144,66 @@ public struct BenchmarkOptions: Equatable {
     }
 }
 
+public struct GoldenGenerationOptions: Equatable {
+    public let weightsPath: String
+    public let promptManifest: GoldenPromptManifest
+
+    public init(weightsPath: String, promptManifest: GoldenPromptManifest) {
+        self.weightsPath = weightsPath
+        self.promptManifest = promptManifest
+    }
+}
+
+private struct BenchmarkTokenMismatchError: Error, CustomStringConvertible {
+    let label: String
+    let step: Int?
+    let expectedToken: Int?
+    let actualToken: Int?
+
+    init(comparison: BenchmarkTokenComparison) {
+        self.label = comparison.label
+        self.step = comparison.step
+        self.expectedToken = comparison.expectedToken
+        self.actualToken = comparison.actualToken
+    }
+
+    var description: String {
+        var message = "\(label) mismatch"
+        if let step {
+            message += " at step \(step)"
+        }
+        message += ": expected \(expectedToken.map { String($0) } ?? "nil"), actual \(actualToken.map { String($0) } ?? "nil")"
+        return message
+    }
+}
+
 public enum DeepSeekRuntime {
+    public static func generateGolden(_ options: GoldenGenerationOptions) throws -> GoldenDocument {
+        let config = try DeepSeekConfig.load(from: options.weightsPath)
+        let loader = try DeepSeekWeightLoader(
+            weightsPath: options.weightsPath,
+            expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: false)
+        )
+        let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
+
+        let cases = try options.promptManifest.cases.map { promptCase in
+            GoldenCase(
+                name: promptCase.name,
+                promptTokens: promptCase.promptTokens,
+                expectedTokens: try generateGreedyCached(
+                    promptTokens: promptCase.promptTokens,
+                    steps: MLXFastConstants.correctnessSteps,
+                    weightCache: weightCache
+                )
+            )
+        }
+        let benchmark = try generateBenchmarkGolden(
+            promptTokens: options.promptManifest.benchmark.promptTokens,
+            weightCache: weightCache
+        )
+        return GoldenDocument(cases: cases, benchmark: benchmark)
+    }
+
     public static func runCorrectness(_ options: CorrectnessOptions) throws -> CorrectnessReport {
         var loadedGolden: GoldenFixture?
         var loader: DeepSeekWeightLoader?
@@ -209,7 +268,10 @@ public enum DeepSeekRuntime {
             )
             benchmarkLoader = runtimeBenchmarkLoader
             let benchmarkCache = DeepSeekRuntimeWeightCache(loader: runtimeBenchmarkLoader, config: config)
-            let promptPlan = try BenchmarkPrompt.plan(from: golden.cases)
+            guard let benchmarkGolden = golden.benchmark else {
+                throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
+            }
+            let promptPlan = try BenchmarkPrompt.plan(from: benchmarkGolden)
             let idleSamples = try MactopSession.measureIdleSamples()
             guard !idleSamples.isEmpty else {
                 throw MLXFastError.invalidInput("mactop idle measurement produced no samples")
@@ -219,10 +281,13 @@ public enum DeepSeekRuntime {
             Memory.peakMemory = 0
             let prefillSecondsPerToken = try measurePrefillSecondsPerToken(
                 promptTokens: promptPlan.prefillTokens,
+                expectedToken: promptPlan.expectedPrefillToken,
                 weightCache: benchmarkCache
             )
             let decode = try measureDecode(
                 seedTokens: promptPlan.decodeSeedTokens,
+                expectedSeedToken: promptPlan.expectedDecodeSeedToken,
+                expectedTokens: promptPlan.expectedDecodeTokens,
                 weightCache: benchmarkCache,
                 idleGBPerSecond: idleGBPerSecond
             )
@@ -275,6 +340,17 @@ public enum DeepSeekRuntime {
                     harnessHash: harnessHash(),
                     runtime: "swift"
                 )
+            )
+        } catch let mismatch as BenchmarkTokenMismatchError {
+            return failedScore(
+                error: mismatch.description,
+                correctness: correctnessReport,
+                passedCorrectness: correctnessReport?.passed == true,
+                expertStats: expertStats(from: benchmarkLoader),
+                firstFailingCase: "benchmark",
+                firstFailingStep: mismatch.step,
+                expectedToken: mismatch.expectedToken,
+                actualToken: mismatch.actualToken
             )
         } catch {
             return failedScore(
@@ -359,6 +435,7 @@ public enum DeepSeekRuntime {
 
     private static func measurePrefillSecondsPerToken(
         promptTokens: [Int],
+        expectedToken: Int,
         weightCache: DeepSeekRuntimeWeightCache
     ) throws -> Double {
         guard !promptTokens.isEmpty else {
@@ -380,7 +457,13 @@ public enum DeepSeekRuntime {
                 positionOffset: 0
             )
             eval(logits)
-            _ = try DeepSeekCorrectness.greedyToken(from: logits)
+            let token = try DeepSeekCorrectness.greedyToken(from: logits)
+            try requireBenchmarkMatch(
+                BenchmarkOutputValidator.comparePrefillToken(
+                    expectedToken: expectedToken,
+                    actualToken: token
+                )
+            )
             let elapsed = secondsSince(start)
             Memory.clearCache()
 
@@ -398,6 +481,8 @@ public enum DeepSeekRuntime {
 
     private static func measureDecode(
         seedTokens: [Int],
+        expectedSeedToken: Int,
+        expectedTokens: [Int],
         weightCache: DeepSeekRuntimeWeightCache,
         idleGBPerSecond: Double
     ) throws -> DecodeMeasurement {
@@ -427,8 +512,16 @@ public enum DeepSeekRuntime {
             positionOffset: 0
         )
         var token = try DeepSeekCorrectness.greedyToken(from: logits)
+        try requireBenchmarkMatch(
+            BenchmarkOutputValidator.compareDecodeSeedToken(
+                expectedToken: expectedSeedToken,
+                actualToken: token
+            )
+        )
         cache.materializeCachedState()
 
+        var actualTokens: [Int] = []
+        actualTokens.reserveCapacity(timingPlan.decodeSteps)
         let session = try MactopSession.start()
         let start = DispatchTime.now().uptimeNanoseconds
         do {
@@ -440,7 +533,27 @@ public enum DeepSeekRuntime {
                     positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
                 )
                 token = try DeepSeekCorrectness.greedyToken(from: logits)
+                actualTokens.append(token)
+                let expectedToken = expectedTokens[decodedStep]
+                if token != expectedToken {
+                    throw BenchmarkTokenMismatchError(
+                        comparison: BenchmarkTokenComparison(
+                            passed: false,
+                            label: "benchmark decode token",
+                            step: decodedStep,
+                            expectedToken: expectedToken,
+                            actualToken: token
+                        )
+                    )
+                }
             }
+
+            try requireBenchmarkMatch(
+                BenchmarkOutputValidator.compareDecodeTokens(
+                    expectedTokens: expectedTokens,
+                    actualTokens: actualTokens
+                )
+            )
 
             let elapsed = secondsSince(start)
             let samples = try session.stop()
@@ -472,7 +585,11 @@ public enum DeepSeekRuntime {
         error: String,
         correctness: CorrectnessReport?,
         passedCorrectness: Bool,
-        expertStats explicitExpertStats: ExpertStreamingStats? = nil
+        expertStats explicitExpertStats: ExpertStreamingStats? = nil,
+        firstFailingCase explicitFirstFailingCase: String? = nil,
+        firstFailingStep explicitFirstFailingStep: Int? = nil,
+        expectedToken explicitExpectedToken: Int? = nil,
+        actualToken explicitActualToken: Int? = nil
     ) -> ScorePayload {
         let expertStats = explicitExpertStats ?? correctness?.expertStreamingStats ?? .zero
         return ScorePayload(
@@ -495,10 +612,10 @@ public enum DeepSeekRuntime {
                 expertPeakCachedTensors: expertStats.peakCachedTensors,
                 expertHitRate: expertStats.hitRate,
                 firstFailingLayer: nil,
-                firstFailingCase: correctness?.firstFailingCase,
-                firstFailingStep: correctness?.firstFailingStep,
-                expectedToken: correctness?.expectedToken,
-                actualToken: correctness?.actualToken,
+                firstFailingCase: explicitFirstFailingCase ?? correctness?.firstFailingCase,
+                firstFailingStep: explicitFirstFailingStep ?? correctness?.firstFailingStep,
+                expectedToken: explicitExpectedToken ?? correctness?.expectedToken,
+                actualToken: explicitActualToken ?? correctness?.actualToken,
                 maxAbsDiff: 0,
                 goldenHash: correctness?.goldenHash ?? "",
                 bandwidthSource: "",
@@ -643,6 +760,116 @@ public enum DeepSeekRuntime {
             expectedToken: nil,
             actualToken: nil
         )
+    }
+
+    private static func generateGreedyCached(
+        promptTokens: [Int],
+        steps: Int,
+        weightCache: DeepSeekRuntimeWeightCache
+    ) throws -> [Int] {
+        guard !promptTokens.isEmpty else {
+            throw MLXFastError.invalidInput("greedy correctness prompt must not be empty")
+        }
+        guard steps >= 0 else {
+            throw MLXFastError.invalidInput("greedy correctness steps must be non-negative")
+        }
+
+        let cache = DeepSeekModelCache(config: weightCache.config)
+        var logits = try DeepSeekModel.logits(
+            inputIDs: inputIDsArray(promptTokens),
+            weightCache: weightCache,
+            cache: cache,
+            positionOffset: 0
+        )
+        var token = try DeepSeekCorrectness.greedyToken(from: logits)
+        var generated: [Int] = []
+        generated.reserveCapacity(steps)
+
+        for step in 0..<steps {
+            generated.append(token)
+            if step == steps - 1 {
+                break
+            }
+            logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray([token]),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: promptTokens.count + step
+            )
+            token = try DeepSeekCorrectness.greedyToken(from: logits)
+        }
+        return generated
+    }
+
+    private static func generateBenchmarkGolden(
+        promptTokens: [Int],
+        weightCache: DeepSeekRuntimeWeightCache
+    ) throws -> BenchmarkGolden {
+        guard promptTokens.count >= MLXFastConstants.benchmarkPrefillPromptTokens else {
+            throw MLXFastError.invalidInput(
+                "benchmark.prompt_tokens has \(promptTokens.count) tokens; need at least \(MLXFastConstants.benchmarkPrefillPromptTokens)"
+            )
+        }
+        let prefillTokens = Array(promptTokens.prefix(MLXFastConstants.benchmarkPrefillPromptTokens))
+        let expectedPrefillToken = try firstGreedyToken(
+            promptTokens: prefillTokens,
+            weightCache: weightCache
+        )
+        let seedTokens = Array(promptTokens.prefix(MLXFastConstants.benchmarkDecodeSeedTokens))
+        let seedCache = DeepSeekModelCache(config: weightCache.config)
+        var logits = try DeepSeekModel.logits(
+            inputIDs: inputIDsArray(seedTokens),
+            weightCache: weightCache,
+            cache: seedCache,
+            positionOffset: 0
+        )
+        var token = try DeepSeekCorrectness.greedyToken(from: logits)
+        let expectedSeedToken = token
+
+        var decodeTokens: [Int] = []
+        decodeTokens.reserveCapacity(MLXFastConstants.benchmarkDecodeSteps)
+        let timingPlan = try DecodeTimingPlan(
+            seedTokenCount: seedTokens.count,
+            decodeSteps: MLXFastConstants.benchmarkDecodeSteps
+        )
+        for decodedStep in 0..<timingPlan.decodeSteps {
+            logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray([token]),
+                weightCache: weightCache,
+                cache: seedCache,
+                positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
+            )
+            token = try DeepSeekCorrectness.greedyToken(from: logits)
+            decodeTokens.append(token)
+        }
+
+        return BenchmarkGolden(
+            prefillPromptTokens: prefillTokens,
+            expectedPrefillToken: expectedPrefillToken,
+            decodeSeedTokens: seedTokens,
+            expectedDecodeSeedToken: expectedSeedToken,
+            expectedDecodeTokens: decodeTokens
+        )
+    }
+
+    private static func firstGreedyToken(
+        promptTokens: [Int],
+        weightCache: DeepSeekRuntimeWeightCache
+    ) throws -> Int {
+        let cache = DeepSeekModelCache(config: weightCache.config)
+        let logits = try DeepSeekModel.logits(
+            inputIDs: inputIDsArray(promptTokens),
+            weightCache: weightCache,
+            cache: cache,
+            positionOffset: 0
+        )
+        return try DeepSeekCorrectness.greedyToken(from: logits)
+    }
+
+    private static func requireBenchmarkMatch(_ comparison: BenchmarkTokenComparison) throws {
+        guard comparison.passed else {
+            throw BenchmarkTokenMismatchError(comparison: comparison)
+        }
     }
 
     private static func inputIDsArray(_ tokens: [Int]) throws -> MLXArray {

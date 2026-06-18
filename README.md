@@ -70,8 +70,8 @@ The repository is Swift-only: setup, transform, correctness, and benchmark all
 run through the Swift package.
 
 `mlxfast-swift submit` reads `benchmark.json` and archives only the paths listed
-in `editablePaths`. Generated `weights/`, reference checkpoints, golden files,
-and local scores are not submitted.
+in `editablePaths` for the Yukon backend. Generated `weights/`, reference
+checkpoints, golden files, and local scores are not submitted.
 
 ## Scoring
 
@@ -101,7 +101,7 @@ weights/                     transformed weights (harness loads from here)
   experts/
     manifest.json            byte ranges for streamed expert tensors
 reference_weights/           original 4-bit checkpoint (frozen, read-only)
-correctness_golden.json      fixed greedy-token correctness cases
+correctness_golden.json      hidden correctness cases and benchmark token oracle
 score.json                   written after each benchmark run
 ```
 
@@ -109,6 +109,35 @@ For stricter organizer-side provenance, set `MLXFAST_VERIFY_TRANSFORM=1` when
 running `benchmark.sh`. That re-runs the Swift transform into a clean temporary
 directory and fails unless the submitted `weights/` tree is byte-equal to the
 clean transform output.
+
+Organizer golden files can be generated from a private prompt manifest:
+
+```bash
+.build/release/mlxfast-swift make-golden \
+  --weights weights \
+  --prompt-file private_prompts.json \
+  --output correctness_golden.json
+```
+
+The manifest contains correctness prompts plus a dedicated benchmark prompt
+(arrays shown abbreviated):
+
+```json
+{
+  "version": 1,
+  "cases": [
+    {"name": "hidden-0", "prompt_tokens": [1, 2, 3]}
+  ],
+  "benchmark": {
+    "name": "timed-hidden",
+    "prompt_tokens": [1, 2, 3]
+  }
+}
+```
+
+The benchmark prompt must contain at least 512 token IDs. The generated golden
+file stores exact expected tokens for the correctness gate, the 512-token
+prefill check, the 32-token decode seed, and the timed 512-token decode window.
 
 ## Requirements
 

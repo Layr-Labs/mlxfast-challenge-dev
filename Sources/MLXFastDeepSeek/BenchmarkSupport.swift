@@ -15,30 +15,35 @@ public struct BenchmarkPreflightReport: Codable, Equatable {
 
 public struct BenchmarkPromptPlan: Equatable {
     public let prefillTokens: [Int]
+    public let expectedPrefillToken: Int
     public let decodeSeedTokens: [Int]
+    public let expectedDecodeSeedToken: Int
+    public let expectedDecodeTokens: [Int]
 
-    public init(prefillTokens: [Int], decodeSeedTokens: [Int]) {
+    public init(
+        prefillTokens: [Int],
+        expectedPrefillToken: Int,
+        decodeSeedTokens: [Int],
+        expectedDecodeSeedToken: Int,
+        expectedDecodeTokens: [Int]
+    ) {
         self.prefillTokens = prefillTokens
+        self.expectedPrefillToken = expectedPrefillToken
         self.decodeSeedTokens = decodeSeedTokens
+        self.expectedDecodeSeedToken = expectedDecodeSeedToken
+        self.expectedDecodeTokens = expectedDecodeTokens
     }
 }
 
 public enum BenchmarkPrompt {
-    public static func plan(from cases: [GoldenCase]) throws -> BenchmarkPromptPlan {
-        guard let testCase = cases.first else {
-            throw MLXFastError.invalidInput("benchmark requires at least one golden case")
-        }
-        let required = MLXFastConstants.benchmarkPrefillPromptTokens
-        guard testCase.promptTokens.count >= required else {
-            throw MLXFastError.invalidInput(
-                "\(testCase.name).prompt_tokens has \(testCase.promptTokens.count) tokens; benchmark prefill needs at least \(required)"
-            )
-        }
-
-        let prefillTokens = Array(testCase.promptTokens.prefix(required))
+    public static func plan(from benchmark: BenchmarkGolden) throws -> BenchmarkPromptPlan {
+        try validateBenchmarkGolden(benchmark)
         return BenchmarkPromptPlan(
-            prefillTokens: prefillTokens,
-            decodeSeedTokens: Array(prefillTokens.prefix(MLXFastConstants.benchmarkDecodeSeedTokens))
+            prefillTokens: benchmark.prefillPromptTokens,
+            expectedPrefillToken: benchmark.expectedPrefillToken,
+            decodeSeedTokens: benchmark.decodeSeedTokens,
+            expectedDecodeSeedToken: benchmark.expectedDecodeSeedToken,
+            expectedDecodeTokens: benchmark.expectedDecodeTokens
         )
     }
 }
@@ -59,8 +64,11 @@ public enum BenchmarkPreflight {
             try requireFile(path, description: description)
         }
 
-        let cases = try loadGoldenCases(from: goldenPath)
-        _ = try BenchmarkPrompt.plan(from: cases)
+        let golden = try loadGoldenFixture(from: goldenPath)
+        guard let benchmark = golden.benchmark else {
+            throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
+        }
+        _ = try BenchmarkPrompt.plan(from: benchmark)
         let config = try DeepSeekConfig.load(from: weightsPath)
 
         let denseStore = try DenseTensorStore(weightsPath: weightsPath)

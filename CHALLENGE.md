@@ -17,9 +17,11 @@ The benchmark entrypoint:
 1. Builds `mlxfast-swift` when needed.
 2. Runs the Swift transform if `weights/` is missing or `MLXFAST_FORCE_TRANSFORM=1`.
 3. Runs the correctness gate against `correctness_golden.json`.
-4. Measures prefill latency, 512-step greedy decode latency, MLX peak memory, and
+4. Validates the benchmark prefill/decode tokens against the hidden benchmark
+   oracle in `correctness_golden.json`.
+5. Measures prefill latency, 512-step greedy decode latency, MLX peak memory, and
    `mactop` hardware DRAM bandwidth.
-5. Writes `score.json` in the Darkbloom-compatible schema.
+6. Writes `score.json` in the Darkbloom-compatible schema.
 
 If required artifacts are missing, the harness writes a failed `score.json`
 rather than producing a ranked score.
@@ -49,8 +51,8 @@ weights/
   experts/manifest.json
 ```
 
-Correctness cases are supplied by the benchmark operator and are intentionally
-not committed to the public repo:
+Correctness cases and the timed benchmark token oracle are supplied by the
+benchmark operator and are intentionally not committed to the public repo:
 
 ```text
 correctness_golden.json
@@ -97,6 +99,11 @@ VLM/image inputs and speculative/MTP draft decoding are also out of scope for
 this challenge. They should only be added if the official benchmark contract
 changes to score those paths.
 
+The hidden golden file also includes a benchmark oracle. The benchmark validates
+the greedy token after the fixed 512-token prefill prompt, the greedy token
+after the fixed 32-token decode seed, and all 512 tokens produced inside the
+timed decode window before accepting a score.
+
 ## Score
 
 ```text
@@ -119,6 +126,7 @@ swift build -c release
 .build/release/mlxfast-swift correctness
 .build/release/mlxfast-swift preflight
 .build/release/mlxfast-swift benchmark --score-path score.json
+.build/release/mlxfast-swift make-golden --prompt-file private_prompts.json --output correctness_golden.json
 .build/release/mlxfast-swift verify-transform
 .build/release/mlxfast-swift clone
 .build/release/mlxfast-swift submit --output mlxfast-submission.zip
