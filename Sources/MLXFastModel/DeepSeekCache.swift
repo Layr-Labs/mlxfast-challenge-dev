@@ -192,7 +192,7 @@ public final class DeepSeekModelCache {
         layers.flatMap { $0.arraysForMaterialization() }
     }
 
-    func materializeCachedState() {
+    public func materializeCachedState() {
         for array in arraysForMaterialization() {
             eval(array)
         }

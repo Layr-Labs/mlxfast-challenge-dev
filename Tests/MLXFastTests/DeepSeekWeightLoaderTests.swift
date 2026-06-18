@@ -2,7 +2,7 @@ import Foundation
 import MLX
 import Testing
 @testable import MLXFastCore
-@testable import MLXFastDeepSeek
+@testable import MLXFastModel
 
 @Test
 func deepSeekWeightLoaderResolvesDenseTensorNamesAndShapes() throws {

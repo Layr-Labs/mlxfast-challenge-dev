@@ -65,10 +65,11 @@ The active implementation is Swift-only:
 
 | Path | Scope |
 |---|---|
-| `Sources/MLXFastDeepSeek/` | DeepSeek V4 Flash runtime, attention, MoE, expert streaming, correctness, benchmark timing. |
+| `Sources/MLXFastModel/` | Participant-editable DeepSeek V4 Flash runtime, attention, MoE, expert streaming, and weight loading. |
 | `Sources/MLXFastTransform/` | Offline safetensors transform and expert manifest generation. |
-| `Sources/MLXFastCore/` | Shared constants, score schema, safetensors, golden-case loading. |
-| `Sources/MLXFastCLI/` | Command-line entrypoint. |
+| `Sources/MLXFastHarness/` | Frozen correctness gate, benchmark timing, mactop/RAM measurement, and score assembly. |
+| `Sources/MLXFastCore/` | Frozen shared constants, score schema, safetensors, and golden-case loading. |
+| `Sources/MLXFastCLI/` | Frozen command-line entrypoint. |
 | `tools/build-mlx-metallib.sh` | Local MLX Metal library build helper. |
 
 There is no Python harness path.

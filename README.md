@@ -62,11 +62,12 @@ in scope. Submissions should focus on the Swift targets listed in
 
 | Path | What it controls |
 |---|---|
-| `Sources/MLXFastDeepSeek/` | DeepSeek V4 Flash runtime, MLX Swift array bridge, dense/expert loading, SSD streaming, decode/prefill logic. **Primary target.** |
+| `Sources/MLXFastModel/` | DeepSeek V4 Flash model implementation, MLX Swift array bridge, dense/expert loading, SSD streaming, decode/prefill logic. **Primary target.** |
 | `Sources/MLXFastTransform/` | Offline weight transform from frozen reference safetensors into benchmark-ready `weights/`. |
 
 The repository is Swift-only: setup, transform, correctness, and benchmark all
-run through the Swift package.
+run through the Swift package. The correctness gate, benchmark timing, and score
+emission live in frozen harness code outside the participant-editable surface.
 
 ## Scoring
 
@@ -89,8 +90,9 @@ Correctness is a hard gate. See CHALLENGE.md for the full correctness specificat
 Sources/
   MLXFastCLI/                Swift command-line entrypoint
   MLXFastCore/               score.json, golden cases, shared contracts
+  MLXFastHarness/            trusted correctness, benchmark timing, scoring
+  MLXFastModel/              editable DeepSeek V4 Flash Swift runtime
   MLXFastTransform/          Swift offline weight transform
-  MLXFastDeepSeek/           DeepSeek V4 Flash Swift runtime
 weights/                     transformed weights (harness loads from here)
   experts/
     manifest.json            byte ranges for streamed expert tensors

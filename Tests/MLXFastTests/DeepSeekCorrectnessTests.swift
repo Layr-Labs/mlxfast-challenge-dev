@@ -2,7 +2,7 @@ import Foundation
 import CryptoKit
 import MLX
 import MLXFastCore
-@testable import MLXFastDeepSeek
+@testable import MLXFastHarness
 import Testing
 
 @Test
@@ -74,6 +74,26 @@ func deepSeekCorrectnessGeneratesGreedyTokensWithGrowingContext() throws {
 
     #expect(generated == [2, 3, 4])
     #expect(contexts == [[10, 11], [10, 11, 2], [10, 11, 2, 3]])
+}
+
+@Test
+func deepSeekCorrectnessComparesGeneratedGreedyTokens() throws {
+    var calls: [(Int, Int?)] = []
+    let comparison = try DeepSeekCorrectness.compareGreedyTokens(
+        expected: [2, 3, 99],
+        steps: 3
+    ) { step, previousToken in
+        calls.append((step, previousToken))
+        return step + 2
+    }
+
+    #expect(!comparison.passed)
+    #expect(comparison.checkedSteps == 3)
+    #expect(comparison.firstFailingStep == 2)
+    #expect(comparison.expectedToken == 99)
+    #expect(comparison.actualToken == 4)
+    #expect(calls.map(\.0) == [0, 1, 2])
+    #expect(calls.map(\.1) == [nil, 2, 3])
 }
 
 @Test

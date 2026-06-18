@@ -10,7 +10,8 @@ let package = Package(
         .executable(name: "mlxfast-swift", targets: ["MLXFastCLI"]),
         .library(name: "MLXFastCore", targets: ["MLXFastCore"]),
         .library(name: "MLXFastTransform", targets: ["MLXFastTransform"]),
-        .library(name: "MLXFastDeepSeek", targets: ["MLXFastDeepSeek"]),
+        .library(name: "MLXFastModel", targets: ["MLXFastModel"]),
+        .library(name: "MLXFastHarness", targets: ["MLXFastHarness"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.4"),
@@ -22,9 +23,17 @@ let package = Package(
             dependencies: ["MLXFastCore"]
         ),
         .target(
-            name: "MLXFastDeepSeek",
+            name: "MLXFastModel",
             dependencies: [
                 "MLXFastCore",
+                .product(name: "MLX", package: "mlx-swift"),
+            ]
+        ),
+        .target(
+            name: "MLXFastHarness",
+            dependencies: [
+                "MLXFastCore",
+                "MLXFastModel",
                 .product(name: "MLX", package: "mlx-swift"),
             ]
         ),
@@ -33,7 +42,7 @@ let package = Package(
             dependencies: [
                 "MLXFastCore",
                 "MLXFastTransform",
-                "MLXFastDeepSeek",
+                "MLXFastHarness",
             ]
         ),
         .testTarget(
@@ -41,7 +50,8 @@ let package = Package(
             dependencies: [
                 "MLXFastCore",
                 "MLXFastTransform",
-                "MLXFastDeepSeek",
+                "MLXFastModel",
+                "MLXFastHarness",
             ]
         ),
     ]

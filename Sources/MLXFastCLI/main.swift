@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 import MLXFastCore
-import MLXFastDeepSeek
+import MLXFastHarness
 import MLXFastTransform
 
 @main

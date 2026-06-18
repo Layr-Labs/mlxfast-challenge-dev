@@ -35,6 +35,23 @@ jobs:
       - name: Transform reference checkpoint
         run: .build/release/mlxfast-swift transform
 
+      - name: Install organizer correctness golden
+        env:
+          MLXFAST_CORRECTNESS_GOLDEN_B64: ${{ secrets.MLXFAST_CORRECTNESS_GOLDEN_B64 }}
+        run: |
+          if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_B64:-}" ]]; then
+            echo "::error::MLXFAST_CORRECTNESS_GOLDEN_B64 secret is required for correctness"
+            exit 1
+          fi
+          golden_path="${RUNNER_TEMP}/mlxfast-correctness-golden.json"
+          umask 077
+          printf '%s' "${MLXFAST_CORRECTNESS_GOLDEN_B64}" | /usr/bin/base64 -D > "${golden_path}"
+          if [[ ! -s "${golden_path}" ]]; then
+            echo "::error::decoded correctness golden is empty"
+            exit 1
+          fi
+          echo "MLXFAST_CORRECTNESS_GOLDEN_PATH=${golden_path}" >> "${GITHUB_ENV}"
+
       - name: Correctness gate
         run: .build/release/mlxfast-swift correctness
 

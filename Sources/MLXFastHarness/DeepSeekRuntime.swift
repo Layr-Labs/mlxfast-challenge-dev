@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import MLX
 import MLXFastCore
+import MLXFastModel
 
 public struct CorrectnessOptions: Equatable {
     public let weightsPath: String
@@ -602,47 +603,31 @@ public enum DeepSeekRuntime {
         let config = weightCache.config
         let cache = DeepSeekModelCache(config: config)
 
-        var logits = try DeepSeekModel.logits(
-            inputIDs: inputIDsArray(testCase.promptTokens),
-            weightCache: weightCache,
-            cache: cache,
-            positionOffset: 0
-        )
-        var token = try DeepSeekCorrectness.greedyToken(from: logits)
-
-        for step in 0..<steps {
-            let expectedToken = testCase.expectedTokens[step]
-            if token != expectedToken {
-                return CorrectnessTokenComparison(
-                    passed: false,
-                    checkedSteps: step + 1,
-                    firstFailingStep: step,
-                    expectedToken: expectedToken,
-                    actualToken: token
+        return try DeepSeekCorrectness.compareGreedyTokens(
+            expected: testCase.expectedTokens,
+            steps: steps
+        ) { step, previousToken in
+            let logits: MLXArray
+            if step == 0 {
+                logits = try DeepSeekModel.logits(
+                    inputIDs: inputIDsArray(testCase.promptTokens),
+                    weightCache: weightCache,
+                    cache: cache,
+                    positionOffset: 0
+                )
+            } else {
+                guard let previousToken else {
+                    throw MLXFastError.invalidInput("missing previous token for greedy correctness step \(step)")
+                }
+                logits = try DeepSeekModel.logits(
+                    inputIDs: inputIDsArray([previousToken]),
+                    weightCache: weightCache,
+                    cache: cache,
+                    positionOffset: testCase.promptTokens.count + step - 1
                 )
             }
-
-            if step == steps - 1 {
-                break
-            }
-
-            let positionOffset = testCase.promptTokens.count + step
-            logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray([token]),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: positionOffset
-            )
-            token = try DeepSeekCorrectness.greedyToken(from: logits)
+            return try DeepSeekCorrectness.greedyToken(from: logits)
         }
-
-        return CorrectnessTokenComparison(
-            passed: true,
-            checkedSteps: steps,
-            firstFailingStep: nil,
-            expectedToken: nil,
-            actualToken: nil
-        )
     }
 
     private static func inputIDsArray(_ tokens: [Int]) throws -> MLXArray {
