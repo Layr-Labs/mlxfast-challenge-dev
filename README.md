@@ -115,7 +115,7 @@ For stricter organizer-side provenance, set `MLXFAST_VERIFY_TRANSFORM=1` when
 running `benchmark.sh`. That re-runs the submitted Swift transform into a clean
 temporary directory and fails unless `weights/` is byte-equal to that fresh run.
 This checks determinism and stale files; it does not require the baseline
-`weights/` layout. The default transformed-output cap is 10 GiB and can be
+`weights/` layout. The default transformed-output cap is 50 GiB and can be
 changed with `MLXFAST_MAX_WEIGHTS_BYTES` or
 `mlxfast-swift verify-transform --max-bytes N`.
 

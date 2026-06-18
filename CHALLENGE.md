@@ -86,7 +86,7 @@ surface. `mlxfast-swift submit` packages only `editablePaths`.
 `mlxfast-swift verify-transform` is an organizer/debug check for deterministic
 transform output. It re-runs the submitted transform and compares the generated
 `weights/` tree against that fresh run. It is not a baseline-layout requirement.
-The default transformed-output cap is 10 GiB; override it with
+The default transformed-output cap is 50 GiB; override it with
 `MLXFAST_MAX_WEIGHTS_BYTES` or `--max-bytes` when running the verifier.
 
 There is no Python harness path.
