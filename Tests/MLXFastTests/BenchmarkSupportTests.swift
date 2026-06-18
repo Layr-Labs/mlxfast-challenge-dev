@@ -26,7 +26,7 @@ func mactopBandwidthParsesNDJSONSamples() {
     {"soc_metrics": {"dram_bw_combined_gbs": 0}}
     """.data(using: .utf8)!
 
-    #expect(MactopBandwidth.parseSamples(from: data) == [3.25, 4.75])
+    #expect(MactopBandwidth.parseSamples(from: data) == [3.25, 4.75, 0])
 }
 
 @Test

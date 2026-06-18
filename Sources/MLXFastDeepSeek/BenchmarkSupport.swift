@@ -169,11 +169,11 @@ public struct MactopBandwidth: Equatable {
             return nil
         }
         switch raw {
-        case let value as Double where value.isFinite && value > 0:
+        case let value as Double where value.isFinite && value >= 0:
             return value
-        case let value as Int where value > 0:
+        case let value as Int where value >= 0:
             return Double(value)
-        case let value as NSNumber where value.doubleValue.isFinite && value.doubleValue > 0:
+        case let value as NSNumber where value.doubleValue.isFinite && value.doubleValue >= 0:
             return value.doubleValue
         default:
             return nil
