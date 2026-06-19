@@ -193,7 +193,6 @@ download_reference_file() {
   local output_path="$2"
   local marker_path="${output_path}.complete"
   local url="${REFERENCE_BASE_URL%/}/${file}"
-  local curl_headers=()
 
   if [[ -f "${marker_path}" && -s "${output_path}" ]]; then
     echo "setup.sh: already downloaded ${file}"
@@ -203,22 +202,31 @@ download_reference_file() {
   if ! url="$(download_url_for_file "${url}")"; then
     return 1
   fi
-  if [[ -n "${REFERENCE_AUTH_HEADER}" ]]; then
-    curl_headers=(-H "${REFERENCE_AUTH_HEADER}")
-  fi
 
   mkdir -p "$(dirname "${output_path}")"
   echo "setup.sh: downloading ${file}"
-  curl \
-    --fail \
-    --location \
-    --retry 5 \
-    --retry-all-errors \
-    --retry-delay 2 \
-    --continue-at - \
-    "${curl_headers[@]}" \
-    --output "${output_path}" \
-    "${url}"
+  if [[ -n "${REFERENCE_AUTH_HEADER}" ]]; then
+    curl \
+      --fail \
+      --location \
+      --retry 5 \
+      --retry-all-errors \
+      --retry-delay 2 \
+      --continue-at - \
+      -H "${REFERENCE_AUTH_HEADER}" \
+      --output "${output_path}" \
+      "${url}"
+  else
+    curl \
+      --fail \
+      --location \
+      --retry 5 \
+      --retry-all-errors \
+      --retry-delay 2 \
+      --continue-at - \
+      --output "${output_path}" \
+      "${url}"
+  fi
   touch "${marker_path}"
 }
 
@@ -263,7 +271,6 @@ download_reference_shards() {
     output_path="${output_dir}/${file}"
     marker_path="${output_path}.complete"
     url="${REFERENCE_BASE_URL%/}/${file}"
-    curl_headers=()
 
     download_url_for_file() {
       local url="$1"
@@ -304,24 +311,35 @@ download_reference_shards() {
     fi
 
     url="$(download_url_for_file "${url}")"
-    if [[ -n "${REFERENCE_AUTH_HEADER:-}" ]]; then
-      curl_headers=(-H "${REFERENCE_AUTH_HEADER}")
-    fi
 
     mkdir -p "$(dirname "${output_path}")"
     echo "setup.sh: downloading ${file}"
-    curl \
-      --fail \
-      --location \
-      --retry 5 \
-      --retry-all-errors \
-      --retry-delay 2 \
-      --continue-at - \
-      --silent \
-      --show-error \
-      "${curl_headers[@]}" \
-      --output "${output_path}" \
-      "${url}"
+    if [[ -n "${REFERENCE_AUTH_HEADER:-}" ]]; then
+      curl \
+        --fail \
+        --location \
+        --retry 5 \
+        --retry-all-errors \
+        --retry-delay 2 \
+        --continue-at - \
+        --silent \
+        --show-error \
+        -H "${REFERENCE_AUTH_HEADER}" \
+        --output "${output_path}" \
+        "${url}"
+    else
+      curl \
+        --fail \
+        --location \
+        --retry 5 \
+        --retry-all-errors \
+        --retry-delay 2 \
+        --continue-at - \
+        --silent \
+        --show-error \
+        --output "${output_path}" \
+        "${url}"
+    fi
     touch "${marker_path}"
     echo "setup.sh: downloaded ${file}"
   ' _ {} "${output_dir}"

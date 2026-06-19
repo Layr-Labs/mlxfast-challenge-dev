@@ -77,20 +77,28 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
-            headers=()
             if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER:-}" ]]; then
-              headers=(-H "${MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER}")
+              echo "benchmark: downloading correctness_golden.json with configured auth header"
+              curl \
+                --fail \
+                --location \
+                --retry 5 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                -H "${MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER}" \
+                --output correctness_golden.json \
+                "${MLXFAST_CORRECTNESS_GOLDEN_URL}"
+            else
+              echo "benchmark: downloading correctness_golden.json"
+              curl \
+                --fail \
+                --location \
+                --retry 5 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                --output correctness_golden.json \
+                "${MLXFAST_CORRECTNESS_GOLDEN_URL}"
             fi
-            echo "benchmark: downloading correctness_golden.json"
-            curl \
-              --fail \
-              --location \
-              --retry 5 \
-              --retry-all-errors \
-              --retry-delay 2 \
-              "${headers[@]}" \
-              --output correctness_golden.json \
-              "${MLXFAST_CORRECTNESS_GOLDEN_URL}"
           else
             echo "benchmark: generating temporary correctness_golden.json from ${MLXFAST_PROMPT_FILE}"
             .build/release/mlxfast-swift make-golden \
