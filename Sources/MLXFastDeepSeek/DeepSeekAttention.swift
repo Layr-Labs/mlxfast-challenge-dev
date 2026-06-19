@@ -656,6 +656,26 @@ public enum DeepSeekCompressedAttention {
                 sinks: sinks
             )
         } else {
+            if spec.compressRatio == 4,
+               let indexer = weights.indexer,
+               let indexPooled = cache?.indexPooled
+            {
+                _ = try DeepSeekKVCompressor.forward(
+                    x,
+                    weights: indexer.compressor,
+                    spec: DeepSeekCompressorSpec(
+                        compressRatio: spec.compressRatio,
+                        headDim: spec.indexHeadDim,
+                        ropeHeadDim: spec.qkRopeHeadDim,
+                        ropeTheta: spec.ropeTheta,
+                        ropeScaling: spec.ropeScaling,
+                        maxPositionEmbeddings: spec.maxPositionEmbeddings,
+                        rmsNormEps: spec.rmsNormEps
+                    ),
+                    poolingCache: indexPooled,
+                    positionOffset: positionOffset
+                )
+            }
             let attentionMask = try extendMask(
                 localMask,
                 pooledLength: pooledLength,
