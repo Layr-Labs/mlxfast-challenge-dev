@@ -15,6 +15,7 @@ weights/*
 
 # Local results log
 results.tsv
+m5_artifacts/
 
 # Benchmark contract outputs
 score.json
