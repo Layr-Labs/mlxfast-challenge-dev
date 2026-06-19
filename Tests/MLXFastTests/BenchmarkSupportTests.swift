@@ -263,7 +263,7 @@ func benchmarkPreflightRejectsMalformedGolden() throws {
 
 @Test
 func benchmarkPreflightRejectsShortBenchmarkPrompt() throws {
-    let fixture = try makePreflightFixture(goldenContents: validGoldenJSON(promptTokens: [1]))
+    let fixture = try makePreflightFixture(goldenContents: validGoldenJSON(benchmarkPromptTokens: [1]))
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
@@ -414,11 +414,13 @@ private func minimalDeepSeekConfigJSON() -> String {
 }
 
 private func validGoldenJSON(
-    promptTokens: [Int] = Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens)
+    correctnessPromptTokens: [Int] = Array(repeating: 1, count: MLXFastConstants.correctnessPromptTokens),
+    benchmarkPromptTokens: [Int] = Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens)
 ) -> String {
-    let prompt = arrayJSON(promptTokens)
+    let correctnessPrompt = arrayJSON(correctnessPromptTokens)
+    let benchmarkPrompt = arrayJSON(benchmarkPromptTokens)
     let expected = arrayJSON(Array(repeating: 7, count: MLXFastConstants.correctnessSteps))
-    let seed = arrayJSON(Array(promptTokens.prefix(MLXFastConstants.benchmarkDecodeSeedTokens)))
+    let seed = arrayJSON(Array(benchmarkPromptTokens.prefix(MLXFastConstants.benchmarkDecodeSeedTokens)))
     let decode = arrayJSON(Array(repeating: 9, count: MLXFastConstants.benchmarkDecodeSteps))
     return """
     {
@@ -426,12 +428,12 @@ private func validGoldenJSON(
       "cases": [
         {
           "name": "preflight",
-          "prompt_tokens": \(prompt),
+          "prompt_tokens": \(correctnessPrompt),
           "expected_tokens": \(expected)
         }
       ],
       "benchmark": {
-        "prefill_prompt_tokens": \(prompt),
+        "prefill_prompt_tokens": \(benchmarkPrompt),
         "expected_prefill_token": 8,
         "decode_seed_tokens": \(seed),
         "expected_decode_seed_token": 7,

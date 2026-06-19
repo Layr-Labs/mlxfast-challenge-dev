@@ -118,7 +118,13 @@ mkdir -p "${WEIGHTS_PATH}"
 wanted_hash="$(source_hash)"
 current_hash="$(cat "${SOURCE_HASH_PATH}" 2>/dev/null || true)"
 
-if [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f "${WEIGHTS_PATH}/config.json" || "${current_hash}" != "${wanted_hash}" ]]; then
+if [[ "${MLXFAST_SKIP_TRANSFORM:-0}" == "1" ]]; then
+  if [[ ! -f "${WEIGHTS_PATH}/config.json" ]]; then
+    echo "benchmark.sh: MLXFAST_SKIP_TRANSFORM=1 but ${WEIGHTS_PATH}/config.json is missing" >&2
+    exit 1
+  fi
+  echo "benchmark.sh: reusing ${WEIGHTS_PATH}/ because MLXFAST_SKIP_TRANSFORM=1"
+elif [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f "${WEIGHTS_PATH}/config.json" || "${current_hash}" != "${wanted_hash}" ]]; then
   if [[ -f "${REFERENCE_PATH}/config.json" ]]; then
     echo "benchmark.sh: regenerating weights with Swift transform"
     clear_weights_dir

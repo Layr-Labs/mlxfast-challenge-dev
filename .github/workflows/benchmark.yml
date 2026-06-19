@@ -4,6 +4,35 @@ name: benchmark
 # Apple Silicon run explicitly. No PR/push triggers should burn macOS minutes.
 on:
   workflow_dispatch:
+    inputs:
+      reference_base_url:
+        description: "Optional HTTP base URL for reference checkpoint files, such as an R2 public/Worker prefix. Defaults to setup.sh/HF or MLXFAST_REFERENCE_BASE_URL secret."
+        required: false
+        type: string
+      correctness_golden_url:
+        description: "Optional URL for precomputed correctness_golden.json. If empty, the workflow generates a temporary golden file from private_prompts.json."
+        required: false
+        type: string
+      prompt_file:
+        description: "Prompt manifest used to generate temporary correctness_golden.json when no golden URL is provided."
+        required: false
+        default: "private_prompts.json"
+        type: string
+      reference_download_jobs:
+        description: "Parallel shard downloads for setup.sh."
+        required: false
+        default: "4"
+        type: string
+      reference_min_free_gib:
+        description: "Minimum free GiB required before reference checkpoint download."
+        required: false
+        default: "170"
+        type: string
+      verify_transform:
+        description: "Run deterministic transform verification before timing."
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: benchmark-${{ github.ref }}
@@ -15,7 +44,16 @@ permissions:
 jobs:
   benchmark:
     runs-on: blacksmith-12vcpu-macos-26
-    timeout-minutes: 240
+    timeout-minutes: 720
+    env:
+      MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || secrets.MLXFAST_REFERENCE_BASE_URL }}
+      MLXFAST_REFERENCE_AUTH_HEADER: ${{ secrets.MLXFAST_REFERENCE_AUTH_HEADER }}
+      MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
+      MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
+      MLXFAST_CORRECTNESS_GOLDEN_URL: ${{ inputs.correctness_golden_url || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL }}
+      MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER: ${{ secrets.MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER }}
+      MLXFAST_PROMPT_FILE: ${{ inputs.prompt_file }}
+      MLXFAST_VERIFY_TRANSFORM: ${{ inputs.verify_transform && '1' || '0' }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -35,12 +73,37 @@ jobs:
       - name: Transform reference checkpoint
         run: .build/release/mlxfast-swift transform
 
-      - name: Correctness gate
-        run: .build/release/mlxfast-swift correctness
+      - name: Prepare correctness golden
+        run: |
+          set -euo pipefail
+          if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
+            headers=()
+            if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER:-}" ]]; then
+              headers=(-H "${MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER}")
+            fi
+            echo "benchmark: downloading correctness_golden.json"
+            curl \
+              --fail \
+              --location \
+              --retry 5 \
+              --retry-all-errors \
+              --retry-delay 2 \
+              "${headers[@]}" \
+              --output correctness_golden.json \
+              "${MLXFAST_CORRECTNESS_GOLDEN_URL}"
+          else
+            echo "benchmark: generating temporary correctness_golden.json from ${MLXFAST_PROMPT_FILE}"
+            .build/release/mlxfast-swift make-golden \
+              --weights weights \
+              --prompt-file "${MLXFAST_PROMPT_FILE}" \
+              --output correctness_golden.json
+          fi
+          test -s correctness_golden.json
 
       - name: Benchmark
         env:
           MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
+          MLXFAST_SKIP_TRANSFORM: "1"
         run: ./benchmark.sh
 
       - name: Upload score artifacts

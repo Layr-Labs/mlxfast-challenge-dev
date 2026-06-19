@@ -47,6 +47,15 @@ be supplied separately. The Swift CLI also honors `MLXFAST_REFERENCE_DIR`,
 `MLXFAST_WEIGHTS_PATH`, `MLXFAST_CORRECTNESS_GOLDEN_PATH`, and
 `MLXFAST_SCORE_PATH` as defaults; explicit CLI flags take precedence.
 
+For manual GitHub Actions benchmark runs, dispatch `benchmark.yml` on a macOS
+Blacksmith runner. Set `reference_base_url` to an HTTP prefix containing the
+reference checkpoint files, such as an R2 public bucket or Worker route. The
+workflow uses `private_prompts.json` to generate a temporary
+`correctness_golden.json` unless `correctness_golden_url` or the
+`MLXFAST_CORRECTNESS_GOLDEN_URL` secret points at a precomputed golden file.
+Private endpoints can pass headers through `MLXFAST_REFERENCE_AUTH_HEADER` and
+`MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER` repository secrets.
+
 ## Why this challenge exists
 
 DeepSeek V4 Flash has 256 routed experts per layer, 6 activated per token.

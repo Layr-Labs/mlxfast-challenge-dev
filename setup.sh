@@ -5,6 +5,8 @@ set -euo pipefail
 REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/DeepSeek-V4-Flash-4bit}"
 REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-main}"
 REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-https://huggingface.co/${REFERENCE_MODEL_REPO}/resolve/${REFERENCE_REVISION}}"
+REFERENCE_AUTH_HEADER="${MLXFAST_REFERENCE_AUTH_HEADER:-}"
+REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}"
 REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-170}"
 REFERENCE_DOWNLOAD_JOBS="${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-4}"
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
@@ -151,19 +153,56 @@ EOF
   fi
 }
 
+download_url_for_file() {
+  local url="$1"
+  local append_query=0
+  local separator="?"
+
+  case "${REFERENCE_APPEND_DOWNLOAD_QUERY}" in
+    1|true|TRUE|yes|YES)
+      append_query=1
+      ;;
+    0|false|FALSE|no|NO)
+      append_query=0
+      ;;
+    auto|"")
+      if [[ "${url}" == https://huggingface.co/* || "${url}" == http://huggingface.co/* ]]; then
+        append_query=1
+      fi
+      ;;
+    *)
+      echo "setup.sh: MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY must be auto, true, or false" >&2
+      return 1
+      ;;
+  esac
+
+  if [[ "${append_query}" == "1" ]]; then
+    if [[ "${url}" == *\?* ]]; then
+      separator="&"
+    fi
+    url="${url}${separator}download=true"
+  fi
+
+  printf '%s\n' "${url}"
+}
+
 download_reference_file() {
   local file="$1"
   local output_path="$2"
   local marker_path="${output_path}.complete"
   local url="${REFERENCE_BASE_URL%/}/${file}"
+  local curl_headers=()
 
   if [[ -f "${marker_path}" && -s "${output_path}" ]]; then
     echo "setup.sh: already downloaded ${file}"
     return 0
   fi
 
-  if [[ "${url}" == http://* || "${url}" == https://* ]]; then
-    url="${url}?download=true"
+  if ! url="$(download_url_for_file "${url}")"; then
+    return 1
+  fi
+  if [[ -n "${REFERENCE_AUTH_HEADER}" ]]; then
+    curl_headers=(-H "${REFERENCE_AUTH_HEADER}")
   fi
 
   mkdir -p "$(dirname "${output_path}")"
@@ -175,6 +214,7 @@ download_reference_file() {
     --retry-all-errors \
     --retry-delay 2 \
     --continue-at - \
+    "${curl_headers[@]}" \
     --output "${output_path}" \
     "${url}"
   touch "${marker_path}"
@@ -200,6 +240,8 @@ download_reference_shards() {
 
   echo "setup.sh: downloading $# safetensors shard(s) with ${jobs} parallel job(s)"
   export REFERENCE_BASE_URL
+  export REFERENCE_AUTH_HEADER
+  export REFERENCE_APPEND_DOWNLOAD_QUERY
   printf '%s\0' "$@" | xargs -0 -I{} -P "${jobs}" bash -c '
     set -euo pipefail
     file="$1"
@@ -207,14 +249,49 @@ download_reference_shards() {
     output_path="${output_dir}/${file}"
     marker_path="${output_path}.complete"
     url="${REFERENCE_BASE_URL%/}/${file}"
+    curl_headers=()
+
+    download_url_for_file() {
+      local url="$1"
+      local append_query=0
+      local separator="?"
+
+      case "${REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}" in
+        1|true|TRUE|yes|YES)
+          append_query=1
+          ;;
+        0|false|FALSE|no|NO)
+          append_query=0
+          ;;
+        auto|"")
+          if [[ "${url}" == https://huggingface.co/* || "${url}" == http://huggingface.co/* ]]; then
+            append_query=1
+          fi
+          ;;
+        *)
+          echo "setup.sh: MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY must be auto, true, or false" >&2
+          return 1
+          ;;
+      esac
+
+      if [[ "${append_query}" == "1" ]]; then
+        if [[ "${url}" == *\?* ]]; then
+          separator="&"
+        fi
+        url="${url}${separator}download=true"
+      fi
+
+      printf "%s\n" "${url}"
+    }
 
     if [[ -f "${marker_path}" && -s "${output_path}" ]]; then
       echo "setup.sh: already downloaded ${file}"
       exit 0
     fi
 
-    if [[ "${url}" == http://* || "${url}" == https://* ]]; then
-      url="${url}?download=true"
+    url="$(download_url_for_file "${url}")"
+    if [[ -n "${REFERENCE_AUTH_HEADER:-}" ]]; then
+      curl_headers=(-H "${REFERENCE_AUTH_HEADER}")
     fi
 
     mkdir -p "$(dirname "${output_path}")"
@@ -228,6 +305,7 @@ download_reference_shards() {
       --continue-at - \
       --silent \
       --show-error \
+      "${curl_headers[@]}" \
       --output "${output_path}" \
       "${url}"
     touch "${marker_path}"
