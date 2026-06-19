@@ -186,6 +186,43 @@ func loadGoldenPromptManifestRejectsShortCorrectnessPrompt() throws {
 }
 
 @Test
+func loadGoldenPromptManifestRejectsWrongMaxOutputTokens() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("prompts.json")
+    let benchmarkPrompt = Array(repeating: 11, count: MLXFastConstants.benchmarkPrefillPromptTokens)
+    let json = """
+    {
+      "version": 1,
+      "max_output_tokens": \(MLXFastConstants.correctnessSteps - 1),
+      "cases": [
+        {
+          "name": "hidden-0",
+          "prompt_tokens": \(correctnessPromptJSON())
+        }
+      ],
+      "benchmark": {
+        "prompt_tokens": \(benchmarkPrompt)
+      }
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try loadGoldenPromptManifest(from: path.path)
+    }
+}
+
+@Test
+func committedTemporaryPromptManifestMatchesContract() throws {
+    let manifest = try loadGoldenPromptManifest(from: "private_prompts.json")
+
+    #expect(manifest.maxOutputTokens == MLXFastConstants.correctnessSteps)
+    #expect(manifest.cases.count == 1)
+    #expect(manifest.cases[0].promptTokens.count == MLXFastConstants.correctnessPromptTokens)
+    #expect(manifest.benchmark.promptTokens.count == MLXFastConstants.correctnessPromptTokens)
+}
+
+@Test
 func benchmarkOutputValidatorReportsTokenMismatches() {
     let oracle = BenchmarkGolden(
         prefillPromptTokens: Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens),

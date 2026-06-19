@@ -107,15 +107,25 @@ public struct GoldenPromptManifest: Codable, Equatable {
     public let version: Int
     public let cases: [GoldenPromptCase]
     public let benchmark: BenchmarkPromptSpec
+    public let maxOutputTokens: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case version
+        case cases
+        case benchmark
+        case maxOutputTokens = "max_output_tokens"
+    }
 
     public init(
         version: Int = 1,
         cases: [GoldenPromptCase],
-        benchmark: BenchmarkPromptSpec
+        benchmark: BenchmarkPromptSpec,
+        maxOutputTokens: Int? = nil
     ) {
         self.version = version
         self.cases = cases
         self.benchmark = benchmark
+        self.maxOutputTokens = maxOutputTokens
     }
 }
 
@@ -200,6 +210,13 @@ public func validateGoldenPromptManifest(_ manifest: GoldenPromptManifest) throw
     }
     guard !manifest.cases.isEmpty else {
         throw MLXFastError.invalidInput("golden prompt manifest must contain at least one case")
+    }
+    if let maxOutputTokens = manifest.maxOutputTokens {
+        guard maxOutputTokens == MLXFastConstants.correctnessSteps else {
+            throw MLXFastError.invalidInput(
+                "golden prompt manifest max_output_tokens is \(maxOutputTokens); need exactly \(MLXFastConstants.correctnessSteps)"
+            )
+        }
     }
 
     var names = Set<String>()

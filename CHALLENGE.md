@@ -69,6 +69,8 @@ correctness_golden.json
 
 Use `MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json` when the
 file is provisioned outside the repository root.
+For bring-up only, this repo currently includes `private_prompts.json`; use it
+to generate a temporary golden file, not as the final hidden prompt set.
 
 ## Editable Surface
 
@@ -115,8 +117,8 @@ There is no Python harness path.
 ## Correctness Gate
 
 Correctness is a hard gate. For each golden case, the prompt must contain
-exactly 512 token IDs. The harness runs cached greedy generation for 2048 tokens
-with temperature-zero behavior and compares token IDs exactly. The first
+exactly 1024 token IDs. The harness runs cached greedy generation for 32,768
+tokens with temperature-zero behavior and compares token IDs exactly. The first
 mismatch records the case, step, expected token, and actual token in the failed
 report.
 
