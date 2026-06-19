@@ -28,11 +28,6 @@ on:
         required: false
         default: false
         type: boolean
-      generate_temporary_golden:
-        description: "Maintainer-only bring-up path: generate the committed public temporary golden on the benchmark runner."
-        required: false
-        default: false
-        type: boolean
 
 concurrency:
   group: benchmark-${{ github.ref }}
@@ -69,14 +64,6 @@ jobs:
       - name: Require precomputed correctness golden
         run: |
           set -euo pipefail
-          if [[ "${{ inputs.generate_temporary_golden }}" == "true" ]]; then
-            if [[ "${GITHUB_REF_NAME}" == submissions/* ]]; then
-              echo "benchmark: generate_temporary_golden is not allowed on submission branches." >&2
-              exit 1
-            fi
-            echo "benchmark: generating temporary public correctness golden on this runner."
-            exit 0
-          fi
           if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" && ! -s fixtures/correctness_golden_512_2048.json ]]; then
             echo "benchmark: no correctness golden URL configured." >&2
             echo "benchmark: benchmark CI does not generate correctness_golden.json; generate and store the golden offline." >&2
@@ -93,13 +80,7 @@ jobs:
       - name: Prepare correctness golden
         run: |
           set -euo pipefail
-          if [[ "${{ inputs.generate_temporary_golden }}" == "true" ]]; then
-            echo "benchmark: generating temporary correctness_golden.json from private_prompts.json"
-            .build/release/mlxfast-swift make-golden \
-              --weights weights \
-              --prompt-file private_prompts.json \
-              --output correctness_golden.json
-          elif [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
+          if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
             if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER:-}" ]]; then
               echo "benchmark: downloading correctness_golden.json with configured auth header"
               curl \
@@ -145,11 +126,3 @@ jobs:
             benchmark-integrity.json
             results.tsv
           if-no-files-found: ignore
-
-      - name: Upload temporary golden artifact
-        if: always() && inputs.generate_temporary_golden
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: temporary-correctness-golden-${{ github.run_id }}
-          path: correctness_golden.json
-          if-no-files-found: error
