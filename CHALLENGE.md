@@ -70,8 +70,11 @@ correctness_golden.json
 Use `MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json` when the
 file is provisioned outside the repository root.
 For bring-up only, this repo currently includes `private_prompts.json` and a
-matching `fixtures/correctness_golden_512_2048.json`; replace them for the final
-hidden prompt set.
+public fixture. Benchmark CI restores a Blacksmith-generated cached
+`correctness_golden.json` when no golden URL is configured, generating it once on
+a trusted-branch cache miss. Submission branches can restore the cache but do not
+generate goldens from submitted code. Replace this public path with a protected
+golden URL for the final hidden prompt set.
 
 ## Editable Surface
 
