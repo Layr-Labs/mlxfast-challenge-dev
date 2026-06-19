@@ -10,7 +10,7 @@ on:
         required: false
         type: string
       correctness_golden_url:
-        description: "Optional URL for precomputed correctness_golden.json. If empty, MLXFAST_CORRECTNESS_GOLDEN_URL secret must be set."
+        description: "Optional URL for precomputed correctness_golden.json. If empty, the workflow uses the committed temporary golden fixture."
         required: false
         type: string
       reference_download_jobs:
@@ -64,10 +64,10 @@ jobs:
       - name: Require precomputed correctness golden
         run: |
           set -euo pipefail
-          if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
+          if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" && ! -s fixtures/correctness_golden_512_2048.json ]]; then
             echo "benchmark: no correctness golden URL configured." >&2
             echo "benchmark: benchmark CI does not generate correctness_golden.json; generate and store the golden offline." >&2
-            echo "benchmark: pass workflow input correctness_golden_url or configure MLXFAST_CORRECTNESS_GOLDEN_URL." >&2
+            echo "benchmark: pass workflow input correctness_golden_url, configure MLXFAST_CORRECTNESS_GOLDEN_URL, or commit a temporary fixture." >&2
             exit 1
           fi
 
@@ -77,30 +77,35 @@ jobs:
       - name: Transform reference checkpoint
         run: .build/release/mlxfast-swift transform
 
-      - name: Download correctness golden
+      - name: Prepare correctness golden
         run: |
           set -euo pipefail
-          if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER:-}" ]]; then
-            echo "benchmark: downloading correctness_golden.json with configured auth header"
-            curl \
-              --fail \
-              --location \
-              --retry 5 \
-              --retry-all-errors \
-              --retry-delay 2 \
-              -H "${MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER}" \
-              --output correctness_golden.json \
-              "${MLXFAST_CORRECTNESS_GOLDEN_URL}"
+          if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
+            if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER:-}" ]]; then
+              echo "benchmark: downloading correctness_golden.json with configured auth header"
+              curl \
+                --fail \
+                --location \
+                --retry 5 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                -H "${MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER}" \
+                --output correctness_golden.json \
+                "${MLXFAST_CORRECTNESS_GOLDEN_URL}"
+            else
+              echo "benchmark: downloading correctness_golden.json"
+              curl \
+                --fail \
+                --location \
+                --retry 5 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                --output correctness_golden.json \
+                "${MLXFAST_CORRECTNESS_GOLDEN_URL}"
+            fi
           else
-            echo "benchmark: downloading correctness_golden.json"
-            curl \
-              --fail \
-              --location \
-              --retry 5 \
-              --retry-all-errors \
-              --retry-delay 2 \
-              --output correctness_golden.json \
-              "${MLXFAST_CORRECTNESS_GOLDEN_URL}"
+            echo "benchmark: using committed temporary correctness golden fixture"
+            cp fixtures/correctness_golden_512_2048.json correctness_golden.json
           fi
           test -s correctness_golden.json
 

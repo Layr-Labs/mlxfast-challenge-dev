@@ -52,9 +52,10 @@ Blacksmith runner. Set `reference_base_url` to an HTTP prefix containing the
 reference checkpoint files, such as an R2 public bucket or Worker route. The
 workflow requires a precomputed `correctness_golden.json` through the
 `correctness_golden_url` input or `MLXFAST_CORRECTNESS_GOLDEN_URL` repository
-secret; it fails before model setup if neither is configured. Generating
-goldens inside the benchmark workflow is intentionally disabled; generate and
-store the golden file offline. Private endpoints can pass headers through
+secret. If neither is configured, the workflow uses the committed temporary
+`fixtures/correctness_golden_512_2048.json` fixture. Generating goldens inside
+the benchmark workflow is intentionally disabled; generate and store final
+goldens offline. Private endpoints can pass headers through
 `MLXFAST_REFERENCE_AUTH_HEADER` and `MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER`
 repository secrets.
 
@@ -178,10 +179,11 @@ Organizer golden files can be generated from a private prompt manifest:
   --output correctness_golden.json
 ```
 
-This repo currently includes a temporary `private_prompts.json` manifest for
-manual benchmark bring-up. Generate final hidden goldens outside the public
-repository and provide the resulting file to benchmark CI with
-`correctness_golden_url` or `MLXFAST_CORRECTNESS_GOLDEN_URL`.
+This repo currently includes a temporary `private_prompts.json` manifest and
+matching `fixtures/correctness_golden_512_2048.json` for manual benchmark
+bring-up. Generate final hidden goldens outside the public repository and
+provide the resulting file to benchmark CI with `correctness_golden_url` or
+`MLXFAST_CORRECTNESS_GOLDEN_URL`.
 
 The manifest contains correctness prompts plus a dedicated benchmark prompt
 (arrays shown as placeholders):

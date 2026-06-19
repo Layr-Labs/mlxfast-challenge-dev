@@ -223,6 +223,19 @@ func committedTemporaryPromptManifestMatchesContract() throws {
 }
 
 @Test
+func committedTemporaryGoldenFixtureMatchesContract() throws {
+    let fixture = try loadGoldenFixture(from: "fixtures/correctness_golden_512_2048.json")
+
+    #expect(fixture.cases.count == 1)
+    #expect(fixture.cases[0].promptTokens.count == MLXFastConstants.correctnessPromptTokens)
+    #expect(fixture.cases[0].expectedTokens.count == MLXFastConstants.correctnessSteps)
+    #expect(fixture.benchmark?.prefillPromptTokens.count == MLXFastConstants.benchmarkPrefillPromptTokens)
+    #expect(fixture.benchmark?.decodeSeedTokens.count == MLXFastConstants.benchmarkDecodeSeedTokens)
+    #expect(fixture.benchmark?.expectedDecodeTokens.count == MLXFastConstants.benchmarkDecodeSteps)
+    #expect(fixture.sha256 == "17876fac4ec846c53f2e192b83976f2212f2c39eb3e7f288f03e011a41802edf")
+}
+
+@Test
 func benchmarkOutputValidatorReportsTokenMismatches() {
     let oracle = BenchmarkGolden(
         prefillPromptTokens: Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens),

@@ -69,9 +69,9 @@ correctness_golden.json
 
 Use `MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json` when the
 file is provisioned outside the repository root.
-For bring-up only, this repo currently includes `private_prompts.json`; use it
-locally to generate a temporary golden file, not as the final hidden prompt set
-or inside the benchmark CI workflow.
+For bring-up only, this repo currently includes `private_prompts.json` and a
+matching `fixtures/correctness_golden_512_2048.json`; replace them for the final
+hidden prompt set.
 
 ## Editable Surface
 
