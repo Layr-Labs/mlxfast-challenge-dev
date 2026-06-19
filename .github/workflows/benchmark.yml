@@ -66,7 +66,7 @@ jobs:
           set -euo pipefail
           if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
             echo "benchmark: no correctness golden URL configured." >&2
-            echo "benchmark: benchmark CI does not generate correctness_golden.json because a 32k-token golden can run for hours." >&2
+            echo "benchmark: benchmark CI does not generate correctness_golden.json; generate and store the golden offline." >&2
             echo "benchmark: pass workflow input correctness_golden_url or configure MLXFAST_CORRECTNESS_GOLDEN_URL." >&2
             exit 1
           fi

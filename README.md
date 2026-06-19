@@ -53,8 +53,8 @@ reference checkpoint files, such as an R2 public bucket or Worker route. The
 workflow requires a precomputed `correctness_golden.json` through the
 `correctness_golden_url` input or `MLXFAST_CORRECTNESS_GOLDEN_URL` repository
 secret; it fails before model setup if neither is configured. Generating
-goldens inside the benchmark workflow is intentionally disabled because a full
-32k-token oracle can run for hours. Private endpoints can pass headers through
+goldens inside the benchmark workflow is intentionally disabled; generate and
+store the golden file offline. Private endpoints can pass headers through
 `MLXFAST_REFERENCE_AUTH_HEADER` and `MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER`
 repository secrets.
 
@@ -189,9 +189,9 @@ The manifest contains correctness prompts plus a dedicated benchmark prompt
 ```text
 {
   "version": 1,
-  "max_output_tokens": 32768,
+  "max_output_tokens": 2048,
   "cases": [
-    {"name": "hidden-0", "prompt_tokens": [exactly 1024 token IDs]}
+    {"name": "hidden-0", "prompt_tokens": [exactly 512 token IDs]}
   ],
   "benchmark": {
     "name": "timed-hidden",
@@ -200,9 +200,9 @@ The manifest contains correctness prompts plus a dedicated benchmark prompt
 }
 ```
 
-Each correctness prompt must contain exactly 1024 token IDs. The benchmark prompt
+Each correctness prompt must contain exactly 512 token IDs. The benchmark prompt
 must contain at least 512 token IDs. The generated golden file stores exact
-expected tokens for each 1024-token correctness prompt and its 32,768-token greedy
+expected tokens for each 512-token correctness prompt and its 2,048-token greedy
 continuation, the 512-token prefill check, the 32-token decode seed, and the
 timed 512-token decode window.
 
