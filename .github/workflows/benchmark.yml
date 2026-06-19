@@ -16,7 +16,7 @@ on:
       reference_download_jobs:
         description: "Parallel shard downloads for setup.sh."
         required: false
-        default: "4"
+        default: "8"
         type: string
       reference_min_free_gib:
         description: "Minimum free GiB required before reference checkpoint download."
