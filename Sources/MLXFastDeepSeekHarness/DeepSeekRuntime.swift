@@ -15,6 +15,67 @@ public struct CorrectnessOptions: Equatable {
     }
 }
 
+public struct CorrectnessTraceOptions: Equatable {
+    public let weightsPath: String
+    public let goldenPath: String
+    public let caseName: String?
+    public let step: Int
+    public let topK: Int
+
+    public init(
+        weightsPath: String,
+        goldenPath: String,
+        caseName: String? = nil,
+        step: Int,
+        topK: Int = 8
+    ) {
+        self.weightsPath = weightsPath
+        self.goldenPath = goldenPath
+        self.caseName = caseName
+        self.step = step
+        self.topK = topK
+    }
+}
+
+public struct CorrectnessTraceLogit: Codable, Equatable {
+    public let token: Int
+    public let logit: Double
+}
+
+public struct CorrectnessTraceReport: Codable, Equatable {
+    public let caseName: String
+    public let step: Int
+    public let promptTokenCount: Int
+    public let expectedToken: Int
+    public let actualToken: Int
+    public let matchedPrefixSteps: Int
+    public let generatedPrefix: [Int]
+    public let actualTokenLogit: Double
+    public let expectedTokenLogit: Double
+    public let actualExpectedLogitDelta: Double
+    public let expectedTokenRank: Int
+    public let topLogitMargin: Double?
+    public let topLogits: [CorrectnessTraceLogit]
+    public let goldenHash: String
+
+    enum CodingKeys: String, CodingKey {
+        case caseName = "case_name"
+        case step
+        case promptTokenCount = "prompt_token_count"
+        case expectedToken = "expected_token"
+        case actualToken = "actual_token"
+        case matchedPrefixSteps = "matched_prefix_steps"
+        case generatedPrefix = "generated_prefix"
+        case actualTokenLogit = "actual_token_logit"
+        case expectedTokenLogit = "expected_token_logit"
+        case actualExpectedLogitDelta = "actual_expected_logit_delta"
+        case expectedTokenRank = "expected_token_rank"
+        case topLogitMargin = "top_logit_margin"
+        case topLogits = "top_logits"
+        case goldenHash = "golden_hash"
+    }
+}
+
 public struct CorrectnessReport: Codable, Equatable {
     public let passed: Bool
     public let checkedSteps: Int
@@ -233,6 +294,36 @@ public enum DeepSeekRuntime {
                 error: "\(error)"
             )
         }
+    }
+
+    public static func traceCorrectness(_ options: CorrectnessTraceOptions) throws -> CorrectnessTraceReport {
+        let golden = try loadGoldenFixture(from: options.goldenPath)
+        let selectedCase: GoldenCase
+        if let caseName = options.caseName, !caseName.isEmpty {
+            guard let match = golden.cases.first(where: { $0.name == caseName }) else {
+                throw MLXFastError.invalidInput("correctness golden does not contain case \(caseName)")
+            }
+            selectedCase = match
+        } else {
+            guard let first = golden.cases.first else {
+                throw MLXFastError.invalidInput("correctness golden contains no cases")
+            }
+            selectedCase = first
+        }
+
+        let config = try DeepSeekConfig.load(from: options.weightsPath)
+        let loader = try DeepSeekWeightLoader(
+            weightsPath: options.weightsPath,
+            expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: true)
+        )
+        let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
+        return try traceGreedyCached(
+            testCase: selectedCase,
+            step: options.step,
+            topK: options.topK,
+            weightCache: weightCache,
+            goldenHash: golden.sha256
+        )
     }
 
     public static func benchmark(_ options: BenchmarkOptions) -> ScorePayload {
@@ -939,6 +1030,129 @@ public enum DeepSeekRuntime {
             expected: testCase.expectedTokens,
             actual: generated,
             steps: steps
+        )
+    }
+
+    private static func traceGreedyCached(
+        testCase: GoldenCase,
+        step: Int,
+        topK: Int,
+        weightCache: DeepSeekRuntimeWeightCache,
+        goldenHash: String
+    ) throws -> CorrectnessTraceReport {
+        guard !testCase.promptTokens.isEmpty else {
+            throw MLXFastError.invalidInput("greedy correctness prompt must not be empty")
+        }
+        guard step >= 0, step < testCase.expectedTokens.count else {
+            throw MLXFastError.invalidInput(
+                "trace step \(step) is outside expected token range 0..<\(testCase.expectedTokens.count)"
+            )
+        }
+        guard topK > 0 else {
+            throw MLXFastError.invalidInput("trace topK must be positive")
+        }
+
+        let cache = DeepSeekModelCache(config: weightCache.config)
+        var logits = try DeepSeekModel.logits(
+            inputIDs: inputIDsArray(testCase.promptTokens),
+            weightCache: weightCache,
+            cache: cache,
+            positionOffset: 0
+        )
+        var token = try DeepSeekCorrectness.greedyToken(from: logits)
+        var generated: [Int] = []
+        generated.reserveCapacity(step + 1)
+
+        for currentStep in 0...step {
+            generated.append(token)
+            if currentStep == step {
+                return try traceReport(
+                    logits: logits,
+                    testCase: testCase,
+                    step: step,
+                    topK: topK,
+                    generated: generated,
+                    goldenHash: goldenHash
+                )
+            }
+
+            logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray([token]),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: testCase.promptTokens.count + currentStep
+            )
+            token = try DeepSeekCorrectness.greedyToken(from: logits)
+        }
+
+        throw MLXFastError.invalidInput("trace failed to reach step \(step)")
+    }
+
+    private static func traceReport(
+        logits: MLXArray,
+        testCase: GoldenCase,
+        step: Int,
+        topK: Int,
+        generated: [Int],
+        goldenHash: String
+    ) throws -> CorrectnessTraceReport {
+        guard let vocabSize = logits.shape.last, vocabSize > 0 else {
+            throw MLXFastError.invalidInput("trace logits must have a non-empty vocab dimension")
+        }
+        let rows = logits.reshaped([-1, vocabSize])
+        let last = rows[-1]
+        eval(last)
+        let values = last.asArray(Float.self).map(Double.init)
+        guard values.count == vocabSize else {
+            throw MLXFastError.invalidInput(
+                "trace logits materialized \(values.count) values, expected \(vocabSize)"
+            )
+        }
+
+        let expectedToken = testCase.expectedTokens[step]
+        let actualToken = generated[step]
+        guard expectedToken >= 0, expectedToken < values.count else {
+            throw MLXFastError.invalidInput("expected token \(expectedToken) is outside vocab size \(values.count)")
+        }
+        guard actualToken >= 0, actualToken < values.count else {
+            throw MLXFastError.invalidInput("actual token \(actualToken) is outside vocab size \(values.count)")
+        }
+
+        let sortedIndices = values.indices.sorted {
+            let lhs = values[$0]
+            let rhs = values[$1]
+            return lhs == rhs ? $0 < $1 : lhs > rhs
+        }
+        let requestedTopK = min(topK, sortedIndices.count)
+        let topLogits = sortedIndices.prefix(requestedTopK).map {
+            CorrectnessTraceLogit(token: $0, logit: values[$0])
+        }
+        let expectedRank = (sortedIndices.firstIndex(of: expectedToken) ?? sortedIndices.count - 1) + 1
+        let topMargin: Double?
+        if sortedIndices.count >= 2 {
+            topMargin = values[sortedIndices[0]] - values[sortedIndices[1]]
+        } else {
+            topMargin = nil
+        }
+        let matchedPrefixSteps = zip(generated, testCase.expectedTokens)
+            .prefix { pair in pair.0 == pair.1 }
+            .count
+
+        return CorrectnessTraceReport(
+            caseName: testCase.name,
+            step: step,
+            promptTokenCount: testCase.promptTokens.count,
+            expectedToken: expectedToken,
+            actualToken: actualToken,
+            matchedPrefixSteps: matchedPrefixSteps,
+            generatedPrefix: generated,
+            actualTokenLogit: values[actualToken],
+            expectedTokenLogit: values[expectedToken],
+            actualExpectedLogitDelta: values[actualToken] - values[expectedToken],
+            expectedTokenRank: expectedRank,
+            topLogitMargin: topMargin,
+            topLogits: topLogits,
+            goldenHash: goldenHash
         )
     }
 

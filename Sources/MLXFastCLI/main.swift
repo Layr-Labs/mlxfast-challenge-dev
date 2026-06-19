@@ -29,6 +29,9 @@ private enum MLXFastCLI {
                 return 0
             case "correctness":
                 return try runCorrectness(options)
+            case "correctness-trace":
+                try runCorrectnessTrace(options)
+                return 0
             case "preflight":
                 try runPreflight(options)
                 return 0
@@ -167,6 +170,48 @@ private enum MLXFastCLI {
         FileHandle.standardOutput.write(data)
         print("")
         return report.passed ? 0 : 1
+    }
+
+    private static func runCorrectnessTrace(_ options: ParsedOptions) throws {
+        try options.validate(valueOptions: ["--weights", "--golden", "--case", "--step", "--top-k"])
+        let weightsPath = options.value(
+            for: "--weights",
+            default: environmentValue(
+                "MLXFAST_WEIGHTS_PATH",
+                fallback: MLXFastConstants.defaultWeightsPath
+            )
+        )
+        let goldenPath = options.value(
+            for: "--golden",
+            default: environmentValue(
+                "MLXFAST_CORRECTNESS_GOLDEN_PATH",
+                fallback: MLXFastConstants.defaultGoldenPath
+            )
+        )
+        let stepRaw = options.value(for: "--step", default: "")
+        guard let step = Int(stepRaw), step >= 0 else {
+            throw MLXFastError.invalidInput("correctness-trace requires --step N with N >= 0")
+        }
+        let topKRaw = options.value(for: "--top-k", default: "8")
+        guard let topK = Int(topKRaw), topK > 0 else {
+            throw MLXFastError.invalidInput("--top-k must be a positive integer")
+        }
+        let caseName = options.value(for: "--case", default: "")
+        let report = try DeepSeekRuntime.traceCorrectness(
+            CorrectnessTraceOptions(
+                weightsPath: weightsPath,
+                goldenPath: goldenPath,
+                caseName: caseName.isEmpty ? nil : caseName,
+                step: step,
+                topK: topK
+            )
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(report)
+        FileHandle.standardOutput.write(data)
+        print("")
     }
 
     private static func runPreflight(_ options: ParsedOptions) throws {
@@ -553,6 +598,7 @@ private enum MLXFastCLI {
               mlxfast-swift transform [--reference PATH] [--output PATH]
               mlxfast-swift verify-transform [--reference PATH] [--weights PATH] [--tmp-parent PATH] [--max-bytes N]
               mlxfast-swift correctness [--weights PATH] [--golden PATH]
+              mlxfast-swift correctness-trace [--weights PATH] [--golden PATH] [--case NAME] --step N [--top-k N]
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--weights PATH] [--golden PATH] [--score-path PATH]
               mlxfast-swift make-golden [--weights PATH] [--output PATH] (--prompt-file PATH | --prompt-tokens TOKENS [--name NAME])

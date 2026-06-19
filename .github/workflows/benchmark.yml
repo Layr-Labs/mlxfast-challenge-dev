@@ -28,6 +28,16 @@ on:
         required: false
         default: false
         type: boolean
+      trace_correctness_step:
+        description: "Optional maintainer diagnostic: trace logits at a 0-based correctness decode step. Disabled on submission branches."
+        required: false
+        default: ""
+        type: string
+      trace_correctness_top_k:
+        description: "Number of logits to include when trace_correctness_step is set."
+        required: false
+        default: "16"
+        type: string
 
 concurrency:
   group: benchmark-${{ github.ref }}
@@ -115,6 +125,17 @@ jobs:
           MLXFAST_SKIP_TRANSFORM: "1"
         run: ./benchmark.sh
 
+      - name: Trace correctness mismatch
+        if: always() && inputs.trace_correctness_step != '' && !startsWith(github.ref_name, 'submissions/')
+        run: |
+          set -euo pipefail
+          .build/release/mlxfast-swift correctness-trace \
+            --weights weights \
+            --golden correctness_golden.json \
+            --step "${{ inputs.trace_correctness_step }}" \
+            --top-k "${{ inputs.trace_correctness_top_k }}" \
+            > correctness-trace.json
+
       - name: Upload score artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -126,3 +147,11 @@ jobs:
             benchmark-integrity.json
             results.tsv
           if-no-files-found: ignore
+
+      - name: Upload correctness trace artifact
+        if: always() && inputs.trace_correctness_step != '' && !startsWith(github.ref_name, 'submissions/')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: correctness-trace-${{ github.run_id }}
+          path: correctness-trace.json
+          if-no-files-found: error
