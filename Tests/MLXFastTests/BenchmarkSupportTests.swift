@@ -188,6 +188,49 @@ func benchmarkPreflightAcceptsRequiredArtifacts() throws {
     #expect(report.weightsPath == fixture.weights.path)
     #expect(report.goldenPath == fixture.golden.path)
     #expect(report.mactopPath == fixture.mactop.path)
+    #expect(report.weightsByteCount > 0)
+    #expect(report.maxWeightsByteCount == MLXFastConstants.defaultMaxTransformedWeightsBytes)
+}
+
+@Test
+func benchmarkPreflightRejectsWeightsAboveDefaultByteLimit() throws {
+    let fixture = try makePreflightFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    try writeSparseFile(
+        fixture.weights.appendingPathComponent("oversized.bin"),
+        byteCount: MLXFastConstants.defaultMaxTransformedWeightsBytes + 1
+    )
+
+    #expect(throws: MLXFastError.self) {
+        _ = try BenchmarkPreflight.check(
+            weightsPath: fixture.weights.path,
+            goldenPath: fixture.golden.path,
+            environment: ["MLXFAST_MACTOP_BIN": fixture.mactop.path]
+        )
+    }
+}
+
+@Test
+func benchmarkPreflightHonorsConfiguredWeightsByteLimit() throws {
+    let fixture = try makePreflightFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    try writeSparseFile(
+        fixture.weights.appendingPathComponent("large-but-allowed.bin"),
+        byteCount: MLXFastConstants.defaultMaxTransformedWeightsBytes + 1
+    )
+    let override = MLXFastConstants.defaultMaxTransformedWeightsBytes * 2
+
+    let report = try BenchmarkPreflight.check(
+        weightsPath: fixture.weights.path,
+        goldenPath: fixture.golden.path,
+        environment: [
+            "MLXFAST_MACTOP_BIN": fixture.mactop.path,
+            "MLXFAST_MAX_WEIGHTS_BYTES": "\(override)",
+        ]
+    )
+
+    #expect(report.weightsByteCount > MLXFastConstants.defaultMaxTransformedWeightsBytes)
+    #expect(report.maxWeightsByteCount == override)
 }
 
 @Test
@@ -639,6 +682,15 @@ private func writeExecutableScript(_ path: URL, contents: String) throws -> URL 
         ofItemAtPath: path.path
     )
     return path
+}
+
+private func writeSparseFile(_ path: URL, byteCount: Int) throws {
+    _ = FileManager.default.createFile(atPath: path.path, contents: nil)
+    let handle = try FileHandle(forWritingTo: path)
+    defer {
+        try? handle.close()
+    }
+    try handle.truncate(atOffset: UInt64(byteCount))
 }
 
 private func temporaryDirectory() throws -> URL {

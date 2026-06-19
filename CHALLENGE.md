@@ -105,8 +105,10 @@ stable backend idempotency key.
 `mlxfast-swift verify-transform` is an organizer/debug check for deterministic
 transform output. It re-runs the submitted transform and compares the generated
 `weights/` tree against that fresh run. It is not a baseline-layout requirement.
-The default transformed-output cap is 50 GiB; override it with
-`MLXFAST_MAX_WEIGHTS_BYTES` or `--max-bytes` when running the verifier.
+The normal preflight/benchmark path also rejects generated `weights/` above the
+default 50 GiB transformed-output cap before correctness or timing runs.
+Override it with `MLXFAST_MAX_WEIGHTS_BYTES`; `verify-transform` additionally
+accepts `--max-bytes`.
 
 There is no Python harness path.
 

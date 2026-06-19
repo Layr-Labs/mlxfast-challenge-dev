@@ -147,12 +147,15 @@ correctness_golden.json      hidden correctness cases and benchmark token oracle
 score.json                   written after each benchmark run
 ```
 
-For stricter organizer-side provenance, set `MLXFAST_VERIFY_TRANSFORM=1` when
-running `benchmark.sh`. That re-runs the submitted Swift transform into a clean
-temporary directory and fails unless `weights/` is byte-equal to that fresh run.
-This checks determinism and stale files; it does not require the baseline
-`weights/` layout. The default transformed-output cap is 50 GiB and can be
-changed with `MLXFAST_MAX_WEIGHTS_BYTES` or
+The standard preflight/benchmark path enforces a default 50 GiB cap on the
+generated `weights/` tree before correctness or timing runs. Change it with
+`MLXFAST_MAX_WEIGHTS_BYTES`; use `0`, `none`, or `unlimited` only for organizer
+debugging. For stricter organizer-side provenance, set
+`MLXFAST_VERIFY_TRANSFORM=1` when running `benchmark.sh`. That re-runs the
+submitted Swift transform into a clean temporary directory and fails unless
+`weights/` is byte-equal to that fresh run. This checks determinism and stale
+files; it does not require the baseline `weights/` layout. `verify-transform`
+uses the same default cap and can also be changed with
 `mlxfast-swift verify-transform --max-bytes N`.
 
 Organizer golden files can be generated from a private prompt manifest:
