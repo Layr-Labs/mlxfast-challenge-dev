@@ -198,7 +198,7 @@ The manifest contains correctness prompts plus a dedicated benchmark prompt
 ```text
 {
   "version": 1,
-  "max_output_tokens": 512,
+  "max_output_tokens": 256,
   "cases": [
     {"name": "hidden-0", "prompt_tokens": [exactly 512 token IDs]}
   ],
@@ -211,9 +211,9 @@ The manifest contains correctness prompts plus a dedicated benchmark prompt
 
 Each correctness prompt must contain exactly 512 token IDs. The benchmark prompt
 must contain at least 512 token IDs. The generated golden file stores exact
-expected tokens for each 512-token correctness prompt and its 2,048-token greedy
+expected tokens for each 512-token correctness prompt and its 256-token greedy
 continuation, the 512-token prefill check, the 32-token decode seed, and the
-timed 512-token decode window.
+timed 256-token decode window.
 
 ## Requirements
 

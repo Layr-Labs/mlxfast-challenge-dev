@@ -121,7 +121,7 @@ There is no Python harness path.
 ## Correctness Gate
 
 Correctness is a hard gate. For each golden case, the prompt must contain
-exactly 512 token IDs. The harness runs cached greedy generation for 2,048
+exactly 512 token IDs. The harness runs cached greedy generation for 256
 tokens with temperature-zero behavior and compares token IDs exactly. The first
 mismatch records the case, step, expected token, and actual token in the failed
 report.

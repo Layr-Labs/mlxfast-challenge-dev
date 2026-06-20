@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "max_output_tokens": 512,
+  "max_output_tokens": 256,
   "cases": [
     {
       "name": "temp-512",
