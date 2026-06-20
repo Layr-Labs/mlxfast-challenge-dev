@@ -584,10 +584,6 @@ EOF
 
 ensure_swift_toolchain
 
-ensure_cmake
-
-ensure_metal_toolchain
-
 ensure_mactop
 
 echo "setup.sh: building Swift harness"
@@ -598,6 +594,8 @@ swift build -c release
 if [[ "${MLXFAST_SKIP_MLX_METALLIB:-0}" == "1" ]]; then
   echo "setup.sh: skipping mlx.metallib build"
 else
+  ensure_cmake
+  ensure_metal_toolchain
   echo "setup.sh: building mlx.metallib for MLX Swift runtime"
   tools/build-mlx-metallib.sh
 fi
