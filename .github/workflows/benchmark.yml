@@ -258,7 +258,7 @@ jobs:
           key: ${{ steps.restore-correctness-golden.outputs.cache-primary-key }}
 
       - name: Correctness
-        if: ${{ !inputs.preserve_golden_only && !inputs.generate_golden_only }}
+        if: ${{ !inputs.preserve_golden_only && !inputs.generate_golden_only && !inputs.run_benchmark }}
         run: |
           set -euo pipefail
           .build/release/mlxfast-swift correctness \
