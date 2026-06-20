@@ -381,8 +381,8 @@ private enum MLXFastCLI {
         if !options.hasFlag("--no-verify") {
             do {
                 let client = try YukonClient(apiBaseURL: apiBaseURL, apiKey: apiKey)
-                let response = try client.me()
-                print("account: \(response.account.email)")
+                _ = try client.me()
+                print("account: verified")
             } catch let error as YukonAPIError where error.statusCode == 401 {
                 throw MLXFastError.invalidInput(
                     "API key was not accepted by \(apiBaseURL); pass --api if the key belongs to another Yukon API"
