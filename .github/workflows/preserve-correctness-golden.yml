@@ -17,6 +17,7 @@ jobs:
     env:
       MLXFAST_CORRECTNESS_GOLDEN_CACHE_VERSION: v2
       MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH: .mlxfast-cache/correctness-golden/correctness_golden.json
+      MLXFAST_PRIVATE_PROMPTS_CACHE_VERSION: ${{ vars.MLXFAST_PRIVATE_PROMPTS_CACHE_VERSION || 'r2-v1' }}
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: c5d520ec87cc4a105ff13a39ade581801049a90944d42f456d15a33ef080eb1e
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "20425"
     steps:
@@ -29,7 +30,7 @@ jobs:
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: .mlxfast-cache/correctness-golden
-          key: correctness-golden-${{ runner.os }}-${{ runner.arch }}-blacksmith-macos-26-${{ env.MLXFAST_CORRECTNESS_GOLDEN_CACHE_VERSION }}-${{ hashFiles('private_prompts.json', 'Package.resolved', 'Sources/MLXFastCore/Constants.swift', 'Sources/MLXFastCore/Golden.swift', 'Sources/MLXFastDeepSeekHarness/**') }}
+          key: correctness-golden-${{ runner.os }}-${{ runner.arch }}-blacksmith-macos-26-${{ env.MLXFAST_CORRECTNESS_GOLDEN_CACHE_VERSION }}-${{ env.MLXFAST_PRIVATE_PROMPTS_CACHE_VERSION }}-${{ hashFiles('Package.resolved', 'Sources/MLXFastCore/Constants.swift', 'Sources/MLXFastCore/Golden.swift', 'Sources/MLXFastDeepSeekHarness/**') }}
 
       - name: Materialize correctness golden
         run: |

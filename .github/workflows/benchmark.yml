@@ -79,6 +79,9 @@ jobs:
       MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH: .mlxfast-cache/correctness-golden/correctness_golden.json
       MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH: fixtures/correctness_golden_512_256_benchmark256.json
       MLXFAST_CORRECTNESS_GOLDEN_URL_PRESENT: ${{ (inputs.correctness_golden_url != '' || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL != '') && '1' || '0' }}
+      MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
+      MLXFAST_PRIVATE_PROMPTS_R2_PATH: correctness_prompts/private_prompts.json
+      MLXFAST_PRIVATE_PROMPTS_CACHE_VERSION: ${{ vars.MLXFAST_PRIVATE_PROMPTS_CACHE_VERSION || 'r2-v1' }}
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: c5d520ec87cc4a105ff13a39ade581801049a90944d42f456d15a33ef080eb1e
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "20425"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "256"
@@ -138,6 +141,8 @@ jobs:
           set -euo pipefail
           if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
             echo "benchmark: using configured correctness golden URL"
+          elif [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
+            echo "benchmark: using R2 private prompt manifest when golden generation is required"
           elif [[ -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
             echo "benchmark: using committed correctness golden fixture"
           else
@@ -150,14 +155,14 @@ jobs:
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: .mlxfast-cache/correctness-golden
-          key: correctness-golden-${{ runner.os }}-${{ runner.arch }}-blacksmith-macos-26-${{ env.MLXFAST_CORRECTNESS_GOLDEN_CACHE_VERSION }}-${{ hashFiles('private_prompts.json', 'Package.resolved', 'Sources/MLXFastCore/Constants.swift', 'Sources/MLXFastCore/Golden.swift', 'Sources/MLXFastDeepSeekHarness/**') }}
+          key: correctness-golden-${{ runner.os }}-${{ runner.arch }}-blacksmith-macos-26-${{ env.MLXFAST_CORRECTNESS_GOLDEN_CACHE_VERSION }}-${{ env.MLXFAST_PRIVATE_PROMPTS_CACHE_VERSION }}-${{ hashFiles('Package.resolved', 'Sources/MLXFastCore/Constants.swift', 'Sources/MLXFastCore/Golden.swift', 'Sources/MLXFastDeepSeekHarness/**') }}
 
       - name: Use restored correctness golden for generate-only
         id: prepare-restored-correctness-golden
         if: ${{ inputs.generate_golden_only && env.MLXFAST_CORRECTNESS_GOLDEN_URL_PRESENT == '0' }}
         run: |
           set -euo pipefail
-          if [[ -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
+          if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" && -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
             echo "benchmark: generate-only using committed correctness_golden.json fixture"
             cp "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" correctness_golden.json
             .github/scripts/verify-correctness-golden.sh
@@ -214,6 +219,10 @@ jobs:
           MLXFAST_CORRECTNESS_GOLDEN_URL: ${{ inputs.correctness_golden_url || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL }}
           MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER: ${{ secrets.MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER }}
           MLXFAST_SUBMISSION_REF: ${{ inputs.submission_ref }}
+          MLXFAST_PRIVATE_PROMPTS_PATH: ${{ runner.temp }}/mlxfast-private/private_prompts.json
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
           if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
@@ -239,13 +248,10 @@ jobs:
                 --output correctness_golden.json \
                 "${MLXFAST_CORRECTNESS_GOLDEN_URL}"
             fi
-          elif [[ -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
-            echo "benchmark: using committed correctness_golden.json fixture"
-            cp "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" correctness_golden.json
           elif [[ -s "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" ]]; then
             echo "benchmark: using cached correctness_golden.json"
             cp "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" correctness_golden.json
-          else
+          elif [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
             if [[ -n "${MLXFAST_SUBMISSION_REF}" ]]; then
               echo "benchmark: correctness golden missing during submitted run; refusing to generate with submitted code" >&2
               exit 1
@@ -258,13 +264,23 @@ jobs:
                 ;;
             esac
             echo "benchmark: correctness golden cache miss; generating on this Blacksmith runner"
+            echo "benchmark: downloading private prompt manifest from R2"
+            .github/scripts/download-r2-object.sh \
+              "${MLXFAST_PRIVATE_PROMPTS_R2_PATH}" \
+              "${MLXFAST_PRIVATE_PROMPTS_PATH}"
             mkdir -p "$(dirname "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}")"
             .build/release/mlxfast-swift make-golden \
               --weights weights \
-              --prompt-file private_prompts.json \
+              --prompt-file "${MLXFAST_PRIVATE_PROMPTS_PATH}" \
               --output "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}"
             cp "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" correctness_golden.json
             echo "generated=true" >> "${GITHUB_OUTPUT}"
+          elif [[ -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
+            echo "benchmark: using committed correctness_golden.json fixture"
+            cp "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" correctness_golden.json
+          else
+            echo "benchmark: correctness golden missing and R2 private prompt credentials are not configured" >&2
+            exit 1
           fi
           .github/scripts/verify-correctness-golden.sh
 

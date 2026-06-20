@@ -15,6 +15,18 @@ Configure the `benchmark-private-prompts` Environment with:
 - Deployment branches restricted to `main`.
 - Required reviewers for private benchmark runs.
 - No fork or submission branch access to the environment.
+- R2 prompt manifest credentials:
+  - `R2_ACCESS_KEY_ID`
+  - `R2_BUCKET_ENDPOINT`
+  - `R2_SECRET_ACCESS_KEY`
+
+The benchmark workflow downloads the private prompt manifest from
+`correctness_prompts/private_prompts.json` only when a trusted run has to
+generate `correctness_golden.json`. It writes the manifest under
+`$RUNNER_TEMP`, never the repository workspace, and does not upload or cache the
+prompt file. Bump the non-secret repository/environment variable
+`MLXFAST_PRIVATE_PROMPTS_CACHE_VERSION` when the private prompt manifest changes
+and the golden cache should be invalidated.
 
 The benchmark workflow also verifies at runtime that it is executing from:
 

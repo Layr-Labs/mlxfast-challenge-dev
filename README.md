@@ -57,15 +57,19 @@ workflow requires a precomputed `correctness_golden.json` through the
 `correctness_golden_url` input or `MLXFAST_CORRECTNESS_GOLDEN_URL` repository
 secret. If neither is configured, the workflow restores a cached
 Blacksmith-generated `correctness_golden.json`; on a trusted branch cache miss it
-generates the file once with `make-golden`, saves it to the Actions cache, and
-reuses it on later runs. Submission branches may restore this cache but refuse to
-generate goldens from submitted code. The checked-in fixture is only a public
-bring-up artifact; final hidden goldens should still come from a protected URL or
-secret-managed storage, not the public cache. Bump
+downloads `correctness_prompts/private_prompts.json` from the configured private
+R2 bucket, generates the file once with `make-golden`, saves it to the Actions
+cache, and reuses it on later runs. Submission branches may restore this cache
+but refuse to generate goldens from submitted code. The checked-in fixture is
+only a public bring-up artifact; final hidden goldens should still come from a
+protected URL or secret-managed storage, not the public cache. Bump
 `MLXFAST_CORRECTNESS_GOLDEN_CACHE_VERSION` in `benchmark.yml` when intentionally
-invalidating the cached public golden. Private endpoints can pass headers through
-`MLXFAST_REFERENCE_AUTH_HEADER` and `MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER`
-repository secrets.
+invalidating the cached public golden, and bump
+`MLXFAST_PRIVATE_PROMPTS_CACHE_VERSION` when the private prompt manifest changes.
+Private endpoints can pass headers through `MLXFAST_REFERENCE_AUTH_HEADER` and
+`MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER` repository secrets. Private prompt
+generation uses the `R2_ACCESS_KEY_ID`, `R2_BUCKET_ENDPOINT`, and
+`R2_SECRET_ACCESS_KEY` secrets.
 
 ## Why this challenge exists
 
@@ -190,10 +194,10 @@ Organizer golden files can be generated from a private prompt manifest:
 This repo currently includes a temporary `private_prompts.json` manifest and a
 public fixture for manual benchmark bring-up. Benchmark CI uses a
 Blacksmith-generated cached `correctness_golden.json` when no golden URL is
-configured, so the first trusted run after a cache key change is expected to run
-`make-golden` once. Generate final hidden goldens outside the public repository
-and provide the resulting file to benchmark CI with `correctness_golden_url` or
-`MLXFAST_CORRECTNESS_GOLDEN_URL`.
+configured, downloading the private prompt manifest from R2 only for trusted
+golden generation after a cache miss. Generate final hidden goldens outside the
+public repository and provide the resulting file to benchmark CI with
+`correctness_golden_url` or `MLXFAST_CORRECTNESS_GOLDEN_URL`.
 
 The manifest contains correctness prompts plus a dedicated benchmark prompt
 (arrays shown as placeholders):
