@@ -1,0 +1,183 @@
+import Foundation
+import MLX
+import MLXFastCore
+
+public struct CorrectnessTokenComparison: Equatable {
+    public let passed: Bool
+    public let checkedSteps: Int
+    public let firstFailingStep: Int?
+    public let expectedToken: Int?
+    public let actualToken: Int?
+
+    public init(
+        passed: Bool,
+        checkedSteps: Int,
+        firstFailingStep: Int?,
+        expectedToken: Int?,
+        actualToken: Int?
+    ) {
+        self.passed = passed
+        self.checkedSteps = checkedSteps
+        self.firstFailingStep = firstFailingStep
+        self.expectedToken = expectedToken
+        self.actualToken = actualToken
+    }
+}
+
+public enum DeepSeekCorrectness {
+    public static func generateGreedyNoCache(
+        promptTokens: [Int],
+        steps: Int = MLXFastConstants.correctnessSteps,
+        nextToken: (_ contextTokens: [Int]) throws -> Int
+    ) throws -> [Int] {
+        guard !promptTokens.isEmpty else {
+            throw MLXFastError.invalidInput("greedy correctness prompt must not be empty")
+        }
+        guard steps >= 0 else {
+            throw MLXFastError.invalidInput("greedy correctness steps must be non-negative")
+        }
+
+        var context = promptTokens
+        var generated: [Int] = []
+        generated.reserveCapacity(steps)
+        for _ in 0..<steps {
+            let token = try nextToken(context)
+            generated.append(token)
+            context.append(token)
+        }
+        return generated
+    }
+
+    public static func greedyToken(from logits: MLXArray) throws -> Int {
+        guard let vocabSize = logits.shape.last, vocabSize > 0 else {
+            throw MLXFastError.invalidInput("greedy logits must have a non-empty vocab dimension")
+        }
+        let rows = logits.reshaped([-1, vocabSize])
+        let last = rows[-1]
+        return Int(last.argMax().item(Int32.self))
+    }
+
+    public static func compareTokens(
+        expected: [Int],
+        actual: [Int],
+        steps: Int = MLXFastConstants.correctnessSteps
+    ) -> CorrectnessTokenComparison {
+        guard steps > 0 else {
+            return CorrectnessTokenComparison(
+                passed: true,
+                checkedSteps: 0,
+                firstFailingStep: nil,
+                expectedToken: nil,
+                actualToken: nil
+            )
+        }
+
+        for step in 0..<steps {
+            let expectedToken = step < expected.count ? expected[step] : nil
+            let actualToken = step < actual.count ? actual[step] : nil
+            guard let expectedToken else {
+                return CorrectnessTokenComparison(
+                    passed: false,
+                    checkedSteps: step + 1,
+                    firstFailingStep: step,
+                    expectedToken: nil,
+                    actualToken: actualToken
+                )
+            }
+            guard let actualToken else {
+                return CorrectnessTokenComparison(
+                    passed: false,
+                    checkedSteps: step + 1,
+                    firstFailingStep: step,
+                    expectedToken: expectedToken,
+                    actualToken: nil
+                )
+            }
+            if actualToken != expectedToken {
+                return CorrectnessTokenComparison(
+                    passed: false,
+                    checkedSteps: step + 1,
+                    firstFailingStep: step,
+                    expectedToken: expectedToken,
+                    actualToken: actualToken
+                )
+            }
+        }
+
+        return CorrectnessTokenComparison(
+            passed: true,
+            checkedSteps: steps,
+            firstFailingStep: nil,
+            expectedToken: nil,
+            actualToken: nil
+        )
+    }
+
+    public static func generateGreedyTokens(
+        steps: Int = MLXFastConstants.correctnessSteps,
+        nextToken: (_ step: Int, _ previousToken: Int?) throws -> Int
+    ) throws -> [Int] {
+        guard steps >= 0 else {
+            throw MLXFastError.invalidInput("greedy correctness steps must be non-negative")
+        }
+
+        var previousToken: Int?
+        var generated: [Int] = []
+        generated.reserveCapacity(steps)
+        for step in 0..<steps {
+            let token = try nextToken(step, previousToken)
+            generated.append(token)
+            previousToken = token
+        }
+        return generated
+    }
+
+    public static func compareGreedyTokens(
+        expected: [Int],
+        steps: Int = MLXFastConstants.correctnessSteps,
+        nextToken: (_ step: Int, _ previousToken: Int?) throws -> Int
+    ) throws -> CorrectnessTokenComparison {
+        guard steps > 0 else {
+            return CorrectnessTokenComparison(
+                passed: true,
+                checkedSteps: 0,
+                firstFailingStep: nil,
+                expectedToken: nil,
+                actualToken: nil
+            )
+        }
+
+        var previousToken: Int?
+        for step in 0..<steps {
+            let actualToken = try nextToken(step, previousToken)
+            let expectedToken = step < expected.count ? expected[step] : nil
+            guard let expectedToken else {
+                return CorrectnessTokenComparison(
+                    passed: false,
+                    checkedSteps: step + 1,
+                    firstFailingStep: step,
+                    expectedToken: nil,
+                    actualToken: actualToken
+                )
+            }
+            if actualToken != expectedToken {
+                return CorrectnessTokenComparison(
+                    passed: false,
+                    checkedSteps: step + 1,
+                    firstFailingStep: step,
+                    expectedToken: expectedToken,
+                    actualToken: actualToken
+                )
+            }
+            previousToken = actualToken
+        }
+
+        return CorrectnessTokenComparison(
+            passed: true,
+            checkedSteps: steps,
+            firstFailingStep: nil,
+            expectedToken: nil,
+            actualToken: nil
+        )
+    }
+}

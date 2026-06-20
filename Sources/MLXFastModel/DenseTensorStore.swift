@@ -1,0 +1,145 @@
+import Foundation
+import MLXFastCore
+
+public struct DenseTensorRecord: Equatable {
+    public let name: String
+    public let shard: String
+    public let dtype: String
+    public let shape: [Int]
+    public let byteOffset: Int
+    public let byteLength: Int
+}
+
+public final class DenseTensorStore {
+    public let weightsPath: String
+    private let recordsByName: [String: DenseTensorRecord]
+
+    public init(weightsPath: String) throws {
+        self.weightsPath = weightsPath
+        self.recordsByName = try DenseTensorStore.loadRecords(weightsPath: weightsPath)
+    }
+
+    public var tensorNames: [String] {
+        recordsByName.keys.sorted()
+    }
+
+    public func record(named name: String) -> DenseTensorRecord? {
+        recordsByName[name]
+    }
+
+    public func tensorBytes(named name: String) throws -> Data {
+        guard let record = recordsByName[name] else {
+            throw MLXFastError.invalidInput("dense tensor not found: \(name)")
+        }
+
+        let shardURL = URL(fileURLWithPath: weightsPath).appendingPathComponent(record.shard)
+        let handle = try FileHandle(forReadingFrom: shardURL)
+        defer {
+            try? handle.close()
+        }
+        try handle.seek(toOffset: UInt64(record.byteOffset))
+        let data = handle.readData(ofLength: record.byteLength)
+        guard data.count == record.byteLength else {
+            throw MLXFastError.invalidInput(
+                "short read for dense tensor \(name): \(data.count)/\(record.byteLength)"
+            )
+        }
+        return data
+    }
+
+    public func materializedTensor(named name: String) throws -> MaterializedTensor {
+        guard let record = recordsByName[name] else {
+            throw MLXFastError.invalidInput("dense tensor not found: \(name)")
+        }
+        return try materializeTensor(
+            name: record.name,
+            dtype: record.dtype,
+            shape: record.shape,
+            bytes: tensorBytes(named: name)
+        )
+    }
+
+    public func validateReadableByteRanges(fileManager: FileManager = .default) throws {
+        let recordsByShard = Dictionary(grouping: recordsByName.values) { $0.shard }
+        for shard in recordsByShard.keys.sorted() {
+            let shardPath = URL(fileURLWithPath: weightsPath).appendingPathComponent(shard).path
+            let attributes = try fileManager.attributesOfItem(atPath: shardPath)
+            let byteCount = try fileSizeByteCount(from: attributes, path: shardPath)
+            for record in recordsByShard[shard, default: []] {
+                let dtype = try TensorDType.parse(record.dtype)
+                let expectedByteLength = try expectedTensorByteCount(
+                    name: record.name,
+                    dtype: dtype,
+                    shape: record.shape
+                )
+                guard record.byteLength == expectedByteLength else {
+                    throw MLXFastError.invalidInput(
+                        "dense tensor \(record.name) byte length \(record.byteLength) does not match dtype \(record.dtype) and shape \(record.shape) expected \(expectedByteLength)"
+                    )
+                }
+                let end = record.byteOffset + record.byteLength
+                guard record.byteOffset >= 0, record.byteLength > 0, end <= byteCount else {
+                    throw MLXFastError.invalidInput(
+                        "dense tensor \(record.name) byte range \(record.byteOffset)..<\(end) exceeds shard size \(byteCount)"
+                    )
+                }
+            }
+        }
+    }
+
+    private static func loadRecords(weightsPath: String) throws -> [String: DenseTensorRecord] {
+        let weightsURL = URL(fileURLWithPath: weightsPath)
+        try requireFile(
+            weightsURL.appendingPathComponent("model.safetensors.index.json").path,
+            description: "dense safetensors index"
+        )
+
+        let weightMap = try loadWeightMap(
+            weightsURL.appendingPathComponent("model.safetensors.index.json")
+        )
+        for shard in Set(weightMap.values).sorted() {
+            try validateSafetensorsShardName(shard, context: "dense safetensors index")
+        }
+        let keysByShard = Dictionary(grouping: weightMap.keys) { key in
+            weightMap[key] ?? ""
+        }
+
+        var records: [String: DenseTensorRecord] = [:]
+        for shard in keysByShard.keys.sorted() {
+            let shardURL = weightsURL.appendingPathComponent(shard)
+            let header = try Safetensors.readHeader(shardURL)
+            for key in keysByShard[shard, default: []] {
+                guard let info = header.tensors[key] else {
+                    throw MLXFastError.invalidInput(
+                        "tensor \(key) is listed in dense index but missing from \(shard)"
+                    )
+                }
+                records[key] = DenseTensorRecord(
+                    name: key,
+                    shard: shard,
+                    dtype: info.dtype,
+                    shape: info.shape,
+                    byteOffset: Int(header.dataBaseOffset) + info.dataStart,
+                    byteLength: info.byteCount
+                )
+            }
+        }
+
+        guard !records.isEmpty else {
+            throw MLXFastError.invalidInput("dense tensor store contains no safetensors tensors")
+        }
+        return records
+    }
+
+    private static func loadWeightMap(_ path: URL) throws -> [String: String] {
+        let data = try Data(contentsOf: path)
+        let object = try JSONSerialization.jsonObject(with: data)
+        guard
+            let root = object as? [String: Any],
+            let weightMap = root["weight_map"] as? [String: String]
+        else {
+            throw MLXFastError.invalidInput("dense safetensors index missing weight_map")
+        }
+        return weightMap
+    }
+}

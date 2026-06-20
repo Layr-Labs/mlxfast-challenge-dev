@@ -1,0 +1,232 @@
+import Foundation
+import CryptoKit
+import MLX
+import MLXFastCore
+@testable import MLXFastHarness
+import Testing
+
+@Test
+func deepSeekCorrectnessComparesExpectedTokenSequences() {
+    let pass = DeepSeekCorrectness.compareTokens(
+        expected: [4, 5, 6],
+        actual: [4, 5, 6],
+        steps: 3
+    )
+    #expect(pass.passed)
+    #expect(pass.checkedSteps == 3)
+    #expect(pass.firstFailingStep == nil)
+
+    let fail = DeepSeekCorrectness.compareTokens(
+        expected: [4, 5, 6],
+        actual: [4, 9, 6],
+        steps: 3
+    )
+    #expect(!fail.passed)
+    #expect(fail.checkedSteps == 2)
+    #expect(fail.firstFailingStep == 1)
+    #expect(fail.expectedToken == 5)
+    #expect(fail.actualToken == 9)
+
+    let short = DeepSeekCorrectness.compareTokens(
+        expected: [4, 5, 6],
+        actual: [4],
+        steps: 3
+    )
+    #expect(!short.passed)
+    #expect(short.checkedSteps == 2)
+    #expect(short.firstFailingStep == 1)
+    #expect(short.expectedToken == 5)
+    #expect(short.actualToken == nil)
+
+    let expectedShort = DeepSeekCorrectness.compareTokens(
+        expected: [4],
+        actual: [4, 5],
+        steps: 2
+    )
+    #expect(!expectedShort.passed)
+    #expect(expectedShort.checkedSteps == 2)
+    #expect(expectedShort.firstFailingStep == 1)
+    #expect(expectedShort.expectedToken == nil)
+    #expect(expectedShort.actualToken == 5)
+
+    let bothShort = DeepSeekCorrectness.compareTokens(
+        expected: [4],
+        actual: [4],
+        steps: 2
+    )
+    #expect(!bothShort.passed)
+    #expect(bothShort.checkedSteps == 2)
+    #expect(bothShort.firstFailingStep == 1)
+    #expect(bothShort.expectedToken == nil)
+    #expect(bothShort.actualToken == nil)
+}
+
+@Test
+func deepSeekCorrectnessGeneratesGreedyTokensWithGrowingContext() throws {
+    var contexts: [[Int]] = []
+    let generated = try DeepSeekCorrectness.generateGreedyNoCache(
+        promptTokens: [10, 11],
+        steps: 3
+    ) { context in
+        contexts.append(context)
+        return context.count
+    }
+
+    #expect(generated == [2, 3, 4])
+    #expect(contexts == [[10, 11], [10, 11, 2], [10, 11, 2, 3]])
+}
+
+@Test
+func deepSeekCorrectnessGeneratesGreedyTokensFromPreviousToken() throws {
+    var calls: [(Int, Int?)] = []
+    let generated = try DeepSeekCorrectness.generateGreedyTokens(steps: 3) { step, previousToken in
+        calls.append((step, previousToken))
+        return (previousToken ?? 10) + step
+    }
+
+    #expect(generated == [10, 11, 13])
+    #expect(calls.map(\.0) == [0, 1, 2])
+    #expect(calls.map(\.1) == [nil, 10, 11])
+}
+
+@Test
+func deepSeekCorrectnessComparesGeneratedGreedyTokens() throws {
+    var calls: [(Int, Int?)] = []
+    let comparison = try DeepSeekCorrectness.compareGreedyTokens(
+        expected: [2, 3, 99],
+        steps: 3
+    ) { step, previousToken in
+        calls.append((step, previousToken))
+        return step + 2
+    }
+
+    #expect(!comparison.passed)
+    #expect(comparison.checkedSteps == 3)
+    #expect(comparison.firstFailingStep == 2)
+    #expect(comparison.expectedToken == 99)
+    #expect(comparison.actualToken == 4)
+    #expect(calls.map(\.0) == [0, 1, 2])
+    #expect(calls.map(\.1) == [nil, 2, 3])
+}
+
+@Test
+func correctnessReportEncodesStableFailureFields() throws {
+    let report = CorrectnessReport(
+        passed: true,
+        checkedSteps: 256,
+        caseCount: 1,
+        expertCacheHits: 4,
+        expertCacheMisses: 6,
+        expertCacheEvictions: 2,
+        expertBytesRead: 2048,
+        expertReadSeconds: 0.5,
+        expertPeakCachedTensors: 8,
+        expertHitRate: 0.4,
+        firstFailingCase: nil,
+        firstFailingStep: nil,
+        expectedToken: nil,
+        actualToken: nil,
+        goldenHash: "abc123",
+        error: ""
+    )
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(report)
+    let raw = String(decoding: data, as: UTF8.self)
+
+    #expect(raw.contains("\"first_failing_case\" : null"))
+    #expect(raw.contains("\"first_failing_step\" : null"))
+    #expect(raw.contains("\"expected_token\" : null"))
+    #expect(raw.contains("\"actual_token\" : null"))
+    #expect(raw.contains("\"checked_steps\" : 256"))
+    #expect(raw.contains("\"case_count\" : 1"))
+    #expect(raw.contains("\"expert_cache_hits\" : 4"))
+    #expect(raw.contains("\"expert_cache_misses\" : 6"))
+    #expect(raw.contains("\"expert_cache_evictions\" : 2"))
+    #expect(raw.contains("\"expert_bytes_read\" : 2048"))
+    #expect(raw.contains("\"expert_read_seconds\" : 0.5"))
+    #expect(raw.contains("\"expert_peak_cached_tensors\" : 8"))
+    #expect(raw.contains("\"expert_hit_rate\" : 0.4"))
+    #expect(raw.contains("\"golden_hash\" : \"abc123\""))
+    #expect(report.expertStreamingStats.cacheHits == 4)
+    #expect(report.expertStreamingStats.cacheMisses == 6)
+    #expect(report.expertStreamingStats.hitRate == 0.4)
+}
+
+@Test
+func deepSeekRuntimeCorrectnessReportsMissingArtifacts() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let report = try DeepSeekRuntime.runCorrectness(
+        CorrectnessOptions(
+            weightsPath: directory.appendingPathComponent("missing-weights").path,
+            goldenPath: directory.appendingPathComponent("missing-golden.json").path
+        )
+    )
+
+    #expect(!report.passed)
+    #expect(report.checkedSteps == 0)
+    #expect(report.firstFailingCase == nil)
+    #expect(report.error.contains("correctness golden file"))
+}
+
+@Test
+func deepSeekRuntimeCorrectnessReportsGoldenMetadataWhenWeightsAreMissing() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let goldenPath = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "valid-golden",
+          "prompt_tokens": [1],
+          "expected_tokens": \(expected)
+        }
+      ]
+    }
+    """
+    try json.write(to: goldenPath, atomically: true, encoding: .utf8)
+
+    let report = try DeepSeekRuntime.runCorrectness(
+        CorrectnessOptions(
+            weightsPath: directory.appendingPathComponent("missing-weights").path,
+            goldenPath: goldenPath.path
+        )
+    )
+
+    let digest = SHA256.hash(data: try Data(contentsOf: goldenPath))
+    let expectedHash = digest.map { String(format: "%02x", $0) }.joined()
+    #expect(!report.passed)
+    #expect(report.checkedSteps == 0)
+    #expect(report.caseCount == 1)
+    #expect(report.goldenHash == expectedHash)
+    #expect(report.firstFailingCase == nil)
+}
+
+@Test
+func deepSeekCorrectnessSelectsGreedyTokenWhenRuntimeTestsAreEnabled() throws {
+    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+        return
+    }
+
+    #expect(try DeepSeekCorrectness.greedyToken(
+        from: MLXArray([Float(0.1), 2.0, 1.0], [3])
+    ) == 1)
+    #expect(try DeepSeekCorrectness.greedyToken(
+        from: MLXArray([Float(1), 2, 3, 2], [2, 2])
+    ) == 0)
+}
+
+private func temporaryDirectory() throws -> URL {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+        UUID().uuidString,
+        isDirectory: true
+    )
+    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
+}

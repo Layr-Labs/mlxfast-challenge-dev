@@ -1,9 +1,7 @@
 name: benchmark
 
-# Dispatch-only: Yukon dispatches on yukon/baseline/* and submissions/* branches
-# it constructs, then reads the score from the uploaded artifact. Maintainers can
-# dispatch manually on any branch. No PR/push triggers: runner minutes (esp.
-# macOS) are expensive, and nothing should burn them without an explicit dispatch.
+# Dispatch-only: maintainers or the benchmark orchestrator start the expensive
+# Apple Silicon run explicitly. No PR/push triggers should burn macOS minutes.
 on:
   workflow_dispatch:
 
@@ -14,56 +12,16 @@ concurrency:
 permissions:
   contents: read
 
-# Two-step pipeline. The transform needs the reference checkpoint AND its output
-# on disk at once (~154 GB + ~141 GB ≈ 295 GB), which exceeds the 250 GB macOS
-# runner; and MLX is what reads/writes the weights. So:
-#   1) transform  — runs on a 750 GB Linux runner (MLX installs via mlx[cpu]),
-#      producing weights/ and uploading it to R2.
-#   2) benchmark  — runs on the Apple-Silicon macOS runner (Metal), downloading
-#      weights/ from R2 (≤141 GB, fits 250 GB) and measuring performance.
-#
-# R2 is the single persistence layer (no sticky disks, no Actions-cache quota):
-#   - transformed weights, keyed on transform.py: ds4-weights/<hash>/  (+ .complete)
-#   - the reference checkpoint, static & self-seeding: ds4-reference/   (+ .complete)
-# An mlx_models-only submission finds the weights object present, so the transform
-# job skips and the benchmark job just downloads. Correctness is disabled
-# (perf-only), so no reference is needed on the macOS side.
-#
-# SECURITY: both jobs run participant-editable code (transform.py / the model),
-# so R2 credentials are scoped to ONLY the aws steps via step-level env — never
-# job/workflow level, and never `aws configure set` (which would persist them to
-# ~/.aws on disk). The transform.py and benchmark.sh steps run with no secret env,
-# so untrusted code can't read or log the keys. (mlxfast.cli is frozen/trusted,
-# so running it alongside credentials is fine.)
-#
-# PERF: the aws CLI defaults to 10 concurrent requests, which throttles the multi-GB
-# R2 transfers below to a crawl (~4 MB/s observed on the reference pull). We raise the
-# concurrency via a CREDENTIAL-FREE config file (the "Tune aws CLI …" steps): it holds
-# only the [default] s3 transfer block — never keys — and is wired in via AWS_CONFIG_FILE,
-# so it honors the no-`aws configure set` rule and leaks nothing to untrusted steps.
-#
-# Secrets (repository secrets): R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and
-# R2_BUCKET_ENDPOINT (full URL incl. bucket, e.g.
-# https://<acct>.r2.cloudflarestorage.com/<bucket>). The account-level endpoint
-# and bucket name are derived from it. aws CLI is preinstalled on the
-# GitHub/Blacksmith Ubuntu + macOS images.
-
 jobs:
-  # ── Step 1: transform on Linux (750 GB disk fits reference + output) ──────────
-  transform:
-    runs-on: blacksmith-16vcpu-ubuntu-2404  # 16 vCPU, 64 GB RAM, 750 GB disk
-    timeout-minutes: 150
-    permissions:
-      contents: read
+  benchmark:
+    runs-on: blacksmith-12vcpu-macos-15
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          # Full history so the modifiable-surface guard can diff against the base.
           fetch-depth: 0
 
-      # Yukon enforces editablePaths server-side; re-check here (fail fast, before
-      # the expensive transform) as defense in depth against orchestrator bugs.
-      - name: Enforce modifiable surface (yukon candidate branches)
+      - name: Enforce modifiable surface
         if: startsWith(github.ref_name, 'submissions/')
         env:
           HEAD_SHA: ${{ github.sha }}
@@ -71,160 +29,33 @@ jobs:
           BASE_SHA="$(git merge-base origin/main "${HEAD_SHA}")" \
             .github/scripts/enforce-modifiable-surface.sh
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.12"
+      - name: Setup Swift harness and reference checkpoint
+        run: ./setup.sh
 
-      # Credential-free aws CLI tuning (see PERF note above): only the s3 transfer
-      # block, no keys. AWS_CONFIG_FILE then applies it to every aws step in this job.
-      - name: Tune aws CLI for fast R2 transfers (credential-free)
-        run: |
-          CONF="${RUNNER_TEMP}/aws-r2-tuning.conf"
-          printf '%s\n' '[default]' 's3 =' \
-            '  max_concurrent_requests = 64' \
-            '  max_queue_size = 10000' \
-            '  multipart_chunksize = 16MB' > "${CONF}"
-          echo "AWS_CONFIG_FILE=${CONF}" >> "$GITHUB_ENV"
+      - name: Transform reference checkpoint
+        run: .build/release/mlxfast-swift transform
 
-      # weights/ is a deterministic function of transform.py (NOT mlx_models), so
-      # key the R2 object on transform.py alone. A ".complete" marker (written
-      # last) means a full upload exists — on a hit, every step below is skipped.
-      - name: Check R2 for transformed weights
-        id: probe
+      - name: Install organizer correctness golden
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          MLXFAST_CORRECTNESS_GOLDEN_B64: ${{ secrets.MLXFAST_CORRECTNESS_GOLDEN_B64 }}
         run: |
-          BUCKET="${R2_BUCKET_ENDPOINT##*/}"
-          ENDPOINT="${R2_BUCKET_ENDPOINT%/*}"
-          PREFIX="ds4-weights/${{ hashFiles('transform.py') }}"
-          if aws s3 ls "s3://${BUCKET}/${PREFIX}/.complete" --endpoint-url "${ENDPOINT}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # Everything below runs only when the weights object is absent (transform.py
-      # changed or first run). Install deps only (mlx[cpu] CPU backend on Linux;
-      # skips macOS-only mactop/Homebrew); we acquire the reference explicitly next.
-      - name: Install dependencies
-        if: steps.probe.outputs.exists != 'true'
-        run: MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
-
-      # Reference checkpoint via R2: pull it if present, else download once from HF
-      # and seed R2 so later transforms skip the ~154 GB HF download. mlxfast.cli
-      # is frozen/trusted, so running it with credentials in scope is fine.
-      - name: Fetch reference (R2, else HF then seed R2)
-        if: steps.probe.outputs.exists != 'true'
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
-        run: |
-          BUCKET="${R2_BUCKET_ENDPOINT##*/}"
-          ENDPOINT="${R2_BUCKET_ENDPOINT%/*}"
-          REF_DIR="mlxfast/reference_weights/DeepSeek-V4-Flash-4bit"
-          REF_PREFIX="ds4-reference/DeepSeek-V4-Flash-4bit"
-          if aws s3 ls "s3://${BUCKET}/ds4-reference/.complete" --endpoint-url "${ENDPOINT}" >/dev/null 2>&1; then
-            echo "Reference present in R2 — pulling."
-            aws s3 sync "s3://${BUCKET}/${REF_PREFIX}/" "${REF_DIR}/" --endpoint-url "${ENDPOINT}" --only-show-errors
-          else
-            echo "Reference not in R2 — downloading from HF, then seeding R2 (one-time)."
-            .venv/bin/python -m mlxfast.cli weights
-            aws s3 sync "${REF_DIR}/" "s3://${BUCKET}/${REF_PREFIX}/" --endpoint-url "${ENDPOINT}" --exclude ".cache/*" --only-show-errors
-            printf 'ok\n' | aws s3 cp - "s3://${BUCKET}/ds4-reference/.complete" --endpoint-url "${ENDPOINT}"
-          fi
-          if [[ ! -f "${REF_DIR}/config.json" ]]; then
-            echo "::error::reference checkpoint missing after fetch"; exit 1
-          fi
-
-      # NOTE: transform.py is participant-editable (untrusted) — this step has NO
-      # R2 secrets in its env.
-      - name: Transform (MLX CPU backend) + seed source hash
-        if: steps.probe.outputs.exists != 'true'
-        run: |
-          .venv/bin/python transform.py
-          .venv/bin/python tools/benchmark_contract.py source-hash > weights/.benchmark-source.sha256
-
-      - name: Upload transformed weights to R2
-        if: steps.probe.outputs.exists != 'true'
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
-        run: |
-          BUCKET="${R2_BUCKET_ENDPOINT##*/}"
-          ENDPOINT="${R2_BUCKET_ENDPOINT%/*}"
-          PREFIX="ds4-weights/${{ hashFiles('transform.py') }}"
-          aws s3 sync weights/ "s3://${BUCKET}/${PREFIX}/" --endpoint-url "${ENDPOINT}" --only-show-errors
-          # Write the completion marker LAST so a partial upload is never treated as a hit.
-          printf 'ok\n' | aws s3 cp - "s3://${BUCKET}/${PREFIX}/.complete" --endpoint-url "${ENDPOINT}"
-
-  # ── Step 2: benchmark on macOS (Metal; only needs weights/, ≤141 GB) ──────────
-  benchmark:
-    needs: transform
-    runs-on: blacksmith-12vcpu-macos-15  # Apple Silicon; 250 GB disk (no 16 vCPU macOS tier)
-    timeout-minutes: 90
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.12"
-
-      - name: Cache pip downloads
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ~/Library/Caches/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
-          restore-keys: pip-${{ runner.os }}-
-
-      # macOS: setup.sh installs mactop + MLX (Metal backend). Skip the weight
-      # download — the benchmark only needs the transformed weights/ (below), not
-      # the reference checkpoint (correctness is disabled, so no reference run).
-      - name: Install dependencies
-        run: MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
-
-      # Credential-free aws CLI tuning (see PERF note above): only the s3 transfer
-      # block, no keys. AWS_CONFIG_FILE then applies it to the download step below.
-      - name: Tune aws CLI for fast R2 transfers (credential-free)
-        run: |
-          CONF="${RUNNER_TEMP}/aws-r2-tuning.conf"
-          printf '%s\n' '[default]' 's3 =' \
-            '  max_concurrent_requests = 64' \
-            '  max_queue_size = 10000' \
-            '  multipart_chunksize = 16MB' > "${CONF}"
-          echo "AWS_CONFIG_FILE=${CONF}" >> "$GITHUB_ENV"
-
-      # Download weights/ (incl. .benchmark-source.sha256) from R2, so benchmark.sh
-      # reuses it without re-transforming and never needs the reference here.
-      # Credentials are scoped to THIS step only; benchmark.sh below has none.
-      - name: Download transformed weights from R2
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
-        run: |
-          BUCKET="${R2_BUCKET_ENDPOINT##*/}"
-          ENDPOINT="${R2_BUCKET_ENDPOINT%/*}"
-          PREFIX="ds4-weights/${{ hashFiles('transform.py') }}"
-          aws s3 sync "s3://${BUCKET}/${PREFIX}/" weights/ --endpoint-url "${ENDPOINT}" --only-show-errors
-          if [[ ! -f weights/config.json ]]; then
-            echo "::error::weights not found in R2 at s3://${BUCKET}/${PREFIX}/ — the transform job may have failed."
+          if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_B64:-}" ]]; then
+            echo "::error::MLXFAST_CORRECTNESS_GOLDEN_B64 secret is required for correctness"
             exit 1
           fi
+          golden_path="${RUNNER_TEMP}/mlxfast-correctness-golden.json"
+          umask 077
+          printf '%s' "${MLXFAST_CORRECTNESS_GOLDEN_B64}" | /usr/bin/base64 -D > "${golden_path}"
+          if [[ ! -s "${golden_path}" ]]; then
+            echo "::error::decoded correctness golden is empty"
+            exit 1
+          fi
+          echo "MLXFAST_CORRECTNESS_GOLDEN_PATH=${golden_path}" >> "${GITHUB_ENV}"
 
-      # Offline phase: benchmark.sh proves the Seatbelt profile (tools/deny-network.sb)
-      # blocks egress, then re-execs itself under sandbox-exec with no network.
-      # No R2 secrets in this step's env — untrusted model code can't read them.
-      - name: Benchmark (offline, perf-only)
+      - name: Correctness gate
+        run: .build/release/mlxfast-swift correctness
+
+      - name: Benchmark
         env:
           MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
         run: ./benchmark.sh

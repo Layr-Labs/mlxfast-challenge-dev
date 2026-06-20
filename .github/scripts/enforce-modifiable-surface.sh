@@ -7,8 +7,12 @@ set -euo pipefail
 : "${BASE_SHA:?BASE_SHA is required}"
 : "${HEAD_SHA:?HEAD_SHA is required}"
 
-allowed="$(git show "${BASE_SHA}:benchmark.json" \
-  | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["editablePaths"]))')"
+if ! command -v jq >/dev/null 2>&1; then
+  echo "::error::jq is required to read editablePaths from benchmark.json"
+  exit 1
+fi
+
+allowed="$(git show "${BASE_SHA}:benchmark.json" | jq -r '.editablePaths[]')"
 changed="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
 
 bad=0
