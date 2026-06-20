@@ -20,7 +20,7 @@ public enum MLXFastConstants {
     public static let benchmarkDecodeSteps = 512
     public static let benchmarkDecodeSeedTokens = 32
     public static let benchmarkPrefillWarmupRuns = 1
-    public static let benchmarkPrefillTimedRuns = 2
+    public static let benchmarkPrefillTimedRuns = 1
     public static let defaultMaxTransformedWeightsBytes = 50 * 1024 * 1024 * 1024
     public static let defaultMaxSubmissionSourceBytes = 256 * 1024 * 1024
 }
