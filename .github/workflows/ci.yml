@@ -51,6 +51,9 @@ jobs:
           bash -n benchmark.sh
           bash -n tools/build-mlx-metallib.sh
           bash -n .github/scripts/enforce-modifiable-surface.sh
+          bash -n .github/scripts/overlay-editable-paths.sh
+          bash -n .github/scripts/verify-correctness-golden.sh
+          bash -n .github/scripts/validate-benchmark-artifacts.sh
 
       - name: Build release CLI
         run: |

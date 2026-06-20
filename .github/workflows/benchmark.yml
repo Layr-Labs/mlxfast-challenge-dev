@@ -9,6 +9,14 @@ on:
         description: "Optional HTTP base URL for reference checkpoint files. Defaults to MLXFAST_REFERENCE_BASE_URL or Darkbloom."
         required: false
         type: string
+      submission_repository:
+        description: "Optional repository containing submitted editable paths. Defaults to this repository."
+        required: false
+        type: string
+      submission_ref:
+        description: "Optional submitted ref/SHA. When set, the workflow keeps trusted harness code and overlays only editablePaths from this ref."
+        required: false
+        type: string
       correctness_golden_url:
         description: "Optional URL for precomputed correctness_golden.json. If empty, the workflow restores or creates a cached Blacksmith-generated golden."
         required: false
@@ -74,21 +82,44 @@ jobs:
       MLXFAST_CORRECTNESS_GOLDEN_CACHE_VERSION: v2
       MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH: .mlxfast-cache/correctness-golden/correctness_golden.json
       MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH: fixtures/correctness_golden_512_256_benchmark256.json
-      MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || secrets.MLXFAST_REFERENCE_BASE_URL || 'https://ds4.darkbloom.ai/deepseek-v4-flash-4bit' }}
-      MLXFAST_REFERENCE_AUTH_HEADER: ${{ secrets.MLXFAST_REFERENCE_AUTH_HEADER }}
-      MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
-      MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
-      MLXFAST_CORRECTNESS_GOLDEN_URL: ${{ inputs.correctness_golden_url || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL }}
-      MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER: ${{ secrets.MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER }}
+      MLXFAST_CORRECTNESS_GOLDEN_URL_PRESENT: ${{ (inputs.correctness_golden_url != '' || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL != '') && '1' || '0' }}
+      MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: c5d520ec87cc4a105ff13a39ade581801049a90944d42f456d15a33ef080eb1e
+      MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "20425"
+      MLXFAST_EXPECTED_CORRECTNESS_STEPS: "256"
+      MLXFAST_EXPECTED_CORRECTNESS_CASES: "1"
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
       MLXFAST_VERIFY_TRANSFORM: ${{ inputs.verify_transform && '1' || '0' }}
       MLXFAST_VALIDATION_TOKEN_DELAY_MS: ${{ inputs.validation_token_delay_ms }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refuse untrusted submission workflow code
+        if: inputs.submission_ref == '' && (startsWith(github.ref_name, 'submissions/') || startsWith(github.ref_name, 'yukon/submissions/'))
+        run: |
+          echo "benchmark: submission branches must be benchmarked by dispatching trusted main with submission_ref" >&2
+          exit 1
+
+      - name: Checkout submitted editable paths
+        if: inputs.submission_ref != ''
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: ${{ inputs.submission_repository || github.repository }}
+          ref: ${{ inputs.submission_ref }}
+          path: .mlxfast-submission-src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Overlay submitted editable paths
+        if: inputs.submission_ref != ''
+        env:
+          SUBMISSION_WORKTREE: .mlxfast-submission-src
+        run: .github/scripts/overlay-editable-paths.sh
 
       - name: Enforce modifiable surface
-        if: startsWith(github.ref_name, 'submissions/') || startsWith(github.ref_name, 'yukon/submissions/')
+        if: inputs.submission_ref == '' && (startsWith(github.ref_name, 'submissions/') || startsWith(github.ref_name, 'yukon/submissions/'))
         env:
           HEAD_SHA: ${{ github.sha }}
         run: |
@@ -96,6 +127,8 @@ jobs:
             .github/scripts/enforce-modifiable-surface.sh
 
       - name: Check correctness golden source
+        env:
+          MLXFAST_CORRECTNESS_GOLDEN_URL: ${{ inputs.correctness_golden_url || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL }}
         run: |
           set -euo pipefail
           if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
@@ -108,7 +141,7 @@ jobs:
 
       - name: Restore cached correctness golden
         id: restore-correctness-golden
-        if: env.MLXFAST_CORRECTNESS_GOLDEN_URL == ''
+        if: env.MLXFAST_CORRECTNESS_GOLDEN_URL_PRESENT == '0'
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: .mlxfast-cache/correctness-golden
@@ -116,20 +149,18 @@ jobs:
 
       - name: Use restored correctness golden for generate-only
         id: prepare-restored-correctness-golden
-        if: ${{ inputs.generate_golden_only && env.MLXFAST_CORRECTNESS_GOLDEN_URL == '' }}
+        if: ${{ inputs.generate_golden_only && env.MLXFAST_CORRECTNESS_GOLDEN_URL_PRESENT == '0' }}
         run: |
           set -euo pipefail
           if [[ -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
             echo "benchmark: generate-only using committed correctness_golden.json fixture"
             cp "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" correctness_golden.json
-            shasum -a 256 correctness_golden.json > correctness_golden.json.sha256
-            wc -c correctness_golden.json > correctness_golden.json.bytes
+            .github/scripts/verify-correctness-golden.sh
             echo "ready=true" >> "${GITHUB_OUTPUT}"
           elif [[ -s "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" ]]; then
             echo "benchmark: generate-only using restored correctness_golden.json"
             cp "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" correctness_golden.json
-            shasum -a 256 correctness_golden.json > correctness_golden.json.sha256
-            wc -c correctness_golden.json > correctness_golden.json.bytes
+            .github/scripts/verify-correctness-golden.sh
             echo "ready=true" >> "${GITHUB_OUTPUT}"
           else
             echo "benchmark: generate-only did not find restored correctness_golden.json; will generate after setup"
@@ -146,12 +177,10 @@ jobs:
             exit 1
           fi
           cp "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" correctness_golden.json
-          shasum -a 256 correctness_golden.json > correctness_golden.json.sha256
-          wc -c correctness_golden.json > correctness_golden.json.bytes
+          .github/scripts/verify-correctness-golden.sh
 
       - name: Upload preserved correctness golden metadata
         if: inputs.preserve_golden_only
-        continue-on-error: true
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: correctness-golden-metadata-${{ github.run_id }}
@@ -162,6 +191,11 @@ jobs:
 
       - name: Setup Swift harness and reference checkpoint
         if: ${{ !inputs.preserve_golden_only && steps.prepare-restored-correctness-golden.outputs.ready != 'true' }}
+        env:
+          MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || secrets.MLXFAST_REFERENCE_BASE_URL || 'https://ds4.darkbloom.ai/deepseek-v4-flash-4bit' }}
+          MLXFAST_REFERENCE_AUTH_HEADER: ${{ secrets.MLXFAST_REFERENCE_AUTH_HEADER }}
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
+          MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
         run: ./setup.sh
 
       - name: Transform reference checkpoint
@@ -171,6 +205,9 @@ jobs:
       - name: Prepare correctness golden
         id: prepare-correctness-golden
         if: ${{ !inputs.preserve_golden_only && steps.prepare-restored-correctness-golden.outputs.ready != 'true' }}
+        env:
+          MLXFAST_CORRECTNESS_GOLDEN_URL: ${{ inputs.correctness_golden_url || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL }}
+          MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER: ${{ secrets.MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER }}
         run: |
           set -euo pipefail
           if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
@@ -219,12 +256,10 @@ jobs:
             cp "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" correctness_golden.json
             echo "generated=true" >> "${GITHUB_OUTPUT}"
           fi
-          test -s correctness_golden.json
-          shasum -a 256 correctness_golden.json > correctness_golden.json.sha256
-          wc -c correctness_golden.json > correctness_golden.json.bytes
+          .github/scripts/verify-correctness-golden.sh
 
       - name: Save cached correctness golden
-        if: env.MLXFAST_CORRECTNESS_GOLDEN_URL == '' && steps.prepare-correctness-golden.outputs.generated == 'true' && steps.restore-correctness-golden.outputs.cache-primary-key != '' && !startsWith(github.ref_name, 'submissions/') && !startsWith(github.ref_name, 'yukon/submissions/')
+        if: env.MLXFAST_CORRECTNESS_GOLDEN_URL_PRESENT == '0' && steps.prepare-correctness-golden.outputs.generated == 'true' && steps.restore-correctness-golden.outputs.cache-primary-key != '' && !startsWith(github.ref_name, 'submissions/') && !startsWith(github.ref_name, 'yukon/submissions/')
         continue-on-error: true
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
@@ -240,12 +275,28 @@ jobs:
             --golden correctness_golden.json \
             > correctness-report.json
 
+      - name: Validate correctness artifacts
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && !inputs.run_benchmark
+        run: |
+          set -euo pipefail
+          test -s correctness-report.json
+          jq -e \
+            --arg golden_hash "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}" \
+            --argjson correctness_steps "${MLXFAST_EXPECTED_CORRECTNESS_STEPS}" \
+            --argjson correctness_cases "${MLXFAST_EXPECTED_CORRECTNESS_CASES}" \
+            '.passed == true and .checked_steps == $correctness_steps and .case_count == $correctness_cases and .golden_hash == $golden_hash' \
+            correctness-report.json >/dev/null
+
       - name: Benchmark
         if: ${{ !inputs.preserve_golden_only && !inputs.generate_golden_only && inputs.run_benchmark }}
         env:
           MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
           MLXFAST_SKIP_TRANSFORM: "1"
         run: ./benchmark.sh
+
+      - name: Validate benchmark artifacts
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && inputs.run_benchmark
+        run: .github/scripts/validate-benchmark-artifacts.sh
 
       - name: Trace correctness mismatch
         if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && inputs.trace_correctness_step != '' && !startsWith(github.ref_name, 'submissions/')
@@ -258,8 +309,8 @@ jobs:
             --top-k "${{ inputs.trace_correctness_top_k }}" \
             > correctness-trace.json
 
-      - name: Upload score artifacts
-        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only
+      - name: Upload benchmark artifacts
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && inputs.run_benchmark
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: benchmark-results-${{ github.run_id }}
@@ -271,7 +322,18 @@ jobs:
             score.json.sha256
             benchmark-integrity.json
             results.tsv
-          if-no-files-found: ignore
+          if-no-files-found: error
+
+      - name: Upload correctness artifacts
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && !inputs.run_benchmark
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: correctness-results-${{ github.run_id }}
+          path: |
+            correctness-report.json
+            correctness_golden.json.sha256
+            correctness_golden.json.bytes
+          if-no-files-found: error
 
       - name: Upload correctness trace artifact
         if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && inputs.trace_correctness_step != '' && !startsWith(github.ref_name, 'submissions/')

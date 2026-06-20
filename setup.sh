@@ -8,6 +8,8 @@ DEFAULT_REFERENCE_BASE_URL="https://ds4.darkbloom.ai/deepseek-v4-flash-4bit"
 REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}"
 REFERENCE_AUTH_HEADER="${MLXFAST_REFERENCE_AUTH_HEADER:-}"
 REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}"
+REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_deepseek_v4_flash_4bit.sha256}"
+REFERENCE_HASH_VERIFY="${MLXFAST_REFERENCE_HASH_VERIFY:-1}"
 REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-170}"
 REFERENCE_DOWNLOAD_JOBS="${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-8}"
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
@@ -39,10 +41,13 @@ Important environment variables:
                                      Default: ${REFERENCE_DIR}
   MLXFAST_REFERENCE_BASE_URL         HTTP prefix for checkpoint files.
                                      Default: ${DEFAULT_REFERENCE_BASE_URL}
+  MLXFAST_REFERENCE_MANIFEST_PATH    SHA256 manifest for the reference files.
+                                     Default: ${REFERENCE_MANIFEST_PATH}
   MLXFAST_REFERENCE_DOWNLOAD_JOBS    Parallel safetensors downloads.
                                      Default: ${REFERENCE_DOWNLOAD_JOBS}
   MLXFAST_REFERENCE_MIN_FREE_GIB     Required free space before download.
                                      Default: ${REFERENCE_MIN_FREE_GIB}
+  MLXFAST_REFERENCE_HASH_VERIFY=0    Skip reference SHA256 verification.
   MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1    Build tools only; do not download weights.
   MLXFAST_SKIP_MLX_METALLIB=1        Skip mlx.metallib build.
   MLXFAST_SKIP_MACTOP_INSTALL=1      Skip mactop install/check.
@@ -623,7 +628,87 @@ verify_reference_weights() {
     return 1
   fi
 
+  verify_reference_manifest "${reference_dir}"
   echo "setup.sh: verified reference checkpoint at ${reference_dir} (${#shard_files[@]} safetensors shard(s))"
+}
+
+verify_reference_manifest() {
+  local reference_dir="$1"
+  local line
+  local expected_hash
+  local expected_size
+  local relative_path
+  local extra
+  local file_path
+  local actual_size
+  local actual_hash
+  local checked=0
+
+  case "${REFERENCE_HASH_VERIFY}" in
+    0|false|FALSE|no|NO)
+      echo "setup.sh: skipping reference SHA256 verification"
+      return 0
+      ;;
+    1|true|TRUE|yes|YES)
+      ;;
+    *)
+      echo "setup.sh: MLXFAST_REFERENCE_HASH_VERIFY must be 0 or 1" >&2
+      return 1
+      ;;
+  esac
+
+  if [[ ! -f "${REFERENCE_MANIFEST_PATH}" ]]; then
+    echo "setup.sh: reference manifest missing at ${REFERENCE_MANIFEST_PATH}" >&2
+    return 1
+  fi
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    read -r expected_hash expected_size relative_path extra <<< "${line}"
+    if [[ -n "${extra:-}" || -z "${expected_hash:-}" || -z "${expected_size:-}" || -z "${relative_path:-}" ]]; then
+      echo "setup.sh: malformed reference manifest line: ${line}" >&2
+      return 1
+    fi
+    if [[ ! "${expected_hash}" =~ ^[0-9a-f]{64}$ || ! "${expected_size}" =~ ^[0-9]+$ ]]; then
+      echo "setup.sh: malformed reference manifest line: ${line}" >&2
+      return 1
+    fi
+    if [[ "${relative_path}" == /* || "${relative_path}" == *\\* ]]; then
+      echo "setup.sh: unsafe reference manifest path: ${relative_path}" >&2
+      return 1
+    fi
+    case "/${relative_path}/" in
+      *"/../"*|*"/./"*)
+        echo "setup.sh: unsafe reference manifest path: ${relative_path}" >&2
+        return 1
+        ;;
+    esac
+
+    file_path="${reference_dir}/${relative_path}"
+    if [[ ! -f "${file_path}" ]]; then
+      echo "setup.sh: reference checkpoint is missing manifest file ${relative_path}" >&2
+      return 1
+    fi
+    actual_size="$(wc -c < "${file_path}" | tr -d ' ')"
+    if [[ "${actual_size}" != "${expected_size}" ]]; then
+      echo "setup.sh: reference file ${relative_path} size mismatch: expected ${expected_size}, got ${actual_size}" >&2
+      return 1
+    fi
+    actual_hash="$(shasum -a 256 "${file_path}" | awk '{print $1}')"
+    if [[ "${actual_hash}" != "${expected_hash}" ]]; then
+      echo "setup.sh: reference file ${relative_path} sha256 mismatch" >&2
+      echo "setup.sh: expected ${expected_hash}" >&2
+      echo "setup.sh: actual   ${actual_hash}" >&2
+      return 1
+    fi
+    checked=$((checked + 1))
+  done < "${REFERENCE_MANIFEST_PATH}"
+
+  if [[ "${checked}" -eq 0 ]]; then
+    echo "setup.sh: reference manifest contained no files: ${REFERENCE_MANIFEST_PATH}" >&2
+    return 1
+  fi
+  echo "setup.sh: verified ${checked} reference file hash(es)"
 }
 
 download_reference_weights() {

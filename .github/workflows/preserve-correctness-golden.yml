@@ -17,6 +17,8 @@ jobs:
     env:
       MLXFAST_CORRECTNESS_GOLDEN_CACHE_VERSION: v2
       MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH: .mlxfast-cache/correctness-golden/correctness_golden.json
+      MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: c5d520ec87cc4a105ff13a39ade581801049a90944d42f456d15a33ef080eb1e
+      MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "20425"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -38,8 +40,7 @@ jobs:
             exit 1
           fi
           cp "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" correctness_golden.json
-          shasum -a 256 correctness_golden.json > correctness_golden.json.sha256
-          wc -c correctness_golden.json > correctness_golden.json.bytes
+          .github/scripts/verify-correctness-golden.sh
 
       - name: Upload correctness golden metadata
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
