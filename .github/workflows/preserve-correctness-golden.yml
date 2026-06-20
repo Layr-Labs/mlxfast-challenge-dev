@@ -24,7 +24,7 @@ jobs:
 
       - name: Restore cached correctness golden
         id: restore-correctness-golden
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: .mlxfast-cache/correctness-golden
           key: correctness-golden-${{ runner.os }}-${{ runner.arch }}-blacksmith-macos-26-${{ env.MLXFAST_CORRECTNESS_GOLDEN_CACHE_VERSION }}-${{ hashFiles('private_prompts.json', 'Package.resolved', 'Sources/MLXFastCore/Constants.swift', 'Sources/MLXFastCore/Golden.swift', 'Sources/MLXFastDeepSeekHarness/**') }}
@@ -42,7 +42,7 @@ jobs:
           wc -c correctness_golden.json > correctness_golden.json.bytes
 
       - name: Upload correctness golden metadata
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: correctness-golden-metadata-${{ github.run_id }}
           path: |
