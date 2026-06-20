@@ -217,6 +217,7 @@ jobs:
           echo "::group::correctness_golden.json raw"
           echo "MLXFAST_CORRECTNESS_GOLDEN_JSON_BEGIN"
           cat correctness_golden.json
+          printf '\n'
           echo "MLXFAST_CORRECTNESS_GOLDEN_JSON_END"
           echo "::endgroup::"
 
