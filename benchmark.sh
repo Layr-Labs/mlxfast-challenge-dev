@@ -40,6 +40,7 @@ source_hash() {
     "Package.swift"
     "Package.resolved"
     "Sources/MLXFastCore"
+    "Sources/MLXFastDeepSeek"
     "Sources/MLXFastTransform"
   )
 

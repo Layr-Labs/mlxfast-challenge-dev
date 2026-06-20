@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       reference_base_url:
-        description: "Optional HTTP base URL for reference checkpoint files, such as an R2 public/Worker prefix. Defaults to setup.sh/HF or MLXFAST_REFERENCE_BASE_URL secret."
+        description: "Optional HTTP base URL for reference checkpoint files. Defaults to MLXFAST_REFERENCE_BASE_URL or Darkbloom."
         required: false
         type: string
       correctness_golden_url:
@@ -69,7 +69,7 @@ jobs:
       MLXFAST_CORRECTNESS_GOLDEN_CACHE_VERSION: v2
       MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH: .mlxfast-cache/correctness-golden/correctness_golden.json
       MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH: fixtures/correctness_golden_512_256_benchmark512.json
-      MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || secrets.MLXFAST_REFERENCE_BASE_URL }}
+      MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || secrets.MLXFAST_REFERENCE_BASE_URL || 'https://ds4.darkbloom.ai/deepseek-v4-flash-4bit' }}
       MLXFAST_REFERENCE_AUTH_HEADER: ${{ secrets.MLXFAST_REFERENCE_AUTH_HEADER }}
       MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
       MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
