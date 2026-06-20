@@ -4,7 +4,8 @@ set -euo pipefail
 
 REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/DeepSeek-V4-Flash-4bit}"
 REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-main}"
-REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-https://huggingface.co/${REFERENCE_MODEL_REPO}/resolve/${REFERENCE_REVISION}}"
+DEFAULT_REFERENCE_BASE_URL="https://ds4.darkbloom.ai/deepseek-v4-flash-4bit"
+REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}"
 REFERENCE_AUTH_HEADER="${MLXFAST_REFERENCE_AUTH_HEADER:-}"
 REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}"
 REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-170}"
@@ -113,20 +114,124 @@ ensure_mactop() {
   fi
 }
 
+find_cmake() {
+  local candidate
+  if [[ -n "${MLXFAST_CMAKE_BIN:-}" ]]; then
+    if [[ -x "${MLXFAST_CMAKE_BIN}" ]]; then
+      printf '%s\n' "${MLXFAST_CMAKE_BIN}"
+      return 0
+    fi
+    echo "setup.sh: MLXFAST_CMAKE_BIN is set but not executable: ${MLXFAST_CMAKE_BIN}" >&2
+    return 1
+  fi
+
+  if candidate="$(command -v cmake 2>/dev/null)"; then
+    printf '%s\n' "${candidate}"
+    return 0
+  fi
+
+  for candidate in /opt/homebrew/bin/cmake /usr/local/bin/cmake; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+ensure_cmake() {
+  if find_cmake >/dev/null; then
+    return 0
+  fi
+
+  if [[ "${MLXFAST_SKIP_CMAKE_INSTALL:-0}" == "1" ]]; then
+    echo "setup.sh: cmake is not installed and MLXFAST_SKIP_CMAKE_INSTALL=1" >&2
+    return 1
+  fi
+
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "setup.sh: automatic cmake installation is only supported on macOS" >&2
+    return 1
+  fi
+
+  ensure_homebrew
+  echo "setup.sh: installing cmake with Homebrew"
+  brew install cmake
+
+  if ! find_cmake >/dev/null; then
+    echo "setup.sh: cmake installation finished, but cmake was not found" >&2
+    return 1
+  fi
+}
+
 ensure_swift_toolchain() {
   if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "setup.sh: this Swift harness targets macOS on Apple Silicon" >&2
     exit 1
   fi
 
+  if [[ "$(uname -m)" != "arm64" ]]; then
+    echo "setup.sh: this Swift harness requires Apple Silicon (arm64)" >&2
+    exit 1
+  fi
+
   if ! command -v swift >/dev/null 2>&1; then
-    echo "setup.sh: swift was not found; install Xcode command line tools" >&2
+    echo "setup.sh: swift was not found; install Xcode command line tools with xcode-select --install" >&2
     exit 1
   fi
 
   if ! command -v xcodebuild >/dev/null 2>&1; then
     echo "setup.sh: xcodebuild was not found; install Xcode" >&2
     exit 1
+  fi
+
+  if ! xcodebuild -version >/dev/null 2>&1; then
+    cat >&2 <<EOF
+setup.sh: xcodebuild is installed but not usable.
+
+Open Xcode once, select its command line tools, and accept the license, then retry:
+
+  sudo xcodebuild -license accept
+
+EOF
+    exit 1
+  fi
+}
+
+ensure_metal_toolchain() {
+  if xcrun -sdk macosx metal -v >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ "${MLXFAST_SKIP_METAL_TOOLCHAIN_INSTALL:-0}" == "1" ]]; then
+    cat >&2 <<EOF
+setup.sh: Xcode's Metal Toolchain is not installed and MLXFAST_SKIP_METAL_TOOLCHAIN_INSTALL=1.
+
+Install it, then retry:
+
+  xcodebuild -downloadComponent MetalToolchain
+
+EOF
+    return 1
+  fi
+
+  echo "setup.sh: installing Xcode Metal Toolchain"
+  if ! xcodebuild -downloadComponent MetalToolchain; then
+    cat >&2 <<EOF
+setup.sh: failed to install Xcode's Metal Toolchain.
+
+Install it manually, then retry:
+
+  xcodebuild -downloadComponent MetalToolchain
+
+EOF
+    return 1
+  fi
+
+  if ! xcrun -sdk macosx metal -v >/dev/null 2>&1; then
+    echo "setup.sh: Metal Toolchain installation finished, but xcrun still cannot execute metal" >&2
+    return 1
   fi
 }
 
@@ -477,9 +582,13 @@ EOF
   echo "setup.sh: downloaded reference weights to ${reference_dir}"
 }
 
-ensure_mactop
-
 ensure_swift_toolchain
+
+ensure_cmake
+
+ensure_metal_toolchain
+
+ensure_mactop
 
 echo "setup.sh: building Swift harness"
 mkdir -p .build/clang-module-cache

@@ -2,6 +2,17 @@ import Foundation
 import Testing
 
 @Test
+func setupScriptDefaultsToFastReferenceMirror() throws {
+    let setup = try String(
+        contentsOfFile: "setup.sh",
+        encoding: .utf8
+    )
+
+    #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://ds4.darkbloom.ai/deepseek-v4-flash-4bit\""))
+    #expect(setup.contains("REFERENCE_BASE_URL=\"${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}\""))
+}
+
+@Test
 func benchmarkScriptFailsWhenScorePayloadFails() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
