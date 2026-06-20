@@ -36,11 +36,6 @@ on:
         required: false
         default: false
         type: boolean
-      validation_token_delay_ms:
-        description: "Temporary validation knob: add this many milliseconds after each measured decode token."
-        required: false
-        default: "0"
-        type: string
       run_benchmark:
         description: "Run the timed benchmark after the correctness gate."
         required: false
@@ -91,7 +86,6 @@ jobs:
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
       MLXFAST_TRUSTED_BENCHMARK_REF: refs/heads/main
       MLXFAST_VERIFY_TRANSFORM: ${{ inputs.verify_transform && '1' || '0' }}
-      MLXFAST_VALIDATION_TOKEN_DELAY_MS: ${{ inputs.validation_token_delay_ms }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:

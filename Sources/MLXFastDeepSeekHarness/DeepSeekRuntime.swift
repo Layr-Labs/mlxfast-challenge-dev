@@ -797,7 +797,7 @@ public enum DeepSeekRuntime {
         var actualTokens: [Int] = []
         actualTokens.reserveCapacity(timingPlan.decodeSteps)
         let metricsBeforeDecode = weightCache.loader.expertStreamingMetrics?.snapshot()
-        let validationDelayMS = try validationTokenDelayMilliseconds()
+        let validationDelayMS = try submissionValidationDelayMilliseconds()
         let session: MactopSession?
         if idleGBPerSecond != nil {
             do {
@@ -931,17 +931,12 @@ public enum DeepSeekRuntime {
         )
     }
 
-    static func validationTokenDelayMilliseconds(
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) throws -> Int {
-        let raw = environment["MLXFAST_VALIDATION_TOKEN_DELAY_MS"]?.trimmingCharacters(
-            in: .whitespacesAndNewlines
-        ) ?? ""
-        guard !raw.isEmpty else {
-            return 0
-        }
-        guard let milliseconds = Int(raw), milliseconds >= 0 else {
-            throw MLXFastError.invalidInput("MLXFAST_VALIDATION_TOKEN_DELAY_MS must be a non-negative integer")
+    static func submissionValidationDelayMilliseconds() throws -> Int {
+        let milliseconds = DeepSeekSubmissionControls.measuredDecodeDelayMilliseconds
+        guard milliseconds >= 0 else {
+            throw MLXFastError.invalidInput(
+                "DeepSeekSubmissionControls.measuredDecodeDelayMilliseconds must be non-negative"
+            )
         }
         return milliseconds
     }

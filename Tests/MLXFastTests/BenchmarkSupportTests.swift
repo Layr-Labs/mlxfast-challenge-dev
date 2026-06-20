@@ -81,22 +81,9 @@ func decodeTimingPlanRejectsInvalidRanges() throws {
 }
 
 @Test
-func validationTokenDelayParsesEnvironment() throws {
-    #expect(try DeepSeekRuntime.validationTokenDelayMilliseconds(environment: [:]) == 0)
-    #expect(try DeepSeekRuntime.validationTokenDelayMilliseconds(environment: [
-        "MLXFAST_VALIDATION_TOKEN_DELAY_MS": "100",
-    ]) == 100)
-
-    #expect(throws: MLXFastError.self) {
-        _ = try DeepSeekRuntime.validationTokenDelayMilliseconds(environment: [
-            "MLXFAST_VALIDATION_TOKEN_DELAY_MS": "-1",
-        ])
-    }
-    #expect(throws: MLXFastError.self) {
-        _ = try DeepSeekRuntime.validationTokenDelayMilliseconds(environment: [
-            "MLXFAST_VALIDATION_TOKEN_DELAY_MS": "abc",
-        ])
-    }
+func submissionValidationDelayDefaultsToZero() throws {
+    #expect(DeepSeekSubmissionControls.measuredDecodeDelayMilliseconds == 0)
+    #expect(try DeepSeekRuntime.submissionValidationDelayMilliseconds() == 0)
 }
 
 @Test
