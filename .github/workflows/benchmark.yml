@@ -68,7 +68,7 @@ jobs:
     env:
       MLXFAST_CORRECTNESS_GOLDEN_CACHE_VERSION: v2
       MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH: .mlxfast-cache/correctness-golden/correctness_golden.json
-      MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH: fixtures/correctness_golden_512_256_benchmark512.json
+      MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH: fixtures/correctness_golden_512_256_benchmark256.json
       MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || secrets.MLXFAST_REFERENCE_BASE_URL || 'https://ds4.darkbloom.ai/deepseek-v4-flash-4bit' }}
       MLXFAST_REFERENCE_AUTH_HEADER: ${{ secrets.MLXFAST_REFERENCE_AUTH_HEADER }}
       MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}

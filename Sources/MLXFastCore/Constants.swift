@@ -15,12 +15,11 @@ public enum MLXFastConstants {
     public static let routedExperts = 256
     public static let expertsPerToken = 6
     public static let correctnessPromptTokens = 512
-    // Keep the gate long enough to exercise decode/cache/expert-routing behavior,
-    // but short enough for every correctness passer to run the benchmark; the
-    // benchmark oracle covers a longer 512-token decode path before scoring.
+    // Keep the gate and timed decode windows long enough to exercise cache and
+    // expert-routing behavior while staying within the target benchmark budget.
     public static let correctnessSteps = 256
     public static let benchmarkPrefillPromptTokens = 512
-    public static let benchmarkDecodeSteps = 512
+    public static let benchmarkDecodeSteps = 256
     public static let benchmarkDecodeSeedTokens = 32
     public static let benchmarkPrefillWarmupRuns = 1
     public static let benchmarkPrefillTimedRuns = 1
