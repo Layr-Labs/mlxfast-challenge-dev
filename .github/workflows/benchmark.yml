@@ -68,6 +68,7 @@ jobs:
     env:
       MLXFAST_CORRECTNESS_GOLDEN_CACHE_VERSION: v1
       MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH: .mlxfast-cache/correctness-golden/correctness_golden.json
+      MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH: fixtures/correctness_golden_512_2048.json
       MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || secrets.MLXFAST_REFERENCE_BASE_URL }}
       MLXFAST_REFERENCE_AUTH_HEADER: ${{ secrets.MLXFAST_REFERENCE_AUTH_HEADER }}
       MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
@@ -93,6 +94,8 @@ jobs:
           set -euo pipefail
           if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
             echo "benchmark: using configured correctness golden URL"
+          elif [[ -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
+            echo "benchmark: using committed correctness golden fixture"
           else
             echo "benchmark: using cached Blacksmith-generated correctness golden"
           fi
@@ -110,7 +113,13 @@ jobs:
         if: ${{ inputs.generate_golden_only && env.MLXFAST_CORRECTNESS_GOLDEN_URL == '' }}
         run: |
           set -euo pipefail
-          if [[ -s "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" ]]; then
+          if [[ -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
+            echo "benchmark: generate-only using committed correctness_golden.json fixture"
+            cp "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" correctness_golden.json
+            shasum -a 256 correctness_golden.json > correctness_golden.json.sha256
+            wc -c correctness_golden.json > correctness_golden.json.bytes
+            echo "ready=true" >> "${GITHUB_OUTPUT}"
+          elif [[ -s "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" ]]; then
             echo "benchmark: generate-only using restored correctness_golden.json"
             cp "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" correctness_golden.json
             shasum -a 256 correctness_golden.json > correctness_golden.json.sha256
@@ -182,6 +191,9 @@ jobs:
                 --output correctness_golden.json \
                 "${MLXFAST_CORRECTNESS_GOLDEN_URL}"
             fi
+          elif [[ -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
+            echo "benchmark: using committed correctness_golden.json fixture"
+            cp "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" correctness_golden.json
           elif [[ -s "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" ]]; then
             echo "benchmark: using cached correctness_golden.json"
             cp "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" correctness_golden.json
@@ -207,7 +219,6 @@ jobs:
           wc -c correctness_golden.json > correctness_golden.json.bytes
 
       - name: Print correctness golden to logs
-        if: ${{ inputs.preserve_golden_only || inputs.generate_golden_only }}
         run: |
           set -euo pipefail
           test -s correctness_golden.json
