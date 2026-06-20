@@ -59,7 +59,9 @@ signature="$(printf '%s' "${string_to_sign}" \
 authorization="AWS4-HMAC-SHA256 Credential=${R2_ACCESS_KEY_ID}/${credential_scope}, SignedHeaders=${signed_headers}, Signature=${signature}"
 tmp_path="${output_path}.tmp"
 
+umask 077
 mkdir -p "$(dirname "${output_path}")"
+trap 'rm -f "${tmp_path}"' EXIT
 curl \
   --fail \
   --silent \
@@ -76,4 +78,5 @@ curl \
 
 chmod 600 "${tmp_path}"
 mv "${tmp_path}" "${output_path}"
+trap - EXIT
 echo "download-r2-object: wrote ${output_path}"
