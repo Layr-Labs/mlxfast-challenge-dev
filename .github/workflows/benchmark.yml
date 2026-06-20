@@ -34,12 +34,12 @@ on:
         default: true
         type: boolean
       preserve_golden_only:
-        description: "Restore the cached correctness golden and upload it as an artifact without setup, transform, correctness, or benchmark."
+        description: "Restore the cached correctness golden and upload metadata without setup, transform, correctness, or benchmark."
         required: false
         default: false
         type: boolean
       generate_golden_only:
-        description: "Generate and upload correctness_golden.json, then stop before correctness or benchmark."
+        description: "Generate/cache correctness_golden.json, then stop before correctness or benchmark."
         required: false
         default: false
         type: boolean
@@ -143,14 +143,13 @@ jobs:
           shasum -a 256 correctness_golden.json > correctness_golden.json.sha256
           wc -c correctness_golden.json > correctness_golden.json.bytes
 
-      - name: Upload preserved correctness golden artifact
+      - name: Upload preserved correctness golden metadata
         if: inputs.preserve_golden_only
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: correctness-golden-${{ github.run_id }}
+          name: correctness-golden-metadata-${{ github.run_id }}
           path: |
-            correctness_golden.json
             correctness_golden.json.sha256
             correctness_golden.json.bytes
           if-no-files-found: error
@@ -218,37 +217,6 @@ jobs:
           shasum -a 256 correctness_golden.json > correctness_golden.json.sha256
           wc -c correctness_golden.json > correctness_golden.json.bytes
 
-      - name: Print correctness golden to logs
-        run: |
-          set -euo pipefail
-          test -s correctness_golden.json
-          shasum -a 256 correctness_golden.json | tee correctness_golden.json.sha256
-          wc -c correctness_golden.json | tee correctness_golden.json.bytes
-
-          echo "::group::correctness_golden.json raw"
-          echo "MLXFAST_CORRECTNESS_GOLDEN_JSON_BEGIN"
-          cat correctness_golden.json
-          printf '\n'
-          echo "MLXFAST_CORRECTNESS_GOLDEN_JSON_END"
-          echo "::endgroup::"
-
-          echo "::group::correctness_golden.json base64"
-          echo "MLXFAST_CORRECTNESS_GOLDEN_B64_BEGIN"
-          base64 < correctness_golden.json | fold -w 76
-          echo "MLXFAST_CORRECTNESS_GOLDEN_B64_END"
-          echo "::endgroup::"
-
-      - name: Upload correctness golden artifact
-        if: ${{ !inputs.preserve_golden_only }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: correctness-golden-${{ github.run_id }}
-          path: |
-            correctness_golden.json
-            correctness_golden.json.sha256
-            correctness_golden.json.bytes
-          if-no-files-found: error
-
       - name: Save cached correctness golden
         if: env.MLXFAST_CORRECTNESS_GOLDEN_URL == '' && steps.prepare-correctness-golden.outputs.generated == 'true' && steps.restore-correctness-golden.outputs.cache-primary-key != '' && !startsWith(github.ref_name, 'submissions/') && !startsWith(github.ref_name, 'yukon/submissions/')
         continue-on-error: true
@@ -291,7 +259,8 @@ jobs:
           name: benchmark-results-${{ github.run_id }}
           path: |
             correctness-report.json
-            correctness_golden.json
+            correctness_golden.json.sha256
+            correctness_golden.json.bytes
             score.json
             score.json.sha256
             benchmark-integrity.json

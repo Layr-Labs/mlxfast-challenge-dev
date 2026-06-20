@@ -41,12 +41,11 @@ jobs:
           shasum -a 256 correctness_golden.json > correctness_golden.json.sha256
           wc -c correctness_golden.json > correctness_golden.json.bytes
 
-      - name: Upload correctness golden artifact
+      - name: Upload correctness golden metadata
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: correctness-golden-${{ github.run_id }}
+          name: correctness-golden-metadata-${{ github.run_id }}
           path: |
-            correctness_golden.json
             correctness_golden.json.sha256
             correctness_golden.json.bytes
           if-no-files-found: error
