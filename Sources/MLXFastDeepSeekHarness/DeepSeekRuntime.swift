@@ -797,6 +797,7 @@ public enum DeepSeekRuntime {
         var actualTokens: [Int] = []
         actualTokens.reserveCapacity(timingPlan.decodeSteps)
         let metricsBeforeDecode = weightCache.loader.expertStreamingMetrics?.snapshot()
+        let validationDelayMS = try validationTokenDelayMilliseconds()
         let session: MactopSession?
         if idleGBPerSecond != nil {
             do {
@@ -815,6 +816,9 @@ public enum DeepSeekRuntime {
         let start = DispatchTime.now().uptimeNanoseconds
         do {
             progress?("decode measured start tokens=\(timingPlan.decodeSteps)")
+            if validationDelayMS > 0 {
+                progress?("decode validation delay enabled milliseconds_per_token=\(validationDelayMS)")
+            }
             for decodedStep in 0..<timingPlan.decodeSteps {
                 logits = try DeepSeekModel.logits(
                     inputIDs: inputIDsArray([token]),
@@ -835,6 +839,9 @@ public enum DeepSeekRuntime {
                             actualToken: token
                         )
                     )
+                }
+                if validationDelayMS > 0 {
+                    Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
                 }
                 reportProgress(
                     step: decodedStep + 1,
@@ -922,6 +929,21 @@ public enum DeepSeekRuntime {
             Double(bytesRead) / Double(1 << 30) / Double(decodedTokens),
             "expert_streaming_reads"
         )
+    }
+
+    static func validationTokenDelayMilliseconds(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> Int {
+        let raw = environment["MLXFAST_VALIDATION_TOKEN_DELAY_MS"]?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ) ?? ""
+        guard !raw.isEmpty else {
+            return 0
+        }
+        guard let milliseconds = Int(raw), milliseconds >= 0 else {
+            throw MLXFastError.invalidInput("MLXFAST_VALIDATION_TOKEN_DELAY_MS must be a non-negative integer")
+        }
+        return milliseconds
     }
 
     private static func expertStats(from weightCache: DeepSeekRuntimeWeightCache) -> ExpertStreamingStats {
