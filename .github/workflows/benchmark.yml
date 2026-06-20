@@ -105,6 +105,22 @@ jobs:
           path: .mlxfast-cache/correctness-golden
           key: correctness-golden-${{ runner.os }}-${{ runner.arch }}-blacksmith-macos-26-${{ env.MLXFAST_CORRECTNESS_GOLDEN_CACHE_VERSION }}-${{ hashFiles('private_prompts.json', 'Package.resolved', 'Sources/MLXFastCore/Constants.swift', 'Sources/MLXFastCore/Golden.swift', 'Sources/MLXFastDeepSeekHarness/**') }}
 
+      - name: Use restored correctness golden for generate-only
+        id: prepare-restored-correctness-golden
+        if: ${{ inputs.generate_golden_only && env.MLXFAST_CORRECTNESS_GOLDEN_URL == '' }}
+        run: |
+          set -euo pipefail
+          if [[ -s "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" ]]; then
+            echo "benchmark: generate-only using restored correctness_golden.json"
+            cp "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" correctness_golden.json
+            shasum -a 256 correctness_golden.json > correctness_golden.json.sha256
+            wc -c correctness_golden.json > correctness_golden.json.bytes
+            echo "ready=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "benchmark: generate-only did not find restored correctness_golden.json; will generate after setup"
+            echo "ready=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Preserve cached correctness golden
         if: inputs.preserve_golden_only
         run: |
@@ -131,16 +147,16 @@ jobs:
           if-no-files-found: error
 
       - name: Setup Swift harness and reference checkpoint
-        if: ${{ !inputs.preserve_golden_only }}
+        if: ${{ !inputs.preserve_golden_only && steps.prepare-restored-correctness-golden.outputs.ready != 'true' }}
         run: ./setup.sh
 
       - name: Transform reference checkpoint
-        if: ${{ !inputs.preserve_golden_only }}
+        if: ${{ !inputs.preserve_golden_only && steps.prepare-restored-correctness-golden.outputs.ready != 'true' }}
         run: .build/release/mlxfast-swift transform
 
       - name: Prepare correctness golden
         id: prepare-correctness-golden
-        if: ${{ !inputs.preserve_golden_only }}
+        if: ${{ !inputs.preserve_golden_only && steps.prepare-restored-correctness-golden.outputs.ready != 'true' }}
         run: |
           set -euo pipefail
           if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
