@@ -193,3 +193,8 @@ cat > "${INTEGRITY_PATH}" <<EOF
   "transform_source_sha256": "$(json_string "${wanted_hash}")"
 }
 EOF
+
+if grep -Eq '"passed"[[:space:]]*:[[:space:]]*false' "${SCORE_PATH}"; then
+  echo "benchmark.sh: benchmark produced a failing score; see ${SCORE_PATH}" >&2
+  exit 1
+fi
