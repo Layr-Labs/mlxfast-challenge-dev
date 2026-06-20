@@ -45,7 +45,7 @@ on:
         type: string
 
 concurrency:
-  group: benchmark-${{ github.ref }}
+  group: benchmark-${{ github.ref }}-${{ inputs.run_benchmark && 'full' || 'correctness-only' }}
   cancel-in-progress: true
 
 permissions:
@@ -156,6 +156,13 @@ jobs:
         with:
           path: .mlxfast-cache/correctness-golden
           key: ${{ steps.restore-correctness-golden.outputs.cache-primary-key }}
+
+      - name: Upload correctness golden artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: correctness-golden-${{ github.run_id }}
+          path: correctness_golden.json
+          if-no-files-found: error
 
       - name: Correctness
         run: |
