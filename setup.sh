@@ -11,6 +11,9 @@ REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto
 REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-170}"
 REFERENCE_DOWNLOAD_JOBS="${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-8}"
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
+MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
+REFERENCE_DIR="${MLXFAST_REFERENCE_DIR:-reference_weights/DeepSeek-V4-Flash-4bit}"
+SETUP_STARTED_SECONDS="${SECONDS}"
 REFERENCE_REQUIRED_METADATA_FILES=(
   "config.json"
   "model.safetensors.index.json"
@@ -22,6 +25,106 @@ REFERENCE_OPTIONAL_METADATA_FILES=(
   "tokenizer.json"
   "tokenizer_config.json"
 )
+
+print_help() {
+  cat <<EOF
+Usage: ./setup.sh
+
+Checks the local macOS/Apple Silicon toolchain, builds the Swift harness,
+builds mlx.metallib, and downloads the DeepSeek V4 Flash 4-bit reference
+checkpoint when it is not already present.
+
+Important environment variables:
+  MLXFAST_REFERENCE_DIR              Reference checkpoint directory.
+                                     Default: ${REFERENCE_DIR}
+  MLXFAST_REFERENCE_BASE_URL         HTTP prefix for checkpoint files.
+                                     Default: ${DEFAULT_REFERENCE_BASE_URL}
+  MLXFAST_REFERENCE_DOWNLOAD_JOBS    Parallel safetensors downloads.
+                                     Default: ${REFERENCE_DOWNLOAD_JOBS}
+  MLXFAST_REFERENCE_MIN_FREE_GIB     Required free space before download.
+                                     Default: ${REFERENCE_MIN_FREE_GIB}
+  MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1    Build tools only; do not download weights.
+  MLXFAST_SKIP_MLX_METALLIB=1        Skip mlx.metallib build.
+  MLXFAST_SKIP_MACTOP_INSTALL=1      Skip mactop install/check.
+  MLXFAST_MACTOP_BIN=/path/mactop    Use a specific mactop binary.
+
+After setup:
+  .build/release/mlxfast-swift transform
+  ./benchmark.sh
+EOF
+}
+
+if [[ "$#" -gt 0 ]]; then
+  case "$1" in
+    -h|--help|help)
+      print_help
+      exit 0
+      ;;
+    *)
+      echo "setup.sh: unknown argument '$1'" >&2
+      echo "Run ./setup.sh --help for usage." >&2
+      exit 2
+      ;;
+  esac
+fi
+
+format_duration() {
+  local total_seconds="${1:-0}"
+  printf '%02d:%02d:%02d' \
+    $((total_seconds / 3600)) \
+    $(((total_seconds % 3600) / 60)) \
+    $((total_seconds % 60))
+}
+
+path_size_gib() {
+  local path="$1"
+  local size_kib
+
+  if [[ ! -e "${path}" ]]; then
+    printf '0.0'
+    return 0
+  fi
+
+  size_kib="$(du -sk "${path}" 2>/dev/null | awk '{print $1}')"
+  if [[ -z "${size_kib}" ]]; then
+    printf 'unknown'
+    return 0
+  fi
+
+  awk -v kib="${size_kib}" 'BEGIN { printf "%.1f", kib / 1024 / 1024 }'
+}
+
+print_setup_summary() {
+  local reference_status="${1:-ready}"
+  local elapsed="$((SECONDS - SETUP_STARTED_SECONDS))"
+  local reference_line
+  local metallib_line
+
+  if [[ "${reference_status}" == "skipped" ]]; then
+    reference_line="skipped (${REFERENCE_DIR})"
+  elif [[ -f "${REFERENCE_DIR}/config.json" ]]; then
+    reference_line="${REFERENCE_DIR} ($(path_size_gib "${REFERENCE_DIR}") GiB)"
+  else
+    reference_line="missing (${REFERENCE_DIR})"
+  fi
+
+  if [[ "${MLXFAST_SKIP_MLX_METALLIB:-0}" == "1" ]]; then
+    metallib_line="skipped (${MLX_METALLIB})"
+  else
+    metallib_line="${MLX_METALLIB}"
+  fi
+
+  cat <<EOF
+setup.sh: setup complete elapsed=$(format_duration "${elapsed}")
+setup.sh: summary
+  binary: ${SWIFT_BIN}
+  mlx.metallib: ${metallib_line}
+  reference checkpoint: ${reference_line}
+  next:
+    ${SWIFT_BIN} transform
+    ./benchmark.sh
+EOF
+}
 
 load_homebrew_shellenv() {
   local candidate
@@ -296,11 +399,13 @@ download_url_for_file() {
 download_reference_file() {
   local file="$1"
   local output_path="$2"
+  local label="${3:-${file}}"
   local marker_path="${output_path}.complete"
   local url="${REFERENCE_BASE_URL%/}/${file}"
+  local started_seconds
 
   if [[ -f "${marker_path}" && -s "${output_path}" ]]; then
-    echo "setup.sh: already downloaded ${file}"
+    echo "setup.sh: already downloaded ${label}"
     return 0
   fi
 
@@ -309,7 +414,8 @@ download_reference_file() {
   fi
 
   mkdir -p "$(dirname "${output_path}")"
-  echo "setup.sh: downloading ${file}"
+  started_seconds="${SECONDS}"
+  echo "setup.sh: downloading ${label}"
   if [[ -n "${REFERENCE_AUTH_HEADER}" ]]; then
     curl \
       --fail \
@@ -333,6 +439,7 @@ download_reference_file() {
       "${url}"
   fi
   touch "${marker_path}"
+  echo "setup.sh: downloaded ${label} elapsed=$(format_duration "$((SECONDS - started_seconds))")"
 }
 
 download_optional_reference_file() {
@@ -351,6 +458,8 @@ download_reference_shards() {
   local output_dir="$1"
   shift
   local jobs="${REFERENCE_DOWNLOAD_JOBS}"
+  local total="$#"
+  local started_seconds="${SECONDS}"
 
   if ! [[ "${jobs}" =~ ^[1-9][0-9]*$ ]]; then
     echo "setup.sh: MLXFAST_REFERENCE_DOWNLOAD_JOBS must be a positive integer" >&2
@@ -359,23 +468,35 @@ download_reference_shards() {
 
   if [[ "${jobs}" == "1" || "$#" -le 1 ]]; then
     local file
+    local ordinal=0
+    echo "setup.sh: downloading ${total} safetensors shard(s) with 1 parallel job"
     for file in "$@"; do
-      download_reference_file "${file}" "${output_dir}/${file}"
+      ordinal=$((ordinal + 1))
+      download_reference_file "${file}" "${output_dir}/${file}" "shard ${ordinal}/${total}: ${file}"
     done
+    echo "setup.sh: downloaded ${total}/${total} safetensors shard(s) elapsed=$(format_duration "$((SECONDS - started_seconds))")"
     return 0
   fi
 
-  echo "setup.sh: downloading $# safetensors shard(s) with ${jobs} parallel job(s)"
+  echo "setup.sh: downloading ${total} safetensors shard(s) with ${jobs} parallel job(s)"
   export REFERENCE_BASE_URL
   export REFERENCE_AUTH_HEADER
   export REFERENCE_APPEND_DOWNLOAD_QUERY
-  printf '%s\0' "$@" | xargs -0 -I{} -P "${jobs}" bash -c '
+  local ordinal=0
+  for file in "$@"; do
+    ordinal=$((ordinal + 1))
+    printf "%s|%s\0" "${ordinal}" "${file}"
+  done | xargs -0 -I{} -P "${jobs}" bash -c '
     set -euo pipefail
-    file="$1"
+    record="$1"
     output_dir="$2"
+    total="$3"
+    ordinal="${record%%|*}"
+    file="${record#*|}"
     output_path="${output_dir}/${file}"
     marker_path="${output_path}.complete"
     url="${REFERENCE_BASE_URL%/}/${file}"
+    started_seconds="${SECONDS}"
 
     download_url_for_file() {
       local url="$1"
@@ -411,14 +532,14 @@ download_reference_shards() {
     }
 
     if [[ -f "${marker_path}" && -s "${output_path}" ]]; then
-      echo "setup.sh: already downloaded ${file}"
+      echo "setup.sh: already downloaded shard ${ordinal}/${total}: ${file}"
       exit 0
     fi
 
     url="$(download_url_for_file "${url}")"
 
     mkdir -p "$(dirname "${output_path}")"
-    echo "setup.sh: downloading ${file}"
+    echo "setup.sh: downloading shard ${ordinal}/${total}: ${file}"
     if [[ -n "${REFERENCE_AUTH_HEADER:-}" ]]; then
       curl \
         --fail \
@@ -446,8 +567,9 @@ download_reference_shards() {
         "${url}"
     fi
     touch "${marker_path}"
-    echo "setup.sh: downloaded ${file}"
-  ' _ {} "${output_dir}"
+    echo "setup.sh: downloaded shard ${ordinal}/${total}: ${file} elapsed=$((SECONDS - started_seconds))s"
+  ' _ {} "${output_dir}" "${total}"
+  echo "setup.sh: downloaded ${total}/${total} safetensors shard(s) elapsed=$(format_duration "$((SECONDS - started_seconds))")"
 }
 
 list_reference_shards() {
@@ -600,11 +722,11 @@ else
   tools/build-mlx-metallib.sh
 fi
 
-REFERENCE_DIR="${MLXFAST_REFERENCE_DIR:-reference_weights/DeepSeek-V4-Flash-4bit}"
-
 if [[ "${MLXFAST_SKIP_WEIGHTS_DOWNLOAD:-0}" == "1" || "${SKIP_MODEL_DOWNLOAD:-0}" == "1" ]]; then
   echo "setup.sh: skipping reference weight download"
+  print_setup_summary "skipped"
   exit 0
 fi
 
 download_reference_weights "${REFERENCE_DIR}"
+print_setup_summary "ready"

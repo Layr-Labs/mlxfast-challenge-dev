@@ -10,6 +10,10 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
 
     #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://ds4.darkbloom.ai/deepseek-v4-flash-4bit\""))
     #expect(setup.contains("REFERENCE_BASE_URL=\"${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}\""))
+    #expect(setup.contains("Usage: ./setup.sh"))
+    #expect(setup.contains("downloaded ${total}/${total} safetensors shard(s)"))
+    #expect(setup.contains("setup.sh: setup complete elapsed="))
+    #expect(setup.contains("${SWIFT_BIN} transform"))
 }
 
 @Test

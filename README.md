@@ -39,15 +39,16 @@ transform source hash for run auditing.
 Full model setup needs a large local or mounted SSD. The reference checkpoint is
 `mlx-community/DeepSeek-V4-Flash-4bit`, with 33 safetensors shards totaling about
 141 GiB. `setup.sh` downloads the checkpoint from the fast Darkbloom/R2 mirror by
-default with resumable `curl` requests when `reference_weights/` is missing and
-checks for at least 170 GiB free by default. Use
+default with resumable `curl` requests when `reference_weights/` is missing,
+prints numbered shard progress with elapsed time, and checks for at least
+170 GiB free by default. Use
 `MLXFAST_REFERENCE_DIR=/Volumes/ssd/DeepSeek-V4-Flash-4bit` to point at a larger
 volume, or `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh` when the checkpoint will
 be supplied separately. The Swift CLI also honors `MLXFAST_REFERENCE_DIR`,
 `MLXFAST_WEIGHTS_PATH`, `MLXFAST_CORRECTNESS_GOLDEN_PATH`, and
 `MLXFAST_SCORE_PATH` as defaults; explicit CLI flags take precedence. Set
 `MLXFAST_REFERENCE_BASE_URL` to use another HTTP checkpoint prefix, including
-Hugging Face.
+Hugging Face. Run `./setup.sh --help` for the full local setup knobs.
 
 For manual GitHub Actions benchmark runs, dispatch `benchmark.yml` on a macOS
 Blacksmith runner. Set `reference_base_url` to an HTTP prefix containing the
