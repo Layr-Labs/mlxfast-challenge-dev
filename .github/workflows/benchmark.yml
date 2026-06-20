@@ -38,6 +38,11 @@ on:
         required: false
         default: false
         type: boolean
+      generate_golden_only:
+        description: "Generate and upload correctness_golden.json, then stop before correctness or benchmark."
+        required: false
+        default: false
+        type: boolean
       trace_correctness_step:
         description: "Optional maintainer diagnostic: trace logits at a 0-based correctness decode step. Disabled on submission branches."
         required: false
@@ -50,7 +55,7 @@ on:
         type: string
 
 concurrency:
-  group: benchmark-${{ github.ref }}-${{ inputs.preserve_golden_only && 'preserve-golden' || (inputs.run_benchmark && 'full' || 'correctness-only') }}
+  group: benchmark-${{ github.ref }}-${{ inputs.preserve_golden_only && 'preserve-golden' || (inputs.generate_golden_only && 'generate-golden' || (inputs.run_benchmark && 'full' || 'correctness-only')) }}
   cancel-in-progress: true
 
 permissions:
@@ -115,6 +120,7 @@ jobs:
 
       - name: Upload preserved correctness golden artifact
         if: inputs.preserve_golden_only
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: correctness-golden-${{ github.run_id }}
@@ -181,24 +187,50 @@ jobs:
             echo "generated=true" >> "${GITHUB_OUTPUT}"
           fi
           test -s correctness_golden.json
+          shasum -a 256 correctness_golden.json > correctness_golden.json.sha256
+          wc -c correctness_golden.json > correctness_golden.json.bytes
 
-      - name: Save cached correctness golden
-        if: env.MLXFAST_CORRECTNESS_GOLDEN_URL == '' && steps.prepare-correctness-golden.outputs.generated == 'true' && !startsWith(github.ref_name, 'submissions/') && !startsWith(github.ref_name, 'yukon/submissions/')
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: .mlxfast-cache/correctness-golden
-          key: ${{ steps.restore-correctness-golden.outputs.cache-primary-key }}
+      - name: Print correctness golden to logs
+        if: ${{ inputs.preserve_golden_only || inputs.generate_golden_only }}
+        run: |
+          set -euo pipefail
+          test -s correctness_golden.json
+          shasum -a 256 correctness_golden.json | tee correctness_golden.json.sha256
+          wc -c correctness_golden.json | tee correctness_golden.json.bytes
+
+          echo "::group::correctness_golden.json raw"
+          echo "MLXFAST_CORRECTNESS_GOLDEN_JSON_BEGIN"
+          cat correctness_golden.json
+          echo "MLXFAST_CORRECTNESS_GOLDEN_JSON_END"
+          echo "::endgroup::"
+
+          echo "::group::correctness_golden.json base64"
+          echo "MLXFAST_CORRECTNESS_GOLDEN_B64_BEGIN"
+          base64 < correctness_golden.json | fold -w 76
+          echo "MLXFAST_CORRECTNESS_GOLDEN_B64_END"
+          echo "::endgroup::"
 
       - name: Upload correctness golden artifact
         if: ${{ !inputs.preserve_golden_only }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: correctness-golden-${{ github.run_id }}
-          path: correctness_golden.json
+          path: |
+            correctness_golden.json
+            correctness_golden.json.sha256
+            correctness_golden.json.bytes
           if-no-files-found: error
 
+      - name: Save cached correctness golden
+        if: env.MLXFAST_CORRECTNESS_GOLDEN_URL == '' && steps.prepare-correctness-golden.outputs.generated == 'true' && steps.restore-correctness-golden.outputs.cache-primary-key != '' && !startsWith(github.ref_name, 'submissions/') && !startsWith(github.ref_name, 'yukon/submissions/')
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .mlxfast-cache/correctness-golden
+          key: ${{ steps.restore-correctness-golden.outputs.cache-primary-key }}
+
       - name: Correctness
-        if: ${{ !inputs.preserve_golden_only }}
+        if: ${{ !inputs.preserve_golden_only && !inputs.generate_golden_only }}
         run: |
           set -euo pipefail
           .build/release/mlxfast-swift correctness \
@@ -207,14 +239,14 @@ jobs:
             > correctness-report.json
 
       - name: Benchmark
-        if: ${{ !inputs.preserve_golden_only && inputs.run_benchmark }}
+        if: ${{ !inputs.preserve_golden_only && !inputs.generate_golden_only && inputs.run_benchmark }}
         env:
           MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
           MLXFAST_SKIP_TRANSFORM: "1"
         run: ./benchmark.sh
 
       - name: Trace correctness mismatch
-        if: always() && !inputs.preserve_golden_only && inputs.trace_correctness_step != '' && !startsWith(github.ref_name, 'submissions/')
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && inputs.trace_correctness_step != '' && !startsWith(github.ref_name, 'submissions/')
         run: |
           set -euo pipefail
           .build/release/mlxfast-swift correctness-trace \
@@ -225,7 +257,7 @@ jobs:
             > correctness-trace.json
 
       - name: Upload score artifacts
-        if: always() && !inputs.preserve_golden_only
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: benchmark-results-${{ github.run_id }}
@@ -239,7 +271,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Upload correctness trace artifact
-        if: always() && !inputs.preserve_golden_only && inputs.trace_correctness_step != '' && !startsWith(github.ref_name, 'submissions/')
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && inputs.trace_correctness_step != '' && !startsWith(github.ref_name, 'submissions/')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: correctness-trace-${{ github.run_id }}
