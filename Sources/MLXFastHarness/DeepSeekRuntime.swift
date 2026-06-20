@@ -324,13 +324,28 @@ public enum DeepSeekRuntime {
     public static func benchmark(_ options: BenchmarkOptions) -> ScorePayload {
         var correctnessReport: CorrectnessReport?
         var benchmarkLoader: DeepSeekWeightLoader?
+        let progress = makeBenchmarkProgressReporter()
         do {
+            progress("preflight start")
             _ = try BenchmarkPreflight.check(
                 weightsPath: options.weightsPath,
                 goldenPath: options.goldenPath
             )
+            progress("preflight complete")
+            progress("loading golden and config")
             let golden = try loadGoldenFixture(from: options.goldenPath)
             let config = try DeepSeekConfig.load(from: options.weightsPath)
+            let promptPlan = try BenchmarkPrompt.plan(from: golden)
+            progress(
+                "loaded golden cases=\(golden.cases.count) correctness_steps=\(MLXFastConstants.correctnessSteps) "
+                    + "prefill_tokens=\(promptPlan.prefillTokens.count) decode_steps=\(MLXFastConstants.benchmarkDecodeSteps)"
+            )
+
+            progress("mactop preflight start")
+            _ = try measureMactopIdleSamples(attempts: 1, progress: progress)
+            progress("mactop preflight complete")
+
+            progress("correctness start")
             let correctnessLoader = try DeepSeekWeightLoader(
                 weightsPath: options.weightsPath,
                 expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: true)
@@ -339,9 +354,13 @@ public enum DeepSeekRuntime {
             let correctness = runCorrectness(
                 cases: golden.cases,
                 weightCache: correctnessCache,
-                goldenHash: golden.sha256
-            )
+                goldenHash: golden.sha256,
+                progressIntervalSteps: 64
+            ) { caseName, checkedSteps, totalSteps in
+                progress("correctness case=\(caseName) checked=\(checkedSteps)/\(totalSteps)")
+            }
             correctnessReport = correctness
+            progress("correctness complete passed=\(correctness.passed) checked_steps=\(correctness.checkedSteps)")
             guard correctness.passed else {
                 return failedScore(
                     error: correctness.error.isEmpty ? "correctness gate failed" : correctness.error,
@@ -350,25 +369,27 @@ public enum DeepSeekRuntime {
                 )
             }
 
+            progress("benchmark loader start")
             let runtimeBenchmarkLoader = try DeepSeekWeightLoader(
                 weightsPath: options.weightsPath,
                 expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: true)
             )
             benchmarkLoader = runtimeBenchmarkLoader
             let benchmarkCache = DeepSeekRuntimeWeightCache(loader: runtimeBenchmarkLoader, config: config)
-            let promptPlan = try BenchmarkPrompt.plan(from: golden)
-            let idleSamples = try MactopSession.measureIdleSamples()
-            guard !idleSamples.isEmpty else {
-                throw MLXFastError.invalidInput("mactop idle measurement produced no samples")
-            }
-            let idleGBPerSecond = idleSamples.reduce(0, +) / Double(idleSamples.count)
+            progress("benchmark loader complete")
 
             Memory.peakMemory = 0
+            progress(
+                "prefill start prompt_tokens=\(promptPlan.prefillTokens.count) "
+                    + "warmup_runs=\(MLXFastConstants.benchmarkPrefillWarmupRuns) "
+                    + "timed_runs=\(MLXFastConstants.benchmarkPrefillTimedRuns)"
+            )
             let prefill = try measurePrefillSecondsPerToken(
                 caseName: promptPlan.name,
                 promptTokens: promptPlan.prefillTokens,
                 expectedToken: promptPlan.expectedPrefillToken,
-                weightCache: benchmarkCache
+                weightCache: benchmarkCache,
+                progress: progress
             )
             if let mismatch = prefill.mismatch {
                 return failedScore(
@@ -382,10 +403,25 @@ public enum DeepSeekRuntime {
                     actualToken: mismatch.actualToken
                 )
             }
+            progress("prefill complete seconds_per_token=\(formatDouble(prefill.secondsPerToken))")
+            let idleSamples = try measureMactopIdleSamples(progress: progress)
+            let idleGBPerSecond = idleSamples.reduce(0, +) / Double(idleSamples.count)
+            progress(
+                "mactop idle complete samples=\(idleSamples.count) idle_gb_per_second=\(formatDouble(idleGBPerSecond))"
+            )
+            progress(
+                "decode start seed_tokens=\(promptPlan.decodeSeedTokens.count) "
+                    + "timed_steps=\(MLXFastConstants.benchmarkDecodeSteps)"
+            )
             let decode = try measureDecode(
                 seedTokens: promptPlan.decodeSeedTokens,
                 weightCache: benchmarkCache,
-                idleGBPerSecond: idleGBPerSecond
+                idleGBPerSecond: idleGBPerSecond,
+                progress: progress
+            )
+            progress(
+                "decode complete seconds_per_token=\(formatDouble(decode.secondsPerToken)) "
+                    + "bandwidth_gb_per_token=\(formatDouble(decode.bandwidthGBPerToken))"
             )
             let decodeValidation = BenchmarkOutputValidator.compareDecode(
                 plan: promptPlan,
@@ -455,6 +491,7 @@ public enum DeepSeekRuntime {
                 )
             )
         } catch {
+            progress("failed error=\(singleLine("\(error)"))")
             return failedScore(
                 error: "\(error)",
                 correctness: correctnessReport,
@@ -467,14 +504,23 @@ public enum DeepSeekRuntime {
     private static func runCorrectness(
         cases: [GoldenCase],
         weightCache: DeepSeekRuntimeWeightCache,
-        goldenHash: String
+        goldenHash: String,
+        progressIntervalSteps: Int = 0,
+        progress: ((String, Int, Int) -> Void)? = nil
     ) -> CorrectnessReport {
         var checkedSteps = 0
         var currentCase: GoldenCase?
+        let totalSteps = cases.count * MLXFastConstants.correctnessSteps
         do {
             for testCase in cases {
                 currentCase = testCase
-                let comparison = try compareGreedyCached(testCase: testCase, weightCache: weightCache)
+                let comparison = try compareGreedyCached(
+                    testCase: testCase,
+                    weightCache: weightCache,
+                    progressIntervalSteps: progressIntervalSteps
+                ) { caseCheckedSteps, _ in
+                    progress?(testCase.name, checkedSteps + caseCheckedSteps, totalSteps)
+                }
                 if !comparison.passed {
                     let expertStats = expertStats(from: weightCache)
                     return CorrectnessReport(
@@ -551,7 +597,8 @@ public enum DeepSeekRuntime {
         caseName: String,
         promptTokens: [Int],
         expectedToken: Int,
-        weightCache: DeepSeekRuntimeWeightCache
+        weightCache: DeepSeekRuntimeWeightCache,
+        progress: ((String) -> Void)? = nil
     ) throws -> PrefillMeasurement {
         guard !promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("benchmark prefill prompt must not be empty")
@@ -563,6 +610,8 @@ public enum DeepSeekRuntime {
         timedElapsed.reserveCapacity(MLXFastConstants.benchmarkPrefillTimedRuns)
 
         for runIndex in 0..<totalRuns {
+            let label = runIndex < MLXFastConstants.benchmarkPrefillWarmupRuns ? "warmup" : "timed"
+            progress?("prefill \(label) run \(runIndex + 1)/\(totalRuns) start")
             let cache = DeepSeekModelCache(config: weightCache.config)
             let start = DispatchTime.now().uptimeNanoseconds
             let logits = try DeepSeekModel.logits(
@@ -583,6 +632,7 @@ public enum DeepSeekRuntime {
             }
             let elapsed = secondsSince(start)
             Memory.clearCache()
+            progress?("prefill \(label) run \(runIndex + 1)/\(totalRuns) elapsed=\(formatSeconds(elapsed))s")
 
             if runIndex >= MLXFastConstants.benchmarkPrefillWarmupRuns {
                 timedElapsed.append(elapsed)
@@ -599,10 +649,37 @@ public enum DeepSeekRuntime {
         )
     }
 
+    private static func measureMactopIdleSamples(
+        attempts: Int = 3,
+        progress: ((String) -> Void)? = nil
+    ) throws -> [Double] {
+        var lastError: Error?
+        for attempt in 1...attempts {
+            do {
+                progress?("mactop idle attempt \(attempt)/\(attempts) start")
+                let samples = try MactopSession.measureIdleSamples()
+                guard !samples.isEmpty else {
+                    throw MLXFastError.invalidInput("mactop idle measurement produced no samples")
+                }
+                progress?("mactop idle attempt \(attempt)/\(attempts) complete samples=\(samples.count)")
+                return samples
+            } catch {
+                lastError = error
+                progress?("mactop idle attempt \(attempt)/\(attempts) failed error=\(singleLine("\(error)"))")
+                if attempt < attempts {
+                    Thread.sleep(forTimeInterval: 2)
+                }
+            }
+        }
+
+        throw lastError ?? MLXFastError.invalidInput("mactop idle measurement failed")
+    }
+
     private static func measureDecode(
         seedTokens: [Int],
         weightCache: DeepSeekRuntimeWeightCache,
-        idleGBPerSecond: Double
+        idleGBPerSecond: Double,
+        progress: ((String) -> Void)? = nil
     ) throws -> DecodeMeasurement {
         guard !seedTokens.isEmpty else {
             throw MLXFastError.invalidInput("benchmark decode seed must not be empty")
@@ -612,6 +689,7 @@ public enum DeepSeekRuntime {
             decodeSteps: MLXFastConstants.benchmarkDecodeSteps
         )
 
+        progress?("decode warmup start")
         let warmupCache = DeepSeekModelCache(config: weightCache.config)
         let warmupLogits = try DeepSeekModel.logits(
             inputIDs: inputIDsArray(seedTokens),
@@ -621,8 +699,10 @@ public enum DeepSeekRuntime {
         )
         _ = try DeepSeekCorrectness.greedyToken(from: warmupLogits)
         Memory.clearCache()
+        progress?("decode warmup complete")
 
         let cache = DeepSeekModelCache(config: weightCache.config)
+        progress?("decode seed prefill start")
         var logits = try DeepSeekModel.logits(
             inputIDs: inputIDsArray(seedTokens),
             weightCache: weightCache,
@@ -632,9 +712,11 @@ public enum DeepSeekRuntime {
         var token = try DeepSeekCorrectness.greedyToken(from: logits)
         let seedToken = token
         cache.materializeCachedState()
+        progress?("decode seed prefill complete")
         var generatedTokens: [Int] = []
         generatedTokens.reserveCapacity(timingPlan.decodeSteps)
 
+        progress?("decode mactop session start")
         let session = try MactopSession.start()
         let start = DispatchTime.now().uptimeNanoseconds
         do {
@@ -647,10 +729,18 @@ public enum DeepSeekRuntime {
                 )
                 token = try DeepSeekCorrectness.greedyToken(from: logits)
                 generatedTokens.append(token)
+                reportProgress(
+                    step: decodedStep + 1,
+                    total: timingPlan.decodeSteps,
+                    intervalSteps: 64
+                ) { step, total in
+                    progress?("decode generated=\(step)/\(total)")
+                }
             }
 
             let elapsed = secondsSince(start)
             let samples = try session.stop()
+            progress?("decode mactop samples=\(samples.count)")
             let bandwidth = try MactopBandwidth.gigabytesPerToken(
                 samples: samples,
                 idleGBPerSecond: idleGBPerSecond,
@@ -728,6 +818,45 @@ public enum DeepSeekRuntime {
         Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000_000.0
     }
 
+    private static func makeBenchmarkProgressReporter() -> (String) -> Void {
+        let start = DispatchTime.now().uptimeNanoseconds
+        return { message in
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000_000.0
+            let line = "mlxfast: benchmark elapsed=\(formatSeconds(elapsed))s \(singleLine(message))\n"
+            if let data = line.data(using: .utf8) {
+                FileHandle.standardError.write(data)
+            }
+        }
+    }
+
+    private static func reportProgress(
+        step: Int,
+        total: Int,
+        intervalSteps: Int,
+        progress: ((Int, Int) -> Void)?
+    ) {
+        guard let progress, total > 0 else {
+            return
+        }
+        if step == 1 || step == total || (intervalSteps > 0 && step % intervalSteps == 0) {
+            progress(step, total)
+        }
+    }
+
+    private static func formatSeconds(_ value: Double) -> String {
+        String(format: "%.1f", value)
+    }
+
+    private static func formatDouble(_ value: Double) -> String {
+        String(format: "%.6f", value)
+    }
+
+    private static func singleLine(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+    }
+
     private static func commitIdentifier() -> String {
         (try? runProcess("/usr/bin/git", arguments: ["rev-parse", "--short", "HEAD"])) ?? ""
     }
@@ -800,7 +929,9 @@ public enum DeepSeekRuntime {
 
     private static func compareGreedyCached(
         testCase: GoldenCase,
-        weightCache: DeepSeekRuntimeWeightCache
+        weightCache: DeepSeekRuntimeWeightCache,
+        progressIntervalSteps: Int = 0,
+        progress: ((Int, Int) -> Void)? = nil
     ) throws -> CorrectnessTokenComparison {
         let steps = MLXFastConstants.correctnessSteps
         guard !testCase.promptTokens.isEmpty else {
@@ -838,7 +969,14 @@ public enum DeepSeekRuntime {
                     positionOffset: testCase.promptTokens.count + step - 1
                 )
             }
-            return try DeepSeekCorrectness.greedyToken(from: logits)
+            let token = try DeepSeekCorrectness.greedyToken(from: logits)
+            reportProgress(
+                step: step + 1,
+                total: steps,
+                intervalSteps: progressIntervalSteps,
+                progress: progress
+            )
+            return token
         }
     }
 

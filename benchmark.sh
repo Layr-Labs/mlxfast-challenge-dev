@@ -10,12 +10,37 @@ SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
 SANDBOX_PROFILE="${MLXFAST_SANDBOX_PROFILE:-tools/deny-network.sb}"
 SOURCE_HASH_PATH="${WEIGHTS_PATH}/.benchmark-source.sha256"
+INTEGRITY_PATH="${MLXFAST_INTEGRITY_PATH:-benchmark-integrity.json}"
+
+json_string() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_number_or_null() {
+  local value="$1"
+  if [[ -z "${value}" ]]; then
+    printf 'null'
+  else
+    printf '%s' "${value}"
+  fi
+}
+
+score_metric_string() {
+  local key="$1"
+  sed -n "s/.*\"${key}\" : \"\\([^\"]*\\)\".*/\\1/p" "${SCORE_PATH}" | head -n 1
+}
+
+score_metric_number() {
+  local key="$1"
+  sed -n "s/.*\"${key}\" : \\([0-9][0-9]*\\).*/\\1/p" "${SCORE_PATH}" | head -n 1
+}
 
 source_hash() {
   local paths=(
     "Package.swift"
     "Package.resolved"
     "Sources/MLXFastCore"
+    "Sources/MLXFastModel"
     "Sources/MLXFastTransform"
   )
 
@@ -94,7 +119,13 @@ mkdir -p "${WEIGHTS_PATH}"
 wanted_hash="$(source_hash)"
 current_hash="$(cat "${SOURCE_HASH_PATH}" 2>/dev/null || true)"
 
-if [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f "${WEIGHTS_PATH}/config.json" || "${current_hash}" != "${wanted_hash}" ]]; then
+if [[ "${MLXFAST_SKIP_TRANSFORM:-0}" == "1" ]]; then
+  if [[ ! -f "${WEIGHTS_PATH}/config.json" ]]; then
+    echo "benchmark.sh: MLXFAST_SKIP_TRANSFORM=1 but ${WEIGHTS_PATH}/config.json is missing" >&2
+    exit 1
+  fi
+  echo "benchmark.sh: reusing ${WEIGHTS_PATH}/ because MLXFAST_SKIP_TRANSFORM=1"
+elif [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f "${WEIGHTS_PATH}/config.json" || "${current_hash}" != "${wanted_hash}" ]]; then
   if [[ -f "${REFERENCE_PATH}/config.json" ]]; then
     echo "benchmark.sh: regenerating weights with Swift transform"
     clear_weights_dir
@@ -128,3 +159,28 @@ if [[ ! -s "${SCORE_PATH}" ]]; then
   echo "benchmark.sh: benchmark did not produce ${SCORE_PATH}" >&2
   exit 1
 fi
+
+score_hash="$(shasum -a 256 "${SCORE_PATH}" | awk '{print $1}')"
+printf '%s  %s\n' "${score_hash}" "${SCORE_PATH}" > "${SCORE_PATH}.sha256"
+
+weights_hash="$(score_metric_string weights_hash)"
+weights_file_count="$(score_metric_number weights_file_count)"
+weights_byte_count="$(score_metric_number weights_byte_count)"
+golden_hash=""
+if [[ -f "${GOLDEN_PATH}" ]]; then
+  golden_hash="$(shasum -a 256 "${GOLDEN_PATH}" | awk '{print $1}')"
+fi
+
+cat > "${INTEGRITY_PATH}" <<EOF
+{
+  "score_path": "$(json_string "${SCORE_PATH}")",
+  "score_sha256": "$(json_string "${score_hash}")",
+  "weights_path": "$(json_string "${WEIGHTS_PATH}")",
+  "weights_sha256": "$(json_string "${weights_hash}")",
+  "weights_file_count": $(json_number_or_null "${weights_file_count}"),
+  "weights_byte_count": $(json_number_or_null "${weights_byte_count}"),
+  "golden_path": "$(json_string "${GOLDEN_PATH}")",
+  "golden_sha256": "$(json_string "${golden_hash}")",
+  "transform_source_sha256": "$(json_string "${wanted_hash}")"
+}
+EOF

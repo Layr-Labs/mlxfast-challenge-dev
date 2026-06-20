@@ -14,10 +14,12 @@ public enum MLXFastConstants {
     public static let keyValueHeads = 1
     public static let routedExperts = 256
     public static let expertsPerToken = 6
+    // 256 greedy decode steps catches sustained KV-cache, router, and expert-streaming
+    // errors while keeping the CI gate short enough to run before the timed benchmark.
     public static let correctnessSteps = 256
     public static let benchmarkPrefillPromptTokens = 512
     public static let benchmarkDecodeSteps = 512
     public static let benchmarkDecodeSeedTokens = 32
     public static let benchmarkPrefillWarmupRuns = 1
-    public static let benchmarkPrefillTimedRuns = 2
+    public static let benchmarkPrefillTimedRuns = 1
 }
