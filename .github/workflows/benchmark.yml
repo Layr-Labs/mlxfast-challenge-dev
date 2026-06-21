@@ -285,6 +285,17 @@ jobs:
             echo "benchmark: correctness golden missing and R2 private prompt credentials are not configured" >&2
             exit 1
           fi
+          if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" && "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
+            actual_hash="$(shasum -a 256 correctness_golden.json | awk '{print $1}')"
+            actual_bytes="$(wc -c < correctness_golden.json | tr -d ' ')"
+            export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256="${actual_hash}"
+            export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES="${actual_bytes}"
+            {
+              echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"
+              echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"
+            } >> "${GITHUB_ENV}"
+            echo "benchmark: using private correctness golden ${actual_hash} bytes=${actual_bytes}"
+          fi
           .github/scripts/verify-correctness-golden.sh
 
       - name: Save cached correctness golden
