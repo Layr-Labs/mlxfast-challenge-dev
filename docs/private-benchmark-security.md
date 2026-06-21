@@ -20,13 +20,12 @@ Configure the `benchmark-private-prompts` Environment with:
   - `R2_BUCKET_ENDPOINT`
   - `R2_SECRET_ACCESS_KEY`
 
-The benchmark workflow downloads the private prompt manifest from
-`correctness_prompts/private_prompts.json` only when a trusted run has to
-generate `correctness_golden.json`. It writes the manifest under
-`$RUNNER_TEMP`, never the repository workspace, and does not upload or cache the
-prompt file. Bump the non-secret repository/environment variable
-`MLXFAST_PRIVATE_PROMPTS_CACHE_VERSION` when the private prompt manifest changes
-and the golden cache should be invalidated.
+Normal private benchmark runs download the precomputed
+`correctness_prompts/correctness_golden.json` object from the private R2 bucket.
+The private prompt manifest, `correctness_prompts/private_prompts.json`, is only
+an organizer input for regenerating the golden outside the benchmark workflow.
+It should not be downloaded by submission benchmark runs, written into the
+repository workspace, uploaded, or cached.
 
 The benchmark workflow also verifies at runtime that it is executing from:
 

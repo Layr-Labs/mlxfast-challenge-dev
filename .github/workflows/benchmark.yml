@@ -18,7 +18,7 @@ on:
         required: false
         type: string
       correctness_golden_url:
-        description: "Optional URL for precomputed correctness_golden.json. If empty, the workflow restores or creates a cached Blacksmith-generated golden."
+        description: "Optional URL for precomputed correctness_golden.json. If empty, private R2 correctness_prompts/correctness_golden.json is used when configured."
         required: false
         type: string
       reference_download_jobs:
@@ -42,12 +42,12 @@ on:
         default: true
         type: boolean
       preserve_golden_only:
-        description: "Restore the cached correctness golden and upload metadata without setup, transform, correctness, or benchmark."
+        description: "Download or restore correctness_golden.json and upload only hash/byte metadata without setup, transform, correctness, or benchmark."
         required: false
         default: false
         type: boolean
       generate_golden_only:
-        description: "Generate/cache correctness_golden.json, then stop before correctness or benchmark."
+        description: "Prepare correctness_golden.json, then stop before correctness or benchmark."
         required: false
         default: false
         type: boolean
@@ -80,7 +80,7 @@ jobs:
       MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH: fixtures/correctness_golden_512_256_benchmark256.json
       MLXFAST_CORRECTNESS_GOLDEN_URL_PRESENT: ${{ (inputs.correctness_golden_url != '' || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL != '') && '1' || '0' }}
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
-      MLXFAST_PRIVATE_PROMPTS_R2_PATH: correctness_prompts/private_prompts.json
+      MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/correctness_golden.json
       MLXFAST_PRIVATE_PROMPTS_CACHE_VERSION: ${{ vars.MLXFAST_PRIVATE_PROMPTS_CACHE_VERSION || 'r2-v1' }}
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: c5d520ec87cc4a105ff13a39ade581801049a90944d42f456d15a33ef080eb1e
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "20425"
@@ -145,7 +145,7 @@ jobs:
           if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
             echo "benchmark: using configured correctness golden URL"
           elif [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
-            echo "benchmark: using R2 private prompt manifest when golden generation is required"
+            echo "benchmark: using precomputed R2 private correctness golden"
           elif [[ -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
             echo "benchmark: using committed correctness golden fixture"
           else
@@ -154,7 +154,7 @@ jobs:
 
       - name: Restore cached correctness golden
         id: restore-correctness-golden
-        if: env.MLXFAST_CORRECTNESS_GOLDEN_URL_PRESENT == '0'
+        if: env.MLXFAST_CORRECTNESS_GOLDEN_URL_PRESENT == '0' && env.MLXFAST_PRIVATE_PROMPTS_R2_PRESENT != '1'
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: .mlxfast-cache/correctness-golden
@@ -163,9 +163,24 @@ jobs:
       - name: Use restored correctness golden for generate-only
         id: prepare-restored-correctness-golden
         if: ${{ inputs.generate_golden_only && env.MLXFAST_CORRECTNESS_GOLDEN_URL_PRESENT == '0' }}
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
-          if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" && -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
+          if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
+            echo "benchmark: generate-only downloading precomputed R2 correctness_golden.json"
+            .github/scripts/download-r2-object.sh \
+              "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" \
+              correctness_golden.json
+            actual_hash="$(shasum -a 256 correctness_golden.json | awk '{print $1}')"
+            actual_bytes="$(wc -c < correctness_golden.json | tr -d ' ')"
+            export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256="${actual_hash}"
+            export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES="${actual_bytes}"
+            .github/scripts/verify-correctness-golden.sh
+            echo "ready=true" >> "${GITHUB_OUTPUT}"
+          elif [[ -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
             echo "benchmark: generate-only using committed correctness_golden.json fixture"
             cp "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" correctness_golden.json
             .github/scripts/verify-correctness-golden.sh
@@ -176,20 +191,30 @@ jobs:
             .github/scripts/verify-correctness-golden.sh
             echo "ready=true" >> "${GITHUB_OUTPUT}"
           else
-            echo "benchmark: generate-only did not find restored correctness_golden.json; will generate after setup"
+            echo "benchmark: generate-only did not find a configured correctness_golden.json"
             echo "ready=false" >> "${GITHUB_OUTPUT}"
           fi
 
       - name: Preserve cached correctness golden
         if: inputs.preserve_golden_only
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
-          if [[ ! -s "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" ]]; then
+          if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
+            echo "benchmark: downloading precomputed R2 correctness_golden.json"
+            .github/scripts/download-r2-object.sh \
+              "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" \
+              correctness_golden.json
+          elif [[ -s "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" ]]; then
+            cp "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" correctness_golden.json
+          else
             echo "benchmark: cached correctness golden missing at ${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" >&2
             echo "benchmark: cache-hit=${{ steps.restore-correctness-golden.outputs.cache-hit }}" >&2
             exit 1
           fi
-          cp "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" correctness_golden.json
           actual_hash="$(shasum -a 256 correctness_golden.json | awk '{print $1}')"
           actual_bytes="$(wc -c < correctness_golden.json | tr -d ' ')"
           export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256="${actual_hash}"
@@ -203,13 +228,12 @@ jobs:
         with:
           name: correctness-golden-metadata-${{ github.run_id }}
           path: |
-            correctness_golden.json
             correctness_golden.json.sha256
             correctness_golden.json.bytes
           if-no-files-found: error
 
       - name: Setup Swift harness and reference checkpoint
-        if: ${{ !inputs.preserve_golden_only && steps.prepare-restored-correctness-golden.outputs.ready != 'true' }}
+        if: ${{ !inputs.preserve_golden_only && !inputs.generate_golden_only && steps.prepare-restored-correctness-golden.outputs.ready != 'true' }}
         env:
           MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || secrets.MLXFAST_REFERENCE_BASE_URL || 'https://ds4.darkbloom.ai/deepseek-v4-flash-4bit' }}
           MLXFAST_REFERENCE_AUTH_HEADER: ${{ secrets.MLXFAST_REFERENCE_AUTH_HEADER }}
@@ -218,7 +242,7 @@ jobs:
         run: ./setup.sh
 
       - name: Transform reference checkpoint
-        if: ${{ !inputs.preserve_golden_only && steps.prepare-restored-correctness-golden.outputs.ready != 'true' }}
+        if: ${{ !inputs.preserve_golden_only && !inputs.generate_golden_only && steps.prepare-restored-correctness-golden.outputs.ready != 'true' }}
         run: .build/release/mlxfast-swift transform
 
       - name: Prepare correctness golden
@@ -227,8 +251,6 @@ jobs:
         env:
           MLXFAST_CORRECTNESS_GOLDEN_URL: ${{ inputs.correctness_golden_url || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL }}
           MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER: ${{ secrets.MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER }}
-          MLXFAST_SUBMISSION_REF: ${{ inputs.submission_ref }}
-          MLXFAST_PRIVATE_PROMPTS_PATH: ${{ runner.temp }}/mlxfast-private/private_prompts.json
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -257,38 +279,19 @@ jobs:
                 --output correctness_golden.json \
                 "${MLXFAST_CORRECTNESS_GOLDEN_URL}"
             fi
+          elif [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
+            echo "benchmark: downloading precomputed R2 correctness_golden.json"
+            .github/scripts/download-r2-object.sh \
+              "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" \
+              correctness_golden.json
           elif [[ -s "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" ]]; then
             echo "benchmark: using cached correctness_golden.json"
             cp "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" correctness_golden.json
-          elif [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
-            if [[ -n "${MLXFAST_SUBMISSION_REF}" ]]; then
-              echo "benchmark: correctness golden missing during submitted run; refusing to generate with submitted code" >&2
-              exit 1
-            fi
-            case "${GITHUB_REF_NAME}" in
-              submissions/*|yukon/submissions/*)
-                echo "benchmark: correctness golden cache miss on submission branch; refusing to generate from submitted code." >&2
-                echo "benchmark: warm the cache from a trusted branch or provide correctness_golden_url." >&2
-                exit 1
-                ;;
-            esac
-            echo "benchmark: correctness golden cache miss; generating on this Blacksmith runner"
-            echo "benchmark: downloading private prompt manifest from R2"
-            .github/scripts/download-r2-object.sh \
-              "${MLXFAST_PRIVATE_PROMPTS_R2_PATH}" \
-              "${MLXFAST_PRIVATE_PROMPTS_PATH}"
-            mkdir -p "$(dirname "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}")"
-            .build/release/mlxfast-swift make-golden \
-              --weights weights \
-              --prompt-file "${MLXFAST_PRIVATE_PROMPTS_PATH}" \
-              --output "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}"
-            cp "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" correctness_golden.json
-            echo "generated=true" >> "${GITHUB_OUTPUT}"
           elif [[ -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
             echo "benchmark: using committed correctness_golden.json fixture"
             cp "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" correctness_golden.json
           else
-            echo "benchmark: correctness golden missing and R2 private prompt credentials are not configured" >&2
+            echo "benchmark: correctness golden missing; configure correctness_golden_url, private R2 correctness_golden.json, or a valid cache/fixture" >&2
             exit 1
           fi
           if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" && "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
@@ -303,14 +306,6 @@ jobs:
             echo "benchmark: using private correctness golden ${actual_hash} bytes=${actual_bytes}"
           fi
           .github/scripts/verify-correctness-golden.sh
-
-      - name: Save cached correctness golden
-        if: env.MLXFAST_CORRECTNESS_GOLDEN_URL_PRESENT == '0' && steps.prepare-correctness-golden.outputs.generated == 'true' && steps.restore-correctness-golden.outputs.cache-primary-key != '' && !startsWith(github.ref_name, 'submissions/') && !startsWith(github.ref_name, 'yukon/submissions/')
-        continue-on-error: true
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: .mlxfast-cache/correctness-golden
-          key: ${{ steps.restore-correctness-golden.outputs.cache-primary-key }}
 
       - name: Correctness
         if: ${{ !inputs.preserve_golden_only && !inputs.generate_golden_only && !inputs.run_benchmark }}

@@ -54,21 +54,14 @@ For manual GitHub Actions benchmark runs, dispatch `benchmark.yml` on a macOS
 Blacksmith runner. Set `reference_base_url` to an HTTP prefix containing the
 reference checkpoint files, such as an R2 public bucket or Worker route. The
 workflow requires a precomputed `correctness_golden.json` through the
-`correctness_golden_url` input or `MLXFAST_CORRECTNESS_GOLDEN_URL` repository
-secret. If neither is configured, the workflow restores a cached
-Blacksmith-generated `correctness_golden.json`; on a trusted branch cache miss it
-downloads `correctness_prompts/private_prompts.json` from the configured private
-R2 bucket, generates the file once with `make-golden`, saves it to the Actions
-cache, and reuses it on later runs. Submission branches may restore this cache
-but refuse to generate goldens from submitted code. The checked-in fixture is
-only a public bring-up artifact; final hidden goldens should still come from a
-protected URL or secret-managed storage, not the public cache. Bump
-`MLXFAST_CORRECTNESS_GOLDEN_CACHE_VERSION` in `benchmark.yml` when intentionally
-invalidating the cached public golden, and bump
-`MLXFAST_PRIVATE_PROMPTS_CACHE_VERSION` when the private prompt manifest changes.
-Private endpoints can pass headers through `MLXFAST_REFERENCE_AUTH_HEADER` and
-`MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER` repository secrets. Private prompt
-generation uses the `R2_ACCESS_KEY_ID`, `R2_BUCKET_ENDPOINT`, and
+`correctness_golden_url` input, `MLXFAST_CORRECTNESS_GOLDEN_URL` repository
+secret, or the private R2 object
+`correctness_prompts/correctness_golden.json`. If none of those is configured,
+the workflow falls back to a cached or checked-in public bring-up fixture. Final
+hidden goldens should come from protected storage, not the public cache. Private
+endpoints can pass headers through `MLXFAST_REFERENCE_AUTH_HEADER` and
+`MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER` repository secrets. Private R2 golden
+downloads use the `R2_ACCESS_KEY_ID`, `R2_BUCKET_ENDPOINT`, and
 `R2_SECRET_ACCESS_KEY` secrets.
 
 ## Why this challenge exists
@@ -192,12 +185,12 @@ Organizer golden files can be generated from a private prompt manifest:
 ```
 
 This repo currently includes a temporary `private_prompts.json` manifest and a
-public fixture for manual benchmark bring-up. Benchmark CI uses a
-Blacksmith-generated cached `correctness_golden.json` when no golden URL is
-configured, downloading the private prompt manifest from R2 only for trusted
-golden generation after a cache miss. Generate final hidden goldens outside the
-public repository and provide the resulting file to benchmark CI with
-`correctness_golden_url` or `MLXFAST_CORRECTNESS_GOLDEN_URL`.
+public fixture for manual benchmark bring-up. In private CI, the normal path
+downloads the precomputed `correctness_prompts/correctness_golden.json` object
+from R2; the private prompt manifest is only needed when regenerating that
+golden outside the benchmark workflow. Generate final hidden goldens outside the
+public repository and provide the resulting file to benchmark CI with R2,
+`correctness_golden_url`, or `MLXFAST_CORRECTNESS_GOLDEN_URL`.
 
 The manifest contains correctness prompts plus a dedicated benchmark prompt
 (arrays shown as placeholders):
