@@ -2394,6 +2394,7 @@ private final class RuntimeWorkerClient {
     private let process: Process
     private let input: FileHandle
     private let output: FileHandle
+    private let errorOutput: FileHandle
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var nextID = 1
@@ -2403,7 +2404,7 @@ private final class RuntimeWorkerClient {
         let process = Process()
         let stdin = Pipe()
         let stdout = Pipe()
-        let stderr = try FileHandle(forWritingTo: URL(fileURLWithPath: "/dev/null"))
+        let stderr = Pipe()
         if let sandboxProfilePath = options.sandboxProfilePath {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
             process.arguments = [
@@ -2445,6 +2446,7 @@ private final class RuntimeWorkerClient {
         self.process = process
         self.input = stdin.fileHandleForWriting
         self.output = stdout.fileHandleForReading
+        self.errorOutput = stderr.fileHandleForReading
     }
 
     deinit {
@@ -2498,7 +2500,7 @@ private final class RuntimeWorkerClient {
         validationDelayMilliseconds: Int? = nil
     ) throws -> RuntimeWorkerResponse {
         guard process.isRunning else {
-            throw MLXFastError.invalidInput("runtime worker exited before request \(kind)")
+            throw MLXFastError.invalidInput("runtime worker exited before request \(kind): \(workerExitDiagnostic())")
         }
         let id = nextID
         nextID += 1
@@ -2530,7 +2532,9 @@ private final class RuntimeWorkerClient {
         while true {
             let byte = output.readData(ofLength: 1)
             if byte.isEmpty {
-                throw MLXFastError.invalidInput("runtime worker closed stdout before returning a response")
+                throw MLXFastError.invalidInput(
+                    "runtime worker closed stdout before returning a response: \(workerExitDiagnostic())"
+                )
             }
             if byte[byte.startIndex] == 0x0a {
                 break
@@ -2538,6 +2542,32 @@ private final class RuntimeWorkerClient {
             data.append(byte)
         }
         return try decoder.decode(RuntimeWorkerResponse.self, from: data)
+    }
+
+    private func workerExitDiagnostic() -> String {
+        if process.isRunning {
+            process.terminate()
+        }
+        process.waitUntilExit()
+        let stderr = String(data: errorOutput.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        let redacted = sanitizeWorkerDiagnostic(trimmed)
+        if redacted.isEmpty {
+            return "exit_status=\(process.terminationStatus)"
+        }
+        return "exit_status=\(process.terminationStatus) stderr=\(redacted)"
+    }
+
+    private func sanitizeWorkerDiagnostic(_ value: String) -> String {
+        let singleLine = value
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        if singleLine.range(of: "expected", options: .caseInsensitive) != nil
+            || singleLine.range(of: "actual", options: .caseInsensitive) != nil
+        {
+            return "token-validation-failed"
+        }
+        return singleLine
     }
 }
 
