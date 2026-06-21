@@ -296,6 +296,78 @@ func deepSeekCompressedAttentionUsesPoolingCacheWhenRuntimeTestsAreEnabled() thr
 }
 
 @Test
+func deepSeekCompressedAttentionWarmsIndexerCacheBeforeSparseBranchWhenRuntimeTestsAreEnabled() throws {
+    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+        return
+    }
+
+    let spec = DeepSeekCompressedAttentionSpec(
+        numAttentionHeads: 1,
+        headDim: 2,
+        outputGroups: 1,
+        qkRopeHeadDim: 2,
+        ropeTheta: 10_000.0,
+        ropeScaling: nil,
+        maxPositionEmbeddings: 1_024,
+        rmsNormEps: 0,
+        compressRatio: 4,
+        indexHeads: 1,
+        indexHeadDim: 2,
+        indexTopK: 2
+    )
+    let identity = MLXArray([Float(1), 0, 0, 1], [2, 2])
+    let compressor = DeepSeekCompressorWeights(
+        wkv: MLXArray([Float(1), 0, 0, 1, 1, 0, 0, 1], [4, 2]),
+        wgate: zeros([4, 2], dtype: .float32),
+        ape: zeros([4, 4], dtype: .float32),
+        norm: ones([2], dtype: .float32)
+    )
+    let weights = DeepSeekCompressedAttentionWeights(
+        attention: DeepSeekLocalAttentionWeights(
+            wqA: identity,
+            qNorm: ones([2], dtype: .float32),
+            wqB: identity,
+            wkv: identity,
+            kvNorm: ones([2], dtype: .float32),
+            woA: MLXArray([Float(1), 0, 0, 1], [1, 2, 2]),
+            woB: identity
+        ),
+        compressor: compressor,
+        indexer: DeepSeekIndexerWeights(
+            wqB: identity,
+            weightsProj: MLXArray([Float(1), 1], [1, 2]),
+            compressor: compressor
+        )
+    )
+    let cache = DeepSeekLayerCache(
+        local: DeepSeekLocalKVCache(maxSize: 4),
+        pooled: DeepSeekPoolingCache(ratio: 4),
+        indexPooled: DeepSeekPoolingCache(ratio: 4)
+    )
+    _ = try DeepSeekCompressedAttention.forward(
+        MLXArray((1...6).map { Float($0) }, [1, 3, 2]),
+        weights: weights,
+        spec: spec,
+        cache: cache,
+        windowSize: 4
+    )
+    #expect(cache.pooled?.pooledLength == 0)
+    #expect(cache.indexPooled?.pooledLength == 0)
+
+    let decode = try DeepSeekCompressedAttention.forward(
+        MLXArray([Float(7), 8], [1, 1, 2]),
+        weights: weights,
+        spec: spec,
+        cache: cache,
+        windowSize: 4,
+        positionOffset: 3
+    )
+    #expect(decode.shape == [1, 1, 2])
+    #expect(cache.pooled?.pooledLength == 1)
+    #expect(cache.indexPooled?.pooledLength == 1)
+}
+
+@Test
 func deepSeekCompressedAttentionRunsSparsePooledBranchWhenRuntimeTestsAreEnabled() throws {
     guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
         return

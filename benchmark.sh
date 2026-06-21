@@ -10,12 +10,104 @@ SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
 SANDBOX_PROFILE="${MLXFAST_SANDBOX_PROFILE:-tools/deny-network.sb}"
 SOURCE_HASH_PATH="${WEIGHTS_PATH}/.benchmark-source.sha256"
+INTEGRITY_PATH="${MLXFAST_INTEGRITY_PATH:-benchmark-integrity.json}"
+USE_RUNTIME_WORKER="${MLXFAST_USE_RUNTIME_WORKER:-1}"
+
+json_string() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_number_or_null() {
+  local value="$1"
+  if [[ -z "${value}" ]]; then
+    printf 'null'
+  else
+    printf '%s' "${value}"
+  fi
+}
+
+absolute_path() {
+  local path="$1"
+  local dir
+  local base
+  dir="$(dirname "${path}")"
+  base="$(basename "${path}")"
+  if [[ "${dir}" = "." ]]; then
+    printf '%s/%s\n' "${PWD}" "${base}"
+  else
+    (cd "${dir}" 2>/dev/null && printf '%s/%s\n' "${PWD}" "${base}") || printf '%s\n' "${path}"
+  fi
+}
+
+sandbox_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+write_runtime_worker_sandbox_profile() {
+  if [[ "${USE_RUNTIME_WORKER}" != "1" || "${MLXFAST_NO_SANDBOX:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ -n "${MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE:-}" ]]; then
+    return 0
+  fi
+  if ! command -v sandbox-exec >/dev/null 2>&1; then
+    echo "benchmark.sh: sandbox-exec not found for runtime worker sandbox" >&2
+    exit 1
+  fi
+
+  local profile
+  local golden_absolute
+  local private_dir_absolute
+  profile="$(mktemp "${TMPDIR:-/tmp}/mlxfast-runtime-worker.XXXXXX.sb")"
+  golden_absolute="$(absolute_path "${GOLDEN_PATH}")"
+  {
+    cat <<EOF
+(version 1)
+(allow default)
+(deny network*)
+(allow network* (remote ip "localhost:*"))
+(allow network* (local unix-socket))
+(allow network* (remote unix-socket))
+(allow network-bind (local ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
+(deny file-read* (literal "$(sandbox_escape "${golden_absolute}")"))
+(deny file-write* (literal "$(sandbox_escape "${golden_absolute}")"))
+EOF
+    if [[ -n "${MLXFAST_PRIVATE_DIR:-}" ]]; then
+      private_dir_absolute="$(absolute_path "${MLXFAST_PRIVATE_DIR}")"
+      cat <<EOF
+(deny file-read* (subpath "$(sandbox_escape "${private_dir_absolute}")"))
+(deny file-write* (subpath "$(sandbox_escape "${private_dir_absolute}")"))
+EOF
+    fi
+  } > "${profile}"
+  export MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE="${profile}"
+}
+
+run_offline_command() {
+  if [[ "${MLXFAST_IN_SANDBOX:-0}" == "1" || "${MLXFAST_NO_SANDBOX:-0}" == "1" ]]; then
+    "$@"
+    return 0
+  fi
+  .github/scripts/run-offline.sh "$@"
+}
+
+score_metric_string() {
+  local key="$1"
+  sed -n "s/.*\"${key}\" : \"\\([^\"]*\\)\".*/\\1/p" "${SCORE_PATH}" | head -n 1
+}
+
+score_metric_number() {
+  local key="$1"
+  sed -n "s/.*\"${key}\" : \\([0-9][0-9]*\\).*/\\1/p" "${SCORE_PATH}" | head -n 1
+}
 
 source_hash() {
   local paths=(
     "Package.swift"
     "Package.resolved"
     "Sources/MLXFastCore"
+    "Sources/MLXFastModel"
     "Sources/MLXFastTransform"
   )
 
@@ -55,12 +147,11 @@ if [[ "${MLXFAST_IN_SANDBOX:-0}" != "1" && ! -x "${SWIFT_BIN}" ]]; then
   swift build -c release
 fi
 
-# The benchmark runtime always runs offline. Unless already inside the sandbox,
-# prove the Seatbelt profile blocks egress, then re-exec under sandbox-exec (no
-# sudo needed) so transform/runtime code never sees the network — locally or in
-# CI. The proxy vars point at a closed local port so anything that ignores the
-# profile fails fast instead of hanging.
-if [[ "${MLXFAST_IN_SANDBOX:-0}" != "1" && "${MLXFAST_NO_SANDBOX:-0}" != "1" ]]; then
+# When the runtime worker is disabled, sandbox this whole script so model code
+# cannot use the network. With the worker enabled, do not sandbox the parent:
+# Blacksmith rejects nested sandbox-exec. Submitted transform runs through
+# run-offline.sh below, and submitted model execution runs in the worker sandbox.
+if [[ "${USE_RUNTIME_WORKER}" != "1" && "${MLXFAST_IN_SANDBOX:-0}" != "1" && "${MLXFAST_NO_SANDBOX:-0}" != "1" ]]; then
   if ! command -v sandbox-exec >/dev/null 2>&1; then
     echo "benchmark.sh: sandbox-exec not found (the benchmark requires macOS)." >&2
     echo "Set MLXFAST_NO_SANDBOX=1 to skip the offline sandbox; scores" >&2
@@ -90,15 +181,24 @@ if [[ ! -f "${MLX_METALLIB}" ]]; then
   echo "benchmark.sh: MLX metallib missing at ${MLX_METALLIB}; run ./setup.sh before ranked benchmark runs" >&2
 fi
 
+write_runtime_worker_sandbox_profile
+export MLXFAST_USE_RUNTIME_WORKER="${USE_RUNTIME_WORKER}"
+
 mkdir -p "${WEIGHTS_PATH}"
 wanted_hash="$(source_hash)"
 current_hash="$(cat "${SOURCE_HASH_PATH}" 2>/dev/null || true)"
 
-if [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f "${WEIGHTS_PATH}/config.json" || "${current_hash}" != "${wanted_hash}" ]]; then
+if [[ "${MLXFAST_SKIP_TRANSFORM:-0}" == "1" ]]; then
+  if [[ ! -f "${WEIGHTS_PATH}/config.json" ]]; then
+    echo "benchmark.sh: MLXFAST_SKIP_TRANSFORM=1 but ${WEIGHTS_PATH}/config.json is missing" >&2
+    exit 1
+  fi
+  echo "benchmark.sh: reusing ${WEIGHTS_PATH}/ because MLXFAST_SKIP_TRANSFORM=1"
+elif [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f "${WEIGHTS_PATH}/config.json" || "${current_hash}" != "${wanted_hash}" ]]; then
   if [[ -f "${REFERENCE_PATH}/config.json" ]]; then
     echo "benchmark.sh: regenerating weights with Swift transform"
     clear_weights_dir
-    "${SWIFT_BIN}" transform --reference "${REFERENCE_PATH}" --output "${WEIGHTS_PATH}"
+    run_offline_command "${SWIFT_BIN}" transform --reference "${REFERENCE_PATH}" --output "${WEIGHTS_PATH}"
     if [[ ! -f "${WEIGHTS_PATH}/config.json" ]]; then
       echo "benchmark.sh: Swift transform did not produce ${WEIGHTS_PATH}/config.json" >&2
       exit 1
@@ -116,6 +216,15 @@ else
   echo "benchmark.sh: reusing ${WEIGHTS_PATH}/ for unchanged transform source"
 fi
 
+if [[ "${MLXFAST_VERIFY_TRANSFORM:-0}" == "1" ]]; then
+  if [[ ! -f "${REFERENCE_PATH}/config.json" ]]; then
+    echo "benchmark.sh: MLXFAST_VERIFY_TRANSFORM=1 requires reference weights at ${REFERENCE_PATH}" >&2
+    exit 1
+  fi
+  echo "benchmark.sh: verifying weights match a fresh run of the submitted Swift transform"
+  run_offline_command "${SWIFT_BIN}" verify-transform --reference "${REFERENCE_PATH}" --weights "${WEIGHTS_PATH}"
+fi
+
 rm -f "${SCORE_PATH}"
 
 "${SWIFT_BIN}" benchmark \
@@ -126,5 +235,35 @@ rm -f "${SCORE_PATH}"
 
 if [[ ! -s "${SCORE_PATH}" ]]; then
   echo "benchmark.sh: benchmark did not produce ${SCORE_PATH}" >&2
+  exit 1
+fi
+
+score_hash="$(shasum -a 256 "${SCORE_PATH}" | awk '{print $1}')"
+printf '%s  %s\n' "${score_hash}" "${SCORE_PATH}" > "${SCORE_PATH}.sha256"
+
+weights_hash="$(score_metric_string weights_hash)"
+weights_file_count="$(score_metric_number weights_file_count)"
+weights_byte_count="$(score_metric_number weights_byte_count)"
+golden_hash=""
+if [[ -f "${GOLDEN_PATH}" ]]; then
+  golden_hash="$(shasum -a 256 "${GOLDEN_PATH}" | awk '{print $1}')"
+fi
+
+cat > "${INTEGRITY_PATH}" <<EOF
+{
+  "score_path": "$(json_string "${SCORE_PATH}")",
+  "score_sha256": "$(json_string "${score_hash}")",
+  "weights_path": "$(json_string "${WEIGHTS_PATH}")",
+  "weights_sha256": "$(json_string "${weights_hash}")",
+  "weights_file_count": $(json_number_or_null "${weights_file_count}"),
+  "weights_byte_count": $(json_number_or_null "${weights_byte_count}"),
+  "golden_path": "[private]",
+  "golden_sha256": "$(json_string "${golden_hash}")",
+  "transform_source_sha256": "$(json_string "${wanted_hash}")"
+}
+EOF
+
+if grep -Eq '"passed"[[:space:]]*:[[:space:]]*false' "${SCORE_PATH}"; then
+  echo "benchmark.sh: benchmark produced a failing score; see ${SCORE_PATH}" >&2
   exit 1
 fi

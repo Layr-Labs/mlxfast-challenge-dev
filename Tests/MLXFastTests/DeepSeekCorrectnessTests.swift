@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import MLX
 import MLXFastCore
+@testable import MLXFastModel
 @testable import MLXFastHarness
 import Testing
 
@@ -77,43 +78,28 @@ func deepSeekCorrectnessGeneratesGreedyTokensWithGrowingContext() throws {
 }
 
 @Test
-func deepSeekCorrectnessGeneratesGreedyTokensFromPreviousToken() throws {
-    var calls: [(Int, Int?)] = []
-    let generated = try DeepSeekCorrectness.generateGreedyTokens(steps: 3) { step, previousToken in
-        calls.append((step, previousToken))
-        return (previousToken ?? 10) + step
+func deepSeekCorrectnessTeacherForcedUsesGoldenPrefix() throws {
+    var contexts: [[Int]] = []
+    let expected = [20, 21, 22]
+    let comparison = try DeepSeekCorrectness.compareTeacherForcedNoCache(
+        promptTokens: [10, 11],
+        expectedTokens: expected,
+        steps: expected.count
+    ) { context in
+        contexts.append(context)
+        return expected[context.count - 2]
     }
 
-    #expect(generated == [10, 11, 13])
-    #expect(calls.map(\.0) == [0, 1, 2])
-    #expect(calls.map(\.1) == [nil, 10, 11])
-}
-
-@Test
-func deepSeekCorrectnessComparesGeneratedGreedyTokens() throws {
-    var calls: [(Int, Int?)] = []
-    let comparison = try DeepSeekCorrectness.compareGreedyTokens(
-        expected: [2, 3, 99],
-        steps: 3
-    ) { step, previousToken in
-        calls.append((step, previousToken))
-        return step + 2
-    }
-
-    #expect(!comparison.passed)
+    #expect(comparison.passed)
     #expect(comparison.checkedSteps == 3)
-    #expect(comparison.firstFailingStep == 2)
-    #expect(comparison.expectedToken == 99)
-    #expect(comparison.actualToken == 4)
-    #expect(calls.map(\.0) == [0, 1, 2])
-    #expect(calls.map(\.1) == [nil, 2, 3])
+    #expect(contexts == [[10, 11], [10, 11, 20], [10, 11, 20, 21]])
 }
 
 @Test
 func correctnessReportEncodesStableFailureFields() throws {
     let report = CorrectnessReport(
         passed: true,
-        checkedSteps: 256,
+        checkedSteps: MLXFastConstants.correctnessSteps,
         caseCount: 1,
         expertCacheHits: 4,
         expertCacheMisses: 6,
@@ -138,7 +124,7 @@ func correctnessReportEncodesStableFailureFields() throws {
     #expect(raw.contains("\"first_failing_step\" : null"))
     #expect(raw.contains("\"expected_token\" : null"))
     #expect(raw.contains("\"actual_token\" : null"))
-    #expect(raw.contains("\"checked_steps\" : 256"))
+    #expect(raw.contains("\"checked_steps\" : \(MLXFastConstants.correctnessSteps)"))
     #expect(raw.contains("\"case_count\" : 1"))
     #expect(raw.contains("\"expert_cache_hits\" : 4"))
     #expect(raw.contains("\"expert_cache_misses\" : 6"))
@@ -184,7 +170,7 @@ func deepSeekRuntimeCorrectnessReportsGoldenMetadataWhenWeightsAreMissing() thro
       "cases": [
         {
           "name": "valid-golden",
-          "prompt_tokens": [1],
+          "prompt_tokens": \(arrayJSON(Array(repeating: 1, count: MLXFastConstants.correctnessPromptTokens))),
           "expected_tokens": \(expected)
         }
       ]
@@ -229,4 +215,8 @@ private func temporaryDirectory() throws -> URL {
     )
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
+}
+
+private func arrayJSON(_ values: [Int]) -> String {
+    "[\(values.map(String.init).joined(separator: ","))]"
 }

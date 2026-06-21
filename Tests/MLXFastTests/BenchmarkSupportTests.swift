@@ -1,7 +1,7 @@
 import Foundation
 @testable import MLXFastCore
-@testable import MLXFastHarness
 @testable import MLXFastModel
+@testable import MLXFastHarness
 import Testing
 
 @Test
@@ -28,6 +28,34 @@ func mactopBandwidthParsesNDJSONSamples() {
     """.data(using: .utf8)!
 
     #expect(MactopBandwidth.parseSamples(from: data) == [3.25, 4.75, 0])
+}
+
+@Test
+func runtimeWorkerClientSkipsNonJSONStdoutLines() {
+    #expect(runtimeWorkerLineLooksLikeJSONResponse(Data("  {\"id\":1,\"ok\":true}".utf8)))
+    #expect(!runtimeWorkerLineLooksLikeJSONResponse(Data("Metal device initialized".utf8)))
+    #expect(!runtimeWorkerLineLooksLikeJSONResponse(Data("".utf8)))
+}
+
+@Test
+func correctnessAcceptsOnlyExactTopLogitTies() {
+    #expect(correctnessTokenAccepted(
+        expectedToken: 30,
+        actualToken: 1,
+        topLogits: [
+            CorrectnessTraceLogit(token: 1, logit: 19.25),
+            CorrectnessTraceLogit(token: 30, logit: 19.25),
+        ]
+    ))
+    #expect(!correctnessTokenAccepted(
+        expectedToken: 30,
+        actualToken: 1,
+        topLogits: [
+            CorrectnessTraceLogit(token: 1, logit: 19.25),
+            CorrectnessTraceLogit(token: 30, logit: 19.0),
+        ]
+    ))
+    #expect(!correctnessTokenAccepted(expectedToken: 30, actualToken: 1, topLogits: nil))
 }
 
 @Test
@@ -81,119 +109,42 @@ func decodeTimingPlanRejectsInvalidRanges() throws {
 }
 
 @Test
-func benchmarkPromptPlanUsesGoldenBenchmarkBlock() throws {
+func submissionValidationDelayDefaultsToZero() throws {
+    #expect(DeepSeekSubmissionControls.measuredDecodeDelayMilliseconds == 0)
+    #expect(try DeepSeekRuntime.submissionValidationDelayMilliseconds() == 0)
+}
+
+@Test
+func benchmarkPromptPlanUsesHiddenBenchmarkOracle() throws {
     let prefill = Array(0..<MLXFastConstants.benchmarkPrefillPromptTokens)
-    let seed = Array(prefill.prefix(MLXFastConstants.benchmarkDecodeSeedTokens))
-    let expectedDecode = Array(repeating: 7, count: MLXFastConstants.benchmarkDecodeSteps)
-    let fixture = GoldenFixture(
-        cases: [
-            GoldenCase(
-                name: "correctness",
-                promptTokens: [1],
-                expectedTokens: Array(repeating: 8, count: MLXFastConstants.correctnessSteps)
-            ),
-        ],
-        benchmark: BenchmarkGolden(
-            name: "benchmark",
-            prefillPromptTokens: prefill,
-            expectedPrefillToken: 3,
-            decodeSeedTokens: seed,
-            expectedDecodeSeedToken: 4,
-            expectedDecodeTokens: expectedDecode
-        ),
-        sha256: "hash"
-    )
+    let seed = Array(0..<MLXFastConstants.benchmarkDecodeSeedTokens)
+    let decode = Array(repeating: 9, count: MLXFastConstants.benchmarkDecodeSteps)
+    let plan = try BenchmarkPrompt.plan(from: BenchmarkGolden(
+        prefillPromptTokens: prefill,
+        expectedPrefillToken: 17,
+        decodeSeedTokens: seed,
+        expectedDecodeSeedToken: 23,
+        expectedDecodeTokens: decode
+    ))
 
-    let plan = try BenchmarkPrompt.plan(from: fixture)
-
-    #expect(plan.name == "benchmark")
     #expect(plan.prefillTokens == prefill)
-    #expect(plan.expectedPrefillToken == 3)
+    #expect(plan.expectedPrefillToken == 17)
     #expect(plan.decodeSeedTokens == seed)
-    #expect(plan.expectedDecodeSeedToken == 4)
-    #expect(plan.expectedDecodeTokens == expectedDecode)
+    #expect(plan.expectedDecodeSeedToken == 23)
+    #expect(plan.expectedDecodeTokens == decode)
 }
 
 @Test
-func benchmarkPromptPlanRejectsMissingBenchmarkBlock() {
+func benchmarkPromptPlanRejectsMalformedBenchmarkOracle() {
     #expect(throws: MLXFastError.self) {
-        _ = try BenchmarkPrompt.plan(from: GoldenFixture(cases: [], benchmark: nil, sha256: "hash"))
+        _ = try BenchmarkPrompt.plan(from: BenchmarkGolden(
+            prefillPromptTokens: [1],
+            expectedPrefillToken: 7,
+            decodeSeedTokens: Array(repeating: 1, count: MLXFastConstants.benchmarkDecodeSeedTokens),
+            expectedDecodeSeedToken: 7,
+            expectedDecodeTokens: Array(repeating: 7, count: MLXFastConstants.benchmarkDecodeSteps)
+        ))
     }
-}
-
-@Test
-func benchmarkOutputValidatorAcceptsMatchingTokens() {
-    let plan = validBenchmarkPlan()
-
-    let prefill = BenchmarkOutputValidator.comparePrefill(
-        caseName: plan.name,
-        expectedToken: plan.expectedPrefillToken,
-        actualToken: plan.expectedPrefillToken
-    )
-    let decode = BenchmarkOutputValidator.compareDecode(
-        plan: plan,
-        seedToken: plan.expectedDecodeSeedToken,
-        generatedTokens: plan.expectedDecodeTokens
-    )
-
-    #expect(prefill.passed)
-    #expect(decode.passed)
-}
-
-@Test
-func benchmarkOutputValidatorRejectsPrefillMismatch() {
-    let plan = validBenchmarkPlan()
-
-    let result = BenchmarkOutputValidator.comparePrefill(
-        caseName: plan.name,
-        expectedToken: plan.expectedPrefillToken,
-        actualToken: plan.expectedPrefillToken + 1
-    )
-
-    #expect(!result.passed)
-    #expect(result.caseName == plan.name)
-    #expect(result.firstFailingStep == 0)
-    #expect(result.expectedToken == plan.expectedPrefillToken)
-    #expect(result.actualToken == plan.expectedPrefillToken + 1)
-    #expect(result.error == "benchmark prefill token mismatch")
-}
-
-@Test
-func benchmarkOutputValidatorRejectsDecodeSeedMismatch() {
-    let plan = validBenchmarkPlan()
-
-    let result = BenchmarkOutputValidator.compareDecode(
-        plan: plan,
-        seedToken: plan.expectedDecodeSeedToken + 1,
-        generatedTokens: plan.expectedDecodeTokens
-    )
-
-    #expect(!result.passed)
-    #expect(result.caseName == plan.name)
-    #expect(result.firstFailingStep == nil)
-    #expect(result.expectedToken == plan.expectedDecodeSeedToken)
-    #expect(result.actualToken == plan.expectedDecodeSeedToken + 1)
-    #expect(result.error == "benchmark decode seed token mismatch")
-}
-
-@Test
-func benchmarkOutputValidatorRejectsTimedDecodeMismatch() {
-    let plan = validBenchmarkPlan()
-    var actual = plan.expectedDecodeTokens
-    actual[17] += 1
-
-    let result = BenchmarkOutputValidator.compareDecode(
-        plan: plan,
-        seedToken: plan.expectedDecodeSeedToken,
-        generatedTokens: actual
-    )
-
-    #expect(!result.passed)
-    #expect(result.caseName == plan.name)
-    #expect(result.firstFailingStep == 17)
-    #expect(result.expectedToken == plan.expectedDecodeTokens[17])
-    #expect(result.actualToken == actual[17])
-    #expect(result.error == "benchmark decode token mismatch")
 }
 
 @Test
@@ -271,6 +222,49 @@ func benchmarkPreflightAcceptsRequiredArtifacts() throws {
     #expect(report.weightsPath == fixture.weights.path)
     #expect(report.goldenPath == fixture.golden.path)
     #expect(report.mactopPath == fixture.mactop.path)
+    #expect(report.weightsByteCount > 0)
+    #expect(report.maxWeightsByteCount == MLXFastConstants.defaultMaxTransformedWeightsBytes)
+}
+
+@Test
+func benchmarkPreflightRejectsWeightsAboveDefaultByteLimit() throws {
+    let fixture = try makePreflightFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    try writeSparseFile(
+        fixture.weights.appendingPathComponent("oversized.bin"),
+        byteCount: MLXFastConstants.defaultMaxTransformedWeightsBytes + 1
+    )
+
+    #expect(throws: MLXFastError.self) {
+        _ = try BenchmarkPreflight.check(
+            weightsPath: fixture.weights.path,
+            goldenPath: fixture.golden.path,
+            environment: ["MLXFAST_MACTOP_BIN": fixture.mactop.path]
+        )
+    }
+}
+
+@Test
+func benchmarkPreflightHonorsConfiguredWeightsByteLimit() throws {
+    let fixture = try makePreflightFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    try writeSparseFile(
+        fixture.weights.appendingPathComponent("large-but-allowed.bin"),
+        byteCount: MLXFastConstants.defaultMaxTransformedWeightsBytes + 1
+    )
+    let override = MLXFastConstants.defaultMaxTransformedWeightsBytes * 2
+
+    let report = try BenchmarkPreflight.check(
+        weightsPath: fixture.weights.path,
+        goldenPath: fixture.golden.path,
+        environment: [
+            "MLXFAST_MACTOP_BIN": fixture.mactop.path,
+            "MLXFAST_MAX_WEIGHTS_BYTES": "\(override)",
+        ]
+    )
+
+    #expect(report.weightsByteCount > MLXFastConstants.defaultMaxTransformedWeightsBytes)
+    #expect(report.maxWeightsByteCount == override)
 }
 
 @Test
@@ -303,7 +297,33 @@ func benchmarkPreflightRejectsMalformedGolden() throws {
 
 @Test
 func benchmarkPreflightRejectsShortBenchmarkPrompt() throws {
-    let fixture = try makePreflightFixture(goldenContents: validGoldenJSON(benchmarkPrefillTokens: [1]))
+    let fixture = try makePreflightFixture(goldenContents: validGoldenJSON(benchmarkPromptTokens: [1]))
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    #expect(throws: MLXFastError.self) {
+        _ = try BenchmarkPreflight.check(
+            weightsPath: fixture.weights.path,
+            goldenPath: fixture.golden.path,
+            environment: ["MLXFAST_MACTOP_BIN": fixture.mactop.path]
+        )
+    }
+}
+
+@Test
+func benchmarkPreflightRejectsMissingBenchmarkOracle() throws {
+    let expected = arrayJSON(Array(repeating: 7, count: MLXFastConstants.correctnessSteps))
+    let fixture = try makePreflightFixture(goldenContents: """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "preflight",
+          "prompt_tokens": \(arrayJSON(Array(repeating: 1, count: MLXFastConstants.correctnessPromptTokens))),
+          "expected_tokens": \(expected)
+        }
+      ]
+    }
+    """)
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
@@ -428,47 +448,33 @@ private func minimalDeepSeekConfigJSON() -> String {
 }
 
 private func validGoldenJSON(
-    promptTokens: [Int] = Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens),
-    benchmarkPrefillTokens: [Int]? = nil
+    correctnessPromptTokens: [Int] = Array(repeating: 1, count: MLXFastConstants.correctnessPromptTokens),
+    benchmarkPromptTokens: [Int] = Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens)
 ) -> String {
-    let prompt = arrayJSON(promptTokens)
-    let expected = arrayJSON(Array(repeating: 7, count: MLXFastConstants.correctnessSteps))
-    let benchmarkPromptTokens = benchmarkPrefillTokens
-        ?? Array(repeating: 2, count: MLXFastConstants.benchmarkPrefillPromptTokens)
+    let correctnessPrompt = arrayJSON(correctnessPromptTokens)
     let benchmarkPrompt = arrayJSON(benchmarkPromptTokens)
-    let decodeSeed = arrayJSON(Array(benchmarkPromptTokens.prefix(MLXFastConstants.benchmarkDecodeSeedTokens)))
-    let expectedDecode = arrayJSON(Array(repeating: 9, count: MLXFastConstants.benchmarkDecodeSteps))
+    let expected = arrayJSON(Array(repeating: 7, count: MLXFastConstants.correctnessSteps))
+    let seed = arrayJSON(Array(benchmarkPromptTokens.prefix(MLXFastConstants.benchmarkDecodeSeedTokens)))
+    let decode = arrayJSON(Array(repeating: 9, count: MLXFastConstants.benchmarkDecodeSteps))
     return """
     {
       "version": 1,
       "cases": [
         {
           "name": "preflight",
-          "prompt_tokens": \(prompt),
+          "prompt_tokens": \(correctnessPrompt),
           "expected_tokens": \(expected)
         }
       ],
       "benchmark": {
-        "name": "benchmark",
         "prefill_prompt_tokens": \(benchmarkPrompt),
         "expected_prefill_token": 8,
-        "decode_seed_tokens": \(decodeSeed),
-        "expected_decode_seed_token": 10,
-        "expected_decode_tokens": \(expectedDecode)
+        "decode_seed_tokens": \(seed),
+        "expected_decode_seed_token": 7,
+        "expected_decode_tokens": \(decode)
       }
     }
     """
-}
-
-private func validBenchmarkPlan() -> BenchmarkPromptPlan {
-    BenchmarkPromptPlan(
-        name: "benchmark",
-        prefillTokens: Array(repeating: 2, count: MLXFastConstants.benchmarkPrefillPromptTokens),
-        expectedPrefillToken: 8,
-        decodeSeedTokens: Array(repeating: 2, count: MLXFastConstants.benchmarkDecodeSeedTokens),
-        expectedDecodeSeedToken: 10,
-        expectedDecodeTokens: Array(repeating: 9, count: MLXFastConstants.benchmarkDecodeSteps)
-    )
 }
 
 private func requiredDenseTensorFixtures() -> [TensorFixture] {
@@ -712,6 +718,15 @@ private func writeExecutableScript(_ path: URL, contents: String) throws -> URL 
         ofItemAtPath: path.path
     )
     return path
+}
+
+private func writeSparseFile(_ path: URL, byteCount: Int) throws {
+    _ = FileManager.default.createFile(atPath: path.path, contents: nil)
+    let handle = try FileHandle(forWritingTo: path)
+    defer {
+        try? handle.close()
+    }
+    try handle.truncate(atOffset: UInt64(byteCount))
 }
 
 private func temporaryDirectory() throws -> URL {

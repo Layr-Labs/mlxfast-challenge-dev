@@ -48,6 +48,53 @@ public enum DeepSeekCorrectness {
         return generated
     }
 
+    public static func compareTeacherForcedNoCache(
+        promptTokens: [Int],
+        expectedTokens: [Int],
+        steps: Int = MLXFastConstants.correctnessSteps,
+        nextToken: (_ contextTokens: [Int]) throws -> Int
+    ) throws -> CorrectnessTokenComparison {
+        guard !promptTokens.isEmpty else {
+            throw MLXFastError.invalidInput("teacher-forced correctness prompt must not be empty")
+        }
+        guard steps >= 0 else {
+            throw MLXFastError.invalidInput("teacher-forced correctness steps must be non-negative")
+        }
+
+        var context = promptTokens
+        for step in 0..<steps {
+            guard step < expectedTokens.count else {
+                return CorrectnessTokenComparison(
+                    passed: false,
+                    checkedSteps: step + 1,
+                    firstFailingStep: step,
+                    expectedToken: nil,
+                    actualToken: nil
+                )
+            }
+            let expectedToken = expectedTokens[step]
+            let actualToken = try nextToken(context)
+            if actualToken != expectedToken {
+                return CorrectnessTokenComparison(
+                    passed: false,
+                    checkedSteps: step + 1,
+                    firstFailingStep: step,
+                    expectedToken: expectedToken,
+                    actualToken: actualToken
+                )
+            }
+            context.append(expectedToken)
+        }
+
+        return CorrectnessTokenComparison(
+            passed: true,
+            checkedSteps: steps,
+            firstFailingStep: nil,
+            expectedToken: nil,
+            actualToken: nil
+        )
+    }
+
     public static func greedyToken(from logits: MLXArray) throws -> Int {
         guard let vocabSize = logits.shape.last, vocabSize > 0 else {
             throw MLXFastError.invalidInput("greedy logits must have a non-empty vocab dimension")
@@ -102,74 +149,6 @@ public enum DeepSeekCorrectness {
                     actualToken: actualToken
                 )
             }
-        }
-
-        return CorrectnessTokenComparison(
-            passed: true,
-            checkedSteps: steps,
-            firstFailingStep: nil,
-            expectedToken: nil,
-            actualToken: nil
-        )
-    }
-
-    public static func generateGreedyTokens(
-        steps: Int = MLXFastConstants.correctnessSteps,
-        nextToken: (_ step: Int, _ previousToken: Int?) throws -> Int
-    ) throws -> [Int] {
-        guard steps >= 0 else {
-            throw MLXFastError.invalidInput("greedy correctness steps must be non-negative")
-        }
-
-        var previousToken: Int?
-        var generated: [Int] = []
-        generated.reserveCapacity(steps)
-        for step in 0..<steps {
-            let token = try nextToken(step, previousToken)
-            generated.append(token)
-            previousToken = token
-        }
-        return generated
-    }
-
-    public static func compareGreedyTokens(
-        expected: [Int],
-        steps: Int = MLXFastConstants.correctnessSteps,
-        nextToken: (_ step: Int, _ previousToken: Int?) throws -> Int
-    ) throws -> CorrectnessTokenComparison {
-        guard steps > 0 else {
-            return CorrectnessTokenComparison(
-                passed: true,
-                checkedSteps: 0,
-                firstFailingStep: nil,
-                expectedToken: nil,
-                actualToken: nil
-            )
-        }
-
-        var previousToken: Int?
-        for step in 0..<steps {
-            let actualToken = try nextToken(step, previousToken)
-            let expectedToken = step < expected.count ? expected[step] : nil
-            guard let expectedToken else {
-                return CorrectnessTokenComparison(
-                    passed: false,
-                    checkedSteps: step + 1,
-                    firstFailingStep: step,
-                    expectedToken: nil,
-                    actualToken: actualToken
-                )
-            }
-            if actualToken != expectedToken {
-                return CorrectnessTokenComparison(
-                    passed: false,
-                    checkedSteps: step + 1,
-                    firstFailingStep: step,
-                    expectedToken: expectedToken,
-                    actualToken: actualToken
-                )
-            }
-            previousToken = actualToken
         }
 
         return CorrectnessTokenComparison(

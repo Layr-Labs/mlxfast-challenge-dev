@@ -17,27 +17,41 @@ The benchmark entrypoint:
 1. Builds `mlxfast-swift` when needed.
 2. Runs the Swift transform if `weights/` is missing or `MLXFAST_FORCE_TRANSFORM=1`.
 3. Runs the correctness gate against `correctness_golden.json`.
-4. Measures prefill latency, 512-step greedy decode latency, MLX peak memory, and
+4. Validates the benchmark prefill/decode tokens against the hidden benchmark
+   oracle in `correctness_golden.json`.
+5. Measures prefill latency, 512-step greedy decode latency, MLX peak memory, and
    `mactop` hardware DRAM bandwidth.
-5. Writes `score.json` in the Darkbloom-compatible schema.
+6. Writes `score.json` in the Darkbloom-compatible schema, plus
+   `score.json.sha256` and `benchmark-integrity.json` audit sidecars.
 
 If required artifacts are missing, the harness writes a failed `score.json`
 rather than producing a ranked score.
 
 ## Model Artifacts
 
-Place the frozen reference checkpoint here unless overriding with
-`MLXFAST_REFERENCE_DIR`:
+By default, `setup.sh` stores the frozen reference checkpoint in a repo-local
+Hugging Face-style cache:
+
+```text
+.cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main/
+```
+
+It also creates this compatibility symlink unless the path already exists:
 
 ```text
 reference_weights/DeepSeek-V4-Flash-4bit/
 ```
 
-By default `setup.sh` downloads `mlx-community/DeepSeek-V4-Flash-4bit` directly
-from Hugging Face with resumable `curl` requests when that directory is missing.
-The safetensors payload is about 141 GiB across 33 shards; `setup.sh` requires
-170 GiB free by default before starting. Set `MLXFAST_REFERENCE_DIR` to a larger
-local or mounted SSD when the repo disk is too small, or set
+By default `setup.sh` downloads `mlx-community/DeepSeek-V4-Flash-4bit` from the
+configured mirror with resumable `curl` requests. It checks cached files against
+the pinned SHA256 manifest and redownloads only missing, truncated, or
+hash-mismatched files. The safetensors payload is about 141 GiB across 33
+shards; `setup.sh` requires 170 GiB free by default before starting. After a
+full verification, setup writes `.mlxfast-reference-cache.lock`; later setup
+runs use cheap size/mtime checks from that lock and skip the full checkpoint
+hash pass when the cache is unchanged. Set
+`MLXFAST_REFERENCE_CACHE_DIR` or `MLXFAST_REFERENCE_DIR` to a larger local or
+mounted SSD when the repo disk is too small, or set
 `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1` when the checkpoint is provisioned externally.
 
 The Swift transform writes benchmark-ready weights here:
@@ -49,8 +63,16 @@ weights/
   experts/manifest.json
 ```
 
-Correctness cases are supplied by the benchmark operator and are intentionally
-not committed to the public repo:
+The generated `weights/` tree is a compact runtime artifact set, not a second
+full copy of the checkpoint. It stores dense/shared tensors plus metadata, while
+the baseline runtime streams routed expert tensors from the frozen reference
+checkpoint. Submissions may adjust this overlay by changing both
+`Sources/MLXFastTransform/` and `Sources/MLXFastModel/`; correctness and
+benchmark results are the authority, not byte equality with the baseline
+layout.
+
+Correctness cases and the timed benchmark token oracle are supplied by the
+benchmark operator and are intentionally not committed to the public repo:
 
 ```text
 correctness_golden.json
@@ -58,86 +80,84 @@ correctness_golden.json
 
 Use `MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json` when the
 file is provisioned outside the repository root.
-
-That hidden fixture also contains the scored benchmark oracle: the 512-token
-prefill prompt, expected prefill token, 32-token decode seed, expected seed
-token, and expected tokens emitted by the timed decode loop. The benchmark only
-accepts a speed score when those hidden token IDs match.
-
-The organizer can generate that hidden fixture from a private prompt manifest:
-
-```bash
-.build/release/mlxfast-swift make-golden \
-  --prompt-file private_prompts.json \
-  --output correctness_golden.json
-```
-
-The private manifest contains named correctness prompts and one named benchmark
-prompt:
-
-```json
-{
-  "version": 1,
-  "cases": [
-    {"name": "hidden-0", "prompt_tokens": [1, 2, 3]}
-  ],
-  "benchmark": {"name": "timed-hidden", "prompt_tokens": [1, 2, 3]}
-}
-```
-
-The arrays above are abbreviated. The benchmark prompt must contain at least 512
-token IDs.
-
-For local development only, participants can generate a self-consistent fixture
-from their current transformed weights:
-
-```bash
-.build/release/mlxfast-swift make-golden --output local_correctness_golden.json
-MLXFAST_CORRECTNESS_GOLDEN_PATH=local_correctness_golden.json ./benchmark.sh
-```
-
-This local fixture is useful for exercising the full harness and catching
-obvious regressions, but it is not the organizer-owned hidden golden used for
-scoring.
+Benchmark CI downloads the private precomputed golden from protected storage.
+Prompt manifests and generated goldens are not committed to the public
+repository. Submission branches can restore or download a golden but do not
+generate goldens from submitted code.
 
 ## Editable Surface
 
-The active implementation is Swift-only:
+The active editable surface is Swift-only and is defined by `benchmark.json`:
 
 | Path | Scope |
 |---|---|
-| `Sources/MLXFastModel/` | Participant-editable DeepSeek V4 Flash runtime, attention, MoE, expert streaming, and weight loading. |
+| `Sources/MLXFastModel/` | DeepSeek V4 Flash model implementation: attention, MoE, expert streaming, caches, weight loading, and prefill/decode execution. |
 | `Sources/MLXFastTransform/` | Offline safetensors transform and expert manifest generation. |
-| `Sources/MLXFastHarness/` | Frozen correctness gate, benchmark timing, mactop/RAM measurement, and score assembly. |
-| `Sources/MLXFastCore/` | Frozen shared constants, score schema, safetensors, and golden-case loading. |
-| `Sources/MLXFastCLI/` | Frozen command-line entrypoint. |
-| `tools/build-mlx-metallib.sh` | Local MLX Metal library build helper. |
+
+`Sources/MLXFastCore/`, `Sources/MLXFastHarness/`,
+`Sources/MLXFastCLI/`, `Sources/MLXFastSubmission/`, scripts, tests,
+`benchmark.json`, generated
+`weights/`, reference checkpoints, golden fixtures, and local scores are
+harness/operator files, not submission surface. Correctness, scoring, timing,
+golden generation, benchmark-oracle validation, provenance checks, and
+submission packaging live in that trusted harness layer. `mlxfast-swift submit`
+packages only `editablePaths`, rejects symlinks and generated/model artifact
+paths, skips macOS metadata files, and applies a 256 MiB default source archive
+input cap. Override the cap with `MLXFAST_MAX_SUBMISSION_BYTES` or
+`mlxfast-swift submit --max-bytes`. Before packaging or upload, submit checks
+the local Git diff against the trusted base ref and rejects any committed,
+staged, unstaged, or untracked source changes outside `editablePaths`. The base
+ref normally comes from `mlxfast-swift clone`/`link`; submit fails if no base ref
+can be resolved, so pass `--base-ref REF` for manual checkouts.
+
+Use `mlxfast-swift submit --dry-run --output mlxfast-submission.zip` for local
+inspection. For Yukon upload, run `mlxfast-swift login <api-key> --api <url>`
+once, then `mlxfast-swift link <benchmark-id-or-name>` for an existing checkout
+or `mlxfast-swift clone <benchmark-id-or-name>` for a fresh checkout. Upload
+with `mlxfast-swift submit <benchmark-id-or-name> --note "..."`. Uploads are
+sent as a gzip tar archive with bearer-token auth; the backend applies the
+archive to the frozen benchmark checkout and runs hidden validation. Use
+`mlxfast-swift submissions <benchmark-id-or-name>` to inspect submitted jobs.
+Pass `--idempotency-key KEY` when a live submit should be safely retried with a
+stable backend idempotency key.
+
+`mlxfast-swift verify-transform` is an organizer/debug check for deterministic
+transform output. It re-runs the submitted transform and compares the generated
+`weights/` tree against that fresh run. It is not a baseline-layout requirement.
+The normal preflight/benchmark path also rejects generated `weights/` above the
+default 50 GiB transformed-output cap before correctness or timing runs.
+Override it with `MLXFAST_MAX_WEIGHTS_BYTES`; `verify-transform` additionally
+accepts `--max-bytes`.
 
 There is no Python harness path.
 
-The default Swift transform uses an expert byte-range manifest rather than
-rewriting all routed experts into new expert-major files. This is deliberate: on
-Blacksmith's 250 GB Apple-Silicon runners, keeping the reference checkpoint and a
-full rewritten expert copy at the same time would exceed available disk. The
-manifest baseline is still part of the optimization surface. Submissions may
-extend both `MLXFastTransform` and `MLXFastModel` to produce and consume a custom
-expert layout, provided the generated `weights/` are deterministic from the
-frozen reference checkpoint and pass the trusted correctness gate.
-
 ## Correctness Gate
 
-Correctness is a hard gate. For each golden case, the harness runs cached greedy
-generation for 256 tokens with temperature-zero behavior and compares token IDs
-exactly. The first mismatch records the case, step, expected token, and actual
-token in the failed report.
+Correctness is a hard gate. For each golden case, the prompt must contain
+exactly 512 token IDs. The harness runs cached greedy generation for 256
+tokens with temperature-zero behavior and compares token IDs exactly. The first
+mismatch records the case, step, expected token, and actual token in the failed
+report.
 
 The gate is intended as a first-stage filter: an implementation that fails it is
 not eligible for the longer benchmark.
 
-The timed benchmark path is validated separately against the hidden benchmark
-oracle in the same golden fixture. The harness checks the prefill token, decode
-seed token, and tokens generated inside the timed decode loop before accepting a
-score.
+The gate intentionally does not port the earlier Python hidden-state or top-K
+logit comparison layers. The benchmark contract cares about the externally
+observable greedy token stream for a text-to-text DeepSeek V4 Flash run. Exact
+token-oracle checks are cleaner here because they validate the same output path
+that is timed by the benchmark, avoid ambiguous internal tensor choices around
+normalization/head-combination, and keep the hidden golden fixture small enough
+to manage privately.
+
+VLM/image inputs and speculative/MTP draft decoding are also out of scope for
+this challenge. They should only be added if the official benchmark contract
+changes to score those paths.
+
+The hidden golden file also includes a benchmark oracle. The benchmark validates
+the greedy token after the fixed 512-token prefill prompt, the greedy token
+after the fixed 32-token decode seed, and all 512 tokens produced inside the
+timed decode window before accepting a score.
 
 ## Score
 
@@ -150,6 +170,9 @@ Lower is better.
 `bandwidth_GB_per_token` is measured with `mactop` hardware DRAM counters during
 the decode window. `setup.sh` installs `mactop` with Homebrew when needed; set
 `MLXFAST_MACTOP_BIN=/path/to/mactop` to use a local binary instead.
+`score.json` also carries audit-only wall-clock phase timings, final process RSS,
+expert streaming counters, and transformed-weights digest fields. These values
+help operators review runs but do not change the score formula.
 
 ## Useful Commands
 
@@ -157,9 +180,14 @@ the decode window. `setup.sh` installs `mactop` with Homebrew when needed; set
 swift test
 MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test
 swift build -c release
-.build/release/mlxfast-swift transform
-.build/release/mlxfast-swift make-golden --output local_correctness_golden.json
+.github/scripts/run-offline.sh .build/release/mlxfast-swift transform
 .build/release/mlxfast-swift correctness
 .build/release/mlxfast-swift preflight
 .build/release/mlxfast-swift benchmark --score-path score.json
+.build/release/mlxfast-swift make-golden --prompt-file /path/to/private_prompts.json --output correctness_golden.json
+.build/release/mlxfast-swift verify-transform
+.build/release/mlxfast-swift clone
+.build/release/mlxfast-swift link <benchmark-id-or-name>
+.build/release/mlxfast-swift submit --dry-run --output mlxfast-submission.zip
+.build/release/mlxfast-swift submissions <benchmark-id-or-name>
 ```

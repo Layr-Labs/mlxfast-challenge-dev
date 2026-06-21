@@ -12,9 +12,10 @@ let package = Package(
         .library(name: "MLXFastTransform", targets: ["MLXFastTransform"]),
         .library(name: "MLXFastModel", targets: ["MLXFastModel"]),
         .library(name: "MLXFastHarness", targets: ["MLXFastHarness"]),
+        .library(name: "MLXFastSubmission", targets: ["MLXFastSubmission"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.4"),
+        .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.31.4"),
     ],
     targets: [
         .target(name: "MLXFastCore"),
@@ -37,12 +38,17 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
             ]
         ),
+        .target(
+            name: "MLXFastSubmission",
+            dependencies: ["MLXFastCore"]
+        ),
         .executableTarget(
             name: "MLXFastCLI",
             dependencies: [
                 "MLXFastCore",
                 "MLXFastTransform",
                 "MLXFastHarness",
+                "MLXFastSubmission",
             ]
         ),
         .testTarget(
@@ -52,6 +58,7 @@ let package = Package(
                 "MLXFastTransform",
                 "MLXFastModel",
                 "MLXFastHarness",
+                "MLXFastSubmission",
             ]
         ),
     ]

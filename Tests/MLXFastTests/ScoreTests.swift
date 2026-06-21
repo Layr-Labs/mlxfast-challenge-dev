@@ -29,6 +29,14 @@ func writeScorePayloadEmitsDarkbloomShape() throws {
     #expect(decoded.metrics.expertReadSeconds == 0)
     #expect(decoded.metrics.expertPeakCachedTensors == 0)
     #expect(decoded.metrics.expertHitRate == 0)
+    #expect(decoded.metrics.weightsHash == "")
+    #expect(decoded.metrics.weightsByteCount == 0)
+    #expect(decoded.metrics.weightsFileCount == 0)
+    #expect(decoded.metrics.benchmarkWallSeconds == 0)
+    #expect(decoded.metrics.preflightSeconds == 0)
+    #expect(decoded.metrics.correctnessSeconds == 0)
+    #expect(decoded.metrics.timedBenchmarkSeconds == 0)
+    #expect(decoded.metrics.processResidentMemoryGB == 0)
     #expect(decoded.metrics.firstFailingLayer == nil)
     #expect(decoded.metrics.firstFailingCase == nil)
     #expect(decoded.metrics.firstFailingStep == nil)
@@ -53,6 +61,11 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
                 bandwidthGBPerToken: 0,
                 decodeSecondsPerToken: 0,
                 prefillSecondsPerToken: 0,
+                benchmarkWallSeconds: 11,
+                preflightSeconds: 1,
+                correctnessSeconds: 2,
+                timedBenchmarkSeconds: 8,
+                processResidentMemoryGB: 3.5,
                 passedCorrectness: false,
                 numLayers: MLXFastConstants.numHiddenLayers,
                 checkedSteps: 13,
@@ -76,6 +89,9 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
                 commit: "abc123",
                 timestamp: "2026-06-18T00:00:00Z",
                 harnessHash: "hash",
+                weightsHash: "weights-hash",
+                weightsByteCount: 4096,
+                weightsFileCount: 7,
                 runtime: "swift"
             )
         ),
@@ -101,6 +117,14 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(raw.contains("\"expert_peak_cached_tensors\" : 4"))
     #expect(raw.contains("\"expert_hit_rate\" : 0.375"))
     #expect(raw.contains("\"golden_hash\" : \"golden-hash\""))
+    #expect(raw.contains("\"weights_hash\" : \"weights-hash\""))
+    #expect(raw.contains("\"weights_byte_count\" : 4096"))
+    #expect(raw.contains("\"weights_file_count\" : 7"))
+    #expect(raw.contains("\"benchmark_wall_seconds\" : 11"))
+    #expect(raw.contains("\"preflight_seconds\" : 1"))
+    #expect(raw.contains("\"correctness_seconds\" : 2"))
+    #expect(raw.contains("\"timed_benchmark_seconds\" : 8"))
+    #expect(raw.contains("\"process_resident_memory_gb\" : 3.5"))
     #expect(decoded.metrics.firstFailingLayer == nil)
     #expect(decoded.metrics.firstFailingCase == "case-b")
     #expect(decoded.metrics.firstFailingStep == 12)
@@ -116,6 +140,65 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(decoded.metrics.expertPeakCachedTensors == 4)
     #expect(decoded.metrics.expertHitRate == 0.375)
     #expect(decoded.metrics.goldenHash == "golden-hash")
+    #expect(decoded.metrics.weightsHash == "weights-hash")
+    #expect(decoded.metrics.weightsByteCount == 4096)
+    #expect(decoded.metrics.weightsFileCount == 7)
+    #expect(decoded.metrics.benchmarkWallSeconds == 11)
+    #expect(decoded.metrics.preflightSeconds == 1)
+    #expect(decoded.metrics.correctnessSeconds == 2)
+    #expect(decoded.metrics.timedBenchmarkSeconds == 8)
+    #expect(decoded.metrics.processResidentMemoryGB == 3.5)
+}
+
+@Test
+func scoreMetricsDecodeOlderPayloadWithoutWeightsIntegrityFields() throws {
+    let data = """
+    {
+      "score": null,
+      "passed": false,
+      "metrics": {
+        "peak_ram_gb": 0,
+        "bandwidth_gb_per_token": 0,
+        "decode_seconds_per_token": 0,
+        "prefill_seconds_per_token": 0,
+        "passed_correctness": false,
+        "num_layers": \(MLXFastConstants.numHiddenLayers),
+        "checked_steps": 0,
+        "case_count": 0,
+        "expert_cache_hits": 0,
+        "expert_cache_misses": 0,
+        "expert_cache_evictions": 0,
+        "expert_bytes_read": 0,
+        "expert_read_seconds": 0,
+        "expert_peak_cached_tensors": 0,
+        "expert_hit_rate": 0,
+        "first_failing_layer": null,
+        "first_failing_case": null,
+        "first_failing_step": null,
+        "expected_token": null,
+        "actual_token": null,
+        "max_abs_diff": 0,
+        "golden_hash": "",
+        "bandwidth_source": "",
+        "error": "old payload",
+        "commit": "",
+        "timestamp": "2026-06-18T00:00:00Z",
+        "harness_hash": "",
+        "runtime": "swift"
+      }
+    }
+    """.data(using: .utf8)!
+
+    let decoded = try JSONDecoder().decode(ScorePayload.self, from: data)
+
+    #expect(decoded.metrics.weightsHash == "")
+    #expect(decoded.metrics.weightsByteCount == 0)
+    #expect(decoded.metrics.weightsFileCount == 0)
+    #expect(decoded.metrics.benchmarkWallSeconds == 0)
+    #expect(decoded.metrics.preflightSeconds == 0)
+    #expect(decoded.metrics.correctnessSeconds == 0)
+    #expect(decoded.metrics.timedBenchmarkSeconds == 0)
+    #expect(decoded.metrics.processResidentMemoryGB == 0)
 }
 
 private func temporaryDirectory() throws -> URL {

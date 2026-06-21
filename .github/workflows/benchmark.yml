@@ -4,9 +4,66 @@ name: benchmark
 # Apple Silicon run explicitly. No PR/push triggers should burn macOS minutes.
 on:
   workflow_dispatch:
+    inputs:
+      reference_base_url:
+        description: "Optional HTTP base URL for reference checkpoint files. Defaults to MLXFAST_REFERENCE_BASE_URL or Darkbloom."
+        required: false
+        type: string
+      submission_repository:
+        description: "Optional repository containing submitted editable paths. Defaults to this repository."
+        required: false
+        type: string
+      submission_ref:
+        description: "Optional submitted ref/SHA. When set, the workflow keeps trusted harness code and overlays only editablePaths from this ref."
+        required: false
+        type: string
+      correctness_golden_url:
+        description: "Optional URL for precomputed correctness_golden.json. If empty, private R2 correctness_prompts/correctness_golden.json is used when configured."
+        required: false
+        type: string
+      reference_download_jobs:
+        description: "Parallel shard downloads for setup.sh."
+        required: false
+        default: "8"
+        type: string
+      reference_min_free_gib:
+        description: "Minimum free GiB required before reference checkpoint download."
+        required: false
+        default: "170"
+        type: string
+      verify_transform:
+        description: "Run deterministic transform verification before timing."
+        required: false
+        default: false
+        type: boolean
+      run_benchmark:
+        description: "Run the timed benchmark after the correctness gate."
+        required: false
+        default: true
+        type: boolean
+      preserve_golden_only:
+        description: "Download correctness_golden.json and upload only hash/byte metadata without setup, transform, correctness, or benchmark."
+        required: false
+        default: false
+        type: boolean
+      generate_golden_only:
+        description: "Prepare correctness_golden.json, then stop before correctness or benchmark."
+        required: false
+        default: false
+        type: boolean
+      trace_correctness_step:
+        description: "Optional maintainer diagnostic: trace logits at a 0-based correctness decode step. Disabled on submission branches."
+        required: false
+        default: ""
+        type: string
+      trace_correctness_top_k:
+        description: "Number of logits to include when trace_correctness_step is set."
+        required: false
+        default: "16"
+        type: string
 
 concurrency:
-  group: benchmark-${{ github.ref }}
+  group: benchmark-${{ github.ref }}-${{ inputs.preserve_golden_only && 'preserve-golden' || (inputs.generate_golden_only && 'generate-golden' || (inputs.run_benchmark && 'full' || 'correctness-only')) }}
   cancel-in-progress: true
 
 permissions:
@@ -14,58 +71,389 @@ permissions:
 
 jobs:
   benchmark:
-    runs-on: blacksmith-12vcpu-macos-15
-    timeout-minutes: 240
+    runs-on: blacksmith-12vcpu-macos-26
+    timeout-minutes: 720
+    environment: benchmark-private-prompts
+    env:
+      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
+      MLXFAST_CORRECTNESS_GOLDEN_URL_PRESENT: ${{ (inputs.correctness_golden_url != '' || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL != '') && '1' || '0' }}
+      MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
+      MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/correctness_golden.json
+      MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: f43f288c09ec9358a13b9338eca25fc47b6c5c13adbf7ac07ffd38a65f9fee81
+      MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "20435"
+      MLXFAST_EXPECTED_CORRECTNESS_STEPS: "256"
+      MLXFAST_EXPECTED_CORRECTNESS_CASES: "1"
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
+      MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}
+      MLXFAST_VERIFY_TRANSFORM: ${{ inputs.verify_transform && '1' || '0' }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Enforce trusted workflow context
+        run: .github/scripts/enforce-trusted-benchmark-workflow.sh
+
+      - name: Refuse prompt generation with submitted code
+        if: inputs.submission_ref != '' && inputs.generate_golden_only
+        run: |
+          echo "benchmark: generate_golden_only is trusted-maintainer-only and cannot run with submission_ref" >&2
+          exit 1
+
+      - name: Refuse untrusted submission workflow code
+        if: inputs.submission_ref == '' && (startsWith(github.ref_name, 'submissions/') || startsWith(github.ref_name, 'yukon/submissions/'))
+        run: |
+          echo "benchmark: submission branches must be benchmarked by dispatching trusted main with submission_ref" >&2
+          exit 1
+
+      - name: Checkout submitted editable paths
+        if: inputs.submission_ref != ''
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: ${{ inputs.submission_repository || github.repository }}
+          ref: ${{ inputs.submission_ref }}
+          path: .mlxfast-submission-src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Overlay submitted editable paths
+        if: inputs.submission_ref != ''
+        env:
+          SUBMISSION_WORKTREE: .mlxfast-submission-src
+        run: .github/scripts/overlay-editable-paths.sh
 
       - name: Enforce modifiable surface
-        if: startsWith(github.ref_name, 'submissions/')
+        if: inputs.submission_ref == '' && (startsWith(github.ref_name, 'submissions/') || startsWith(github.ref_name, 'yukon/submissions/'))
         env:
           HEAD_SHA: ${{ github.sha }}
         run: |
           BASE_SHA="$(git merge-base origin/main "${HEAD_SHA}")" \
             .github/scripts/enforce-modifiable-surface.sh
 
+      - name: Check correctness golden source
+        env:
+          MLXFAST_CORRECTNESS_GOLDEN_URL: ${{ inputs.correctness_golden_url || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "${MLXFAST_CORRECTNESS_GOLDEN_PATH}")"
+          if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
+            echo "benchmark: using configured correctness golden URL"
+          elif [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
+            echo "benchmark: using precomputed R2 private correctness golden"
+          else
+            echo "benchmark: correctness golden requires correctness_golden_url or private R2 secrets" >&2
+            exit 1
+          fi
+
+      - name: Preserve correctness golden metadata
+        if: inputs.preserve_golden_only
+        env:
+          MLXFAST_CORRECTNESS_GOLDEN_URL: ${{ inputs.correctness_golden_url || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL }}
+          MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER: ${{ secrets.MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
+            if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER:-}" ]]; then
+              echo "benchmark: downloading correctness_golden.json with configured auth header"
+              curl \
+                --fail \
+                --location \
+                --retry 5 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                -H "${MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER}" \
+                --output "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
+                "${MLXFAST_CORRECTNESS_GOLDEN_URL}"
+            else
+              echo "benchmark: downloading correctness_golden.json"
+              curl \
+                --fail \
+                --location \
+                --retry 5 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                --output "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
+                "${MLXFAST_CORRECTNESS_GOLDEN_URL}"
+            fi
+          elif [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
+            echo "benchmark: downloading precomputed R2 correctness_golden.json"
+            .github/scripts/download-r2-object.sh \
+              "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" \
+              "${MLXFAST_CORRECTNESS_GOLDEN_PATH}"
+          else
+            echo "benchmark: preserve_golden_only requires correctness_golden_url or private R2 correctness_golden.json" >&2
+            exit 1
+          fi
+          actual_hash="$(shasum -a 256 "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | awk '{print $1}')"
+          actual_bytes="$(wc -c < "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | tr -d ' ')"
+          export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256="${actual_hash}"
+          export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES="${actual_bytes}"
+          echo "benchmark: preserving private correctness golden ${actual_hash} bytes=${actual_bytes}"
+          .github/scripts/verify-correctness-golden.sh
+
+      - name: Check preserved correctness metadata paths
+        if: inputs.preserve_golden_only
+        run: |
+          set -euo pipefail
+          .github/scripts/deny-private-artifacts.sh \
+            "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
+            "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes"
+
+      - name: Upload preserved correctness golden metadata
+        if: inputs.preserve_golden_only
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: correctness-golden-metadata-${{ github.run_id }}
+          path: |
+            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.sha256
+            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.bytes
+          if-no-files-found: error
+
       - name: Setup Swift harness and reference checkpoint
+        if: ${{ !inputs.preserve_golden_only && !inputs.generate_golden_only }}
+        env:
+          MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || secrets.MLXFAST_REFERENCE_BASE_URL || 'https://ds4.darkbloom.ai/deepseek-v4-flash-4bit' }}
+          MLXFAST_REFERENCE_AUTH_HEADER: ${{ secrets.MLXFAST_REFERENCE_AUTH_HEADER }}
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
+          MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
         run: ./setup.sh
 
       - name: Transform reference checkpoint
-        run: .build/release/mlxfast-swift transform
+        if: ${{ !inputs.preserve_golden_only && !inputs.generate_golden_only }}
+        run: .github/scripts/run-offline.sh .build/release/mlxfast-swift transform
 
-      - name: Install organizer correctness golden
+      - name: Prepare correctness golden
+        id: prepare-correctness-golden
+        if: ${{ !inputs.preserve_golden_only }}
         env:
-          MLXFAST_CORRECTNESS_GOLDEN_B64: ${{ secrets.MLXFAST_CORRECTNESS_GOLDEN_B64 }}
+          MLXFAST_CORRECTNESS_GOLDEN_URL: ${{ inputs.correctness_golden_url || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL }}
+          MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER: ${{ secrets.MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
-          if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_B64:-}" ]]; then
-            echo "::error::MLXFAST_CORRECTNESS_GOLDEN_B64 secret is required for correctness"
+          set -euo pipefail
+          if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" ]]; then
+            if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER:-}" ]]; then
+              echo "benchmark: downloading correctness_golden.json with configured auth header"
+              curl \
+                --fail \
+                --location \
+                --retry 5 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                -H "${MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER}" \
+                --output "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
+                "${MLXFAST_CORRECTNESS_GOLDEN_URL}"
+            else
+              echo "benchmark: downloading correctness_golden.json"
+              curl \
+                --fail \
+                --location \
+                --retry 5 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                --output "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
+                "${MLXFAST_CORRECTNESS_GOLDEN_URL}"
+            fi
+          elif [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
+            echo "benchmark: downloading precomputed R2 correctness_golden.json"
+            .github/scripts/download-r2-object.sh \
+              "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" \
+              "${MLXFAST_CORRECTNESS_GOLDEN_PATH}"
+          else
+            echo "benchmark: correctness golden missing; configure correctness_golden_url or private R2 correctness_golden.json" >&2
             exit 1
           fi
-          golden_path="${RUNNER_TEMP}/mlxfast-correctness-golden.json"
-          umask 077
-          printf '%s' "${MLXFAST_CORRECTNESS_GOLDEN_B64}" | /usr/bin/base64 -D > "${golden_path}"
-          if [[ ! -s "${golden_path}" ]]; then
-            echo "::error::decoded correctness golden is empty"
-            exit 1
+          if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" && "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
+            actual_hash="$(shasum -a 256 "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | awk '{print $1}')"
+            actual_bytes="$(wc -c < "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | tr -d ' ')"
+            export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256="${actual_hash}"
+            export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES="${actual_bytes}"
+            {
+              echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"
+              echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"
+            } >> "${GITHUB_ENV}"
+            echo "benchmark: using private correctness golden ${actual_hash} bytes=${actual_bytes}"
           fi
-          echo "MLXFAST_CORRECTNESS_GOLDEN_PATH=${golden_path}" >> "${GITHUB_ENV}"
+          .github/scripts/verify-correctness-golden.sh
 
-      - name: Correctness gate
-        run: .build/release/mlxfast-swift correctness
+      - name: Correctness
+        if: ${{ !inputs.preserve_golden_only && !inputs.generate_golden_only && !inputs.run_benchmark }}
+        env:
+          MLXFAST_SUBMISSION_REF: ${{ inputs.submission_ref }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${MLXFAST_SUBMISSION_REF}" ]]; then
+            echo "benchmark: running submitted correctness with private process logs suppressed"
+            started="${SECONDS}"
+            .build/release/mlxfast-swift correctness \
+              --weights weights \
+              --golden "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
+              > correctness-report.json \
+              2> "${RUNNER_TEMP}/mlxfast-correctness-private.log" &
+            pid="$!"
+            while kill -0 "${pid}" 2>/dev/null; do
+              sleep 60
+              if kill -0 "${pid}" 2>/dev/null; then
+                echo "benchmark: submitted correctness still running elapsed=$((SECONDS - started))s"
+              fi
+            done
+            wait "${pid}"
+          else
+            .build/release/mlxfast-swift correctness \
+              --weights weights \
+              --golden "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
+              > correctness-report.json
+          fi
+
+      - name: Validate correctness artifacts
+        id: validate_correctness_artifacts
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && !inputs.run_benchmark
+        run: |
+          set -euo pipefail
+          test -s correctness-report.json
+          jq -e \
+            --arg golden_hash "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}" \
+            --argjson correctness_steps "${MLXFAST_EXPECTED_CORRECTNESS_STEPS}" \
+            --argjson correctness_cases "${MLXFAST_EXPECTED_CORRECTNESS_CASES}" \
+            '
+            def same_keys($expected):
+              (keys_unsorted | sort) == ($expected | sort);
+
+            same_keys([
+              "actual_token",
+              "case_count",
+              "checked_steps",
+              "error",
+              "expected_token",
+              "expert_bytes_read",
+              "expert_cache_evictions",
+              "expert_cache_hits",
+              "expert_cache_misses",
+              "expert_hit_rate",
+              "expert_peak_cached_tensors",
+              "expert_read_seconds",
+              "first_failing_case",
+              "first_failing_step",
+              "golden_hash",
+              "passed"
+            ])
+            and .passed == true
+            and .checked_steps == $correctness_steps
+            and .case_count == $correctness_cases
+            and .golden_hash == $golden_hash
+            and .error == ""
+            and .first_failing_case == null
+            and .first_failing_step == null
+            and .expected_token == null
+            and .actual_token == null
+            ' \
+            correctness-report.json >/dev/null
 
       - name: Benchmark
+        if: ${{ !inputs.preserve_golden_only && !inputs.generate_golden_only && inputs.run_benchmark }}
         env:
           MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
-        run: ./benchmark.sh
+          MLXFAST_SKIP_TRANSFORM: "1"
+          MLXFAST_SUBMISSION_REF: ${{ inputs.submission_ref }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${MLXFAST_SUBMISSION_REF}" ]]; then
+            echo "benchmark: running submitted benchmark with private process logs suppressed"
+            started="${SECONDS}"
+            ./benchmark.sh > "${RUNNER_TEMP}/mlxfast-benchmark-private.log" 2>&1 &
+            pid="$!"
+            while kill -0 "${pid}" 2>/dev/null; do
+              sleep 60
+              if kill -0 "${pid}" 2>/dev/null; then
+                echo "benchmark: submitted benchmark still running elapsed=$((SECONDS - started))s"
+              fi
+            done
+            wait "${pid}"
+          else
+            ./benchmark.sh
+          fi
 
-      - name: Upload score artifacts
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Validate benchmark artifacts
+        id: validate_benchmark_artifacts
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && inputs.run_benchmark
+        run: .github/scripts/validate-benchmark-artifacts.sh
+
+      - name: Trace correctness mismatch
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && inputs.trace_correctness_step != '' && inputs.submission_ref == '' && !startsWith(github.ref_name, 'submissions/')
+        run: |
+          set -euo pipefail
+          .build/release/mlxfast-swift correctness-trace \
+            --weights weights \
+            --golden "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
+            --step "${{ inputs.trace_correctness_step }}" \
+            --top-k "${{ inputs.trace_correctness_top_k }}" \
+            > correctness-trace.json
+
+      - name: Check benchmark artifact paths
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && inputs.run_benchmark && (inputs.submission_ref == '' || steps.validate_benchmark_artifacts.outcome == 'success')
+        run: |
+          set -euo pipefail
+          .github/scripts/deny-private-artifacts.sh \
+            correctness-report.json \
+            "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
+            "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes" \
+            score.json \
+            score.json.sha256 \
+            benchmark-integrity.json \
+            results.tsv
+
+      - name: Upload benchmark artifacts
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && inputs.run_benchmark && (inputs.submission_ref == '' || steps.validate_benchmark_artifacts.outcome == 'success')
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: benchmark-results-${{ github.run_id }}
           path: |
+            correctness-report.json
+            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.sha256
+            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.bytes
             score.json
+            score.json.sha256
+            benchmark-integrity.json
             results.tsv
-          if-no-files-found: ignore
+          if-no-files-found: error
+
+      - name: Check correctness artifact paths
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && !inputs.run_benchmark && (inputs.submission_ref == '' || steps.validate_correctness_artifacts.outcome == 'success')
+        run: |
+          set -euo pipefail
+          .github/scripts/deny-private-artifacts.sh \
+            correctness-report.json \
+            "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
+            "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes"
+
+      - name: Upload correctness artifacts
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && !inputs.run_benchmark && (inputs.submission_ref == '' || steps.validate_correctness_artifacts.outcome == 'success')
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: correctness-results-${{ github.run_id }}
+          path: |
+            correctness-report.json
+            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.sha256
+            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.bytes
+          if-no-files-found: error
+
+      - name: Check correctness trace artifact paths
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && inputs.trace_correctness_step != '' && !startsWith(github.ref_name, 'submissions/')
+        run: |
+          set -euo pipefail
+          .github/scripts/deny-private-artifacts.sh correctness-trace.json
+
+      - name: Upload correctness trace artifact
+        if: always() && !inputs.preserve_golden_only && !inputs.generate_golden_only && inputs.trace_correctness_step != '' && !startsWith(github.ref_name, 'submissions/')
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: correctness-trace-${{ github.run_id }}
+          path: correctness-trace.json
+          if-no-files-found: error

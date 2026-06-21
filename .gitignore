@@ -4,6 +4,8 @@ build/
 dist/
 .build/
 .tools/
+.mlxfast-cache/
+.cache/
 
 # Reference weights are large and downloaded by setup.sh
 reference_weights/*
@@ -15,16 +17,21 @@ weights/*
 
 # Local results log
 results.tsv
+m5_artifacts/
 
 # Benchmark contract outputs
 score.json
 score.json.tmp
 correctness_golden.json
+correctness_golden*.json
 local_correctness_golden.json
+private_prompts.json
+private_prompts*.json
 
 # IDE
 .vscode/
 .idea/
+.serena/
 *.swp
 *.swo
 .DS_Store

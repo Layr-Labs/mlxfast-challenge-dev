@@ -4,19 +4,153 @@ set -euo pipefail
 
 REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/DeepSeek-V4-Flash-4bit}"
 REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-main}"
-REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-https://huggingface.co/${REFERENCE_MODEL_REPO}/resolve/${REFERENCE_REVISION}}"
+REFERENCE_CACHE_REPO_DIR="models--${REFERENCE_MODEL_REPO//\//--}"
+REFERENCE_CACHE_REVISION_DIR="${REFERENCE_REVISION//\//--}"
+DEFAULT_REFERENCE_BASE_URL="https://ds4.darkbloom.ai/deepseek-v4-flash-4bit"
+REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}"
+REFERENCE_AUTH_HEADER="${MLXFAST_REFERENCE_AUTH_HEADER:-}"
+REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}"
+REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_deepseek_v4_flash_4bit.sha256}"
+REFERENCE_HASH_VERIFY="${MLXFAST_REFERENCE_HASH_VERIFY:-1}"
 REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-170}"
-REFERENCE_DOWNLOAD_JOBS="${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-4}"
+REFERENCE_DOWNLOAD_JOBS="${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-8}"
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
-REFERENCE_METADATA_FILES=(
+MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
+DEFAULT_REFERENCE_DIR="reference_weights/DeepSeek-V4-Flash-4bit"
+DEFAULT_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${PWD}/.cache/huggingface}}"
+DEFAULT_HF_HUB_CACHE="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${DEFAULT_HF_HOME}/hub}}"
+REFERENCE_CACHE_DIR="${MLXFAST_REFERENCE_CACHE_DIR:-${DEFAULT_HF_HUB_CACHE}/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}}"
+if [[ -n "${MLXFAST_REFERENCE_DIR:-}" ]]; then
+  REFERENCE_DIR="${MLXFAST_REFERENCE_DIR}"
+elif [[ -e "${DEFAULT_REFERENCE_DIR}" && ! -L "${DEFAULT_REFERENCE_DIR}" ]]; then
+  REFERENCE_DIR="${DEFAULT_REFERENCE_DIR}"
+else
+  REFERENCE_DIR="${REFERENCE_CACHE_DIR}"
+fi
+REFERENCE_COMPAT_LINK="${MLXFAST_REFERENCE_COMPAT_LINK:-${DEFAULT_REFERENCE_DIR}}"
+REFERENCE_CACHE_LOCK_PATH="${MLXFAST_REFERENCE_CACHE_LOCK_PATH:-${REFERENCE_DIR}/.mlxfast-reference-cache.lock}"
+SETUP_STARTED_SECONDS="${SECONDS}"
+REFERENCE_REQUIRED_METADATA_FILES=(
+  "config.json"
+  "model.safetensors.index.json"
+)
+REFERENCE_OPTIONAL_METADATA_FILES=(
   "README.md"
   "chat_template.jinja"
-  "config.json"
   "generation_config.json"
-  "model.safetensors.index.json"
   "tokenizer.json"
   "tokenizer_config.json"
 )
+
+print_help() {
+  cat <<EOF
+Usage: ./setup.sh
+
+Checks the local macOS/Apple Silicon toolchain, builds the Swift harness,
+builds mlx.metallib, and downloads the DeepSeek V4 Flash 4-bit reference
+checkpoint when it is not already present.
+
+Important environment variables:
+  MLXFAST_REFERENCE_DIR              Reference checkpoint directory.
+                                     Default: ${REFERENCE_DIR}
+  MLXFAST_REFERENCE_CACHE_DIR        Repo-local Hugging Face-style cache path
+                                     used for new downloads when
+                                     MLXFAST_REFERENCE_DIR is not set.
+                                     Default: ${REFERENCE_CACHE_DIR}
+  MLXFAST_REFERENCE_BASE_URL         HTTP prefix for checkpoint files.
+                                     Default: ${DEFAULT_REFERENCE_BASE_URL}
+  MLXFAST_REFERENCE_MANIFEST_PATH    SHA256 manifest for the reference files.
+                                     Default: ${REFERENCE_MANIFEST_PATH}
+  MLXFAST_REFERENCE_CACHE_LOCK_PATH  Local lock proving the checkpoint was
+                                     fully verified by this manifest.
+                                     Default: ${REFERENCE_CACHE_LOCK_PATH}
+  MLXFAST_REFERENCE_DOWNLOAD_JOBS    Parallel safetensors downloads.
+                                     Default: ${REFERENCE_DOWNLOAD_JOBS}
+  MLXFAST_REFERENCE_MIN_FREE_GIB     Required free space before download.
+                                     Default: ${REFERENCE_MIN_FREE_GIB}
+  MLXFAST_REFERENCE_HASH_VERIFY=0    Skip reference SHA256 verification.
+  MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1    Build tools only; do not download weights.
+  MLXFAST_SKIP_MLX_METALLIB=1        Skip mlx.metallib build.
+  MLXFAST_SKIP_MACTOP_INSTALL=1      Skip mactop install/check.
+  MLXFAST_MACTOP_BIN=/path/mactop    Use a specific mactop binary.
+
+After setup:
+  .github/scripts/run-offline.sh .build/release/mlxfast-swift transform
+  ./benchmark.sh
+EOF
+}
+
+if [[ "$#" -gt 0 ]]; then
+  case "$1" in
+    -h|--help|help)
+      print_help
+      exit 0
+      ;;
+    *)
+      echo "setup.sh: unknown argument '$1'" >&2
+      echo "Run ./setup.sh --help for usage." >&2
+      exit 2
+      ;;
+  esac
+fi
+
+format_duration() {
+  local total_seconds="${1:-0}"
+  printf '%02d:%02d:%02d' \
+    $((total_seconds / 3600)) \
+    $(((total_seconds % 3600) / 60)) \
+    $((total_seconds % 60))
+}
+
+path_size_gib() {
+  local path="$1"
+  local size_kib
+
+  if [[ ! -e "${path}" ]]; then
+    printf '0.0'
+    return 0
+  fi
+
+  size_kib="$(du -sk "${path}" 2>/dev/null | awk '{print $1}')"
+  if [[ -z "${size_kib}" ]]; then
+    printf 'unknown'
+    return 0
+  fi
+
+  awk -v kib="${size_kib}" 'BEGIN { printf "%.1f", kib / 1024 / 1024 }'
+}
+
+print_setup_summary() {
+  local reference_status="${1:-ready}"
+  local elapsed="$((SECONDS - SETUP_STARTED_SECONDS))"
+  local reference_line
+  local metallib_line
+
+  if [[ "${reference_status}" == "skipped" ]]; then
+    reference_line="skipped (${REFERENCE_DIR})"
+  elif [[ -f "${REFERENCE_DIR}/config.json" ]]; then
+    reference_line="${REFERENCE_DIR} ($(path_size_gib "${REFERENCE_DIR}") GiB)"
+  else
+    reference_line="missing (${REFERENCE_DIR})"
+  fi
+
+  if [[ "${MLXFAST_SKIP_MLX_METALLIB:-0}" == "1" ]]; then
+    metallib_line="skipped (${MLX_METALLIB})"
+  else
+    metallib_line="${MLX_METALLIB}"
+  fi
+
+  cat <<EOF
+setup.sh: setup complete elapsed=$(format_duration "${elapsed}")
+setup.sh: summary
+  binary: ${SWIFT_BIN}
+  mlx.metallib: ${metallib_line}
+  reference checkpoint: ${reference_line}
+  next:
+    .github/scripts/run-offline.sh ${SWIFT_BIN} transform
+    ./benchmark.sh
+EOF
+}
 
 load_homebrew_shellenv() {
   local candidate
@@ -109,20 +243,124 @@ ensure_mactop() {
   fi
 }
 
+find_cmake() {
+  local candidate
+  if [[ -n "${MLXFAST_CMAKE_BIN:-}" ]]; then
+    if [[ -x "${MLXFAST_CMAKE_BIN}" ]]; then
+      printf '%s\n' "${MLXFAST_CMAKE_BIN}"
+      return 0
+    fi
+    echo "setup.sh: MLXFAST_CMAKE_BIN is set but not executable: ${MLXFAST_CMAKE_BIN}" >&2
+    return 1
+  fi
+
+  if candidate="$(command -v cmake 2>/dev/null)"; then
+    printf '%s\n' "${candidate}"
+    return 0
+  fi
+
+  for candidate in /opt/homebrew/bin/cmake /usr/local/bin/cmake; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+ensure_cmake() {
+  if find_cmake >/dev/null; then
+    return 0
+  fi
+
+  if [[ "${MLXFAST_SKIP_CMAKE_INSTALL:-0}" == "1" ]]; then
+    echo "setup.sh: cmake is not installed and MLXFAST_SKIP_CMAKE_INSTALL=1" >&2
+    return 1
+  fi
+
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "setup.sh: automatic cmake installation is only supported on macOS" >&2
+    return 1
+  fi
+
+  ensure_homebrew
+  echo "setup.sh: installing cmake with Homebrew"
+  brew install cmake
+
+  if ! find_cmake >/dev/null; then
+    echo "setup.sh: cmake installation finished, but cmake was not found" >&2
+    return 1
+  fi
+}
+
 ensure_swift_toolchain() {
   if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "setup.sh: this Swift harness targets macOS on Apple Silicon" >&2
     exit 1
   fi
 
+  if [[ "$(uname -m)" != "arm64" ]]; then
+    echo "setup.sh: this Swift harness requires Apple Silicon (arm64)" >&2
+    exit 1
+  fi
+
   if ! command -v swift >/dev/null 2>&1; then
-    echo "setup.sh: swift was not found; install Xcode command line tools" >&2
+    echo "setup.sh: swift was not found; install Xcode command line tools with xcode-select --install" >&2
     exit 1
   fi
 
   if ! command -v xcodebuild >/dev/null 2>&1; then
     echo "setup.sh: xcodebuild was not found; install Xcode" >&2
     exit 1
+  fi
+
+  if ! xcodebuild -version >/dev/null 2>&1; then
+    cat >&2 <<EOF
+setup.sh: xcodebuild is installed but not usable.
+
+Open Xcode once, select its command line tools, and accept the license, then retry:
+
+  sudo xcodebuild -license accept
+
+EOF
+    exit 1
+  fi
+}
+
+ensure_metal_toolchain() {
+  if xcrun -sdk macosx metal -v >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ "${MLXFAST_SKIP_METAL_TOOLCHAIN_INSTALL:-0}" == "1" ]]; then
+    cat >&2 <<EOF
+setup.sh: Xcode's Metal Toolchain is not installed and MLXFAST_SKIP_METAL_TOOLCHAIN_INSTALL=1.
+
+Install it, then retry:
+
+  xcodebuild -downloadComponent MetalToolchain
+
+EOF
+    return 1
+  fi
+
+  echo "setup.sh: installing Xcode Metal Toolchain"
+  if ! xcodebuild -downloadComponent MetalToolchain; then
+    cat >&2 <<EOF
+setup.sh: failed to install Xcode's Metal Toolchain.
+
+Install it manually, then retry:
+
+  xcodebuild -downloadComponent MetalToolchain
+
+EOF
+    return 1
+  fi
+
+  if ! xcrun -sdk macosx metal -v >/dev/null 2>&1; then
+    echo "setup.sh: Metal Toolchain installation finished, but xcrun still cannot execute metal" >&2
+    return 1
   fi
 }
 
@@ -151,39 +389,447 @@ EOF
   fi
 }
 
+download_url_for_file() {
+  local url="$1"
+  local append_query=0
+  local separator="?"
+
+  case "${REFERENCE_APPEND_DOWNLOAD_QUERY}" in
+    1|true|TRUE|yes|YES)
+      append_query=1
+      ;;
+    0|false|FALSE|no|NO)
+      append_query=0
+      ;;
+    auto|"")
+      if [[ "${url}" == https://huggingface.co/* || "${url}" == http://huggingface.co/* ]]; then
+        append_query=1
+      fi
+      ;;
+    *)
+      echo "setup.sh: MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY must be auto, true, or false" >&2
+      return 1
+      ;;
+  esac
+
+  if [[ "${append_query}" == "1" ]]; then
+    if [[ "${url}" == *\?* ]]; then
+      separator="&"
+    fi
+    url="${url}${separator}download=true"
+  fi
+
+  printf '%s\n' "${url}"
+}
+
+reference_hash_verification_enabled() {
+  case "${REFERENCE_HASH_VERIFY}" in
+    0|false|FALSE|no|NO)
+      return 1
+      ;;
+    1|true|TRUE|yes|YES)
+      return 0
+      ;;
+    *)
+      echo "setup.sh: MLXFAST_REFERENCE_HASH_VERIFY must be 0 or 1" >&2
+      return 2
+      ;;
+  esac
+}
+
+reference_manifest_entry() {
+  local relative_path="$1"
+  local line
+  local expected_hash
+  local expected_size
+  local manifest_path
+  local extra
+
+  [[ -f "${REFERENCE_MANIFEST_PATH}" ]] || return 1
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    read -r expected_hash expected_size manifest_path extra <<< "${line}"
+    if [[ "${manifest_path}" == "${relative_path}" ]]; then
+      printf '%s %s\n' "${expected_hash}" "${expected_size}"
+      return 0
+    fi
+  done < "${REFERENCE_MANIFEST_PATH}"
+
+  return 1
+}
+
+reference_file_is_current() {
+  local relative_path="$1"
+  local output_path="$2"
+  local label="${3:-${relative_path}}"
+  local manifest_entry
+  local expected_hash
+  local expected_size
+  local actual_size
+  local actual_hash
+  local hash_status
+
+  if reference_hash_verification_enabled; then
+    hash_status=0
+  else
+    hash_status="$?"
+  fi
+  if [[ "${hash_status}" == "1" ]]; then
+    [[ -s "${output_path}" ]]
+    return $?
+  elif [[ "${hash_status}" != "0" ]]; then
+    return 1
+  fi
+
+  if [[ ! -f "${REFERENCE_MANIFEST_PATH}" ]]; then
+    echo "setup.sh: reference manifest missing at ${REFERENCE_MANIFEST_PATH}" >&2
+    return 1
+  fi
+  if ! manifest_entry="$(reference_manifest_entry "${relative_path}")"; then
+    echo "setup.sh: reference manifest has no entry for ${relative_path}" >&2
+    return 1
+  fi
+  read -r expected_hash expected_size <<< "${manifest_entry}"
+
+  if [[ ! -f "${output_path}" ]]; then
+    return 1
+  fi
+
+  actual_size="$(wc -c < "${output_path}" | tr -d ' ')"
+  if [[ "${actual_size}" != "${expected_size}" ]]; then
+    echo "setup.sh: cached ${label} size mismatch: expected ${expected_size}, got ${actual_size}"
+    return 1
+  fi
+
+  actual_hash="$(shasum -a 256 "${output_path}" | awk '{print $1}')"
+  if [[ "${actual_hash}" != "${expected_hash}" ]]; then
+    echo "setup.sh: cached ${label} sha256 mismatch"
+    echo "setup.sh: expected ${expected_hash}"
+    echo "setup.sh: actual   ${actual_hash}"
+    return 1
+  fi
+
+  return 0
+}
+
+reference_manifest_hash() {
+  if [[ ! -f "${REFERENCE_MANIFEST_PATH}" ]]; then
+    echo "setup.sh: reference manifest missing at ${REFERENCE_MANIFEST_PATH}" >&2
+    return 1
+  fi
+  shasum -a 256 "${REFERENCE_MANIFEST_PATH}" | awk '{print $1}'
+}
+
+reference_manifest_totals() {
+  local line
+  local expected_hash
+  local expected_size
+  local relative_path
+  local extra
+  local file_count=0
+  local byte_count=0
+
+  if [[ ! -f "${REFERENCE_MANIFEST_PATH}" ]]; then
+    echo "setup.sh: reference manifest missing at ${REFERENCE_MANIFEST_PATH}" >&2
+    return 1
+  fi
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    read -r expected_hash expected_size relative_path extra <<< "${line}"
+    if [[ -n "${extra:-}" || -z "${expected_hash:-}" || -z "${expected_size:-}" || -z "${relative_path:-}" ]]; then
+      return 1
+    fi
+    if [[ ! "${expected_hash}" =~ ^[0-9a-f]{64}$ || ! "${expected_size}" =~ ^[0-9]+$ ]]; then
+      return 1
+    fi
+    if [[ "${relative_path}" == /* || "${relative_path}" == *\\* ]]; then
+      return 1
+    fi
+    case "/${relative_path}/" in
+      *"/../"*|*"/./"*) return 1 ;;
+    esac
+
+    file_count=$((file_count + 1))
+    byte_count=$((byte_count + expected_size))
+  done < "${REFERENCE_MANIFEST_PATH}"
+
+  [[ "${file_count}" -gt 0 ]] || return 1
+  printf '%s %s\n' "${file_count}" "${byte_count}"
+}
+
+file_mtime_seconds() {
+  local file_path="$1"
+  stat -f '%m' "${file_path}" 2>/dev/null || stat -c '%Y' "${file_path}"
+}
+
+reference_cache_lock_is_current() {
+  local reference_dir="$1"
+  local lock_path="${REFERENCE_CACHE_LOCK_PATH}"
+  local hash_status
+  local expected_manifest_hash
+  local expected_manifest_totals
+  local manifest_file_count
+  local manifest_byte_count
+  local line
+  local key
+  local value
+  local in_files=0
+  local version=""
+  local model_repo=""
+  local revision=""
+  local manifest_hash=""
+  local lock_file_count=""
+  local lock_byte_count=""
+  local actual_file_count=0
+  local actual_byte_count=0
+  local relative_path
+  local expected_size
+  local expected_mtime
+  local extra
+  local file_path
+  local actual_size
+  local actual_mtime
+  local manifest_entry
+  local manifest_expected_hash
+  local manifest_expected_size
+
+  if reference_hash_verification_enabled; then
+    hash_status=0
+  else
+    hash_status="$?"
+  fi
+  if [[ "${hash_status}" != "0" ]]; then
+    return 1
+  fi
+
+  [[ -f "${lock_path}" ]] || return 1
+  if ! expected_manifest_hash="$(reference_manifest_hash)"; then
+    return 1
+  fi
+  if ! expected_manifest_totals="$(reference_manifest_totals)"; then
+    return 1
+  fi
+  read -r manifest_file_count manifest_byte_count <<< "${expected_manifest_totals}"
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" ]] && continue
+    if [[ "${line}" == "--files--" ]]; then
+      in_files=1
+      continue
+    fi
+
+    if [[ "${in_files}" == "0" ]]; then
+      key="${line%%=*}"
+      value="${line#*=}"
+      case "${key}" in
+        version) version="${value}" ;;
+        model_repo) model_repo="${value}" ;;
+        revision) revision="${value}" ;;
+        manifest_sha256) manifest_hash="${value}" ;;
+        file_count) lock_file_count="${value}" ;;
+        byte_count) lock_byte_count="${value}" ;;
+      esac
+      continue
+    fi
+
+    IFS=$'\t' read -r relative_path expected_size expected_mtime extra <<< "${line}"
+    if [[ -n "${extra:-}" || -z "${relative_path:-}" || -z "${expected_size:-}" || -z "${expected_mtime:-}" ]]; then
+      return 1
+    fi
+    if [[ "${relative_path}" == /* || "${relative_path}" == *\\* ]]; then
+      return 1
+    fi
+    [[ "${expected_size}" =~ ^[0-9]+$ ]] || return 1
+    [[ "${expected_mtime}" =~ ^[0-9]+$ ]] || return 1
+    case "/${relative_path}/" in
+      *"/../"*|*"/./"*) return 1 ;;
+    esac
+    if ! manifest_entry="$(reference_manifest_entry "${relative_path}")"; then
+      return 1
+    fi
+    read -r manifest_expected_hash manifest_expected_size <<< "${manifest_entry}"
+    [[ -n "${manifest_expected_hash}" ]] || return 1
+    [[ "${expected_size}" == "${manifest_expected_size}" ]] || return 1
+
+    file_path="${reference_dir}/${relative_path}"
+    [[ -f "${file_path}" ]] || return 1
+    actual_size="$(wc -c < "${file_path}" | tr -d ' ')"
+    [[ "${actual_size}" == "${expected_size}" ]] || return 1
+    if ! actual_mtime="$(file_mtime_seconds "${file_path}")"; then
+      return 1
+    fi
+    [[ "${actual_mtime}" == "${expected_mtime}" ]] || return 1
+
+    actual_file_count=$((actual_file_count + 1))
+    actual_byte_count=$((actual_byte_count + actual_size))
+  done < "${lock_path}"
+
+  [[ "${version}" == "1" ]] || return 1
+  [[ "${model_repo}" == "${REFERENCE_MODEL_REPO}" ]] || return 1
+  [[ "${revision}" == "${REFERENCE_REVISION}" ]] || return 1
+  [[ "${manifest_hash}" == "${expected_manifest_hash}" ]] || return 1
+  [[ "${lock_file_count}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${lock_byte_count}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${lock_file_count}" == "${manifest_file_count}" ]] || return 1
+  [[ "${lock_byte_count}" == "${manifest_byte_count}" ]] || return 1
+  [[ "${actual_file_count}" == "${lock_file_count}" ]] || return 1
+  [[ "${actual_byte_count}" == "${lock_byte_count}" ]] || return 1
+
+  echo "setup.sh: trusted reference cache lock at ${lock_path}; skipping full SHA256 verification"
+  return 0
+}
+
+write_reference_cache_lock() {
+  local reference_dir="$1"
+  local lock_path="${REFERENCE_CACHE_LOCK_PATH}"
+  local temp_path="${lock_path}.tmp"
+  local manifest_hash
+  local line
+  local expected_hash
+  local expected_size
+  local relative_path
+  local extra
+  local file_path
+  local actual_size
+  local actual_mtime
+  local file_count=0
+  local byte_count=0
+  local files_path="${temp_path}.files"
+
+  if ! manifest_hash="$(reference_manifest_hash)"; then
+    return 1
+  fi
+
+  mkdir -p "$(dirname "${lock_path}")"
+  : > "${files_path}"
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    read -r expected_hash expected_size relative_path extra <<< "${line}"
+    if [[ -n "${extra:-}" || -z "${expected_hash:-}" || -z "${expected_size:-}" || -z "${relative_path:-}" ]]; then
+      rm -f "${files_path}"
+      return 1
+    fi
+    file_path="${reference_dir}/${relative_path}"
+    [[ -f "${file_path}" ]] || {
+      rm -f "${files_path}"
+      return 1
+    }
+    actual_size="$(wc -c < "${file_path}" | tr -d ' ')"
+    if ! actual_mtime="$(file_mtime_seconds "${file_path}")"; then
+      rm -f "${files_path}"
+      return 1
+    fi
+    printf '%s\t%s\t%s\n' "${relative_path}" "${actual_size}" "${actual_mtime}" >> "${files_path}"
+    file_count=$((file_count + 1))
+    byte_count=$((byte_count + actual_size))
+  done < "${REFERENCE_MANIFEST_PATH}"
+
+  if [[ "${file_count}" -eq 0 ]]; then
+    rm -f "${files_path}"
+    return 1
+  fi
+
+  {
+    printf 'version=1\n'
+    printf 'model_repo=%s\n' "${REFERENCE_MODEL_REPO}"
+    printf 'revision=%s\n' "${REFERENCE_REVISION}"
+    printf 'manifest_sha256=%s\n' "${manifest_hash}"
+    printf 'file_count=%s\n' "${file_count}"
+    printf 'byte_count=%s\n' "${byte_count}"
+    printf 'verified_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '%s\n' '--files--'
+    cat "${files_path}"
+  } > "${temp_path}"
+  rm -f "${files_path}"
+  mv "${temp_path}" "${lock_path}"
+  echo "setup.sh: wrote reference cache lock ${lock_path}"
+}
+
 download_reference_file() {
   local file="$1"
   local output_path="$2"
+  local label="${3:-${file}}"
   local marker_path="${output_path}.complete"
   local url="${REFERENCE_BASE_URL%/}/${file}"
+  local started_seconds
+  local attempt=1
 
-  if [[ -f "${marker_path}" && -s "${output_path}" ]]; then
-    echo "setup.sh: already downloaded ${file}"
+  if reference_file_is_current "${file}" "${output_path}" "${label}"; then
+    echo "setup.sh: using cached ${label}"
+    touch "${marker_path}"
     return 0
   fi
+  rm -f "${marker_path}"
 
-  if [[ "${url}" == http://* || "${url}" == https://* ]]; then
-    url="${url}?download=true"
+  if ! url="$(download_url_for_file "${url}")"; then
+    return 1
   fi
 
   mkdir -p "$(dirname "${output_path}")"
-  echo "setup.sh: downloading ${file}"
-  curl \
-    --fail \
-    --location \
-    --retry 5 \
-    --retry-all-errors \
-    --retry-delay 2 \
-    --continue-at - \
-    --output "${output_path}" \
-    "${url}"
-  touch "${marker_path}"
+  started_seconds="${SECONDS}"
+  while [[ "${attempt}" -le 2 ]]; do
+    if [[ "${attempt}" == "1" ]]; then
+      echo "setup.sh: downloading ${label}"
+    else
+      echo "setup.sh: redownloading ${label} from scratch after hash verification failed"
+      rm -f "${output_path}" "${marker_path}"
+    fi
+
+    if [[ -n "${REFERENCE_AUTH_HEADER}" ]]; then
+      curl \
+        --fail \
+        --location \
+        --retry 5 \
+        --retry-all-errors \
+        --retry-delay 2 \
+        --continue-at - \
+        -H "${REFERENCE_AUTH_HEADER}" \
+        --output "${output_path}" \
+        "${url}"
+    else
+      curl \
+        --fail \
+        --location \
+        --retry 5 \
+        --retry-all-errors \
+        --retry-delay 2 \
+        --continue-at - \
+        --output "${output_path}" \
+        "${url}"
+    fi
+    touch "${marker_path}"
+
+    if reference_file_is_current "${file}" "${output_path}" "${label}"; then
+      echo "setup.sh: downloaded ${label} elapsed=$(format_duration "$((SECONDS - started_seconds))")"
+      return 0
+    fi
+
+    attempt=$((attempt + 1))
+  done
+
+  echo "setup.sh: failed to download verified ${label}" >&2
+  return 1
+}
+
+download_optional_reference_file() {
+  local file="$1"
+  local output_path="$2"
+
+  if download_reference_file "${file}" "${output_path}"; then
+    return 0
+  fi
+
+  rm -f "${output_path}" "${output_path}.complete"
+  echo "setup.sh: optional metadata ${file} was not available; continuing"
 }
 
 download_reference_shards() {
   local output_dir="$1"
   shift
   local jobs="${REFERENCE_DOWNLOAD_JOBS}"
+  local total="$#"
+  local started_seconds="${SECONDS}"
 
   if ! [[ "${jobs}" =~ ^[1-9][0-9]*$ ]]; then
     echo "setup.sh: MLXFAST_REFERENCE_DOWNLOAD_JOBS must be a positive integer" >&2
@@ -192,47 +838,182 @@ download_reference_shards() {
 
   if [[ "${jobs}" == "1" || "$#" -le 1 ]]; then
     local file
+    local ordinal=0
+    echo "setup.sh: downloading ${total} safetensors shard(s) with 1 parallel job"
     for file in "$@"; do
-      download_reference_file "${file}" "${output_dir}/${file}"
+      ordinal=$((ordinal + 1))
+      download_reference_file "${file}" "${output_dir}/${file}" "shard ${ordinal}/${total}: ${file}"
     done
+    echo "setup.sh: downloaded ${total}/${total} safetensors shard(s) elapsed=$(format_duration "$((SECONDS - started_seconds))")"
     return 0
   fi
 
-  echo "setup.sh: downloading $# safetensors shard(s) with ${jobs} parallel job(s)"
+  echo "setup.sh: downloading ${total} safetensors shard(s) with ${jobs} parallel job(s)"
   export REFERENCE_BASE_URL
-  printf '%s\0' "$@" | xargs -0 -I{} -P "${jobs}" bash -c '
+  export REFERENCE_AUTH_HEADER
+  export REFERENCE_APPEND_DOWNLOAD_QUERY
+  export REFERENCE_HASH_VERIFY
+  local ordinal=0
+  local manifest_entry
+  local expected_hash
+  local expected_size
+  for file in "$@"; do
+    ordinal=$((ordinal + 1))
+    expected_hash=""
+    expected_size=""
+    if manifest_entry="$(reference_manifest_entry "${file}")"; then
+      read -r expected_hash expected_size <<< "${manifest_entry}"
+    fi
+    printf "%s|%s|%s|%s\0" "${ordinal}" "${file}" "${expected_hash}" "${expected_size}"
+  done | xargs -0 -I{} -P "${jobs}" bash -c '
     set -euo pipefail
-    file="$1"
+    record="$1"
     output_dir="$2"
+    total="$3"
+    ordinal="${record%%|*}"
+    remainder="${record#*|}"
+    file="${remainder%%|*}"
+    remainder="${remainder#*|}"
+    expected_hash="${remainder%%|*}"
+    expected_size="${remainder#*|}"
     output_path="${output_dir}/${file}"
     marker_path="${output_path}.complete"
     url="${REFERENCE_BASE_URL%/}/${file}"
+    started_seconds="${SECONDS}"
+    attempt=1
 
-    if [[ -f "${marker_path}" && -s "${output_path}" ]]; then
-      echo "setup.sh: already downloaded ${file}"
+    download_url_for_file() {
+      local url="$1"
+      local append_query=0
+      local separator="?"
+
+      case "${REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}" in
+        1|true|TRUE|yes|YES)
+          append_query=1
+          ;;
+        0|false|FALSE|no|NO)
+          append_query=0
+          ;;
+        auto|"")
+          if [[ "${url}" == https://huggingface.co/* || "${url}" == http://huggingface.co/* ]]; then
+            append_query=1
+          fi
+          ;;
+        *)
+          echo "setup.sh: MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY must be auto, true, or false" >&2
+          return 1
+          ;;
+      esac
+
+      if [[ "${append_query}" == "1" ]]; then
+        if [[ "${url}" == *\?* ]]; then
+          separator="&"
+        fi
+        url="${url}${separator}download=true"
+      fi
+
+      printf "%s\n" "${url}"
+    }
+
+    reference_file_is_current() {
+      local actual_size
+      local actual_hash
+
+      case "${REFERENCE_HASH_VERIFY:-1}" in
+        0|false|FALSE|no|NO)
+          [[ -s "${output_path}" ]]
+          return $?
+          ;;
+        1|true|TRUE|yes|YES)
+          ;;
+        *)
+          echo "setup.sh: MLXFAST_REFERENCE_HASH_VERIFY must be 0 or 1" >&2
+          return 1
+          ;;
+      esac
+
+      if [[ -z "${expected_hash}" || -z "${expected_size}" ]]; then
+        echo "setup.sh: reference manifest has no entry for ${file}" >&2
+        return 1
+      fi
+      if [[ ! -f "${output_path}" ]]; then
+        return 1
+      fi
+
+      actual_size="$(wc -c < "${output_path}" | tr -d " ")"
+      if [[ "${actual_size}" != "${expected_size}" ]]; then
+        echo "setup.sh: cached shard ${ordinal}/${total}: ${file} size mismatch: expected ${expected_size}, got ${actual_size}"
+        return 1
+      fi
+      actual_hash="$(shasum -a 256 "${output_path}" | awk "{print \$1}")"
+      if [[ "${actual_hash}" != "${expected_hash}" ]]; then
+        echo "setup.sh: cached shard ${ordinal}/${total}: ${file} sha256 mismatch"
+        echo "setup.sh: expected ${expected_hash}"
+        echo "setup.sh: actual   ${actual_hash}"
+        return 1
+      fi
+
+      return 0
+    }
+
+    if reference_file_is_current; then
+      echo "setup.sh: using cached shard ${ordinal}/${total}: ${file}"
+      touch "${marker_path}"
       exit 0
     fi
+    rm -f "${marker_path}"
 
-    if [[ "${url}" == http://* || "${url}" == https://* ]]; then
-      url="${url}?download=true"
-    fi
+    url="$(download_url_for_file "${url}")"
 
     mkdir -p "$(dirname "${output_path}")"
-    echo "setup.sh: downloading ${file}"
-    curl \
-      --fail \
-      --location \
-      --retry 5 \
-      --retry-all-errors \
-      --retry-delay 2 \
-      --continue-at - \
-      --silent \
-      --show-error \
-      --output "${output_path}" \
-      "${url}"
-    touch "${marker_path}"
-    echo "setup.sh: downloaded ${file}"
-  ' _ {} "${output_dir}"
+    while [[ "${attempt}" -le 2 ]]; do
+      if [[ "${attempt}" == "1" ]]; then
+        echo "setup.sh: downloading shard ${ordinal}/${total}: ${file}"
+      else
+        echo "setup.sh: redownloading shard ${ordinal}/${total}: ${file} from scratch after hash verification failed"
+        rm -f "${output_path}" "${marker_path}"
+      fi
+
+      if [[ -n "${REFERENCE_AUTH_HEADER:-}" ]]; then
+        curl \
+          --fail \
+          --location \
+          --retry 5 \
+          --retry-all-errors \
+          --retry-delay 2 \
+          --continue-at - \
+          --silent \
+          --show-error \
+          -H "${REFERENCE_AUTH_HEADER}" \
+          --output "${output_path}" \
+          "${url}"
+      else
+        curl \
+          --fail \
+          --location \
+          --retry 5 \
+          --retry-all-errors \
+          --retry-delay 2 \
+          --continue-at - \
+          --silent \
+          --show-error \
+          --output "${output_path}" \
+          "${url}"
+      fi
+      touch "${marker_path}"
+
+      if reference_file_is_current; then
+        echo "setup.sh: downloaded shard ${ordinal}/${total}: ${file} elapsed=$((SECONDS - started_seconds))s"
+        exit 0
+      fi
+
+      attempt=$((attempt + 1))
+    done
+
+    echo "setup.sh: failed to download verified shard ${ordinal}/${total}: ${file}" >&2
+    exit 1
+  ' _ {} "${output_dir}" "${total}"
+  echo "setup.sh: downloaded ${total}/${total} safetensors shard(s) elapsed=$(format_duration "$((SECONDS - started_seconds))")"
 }
 
 list_reference_shards() {
@@ -286,13 +1067,135 @@ verify_reference_weights() {
     return 1
   fi
 
+  if reference_cache_lock_is_current "${reference_dir}"; then
+    echo "setup.sh: verified reference checkpoint at ${reference_dir} (${#shard_files[@]} safetensors shard(s))"
+    return 0
+  fi
+
+  if ! verify_reference_manifest "${reference_dir}"; then
+    rm -f "${REFERENCE_CACHE_LOCK_PATH}"
+    return 1
+  fi
+  if ! write_reference_cache_lock "${reference_dir}"; then
+    return 1
+  fi
   echo "setup.sh: verified reference checkpoint at ${reference_dir} (${#shard_files[@]} safetensors shard(s))"
+}
+
+verify_reference_manifest() {
+  local reference_dir="$1"
+  local line
+  local expected_hash
+  local expected_size
+  local relative_path
+  local extra
+  local file_path
+  local actual_size
+  local actual_hash
+  local checked=0
+
+  case "${REFERENCE_HASH_VERIFY}" in
+    0|false|FALSE|no|NO)
+      echo "setup.sh: skipping reference SHA256 verification"
+      return 0
+      ;;
+    1|true|TRUE|yes|YES)
+      ;;
+    *)
+      echo "setup.sh: MLXFAST_REFERENCE_HASH_VERIFY must be 0 or 1" >&2
+      return 1
+      ;;
+  esac
+
+  if [[ ! -f "${REFERENCE_MANIFEST_PATH}" ]]; then
+    echo "setup.sh: reference manifest missing at ${REFERENCE_MANIFEST_PATH}" >&2
+    return 1
+  fi
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    read -r expected_hash expected_size relative_path extra <<< "${line}"
+    if [[ -n "${extra:-}" || -z "${expected_hash:-}" || -z "${expected_size:-}" || -z "${relative_path:-}" ]]; then
+      echo "setup.sh: malformed reference manifest line: ${line}" >&2
+      return 1
+    fi
+    if [[ ! "${expected_hash}" =~ ^[0-9a-f]{64}$ || ! "${expected_size}" =~ ^[0-9]+$ ]]; then
+      echo "setup.sh: malformed reference manifest line: ${line}" >&2
+      return 1
+    fi
+    if [[ "${relative_path}" == /* || "${relative_path}" == *\\* ]]; then
+      echo "setup.sh: unsafe reference manifest path: ${relative_path}" >&2
+      return 1
+    fi
+    case "/${relative_path}/" in
+      *"/../"*|*"/./"*)
+        echo "setup.sh: unsafe reference manifest path: ${relative_path}" >&2
+        return 1
+        ;;
+    esac
+
+    file_path="${reference_dir}/${relative_path}"
+    if [[ ! -f "${file_path}" ]]; then
+      echo "setup.sh: reference checkpoint is missing manifest file ${relative_path}" >&2
+      return 1
+    fi
+    actual_size="$(wc -c < "${file_path}" | tr -d ' ')"
+    if [[ "${actual_size}" != "${expected_size}" ]]; then
+      echo "setup.sh: reference file ${relative_path} size mismatch: expected ${expected_size}, got ${actual_size}" >&2
+      return 1
+    fi
+    actual_hash="$(shasum -a 256 "${file_path}" | awk '{print $1}')"
+    if [[ "${actual_hash}" != "${expected_hash}" ]]; then
+      echo "setup.sh: reference file ${relative_path} sha256 mismatch" >&2
+      echo "setup.sh: expected ${expected_hash}" >&2
+      echo "setup.sh: actual   ${actual_hash}" >&2
+      return 1
+    fi
+    checked=$((checked + 1))
+  done < "${REFERENCE_MANIFEST_PATH}"
+
+  if [[ "${checked}" -eq 0 ]]; then
+    echo "setup.sh: reference manifest contained no files: ${REFERENCE_MANIFEST_PATH}" >&2
+    return 1
+  fi
+  echo "setup.sh: verified ${checked} reference file hash(es)"
+}
+
+ensure_reference_compat_link() {
+  local reference_dir="$1"
+  local link_path="${REFERENCE_COMPAT_LINK}"
+  local link_parent
+  local link_target
+
+  case "${reference_dir}" in
+    /*) ;;
+    *) reference_dir="${PWD}/${reference_dir}" ;;
+  esac
+
+  if [[ "${reference_dir}" == "${link_path}" ]]; then
+    return 0
+  fi
+
+  if [[ -L "${link_path}" ]]; then
+    link_target="$(readlink "${link_path}")"
+    if [[ "${link_target}" == "${reference_dir}" ]]; then
+      return 0
+    fi
+    rm -f "${link_path}"
+  elif [[ -e "${link_path}" ]]; then
+    echo "setup.sh: compatibility reference path exists; leaving it unchanged: ${link_path}"
+    return 0
+  fi
+
+  link_parent="$(dirname "${link_path}")"
+  mkdir -p "${link_parent}"
+  ln -s "${reference_dir}" "${link_path}"
+  echo "setup.sh: linked ${link_path} -> ${reference_dir}"
 }
 
 download_reference_weights() {
   local reference_dir="$1"
   local parent_dir
-  local partial_dir
   local file
   local index_path
   local shard_list
@@ -301,42 +1204,42 @@ download_reference_weights() {
   if [[ -f "${reference_dir}/config.json" ]]; then
     if verify_reference_weights "${reference_dir}"; then
       echo "setup.sh: reference weights already present at ${reference_dir}"
+      ensure_reference_compat_link "${reference_dir}"
       return 0
     fi
-    return 1
+    echo "setup.sh: reference cache at ${reference_dir} is incomplete or stale; repairing changed files"
   fi
 
-  if [[ -e "${reference_dir}" ]]; then
+  if [[ -e "${reference_dir}" && ! -d "${reference_dir}" ]]; then
     cat >&2 <<EOF
-setup.sh: ${reference_dir} exists but does not contain config.json.
+setup.sh: ${reference_dir} exists but is not a directory.
 
-Move it aside or set MLXFAST_REFERENCE_DIR to a complete checkpoint directory.
+Move it aside or set MLXFAST_REFERENCE_DIR to a checkpoint directory.
 
 EOF
     return 1
   fi
 
   parent_dir="$(dirname "${reference_dir}")"
-  partial_dir="${reference_dir}.partial"
   mkdir -p "${parent_dir}"
 
   ensure_reference_space "${parent_dir}"
-  if [[ -e "${partial_dir}" && ! -d "${partial_dir}" ]]; then
-    echo "setup.sh: partial download path exists but is not a directory: ${partial_dir}" >&2
-    return 1
-  fi
-  mkdir -p "${partial_dir}"
+  mkdir -p "${reference_dir}"
 
   echo "setup.sh: downloading ${REFERENCE_MODEL_REPO} from ${REFERENCE_BASE_URL}"
-  for file in "${REFERENCE_METADATA_FILES[@]}"; do
-    download_reference_file "${file}" "${partial_dir}/${file}"
+  echo "setup.sh: reference cache path ${reference_dir}"
+  for file in "${REFERENCE_REQUIRED_METADATA_FILES[@]}"; do
+    download_reference_file "${file}" "${reference_dir}/${file}"
+  done
+  for file in "${REFERENCE_OPTIONAL_METADATA_FILES[@]}"; do
+    download_optional_reference_file "${file}" "${reference_dir}/${file}"
   done
 
-  if [[ ! -f "${partial_dir}/config.json" ]]; then
+  if [[ ! -f "${reference_dir}/config.json" ]]; then
     echo "setup.sh: downloaded checkpoint is missing config.json" >&2
     return 1
   fi
-  index_path="${partial_dir}/model.safetensors.index.json"
+  index_path="${reference_dir}/model.safetensors.index.json"
   if [[ ! -f "${index_path}" ]]; then
     echo "setup.sh: downloaded checkpoint is missing model.safetensors.index.json" >&2
     return 1
@@ -356,17 +1259,19 @@ EOF
   fi
 
   echo "setup.sh: checkpoint index lists ${#shard_files[@]} safetensors shard(s)"
-  download_reference_shards "${partial_dir}" "${shard_files[@]}"
-  verify_reference_weights "${partial_dir}"
+  download_reference_shards "${reference_dir}" "${shard_files[@]}"
+  if ! verify_reference_weights "${reference_dir}"; then
+    return 1
+  fi
 
-  find "${partial_dir}" -name "*.complete" -type f -delete
-  mv "${partial_dir}" "${reference_dir}"
-  echo "setup.sh: downloaded reference weights to ${reference_dir}"
+  find "${reference_dir}" -name "*.complete" -type f -delete
+  ensure_reference_compat_link "${reference_dir}"
+  echo "setup.sh: reference weights ready at ${reference_dir}"
 }
 
-ensure_mactop
-
 ensure_swift_toolchain
+
+ensure_mactop
 
 echo "setup.sh: building Swift harness"
 mkdir -p .build/clang-module-cache
@@ -376,15 +1281,17 @@ swift build -c release
 if [[ "${MLXFAST_SKIP_MLX_METALLIB:-0}" == "1" ]]; then
   echo "setup.sh: skipping mlx.metallib build"
 else
+  ensure_cmake
+  ensure_metal_toolchain
   echo "setup.sh: building mlx.metallib for MLX Swift runtime"
   tools/build-mlx-metallib.sh
 fi
 
-REFERENCE_DIR="${MLXFAST_REFERENCE_DIR:-reference_weights/DeepSeek-V4-Flash-4bit}"
-
 if [[ "${MLXFAST_SKIP_WEIGHTS_DOWNLOAD:-0}" == "1" || "${SKIP_MODEL_DOWNLOAD:-0}" == "1" ]]; then
   echo "setup.sh: skipping reference weight download"
+  print_setup_summary "skipped"
   exit 0
 fi
 
 download_reference_weights "${REFERENCE_DIR}"
+print_setup_summary "ready"

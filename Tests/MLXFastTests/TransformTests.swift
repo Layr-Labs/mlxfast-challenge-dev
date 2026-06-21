@@ -2,6 +2,7 @@ import Foundation
 import Testing
 @testable import MLXFastCore
 @testable import MLXFastModel
+@testable import MLXFastHarness
 @testable import MLXFastTransform
 
 @Test
@@ -80,6 +81,104 @@ func transformCopiesDenseTensorsAndWritesExpertManifest() throws {
         capacity: 1
     )
     #expect(try bank.tensorBytes(named: expertName) == Data([9, 8, 7]))
+}
+
+@Test
+func transformVerifierAcceptsFreshSubmittedTransformOutputAndIgnoresLocalCacheMarkers() throws {
+    let fixture = try writeTransformFixture()
+    _ = try SwiftTransform.run(
+        TransformOptions(referencePath: fixture.reference.path, outputPath: fixture.output.path)
+    )
+    try "cache\n".write(
+        to: fixture.output.appendingPathComponent(".benchmark-source.sha256"),
+        atomically: true,
+        encoding: .utf8
+    )
+    FileManager.default.createFile(
+        atPath: fixture.output.appendingPathComponent(".gitkeep").path,
+        contents: Data()
+    )
+
+    let report = try TransformVerifier.verify(
+        TransformVerificationOptions(
+            referencePath: fixture.reference.path,
+            weightsPath: fixture.output.path,
+            temporaryParentPath: fixture.root.path
+        )
+    )
+
+    #expect(report.referencePath == fixture.reference.path)
+    #expect(report.weightsPath == fixture.output.path)
+    #expect(report.fileCount > 0)
+    #expect(report.byteCount > 0)
+    #expect(report.maxByteCount == MLXFastConstants.defaultMaxTransformedWeightsBytes)
+    #expect(report.sha256.count == 64)
+    #expect(report.deterministic)
+}
+
+@Test
+func transformVerifierRejectsOutputThatDiffersFromFreshTransformRun() throws {
+    let fixture = try writeTransformFixture()
+    _ = try SwiftTransform.run(
+        TransformOptions(referencePath: fixture.reference.path, outputPath: fixture.output.path)
+    )
+    try #"{"changed":true}"#.write(
+        to: fixture.output.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    #expect(throws: MLXFastError.self) {
+        _ = try TransformVerifier.verify(
+            TransformVerificationOptions(
+                referencePath: fixture.reference.path,
+                weightsPath: fixture.output.path,
+                temporaryParentPath: fixture.root.path
+            )
+        )
+    }
+}
+
+@Test
+func transformVerifierRejectsStaleExtraGeneratedFile() throws {
+    let fixture = try writeTransformFixture()
+    _ = try SwiftTransform.run(
+        TransformOptions(referencePath: fixture.reference.path, outputPath: fixture.output.path)
+    )
+    try "extra".write(
+        to: fixture.output.appendingPathComponent("extra.txt"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    #expect(throws: MLXFastError.self) {
+        _ = try TransformVerifier.verify(
+            TransformVerificationOptions(
+                referencePath: fixture.reference.path,
+                weightsPath: fixture.output.path,
+                temporaryParentPath: fixture.root.path
+            )
+        )
+    }
+}
+
+@Test
+func transformVerifierRejectsOutputAboveConfiguredByteLimit() throws {
+    let fixture = try writeTransformFixture()
+    _ = try SwiftTransform.run(
+        TransformOptions(referencePath: fixture.reference.path, outputPath: fixture.output.path)
+    )
+
+    #expect(throws: MLXFastError.self) {
+        _ = try TransformVerifier.verify(
+            TransformVerificationOptions(
+                referencePath: fixture.reference.path,
+                weightsPath: fixture.output.path,
+                temporaryParentPath: fixture.root.path,
+                maxByteCount: 1
+            )
+        )
+    }
 }
 
 @Test
@@ -229,6 +328,45 @@ private struct TensorFixture {
     let dtype: String
     let shape: [Int]
     let data: Data
+}
+
+private struct TransformFixturePaths {
+    let root: URL
+    let reference: URL
+    let output: URL
+}
+
+private func writeTransformFixture() throws -> TransformFixturePaths {
+    let root = try temporaryDirectory()
+    let reference = root.appendingPathComponent("reference", isDirectory: true)
+    let output = root.appendingPathComponent("weights", isDirectory: true)
+    try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
+    try writeReferenceConfig(reference)
+    try #"{"tokenizer":"fixture"}"#.write(
+        to: reference.appendingPathComponent("tokenizer.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let denseName = "model.layers.0.self_attn.q_proj.weight"
+    let expertName = "model.layers.0.ffn.switch_mlp.gate_proj.weight"
+    let shardName = "model-00001-of-00001.safetensors"
+    try writeSafetensors(
+        reference.appendingPathComponent(shardName),
+        tensors: [
+            TensorFixture(name: denseName, dtype: "U8", shape: [4], data: Data([1, 2, 3, 4])),
+            TensorFixture(name: expertName, dtype: "U8", shape: [3], data: Data([9, 8, 7])),
+        ]
+    )
+    try writeCheckpointIndex(
+        reference.appendingPathComponent("model.safetensors.index.json"),
+        weightMap: [
+            denseName: shardName,
+            expertName: shardName,
+        ]
+    )
+
+    return TransformFixturePaths(root: root, reference: reference, output: output)
 }
 
 private func writeReferenceConfig(_ reference: URL) throws {

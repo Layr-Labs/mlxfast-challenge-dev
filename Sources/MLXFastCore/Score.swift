@@ -41,6 +41,11 @@ public struct ScoreMetrics: Codable, Equatable {
     public let bandwidthGBPerToken: Double
     public let decodeSecondsPerToken: Double
     public let prefillSecondsPerToken: Double
+    public let benchmarkWallSeconds: Double
+    public let preflightSeconds: Double
+    public let correctnessSeconds: Double
+    public let timedBenchmarkSeconds: Double
+    public let processResidentMemoryGB: Double
     public let passedCorrectness: Bool
     public let numLayers: Int
     public let checkedSteps: Int
@@ -64,6 +69,9 @@ public struct ScoreMetrics: Codable, Equatable {
     public let commit: String
     public let timestamp: String
     public let harnessHash: String
+    public let weightsHash: String
+    public let weightsByteCount: Int
+    public let weightsFileCount: Int
     public let runtime: String
 
     enum CodingKeys: String, CodingKey {
@@ -71,6 +79,11 @@ public struct ScoreMetrics: Codable, Equatable {
         case bandwidthGBPerToken = "bandwidth_gb_per_token"
         case decodeSecondsPerToken = "decode_seconds_per_token"
         case prefillSecondsPerToken = "prefill_seconds_per_token"
+        case benchmarkWallSeconds = "benchmark_wall_seconds"
+        case preflightSeconds = "preflight_seconds"
+        case correctnessSeconds = "correctness_seconds"
+        case timedBenchmarkSeconds = "timed_benchmark_seconds"
+        case processResidentMemoryGB = "process_resident_memory_gb"
         case passedCorrectness = "passed_correctness"
         case numLayers = "num_layers"
         case checkedSteps = "checked_steps"
@@ -94,6 +107,9 @@ public struct ScoreMetrics: Codable, Equatable {
         case commit
         case timestamp
         case harnessHash = "harness_hash"
+        case weightsHash = "weights_hash"
+        case weightsByteCount = "weights_byte_count"
+        case weightsFileCount = "weights_file_count"
         case runtime
     }
 
@@ -102,6 +118,11 @@ public struct ScoreMetrics: Codable, Equatable {
         bandwidthGBPerToken: Double,
         decodeSecondsPerToken: Double,
         prefillSecondsPerToken: Double,
+        benchmarkWallSeconds: Double = 0,
+        preflightSeconds: Double = 0,
+        correctnessSeconds: Double = 0,
+        timedBenchmarkSeconds: Double = 0,
+        processResidentMemoryGB: Double = 0,
         passedCorrectness: Bool,
         numLayers: Int,
         checkedSteps: Int,
@@ -125,12 +146,20 @@ public struct ScoreMetrics: Codable, Equatable {
         commit: String,
         timestamp: String,
         harnessHash: String,
+        weightsHash: String = "",
+        weightsByteCount: Int = 0,
+        weightsFileCount: Int = 0,
         runtime: String
     ) {
         self.peakRamGB = peakRamGB
         self.bandwidthGBPerToken = bandwidthGBPerToken
         self.decodeSecondsPerToken = decodeSecondsPerToken
         self.prefillSecondsPerToken = prefillSecondsPerToken
+        self.benchmarkWallSeconds = benchmarkWallSeconds
+        self.preflightSeconds = preflightSeconds
+        self.correctnessSeconds = correctnessSeconds
+        self.timedBenchmarkSeconds = timedBenchmarkSeconds
+        self.processResidentMemoryGB = processResidentMemoryGB
         self.passedCorrectness = passedCorrectness
         self.numLayers = numLayers
         self.checkedSteps = checkedSteps
@@ -154,7 +183,50 @@ public struct ScoreMetrics: Codable, Equatable {
         self.commit = commit
         self.timestamp = timestamp
         self.harnessHash = harnessHash
+        self.weightsHash = weightsHash
+        self.weightsByteCount = weightsByteCount
+        self.weightsFileCount = weightsFileCount
         self.runtime = runtime
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.peakRamGB = try container.decode(Double.self, forKey: .peakRamGB)
+        self.bandwidthGBPerToken = try container.decode(Double.self, forKey: .bandwidthGBPerToken)
+        self.decodeSecondsPerToken = try container.decode(Double.self, forKey: .decodeSecondsPerToken)
+        self.prefillSecondsPerToken = try container.decode(Double.self, forKey: .prefillSecondsPerToken)
+        self.benchmarkWallSeconds = try container.decodeIfPresent(Double.self, forKey: .benchmarkWallSeconds) ?? 0
+        self.preflightSeconds = try container.decodeIfPresent(Double.self, forKey: .preflightSeconds) ?? 0
+        self.correctnessSeconds = try container.decodeIfPresent(Double.self, forKey: .correctnessSeconds) ?? 0
+        self.timedBenchmarkSeconds = try container.decodeIfPresent(Double.self, forKey: .timedBenchmarkSeconds) ?? 0
+        self.processResidentMemoryGB = try container.decodeIfPresent(Double.self, forKey: .processResidentMemoryGB) ?? 0
+        self.passedCorrectness = try container.decode(Bool.self, forKey: .passedCorrectness)
+        self.numLayers = try container.decode(Int.self, forKey: .numLayers)
+        self.checkedSteps = try container.decode(Int.self, forKey: .checkedSteps)
+        self.caseCount = try container.decode(Int.self, forKey: .caseCount)
+        self.expertCacheHits = try container.decode(UInt64.self, forKey: .expertCacheHits)
+        self.expertCacheMisses = try container.decode(UInt64.self, forKey: .expertCacheMisses)
+        self.expertCacheEvictions = try container.decode(UInt64.self, forKey: .expertCacheEvictions)
+        self.expertBytesRead = try container.decode(UInt64.self, forKey: .expertBytesRead)
+        self.expertReadSeconds = try container.decode(Double.self, forKey: .expertReadSeconds)
+        self.expertPeakCachedTensors = try container.decode(UInt64.self, forKey: .expertPeakCachedTensors)
+        self.expertHitRate = try container.decode(Double.self, forKey: .expertHitRate)
+        self.firstFailingLayer = try container.decodeIfPresent(Int.self, forKey: .firstFailingLayer)
+        self.firstFailingCase = try container.decodeIfPresent(String.self, forKey: .firstFailingCase)
+        self.firstFailingStep = try container.decodeIfPresent(Int.self, forKey: .firstFailingStep)
+        self.expectedToken = try container.decodeIfPresent(Int.self, forKey: .expectedToken)
+        self.actualToken = try container.decodeIfPresent(Int.self, forKey: .actualToken)
+        self.maxAbsDiff = try container.decode(Double.self, forKey: .maxAbsDiff)
+        self.goldenHash = try container.decode(String.self, forKey: .goldenHash)
+        self.bandwidthSource = try container.decode(String.self, forKey: .bandwidthSource)
+        self.error = try container.decode(String.self, forKey: .error)
+        self.commit = try container.decode(String.self, forKey: .commit)
+        self.timestamp = try container.decode(String.self, forKey: .timestamp)
+        self.harnessHash = try container.decode(String.self, forKey: .harnessHash)
+        self.weightsHash = try container.decodeIfPresent(String.self, forKey: .weightsHash) ?? ""
+        self.weightsByteCount = try container.decodeIfPresent(Int.self, forKey: .weightsByteCount) ?? 0
+        self.weightsFileCount = try container.decodeIfPresent(Int.self, forKey: .weightsFileCount) ?? 0
+        self.runtime = try container.decode(String.self, forKey: .runtime)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -163,6 +235,11 @@ public struct ScoreMetrics: Codable, Equatable {
         try container.encode(bandwidthGBPerToken, forKey: .bandwidthGBPerToken)
         try container.encode(decodeSecondsPerToken, forKey: .decodeSecondsPerToken)
         try container.encode(prefillSecondsPerToken, forKey: .prefillSecondsPerToken)
+        try container.encode(benchmarkWallSeconds, forKey: .benchmarkWallSeconds)
+        try container.encode(preflightSeconds, forKey: .preflightSeconds)
+        try container.encode(correctnessSeconds, forKey: .correctnessSeconds)
+        try container.encode(timedBenchmarkSeconds, forKey: .timedBenchmarkSeconds)
+        try container.encode(processResidentMemoryGB, forKey: .processResidentMemoryGB)
         try container.encode(passedCorrectness, forKey: .passedCorrectness)
         try container.encode(numLayers, forKey: .numLayers)
         try container.encode(checkedSteps, forKey: .checkedSteps)
@@ -206,6 +283,9 @@ public struct ScoreMetrics: Codable, Equatable {
         try container.encode(commit, forKey: .commit)
         try container.encode(timestamp, forKey: .timestamp)
         try container.encode(harnessHash, forKey: .harnessHash)
+        try container.encode(weightsHash, forKey: .weightsHash)
+        try container.encode(weightsByteCount, forKey: .weightsByteCount)
+        try container.encode(weightsFileCount, forKey: .weightsFileCount)
         try container.encode(runtime, forKey: .runtime)
     }
 }
