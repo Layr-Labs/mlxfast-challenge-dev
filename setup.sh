@@ -12,6 +12,7 @@ REFERENCE_AUTH_HEADER="${MLXFAST_REFERENCE_AUTH_HEADER:-}"
 REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}"
 REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_deepseek_v4_flash_4bit.sha256}"
 REFERENCE_HASH_VERIFY="${MLXFAST_REFERENCE_HASH_VERIFY:-1}"
+REFERENCE_POST_DOWNLOAD_FULL_VERIFY="${MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY:-1}"
 REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-170}"
 REFERENCE_DOWNLOAD_JOBS="${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-8}"
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
@@ -69,6 +70,10 @@ Important environment variables:
   MLXFAST_REFERENCE_MIN_FREE_GIB     Required free space before download.
                                      Default: ${REFERENCE_MIN_FREE_GIB}
   MLXFAST_REFERENCE_HASH_VERIFY=0    Skip reference SHA256 verification.
+  MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY=0
+                                     Skip the second full-checkpoint SHA256 pass
+                                     after all downloaded files were already
+                                     verified by size and hash. CI-only speedup.
   MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1    Build tools only; do not download weights.
   MLXFAST_SKIP_MLX_METALLIB=1        Skip mlx.metallib build.
   MLXFAST_SKIP_MACTOP_INSTALL=1      Skip mactop install/check.
@@ -337,9 +342,14 @@ ensure_metal_toolchain() {
     cat >&2 <<EOF
 setup.sh: Xcode's Metal Toolchain is not installed and MLXFAST_SKIP_METAL_TOOLCHAIN_INSTALL=1.
 
-Install it, then retry:
+Install full Xcode from the App Store or Apple Developer, open it once, select
+its command line tools, accept the license, then retry:
 
+  sudo xcodebuild -license accept
   xcodebuild -downloadComponent MetalToolchain
+
+If you only installed the Command Line Tools and this still fails, install full
+Xcode; the MLX Metal runtime needs Apple's Metal compiler toolchain.
 
 EOF
     return 1
@@ -350,9 +360,14 @@ EOF
     cat >&2 <<EOF
 setup.sh: failed to install Xcode's Metal Toolchain.
 
-Install it manually, then retry:
+Install full Xcode from the App Store or Apple Developer, open it once, select
+its command line tools, accept the license, then retry:
 
+  sudo xcodebuild -license accept
   xcodebuild -downloadComponent MetalToolchain
+
+If you only installed the Command Line Tools and this still fails, install full
+Xcode; the MLX Metal runtime needs Apple's Metal compiler toolchain.
 
 EOF
     return 1
@@ -432,6 +447,21 @@ reference_hash_verification_enabled() {
       ;;
     *)
       echo "setup.sh: MLXFAST_REFERENCE_HASH_VERIFY must be 0 or 1" >&2
+      return 2
+      ;;
+  esac
+}
+
+reference_post_download_full_verify_enabled() {
+  case "${REFERENCE_POST_DOWNLOAD_FULL_VERIFY}" in
+    0|false|FALSE|no|NO)
+      return 1
+      ;;
+    1|true|TRUE|yes|YES)
+      return 0
+      ;;
+    *)
+      echo "setup.sh: MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY must be 0 or 1" >&2
       return 2
       ;;
   esac
@@ -1082,6 +1112,125 @@ verify_reference_weights() {
   echo "setup.sh: verified reference checkpoint at ${reference_dir} (${#shard_files[@]} safetensors shard(s))"
 }
 
+verify_reference_weights_after_verified_download() {
+  local reference_dir="$1"
+  local index_path="${reference_dir}/model.safetensors.index.json"
+  local hash_status
+  local shard_list
+  local file
+  local shard_files=()
+  local missing=0
+
+  if reference_hash_verification_enabled; then
+    hash_status=0
+  else
+    hash_status="$?"
+  fi
+  if [[ "${hash_status}" != "0" ]]; then
+    echo "setup.sh: cannot skip post-download full verification unless MLXFAST_REFERENCE_HASH_VERIFY=1" >&2
+    return 1
+  fi
+
+  if [[ ! -f "${reference_dir}/config.json" ]]; then
+    echo "setup.sh: reference checkpoint is missing config.json at ${reference_dir}" >&2
+    return 1
+  fi
+  if [[ ! -f "${index_path}" ]]; then
+    echo "setup.sh: reference checkpoint is missing model.safetensors.index.json at ${reference_dir}" >&2
+    return 1
+  fi
+
+  if ! shard_list="$(list_reference_shards "${index_path}")"; then
+    return 1
+  fi
+  while IFS= read -r file; do
+    if [[ -n "${file}" ]]; then
+      shard_files+=("${file}")
+    fi
+  done <<< "${shard_list}"
+  if [[ "${#shard_files[@]}" -eq 0 ]]; then
+    echo "setup.sh: checkpoint index did not list any safetensors shards" >&2
+    return 1
+  fi
+
+  for file in "${shard_files[@]}"; do
+    if [[ ! -s "${reference_dir}/${file}" ]]; then
+      echo "setup.sh: reference checkpoint is missing shard ${file} at ${reference_dir}" >&2
+      missing=1
+    fi
+  done
+  if [[ "${missing}" != "0" ]]; then
+    return 1
+  fi
+
+  if ! verify_reference_manifest_sizes "${reference_dir}"; then
+    rm -f "${REFERENCE_CACHE_LOCK_PATH}"
+    return 1
+  fi
+  if ! write_reference_cache_lock "${reference_dir}"; then
+    return 1
+  fi
+  echo "setup.sh: verified reference checkpoint at ${reference_dir} (${#shard_files[@]} safetensors shard(s)); skipped second SHA256 pass after verified downloads"
+}
+
+verify_reference_manifest_sizes() {
+  local reference_dir="$1"
+  local line
+  local expected_hash
+  local expected_size
+  local relative_path
+  local extra
+  local file_path
+  local actual_size
+  local checked=0
+
+  if [[ ! -f "${REFERENCE_MANIFEST_PATH}" ]]; then
+    echo "setup.sh: reference manifest missing at ${REFERENCE_MANIFEST_PATH}" >&2
+    return 1
+  fi
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    read -r expected_hash expected_size relative_path extra <<< "${line}"
+    if [[ -n "${extra:-}" || -z "${expected_hash:-}" || -z "${expected_size:-}" || -z "${relative_path:-}" ]]; then
+      echo "setup.sh: malformed reference manifest line: ${line}" >&2
+      return 1
+    fi
+    if [[ ! "${expected_hash}" =~ ^[0-9a-f]{64}$ || ! "${expected_size}" =~ ^[0-9]+$ ]]; then
+      echo "setup.sh: malformed reference manifest line: ${line}" >&2
+      return 1
+    fi
+    if [[ "${relative_path}" == /* || "${relative_path}" == *\\* ]]; then
+      echo "setup.sh: unsafe reference manifest path: ${relative_path}" >&2
+      return 1
+    fi
+    case "/${relative_path}/" in
+      *"/../"*|*"/./"*)
+        echo "setup.sh: unsafe reference manifest path: ${relative_path}" >&2
+        return 1
+        ;;
+    esac
+
+    file_path="${reference_dir}/${relative_path}"
+    if [[ ! -f "${file_path}" ]]; then
+      echo "setup.sh: reference checkpoint is missing manifest file ${relative_path}" >&2
+      return 1
+    fi
+    actual_size="$(wc -c < "${file_path}" | tr -d ' ')"
+    if [[ "${actual_size}" != "${expected_size}" ]]; then
+      echo "setup.sh: reference file ${relative_path} size mismatch: expected ${expected_size}, got ${actual_size}" >&2
+      return 1
+    fi
+    checked=$((checked + 1))
+  done < "${REFERENCE_MANIFEST_PATH}"
+
+  if [[ "${checked}" -eq 0 ]]; then
+    echo "setup.sh: reference manifest contained no files: ${REFERENCE_MANIFEST_PATH}" >&2
+    return 1
+  fi
+  echo "setup.sh: verified ${checked} reference file size(s)"
+}
+
 verify_reference_manifest() {
   local reference_dir="$1"
   local line
@@ -1205,6 +1354,7 @@ download_reference_weights() {
   local parent_dir
   local file
   local index_path
+  local post_verify_status
   local shard_list
   local shard_files=()
 
@@ -1267,8 +1417,19 @@ EOF
 
   echo "setup.sh: checkpoint index lists ${#shard_files[@]} safetensors shard(s)"
   download_reference_shards "${reference_dir}" "${shard_files[@]}"
-  if ! verify_reference_weights "${reference_dir}"; then
-    return 1
+  if reference_post_download_full_verify_enabled; then
+    if ! verify_reference_weights "${reference_dir}"; then
+      return 1
+    fi
+  else
+    post_verify_status="$?"
+    if [[ "${post_verify_status}" == "1" ]]; then
+      if ! verify_reference_weights_after_verified_download "${reference_dir}"; then
+        return 1
+      fi
+    else
+      return 1
+    fi
   fi
 
   find "${reference_dir}" -name "*.complete" -type f -delete

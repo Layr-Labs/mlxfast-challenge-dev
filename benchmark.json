@@ -3,7 +3,7 @@
   "name": "mlxfast-challenge-dev",
   "description": "Optimize DeepSeek-V4-Flash MoE inference by transforming weights offline and reducing memory bandwidth without failing the correctness gate.",
   "category": "swift",
-  "direction": "-",
+  "direction": "+",
   "editablePaths": [
     "Sources/MLXFastModel",
     "Sources/MLXFastTransform"

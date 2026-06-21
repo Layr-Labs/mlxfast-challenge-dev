@@ -11,8 +11,10 @@ See [CHALLENGE.md](CHALLENGE.md) for the full problem statement, scoring formula
 # Check local tools, build the Swift harness/MLX metallib, and fetch weights if needed
 ./setup.sh
 
-# Split dense weights into weights/ and write the expert streaming manifest
-.github/scripts/run-offline.sh .build/release/mlxfast-swift transform
+# Optional: split dense weights into weights/ and write the expert streaming
+# manifest. setup.sh prints this command with the exact reference path it used.
+.github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+  --reference .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
 
 # Run the Darkbloom-compatible benchmark entrypoint.
 # Requires the organizer-supplied correctness_golden.json.
@@ -50,35 +52,43 @@ default into a repo-local Hugging Face-style cache under
 It verifies cached files against `fixtures/reference_deepseek_v4_flash_4bit.sha256`
 and redownloads only files that are missing, truncated, or hash-mismatched. A
 compatibility symlink is created at `reference_weights/DeepSeek-V4-Flash-4bit`
-so the default transform path still works after setup. The downloader uses
-resumable `curl` requests, prints numbered shard progress with elapsed time, and
-checks for at least 170 GiB free by default. After a full SHA-256 verification,
-setup writes `.mlxfast-reference-cache.lock` next to the checkpoint; later setup
-runs use cheap size/mtime checks against that lock and skip the full 141 GiB
-hash pass when the cache is unchanged. Use
+for older commands, but current setup and CI pass the canonical cache directory
+to transform explicitly. The downloader uses resumable `curl` requests, prints
+numbered shard progress with elapsed time, and checks for at least 170 GiB free
+by default. After a full SHA-256 verification, setup writes
+`.mlxfast-reference-cache.lock` next to the checkpoint; later setup runs use
+cheap size/mtime checks against that lock and skip the full 141 GiB hash pass
+when the cache is unchanged. Use
 `MLXFAST_REFERENCE_CACHE_DIR=/Volumes/ssd/hf-cache/.../snapshots/main` or
 `MLXFAST_REFERENCE_DIR=/Volumes/ssd/DeepSeek-V4-Flash-4bit` to point at a larger
 volume, or `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh` when the checkpoint will
-be supplied separately. The Swift CLI also honors `MLXFAST_REFERENCE_DIR`,
-`MLXFAST_WEIGHTS_PATH`, `MLXFAST_CORRECTNESS_GOLDEN_PATH`, and
-`MLXFAST_SCORE_PATH` as defaults; explicit CLI flags take precedence. Set
-`MLXFAST_REFERENCE_BASE_URL` to use another HTTP checkpoint prefix, including
-Hugging Face. Run `./setup.sh --help` for the full local setup knobs.
+be supplied separately. If you use a custom cache path, either copy the exact
+transform command printed by `setup.sh` or set `MLXFAST_REFERENCE_DIR` before
+running `transform` or `benchmark.sh`. The Swift CLI also honors
+`MLXFAST_REFERENCE_DIR`, `MLXFAST_WEIGHTS_PATH`,
+`MLXFAST_CORRECTNESS_GOLDEN_PATH`, and `MLXFAST_SCORE_PATH` as defaults;
+explicit CLI flags take precedence. Set `MLXFAST_REFERENCE_BASE_URL` to use
+another HTTP checkpoint prefix, including Hugging Face. Run `./setup.sh --help`
+for the full local setup knobs.
 
 For manual GitHub Actions benchmark runs, dispatch `benchmark.yml` on a macOS
 Blacksmith runner. Set `reference_base_url` to an HTTP prefix containing the
 reference checkpoint files, such as an R2 public bucket or Worker route. The
-workflow requires a precomputed `correctness_golden.json` through the
-`correctness_golden_url` input, `MLXFAST_CORRECTNESS_GOLDEN_URL` repository
-secret, or the private R2 object
+workflow downloads the reference checkpoint into the same repo-local
+Hugging Face-style cache path used by local setup, passes that path explicitly
+to the offline transform, then downloads the private correctness golden after
+transform completes. The workflow requires a precomputed
+`correctness_golden.json` through the `correctness_golden_url` input,
+`MLXFAST_CORRECTNESS_GOLDEN_URL` repository secret, or the private R2 object
 `correctness_prompts/correctness_golden.json`. If none of those is configured,
 the workflow fails; it will not use a committed prompt, committed golden, or
 Actions cache fallback. Final hidden goldens should come from protected
-storage. Private
-endpoints can pass headers through `MLXFAST_REFERENCE_AUTH_HEADER` and
-`MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER` repository secrets. Private R2 golden
-downloads use the `R2_ACCESS_KEY_ID`, `R2_BUCKET_ENDPOINT`, and
-`R2_SECRET_ACCESS_KEY` secrets.
+storage. Private endpoints can pass headers through
+`MLXFAST_REFERENCE_AUTH_HEADER` and `MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER`
+repository secrets. Private R2 golden downloads use the `R2_ACCESS_KEY_ID`,
+`R2_BUCKET_ENDPOINT`, and `R2_SECRET_ACCESS_KEY` secrets. See
+[`docs/private-benchmark-security.md`](docs/private-benchmark-security.md) for
+the private prompt and artifact handling model.
 
 ## Why this challenge exists
 
@@ -109,9 +119,8 @@ in scope. Submissions should focus on the Swift targets listed in
 
 The repository is Swift-only: setup, transform, correctness, and benchmark all
 run through the Swift package. Correctness, scoring, timing, provenance, and
-submission packaging are trusted harness code outside `editablePaths`, matching
-the original Python harness split between editable model code and non-editable
-judge code.
+submission packaging are trusted harness code outside `editablePaths`; only
+the model and transform targets are contestant-editable.
 
 `mlxfast-swift submit --dry-run` reads `benchmark.json` and archives only the
 paths listed in `editablePaths`. Generated `weights/`, reference checkpoints,
@@ -149,13 +158,19 @@ live submit retry use a stable backend idempotency key.
 ## Scoring
 
 ```
-score = peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill_sec_per_token
+cost = peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill_sec_per_token
+score = 1 / cost
 ```
 
+Higher score is better. The cost product is still recoverable from the
+component metrics in `score.json`, but the top-level `score` is an up-only value
+so leaderboards and local comparisons read naturally.
 Bandwidth is measured via **mactop hardware DRAM counters** — not a software model.
 Correctness is a hard gate. See CHALLENGE.md for the full correctness specification.
-For local iteration, `--quick` shortens correctness and decode to 64 token checks
-against the same public/local golden and prints the resulting `score.json`.
+The official run checks 256 correctness positions and times a 256-token decode
+window. For local iteration, `--quick` shortens correctness and decode to 64
+token checks against the same public/local golden and prints the resulting
+`score.json`.
 The score payload also includes audit-only fields for wall-clock benchmark time,
 preflight time, correctness time, timed benchmark time, final process RSS, expert
 streaming counters, and transformed-weights digest. These fields are for
@@ -180,11 +195,16 @@ Sources/
 weights/                     transformed weights (harness loads from here)
   experts/
     manifest.json            baseline byte ranges for streamed expert tensors
-reference_weights/           original 4-bit checkpoint (frozen, read-only;
-                              baseline runtime also uses it as expert backing)
+.cache/huggingface/hub/...   canonical frozen 4-bit reference checkpoint cache
+reference_weights/...        compatibility symlink to the reference cache
 correctness_golden.json      hidden correctness cases and benchmark token oracle
 score.json                   written after each benchmark run
 ```
+
+The baseline runtime loads dense/shared tensors from `weights/` and streams
+routed expert tensors from the frozen reference checkpoint named by
+`MLXFAST_REFERENCE_DIR`, falling back to the compatibility symlink when that
+environment variable is not set.
 
 The standard preflight/benchmark path enforces a default 50 GiB cap on the
 generated `weights/` tree before correctness or timing runs. Change it with
@@ -237,13 +257,22 @@ Each correctness prompt must contain exactly 512 token IDs. The benchmark prompt
 must contain at least 512 token IDs. The generated golden file stores exact
 expected tokens for each 512-token correctness prompt and its 256-token greedy
 continuation, the 512-token prefill check, the 32-token decode seed, and the
-timed 256-token decode window.
+timed 256-token decode window. During correctness, the harness checks those
+continuation positions teacher-forced: after each accepted step it feeds the
+golden previous token back into the model. This keeps the gate stable across
+Apple GPU/software differences by preventing one earlier mismatch from
+cascading into unrelated later-token failures. A token is accepted only when it
+matches the expected token, except for a true top-logit tie within the tiny
+`1e-6` logit tolerance used by the harness.
 
 ## Requirements
 
 - Apple Silicon Mac, 24 GB+ unified memory (M2 or newer)
 - macOS Sequoia or later
-- Swift 6 / Xcode command line tools
-- Xcode Metal Toolchain, installed by `./setup.sh` when missing or manually with `xcodebuild -downloadComponent MetalToolchain`
+- Swift 6 through Xcode or Xcode Command Line Tools
+- Xcode Metal Toolchain for `mlx.metallib`; `./setup.sh` tries
+  `xcodebuild -downloadComponent MetalToolchain`, but users with only Command
+  Line Tools may need full Xcode installed, opened once, and licensed with
+  `sudo xcodebuild -license accept`
 - CMake, installed by `./setup.sh` via Homebrew when missing and used by `tools/build-mlx-metallib.sh` to build `mlx.metallib`
 - [mactop](https://github.com/metaspartan/mactop) — installed by `./setup.sh` via Homebrew when missing, or supplied with `MLXFAST_MACTOP_BIN=/path/to/mactop`

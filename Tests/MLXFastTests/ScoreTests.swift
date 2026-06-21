@@ -3,6 +3,25 @@ import Testing
 @testable import MLXFastCore
 
 @Test
+func benchmarkScoreIsInverseOfCostProduct() {
+    let cost = BenchmarkScore.cost(
+        peakRamGB: 40,
+        bandwidthGBPerToken: 0.01,
+        decodeSecondsPerToken: 2,
+        prefillSecondsPerToken: 0.125
+    )
+    let score = BenchmarkScore.score(
+        peakRamGB: 40,
+        bandwidthGBPerToken: 0.01,
+        decodeSecondsPerToken: 2,
+        prefillSecondsPerToken: 0.125
+    )
+
+    #expect(abs(cost - 0.1) < 1e-12)
+    #expect(abs(score - 10) < 1e-12)
+}
+
+@Test
 func writeScorePayloadEmitsDarkbloomShape() throws {
     let directory = try temporaryDirectory()
     let path = directory.appendingPathComponent("score.json")

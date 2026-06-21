@@ -1,5 +1,30 @@
 import Foundation
 
+public enum BenchmarkScore {
+    public static func cost(
+        peakRamGB: Double,
+        bandwidthGBPerToken: Double,
+        decodeSecondsPerToken: Double,
+        prefillSecondsPerToken: Double
+    ) -> Double {
+        peakRamGB * bandwidthGBPerToken * decodeSecondsPerToken * prefillSecondsPerToken
+    }
+
+    public static func score(
+        peakRamGB: Double,
+        bandwidthGBPerToken: Double,
+        decodeSecondsPerToken: Double,
+        prefillSecondsPerToken: Double
+    ) -> Double {
+        1.0 / cost(
+            peakRamGB: peakRamGB,
+            bandwidthGBPerToken: bandwidthGBPerToken,
+            decodeSecondsPerToken: decodeSecondsPerToken,
+            prefillSecondsPerToken: prefillSecondsPerToken
+        )
+    }
+}
+
 public struct ScorePayload: Codable, Equatable {
     public let score: Double?
     public let passed: Bool

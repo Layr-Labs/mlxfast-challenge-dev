@@ -13,11 +13,16 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("DEFAULT_HF_HOME=\"${MLXFAST_HF_HOME:-${HF_HOME:-${PWD}/.cache/huggingface}}\""))
     #expect(setup.contains("REFERENCE_CACHE_DIR=\"${MLXFAST_REFERENCE_CACHE_DIR:-${DEFAULT_HF_HUB_CACHE}/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}}\""))
     #expect(setup.contains("REFERENCE_CACHE_LOCK_PATH=\"${MLXFAST_REFERENCE_CACHE_LOCK_PATH:-${REFERENCE_DIR}/.mlxfast-reference-cache.lock}\""))
+    #expect(setup.contains("REFERENCE_POST_DOWNLOAD_FULL_VERIFY=\"${MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY:-1}\""))
     #expect(setup.contains("Usage: ./setup.sh"))
     #expect(setup.contains("reference_file_is_current"))
     #expect(setup.contains("reference_cache_lock_is_current"))
+    #expect(setup.contains("reference_post_download_full_verify_enabled"))
+    #expect(setup.contains("verify_reference_weights_after_verified_download"))
+    #expect(setup.contains("cannot skip post-download full verification unless MLXFAST_REFERENCE_HASH_VERIFY=1"))
     #expect(setup.contains("write_reference_cache_lock"))
     #expect(setup.contains("redownloading ${label} from scratch after hash verification failed"))
+    #expect(setup.contains("If you only installed the Command Line Tools and this still fails, install full"))
     #expect(setup.contains("reference cache path ${reference_dir}"))
     #expect(setup.contains("compatibility reference path exists and is not a symlink"))
     #expect(setup.contains("if ! verify_reference_manifest \"${reference_dir}\"; then"))
@@ -37,6 +42,7 @@ func benchmarkWorkflowRunsTransformOfflineAfterSetup() throws {
 
     #expect(setupRange.lowerBound < transformRange.lowerBound)
     #expect(workflow.contains("MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: \"0\""))
     #expect(workflow.contains("run: .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --reference \"${MLXFAST_REFERENCE_DIR}\""))
 }
 
