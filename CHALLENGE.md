@@ -167,10 +167,12 @@ timed decode window before accepting a score.
 ## Score
 
 ```text
-score = peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill_sec_per_token
+cost = peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill_sec_per_token
+score = 1 / cost
 ```
 
-Lower is better.
+Higher is better. The component metrics remain in `score.json`, so operators can
+still inspect the raw cost factors that produced the score.
 
 `bandwidth_GB_per_token` is measured with `mactop` hardware DRAM counters during
 the decode window. `setup.sh` installs `mactop` with Homebrew when needed; set

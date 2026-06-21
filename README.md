@@ -158,9 +158,13 @@ live submit retry use a stable backend idempotency key.
 ## Scoring
 
 ```
-score = peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill_sec_per_token
+cost = peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill_sec_per_token
+score = 1 / cost
 ```
 
+Higher score is better. The cost product is still recoverable from the
+component metrics in `score.json`, but the top-level `score` is an up-only value
+so leaderboards and local comparisons read naturally.
 Bandwidth is measured via **mactop hardware DRAM counters** — not a software model.
 Correctness is a hard gate. See CHALLENGE.md for the full correctness specification.
 The official run checks 256 correctness positions and times a 256-token decode

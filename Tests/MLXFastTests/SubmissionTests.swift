@@ -694,7 +694,7 @@ private let benchmarkResponseJSON = """
     "name": "DeepSeek V4 Flash",
     "status": "active",
     "category": "swift",
-    "direction": "-",
+    "direction": "+",
     "sourceUrl": "https://github.com/Layr-Labs/mlxfast-challenge-dev.git",
     "sourceRef": "abc123",
     "scorePath": "score.json",

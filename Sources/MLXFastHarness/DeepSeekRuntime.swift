@@ -808,10 +808,12 @@ public enum DeepSeekRuntime {
             )
             timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
             let peakRamGB = Double(Memory.peakMemory) / Double(1 << 30)
-            let score = peakRamGB
-                * decode.bandwidthGBPerToken
-                * decode.secondsPerToken
-                * prefillSecondsPerToken
+            let score = BenchmarkScore.score(
+                peakRamGB: peakRamGB,
+                bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                decodeSecondsPerToken: decode.secondsPerToken,
+                prefillSecondsPerToken: prefillSecondsPerToken
+            )
             let expertStats = expertStats(from: runtimeBenchmarkLoader)
 
             guard score.isFinite, score >= 0 else {
@@ -1094,10 +1096,12 @@ public enum DeepSeekRuntime {
                 expertStats: &lastExpertStats
             )
             timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
-            let score = peakRamGB
-                * decode.bandwidthGBPerToken
-                * decode.secondsPerToken
-                * prefillSecondsPerToken
+            let score = BenchmarkScore.score(
+                peakRamGB: peakRamGB,
+                bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                decodeSecondsPerToken: decode.secondsPerToken,
+                prefillSecondsPerToken: prefillSecondsPerToken
+            )
 
             guard score.isFinite, score >= 0 else {
                 return makeFailedScore(
