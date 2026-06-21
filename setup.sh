@@ -337,9 +337,14 @@ ensure_metal_toolchain() {
     cat >&2 <<EOF
 setup.sh: Xcode's Metal Toolchain is not installed and MLXFAST_SKIP_METAL_TOOLCHAIN_INSTALL=1.
 
-Install it, then retry:
+Install full Xcode from the App Store or Apple Developer, open it once, select
+its command line tools, accept the license, then retry:
 
+  sudo xcodebuild -license accept
   xcodebuild -downloadComponent MetalToolchain
+
+If you only installed the Command Line Tools and this still fails, install full
+Xcode; the MLX Metal runtime needs Apple's Metal compiler toolchain.
 
 EOF
     return 1
@@ -350,9 +355,14 @@ EOF
     cat >&2 <<EOF
 setup.sh: failed to install Xcode's Metal Toolchain.
 
-Install it manually, then retry:
+Install full Xcode from the App Store or Apple Developer, open it once, select
+its command line tools, accept the license, then retry:
 
+  sudo xcodebuild -license accept
   xcodebuild -downloadComponent MetalToolchain
+
+If you only installed the Command Line Tools and this still fails, install full
+Xcode; the MLX Metal runtime needs Apple's Metal compiler toolchain.
 
 EOF
     return 1

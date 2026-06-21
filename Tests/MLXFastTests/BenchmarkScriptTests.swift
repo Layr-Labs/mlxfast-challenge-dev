@@ -18,6 +18,7 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("reference_cache_lock_is_current"))
     #expect(setup.contains("write_reference_cache_lock"))
     #expect(setup.contains("redownloading ${label} from scratch after hash verification failed"))
+    #expect(setup.contains("If you only installed the Command Line Tools and this still fails, install full"))
     #expect(setup.contains("reference cache path ${reference_dir}"))
     #expect(setup.contains("compatibility reference path exists and is not a symlink"))
     #expect(setup.contains("if ! verify_reference_manifest \"${reference_dir}\"; then"))
