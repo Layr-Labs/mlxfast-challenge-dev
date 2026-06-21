@@ -54,7 +54,7 @@ Important environment variables:
   MLXFAST_MACTOP_BIN=/path/mactop    Use a specific mactop binary.
 
 After setup:
-  .build/release/mlxfast-swift transform
+  .github/scripts/run-offline.sh .build/release/mlxfast-swift transform
   ./benchmark.sh
 EOF
 }
@@ -126,7 +126,7 @@ setup.sh: summary
   mlx.metallib: ${metallib_line}
   reference checkpoint: ${reference_line}
   next:
-    ${SWIFT_BIN} transform
+    .github/scripts/run-offline.sh ${SWIFT_BIN} transform
     ./benchmark.sh
 EOF
 }

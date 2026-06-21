@@ -12,7 +12,7 @@ See [CHALLENGE.md](CHALLENGE.md) for the full problem statement, scoring formula
 ./setup.sh
 
 # Split dense weights into weights/ and write the expert streaming manifest
-.build/release/mlxfast-swift transform
+.github/scripts/run-offline.sh .build/release/mlxfast-swift transform
 
 # Run the Darkbloom-compatible benchmark entrypoint.
 # Requires the organizer-supplied correctness_golden.json.

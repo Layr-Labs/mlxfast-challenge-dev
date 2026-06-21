@@ -13,7 +13,34 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("Usage: ./setup.sh"))
     #expect(setup.contains("downloaded ${total}/${total} safetensors shard(s)"))
     #expect(setup.contains("setup.sh: setup complete elapsed="))
-    #expect(setup.contains("${SWIFT_BIN} transform"))
+    #expect(setup.contains(".github/scripts/run-offline.sh ${SWIFT_BIN} transform"))
+}
+
+@Test
+func benchmarkWorkflowRunsTransformOfflineAfterSetup() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+    let setupRange = try #require(workflow.range(of: "- name: Setup Swift harness and reference checkpoint"))
+    let transformRange = try #require(workflow.range(of: "- name: Transform reference checkpoint"))
+
+    #expect(setupRange.lowerBound < transformRange.lowerBound)
+    #expect(workflow.contains("run: .github/scripts/run-offline.sh .build/release/mlxfast-swift transform"))
+}
+
+@Test
+func offlineRunnerProvesNetworkIsBlockedBeforeRunningCommand() throws {
+    let runner = try String(
+        contentsOfFile: ".github/scripts/run-offline.sh",
+        encoding: .utf8
+    )
+
+    #expect(runner.contains("sandbox-exec -f \"${SANDBOX_PROFILE}\""))
+    #expect(runner.contains("curl -fsS --max-time 10 https://example.com"))
+    #expect(runner.contains("sandbox profile did not block network access; refusing to run"))
+    #expect(runner.contains("HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1"))
+    #expect(runner.contains("HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9"))
 }
 
 @Test

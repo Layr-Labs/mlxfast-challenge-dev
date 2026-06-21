@@ -225,7 +225,7 @@ jobs:
 
       - name: Transform reference checkpoint
         if: ${{ !inputs.preserve_golden_only && !inputs.generate_golden_only }}
-        run: .build/release/mlxfast-swift transform
+        run: .github/scripts/run-offline.sh .build/release/mlxfast-swift transform
 
       - name: Prepare correctness golden
         id: prepare-correctness-golden

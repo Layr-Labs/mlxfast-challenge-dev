@@ -165,7 +165,7 @@ help operators review runs but do not change the score formula.
 swift test
 MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test
 swift build -c release
-.build/release/mlxfast-swift transform
+.github/scripts/run-offline.sh .build/release/mlxfast-swift transform
 .build/release/mlxfast-swift correctness
 .build/release/mlxfast-swift preflight
 .build/release/mlxfast-swift benchmark --score-path score.json
