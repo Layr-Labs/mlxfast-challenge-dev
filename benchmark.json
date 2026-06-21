@@ -5,7 +5,7 @@
   "category": "swift",
   "direction": "-",
   "editablePaths": [
-    "Sources/MLXFastDeepSeek",
+    "Sources/MLXFastModel",
     "Sources/MLXFastTransform"
   ],
   "setupCommand": ["bash", "-lc", "./setup.sh"],

@@ -89,7 +89,7 @@ in scope. Submissions should focus on the Swift targets listed in
 
 | Path | What it controls |
 |---|---|
-| `Sources/MLXFastDeepSeek/` | DeepSeek V4 Flash runtime, MLX Swift array bridge, dense/expert loading, SSD streaming, decode/prefill logic. **Primary target.** |
+| `Sources/MLXFastModel/` | DeepSeek V4 Flash runtime, MLX Swift array bridge, dense/expert loading, SSD streaming, decode/prefill logic. **Primary target.** |
 | `Sources/MLXFastTransform/` | Offline weight transform from frozen reference safetensors into benchmark-ready `weights/`. |
 
 The repository is Swift-only: setup, transform, correctness, and benchmark all
@@ -151,10 +151,9 @@ operator review and are not additional scoring factors.
 Sources/
   MLXFastCLI/                Swift command-line entrypoint
   MLXFastCore/               score.json, golden cases, shared contracts
-  MLXFastHarness/            trusted benchmark/provenance helpers
   MLXFastTransform/          Swift offline weight transform
-  MLXFastDeepSeek/           editable DeepSeek V4 Flash Swift runtime
-  MLXFastDeepSeekHarness/    trusted correctness, golden, and benchmark runner
+  MLXFastModel/              editable DeepSeek V4 Flash Swift runtime
+  MLXFastHarness/            trusted correctness, golden, and benchmark runner
   MLXFastSubmission/         trusted Yukon login/submit integration
 weights/                     transformed weights (harness loads from here)
   experts/

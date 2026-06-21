@@ -1,7 +1,7 @@
 import Foundation
 import MLX
 import MLXFastCore
-@testable import MLXFastDeepSeek
+@testable import MLXFastModel
 import Testing
 
 @Test

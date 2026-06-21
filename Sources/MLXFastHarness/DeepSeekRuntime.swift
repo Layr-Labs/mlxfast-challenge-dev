@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 import MLX
 import MLXFastCore
-import MLXFastDeepSeek
+import MLXFastModel
 
 public struct CorrectnessOptions: Equatable {
     public let weightsPath: String
@@ -2428,6 +2428,7 @@ private final class RuntimeWorkerClient {
             "MLXFAST_CORRECTNESS_GOLDEN_PATH",
             "MLXFAST_CORRECTNESS_GOLDEN_URL",
             "MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER",
+            "MLXFAST_PRIVATE_DIR",
             "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE",
             "R2_ACCESS_KEY_ID",
             "R2_BUCKET_ENDPOINT",

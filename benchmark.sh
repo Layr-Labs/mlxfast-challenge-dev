@@ -57,9 +57,11 @@ write_runtime_worker_sandbox_profile() {
 
   local profile
   local golden_absolute
+  local private_dir_absolute
   profile="$(mktemp "${TMPDIR:-/tmp}/mlxfast-runtime-worker.XXXXXX.sb")"
   golden_absolute="$(absolute_path "${GOLDEN_PATH}")"
-  cat > "${profile}" <<EOF
+  {
+    cat <<EOF
 (version 1)
 (allow default)
 (deny network*)
@@ -71,6 +73,14 @@ write_runtime_worker_sandbox_profile() {
 (deny file-read* (literal "$(sandbox_escape "${golden_absolute}")"))
 (deny file-write* (literal "$(sandbox_escape "${golden_absolute}")"))
 EOF
+    if [[ -n "${MLXFAST_PRIVATE_DIR:-}" ]]; then
+      private_dir_absolute="$(absolute_path "${MLXFAST_PRIVATE_DIR}")"
+      cat <<EOF
+(deny file-read* (subpath "$(sandbox_escape "${private_dir_absolute}")"))
+(deny file-write* (subpath "$(sandbox_escape "${private_dir_absolute}")"))
+EOF
+    fi
+  } > "${profile}"
   export MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE="${profile}"
 }
 
@@ -89,7 +99,7 @@ source_hash() {
     "Package.swift"
     "Package.resolved"
     "Sources/MLXFastCore"
-    "Sources/MLXFastDeepSeek"
+    "Sources/MLXFastModel"
     "Sources/MLXFastTransform"
   )
 

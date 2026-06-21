@@ -17,6 +17,23 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
 }
 
 @Test
+func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
+    let benchmark = try String(
+        contentsOfFile: "benchmark.sh",
+        encoding: .utf8
+    )
+    let runtime = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
+        encoding: .utf8
+    )
+
+    #expect(benchmark.contains("MLXFAST_PRIVATE_DIR"))
+    #expect(benchmark.contains("(deny file-read* (subpath"))
+    #expect(benchmark.contains("(deny file-write* (subpath"))
+    #expect(runtime.contains("\"MLXFAST_PRIVATE_DIR\""))
+}
+
+@Test
 func benchmarkScriptFailsWhenScorePayloadFails() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -82,6 +99,31 @@ func benchmarkScriptFailsWhenScorePayloadFails() throws {
     #expect(process.terminationStatus != 0)
     #expect(FileManager.default.fileExists(atPath: score.path))
     #expect(FileManager.default.fileExists(atPath: integrity.path))
+}
+
+@Test
+func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let golden = root.appendingPathComponent("correctness_golden_512_2048.json")
+    let prompts = root.appendingPathComponent("my_private_prompts.json")
+    try "{}".write(to: golden, atomically: true, encoding: .utf8)
+    try "{}".write(to: prompts, atomically: true, encoding: .utf8)
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = [
+        ".github/scripts/deny-private-artifacts.sh",
+        golden.path,
+        prompts.path,
+    ]
+    process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+
+    try process.run()
+    process.waitUntilExit()
+
+    #expect(process.terminationStatus != 0)
 }
 
 private func temporaryDirectory() throws -> URL {

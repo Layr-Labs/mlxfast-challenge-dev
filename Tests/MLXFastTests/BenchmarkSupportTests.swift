@@ -1,7 +1,7 @@
 import Foundation
 @testable import MLXFastCore
-@testable import MLXFastDeepSeek
-@testable import MLXFastDeepSeekHarness
+@testable import MLXFastModel
+@testable import MLXFastHarness
 import Testing
 
 @Test

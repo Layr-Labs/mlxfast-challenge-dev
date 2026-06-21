@@ -56,7 +56,7 @@ The generated `weights/` tree is a compact runtime artifact set, not a second
 full copy of the checkpoint. It stores dense/shared tensors plus metadata, while
 the baseline runtime streams routed expert tensors from the frozen reference
 checkpoint. Submissions may adjust this overlay by changing both
-`Sources/MLXFastTransform/` and `Sources/MLXFastDeepSeek/`; correctness and
+`Sources/MLXFastTransform/` and `Sources/MLXFastModel/`; correctness and
 benchmark results are the authority, not byte equality with the baseline
 layout.
 
@@ -80,12 +80,12 @@ The active editable surface is Swift-only and is defined by `benchmark.json`:
 
 | Path | Scope |
 |---|---|
-| `Sources/MLXFastDeepSeek/` | DeepSeek V4 Flash model implementation: attention, MoE, expert streaming, caches, weight loading, and prefill/decode execution. |
+| `Sources/MLXFastModel/` | DeepSeek V4 Flash model implementation: attention, MoE, expert streaming, caches, weight loading, and prefill/decode execution. |
 | `Sources/MLXFastTransform/` | Offline safetensors transform and expert manifest generation. |
 
 `Sources/MLXFastCore/`, `Sources/MLXFastHarness/`,
-`Sources/MLXFastDeepSeekHarness/`, `Sources/MLXFastCLI/`,
-`Sources/MLXFastSubmission/`, scripts, tests, `benchmark.json`, generated
+`Sources/MLXFastCLI/`, `Sources/MLXFastSubmission/`, scripts, tests,
+`benchmark.json`, generated
 `weights/`, reference checkpoints, golden fixtures, and local scores are
 harness/operator files, not submission surface. Correctness, scoring, timing,
 golden generation, benchmark-oracle validation, provenance checks, and

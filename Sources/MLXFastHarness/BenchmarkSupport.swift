@@ -1,6 +1,6 @@
 import Foundation
 import MLXFastCore
-import MLXFastDeepSeek
+import MLXFastModel
 
 public struct BenchmarkPreflightReport: Codable, Equatable {
     public let weightsPath: String

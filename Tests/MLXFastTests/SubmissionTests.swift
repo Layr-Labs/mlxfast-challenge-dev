@@ -15,18 +15,16 @@ func benchmarkContractDoesNotExposeTrustedHarnessPaths() throws {
     )
 
     #expect(report.editablePaths == [
-        "Sources/MLXFastDeepSeek",
+        "Sources/MLXFastModel",
         "Sources/MLXFastTransform",
     ])
-    #expect(!report.editablePaths.contains("Sources/MLXFastDeepSeekHarness"))
     #expect(!report.editablePaths.contains("Sources/MLXFastHarness"))
     #expect(!report.editablePaths.contains("Sources/MLXFastCLI"))
     #expect(!report.editablePaths.contains("Sources/MLXFastSubmission"))
 
     let archiveData = try Data(contentsOf: archive)
-    #expect(archiveData.containsUTF8("Sources/MLXFastDeepSeek/DeepSeekModel.swift"))
+    #expect(archiveData.containsUTF8("Sources/MLXFastModel/DeepSeekModel.swift"))
     #expect(archiveData.containsUTF8("Sources/MLXFastTransform/Transform.swift"))
-    #expect(!archiveData.containsUTF8("Sources/MLXFastDeepSeekHarness/"))
     #expect(!archiveData.containsUTF8("Sources/MLXFastCLI/"))
     #expect(!archiveData.containsUTF8("Sources/MLXFastSubmission/"))
 }

@@ -22,6 +22,10 @@ m5_artifacts/
 score.json
 score.json.tmp
 correctness_golden.json
+correctness_golden*.json
+local_correctness_golden.json
+private_prompts.json
+private_prompts*.json
 
 # IDE
 .vscode/
