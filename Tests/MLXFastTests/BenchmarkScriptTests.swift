@@ -19,10 +19,11 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("write_reference_cache_lock"))
     #expect(setup.contains("redownloading ${label} from scratch after hash verification failed"))
     #expect(setup.contains("reference cache path ${reference_dir}"))
+    #expect(setup.contains("compatibility reference path exists and is not a symlink"))
     #expect(setup.contains("if ! verify_reference_manifest \"${reference_dir}\"; then"))
     #expect(setup.contains("downloaded ${total}/${total} safetensors shard(s)"))
     #expect(setup.contains("setup.sh: setup complete elapsed="))
-    #expect(setup.contains(".github/scripts/run-offline.sh ${SWIFT_BIN} transform"))
+    #expect(setup.contains(".github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference \"${REFERENCE_DIR}\""))
 }
 
 @Test
@@ -35,7 +36,8 @@ func benchmarkWorkflowRunsTransformOfflineAfterSetup() throws {
     let transformRange = try #require(workflow.range(of: "- name: Transform reference checkpoint"))
 
     #expect(setupRange.lowerBound < transformRange.lowerBound)
-    #expect(workflow.contains("run: .github/scripts/run-offline.sh .build/release/mlxfast-swift transform"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main"))
+    #expect(workflow.contains("run: .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --reference \"${MLXFAST_REFERENCE_DIR}\""))
 }
 
 @Test
