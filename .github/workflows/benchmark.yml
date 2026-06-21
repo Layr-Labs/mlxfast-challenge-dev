@@ -190,6 +190,11 @@ jobs:
             exit 1
           fi
           cp "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" correctness_golden.json
+          actual_hash="$(shasum -a 256 correctness_golden.json | awk '{print $1}')"
+          actual_bytes="$(wc -c < correctness_golden.json | tr -d ' ')"
+          export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256="${actual_hash}"
+          export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES="${actual_bytes}"
+          echo "benchmark: preserving private correctness golden ${actual_hash} bytes=${actual_bytes}"
           .github/scripts/verify-correctness-golden.sh
 
       - name: Upload preserved correctness golden metadata
@@ -198,6 +203,7 @@ jobs:
         with:
           name: correctness-golden-metadata-${{ github.run_id }}
           path: |
+            correctness_golden.json
             correctness_golden.json.sha256
             correctness_golden.json.bytes
           if-no-files-found: error
