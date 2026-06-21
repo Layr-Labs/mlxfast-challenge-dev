@@ -31,6 +31,34 @@ func mactopBandwidthParsesNDJSONSamples() {
 }
 
 @Test
+func runtimeWorkerClientSkipsNonJSONStdoutLines() {
+    #expect(runtimeWorkerLineLooksLikeJSONResponse(Data("  {\"id\":1,\"ok\":true}".utf8)))
+    #expect(!runtimeWorkerLineLooksLikeJSONResponse(Data("Metal device initialized".utf8)))
+    #expect(!runtimeWorkerLineLooksLikeJSONResponse(Data("".utf8)))
+}
+
+@Test
+func correctnessAcceptsOnlyExactTopLogitTies() {
+    #expect(correctnessTokenAccepted(
+        expectedToken: 30,
+        actualToken: 1,
+        topLogits: [
+            CorrectnessTraceLogit(token: 1, logit: 19.25),
+            CorrectnessTraceLogit(token: 30, logit: 19.25),
+        ]
+    ))
+    #expect(!correctnessTokenAccepted(
+        expectedToken: 30,
+        actualToken: 1,
+        topLogits: [
+            CorrectnessTraceLogit(token: 1, logit: 19.25),
+            CorrectnessTraceLogit(token: 30, logit: 19.0),
+        ]
+    ))
+    #expect(!correctnessTokenAccepted(expectedToken: 30, actualToken: 1, topLogits: nil))
+}
+
+@Test
 func mactopBandwidthComputesIdleSubtractedGigabytesPerToken() throws {
     let value = try MactopBandwidth.gigabytesPerToken(
         samples: [10, 12, 8],

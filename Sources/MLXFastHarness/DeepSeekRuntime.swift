@@ -524,6 +524,7 @@ public enum DeepSeekRuntime {
                 id: request.id,
                 ok: true,
                 token: token,
+                topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
                 expertStats: expertStats(from: weightCache),
                 peakRamGB: currentResidentMemoryGB()
             )
@@ -547,6 +548,7 @@ public enum DeepSeekRuntime {
                 id: request.id,
                 ok: true,
                 token: token,
+                topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
                 expertStats: expertStats(from: weightCache),
                 peakRamGB: currentResidentMemoryGB()
             )
@@ -2028,7 +2030,11 @@ public enum DeepSeekRuntime {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness response missing token")
             }
             let expectedToken = testCase.expectedTokens[step]
-            if actualToken != expectedToken {
+            if !correctnessTokenAccepted(
+                expectedToken: expectedToken,
+                actualToken: actualToken,
+                topLogits: response.topLogits
+            ) {
                 return WorkerCorrectnessResult(
                     comparison: CorrectnessTokenComparison(
                         passed: false,
@@ -2164,7 +2170,11 @@ public enum DeepSeekRuntime {
 
         for step in 0..<steps {
             let expectedToken = testCase.expectedTokens[step]
-            if actualToken != expectedToken {
+            if !correctnessTokenAccepted(
+                expectedToken: expectedToken,
+                actualToken: actualToken,
+                topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits)
+            ) {
                 return CorrectnessTokenComparison(
                     passed: false,
                     checkedSteps: step + 1,
@@ -2200,6 +2210,30 @@ public enum DeepSeekRuntime {
             expectedToken: nil,
             actualToken: nil
         )
+    }
+
+    private static func topLogits(from logits: MLXArray, topK: Int) throws -> [CorrectnessTraceLogit] {
+        guard let vocabSize = logits.shape.last, vocabSize > 0 else {
+            throw MLXFastError.invalidInput("correctness logits must have a non-empty vocab dimension")
+        }
+        let rows = logits.reshaped([-1, vocabSize])
+        let last = rows[-1]
+        eval(last)
+        let values = last.asArray(Float.self).map(Double.init)
+        guard values.count == vocabSize else {
+            throw MLXFastError.invalidInput(
+                "correctness logits materialized \(values.count) values, expected \(vocabSize)"
+            )
+        }
+
+        let sortedIndices = values.indices.sorted {
+            let lhs = values[$0]
+            let rhs = values[$1]
+            return lhs == rhs ? $0 < $1 : lhs > rhs
+        }
+        return sortedIndices.prefix(min(topK, sortedIndices.count)).map {
+            CorrectnessTraceLogit(token: $0, logit: values[$0])
+        }
     }
 
     private static func traceGreedyCached(
@@ -2528,6 +2562,7 @@ private struct RuntimeWorkerResponse: Codable {
     let ok: Bool
     let error: String?
     let token: Int?
+    let topLogits: [CorrectnessTraceLogit]?
     let seedToken: Int?
     let tokens: [Int]?
     let seconds: Double?
@@ -2542,6 +2577,7 @@ private struct RuntimeWorkerResponse: Codable {
         ok: Bool,
         error: String? = nil,
         token: Int? = nil,
+        topLogits: [CorrectnessTraceLogit]? = nil,
         seedToken: Int? = nil,
         tokens: [Int]? = nil,
         seconds: Double? = nil,
@@ -2555,6 +2591,7 @@ private struct RuntimeWorkerResponse: Codable {
         self.ok = ok
         self.error = error
         self.token = token
+        self.topLogits = topLogits
         self.seedToken = seedToken
         self.tokens = tokens
         self.seconds = seconds
@@ -2570,6 +2607,7 @@ private struct RuntimeWorkerResponse: Codable {
         case ok
         case error
         case token
+        case topLogits = "top_logits"
         case seedToken = "seed_token"
         case tokens
         case seconds
@@ -2735,6 +2773,16 @@ private final class RuntimeWorkerClient {
     }
 
     private func readResponseLine() throws -> RuntimeWorkerResponse {
+        while true {
+            let data = try readWorkerOutputLine()
+            guard runtimeWorkerLineLooksLikeJSONResponse(data) else {
+                continue
+            }
+            return try decoder.decode(RuntimeWorkerResponse.self, from: data)
+        }
+    }
+
+    private func readWorkerOutputLine() throws -> Data {
         var data = Data()
         while true {
             let byte = output.readData(ofLength: 1)
@@ -2744,11 +2792,10 @@ private final class RuntimeWorkerClient {
                 )
             }
             if byte[byte.startIndex] == 0x0a {
-                break
+                return data
             }
             data.append(byte)
         }
-        return try decoder.decode(RuntimeWorkerResponse.self, from: data)
     }
 
     private func workerExitDiagnostic() -> String {
@@ -2776,6 +2823,32 @@ private final class RuntimeWorkerClient {
         }
         return singleLine
     }
+}
+
+func runtimeWorkerLineLooksLikeJSONResponse(_ data: Data) -> Bool {
+    for byte in data where byte != 0x20 && byte != 0x09 && byte != 0x0d {
+        return byte == 0x7b
+    }
+    return false
+}
+
+func correctnessTokenAccepted(
+    expectedToken: Int,
+    actualToken: Int,
+    topLogits: [CorrectnessTraceLogit]?
+) -> Bool {
+    if actualToken == expectedToken {
+        return true
+    }
+    guard let topLogits,
+          let topLogit = topLogits.first?.logit,
+          let expectedLogit = topLogits.first(where: { $0.token == expectedToken })?.logit
+    else {
+        return false
+    }
+    // Some Apple GPU/Metal combinations break exact argmax ties differently.
+    // Accept only a true top-logit tie, and keep feeding the golden token.
+    return topLogit - expectedLogit <= MLXFastConstants.correctnessLogitTieTolerance
 }
 
 struct DecodeTimingPlan: Equatable {
