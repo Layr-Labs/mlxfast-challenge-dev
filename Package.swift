@@ -15,7 +15,7 @@ let package = Package(
         .library(name: "MLXFastSubmission", targets: ["MLXFastSubmission"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.4"),
+        .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.31.4"),
     ],
     targets: [
         .target(name: "MLXFastCore"),
