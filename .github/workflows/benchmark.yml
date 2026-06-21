@@ -75,8 +75,8 @@ jobs:
     timeout-minutes: 720
     environment: benchmark-private-prompts
     env:
-      MLXFAST_PRIVATE_DIR: ${{ runner.temp }}/mlxfast-private
-      MLXFAST_CORRECTNESS_GOLDEN_PATH: ${{ runner.temp }}/mlxfast-private/correctness_golden.json
+      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
       MLXFAST_CORRECTNESS_GOLDEN_URL_PRESENT: ${{ (inputs.correctness_golden_url != '' || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL != '') && '1' || '0' }}
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
       MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/correctness_golden.json

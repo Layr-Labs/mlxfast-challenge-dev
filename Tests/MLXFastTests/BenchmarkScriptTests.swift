@@ -46,6 +46,18 @@ func benchmarkWorkflowCanBeDispatchedFromCurrentRefForTesting() throws {
 }
 
 @Test
+func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+
+    #expect(!workflow.contains("${{ runner.temp }}"))
+    #expect(workflow.contains("MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}"))
+    #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json"))
+}
+
+@Test
 func offlineRunnerProvesNetworkIsBlockedBeforeRunningCommand() throws {
     let runner = try String(
         contentsOfFile: ".github/scripts/run-offline.sh",
