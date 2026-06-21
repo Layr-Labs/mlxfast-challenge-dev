@@ -363,16 +363,12 @@ public enum DeepSeekRuntime {
 
             for testCase in golden.cases {
                 currentCase = testCase
-                let response = try worker.generateCorrectness(
-                    promptTokens: testCase.promptTokens,
-                    steps: MLXFastConstants.correctnessSteps
+                let result = try compareTeacherForcedWithWorker(
+                    testCase: testCase,
+                    worker: worker
                 )
-                lastExpertStats = response.expertStats ?? lastExpertStats
-                let comparison = DeepSeekCorrectness.compareTokens(
-                    expected: testCase.expectedTokens,
-                    actual: response.tokens ?? [],
-                    steps: MLXFastConstants.correctnessSteps
-                )
+                lastExpertStats = result.expertStats
+                let comparison = result.comparison
                 checkedSteps += comparison.checkedSteps
                 if !comparison.passed {
                     return CorrectnessReport(
@@ -391,7 +387,7 @@ public enum DeepSeekRuntime {
                         expectedToken: comparison.expectedToken,
                         actualToken: comparison.actualToken,
                         goldenHash: golden.sha256,
-                        error: "generated token mismatch"
+                        error: "teacher-forced token mismatch"
                     )
                 }
             }
@@ -466,6 +462,7 @@ public enum DeepSeekRuntime {
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
+        var state = RuntimeWorkerState()
 
         while let line = readLine(strippingNewline: true) {
             guard !line.isEmpty else {
@@ -474,7 +471,7 @@ public enum DeepSeekRuntime {
             let response: RuntimeWorkerResponse
             do {
                 let request = try decoder.decode(RuntimeWorkerRequest.self, from: Data(line.utf8))
-                response = try handleWorkerRequest(request, weightCache: weightCache)
+                response = try handleWorkerRequest(request, weightCache: weightCache, state: &state)
             } catch {
                 response = RuntimeWorkerResponse(id: -1, ok: false, error: "\(error)")
             }
@@ -487,7 +484,8 @@ public enum DeepSeekRuntime {
 
     private static func handleWorkerRequest(
         _ request: RuntimeWorkerRequest,
-        weightCache: DeepSeekRuntimeWeightCache
+        weightCache: DeepSeekRuntimeWeightCache,
+        state: inout RuntimeWorkerState
     ) throws -> RuntimeWorkerResponse {
         switch request.kind {
         case "correctness":
@@ -503,6 +501,52 @@ public enum DeepSeekRuntime {
                 id: request.id,
                 ok: true,
                 tokens: tokens,
+                expertStats: expertStats(from: weightCache),
+                peakRamGB: currentResidentMemoryGB()
+            )
+
+        case "correctness_begin":
+            guard let promptTokens = request.promptTokens else {
+                throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing prompt_tokens")
+            }
+            let cache = DeepSeekModelCache(config: weightCache.config)
+            let logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray(promptTokens),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: 0
+            )
+            let token = try DeepSeekCorrectness.greedyToken(from: logits)
+            state.correctnessCache = cache
+            state.correctnessPromptTokenCount = promptTokens.count
+            state.correctnessStep = 0
+            return RuntimeWorkerResponse(
+                id: request.id,
+                ok: true,
+                token: token,
+                expertStats: expertStats(from: weightCache),
+                peakRamGB: currentResidentMemoryGB()
+            )
+
+        case "correctness_step":
+            guard let previousToken = request.token else {
+                throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing token")
+            }
+            guard let cache = state.correctnessCache else {
+                throw MLXFastError.invalidInput("runtime worker teacher-forced correctness step before begin")
+            }
+            let logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray([previousToken]),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: state.correctnessPromptTokenCount + state.correctnessStep
+            )
+            let token = try DeepSeekCorrectness.greedyToken(from: logits)
+            state.correctnessStep += 1
+            return RuntimeWorkerResponse(
+                id: request.id,
+                ok: true,
+                token: token,
                 expertStats: expertStats(from: weightCache),
                 peakRamGB: currentResidentMemoryGB()
             )
@@ -930,18 +974,17 @@ public enum DeepSeekRuntime {
             for (caseIndex, testCase) in golden.cases.enumerated() {
                 let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
                 progress("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
-                let response = try worker.generateCorrectness(
-                    promptTokens: testCase.promptTokens,
-                    steps: MLXFastConstants.correctnessSteps
+                let result = try compareTeacherForcedWithWorker(
+                    testCase: testCase,
+                    worker: worker,
+                    progressIntervalSteps: 64,
+                    progress: { step, total in
+                        progress("correctness case \(caseLabel) checked \(step)/\(total) tokens")
+                    }
                 )
-                lastExpertStats = response.expertStats ?? lastExpertStats
-                peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
-                let actual = response.tokens ?? []
-                let comparison = DeepSeekCorrectness.compareTokens(
-                    expected: testCase.expectedTokens,
-                    actual: actual,
-                    steps: MLXFastConstants.correctnessSteps
-                )
+                lastExpertStats = result.expertStats
+                peakRamGB = max(peakRamGB, result.peakRamGB)
+                let comparison = result.comparison
                 checkedSteps += comparison.checkedSteps
                 if !comparison.passed {
                     firstFailingCase = testCase.name
@@ -968,7 +1011,7 @@ public enum DeepSeekRuntime {
                 expectedToken: firstFailingComparison?.expectedToken,
                 actualToken: firstFailingComparison?.actualToken,
                 goldenHash: golden.sha256,
-                error: firstFailingComparison == nil ? "" : "generated token mismatch"
+                error: firstFailingComparison == nil ? "" : "teacher-forced token mismatch"
             )
             correctnessReport = correctness
             progress(
@@ -1107,12 +1150,12 @@ public enum DeepSeekRuntime {
                 currentCase = testCase
                 let caseLabel = "\(caseIndex + 1)/\(cases.count)"
                 progress?("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
-                let comparison = try compareGreedyCached(
+                let comparison = try compareTeacherForcedCached(
                     testCase: testCase,
                     weightCache: weightCache,
                     progressIntervalSteps: 64,
                     progress: { step, total in
-                        progress?("correctness case \(caseLabel) generated \(step)/\(total) tokens")
+                        progress?("correctness case \(caseLabel) checked \(step)/\(total) tokens")
                     }
                 )
                 if !comparison.passed {
@@ -1134,7 +1177,7 @@ public enum DeepSeekRuntime {
                         expectedToken: comparison.expectedToken,
                         actualToken: comparison.actualToken,
                         goldenHash: goldenHash,
-                        error: "generated token mismatch"
+                        error: "teacher-forced token mismatch"
                     )
                 }
                 progress?("correctness case \(caseLabel) complete checked_steps=\(comparison.checkedSteps)")
@@ -1952,6 +1995,81 @@ public enum DeepSeekRuntime {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
+    private struct WorkerCorrectnessResult {
+        let comparison: CorrectnessTokenComparison
+        let expertStats: ExpertStreamingStats
+        let peakRamGB: Double
+    }
+
+    private static func compareTeacherForcedWithWorker(
+        testCase: GoldenCase,
+        worker: RuntimeWorkerClient,
+        progressIntervalSteps: Int = 0,
+        progress: ((Int, Int) -> Void)? = nil
+    ) throws -> WorkerCorrectnessResult {
+        let steps = MLXFastConstants.correctnessSteps
+        guard !testCase.promptTokens.isEmpty else {
+            throw MLXFastError.invalidInput("teacher-forced correctness prompt must not be empty")
+        }
+        guard testCase.expectedTokens.count == steps else {
+            throw MLXFastError.invalidInput(
+                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need exactly \(steps)"
+            )
+        }
+
+        var lastExpertStats = ExpertStreamingStats.zero
+        var peakRamGB = 0.0
+        var response = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
+        lastExpertStats = response.expertStats ?? lastExpertStats
+        peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
+
+        for step in 0..<steps {
+            guard let actualToken = response.token else {
+                throw MLXFastError.invalidInput("runtime worker teacher-forced correctness response missing token")
+            }
+            let expectedToken = testCase.expectedTokens[step]
+            if actualToken != expectedToken {
+                return WorkerCorrectnessResult(
+                    comparison: CorrectnessTokenComparison(
+                        passed: false,
+                        checkedSteps: step + 1,
+                        firstFailingStep: step,
+                        expectedToken: expectedToken,
+                        actualToken: actualToken
+                    ),
+                    expertStats: lastExpertStats,
+                    peakRamGB: peakRamGB
+                )
+            }
+            reportProgress(
+                step: step + 1,
+                total: steps,
+                intervalSteps: progressIntervalSteps,
+                progress: progress
+            )
+
+            if step == steps - 1 {
+                break
+            }
+
+            response = try worker.teacherForcedCorrectnessStep(previousToken: expectedToken)
+            lastExpertStats = response.expertStats ?? lastExpertStats
+            peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
+        }
+
+        return WorkerCorrectnessResult(
+            comparison: CorrectnessTokenComparison(
+                passed: true,
+                checkedSteps: steps,
+                firstFailingStep: nil,
+                expectedToken: nil,
+                actualToken: nil
+            ),
+            expertStats: lastExpertStats,
+            peakRamGB: peakRamGB
+        )
+    }
+
     private static func compareGreedyCached(
         testCase: GoldenCase,
         weightCache: DeepSeekRuntimeWeightCache,
@@ -2016,6 +2134,71 @@ public enum DeepSeekRuntime {
             expected: testCase.expectedTokens,
             actual: generated,
             steps: steps
+        )
+    }
+
+    private static func compareTeacherForcedCached(
+        testCase: GoldenCase,
+        weightCache: DeepSeekRuntimeWeightCache,
+        progressIntervalSteps: Int = 0,
+        progress: ((Int, Int) -> Void)? = nil
+    ) throws -> CorrectnessTokenComparison {
+        let steps = MLXFastConstants.correctnessSteps
+        guard !testCase.promptTokens.isEmpty else {
+            throw MLXFastError.invalidInput("teacher-forced correctness prompt must not be empty")
+        }
+        guard testCase.expectedTokens.count == steps else {
+            throw MLXFastError.invalidInput(
+                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need exactly \(steps)"
+            )
+        }
+
+        let cache = DeepSeekModelCache(config: weightCache.config)
+        var logits = try DeepSeekModel.logits(
+            inputIDs: inputIDsArray(testCase.promptTokens),
+            weightCache: weightCache,
+            cache: cache,
+            positionOffset: 0
+        )
+        var actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
+
+        for step in 0..<steps {
+            let expectedToken = testCase.expectedTokens[step]
+            if actualToken != expectedToken {
+                return CorrectnessTokenComparison(
+                    passed: false,
+                    checkedSteps: step + 1,
+                    firstFailingStep: step,
+                    expectedToken: expectedToken,
+                    actualToken: actualToken
+                )
+            }
+            reportProgress(
+                step: step + 1,
+                total: steps,
+                intervalSteps: progressIntervalSteps,
+                progress: progress
+            )
+
+            if step == steps - 1 {
+                break
+            }
+
+            logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray([expectedToken]),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: testCase.promptTokens.count + step
+            )
+            actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
+        }
+
+        return CorrectnessTokenComparison(
+            passed: true,
+            checkedSteps: steps,
+            firstFailingStep: nil,
+            expectedToken: nil,
+            actualToken: nil
         )
     }
 
@@ -2316,6 +2499,7 @@ private struct RuntimeWorkerRequest: Codable {
     let id: Int
     let kind: String
     let promptTokens: [Int]?
+    let token: Int?
     let seedTokens: [Int]?
     let steps: Int?
     let decodeSteps: Int?
@@ -2325,11 +2509,18 @@ private struct RuntimeWorkerRequest: Codable {
         case id
         case kind
         case promptTokens = "prompt_tokens"
+        case token
         case seedTokens = "seed_tokens"
         case steps
         case decodeSteps = "decode_steps"
         case validationDelayMilliseconds = "validation_delay_ms"
     }
+}
+
+private struct RuntimeWorkerState {
+    var correctnessCache: DeepSeekModelCache?
+    var correctnessPromptTokenCount = 0
+    var correctnessStep = 0
 }
 
 private struct RuntimeWorkerResponse: Codable {
@@ -2473,6 +2664,20 @@ private final class RuntimeWorkerClient {
         )
     }
 
+    func beginTeacherForcedCorrectness(promptTokens: [Int]) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "correctness_begin",
+            promptTokens: promptTokens
+        )
+    }
+
+    func teacherForcedCorrectnessStep(previousToken: Int) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "correctness_step",
+            token: previousToken
+        )
+    }
+
     func prefill(promptTokens: [Int]) throws -> RuntimeWorkerResponse {
         try send(
             kind: "prefill",
@@ -2494,6 +2699,7 @@ private final class RuntimeWorkerClient {
     private func send(
         kind: String,
         promptTokens: [Int]? = nil,
+        token: Int? = nil,
         seedTokens: [Int]? = nil,
         steps: Int? = nil,
         decodeSteps: Int? = nil,
@@ -2508,6 +2714,7 @@ private final class RuntimeWorkerClient {
             id: id,
             kind: kind,
             promptTokens: promptTokens,
+            token: token,
             seedTokens: seedTokens,
             steps: steps,
             decodeSteps: decodeSteps,

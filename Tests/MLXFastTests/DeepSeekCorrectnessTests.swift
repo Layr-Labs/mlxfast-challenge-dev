@@ -78,6 +78,24 @@ func deepSeekCorrectnessGeneratesGreedyTokensWithGrowingContext() throws {
 }
 
 @Test
+func deepSeekCorrectnessTeacherForcedUsesGoldenPrefix() throws {
+    var contexts: [[Int]] = []
+    let expected = [20, 21, 22]
+    let comparison = try DeepSeekCorrectness.compareTeacherForcedNoCache(
+        promptTokens: [10, 11],
+        expectedTokens: expected,
+        steps: expected.count
+    ) { context in
+        contexts.append(context)
+        return expected[context.count - 2]
+    }
+
+    #expect(comparison.passed)
+    #expect(comparison.checkedSteps == 3)
+    #expect(contexts == [[10, 11], [10, 11, 20], [10, 11, 20, 21]])
+}
+
+@Test
 func correctnessReportEncodesStableFailureFields() throws {
     let report = CorrectnessReport(
         passed: true,

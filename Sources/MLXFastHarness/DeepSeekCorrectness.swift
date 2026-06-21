@@ -48,6 +48,53 @@ public enum DeepSeekCorrectness {
         return generated
     }
 
+    public static func compareTeacherForcedNoCache(
+        promptTokens: [Int],
+        expectedTokens: [Int],
+        steps: Int = MLXFastConstants.correctnessSteps,
+        nextToken: (_ contextTokens: [Int]) throws -> Int
+    ) throws -> CorrectnessTokenComparison {
+        guard !promptTokens.isEmpty else {
+            throw MLXFastError.invalidInput("teacher-forced correctness prompt must not be empty")
+        }
+        guard steps >= 0 else {
+            throw MLXFastError.invalidInput("teacher-forced correctness steps must be non-negative")
+        }
+
+        var context = promptTokens
+        for step in 0..<steps {
+            guard step < expectedTokens.count else {
+                return CorrectnessTokenComparison(
+                    passed: false,
+                    checkedSteps: step + 1,
+                    firstFailingStep: step,
+                    expectedToken: nil,
+                    actualToken: nil
+                )
+            }
+            let expectedToken = expectedTokens[step]
+            let actualToken = try nextToken(context)
+            if actualToken != expectedToken {
+                return CorrectnessTokenComparison(
+                    passed: false,
+                    checkedSteps: step + 1,
+                    firstFailingStep: step,
+                    expectedToken: expectedToken,
+                    actualToken: actualToken
+                )
+            }
+            context.append(expectedToken)
+        }
+
+        return CorrectnessTokenComparison(
+            passed: true,
+            checkedSteps: steps,
+            firstFailingStep: nil,
+            expectedToken: nil,
+            actualToken: nil
+        )
+    }
+
     public static func greedyToken(from logits: MLXArray) throws -> Int {
         guard let vocabSize = logits.shape.last, vocabSize > 0 else {
             throw MLXFastError.invalidInput("greedy logits must have a non-empty vocab dimension")
