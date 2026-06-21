@@ -77,13 +77,12 @@ jobs:
     env:
       MLXFAST_CORRECTNESS_GOLDEN_CACHE_VERSION: v2
       MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH: .mlxfast-cache/correctness-golden/correctness_golden.json
-      MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH: fixtures/correctness_golden_512_256_benchmark256.json
       MLXFAST_CORRECTNESS_GOLDEN_URL_PRESENT: ${{ (inputs.correctness_golden_url != '' || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL != '') && '1' || '0' }}
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
       MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/correctness_golden.json
       MLXFAST_PRIVATE_PROMPTS_CACHE_VERSION: ${{ vars.MLXFAST_PRIVATE_PROMPTS_CACHE_VERSION || 'r2-v1' }}
-      MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: c5d520ec87cc4a105ff13a39ade581801049a90944d42f456d15a33ef080eb1e
-      MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "20425"
+      MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: f43f288c09ec9358a13b9338eca25fc47b6c5c13adbf7ac07ffd38a65f9fee81
+      MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "20435"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "256"
       MLXFAST_EXPECTED_CORRECTNESS_CASES: "1"
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
@@ -146,8 +145,6 @@ jobs:
             echo "benchmark: using configured correctness golden URL"
           elif [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
             echo "benchmark: using precomputed R2 private correctness golden"
-          elif [[ -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
-            echo "benchmark: using committed correctness golden fixture"
           else
             echo "benchmark: using cached Blacksmith-generated correctness golden"
           fi
@@ -178,11 +175,6 @@ jobs:
             actual_bytes="$(wc -c < correctness_golden.json | tr -d ' ')"
             export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256="${actual_hash}"
             export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES="${actual_bytes}"
-            .github/scripts/verify-correctness-golden.sh
-            echo "ready=true" >> "${GITHUB_OUTPUT}"
-          elif [[ -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
-            echo "benchmark: generate-only using committed correctness_golden.json fixture"
-            cp "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" correctness_golden.json
             .github/scripts/verify-correctness-golden.sh
             echo "ready=true" >> "${GITHUB_OUTPUT}"
           elif [[ -s "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" ]]; then
@@ -287,11 +279,8 @@ jobs:
           elif [[ -s "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" ]]; then
             echo "benchmark: using cached correctness_golden.json"
             cp "${MLXFAST_CORRECTNESS_GOLDEN_CACHE_PATH}" correctness_golden.json
-          elif [[ -s "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" ]]; then
-            echo "benchmark: using committed correctness_golden.json fixture"
-            cp "${MLXFAST_COMMITTED_CORRECTNESS_GOLDEN_PATH}" correctness_golden.json
           else
-            echo "benchmark: correctness golden missing; configure correctness_golden_url, private R2 correctness_golden.json, or a valid cache/fixture" >&2
+            echo "benchmark: correctness golden missing; configure correctness_golden_url, private R2 correctness_golden.json, or a valid cache" >&2
             exit 1
           fi
           if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" && "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then

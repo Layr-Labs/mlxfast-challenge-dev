@@ -57,8 +57,9 @@ workflow requires a precomputed `correctness_golden.json` through the
 `correctness_golden_url` input, `MLXFAST_CORRECTNESS_GOLDEN_URL` repository
 secret, or the private R2 object
 `correctness_prompts/correctness_golden.json`. If none of those is configured,
-the workflow falls back to a cached or checked-in public bring-up fixture. Final
-hidden goldens should come from protected storage, not the public cache. Private
+the workflow can fall back to an existing Actions cache, but it will not use a
+committed prompt or golden fixture. Final hidden goldens should come from
+protected storage, not the public cache. Private
 endpoints can pass headers through `MLXFAST_REFERENCE_AUTH_HEADER` and
 `MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER` repository secrets. Private R2 golden
 downloads use the `R2_ACCESS_KEY_ID`, `R2_BUCKET_ENDPOINT`, and
@@ -180,17 +181,17 @@ Organizer golden files can be generated from a private prompt manifest:
 ```bash
 .build/release/mlxfast-swift make-golden \
   --weights weights \
-  --prompt-file private_prompts.json \
+  --prompt-file /path/to/private_prompts.json \
   --output correctness_golden.json
 ```
 
-This repo currently includes a temporary `private_prompts.json` manifest and a
-public fixture for manual benchmark bring-up. In private CI, the normal path
-downloads the precomputed `correctness_prompts/correctness_golden.json` object
-from R2; the private prompt manifest is only needed when regenerating that
-golden outside the benchmark workflow. Generate final hidden goldens outside the
-public repository and provide the resulting file to benchmark CI with R2,
-`correctness_golden_url`, or `MLXFAST_CORRECTNESS_GOLDEN_URL`.
+Private prompt manifests and generated golden files are not committed. In
+private CI, the normal path downloads the precomputed
+`correctness_prompts/correctness_golden.json` object from R2; the private prompt
+manifest is only needed when regenerating that golden outside the benchmark
+workflow. Generate final hidden goldens outside the public repository and
+provide the resulting file to benchmark CI with R2, `correctness_golden_url`, or
+`MLXFAST_CORRECTNESS_GOLDEN_URL`.
 
 The manifest contains correctness prompts plus a dedicated benchmark prompt
 (arrays shown as placeholders):

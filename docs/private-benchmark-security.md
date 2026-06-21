@@ -70,5 +70,5 @@ hardening above blocks direct extraction paths, but competition policy should
 still limit repeated private benchmark attempts and avoid exposing per-case
 failure details for hidden cases.
 
-The committed public fixture is temporary test data and is not a substitute for
-the private hidden prompt/golden store.
+No prompt manifest or generated correctness golden should be committed to the
+public repository.

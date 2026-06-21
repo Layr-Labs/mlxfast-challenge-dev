@@ -69,12 +69,10 @@ correctness_golden.json
 
 Use `MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json` when the
 file is provisioned outside the repository root.
-For bring-up only, this repo currently includes `private_prompts.json` and a
-public fixture. Benchmark CI restores a Blacksmith-generated cached
-`correctness_golden.json` when no golden URL is configured, generating it once on
-a trusted-branch cache miss. Submission branches can restore the cache but do not
-generate goldens from submitted code. Replace this public path with a protected
-golden URL for the final hidden prompt set.
+Benchmark CI downloads the private precomputed golden from protected storage.
+Prompt manifests and generated goldens are not committed to the public
+repository. Submission branches can restore or download a golden but do not
+generate goldens from submitted code.
 
 ## Editable Surface
 
@@ -171,7 +169,7 @@ swift build -c release
 .build/release/mlxfast-swift correctness
 .build/release/mlxfast-swift preflight
 .build/release/mlxfast-swift benchmark --score-path score.json
-.build/release/mlxfast-swift make-golden --prompt-file private_prompts.json --output correctness_golden.json
+.build/release/mlxfast-swift make-golden --prompt-file /path/to/private_prompts.json --output correctness_golden.json
 .build/release/mlxfast-swift verify-transform
 .build/release/mlxfast-swift clone
 .build/release/mlxfast-swift link <benchmark-id-or-name>
