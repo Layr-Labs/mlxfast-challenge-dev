@@ -831,47 +831,21 @@ public enum DeepSeekRuntime {
                     + "timed_seconds=\(formatSeconds(timedBenchmarkSeconds))"
             )
 
-            return ScorePayload(
+            return passedScore(
                 score: score,
-                passed: true,
-                metrics: ScoreMetrics(
-                    peakRamGB: peakRamGB,
-                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
-                    decodeSecondsPerToken: decode.secondsPerToken,
-                    prefillSecondsPerToken: prefillSecondsPerToken,
-                    benchmarkWallSeconds: secondsSince(benchmarkStart),
-                    preflightSeconds: preflightSeconds,
-                    correctnessSeconds: correctnessSeconds,
-                    timedBenchmarkSeconds: timedBenchmarkSeconds,
-                    processResidentMemoryGB: currentResidentMemoryGB(),
-                    passedCorrectness: true,
-                    numLayers: config.numHiddenLayers,
-                    checkedSteps: correctness.checkedSteps,
-                    caseCount: correctness.caseCount,
-                    expertCacheHits: expertStats.cacheHits,
-                    expertCacheMisses: expertStats.cacheMisses,
-                    expertCacheEvictions: expertStats.cacheEvictions,
-                    expertBytesRead: expertStats.bytesRead,
-                    expertReadSeconds: expertStats.readSeconds,
-                    expertPeakCachedTensors: expertStats.peakCachedTensors,
-                    expertHitRate: expertStats.hitRate,
-                    firstFailingLayer: nil,
-                    firstFailingCase: nil,
-                    firstFailingStep: nil,
-                    expectedToken: nil,
-                    actualToken: nil,
-                    maxAbsDiff: 0,
-                    goldenHash: correctness.goldenHash,
-                    bandwidthSource: decode.bandwidthSource,
-                    error: "",
-                    commit: commitIdentifier(),
-                    timestamp: ISO8601DateFormatter().string(from: Date()),
-                    harnessHash: harnessHash(),
-                    weightsHash: transformedWeightsDigest?.sha256 ?? "",
-                    weightsByteCount: transformedWeightsDigest?.byteCount ?? 0,
-                    weightsFileCount: transformedWeightsDigest?.fileCount ?? 0,
-                    runtime: "swift"
-                )
+                peakRamGB: peakRamGB,
+                bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                decodeSecondsPerToken: decode.secondsPerToken,
+                prefillSecondsPerToken: prefillSecondsPerToken,
+                benchmarkWallSeconds: secondsSince(benchmarkStart),
+                preflightSeconds: preflightSeconds,
+                correctnessSeconds: correctnessSeconds,
+                timedBenchmarkSeconds: timedBenchmarkSeconds,
+                numLayers: config.numHiddenLayers,
+                correctness: correctness,
+                expertStats: expertStats,
+                bandwidthSource: decode.bandwidthSource,
+                weightsDigest: transformedWeightsDigest
             )
         } catch let mismatch as BenchmarkTokenMismatchError {
             return makeFailedScore(
@@ -1116,47 +1090,21 @@ public enum DeepSeekRuntime {
                     + "timed_seconds=\(formatSeconds(timedBenchmarkSeconds))"
             )
 
-            return ScorePayload(
+            return passedScore(
                 score: score,
-                passed: true,
-                metrics: ScoreMetrics(
-                    peakRamGB: peakRamGB,
-                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
-                    decodeSecondsPerToken: decode.secondsPerToken,
-                    prefillSecondsPerToken: prefillSecondsPerToken,
-                    benchmarkWallSeconds: secondsSince(benchmarkStart),
-                    preflightSeconds: preflightSeconds,
-                    correctnessSeconds: correctnessSeconds,
-                    timedBenchmarkSeconds: timedBenchmarkSeconds,
-                    processResidentMemoryGB: currentResidentMemoryGB(),
-                    passedCorrectness: true,
-                    numLayers: MLXFastConstants.numHiddenLayers,
-                    checkedSteps: correctness.checkedSteps,
-                    caseCount: correctness.caseCount,
-                    expertCacheHits: lastExpertStats.cacheHits,
-                    expertCacheMisses: lastExpertStats.cacheMisses,
-                    expertCacheEvictions: lastExpertStats.cacheEvictions,
-                    expertBytesRead: lastExpertStats.bytesRead,
-                    expertReadSeconds: lastExpertStats.readSeconds,
-                    expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
-                    expertHitRate: lastExpertStats.hitRate,
-                    firstFailingLayer: nil,
-                    firstFailingCase: nil,
-                    firstFailingStep: nil,
-                    expectedToken: nil,
-                    actualToken: nil,
-                    maxAbsDiff: 0,
-                    goldenHash: correctness.goldenHash,
-                    bandwidthSource: decode.bandwidthSource,
-                    error: "",
-                    commit: commitIdentifier(),
-                    timestamp: ISO8601DateFormatter().string(from: Date()),
-                    harnessHash: harnessHash(),
-                    weightsHash: transformedWeightsDigest?.sha256 ?? "",
-                    weightsByteCount: transformedWeightsDigest?.byteCount ?? 0,
-                    weightsFileCount: transformedWeightsDigest?.fileCount ?? 0,
-                    runtime: "swift"
-                )
+                peakRamGB: peakRamGB,
+                bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                decodeSecondsPerToken: decode.secondsPerToken,
+                prefillSecondsPerToken: prefillSecondsPerToken,
+                benchmarkWallSeconds: secondsSince(benchmarkStart),
+                preflightSeconds: preflightSeconds,
+                correctnessSeconds: correctnessSeconds,
+                timedBenchmarkSeconds: timedBenchmarkSeconds,
+                numLayers: MLXFastConstants.numHiddenLayers,
+                correctness: correctness,
+                expertStats: lastExpertStats,
+                bandwidthSource: decode.bandwidthSource,
+                weightsDigest: transformedWeightsDigest
             )
         } catch let mismatch as BenchmarkTokenMismatchError {
             return makeFailedScore(
@@ -1674,6 +1622,66 @@ public enum DeepSeekRuntime {
 
     private static func expertStats(from loader: DeepSeekWeightLoader?) -> ExpertStreamingStats {
         loader?.expertStreamingMetrics?.snapshot().stats ?? .zero
+    }
+
+    private static func passedScore(
+        score: Double,
+        peakRamGB: Double,
+        bandwidthGBPerToken: Double,
+        decodeSecondsPerToken: Double,
+        prefillSecondsPerToken: Double,
+        benchmarkWallSeconds: Double,
+        preflightSeconds: Double,
+        correctnessSeconds: Double,
+        timedBenchmarkSeconds: Double,
+        numLayers: Int,
+        correctness: CorrectnessReport,
+        expertStats: ExpertStreamingStats,
+        bandwidthSource: String,
+        weightsDigest: DirectoryDigest?
+    ) -> ScorePayload {
+        ScorePayload(
+            score: score,
+            passed: true,
+            metrics: ScoreMetrics(
+                peakRamGB: peakRamGB,
+                bandwidthGBPerToken: bandwidthGBPerToken,
+                decodeSecondsPerToken: decodeSecondsPerToken,
+                prefillSecondsPerToken: prefillSecondsPerToken,
+                benchmarkWallSeconds: benchmarkWallSeconds,
+                preflightSeconds: preflightSeconds,
+                correctnessSeconds: correctnessSeconds,
+                timedBenchmarkSeconds: timedBenchmarkSeconds,
+                processResidentMemoryGB: currentResidentMemoryGB(),
+                passedCorrectness: true,
+                numLayers: numLayers,
+                checkedSteps: correctness.checkedSteps,
+                caseCount: correctness.caseCount,
+                expertCacheHits: expertStats.cacheHits,
+                expertCacheMisses: expertStats.cacheMisses,
+                expertCacheEvictions: expertStats.cacheEvictions,
+                expertBytesRead: expertStats.bytesRead,
+                expertReadSeconds: expertStats.readSeconds,
+                expertPeakCachedTensors: expertStats.peakCachedTensors,
+                expertHitRate: expertStats.hitRate,
+                firstFailingLayer: nil,
+                firstFailingCase: nil,
+                firstFailingStep: nil,
+                expectedToken: nil,
+                actualToken: nil,
+                maxAbsDiff: 0,
+                goldenHash: correctness.goldenHash,
+                bandwidthSource: bandwidthSource,
+                error: "",
+                commit: commitIdentifier(),
+                timestamp: ISO8601DateFormatter().string(from: Date()),
+                harnessHash: harnessHash(),
+                weightsHash: weightsDigest?.sha256 ?? "",
+                weightsByteCount: weightsDigest?.byteCount ?? 0,
+                weightsFileCount: weightsDigest?.fileCount ?? 0,
+                runtime: "swift"
+            )
+        )
     }
 
     private static func failedScore(
