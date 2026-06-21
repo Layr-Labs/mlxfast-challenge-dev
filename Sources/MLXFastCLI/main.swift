@@ -570,6 +570,7 @@ private enum MLXFastCLI {
         try options.validate(
             valueOptions: [
                 "--api",
+                "--base-ref",
                 "--benchmark",
                 "--claimed-score",
                 "--contract",
@@ -601,6 +602,15 @@ private enum MLXFastCLI {
             maxBytesRaw,
             defaultByteCount: MLXFastConstants.defaultMaxSubmissionSourceBytes,
             optionName: "--max-bytes"
+        )
+        let surfaceReport = try SubmissionSupport.enforceModifiableSurface(
+            contractPath: contractPath,
+            baseRef: options.value(for: "--base-ref", default: "")
+        )
+        let baseDescription = surfaceReport.baseRef ?? "unresolved"
+        fputs(
+            "submit: modifiable surface ok changed_files=\(surfaceReport.changedPaths.count) base=\(baseDescription)\n",
+            stderr
         )
 
         let credentials = try loadOptionalCredentials()
@@ -715,7 +725,7 @@ private enum MLXFastCLI {
               mlxfast-swift config
               mlxfast-swift clone [BENCHMARK [DIRECTORY]] [--api URL]
               mlxfast-swift link [BENCHMARK] [--benchmark ID] [--api URL]
-              mlxfast-swift submit [BENCHMARK] [--benchmark ID] [--contract benchmark.json] [--output mlxfast-submission.zip] [--max-bytes N] [--note TEXT | --note-file PATH] [--claimed-score N] [--idempotency-key KEY] [--dry-run]
+              mlxfast-swift submit [BENCHMARK] [--benchmark ID] [--contract benchmark.json] [--base-ref REF] [--output mlxfast-submission.zip] [--max-bytes N] [--note TEXT | --note-file PATH] [--claimed-score N] [--idempotency-key KEY] [--dry-run]
               mlxfast-swift submissions [BENCHMARK] [--benchmark ID] [--api URL]
 
             Swift-only DeepSeek V4 Flash harness entrypoint.

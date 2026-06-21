@@ -46,7 +46,10 @@ By default `setup.sh` downloads `mlx-community/DeepSeek-V4-Flash-4bit` from the
 configured mirror with resumable `curl` requests. It checks cached files against
 the pinned SHA256 manifest and redownloads only missing, truncated, or
 hash-mismatched files. The safetensors payload is about 141 GiB across 33
-shards; `setup.sh` requires 170 GiB free by default before starting. Set
+shards; `setup.sh` requires 170 GiB free by default before starting. After a
+full verification, setup writes `.mlxfast-reference-cache.lock`; later setup
+runs use cheap size/mtime checks from that lock and skip the full checkpoint
+hash pass when the cache is unchanged. Set
 `MLXFAST_REFERENCE_CACHE_DIR` or `MLXFAST_REFERENCE_DIR` to a larger local or
 mounted SSD when the repo disk is too small, or set
 `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1` when the checkpoint is provisioned externally.
@@ -101,7 +104,11 @@ submission packaging live in that trusted harness layer. `mlxfast-swift submit`
 packages only `editablePaths`, rejects symlinks and generated/model artifact
 paths, skips macOS metadata files, and applies a 256 MiB default source archive
 input cap. Override the cap with `MLXFAST_MAX_SUBMISSION_BYTES` or
-`mlxfast-swift submit --max-bytes`.
+`mlxfast-swift submit --max-bytes`. Before packaging or upload, submit checks
+the local Git diff against the trusted base ref and rejects any committed,
+staged, unstaged, or untracked source changes outside `editablePaths`. The base
+ref normally comes from `mlxfast-swift clone`/`link`; submit fails if no base ref
+can be resolved, so pass `--base-ref REF` for manual checkouts.
 
 Use `mlxfast-swift submit --dry-run --output mlxfast-submission.zip` for local
 inspection. For Yukon upload, run `mlxfast-swift login <api-key> --api <url>`

@@ -17,6 +17,28 @@ public struct SubmissionArchiveReport: Codable, Equatable {
     public let archiveSha256: String
 }
 
+public struct ModifiableSurfaceReport: Codable, Equatable {
+    public let contractPath: String
+    public let repositoryRoot: String
+    public let baseRef: String?
+    public let editablePaths: [String]
+    public let changedPaths: [String]
+
+    public init(
+        contractPath: String,
+        repositoryRoot: String,
+        baseRef: String?,
+        editablePaths: [String],
+        changedPaths: [String]
+    ) {
+        self.contractPath = contractPath
+        self.repositoryRoot = repositoryRoot
+        self.baseRef = baseRef
+        self.editablePaths = editablePaths
+        self.changedPaths = changedPaths
+    }
+}
+
 public struct StoredCredentials: Codable, Equatable {
     public let apiKey: String
     public let apiBaseURL: String?
@@ -40,6 +62,68 @@ public enum SubmissionSupport {
         let contract = try loadContract(at: contractPath)
         _ = try editableFiles(from: contract, contractPath: contractPath)
         return contract
+    }
+
+    public static func enforceModifiableSurface(
+        contractPath: String,
+        baseRef explicitBaseRef: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> ModifiableSurfaceReport {
+        let contract = try loadContract(at: contractPath)
+        let contractURL = URL(fileURLWithPath: contractPath).standardizedFileURL
+        let contractRoot = contractURL.deletingLastPathComponent()
+        let repositoryRoot = try gitRepositoryRoot(startingAt: contractRoot)
+        let contractPrefix = try gitRelativePath(for: contractRoot, repositoryRoot: repositoryRoot)
+        let allowedPaths = contract.editablePaths.map {
+            contractPrefix.isEmpty ? $0 : "\(contractPrefix)/\($0)"
+        }
+        let resolvedBaseRef = try resolveLocalSubmissionBaseRef(
+            explicitBaseRef,
+            repositoryRoot: repositoryRoot,
+            environment: environment
+        )
+        guard let baseRef = resolvedBaseRef else {
+            throw MLXFastError.invalidInput(
+                "submit base ref not found; run mlxfast-swift link/clone or pass --base-ref REF"
+            )
+        }
+
+        var changedPaths = Set<String>()
+        changedPaths.formUnion(
+            try gitPathList(
+                ["diff", "--name-only", "-z", baseRef, "HEAD", "--"],
+                repositoryRoot: repositoryRoot
+            )
+        )
+        changedPaths.formUnion(
+            try gitPathList(["diff", "--name-only", "-z", "--"], repositoryRoot: repositoryRoot)
+        )
+        changedPaths.formUnion(
+            try gitPathList(["diff", "--cached", "--name-only", "-z", "--"], repositoryRoot: repositoryRoot)
+        )
+        changedPaths.formUnion(
+            try gitPathList(["ls-files", "--others", "--exclude-standard", "-z"], repositoryRoot: repositoryRoot)
+        )
+
+        let sortedChangedPaths = changedPaths
+            .filter { !isIgnoredLocalGitChange($0) }
+            .sorted()
+        let rejectedPaths = sortedChangedPaths.filter { !path($0, isAllowedBy: allowedPaths) }
+        guard rejectedPaths.isEmpty else {
+            let listed = rejectedPaths.prefix(12).joined(separator: ", ")
+            let suffix = rejectedPaths.count > 12 ? ", ..." : ""
+            throw MLXFastError.invalidInput(
+                "local submit includes changes outside benchmark.json editablePaths: \(listed)\(suffix)"
+            )
+        }
+
+        return ModifiableSurfaceReport(
+            contractPath: contractURL.path,
+            repositoryRoot: repositoryRoot.path,
+            baseRef: resolvedBaseRef,
+            editablePaths: contract.editablePaths,
+            changedPaths: sortedChangedPaths
+        )
     }
 
     public static func packageEditablePaths(
@@ -254,6 +338,7 @@ public enum SubmissionSupport {
 
     private static let reservedSubmissionPathPrefixes: Set<String> = [
         ".build",
+        ".cache",
         ".git",
         ".github",
         ".swiftpm",
@@ -261,6 +346,26 @@ public enum SubmissionSupport {
         "mlxfast-submission.zip",
         "reference_weights",
         "score.json",
+        "weights",
+    ]
+
+    private static let ignoredLocalGitChangePrefixes: Set<String> = [
+        ".build",
+        ".cache",
+        ".mlxfast-cache",
+        ".swiftpm",
+        "benchmark-integrity.json",
+        "correctness_golden.json",
+        "local_correctness_golden.json",
+        "m5_artifacts",
+        "mlxfast-submission.tar.gz",
+        "mlxfast-submission.tgz",
+        "mlxfast-submission.zip",
+        "private_prompts.json",
+        "reference_weights",
+        "results.tsv",
+        "score.json",
+        "score.json.sha256",
         "weights",
     ]
 
@@ -287,6 +392,133 @@ public enum SubmissionSupport {
     ) -> String? {
         let value = environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return value.isEmpty ? nil : value
+    }
+
+    private static func resolveLocalSubmissionBaseRef(
+        _ explicitBaseRef: String?,
+        repositoryRoot: URL,
+        environment: [String: String]
+    ) throws -> String? {
+        if let explicit = explicitBaseRef?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !explicit.isEmpty {
+            guard gitRefExists(explicit, repositoryRoot: repositoryRoot) else {
+                throw MLXFastError.invalidInput("submit base ref not found: \(explicit)")
+            }
+            return explicit
+        }
+
+        var candidates: [String] = []
+        if let value = nonEmptyEnvironmentValue("MLXFAST_SUBMISSION_BASE_REF", in: environment) {
+            candidates.append(value)
+        }
+        if let value = nonEmptyEnvironmentValue("YUKON_SOURCE_REF", in: environment) {
+            candidates.append(value)
+        }
+        if let value = gitConfigValue("yukon.source-ref", repositoryRoot: repositoryRoot) {
+            candidates.append(value)
+        }
+        candidates.append("origin/main")
+
+        var seen: Set<String> = []
+        for candidate in candidates {
+            guard seen.insert(candidate).inserted else {
+                continue
+            }
+            if gitRefExists(candidate, repositoryRoot: repositoryRoot) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private static func gitRepositoryRoot(startingAt directory: URL) throws -> URL {
+        do {
+            let output = try runGit(["rev-parse", "--show-toplevel"], repositoryRoot: directory)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !output.isEmpty else {
+                throw MLXFastError.invalidInput("git did not return a repository root")
+            }
+            return URL(fileURLWithPath: output, isDirectory: true).standardizedFileURL
+        } catch {
+            throw MLXFastError.invalidInput(
+                "submit must run inside a git checkout so local editable-path enforcement can compare changes"
+            )
+        }
+    }
+
+    private static func gitRelativePath(for url: URL, repositoryRoot: URL) throws -> String {
+        let rootPath = repositoryRoot.standardizedFileURL.path
+        let path = url.standardizedFileURL.path
+        if path == rootPath {
+            return ""
+        }
+        guard path.hasPrefix(rootPath + "/") else {
+            throw MLXFastError.invalidInput("benchmark contract is outside the git repository")
+        }
+        return String(path.dropFirst(rootPath.count + 1))
+    }
+
+    private static func gitPathList(_ arguments: [String], repositoryRoot: URL) throws -> [String] {
+        try runGit(arguments, repositoryRoot: repositoryRoot)
+            .split(separator: "\0")
+            .map(String.init)
+            .filter { !$0.isEmpty }
+    }
+
+    private static func gitConfigValue(_ key: String, repositoryRoot: URL) -> String? {
+        guard let output = try? runGit(["config", "--get", key], repositoryRoot: repositoryRoot) else {
+            return nil
+        }
+        let value = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private static func gitRefExists(_ ref: String, repositoryRoot: URL) -> Bool {
+        (try? runGit(["rev-parse", "--verify", "--quiet", "\(ref)^{commit}"], repositoryRoot: repositoryRoot)) != nil
+    }
+
+    private static func path(_ path: String, isAllowedBy allowedPaths: [String]) -> Bool {
+        for allowedPath in allowedPaths {
+            if path == allowedPath || path.hasPrefix(allowedPath + "/") {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func isIgnoredLocalGitChange(_ path: String) -> Bool {
+        if shouldIgnoreMetadataFile(path) {
+            return true
+        }
+        for ignoredPath in ignoredLocalGitChangePrefixes {
+            if path == ignoredPath || path.hasPrefix(ignoredPath + "/") {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func runGit(_ arguments: [String], repositoryRoot: URL) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", repositoryRoot.path] + arguments
+        let output = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = output
+        process.standardError = errorPipe
+
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            let error = String(
+                data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8
+            ) ?? ""
+            throw MLXFastError.invalidInput("git \(arguments.joined(separator: " ")) failed: \(error)")
+        }
+
+        return String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     }
 
     private static func absoluteDirectory(from rawPath: String, environmentName: String) throws -> URL {

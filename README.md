@@ -46,7 +46,10 @@ and redownloads only files that are missing, truncated, or hash-mismatched. A
 compatibility symlink is created at `reference_weights/DeepSeek-V4-Flash-4bit`
 so the default transform path still works after setup. The downloader uses
 resumable `curl` requests, prints numbered shard progress with elapsed time, and
-checks for at least 170 GiB free by default. Use
+checks for at least 170 GiB free by default. After a full SHA-256 verification,
+setup writes `.mlxfast-reference-cache.lock` next to the checkpoint; later setup
+runs use cheap size/mtime checks against that lock and skip the full 141 GiB
+hash pass when the cache is unchanged. Use
 `MLXFAST_REFERENCE_CACHE_DIR=/Volumes/ssd/hf-cache/.../snapshots/main` or
 `MLXFAST_REFERENCE_DIR=/Volumes/ssd/DeepSeek-V4-Flash-4bit` to point at a larger
 volume, or `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh` when the checkpoint will
@@ -110,7 +113,12 @@ golden files, local scores, repository metadata, symlinks, and macOS metadata
 files are not submitted. The default source archive input cap is 256 MiB;
 override it with `MLXFAST_MAX_SUBMISSION_BYTES` or
 `mlxfast-swift submit --max-bytes`. The dry-run report includes the generated
-zip SHA-256 hash.
+zip SHA-256 hash. Before packaging or upload, submit also checks the local Git
+diff against the trusted base ref and fails if any committed, staged, unstaged,
+or untracked source changes are outside `editablePaths`. The base ref defaults
+to Yukon metadata from `mlxfast-swift clone`/`link`, then `origin/main`; submit
+fails if no base ref can be resolved, so pass `--base-ref REF` for a manually
+prepared checkout.
 
 For Yukon upload, first store an API key:
 

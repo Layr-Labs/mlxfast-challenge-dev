@@ -239,6 +239,80 @@ func submissionPackagesEditablePathsAsTarGzipForYukon() throws {
 }
 
 @Test
+func submissionSurfaceAllowsOnlyEditableWorkingTreeChanges() throws {
+    let root = try makeGitSubmissionWorkspace(editablePaths: ["Sources/Allowed"])
+    let base = try gitOutput(["rev-parse", "HEAD"], repository: root)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    try "public enum A { static let changed = true }\n".write(
+        to: root.appendingPathComponent("Sources/Allowed/A.swift"),
+        atomically: true,
+        encoding: .utf8
+    )
+    try "local archive\n".write(
+        to: root.appendingPathComponent("mlxfast-submission.zip"),
+        atomically: true,
+        encoding: .utf8
+    )
+    let report = try SubmissionSupport.enforceModifiableSurface(
+        contractPath: root.appendingPathComponent("benchmark.json").path,
+        baseRef: base,
+        environment: [:]
+    )
+    #expect(report.baseRef == base)
+    #expect(report.changedPaths == ["Sources/Allowed/A.swift"])
+
+    try "changed docs\n".write(
+        to: root.appendingPathComponent("README.md"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    #expect(throws: MLXFastError.self) {
+        _ = try SubmissionSupport.enforceModifiableSurface(
+            contractPath: root.appendingPathComponent("benchmark.json").path,
+            baseRef: base,
+            environment: [:]
+        )
+    }
+}
+
+@Test
+func submissionSurfaceRejectsCommittedHarnessChanges() throws {
+    let root = try makeGitSubmissionWorkspace(editablePaths: ["Sources/Allowed"])
+    let base = try gitOutput(["rev-parse", "HEAD"], repository: root)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    try "committed docs change\n".write(
+        to: root.appendingPathComponent("README.md"),
+        atomically: true,
+        encoding: .utf8
+    )
+    try git(["add", "README.md"], repository: root)
+    try git(["-c", "user.email=test@example.invalid", "-c", "user.name=Test", "commit", "-m", "docs"], repository: root)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try SubmissionSupport.enforceModifiableSurface(
+            contractPath: root.appendingPathComponent("benchmark.json").path,
+            baseRef: base,
+            environment: [:]
+        )
+    }
+}
+
+@Test
+func submissionSurfaceRequiresTrustedBaseRef() throws {
+    let root = try makeGitSubmissionWorkspace(editablePaths: ["Sources/Allowed"])
+
+    #expect(throws: MLXFastError.self) {
+        _ = try SubmissionSupport.enforceModifiableSurface(
+            contractPath: root.appendingPathComponent("benchmark.json").path,
+            environment: [:]
+        )
+    }
+}
+
+@Test
 func loginStoresYukonCompatibleCredentialsFile() throws {
     let home = try temporarySubmissionDirectory()
     let path = try SubmissionSupport.storeCredentials(
@@ -573,6 +647,29 @@ private func makeSubmissionWorkspace(editablePaths: [String]) throws -> URL {
     return root
 }
 
+private func makeGitSubmissionWorkspace(editablePaths: [String]) throws -> URL {
+    let root = try makeSubmissionWorkspace(editablePaths: editablePaths)
+    let allowed = root.appendingPathComponent("Sources/Allowed", isDirectory: true)
+    try FileManager.default.createDirectory(at: allowed, withIntermediateDirectories: true)
+    try "public enum A {}\n".write(
+        to: allowed.appendingPathComponent("A.swift"),
+        atomically: true,
+        encoding: .utf8
+    )
+    try "base docs\n".write(
+        to: root.appendingPathComponent("README.md"),
+        atomically: true,
+        encoding: .utf8
+    )
+    try git(["init"], repository: root)
+    try git(["add", "."], repository: root)
+    try git(
+        ["-c", "user.email=test@example.invalid", "-c", "user.name=Test", "commit", "-m", "base"],
+        repository: root
+    )
+    return root
+}
+
 private let submissionResponseJSON = """
 {
   "submission": {
@@ -657,6 +754,30 @@ private func writeSubmissionContract(_ path: URL, editablePaths: [String]) throw
     }
     """
     try json.write(to: path, atomically: true, encoding: .utf8)
+}
+
+private func git(_ arguments: [String], repository: URL) throws {
+    _ = try gitOutput(arguments, repository: repository)
+}
+
+private func gitOutput(_ arguments: [String], repository: URL) throws -> String {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    process.arguments = ["-C", repository.path] + arguments
+    let output = Pipe()
+    let errorPipe = Pipe()
+    process.standardOutput = output
+    process.standardError = errorPipe
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        let error = String(
+            data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+        throw MLXFastError.invalidInput("git \(arguments.joined(separator: " ")) failed: \(error)")
+    }
+    return String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
 }
 
 private func repositoryRoot() -> URL {

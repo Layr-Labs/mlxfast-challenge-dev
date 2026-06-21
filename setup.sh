@@ -28,6 +28,7 @@ else
   REFERENCE_DIR="${REFERENCE_CACHE_DIR}"
 fi
 REFERENCE_COMPAT_LINK="${MLXFAST_REFERENCE_COMPAT_LINK:-${DEFAULT_REFERENCE_DIR}}"
+REFERENCE_CACHE_LOCK_PATH="${MLXFAST_REFERENCE_CACHE_LOCK_PATH:-${REFERENCE_DIR}/.mlxfast-reference-cache.lock}"
 SETUP_STARTED_SECONDS="${SECONDS}"
 REFERENCE_REQUIRED_METADATA_FILES=(
   "config.json"
@@ -60,6 +61,9 @@ Important environment variables:
                                      Default: ${DEFAULT_REFERENCE_BASE_URL}
   MLXFAST_REFERENCE_MANIFEST_PATH    SHA256 manifest for the reference files.
                                      Default: ${REFERENCE_MANIFEST_PATH}
+  MLXFAST_REFERENCE_CACHE_LOCK_PATH  Local lock proving the checkpoint was
+                                     fully verified by this manifest.
+                                     Default: ${REFERENCE_CACHE_LOCK_PATH}
   MLXFAST_REFERENCE_DOWNLOAD_JOBS    Parallel safetensors downloads.
                                      Default: ${REFERENCE_DOWNLOAD_JOBS}
   MLXFAST_REFERENCE_MIN_FREE_GIB     Required free space before download.
@@ -508,6 +512,240 @@ reference_file_is_current() {
   return 0
 }
 
+reference_manifest_hash() {
+  if [[ ! -f "${REFERENCE_MANIFEST_PATH}" ]]; then
+    echo "setup.sh: reference manifest missing at ${REFERENCE_MANIFEST_PATH}" >&2
+    return 1
+  fi
+  shasum -a 256 "${REFERENCE_MANIFEST_PATH}" | awk '{print $1}'
+}
+
+reference_manifest_totals() {
+  local line
+  local expected_hash
+  local expected_size
+  local relative_path
+  local extra
+  local file_count=0
+  local byte_count=0
+
+  if [[ ! -f "${REFERENCE_MANIFEST_PATH}" ]]; then
+    echo "setup.sh: reference manifest missing at ${REFERENCE_MANIFEST_PATH}" >&2
+    return 1
+  fi
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    read -r expected_hash expected_size relative_path extra <<< "${line}"
+    if [[ -n "${extra:-}" || -z "${expected_hash:-}" || -z "${expected_size:-}" || -z "${relative_path:-}" ]]; then
+      return 1
+    fi
+    if [[ ! "${expected_hash}" =~ ^[0-9a-f]{64}$ || ! "${expected_size}" =~ ^[0-9]+$ ]]; then
+      return 1
+    fi
+    if [[ "${relative_path}" == /* || "${relative_path}" == *\\* ]]; then
+      return 1
+    fi
+    case "/${relative_path}/" in
+      *"/../"*|*"/./"*) return 1 ;;
+    esac
+
+    file_count=$((file_count + 1))
+    byte_count=$((byte_count + expected_size))
+  done < "${REFERENCE_MANIFEST_PATH}"
+
+  [[ "${file_count}" -gt 0 ]] || return 1
+  printf '%s %s\n' "${file_count}" "${byte_count}"
+}
+
+file_mtime_seconds() {
+  local file_path="$1"
+  stat -f '%m' "${file_path}" 2>/dev/null || stat -c '%Y' "${file_path}"
+}
+
+reference_cache_lock_is_current() {
+  local reference_dir="$1"
+  local lock_path="${REFERENCE_CACHE_LOCK_PATH}"
+  local hash_status
+  local expected_manifest_hash
+  local expected_manifest_totals
+  local manifest_file_count
+  local manifest_byte_count
+  local line
+  local key
+  local value
+  local in_files=0
+  local version=""
+  local model_repo=""
+  local revision=""
+  local manifest_hash=""
+  local lock_file_count=""
+  local lock_byte_count=""
+  local actual_file_count=0
+  local actual_byte_count=0
+  local relative_path
+  local expected_size
+  local expected_mtime
+  local extra
+  local file_path
+  local actual_size
+  local actual_mtime
+  local manifest_entry
+  local manifest_expected_hash
+  local manifest_expected_size
+
+  if reference_hash_verification_enabled; then
+    hash_status=0
+  else
+    hash_status="$?"
+  fi
+  if [[ "${hash_status}" != "0" ]]; then
+    return 1
+  fi
+
+  [[ -f "${lock_path}" ]] || return 1
+  if ! expected_manifest_hash="$(reference_manifest_hash)"; then
+    return 1
+  fi
+  if ! expected_manifest_totals="$(reference_manifest_totals)"; then
+    return 1
+  fi
+  read -r manifest_file_count manifest_byte_count <<< "${expected_manifest_totals}"
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" ]] && continue
+    if [[ "${line}" == "--files--" ]]; then
+      in_files=1
+      continue
+    fi
+
+    if [[ "${in_files}" == "0" ]]; then
+      key="${line%%=*}"
+      value="${line#*=}"
+      case "${key}" in
+        version) version="${value}" ;;
+        model_repo) model_repo="${value}" ;;
+        revision) revision="${value}" ;;
+        manifest_sha256) manifest_hash="${value}" ;;
+        file_count) lock_file_count="${value}" ;;
+        byte_count) lock_byte_count="${value}" ;;
+      esac
+      continue
+    fi
+
+    IFS=$'\t' read -r relative_path expected_size expected_mtime extra <<< "${line}"
+    if [[ -n "${extra:-}" || -z "${relative_path:-}" || -z "${expected_size:-}" || -z "${expected_mtime:-}" ]]; then
+      return 1
+    fi
+    if [[ "${relative_path}" == /* || "${relative_path}" == *\\* ]]; then
+      return 1
+    fi
+    [[ "${expected_size}" =~ ^[0-9]+$ ]] || return 1
+    [[ "${expected_mtime}" =~ ^[0-9]+$ ]] || return 1
+    case "/${relative_path}/" in
+      *"/../"*|*"/./"*) return 1 ;;
+    esac
+    if ! manifest_entry="$(reference_manifest_entry "${relative_path}")"; then
+      return 1
+    fi
+    read -r manifest_expected_hash manifest_expected_size <<< "${manifest_entry}"
+    [[ -n "${manifest_expected_hash}" ]] || return 1
+    [[ "${expected_size}" == "${manifest_expected_size}" ]] || return 1
+
+    file_path="${reference_dir}/${relative_path}"
+    [[ -f "${file_path}" ]] || return 1
+    actual_size="$(wc -c < "${file_path}" | tr -d ' ')"
+    [[ "${actual_size}" == "${expected_size}" ]] || return 1
+    if ! actual_mtime="$(file_mtime_seconds "${file_path}")"; then
+      return 1
+    fi
+    [[ "${actual_mtime}" == "${expected_mtime}" ]] || return 1
+
+    actual_file_count=$((actual_file_count + 1))
+    actual_byte_count=$((actual_byte_count + actual_size))
+  done < "${lock_path}"
+
+  [[ "${version}" == "1" ]] || return 1
+  [[ "${model_repo}" == "${REFERENCE_MODEL_REPO}" ]] || return 1
+  [[ "${revision}" == "${REFERENCE_REVISION}" ]] || return 1
+  [[ "${manifest_hash}" == "${expected_manifest_hash}" ]] || return 1
+  [[ "${lock_file_count}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${lock_byte_count}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${lock_file_count}" == "${manifest_file_count}" ]] || return 1
+  [[ "${lock_byte_count}" == "${manifest_byte_count}" ]] || return 1
+  [[ "${actual_file_count}" == "${lock_file_count}" ]] || return 1
+  [[ "${actual_byte_count}" == "${lock_byte_count}" ]] || return 1
+
+  echo "setup.sh: trusted reference cache lock at ${lock_path}; skipping full SHA256 verification"
+  return 0
+}
+
+write_reference_cache_lock() {
+  local reference_dir="$1"
+  local lock_path="${REFERENCE_CACHE_LOCK_PATH}"
+  local temp_path="${lock_path}.tmp"
+  local manifest_hash
+  local line
+  local expected_hash
+  local expected_size
+  local relative_path
+  local extra
+  local file_path
+  local actual_size
+  local actual_mtime
+  local file_count=0
+  local byte_count=0
+  local files_path="${temp_path}.files"
+
+  if ! manifest_hash="$(reference_manifest_hash)"; then
+    return 1
+  fi
+
+  mkdir -p "$(dirname "${lock_path}")"
+  : > "${files_path}"
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    read -r expected_hash expected_size relative_path extra <<< "${line}"
+    if [[ -n "${extra:-}" || -z "${expected_hash:-}" || -z "${expected_size:-}" || -z "${relative_path:-}" ]]; then
+      rm -f "${files_path}"
+      return 1
+    fi
+    file_path="${reference_dir}/${relative_path}"
+    [[ -f "${file_path}" ]] || {
+      rm -f "${files_path}"
+      return 1
+    }
+    actual_size="$(wc -c < "${file_path}" | tr -d ' ')"
+    if ! actual_mtime="$(file_mtime_seconds "${file_path}")"; then
+      rm -f "${files_path}"
+      return 1
+    fi
+    printf '%s\t%s\t%s\n' "${relative_path}" "${actual_size}" "${actual_mtime}" >> "${files_path}"
+    file_count=$((file_count + 1))
+    byte_count=$((byte_count + actual_size))
+  done < "${REFERENCE_MANIFEST_PATH}"
+
+  if [[ "${file_count}" -eq 0 ]]; then
+    rm -f "${files_path}"
+    return 1
+  fi
+
+  {
+    printf 'version=1\n'
+    printf 'model_repo=%s\n' "${REFERENCE_MODEL_REPO}"
+    printf 'revision=%s\n' "${REFERENCE_REVISION}"
+    printf 'manifest_sha256=%s\n' "${manifest_hash}"
+    printf 'file_count=%s\n' "${file_count}"
+    printf 'byte_count=%s\n' "${byte_count}"
+    printf 'verified_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '%s\n' '--files--'
+    cat "${files_path}"
+  } > "${temp_path}"
+  rm -f "${files_path}"
+  mv "${temp_path}" "${lock_path}"
+  echo "setup.sh: wrote reference cache lock ${lock_path}"
+}
+
 download_reference_file() {
   local file="$1"
   local output_path="$2"
@@ -829,7 +1067,16 @@ verify_reference_weights() {
     return 1
   fi
 
+  if reference_cache_lock_is_current "${reference_dir}"; then
+    echo "setup.sh: verified reference checkpoint at ${reference_dir} (${#shard_files[@]} safetensors shard(s))"
+    return 0
+  fi
+
   if ! verify_reference_manifest "${reference_dir}"; then
+    rm -f "${REFERENCE_CACHE_LOCK_PATH}"
+    return 1
+  fi
+  if ! write_reference_cache_lock "${reference_dir}"; then
     return 1
   fi
   echo "setup.sh: verified reference checkpoint at ${reference_dir} (${#shard_files[@]} safetensors shard(s))"
