@@ -27,6 +27,6 @@ if [[ "${actual_bytes}" != "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES}" ]]; th
   exit 1
 fi
 
-printf '%s  %s\n' "${actual_hash}" "${GOLDEN_PATH}" > "${GOLDEN_PATH}.sha256"
-wc -c "${GOLDEN_PATH}" > "${GOLDEN_PATH}.bytes"
+printf '%s  correctness_golden.json\n' "${actual_hash}" > "${GOLDEN_PATH}.sha256"
+printf '%s  correctness_golden.json\n' "${actual_bytes}" > "${GOLDEN_PATH}.bytes"
 echo "benchmark: verified correctness golden ${actual_hash} bytes=${actual_bytes}"

@@ -55,6 +55,7 @@ jobs:
           bash -n .github/scripts/overlay-editable-paths.sh
           bash -n .github/scripts/verify-correctness-golden.sh
           bash -n .github/scripts/validate-benchmark-artifacts.sh
+          bash -n .github/scripts/deny-private-artifacts.sh
 
       - name: Build release CLI
         run: |

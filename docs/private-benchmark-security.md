@@ -25,7 +25,10 @@ Normal private benchmark runs download the precomputed
 The private prompt manifest, `correctness_prompts/private_prompts.json`, is only
 an organizer input for regenerating the golden outside the benchmark workflow.
 It should not be downloaded by submission benchmark runs, written into the
-repository workspace, uploaded, or cached.
+repository workspace, uploaded, or cached. The workflow writes the downloaded
+golden only under `$RUNNER_TEMP` and uploads only its hash and byte-count
+sidecars after a deny-list check rejects prompt, golden, model, symlink, and
+oversized artifact paths.
 
 The benchmark workflow also verifies at runtime that it is executing from:
 
@@ -57,6 +60,9 @@ For `submission_ref` runs:
 - `score.json`, `benchmark-integrity.json`, and correctness artifacts are
   uploaded only after strict schema and hash validation succeeds.
 - Correctness traces are disabled.
+- Timed benchmark model execution runs in a child worker process that receives
+  prompt tokens, but not the golden file path or expected output tokens. The
+  parent trusted harness performs token comparison.
 
 This prevents submitted code from using GitHub logs or uploaded artifacts as a
 direct prompt-exfiltration channel.

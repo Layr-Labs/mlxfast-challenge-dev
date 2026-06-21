@@ -11,6 +11,7 @@ MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
 SANDBOX_PROFILE="${MLXFAST_SANDBOX_PROFILE:-tools/deny-network.sb}"
 SOURCE_HASH_PATH="${WEIGHTS_PATH}/.benchmark-source.sha256"
 INTEGRITY_PATH="${MLXFAST_INTEGRITY_PATH:-benchmark-integrity.json}"
+USE_RUNTIME_WORKER="${MLXFAST_USE_RUNTIME_WORKER:-1}"
 
 json_string() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
@@ -23,6 +24,54 @@ json_number_or_null() {
   else
     printf '%s' "${value}"
   fi
+}
+
+absolute_path() {
+  local path="$1"
+  local dir
+  local base
+  dir="$(dirname "${path}")"
+  base="$(basename "${path}")"
+  if [[ "${dir}" = "." ]]; then
+    printf '%s/%s\n' "${PWD}" "${base}"
+  else
+    (cd "${dir}" 2>/dev/null && printf '%s/%s\n' "${PWD}" "${base}") || printf '%s\n' "${path}"
+  fi
+}
+
+sandbox_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+write_runtime_worker_sandbox_profile() {
+  if [[ "${USE_RUNTIME_WORKER}" != "1" || "${MLXFAST_NO_SANDBOX:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ -n "${MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE:-}" ]]; then
+    return 0
+  fi
+  if ! command -v sandbox-exec >/dev/null 2>&1; then
+    echo "benchmark.sh: sandbox-exec not found for runtime worker sandbox" >&2
+    exit 1
+  fi
+
+  local profile
+  local golden_absolute
+  profile="$(mktemp "${TMPDIR:-/tmp}/mlxfast-runtime-worker.XXXXXX.sb")"
+  golden_absolute="$(absolute_path "${GOLDEN_PATH}")"
+  cat > "${profile}" <<EOF
+(version 1)
+(allow default)
+(deny network*)
+(allow network* (remote ip "localhost:*"))
+(allow network* (local unix-socket))
+(allow network* (remote unix-socket))
+(allow network-bind (local ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
+(deny file-read* (literal "$(sandbox_escape "${golden_absolute}")"))
+(deny file-write* (literal "$(sandbox_escape "${golden_absolute}")"))
+EOF
+  export MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE="${profile}"
 }
 
 score_metric_string() {
@@ -115,6 +164,9 @@ if [[ ! -f "${MLX_METALLIB}" ]]; then
   echo "benchmark.sh: MLX metallib missing at ${MLX_METALLIB}; run ./setup.sh before ranked benchmark runs" >&2
 fi
 
+write_runtime_worker_sandbox_profile
+export MLXFAST_USE_RUNTIME_WORKER="${USE_RUNTIME_WORKER}"
+
 mkdir -p "${WEIGHTS_PATH}"
 wanted_hash="$(source_hash)"
 current_hash="$(cat "${SOURCE_HASH_PATH}" 2>/dev/null || true)"
@@ -188,7 +240,7 @@ cat > "${INTEGRITY_PATH}" <<EOF
   "weights_sha256": "$(json_string "${weights_hash}")",
   "weights_file_count": $(json_number_or_null "${weights_file_count}"),
   "weights_byte_count": $(json_number_or_null "${weights_byte_count}"),
-  "golden_path": "$(json_string "${GOLDEN_PATH}")",
+  "golden_path": "[private]",
   "golden_sha256": "$(json_string "${golden_hash}")",
   "transform_source_sha256": "$(json_string "${wanted_hash}")"
 }

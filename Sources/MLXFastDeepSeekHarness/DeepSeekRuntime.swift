@@ -207,6 +207,16 @@ public struct BenchmarkOptions: Equatable {
     }
 }
 
+public struct RuntimeWorkerOptions: Equatable {
+    public let executablePath: String
+    public let sandboxProfilePath: String?
+
+    public init(executablePath: String, sandboxProfilePath: String? = nil) {
+        self.executablePath = executablePath
+        self.sandboxProfilePath = sandboxProfilePath
+    }
+}
+
 public struct GoldenGenerationOptions: Equatable {
     public let weightsPath: String
     public let promptManifest: GoldenPromptManifest
@@ -294,7 +304,14 @@ public enum DeepSeekRuntime {
         return GoldenDocument(cases: cases, benchmark: benchmark)
     }
 
-    public static func runCorrectness(_ options: CorrectnessOptions) throws -> CorrectnessReport {
+    public static func runCorrectness(
+        _ options: CorrectnessOptions,
+        worker: RuntimeWorkerOptions? = nil
+    ) throws -> CorrectnessReport {
+        if let worker {
+            return runCorrectnessWithWorker(options, worker: worker)
+        }
+
         var loadedGolden: GoldenFixture?
         var loader: DeepSeekWeightLoader?
         do {
@@ -318,6 +335,92 @@ public enum DeepSeekRuntime {
                 caseCount: loadedGolden?.cases.count ?? 0,
                 goldenHash: loadedGolden?.sha256 ?? "",
                 expertStats: expertStats(from: loader),
+                error: "\(error)"
+            )
+        }
+    }
+
+    private static func runCorrectnessWithWorker(
+        _ options: CorrectnessOptions,
+        worker workerOptions: RuntimeWorkerOptions
+    ) -> CorrectnessReport {
+        var loadedGolden: GoldenFixture?
+        var lastExpertStats = ExpertStreamingStats.zero
+        var checkedSteps = 0
+        var currentCase: GoldenCase?
+        do {
+            try requireRegularFile(options.weightsPath + "/config.json", description: "transformed config")
+            try requireRegularFile(options.goldenPath, description: "correctness golden file")
+            let golden = try loadGoldenFixture(from: options.goldenPath)
+            loadedGolden = golden
+            let worker = try RuntimeWorkerClient(
+                options: workerOptions,
+                weightsPath: options.weightsPath
+            )
+            defer {
+                worker.close()
+            }
+
+            for testCase in golden.cases {
+                currentCase = testCase
+                let response = try worker.generateCorrectness(
+                    promptTokens: testCase.promptTokens,
+                    steps: MLXFastConstants.correctnessSteps
+                )
+                lastExpertStats = response.expertStats ?? lastExpertStats
+                let comparison = DeepSeekCorrectness.compareTokens(
+                    expected: testCase.expectedTokens,
+                    actual: response.tokens ?? [],
+                    steps: MLXFastConstants.correctnessSteps
+                )
+                checkedSteps += comparison.checkedSteps
+                if !comparison.passed {
+                    return CorrectnessReport(
+                        passed: false,
+                        checkedSteps: checkedSteps,
+                        caseCount: golden.cases.count,
+                        expertCacheHits: lastExpertStats.cacheHits,
+                        expertCacheMisses: lastExpertStats.cacheMisses,
+                        expertCacheEvictions: lastExpertStats.cacheEvictions,
+                        expertBytesRead: lastExpertStats.bytesRead,
+                        expertReadSeconds: lastExpertStats.readSeconds,
+                        expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
+                        expertHitRate: lastExpertStats.hitRate,
+                        firstFailingCase: testCase.name,
+                        firstFailingStep: comparison.firstFailingStep,
+                        expectedToken: comparison.expectedToken,
+                        actualToken: comparison.actualToken,
+                        goldenHash: golden.sha256,
+                        error: "generated token mismatch"
+                    )
+                }
+            }
+
+            return CorrectnessReport(
+                passed: true,
+                checkedSteps: checkedSteps,
+                caseCount: golden.cases.count,
+                expertCacheHits: lastExpertStats.cacheHits,
+                expertCacheMisses: lastExpertStats.cacheMisses,
+                expertCacheEvictions: lastExpertStats.cacheEvictions,
+                expertBytesRead: lastExpertStats.bytesRead,
+                expertReadSeconds: lastExpertStats.readSeconds,
+                expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
+                expertHitRate: lastExpertStats.hitRate,
+                firstFailingCase: nil,
+                firstFailingStep: nil,
+                expectedToken: nil,
+                actualToken: nil,
+                goldenHash: golden.sha256,
+                error: ""
+            )
+        } catch {
+            return failedCorrectnessReport(
+                checkedSteps: checkedSteps,
+                caseCount: loadedGolden?.cases.count ?? 0,
+                firstFailingCase: currentCase?.name,
+                goldenHash: loadedGolden?.sha256 ?? "",
+                expertStats: lastExpertStats,
                 error: "\(error)"
             )
         }
@@ -353,7 +456,163 @@ public enum DeepSeekRuntime {
         )
     }
 
-    public static func benchmark(_ options: BenchmarkOptions) -> ScorePayload {
+    public static func runWorker(weightsPath: String) throws {
+        let config = try DeepSeekConfig.load(from: weightsPath)
+        let loader = try DeepSeekWeightLoader(
+            weightsPath: weightsPath,
+            expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: true)
+        )
+        let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
+        let decoder = JSONDecoder()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+
+        while let line = readLine(strippingNewline: true) {
+            guard !line.isEmpty else {
+                continue
+            }
+            let response: RuntimeWorkerResponse
+            do {
+                let request = try decoder.decode(RuntimeWorkerRequest.self, from: Data(line.utf8))
+                response = try handleWorkerRequest(request, weightCache: weightCache)
+            } catch {
+                response = RuntimeWorkerResponse(id: -1, ok: false, error: "\(error)")
+            }
+            let data = try encoder.encode(response)
+            FileHandle.standardOutput.write(data)
+            FileHandle.standardOutput.write(Data([0x0a]))
+            fflush(stdout)
+        }
+    }
+
+    private static func handleWorkerRequest(
+        _ request: RuntimeWorkerRequest,
+        weightCache: DeepSeekRuntimeWeightCache
+    ) throws -> RuntimeWorkerResponse {
+        switch request.kind {
+        case "correctness":
+            guard let promptTokens = request.promptTokens, let steps = request.steps else {
+                throw MLXFastError.invalidInput("runtime worker correctness request missing prompt_tokens or steps")
+            }
+            let tokens = try generateGreedyCached(
+                promptTokens: promptTokens,
+                steps: steps,
+                weightCache: weightCache
+            )
+            return RuntimeWorkerResponse(
+                id: request.id,
+                ok: true,
+                tokens: tokens,
+                expertStats: expertStats(from: weightCache),
+                peakRamGB: currentResidentMemoryGB()
+            )
+
+        case "prefill":
+            guard let promptTokens = request.promptTokens else {
+                throw MLXFastError.invalidInput("runtime worker prefill request missing prompt_tokens")
+            }
+            let cache = DeepSeekModelCache(config: weightCache.config)
+            let start = DispatchTime.now().uptimeNanoseconds
+            let logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray(promptTokens),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: 0
+            )
+            eval(logits)
+            let token = try DeepSeekCorrectness.greedyToken(from: logits)
+            let elapsed = secondsSince(start)
+            Memory.clearCache()
+            return RuntimeWorkerResponse(
+                id: request.id,
+                ok: true,
+                token: token,
+                seconds: elapsed,
+                expertStats: expertStats(from: weightCache),
+                peakRamGB: currentResidentMemoryGB()
+            )
+
+        case "decode":
+            guard let seedTokens = request.seedTokens, let decodeSteps = request.decodeSteps else {
+                throw MLXFastError.invalidInput("runtime worker decode request missing seed_tokens or decode_steps")
+            }
+            let validationDelayMS = try request.validationDelayMilliseconds
+                ?? submissionValidationDelayMilliseconds()
+            guard validationDelayMS >= 0 else {
+                throw MLXFastError.invalidInput("runtime worker validation delay must be non-negative")
+            }
+            let timingPlan = try DecodeTimingPlan(seedTokenCount: seedTokens.count, decodeSteps: decodeSteps)
+
+            let warmupCache = DeepSeekModelCache(config: weightCache.config)
+            let warmupLogits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray(seedTokens),
+                weightCache: weightCache,
+                cache: warmupCache,
+                positionOffset: 0
+            )
+            _ = try DeepSeekCorrectness.greedyToken(from: warmupLogits)
+            Memory.clearCache()
+
+            let cache = DeepSeekModelCache(config: weightCache.config)
+            var logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray(seedTokens),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: 0
+            )
+            var token = try DeepSeekCorrectness.greedyToken(from: logits)
+            let seedToken = token
+            cache.materializeCachedState()
+
+            var actualTokens: [Int] = []
+            actualTokens.reserveCapacity(timingPlan.decodeSteps)
+            let metricsBeforeDecode = weightCache.loader.expertStreamingMetrics?.snapshot()
+            let start = DispatchTime.now().uptimeNanoseconds
+            for decodedStep in 0..<timingPlan.decodeSteps {
+                logits = try DeepSeekModel.logits(
+                    inputIDs: inputIDsArray([token]),
+                    weightCache: weightCache,
+                    cache: cache,
+                    positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
+                )
+                token = try DeepSeekCorrectness.greedyToken(from: logits)
+                actualTokens.append(token)
+                if validationDelayMS > 0 {
+                    Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
+                }
+            }
+            let elapsed = secondsSince(start)
+            let bandwidth = try expertStreamingBandwidthGBPerToken(
+                before: metricsBeforeDecode,
+                after: weightCache.loader.expertStreamingMetrics?.snapshot(),
+                decodedTokens: timingPlan.decodeSteps
+            )
+            return RuntimeWorkerResponse(
+                id: request.id,
+                ok: true,
+                seedToken: seedToken,
+                tokens: actualTokens,
+                seconds: elapsed,
+                secondsPerToken: elapsed / Double(timingPlan.decodeSteps),
+                bandwidthGBPerToken: bandwidth.gbPerToken,
+                bandwidthSource: bandwidth.source,
+                expertStats: expertStats(from: weightCache),
+                peakRamGB: currentResidentMemoryGB()
+            )
+
+        default:
+            throw MLXFastError.invalidInput("runtime worker received unknown request kind \(request.kind)")
+        }
+    }
+
+    public static func benchmark(
+        _ options: BenchmarkOptions,
+        worker: RuntimeWorkerOptions? = nil
+    ) -> ScorePayload {
+        if let worker {
+            return benchmarkWithWorker(options, worker: worker)
+        }
+
         let benchmarkStart = DispatchTime.now().uptimeNanoseconds
         let progress = makeBenchmarkProgressReporter(startedAt: benchmarkStart)
         var correctnessReport: CorrectnessReport?
@@ -577,6 +836,264 @@ public enum DeepSeekRuntime {
         }
     }
 
+    private static func benchmarkWithWorker(
+        _ options: BenchmarkOptions,
+        worker workerOptions: RuntimeWorkerOptions
+    ) -> ScorePayload {
+        let benchmarkStart = DispatchTime.now().uptimeNanoseconds
+        let progress = makeBenchmarkProgressReporter(startedAt: benchmarkStart)
+        var correctnessReport: CorrectnessReport?
+        var transformedWeightsDigest: DirectoryDigest?
+        var preflightSeconds = 0.0
+        var correctnessSeconds = 0.0
+        var timedBenchmarkSeconds = 0.0
+        var lastExpertStats = ExpertStreamingStats.zero
+        var peakRamGB = 0.0
+
+        progress(
+            "start correctness_steps=\(MLXFastConstants.correctnessSteps) "
+                + "benchmark_decode_steps=\(MLXFastConstants.benchmarkDecodeSteps)"
+        )
+
+        func makeFailedScore(
+            error: String,
+            correctness: CorrectnessReport?,
+            passedCorrectness: Bool,
+            firstFailingCase explicitFirstFailingCase: String? = nil,
+            firstFailingStep explicitFirstFailingStep: Int? = nil,
+            expectedToken explicitExpectedToken: Int? = nil,
+            actualToken explicitActualToken: Int? = nil
+        ) -> ScorePayload {
+            progress("failed passed_correctness=\(passedCorrectness) error=\(redactedProgressError(error))")
+            return failedScore(
+                error: error,
+                correctness: correctness,
+                passedCorrectness: passedCorrectness,
+                expertStats: lastExpertStats,
+                firstFailingCase: explicitFirstFailingCase,
+                firstFailingStep: explicitFirstFailingStep,
+                expectedToken: explicitExpectedToken,
+                actualToken: explicitActualToken,
+                weightsDigest: transformedWeightsDigest,
+                benchmarkWallSeconds: secondsSince(benchmarkStart),
+                preflightSeconds: preflightSeconds,
+                correctnessSeconds: correctnessSeconds,
+                timedBenchmarkSeconds: timedBenchmarkSeconds,
+                processResidentMemoryGB: currentResidentMemoryGB()
+            )
+        }
+
+        do {
+            progress("preflight start")
+            let preflightStart = DispatchTime.now().uptimeNanoseconds
+            try checkWorkerBenchmarkInputs(
+                weightsPath: options.weightsPath,
+                goldenPath: options.goldenPath
+            )
+            preflightSeconds = secondsSince(preflightStart)
+            progress("preflight complete seconds=\(formatSeconds(preflightSeconds))")
+
+            progress("weights digest start")
+            transformedWeightsDigest = try directoryDigest(
+                rootPath: options.weightsPath,
+                ignoredRelativePaths: [".benchmark-source.sha256", ".gitkeep"]
+            )
+            if let transformedWeightsDigest {
+                try enforceTransformedWeightsByteLimit(transformedWeightsDigest.byteCount)
+                progress(
+                    "weights digest complete files=\(transformedWeightsDigest.fileCount) "
+                        + "bytes=\(transformedWeightsDigest.byteCount)"
+                )
+            }
+
+            progress("golden load start")
+            let golden = try loadGoldenFixture(from: options.goldenPath)
+            progress(
+                "golden load complete cases=\(golden.cases.count) "
+                    + "benchmark_oracle=\(golden.benchmark == nil ? "missing" : "present")"
+            )
+
+            progress("runtime worker start")
+            let worker = try RuntimeWorkerClient(
+                options: workerOptions,
+                weightsPath: options.weightsPath
+            )
+            defer {
+                worker.close()
+            }
+
+            let correctnessStart = DispatchTime.now().uptimeNanoseconds
+            progress("correctness start cases=\(golden.cases.count)")
+            var checkedSteps = 0
+            var firstFailingCase: String?
+            var firstFailingComparison: CorrectnessTokenComparison?
+            for (caseIndex, testCase) in golden.cases.enumerated() {
+                let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
+                progress("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
+                let response = try worker.generateCorrectness(
+                    promptTokens: testCase.promptTokens,
+                    steps: MLXFastConstants.correctnessSteps
+                )
+                lastExpertStats = response.expertStats ?? lastExpertStats
+                peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
+                let actual = response.tokens ?? []
+                let comparison = DeepSeekCorrectness.compareTokens(
+                    expected: testCase.expectedTokens,
+                    actual: actual,
+                    steps: MLXFastConstants.correctnessSteps
+                )
+                checkedSteps += comparison.checkedSteps
+                if !comparison.passed {
+                    firstFailingCase = testCase.name
+                    firstFailingComparison = comparison
+                    progress("correctness case \(caseLabel) failed step=\(comparison.firstFailingStep ?? -1)")
+                    break
+                }
+                progress("correctness case \(caseLabel) complete checked_steps=\(comparison.checkedSteps)")
+            }
+            correctnessSeconds = secondsSince(correctnessStart)
+            let correctness = CorrectnessReport(
+                passed: firstFailingComparison == nil,
+                checkedSteps: checkedSteps,
+                caseCount: golden.cases.count,
+                expertCacheHits: lastExpertStats.cacheHits,
+                expertCacheMisses: lastExpertStats.cacheMisses,
+                expertCacheEvictions: lastExpertStats.cacheEvictions,
+                expertBytesRead: lastExpertStats.bytesRead,
+                expertReadSeconds: lastExpertStats.readSeconds,
+                expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
+                expertHitRate: lastExpertStats.hitRate,
+                firstFailingCase: firstFailingCase,
+                firstFailingStep: firstFailingComparison?.firstFailingStep,
+                expectedToken: firstFailingComparison?.expectedToken,
+                actualToken: firstFailingComparison?.actualToken,
+                goldenHash: golden.sha256,
+                error: firstFailingComparison == nil ? "" : "generated token mismatch"
+            )
+            correctnessReport = correctness
+            progress(
+                "correctness complete passed=\(correctness.passed) "
+                    + "checked_steps=\(correctness.checkedSteps) "
+                    + "seconds=\(formatSeconds(correctnessSeconds))"
+            )
+            guard correctness.passed else {
+                return makeFailedScore(
+                    error: correctness.error.isEmpty ? "correctness gate failed" : correctness.error,
+                    correctness: correctness,
+                    passedCorrectness: false
+                )
+            }
+
+            guard let benchmarkGolden = golden.benchmark else {
+                throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
+            }
+            let promptPlan = try BenchmarkPrompt.plan(from: benchmarkGolden)
+            progress(
+                "benchmark oracle ready prefill_tokens=\(promptPlan.prefillTokens.count) "
+                    + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
+                    + "decode_tokens=\(promptPlan.expectedDecodeTokens.count)"
+            )
+            progress("mactop idle measurement skipped; runtime worker uses expert streaming byte fallback")
+
+            let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
+            progress("timed benchmark start")
+            let prefillSecondsPerToken = try measureWorkerPrefillSecondsPerToken(
+                promptTokens: promptPlan.prefillTokens,
+                expectedToken: promptPlan.expectedPrefillToken,
+                worker: worker,
+                progress: progress,
+                peakRamGB: &peakRamGB,
+                expertStats: &lastExpertStats
+            )
+            let decode = try measureWorkerDecode(
+                seedTokens: promptPlan.decodeSeedTokens,
+                expectedSeedToken: promptPlan.expectedDecodeSeedToken,
+                expectedTokens: promptPlan.expectedDecodeTokens,
+                worker: worker,
+                progress: progress,
+                peakRamGB: &peakRamGB,
+                expertStats: &lastExpertStats
+            )
+            timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
+            let score = peakRamGB
+                * decode.bandwidthGBPerToken
+                * decode.secondsPerToken
+                * prefillSecondsPerToken
+
+            guard score.isFinite, score >= 0 else {
+                return makeFailedScore(
+                    error: "computed score was not finite",
+                    correctness: correctnessReport,
+                    passedCorrectness: true
+                )
+            }
+            progress(
+                "complete score=\(formatDouble(score)) "
+                    + "wall_seconds=\(formatSeconds(secondsSince(benchmarkStart))) "
+                    + "timed_seconds=\(formatSeconds(timedBenchmarkSeconds))"
+            )
+
+            return ScorePayload(
+                score: score,
+                passed: true,
+                metrics: ScoreMetrics(
+                    peakRamGB: peakRamGB,
+                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                    decodeSecondsPerToken: decode.secondsPerToken,
+                    prefillSecondsPerToken: prefillSecondsPerToken,
+                    benchmarkWallSeconds: secondsSince(benchmarkStart),
+                    preflightSeconds: preflightSeconds,
+                    correctnessSeconds: correctnessSeconds,
+                    timedBenchmarkSeconds: timedBenchmarkSeconds,
+                    processResidentMemoryGB: currentResidentMemoryGB(),
+                    passedCorrectness: true,
+                    numLayers: MLXFastConstants.numHiddenLayers,
+                    checkedSteps: correctness.checkedSteps,
+                    caseCount: correctness.caseCount,
+                    expertCacheHits: lastExpertStats.cacheHits,
+                    expertCacheMisses: lastExpertStats.cacheMisses,
+                    expertCacheEvictions: lastExpertStats.cacheEvictions,
+                    expertBytesRead: lastExpertStats.bytesRead,
+                    expertReadSeconds: lastExpertStats.readSeconds,
+                    expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
+                    expertHitRate: lastExpertStats.hitRate,
+                    firstFailingLayer: nil,
+                    firstFailingCase: nil,
+                    firstFailingStep: nil,
+                    expectedToken: nil,
+                    actualToken: nil,
+                    maxAbsDiff: 0,
+                    goldenHash: correctness.goldenHash,
+                    bandwidthSource: decode.bandwidthSource,
+                    error: "",
+                    commit: commitIdentifier(),
+                    timestamp: ISO8601DateFormatter().string(from: Date()),
+                    harnessHash: harnessHash(),
+                    weightsHash: transformedWeightsDigest?.sha256 ?? "",
+                    weightsByteCount: transformedWeightsDigest?.byteCount ?? 0,
+                    weightsFileCount: transformedWeightsDigest?.fileCount ?? 0,
+                    runtime: "swift"
+                )
+            )
+        } catch let mismatch as BenchmarkTokenMismatchError {
+            return makeFailedScore(
+                error: mismatch.description,
+                correctness: correctnessReport,
+                passedCorrectness: correctnessReport?.passed == true,
+                firstFailingCase: "benchmark",
+                firstFailingStep: mismatch.step,
+                expectedToken: mismatch.expectedToken,
+                actualToken: mismatch.actualToken
+            )
+        } catch {
+            return makeFailedScore(
+                error: "\(error)",
+                correctness: correctnessReport,
+                passedCorrectness: correctnessReport?.passed == true
+            )
+        }
+    }
+
     private static func runCorrectness(
         cases: [GoldenCase],
         weightCache: DeepSeekRuntimeWeightCache,
@@ -729,6 +1246,66 @@ public enum DeepSeekRuntime {
             )
             let elapsed = secondsSince(start)
             Memory.clearCache()
+            progress?(
+                "prefill \(runLabel) \(runOrdinal)/\(runTotal) complete "
+                    + "seconds=\(formatSeconds(elapsed))"
+            )
+
+            if runIndex >= MLXFastConstants.benchmarkPrefillWarmupRuns {
+                timedElapsed.append(elapsed)
+            }
+        }
+
+        guard !timedElapsed.isEmpty else {
+            throw MLXFastError.invalidInput("benchmark prefill needs at least one timed run")
+        }
+        let meanElapsed = timedElapsed.reduce(0, +) / Double(timedElapsed.count)
+        let secondsPerToken = meanElapsed / Double(promptTokens.count)
+        progress?("prefill complete seconds_per_token=\(formatDouble(secondsPerToken))")
+        return secondsPerToken
+    }
+
+    private static func measureWorkerPrefillSecondsPerToken(
+        promptTokens: [Int],
+        expectedToken: Int,
+        worker: RuntimeWorkerClient,
+        progress: ((String) -> Void)? = nil,
+        peakRamGB: inout Double,
+        expertStats: inout ExpertStreamingStats
+    ) throws -> Double {
+        guard !promptTokens.isEmpty else {
+            throw MLXFastError.invalidInput("benchmark prefill prompt must not be empty")
+        }
+
+        let totalRuns = MLXFastConstants.benchmarkPrefillWarmupRuns
+            + MLXFastConstants.benchmarkPrefillTimedRuns
+        var timedElapsed: [Double] = []
+        timedElapsed.reserveCapacity(MLXFastConstants.benchmarkPrefillTimedRuns)
+
+        for runIndex in 0..<totalRuns {
+            let runLabel = runIndex < MLXFastConstants.benchmarkPrefillWarmupRuns ? "warmup" : "timed"
+            let runOrdinal = runIndex < MLXFastConstants.benchmarkPrefillWarmupRuns
+                ? runIndex + 1
+                : runIndex - MLXFastConstants.benchmarkPrefillWarmupRuns + 1
+            let runTotal = runIndex < MLXFastConstants.benchmarkPrefillWarmupRuns
+                ? MLXFastConstants.benchmarkPrefillWarmupRuns
+                : MLXFastConstants.benchmarkPrefillTimedRuns
+            progress?(
+                "prefill \(runLabel) \(runOrdinal)/\(runTotal) start "
+                    + "prompt_tokens=\(promptTokens.count)"
+            )
+            let response = try worker.prefill(promptTokens: promptTokens)
+            expertStats = response.expertStats ?? expertStats
+            peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
+            guard let token = response.token, let elapsed = response.seconds else {
+                throw MLXFastError.invalidInput("runtime worker prefill response missing token or seconds")
+            }
+            try requireBenchmarkMatch(
+                BenchmarkOutputValidator.comparePrefillToken(
+                    expectedToken: expectedToken,
+                    actualToken: token
+                )
+            )
             progress?(
                 "prefill \(runLabel) \(runOrdinal)/\(runTotal) complete "
                     + "seconds=\(formatSeconds(elapsed))"
@@ -907,6 +1484,59 @@ public enum DeepSeekRuntime {
             _ = try? session?.stop()
             throw error
         }
+    }
+
+    private static func measureWorkerDecode(
+        seedTokens: [Int],
+        expectedSeedToken: Int,
+        expectedTokens: [Int],
+        worker: RuntimeWorkerClient,
+        progress: ((String) -> Void)? = nil,
+        peakRamGB: inout Double,
+        expertStats: inout ExpertStreamingStats
+    ) throws -> DecodeMeasurement {
+        guard !seedTokens.isEmpty else {
+            throw MLXFastError.invalidInput("benchmark decode seed must not be empty")
+        }
+        progress?("decode measured start tokens=\(MLXFastConstants.benchmarkDecodeSteps)")
+        let response = try worker.decode(
+            seedTokens: seedTokens,
+            decodeSteps: MLXFastConstants.benchmarkDecodeSteps
+        )
+        expertStats = response.expertStats ?? expertStats
+        peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
+        guard let seedToken = response.seedToken else {
+            throw MLXFastError.invalidInput("runtime worker decode response missing seed token")
+        }
+        try requireBenchmarkMatch(
+            BenchmarkOutputValidator.compareDecodeSeedToken(
+                expectedToken: expectedSeedToken,
+                actualToken: seedToken
+            )
+        )
+        let actualTokens = response.tokens ?? []
+        try requireBenchmarkMatch(
+            BenchmarkOutputValidator.compareDecodeTokens(
+                expectedTokens: expectedTokens,
+                actualTokens: actualTokens
+            )
+        )
+        guard let secondsPerToken = response.secondsPerToken,
+              let bandwidthGBPerToken = response.bandwidthGBPerToken,
+              let bandwidthSource = response.bandwidthSource else {
+            throw MLXFastError.invalidInput("runtime worker decode response missing timing or bandwidth")
+        }
+        progress?(
+            "decode measured complete seconds=\(formatSeconds(response.seconds ?? 0)) "
+                + "seconds_per_token=\(formatDouble(secondsPerToken)) "
+                + "bandwidth_gb_per_token=\(formatDouble(bandwidthGBPerToken)) "
+                + "bandwidth_source=\(bandwidthSource)"
+        )
+        return DecodeMeasurement(
+            secondsPerToken: secondsPerToken,
+            bandwidthGBPerToken: bandwidthGBPerToken,
+            bandwidthSource: bandwidthSource
+        )
     }
 
     private static func expertStreamingBandwidthGBPerToken(
@@ -1150,6 +1780,76 @@ public enum DeepSeekRuntime {
         let fileCount: Int
         let byteCount: Int
         let sha256: String
+    }
+
+    private static func checkWorkerBenchmarkInputs(
+        weightsPath: String,
+        goldenPath: String
+    ) throws {
+        try requireDirectory(weightsPath, description: "transformed weights")
+        let requiredFiles = [
+            ("\(weightsPath)/config.json", "transformed config"),
+            ("\(weightsPath)/model.safetensors.index.json", "dense safetensors index"),
+            ("\(weightsPath)/experts/manifest.json", "expert manifest"),
+            (goldenPath, "correctness golden file"),
+        ]
+        for (path, description) in requiredFiles {
+            try requireRegularFile(path, description: description)
+        }
+    }
+
+    private static func requireDirectory(_ path: String, description: String) throws {
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        if values.isSymbolicLink == true {
+            throw MLXFastError.invalidInput("\(description) must not be a symlink: \(path)")
+        }
+        guard values.isDirectory == true else {
+            throw MLXFastError.missingFile("\(description) directory missing at \(path)")
+        }
+    }
+
+    private static func requireRegularFile(_ path: String, description: String) throws {
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        if values.isSymbolicLink == true {
+            throw MLXFastError.invalidInput("\(description) must not be a symlink: \(path)")
+        }
+        guard values.isRegularFile == true else {
+            throw MLXFastError.missingFile("\(description) missing at \(path)")
+        }
+    }
+
+    private static func enforceTransformedWeightsByteLimit(_ byteCount: Int) throws {
+        guard let maxByteCount = try transformedWeightsByteLimit() else {
+            return
+        }
+        guard byteCount <= maxByteCount else {
+            throw MLXFastError.invalidInput(
+                "transformed weights are \(byteCount) bytes, above MLXFAST_MAX_WEIGHTS_BYTES=\(maxByteCount)"
+            )
+        }
+    }
+
+    private static func transformedWeightsByteLimit(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> Int? {
+        let raw = environment["MLXFAST_MAX_WEIGHTS_BYTES"] ?? ""
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return MLXFastConstants.defaultMaxTransformedWeightsBytes
+        }
+
+        let lowercased = trimmed.lowercased()
+        if lowercased == "0" || lowercased == "none" || lowercased == "unlimited" {
+            return nil
+        }
+        guard let value = Int(trimmed), value > 0 else {
+            throw MLXFastError.invalidInput(
+                "MLXFAST_MAX_WEIGHTS_BYTES must be a positive byte count, 0, none, or unlimited"
+            )
+        }
+        return value
     }
 
     private static func directoryDigest(
@@ -1609,6 +2309,234 @@ public enum DeepSeekRuntime {
             goldenHash: goldenHash,
             error: error
         )
+    }
+}
+
+private struct RuntimeWorkerRequest: Codable {
+    let id: Int
+    let kind: String
+    let promptTokens: [Int]?
+    let seedTokens: [Int]?
+    let steps: Int?
+    let decodeSteps: Int?
+    let validationDelayMilliseconds: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case kind
+        case promptTokens = "prompt_tokens"
+        case seedTokens = "seed_tokens"
+        case steps
+        case decodeSteps = "decode_steps"
+        case validationDelayMilliseconds = "validation_delay_ms"
+    }
+}
+
+private struct RuntimeWorkerResponse: Codable {
+    let id: Int
+    let ok: Bool
+    let error: String?
+    let token: Int?
+    let seedToken: Int?
+    let tokens: [Int]?
+    let seconds: Double?
+    let secondsPerToken: Double?
+    let bandwidthGBPerToken: Double?
+    let bandwidthSource: String?
+    let expertStats: ExpertStreamingStats?
+    let peakRamGB: Double?
+
+    init(
+        id: Int,
+        ok: Bool,
+        error: String? = nil,
+        token: Int? = nil,
+        seedToken: Int? = nil,
+        tokens: [Int]? = nil,
+        seconds: Double? = nil,
+        secondsPerToken: Double? = nil,
+        bandwidthGBPerToken: Double? = nil,
+        bandwidthSource: String? = nil,
+        expertStats: ExpertStreamingStats? = nil,
+        peakRamGB: Double? = nil
+    ) {
+        self.id = id
+        self.ok = ok
+        self.error = error
+        self.token = token
+        self.seedToken = seedToken
+        self.tokens = tokens
+        self.seconds = seconds
+        self.secondsPerToken = secondsPerToken
+        self.bandwidthGBPerToken = bandwidthGBPerToken
+        self.bandwidthSource = bandwidthSource
+        self.expertStats = expertStats
+        self.peakRamGB = peakRamGB
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case ok
+        case error
+        case token
+        case seedToken = "seed_token"
+        case tokens
+        case seconds
+        case secondsPerToken = "seconds_per_token"
+        case bandwidthGBPerToken = "bandwidth_gb_per_token"
+        case bandwidthSource = "bandwidth_source"
+        case expertStats = "expert_stats"
+        case peakRamGB = "peak_ram_gb"
+    }
+}
+
+private final class RuntimeWorkerClient {
+    private let process: Process
+    private let input: FileHandle
+    private let output: FileHandle
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
+    private var nextID = 1
+    private var closed = false
+
+    init(options: RuntimeWorkerOptions, weightsPath: String) throws {
+        let process = Process()
+        let stdin = Pipe()
+        let stdout = Pipe()
+        let stderr = try FileHandle(forWritingTo: URL(fileURLWithPath: "/dev/null"))
+        if let sandboxProfilePath = options.sandboxProfilePath {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
+            process.arguments = [
+                "-f",
+                sandboxProfilePath,
+                options.executablePath,
+                "runtime-worker",
+                "--weights",
+                weightsPath,
+            ]
+        } else {
+            process.executableURL = URL(fileURLWithPath: options.executablePath)
+            process.arguments = [
+                "runtime-worker",
+                "--weights",
+                weightsPath,
+            ]
+        }
+        var environment = ProcessInfo.processInfo.environment
+        environment["MLXFAST_USE_RUNTIME_WORKER"] = "0"
+        for key in [
+            "MLXFAST_CORRECTNESS_GOLDEN_PATH",
+            "MLXFAST_CORRECTNESS_GOLDEN_URL",
+            "MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER",
+            "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE",
+            "R2_ACCESS_KEY_ID",
+            "R2_BUCKET_ENDPOINT",
+            "R2_SECRET_ACCESS_KEY",
+        ] {
+            environment.removeValue(forKey: key)
+        }
+        process.environment = environment
+        process.standardInput = stdin
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+
+        self.process = process
+        self.input = stdin.fileHandleForWriting
+        self.output = stdout.fileHandleForReading
+    }
+
+    deinit {
+        close()
+    }
+
+    func close() {
+        guard !closed else {
+            return
+        }
+        closed = true
+        try? input.close()
+        if process.isRunning {
+            process.terminate()
+            process.waitUntilExit()
+        }
+    }
+
+    func generateCorrectness(promptTokens: [Int], steps: Int) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "correctness",
+            promptTokens: promptTokens,
+            steps: steps
+        )
+    }
+
+    func prefill(promptTokens: [Int]) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "prefill",
+            promptTokens: promptTokens
+        )
+    }
+
+    func decode(
+        seedTokens: [Int],
+        decodeSteps: Int
+    ) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "decode",
+            seedTokens: seedTokens,
+            decodeSteps: decodeSteps
+        )
+    }
+
+    private func send(
+        kind: String,
+        promptTokens: [Int]? = nil,
+        seedTokens: [Int]? = nil,
+        steps: Int? = nil,
+        decodeSteps: Int? = nil,
+        validationDelayMilliseconds: Int? = nil
+    ) throws -> RuntimeWorkerResponse {
+        guard process.isRunning else {
+            throw MLXFastError.invalidInput("runtime worker exited before request \(kind)")
+        }
+        let id = nextID
+        nextID += 1
+        let request = RuntimeWorkerRequest(
+            id: id,
+            kind: kind,
+            promptTokens: promptTokens,
+            seedTokens: seedTokens,
+            steps: steps,
+            decodeSteps: decodeSteps,
+            validationDelayMilliseconds: validationDelayMilliseconds
+        )
+        var data = try encoder.encode(request)
+        data.append(0x0a)
+        try input.write(contentsOf: data)
+
+        let response = try readResponseLine()
+        guard response.id == id else {
+            throw MLXFastError.invalidInput("runtime worker returned response id \(response.id), expected \(id)")
+        }
+        guard response.ok else {
+            throw MLXFastError.invalidInput("runtime worker \(kind) failed: \(response.error ?? "unknown error")")
+        }
+        return response
+    }
+
+    private func readResponseLine() throws -> RuntimeWorkerResponse {
+        var data = Data()
+        while true {
+            let byte = output.readData(ofLength: 1)
+            if byte.isEmpty {
+                throw MLXFastError.invalidInput("runtime worker closed stdout before returning a response")
+            }
+            if byte[byte.startIndex] == 0x0a {
+                break
+            }
+            data.append(byte)
+        }
+        return try decoder.decode(RuntimeWorkerResponse.self, from: data)
     }
 }
 

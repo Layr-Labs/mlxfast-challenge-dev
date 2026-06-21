@@ -1,7 +1,6 @@
 import Darwin
 import Foundation
 import MLXFastCore
-import MLXFastDeepSeek
 import MLXFastDeepSeekHarness
 import MLXFastHarness
 import MLXFastSubmission
@@ -37,6 +36,9 @@ private enum MLXFastCLI {
                 return 0
             case "benchmark":
                 try runBenchmark(options)
+                return 0
+            case "runtime-worker":
+                try runRuntimeWorker(options)
                 return 0
             case "make-golden":
                 try runMakeGolden(options)
@@ -161,7 +163,8 @@ private enum MLXFastCLI {
             )
         )
         let report = try DeepSeekRuntime.runCorrectness(
-            CorrectnessOptions(weightsPath: weightsPath, goldenPath: goldenPath)
+            CorrectnessOptions(weightsPath: weightsPath, goldenPath: goldenPath),
+            worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
         )
 
         let encoder = JSONEncoder()
@@ -266,10 +269,98 @@ private enum MLXFastCLI {
             )
         )
         let payload = DeepSeekRuntime.benchmark(
-            BenchmarkOptions(weightsPath: weightsPath, goldenPath: goldenPath)
+            BenchmarkOptions(weightsPath: weightsPath, goldenPath: goldenPath),
+            worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
         )
         try writeScorePayload(payload, to: scorePath)
         print("wrote \(scorePath)")
+    }
+
+    private static func runtimeWorkerOptions(blockedGoldenPath: String? = nil) throws -> RuntimeWorkerOptions? {
+        let enabled = environmentValue("MLXFAST_USE_RUNTIME_WORKER", fallback: "1")
+        guard enabled != "0" && enabled.lowercased() != "false" else {
+            return nil
+        }
+        let executable = environmentValue(
+            "MLXFAST_RUNTIME_WORKER_EXECUTABLE",
+            fallback: CommandLine.arguments.first ?? ""
+        )
+        guard !executable.isEmpty else {
+            return nil
+        }
+        let executablePath: String
+        if executable.hasPrefix("/") {
+            executablePath = executable
+        } else {
+            executablePath = URL(
+                fileURLWithPath: executable,
+                relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            ).standardizedFileURL.path
+        }
+        var sandboxProfile = environmentValue("MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE", fallback: "")
+        if sandboxProfile.isEmpty,
+           environmentValue("MLXFAST_NO_SANDBOX", fallback: "0") != "1",
+           let blockedGoldenPath,
+           !blockedGoldenPath.isEmpty
+        {
+            sandboxProfile = try writeRuntimeWorkerSandboxProfile(blockedGoldenPath: blockedGoldenPath)
+        }
+        return RuntimeWorkerOptions(
+            executablePath: executablePath,
+            sandboxProfilePath: sandboxProfile.isEmpty ? nil : sandboxProfile
+        )
+    }
+
+    private static func writeRuntimeWorkerSandboxProfile(blockedGoldenPath: String) throws -> String {
+        let sandboxExecutable = "/usr/bin/sandbox-exec"
+        guard FileManager.default.isExecutableFile(atPath: sandboxExecutable) else {
+            throw MLXFastError.invalidInput("sandbox-exec not found for runtime worker sandbox")
+        }
+        let profileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mlxfast-runtime-worker-\(UUID().uuidString).sb")
+        let absoluteGoldenPath = absolutePath(blockedGoldenPath)
+        let profile = """
+        (version 1)
+        (allow default)
+        (deny network*)
+        (allow network* (remote ip "localhost:*"))
+        (allow network* (local unix-socket))
+        (allow network* (remote unix-socket))
+        (allow network-bind (local ip "localhost:*"))
+        (allow network-inbound (local ip "localhost:*"))
+        (deny file-read* (literal "\(seatbeltEscaped(absoluteGoldenPath))"))
+        (deny file-write* (literal "\(seatbeltEscaped(absoluteGoldenPath))"))
+        """
+        try profile.write(to: profileURL, atomically: true, encoding: .utf8)
+        return profileURL.path
+    }
+
+    private static func absolutePath(_ path: String) -> String {
+        if path.hasPrefix("/") {
+            return URL(fileURLWithPath: path).standardizedFileURL.path
+        }
+        return URL(
+            fileURLWithPath: path,
+            relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        ).standardizedFileURL.path
+    }
+
+    private static func seatbeltEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    private static func runRuntimeWorker(_ options: ParsedOptions) throws {
+        try options.validate(valueOptions: ["--weights"])
+        let weightsPath = options.value(
+            for: "--weights",
+            default: environmentValue(
+                "MLXFAST_WEIGHTS_PATH",
+                fallback: MLXFastConstants.defaultWeightsPath
+            )
+        )
+        try DeepSeekRuntime.runWorker(weightsPath: weightsPath)
     }
 
     private static func runMakeGolden(_ options: ParsedOptions) throws {
