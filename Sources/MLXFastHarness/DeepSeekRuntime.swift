@@ -200,10 +200,19 @@ public struct CorrectnessReport: Codable, Equatable {
 public struct BenchmarkOptions: Equatable {
     public let weightsPath: String
     public let goldenPath: String
+    public let correctnessSteps: Int
+    public let benchmarkDecodeSteps: Int
 
-    public init(weightsPath: String, goldenPath: String) {
+    public init(
+        weightsPath: String,
+        goldenPath: String,
+        correctnessSteps: Int = MLXFastConstants.correctnessSteps,
+        benchmarkDecodeSteps: Int = MLXFastConstants.benchmarkDecodeSteps
+    ) {
         self.weightsPath = weightsPath
         self.goldenPath = goldenPath
+        self.correctnessSteps = correctnessSteps
+        self.benchmarkDecodeSteps = benchmarkDecodeSteps
     }
 }
 
@@ -669,8 +678,8 @@ public enum DeepSeekRuntime {
         var timedBenchmarkSeconds = 0.0
 
         progress(
-            "start correctness_steps=\(MLXFastConstants.correctnessSteps) "
-                + "benchmark_decode_steps=\(MLXFastConstants.benchmarkDecodeSteps)"
+            "start correctness_steps=\(options.correctnessSteps) "
+                + "benchmark_decode_steps=\(options.benchmarkDecodeSteps)"
         )
 
         func makeFailedScore(
@@ -704,6 +713,7 @@ public enum DeepSeekRuntime {
         }
 
         do {
+            try validateBenchmarkOptions(options)
             progress("preflight start")
             let preflightStart = DispatchTime.now().uptimeNanoseconds
             _ = try BenchmarkPreflight.check(
@@ -742,6 +752,7 @@ public enum DeepSeekRuntime {
                 cases: golden.cases,
                 weightCache: correctnessCache,
                 goldenHash: golden.sha256,
+                steps: options.correctnessSteps,
                 progress: progress
             )
             correctnessSeconds = secondsSince(correctnessStart)
@@ -773,7 +784,7 @@ public enum DeepSeekRuntime {
             progress(
                 "benchmark oracle ready prefill_tokens=\(promptPlan.prefillTokens.count) "
                     + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
-                    + "decode_tokens=\(promptPlan.expectedDecodeTokens.count)"
+                    + "decode_tokens=\(options.benchmarkDecodeSteps)"
             )
             let idleGBPerSecond = measureMactopIdleGBPerSecond(progress: progress)
 
@@ -790,6 +801,7 @@ public enum DeepSeekRuntime {
                 seedTokens: promptPlan.decodeSeedTokens,
                 expectedSeedToken: promptPlan.expectedDecodeSeedToken,
                 expectedTokens: promptPlan.expectedDecodeTokens,
+                decodeSteps: options.benchmarkDecodeSteps,
                 weightCache: benchmarkCache,
                 idleGBPerSecond: idleGBPerSecond,
                 progress: progress
@@ -882,6 +894,25 @@ public enum DeepSeekRuntime {
         }
     }
 
+    private static func validateBenchmarkOptions(_ options: BenchmarkOptions) throws {
+        guard options.correctnessSteps > 0 else {
+            throw MLXFastError.invalidInput("benchmark correctness steps must be positive")
+        }
+        guard options.correctnessSteps <= MLXFastConstants.correctnessSteps else {
+            throw MLXFastError.invalidInput(
+                "benchmark correctness steps \(options.correctnessSteps) exceeds golden length \(MLXFastConstants.correctnessSteps)"
+            )
+        }
+        guard options.benchmarkDecodeSteps > 0 else {
+            throw MLXFastError.invalidInput("benchmark decode steps must be positive")
+        }
+        guard options.benchmarkDecodeSteps <= MLXFastConstants.benchmarkDecodeSteps else {
+            throw MLXFastError.invalidInput(
+                "benchmark decode steps \(options.benchmarkDecodeSteps) exceeds oracle length \(MLXFastConstants.benchmarkDecodeSteps)"
+            )
+        }
+    }
+
     private static func benchmarkWithWorker(
         _ options: BenchmarkOptions,
         worker workerOptions: RuntimeWorkerOptions
@@ -897,8 +928,8 @@ public enum DeepSeekRuntime {
         var peakRamGB = 0.0
 
         progress(
-            "start correctness_steps=\(MLXFastConstants.correctnessSteps) "
-                + "benchmark_decode_steps=\(MLXFastConstants.benchmarkDecodeSteps)"
+            "start correctness_steps=\(options.correctnessSteps) "
+                + "benchmark_decode_steps=\(options.benchmarkDecodeSteps)"
         )
 
         func makeFailedScore(
@@ -930,6 +961,7 @@ public enum DeepSeekRuntime {
         }
 
         do {
+            try validateBenchmarkOptions(options)
             progress("preflight start")
             let preflightStart = DispatchTime.now().uptimeNanoseconds
             try checkWorkerBenchmarkInputs(
@@ -979,6 +1011,7 @@ public enum DeepSeekRuntime {
                 let result = try compareTeacherForcedWithWorker(
                     testCase: testCase,
                     worker: worker,
+                    steps: options.correctnessSteps,
                     progressIntervalSteps: 64,
                     progress: { step, total in
                         progress("correctness case \(caseLabel) checked \(step)/\(total) tokens")
@@ -1036,7 +1069,7 @@ public enum DeepSeekRuntime {
             progress(
                 "benchmark oracle ready prefill_tokens=\(promptPlan.prefillTokens.count) "
                     + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
-                    + "decode_tokens=\(promptPlan.expectedDecodeTokens.count)"
+                    + "decode_tokens=\(options.benchmarkDecodeSteps)"
             )
             progress("mactop idle measurement skipped; runtime worker uses expert streaming byte fallback")
 
@@ -1054,6 +1087,7 @@ public enum DeepSeekRuntime {
                 seedTokens: promptPlan.decodeSeedTokens,
                 expectedSeedToken: promptPlan.expectedDecodeSeedToken,
                 expectedTokens: promptPlan.expectedDecodeTokens,
+                decodeSteps: options.benchmarkDecodeSteps,
                 worker: worker,
                 progress: progress,
                 peakRamGB: &peakRamGB,
@@ -1143,6 +1177,7 @@ public enum DeepSeekRuntime {
         cases: [GoldenCase],
         weightCache: DeepSeekRuntimeWeightCache,
         goldenHash: String,
+        steps: Int = MLXFastConstants.correctnessSteps,
         progress: ((String) -> Void)? = nil
     ) -> CorrectnessReport {
         var checkedSteps = 0
@@ -1155,6 +1190,7 @@ public enum DeepSeekRuntime {
                 let comparison = try compareTeacherForcedCached(
                     testCase: testCase,
                     weightCache: weightCache,
+                    steps: steps,
                     progressIntervalSteps: 64,
                     progress: { step, total in
                         progress?("correctness case \(caseLabel) checked \(step)/\(total) tokens")
@@ -1374,6 +1410,7 @@ public enum DeepSeekRuntime {
         seedTokens: [Int],
         expectedSeedToken: Int,
         expectedTokens: [Int],
+        decodeSteps: Int = MLXFastConstants.benchmarkDecodeSteps,
         weightCache: DeepSeekRuntimeWeightCache,
         idleGBPerSecond: Double?,
         progress: ((String) -> Void)? = nil
@@ -1381,9 +1418,14 @@ public enum DeepSeekRuntime {
         guard !seedTokens.isEmpty else {
             throw MLXFastError.invalidInput("benchmark decode seed must not be empty")
         }
+        guard expectedTokens.count >= decodeSteps else {
+            throw MLXFastError.invalidInput(
+                "benchmark decode oracle has \(expectedTokens.count) tokens; need at least \(decodeSteps)"
+            )
+        }
         let timingPlan = try DecodeTimingPlan(
             seedTokenCount: seedTokens.count,
-            decodeSteps: MLXFastConstants.benchmarkDecodeSteps
+            decodeSteps: decodeSteps
         )
 
         progress?("decode warmup start seed_tokens=\(seedTokens.count)")
@@ -1477,7 +1519,7 @@ public enum DeepSeekRuntime {
 
             try requireBenchmarkMatch(
                 BenchmarkOutputValidator.compareDecodeTokens(
-                    expectedTokens: expectedTokens,
+                    expectedTokens: Array(expectedTokens.prefix(timingPlan.decodeSteps)),
                     actualTokens: actualTokens
                 )
             )
@@ -1535,6 +1577,7 @@ public enum DeepSeekRuntime {
         seedTokens: [Int],
         expectedSeedToken: Int,
         expectedTokens: [Int],
+        decodeSteps: Int = MLXFastConstants.benchmarkDecodeSteps,
         worker: RuntimeWorkerClient,
         progress: ((String) -> Void)? = nil,
         peakRamGB: inout Double,
@@ -1543,10 +1586,15 @@ public enum DeepSeekRuntime {
         guard !seedTokens.isEmpty else {
             throw MLXFastError.invalidInput("benchmark decode seed must not be empty")
         }
-        progress?("decode measured start tokens=\(MLXFastConstants.benchmarkDecodeSteps)")
+        guard expectedTokens.count >= decodeSteps else {
+            throw MLXFastError.invalidInput(
+                "benchmark decode oracle has \(expectedTokens.count) tokens; need at least \(decodeSteps)"
+            )
+        }
+        progress?("decode measured start tokens=\(decodeSteps)")
         let response = try worker.decode(
             seedTokens: seedTokens,
-            decodeSteps: MLXFastConstants.benchmarkDecodeSteps
+            decodeSteps: decodeSteps
         )
         expertStats = response.expertStats ?? expertStats
         peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
@@ -1562,7 +1610,7 @@ public enum DeepSeekRuntime {
         let actualTokens = response.tokens ?? []
         try requireBenchmarkMatch(
             BenchmarkOutputValidator.compareDecodeTokens(
-                expectedTokens: expectedTokens,
+                expectedTokens: Array(expectedTokens.prefix(decodeSteps)),
                 actualTokens: actualTokens
             )
         )
@@ -2006,16 +2054,16 @@ public enum DeepSeekRuntime {
     private static func compareTeacherForcedWithWorker(
         testCase: GoldenCase,
         worker: RuntimeWorkerClient,
+        steps: Int = MLXFastConstants.correctnessSteps,
         progressIntervalSteps: Int = 0,
         progress: ((Int, Int) -> Void)? = nil
     ) throws -> WorkerCorrectnessResult {
-        let steps = MLXFastConstants.correctnessSteps
         guard !testCase.promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("teacher-forced correctness prompt must not be empty")
         }
-        guard testCase.expectedTokens.count == steps else {
+        guard testCase.expectedTokens.count >= steps else {
             throw MLXFastError.invalidInput(
-                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need exactly \(steps)"
+                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need at least \(steps)"
             )
         }
 
@@ -2146,16 +2194,16 @@ public enum DeepSeekRuntime {
     private static func compareTeacherForcedCached(
         testCase: GoldenCase,
         weightCache: DeepSeekRuntimeWeightCache,
+        steps: Int = MLXFastConstants.correctnessSteps,
         progressIntervalSteps: Int = 0,
         progress: ((Int, Int) -> Void)? = nil
     ) throws -> CorrectnessTokenComparison {
-        let steps = MLXFastConstants.correctnessSteps
         guard !testCase.promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("teacher-forced correctness prompt must not be empty")
         }
-        guard testCase.expectedTokens.count == steps else {
+        guard testCase.expectedTokens.count >= steps else {
             throw MLXFastError.invalidInput(
-                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need exactly \(steps)"
+                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need at least \(steps)"
             )
         }
 
