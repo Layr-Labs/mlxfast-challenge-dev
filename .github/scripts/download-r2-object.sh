@@ -62,6 +62,48 @@ tmp_path="${output_path}.tmp"
 umask 077
 mkdir -p "$(dirname "${output_path}")"
 trap 'rm -f "${tmp_path}"' EXIT
+
+download_with_aws_cli() {
+  local trimmed_path="${base_path#/}"
+  local bucket
+  local key_prefix
+  local key
+
+  if [[ -z "${trimmed_path}" || ! -x "$(command -v aws 2>/dev/null)" ]]; then
+    return 1
+  fi
+
+  bucket="${trimmed_path%%/*}"
+  key_prefix="${trimmed_path#"${bucket}"}"
+  key_prefix="${key_prefix#/}"
+  key="${object_path}"
+  if [[ -n "${key_prefix}" ]]; then
+    key="${key_prefix}/${object_path}"
+  fi
+
+  echo "download-r2-object: using AWS CLI S3 path-style download"
+  AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}" \
+    AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}" \
+    AWS_DEFAULT_REGION="${region}" \
+    AWS_EC2_METADATA_DISABLED=true \
+    aws \
+      --endpoint-url "https://${host}" \
+      s3 cp \
+      "s3://${bucket}/${key}" \
+      "${tmp_path}" \
+      --only-show-errors \
+      --no-progress
+}
+
+if download_with_aws_cli; then
+  chmod 600 "${tmp_path}"
+  mv "${tmp_path}" "${output_path}"
+  trap - EXIT
+  echo "download-r2-object: wrote ${output_path}"
+  exit 0
+fi
+
+echo "download-r2-object: using signed HTTPS download"
 curl \
   --fail \
   --silent \
