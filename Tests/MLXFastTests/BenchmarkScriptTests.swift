@@ -30,6 +30,22 @@ func benchmarkWorkflowRunsTransformOfflineAfterSetup() throws {
 }
 
 @Test
+func benchmarkWorkflowCanBeDispatchedFromCurrentRefForTesting() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+    let guardScript = try String(
+        contentsOfFile: ".github/scripts/enforce-trusted-benchmark-workflow.sh",
+        encoding: .utf8
+    )
+
+    #expect(workflow.contains("MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}"))
+    #expect(!workflow.contains("MLXFAST_TRUSTED_BENCHMARK_REF: refs/heads/main"))
+    #expect(guardScript.contains("TRUSTED_REF=\"${MLXFAST_TRUSTED_BENCHMARK_REF:-${GITHUB_REF}}\""))
+}
+
+@Test
 func offlineRunnerProvesNetworkIsBlockedBeforeRunningCommand() throws {
     let runner = try String(
         contentsOfFile: ".github/scripts/run-offline.sh",

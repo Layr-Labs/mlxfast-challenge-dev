@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Ensure private benchmark material is only used by the trusted workflow file.
+# Ensure private benchmark material is only used by this repository's benchmark
+# workflow file. During development this can run from a PR branch; production
+# orchestrators should dispatch the trusted default branch.
 set -euo pipefail
 
 TRUSTED_REPOSITORY="${MLXFAST_TRUSTED_REPOSITORY:-Layr-Labs/mlxfast-challenge-dev}"
-TRUSTED_REF="${MLXFAST_TRUSTED_BENCHMARK_REF:-refs/heads/main}"
 WORKFLOW_PATH="${MLXFAST_TRUSTED_BENCHMARK_WORKFLOW:-.github/workflows/benchmark.yml}"
 
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
@@ -11,6 +12,7 @@ WORKFLOW_PATH="${MLXFAST_TRUSTED_BENCHMARK_WORKFLOW:-.github/workflows/benchmark
 : "${GITHUB_WORKFLOW_REF:?GITHUB_WORKFLOW_REF is required}"
 : "${GITHUB_EVENT_NAME:?GITHUB_EVENT_NAME is required}"
 
+TRUSTED_REF="${MLXFAST_TRUSTED_BENCHMARK_REF:-${GITHUB_REF}}"
 expected_workflow_ref="${TRUSTED_REPOSITORY}/${WORKFLOW_PATH}@${TRUSTED_REF}"
 
 if [[ "${GITHUB_REPOSITORY}" != "${TRUSTED_REPOSITORY}" ]]; then
@@ -24,7 +26,7 @@ if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
 fi
 
 if [[ "${GITHUB_REF}" != "${TRUSTED_REF}" ]]; then
-  echo "::error::private benchmark workflow must run from ${TRUSTED_REF}; dispatch trusted main with submission_ref instead" >&2
+  echo "::error::private benchmark workflow must run from ${TRUSTED_REF}; current ref is ${GITHUB_REF}" >&2
   exit 1
 fi
 
