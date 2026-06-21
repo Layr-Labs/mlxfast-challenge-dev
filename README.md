@@ -39,9 +39,15 @@ transform source hash for run auditing.
 Full model setup needs a large local or mounted SSD. The reference checkpoint is
 `mlx-community/DeepSeek-V4-Flash-4bit`, with 33 safetensors shards totaling about
 141 GiB. `setup.sh` downloads the checkpoint from the fast Darkbloom/R2 mirror by
-default with resumable `curl` requests when `reference_weights/` is missing,
-prints numbered shard progress with elapsed time, and checks for at least
-170 GiB free by default. Use
+default into a repo-local Hugging Face-style cache under
+`.cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main/`.
+It verifies cached files against `fixtures/reference_deepseek_v4_flash_4bit.sha256`
+and redownloads only files that are missing, truncated, or hash-mismatched. A
+compatibility symlink is created at `reference_weights/DeepSeek-V4-Flash-4bit`
+so the default transform path still works after setup. The downloader uses
+resumable `curl` requests, prints numbered shard progress with elapsed time, and
+checks for at least 170 GiB free by default. Use
+`MLXFAST_REFERENCE_CACHE_DIR=/Volumes/ssd/hf-cache/.../snapshots/main` or
 `MLXFAST_REFERENCE_DIR=/Volumes/ssd/DeepSeek-V4-Flash-4bit` to point at a larger
 volume, or `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh` when the checkpoint will
 be supplied separately. The Swift CLI also honors `MLXFAST_REFERENCE_DIR`,

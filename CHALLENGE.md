@@ -29,18 +29,26 @@ rather than producing a ranked score.
 
 ## Model Artifacts
 
-Place the frozen reference checkpoint here unless overriding with
-`MLXFAST_REFERENCE_DIR`:
+By default, `setup.sh` stores the frozen reference checkpoint in a repo-local
+Hugging Face-style cache:
+
+```text
+.cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main/
+```
+
+It also creates this compatibility symlink unless the path already exists:
 
 ```text
 reference_weights/DeepSeek-V4-Flash-4bit/
 ```
 
-By default `setup.sh` downloads `mlx-community/DeepSeek-V4-Flash-4bit` directly
-from Hugging Face with resumable `curl` requests when that directory is missing.
-The safetensors payload is about 141 GiB across 33 shards; `setup.sh` requires
-170 GiB free by default before starting. Set `MLXFAST_REFERENCE_DIR` to a larger
-local or mounted SSD when the repo disk is too small, or set
+By default `setup.sh` downloads `mlx-community/DeepSeek-V4-Flash-4bit` from the
+configured mirror with resumable `curl` requests. It checks cached files against
+the pinned SHA256 manifest and redownloads only missing, truncated, or
+hash-mismatched files. The safetensors payload is about 141 GiB across 33
+shards; `setup.sh` requires 170 GiB free by default before starting. Set
+`MLXFAST_REFERENCE_CACHE_DIR` or `MLXFAST_REFERENCE_DIR` to a larger local or
+mounted SSD when the repo disk is too small, or set
 `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1` when the checkpoint is provisioned externally.
 
 The Swift transform writes benchmark-ready weights here:

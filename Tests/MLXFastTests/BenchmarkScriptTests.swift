@@ -10,7 +10,13 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
 
     #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://ds4.darkbloom.ai/deepseek-v4-flash-4bit\""))
     #expect(setup.contains("REFERENCE_BASE_URL=\"${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}\""))
+    #expect(setup.contains("DEFAULT_HF_HOME=\"${MLXFAST_HF_HOME:-${HF_HOME:-${PWD}/.cache/huggingface}}\""))
+    #expect(setup.contains("REFERENCE_CACHE_DIR=\"${MLXFAST_REFERENCE_CACHE_DIR:-${DEFAULT_HF_HUB_CACHE}/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}}\""))
     #expect(setup.contains("Usage: ./setup.sh"))
+    #expect(setup.contains("reference_file_is_current"))
+    #expect(setup.contains("redownloading ${label} from scratch after hash verification failed"))
+    #expect(setup.contains("reference cache path ${reference_dir}"))
+    #expect(setup.contains("if ! verify_reference_manifest \"${reference_dir}\"; then"))
     #expect(setup.contains("downloaded ${total}/${total} safetensors shard(s)"))
     #expect(setup.contains("setup.sh: setup complete elapsed="))
     #expect(setup.contains(".github/scripts/run-offline.sh ${SWIFT_BIN} transform"))
