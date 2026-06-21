@@ -19,13 +19,18 @@ The benchmark entrypoint:
 3. Runs the correctness gate against `correctness_golden.json`.
 4. Validates the benchmark prefill/decode tokens against the hidden benchmark
    oracle in `correctness_golden.json`.
-5. Measures prefill latency, 512-step greedy decode latency, MLX peak memory, and
+5. Measures prefill latency, 256-step greedy decode latency, MLX peak memory, and
    `mactop` hardware DRAM bandwidth.
 6. Writes `score.json` in the Darkbloom-compatible schema, plus
    `score.json.sha256` and `benchmark-integrity.json` audit sidecars.
 
 If required artifacts are missing, the harness writes a failed `score.json`
 rather than producing a ranked score.
+
+For local iteration, `./benchmark.sh --quick` uses the same local golden file but
+checks only the first 64 correctness tokens and times only 64 decode tokens. It
+still writes and prints `score.json`; it is a directional local signal, not the
+official ranking run.
 
 ## Model Artifacts
 
@@ -156,7 +161,7 @@ changes to score those paths.
 
 The hidden golden file also includes a benchmark oracle. The benchmark validates
 the greedy token after the fixed 512-token prefill prompt, the greedy token
-after the fixed 32-token decode seed, and all 512 tokens produced inside the
+after the fixed 32-token decode seed, and all 256 tokens produced inside the
 timed decode window before accepting a score.
 
 ## Score
@@ -184,6 +189,7 @@ swift build -c release
 .build/release/mlxfast-swift correctness
 .build/release/mlxfast-swift preflight
 .build/release/mlxfast-swift benchmark --score-path score.json
+.build/release/mlxfast-swift benchmark --quick --score-path score.json
 .build/release/mlxfast-swift make-golden --prompt-file /path/to/private_prompts.json --output correctness_golden.json
 .build/release/mlxfast-swift verify-transform
 .build/release/mlxfast-swift clone

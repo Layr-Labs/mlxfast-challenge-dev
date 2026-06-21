@@ -245,7 +245,10 @@ private enum MLXFastCLI {
     }
 
     private static func runBenchmark(_ options: ParsedOptions) throws {
-        try options.validate(valueOptions: ["--weights", "--golden", "--score-path"])
+        try options.validate(
+            valueOptions: ["--weights", "--golden", "--score-path"],
+            flagOptions: ["--quick"]
+        )
         let weightsPath = options.value(
             for: "--weights",
             default: environmentValue(
@@ -267,12 +270,30 @@ private enum MLXFastCLI {
                 fallback: MLXFastConstants.defaultScorePath
             )
         )
+        let quick = options.hasFlag("--quick")
         let payload = DeepSeekRuntime.benchmark(
-            BenchmarkOptions(weightsPath: weightsPath, goldenPath: goldenPath),
+            BenchmarkOptions(
+                weightsPath: weightsPath,
+                goldenPath: goldenPath,
+                correctnessSteps: quick ? MLXFastConstants.quickCorrectnessSteps : MLXFastConstants.correctnessSteps,
+                benchmarkDecodeSteps: quick ? MLXFastConstants.quickBenchmarkDecodeSteps : MLXFastConstants.benchmarkDecodeSteps
+            ),
             worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
         )
         try writeScorePayload(payload, to: scorePath)
-        print("wrote \(scorePath)")
+        if quick {
+            try printScorePayload(at: scorePath)
+        } else {
+            print("wrote \(scorePath)")
+        }
+    }
+
+    private static func printScorePayload(at path: String) throws {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        FileHandle.standardOutput.write(data)
+        if data.last != 0x0a {
+            print("")
+        }
     }
 
     private static func runtimeWorkerOptions(blockedGoldenPath: String? = nil) throws -> RuntimeWorkerOptions? {
@@ -718,7 +739,7 @@ private enum MLXFastCLI {
               mlxfast-swift correctness [--weights PATH] [--golden PATH]
               mlxfast-swift correctness-trace [--weights PATH] [--golden PATH] [--case NAME] --step N [--top-k N]
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
-              mlxfast-swift benchmark [--weights PATH] [--golden PATH] [--score-path PATH]
+              mlxfast-swift benchmark [--quick] [--weights PATH] [--golden PATH] [--score-path PATH]
               mlxfast-swift make-golden [--weights PATH] [--output PATH] [--progress-every N] (--prompt-file PATH | --prompt-tokens TOKENS [--name NAME])
               mlxfast-swift checkpoint-shards --index PATH
               mlxfast-swift login [--api-key KEY | KEY] [--api URL] [--no-verify]

@@ -19,10 +19,11 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("write_reference_cache_lock"))
     #expect(setup.contains("redownloading ${label} from scratch after hash verification failed"))
     #expect(setup.contains("reference cache path ${reference_dir}"))
+    #expect(setup.contains("compatibility reference path exists and is not a symlink"))
     #expect(setup.contains("if ! verify_reference_manifest \"${reference_dir}\"; then"))
     #expect(setup.contains("downloaded ${total}/${total} safetensors shard(s)"))
     #expect(setup.contains("setup.sh: setup complete elapsed="))
-    #expect(setup.contains(".github/scripts/run-offline.sh ${SWIFT_BIN} transform"))
+    #expect(setup.contains(".github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference \"${REFERENCE_DIR}\""))
 }
 
 @Test
@@ -35,7 +36,8 @@ func benchmarkWorkflowRunsTransformOfflineAfterSetup() throws {
     let transformRange = try #require(workflow.range(of: "- name: Transform reference checkpoint"))
 
     #expect(setupRange.lowerBound < transformRange.lowerBound)
-    #expect(workflow.contains("run: .github/scripts/run-offline.sh .build/release/mlxfast-swift transform"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main"))
+    #expect(workflow.contains("run: .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --reference \"${MLXFAST_REFERENCE_DIR}\""))
 }
 
 @Test
@@ -108,6 +110,102 @@ func benchmarkScriptAvoidsNestedSandboxWithRuntimeWorker() throws {
     #expect(benchmark.contains("if [[ \"${USE_RUNTIME_WORKER}\" != \"1\" && \"${MLXFAST_IN_SANDBOX:-0}\" != \"1\" && \"${MLXFAST_NO_SANDBOX:-0}\" != \"1\" ]]; then"))
     #expect(benchmark.contains("run_offline_command \"${SWIFT_BIN}\" transform --reference"))
     #expect(benchmark.contains("run_offline_command \"${SWIFT_BIN}\" verify-transform --reference"))
+}
+
+@Test
+func benchmarkQuickModeUsesShortLocalPrefixAndPrintsScore() throws {
+    let constants = try String(
+        contentsOfFile: "Sources/MLXFastCore/Constants.swift",
+        encoding: .utf8
+    )
+    let cli = try String(
+        contentsOfFile: "Sources/MLXFastCLI/main.swift",
+        encoding: .utf8
+    )
+    let runtime = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
+        encoding: .utf8
+    )
+
+    #expect(constants.contains("public static let quickCorrectnessSteps = 64"))
+    #expect(constants.contains("public static let quickBenchmarkDecodeSteps = 64"))
+    #expect(cli.contains("flagOptions: [\"--quick\"]"))
+    #expect(cli.contains("printScorePayload(at: scorePath)"))
+    #expect(runtime.contains("correctness_steps=\\(options.correctnessSteps)"))
+    #expect(runtime.contains("benchmark_decode_steps=\\(options.benchmarkDecodeSteps)"))
+    #expect(runtime.contains("Array(expectedTokens.prefix(timingPlan.decodeSteps))"))
+    #expect(runtime.contains("Array(expectedTokens.prefix(decodeSteps))"))
+}
+
+@Test
+func benchmarkScriptForwardsQuickFlagToSwiftBenchmark() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let golden = root.appendingPathComponent("correctness_golden.json")
+    try "{}".write(to: golden, atomically: true, encoding: .utf8)
+
+    let argLog = root.appendingPathComponent("args.txt")
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    printf '%s\\n' "$@" > "\(argLog.path)"
+    score_path="score.json"
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--score-path" ]; then
+        shift
+        score_path="$1"
+      fi
+      shift || exit 1
+    done
+    cat > "$score_path" <<'JSON'
+    {
+      "score": 1,
+      "passed": true,
+      "metrics": {
+        "weights_hash": "fake-weights",
+        "weights_file_count": 1,
+        "weights_byte_count": 2
+      }
+    }
+    JSON
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    let score = root.appendingPathComponent("score.json")
+    let integrity = root.appendingPathComponent("benchmark-integrity.json")
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = ["benchmark.sh", "--quick"]
+    process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = ProcessInfo.processInfo.environment.merging([
+        "MLXFAST_NO_SANDBOX": "1",
+        "MLXFAST_SKIP_TRANSFORM": "1",
+        "MLXFAST_SWIFT_BIN": fakeSwift.path,
+        "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
+        "MLXFAST_SCORE_PATH": score.path,
+        "MLXFAST_INTEGRITY_PATH": integrity.path,
+    ]) { _, new in new }
+
+    try process.run()
+    process.waitUntilExit()
+
+    let args = try String(contentsOf: argLog, encoding: .utf8)
+    #expect(process.terminationStatus == 0)
+    #expect(args.contains("benchmark\n"))
+    #expect(args.contains("--quick\n"))
 }
 
 @Test

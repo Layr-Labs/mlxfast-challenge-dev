@@ -147,7 +147,7 @@ setup.sh: summary
   mlx.metallib: ${metallib_line}
   reference checkpoint: ${reference_line}
   next:
-    .github/scripts/run-offline.sh ${SWIFT_BIN} transform
+    .github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference "${REFERENCE_DIR}"
     ./benchmark.sh
 EOF
 }
@@ -1183,8 +1183,15 @@ ensure_reference_compat_link() {
     fi
     rm -f "${link_path}"
   elif [[ -e "${link_path}" ]]; then
-    echo "setup.sh: compatibility reference path exists; leaving it unchanged: ${link_path}"
-    return 0
+    cat >&2 <<EOF
+setup.sh: compatibility reference path exists and is not a symlink: ${link_path}
+
+Move it aside, set MLXFAST_REFERENCE_DIR to that checkpoint directly, or set
+MLXFAST_REFERENCE_COMPAT_LINK to another path. Leaving a stale compatibility
+path in place would make later transform commands read the wrong checkpoint.
+
+EOF
+    return 1
   fi
 
   link_parent="$(dirname "${link_path}")"

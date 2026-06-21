@@ -18,9 +18,15 @@ See [CHALLENGE.md](CHALLENGE.md) for the full problem statement, scoring formula
 # Requires the organizer-supplied correctness_golden.json.
 ./benchmark.sh
 
+# Faster local iteration: checks the same public/local golden prefix, measures
+# the same 512-token prefill, measures 64 decode tokens, writes score.json, and
+# prints score.json to stdout. The official score still comes from ./benchmark.sh.
+./benchmark.sh --quick
+
 # Or call the Swift CLI directly
 .build/release/mlxfast-swift preflight
 .build/release/mlxfast-swift benchmark --score-path score.json
+.build/release/mlxfast-swift benchmark --quick --score-path score.json
 .build/release/mlxfast-swift submit --dry-run --output mlxfast-submission.zip
 
 # If required model artifacts are missing, the benchmark emits a valid failed
@@ -148,6 +154,8 @@ score = peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill
 
 Bandwidth is measured via **mactop hardware DRAM counters** — not a software model.
 Correctness is a hard gate. See CHALLENGE.md for the full correctness specification.
+For local iteration, `--quick` shortens correctness and decode to 64 token checks
+against the same public/local golden and prints the resulting `score.json`.
 The score payload also includes audit-only fields for wall-clock benchmark time,
 preflight time, correctness time, timed benchmark time, final process RSS, expert
 streaming counters, and transformed-weights digest. These fields are for

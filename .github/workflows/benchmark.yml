@@ -85,6 +85,7 @@ jobs:
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "256"
       MLXFAST_EXPECTED_CORRECTNESS_CASES: "1"
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
+      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
       MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}
       MLXFAST_VERIFY_TRANSFORM: ${{ inputs.verify_transform && '1' || '0' }}
     steps:
@@ -225,7 +226,7 @@ jobs:
 
       - name: Transform reference checkpoint
         if: ${{ !inputs.preserve_golden_only && !inputs.generate_golden_only }}
-        run: .github/scripts/run-offline.sh .build/release/mlxfast-swift transform
+        run: .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --reference "${MLXFAST_REFERENCE_DIR}"
 
       - name: Prepare correctness golden
         id: prepare-correctness-golden
