@@ -89,6 +89,19 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
 }
 
 @Test
+func benchmarkScriptAvoidsNestedSandboxWithRuntimeWorker() throws {
+    let benchmark = try String(
+        contentsOfFile: "benchmark.sh",
+        encoding: .utf8
+    )
+
+    #expect(benchmark.contains("Blacksmith rejects nested sandbox-exec"))
+    #expect(benchmark.contains("if [[ \"${USE_RUNTIME_WORKER}\" != \"1\" && \"${MLXFAST_IN_SANDBOX:-0}\" != \"1\" && \"${MLXFAST_NO_SANDBOX:-0}\" != \"1\" ]]; then"))
+    #expect(benchmark.contains("run_offline_command \"${SWIFT_BIN}\" transform --reference"))
+    #expect(benchmark.contains("run_offline_command \"${SWIFT_BIN}\" verify-transform --reference"))
+}
+
+@Test
 func benchmarkScriptFailsWhenScorePayloadFails() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }

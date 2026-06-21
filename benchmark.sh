@@ -84,6 +84,14 @@ EOF
   export MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE="${profile}"
 }
 
+run_offline_command() {
+  if [[ "${MLXFAST_IN_SANDBOX:-0}" == "1" || "${MLXFAST_NO_SANDBOX:-0}" == "1" ]]; then
+    "$@"
+    return 0
+  fi
+  .github/scripts/run-offline.sh "$@"
+}
+
 score_metric_string() {
   local key="$1"
   sed -n "s/.*\"${key}\" : \"\\([^\"]*\\)\".*/\\1/p" "${SCORE_PATH}" | head -n 1
@@ -139,12 +147,11 @@ if [[ "${MLXFAST_IN_SANDBOX:-0}" != "1" && ! -x "${SWIFT_BIN}" ]]; then
   swift build -c release
 fi
 
-# The benchmark runtime always runs offline. Unless already inside the sandbox,
-# prove the Seatbelt profile blocks egress, then re-exec under sandbox-exec (no
-# sudo needed) so transform/runtime code never sees the network — locally or in
-# CI. The proxy vars point at a closed local port so anything that ignores the
-# profile fails fast instead of hanging.
-if [[ "${MLXFAST_IN_SANDBOX:-0}" != "1" && "${MLXFAST_NO_SANDBOX:-0}" != "1" ]]; then
+# When the runtime worker is disabled, sandbox this whole script so model code
+# cannot use the network. With the worker enabled, do not sandbox the parent:
+# Blacksmith rejects nested sandbox-exec. Submitted transform runs through
+# run-offline.sh below, and submitted model execution runs in the worker sandbox.
+if [[ "${USE_RUNTIME_WORKER}" != "1" && "${MLXFAST_IN_SANDBOX:-0}" != "1" && "${MLXFAST_NO_SANDBOX:-0}" != "1" ]]; then
   if ! command -v sandbox-exec >/dev/null 2>&1; then
     echo "benchmark.sh: sandbox-exec not found (the benchmark requires macOS)." >&2
     echo "Set MLXFAST_NO_SANDBOX=1 to skip the offline sandbox; scores" >&2
@@ -191,7 +198,7 @@ elif [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f "${WEIGHTS_PATH}/config.j
   if [[ -f "${REFERENCE_PATH}/config.json" ]]; then
     echo "benchmark.sh: regenerating weights with Swift transform"
     clear_weights_dir
-    "${SWIFT_BIN}" transform --reference "${REFERENCE_PATH}" --output "${WEIGHTS_PATH}"
+    run_offline_command "${SWIFT_BIN}" transform --reference "${REFERENCE_PATH}" --output "${WEIGHTS_PATH}"
     if [[ ! -f "${WEIGHTS_PATH}/config.json" ]]; then
       echo "benchmark.sh: Swift transform did not produce ${WEIGHTS_PATH}/config.json" >&2
       exit 1
@@ -215,7 +222,7 @@ if [[ "${MLXFAST_VERIFY_TRANSFORM:-0}" == "1" ]]; then
     exit 1
   fi
   echo "benchmark.sh: verifying weights match a fresh run of the submitted Swift transform"
-  "${SWIFT_BIN}" verify-transform --reference "${REFERENCE_PATH}" --weights "${WEIGHTS_PATH}"
+  run_offline_command "${SWIFT_BIN}" verify-transform --reference "${REFERENCE_PATH}" --weights "${WEIGHTS_PATH}"
 fi
 
 rm -f "${SCORE_PATH}"
