@@ -87,7 +87,10 @@ jobs:
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "256"
       MLXFAST_EXPECTED_CORRECTNESS_CASES: "1"
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
-      MLXFAST_TRUSTED_BENCHMARK_REF: refs/heads/main
+      # Temporary test setting: allow manually dispatched PR-branch benchmark
+      # runs while validating the R2 prompt path. Restore refs/heads/main before
+      # using private production prompts.
+      MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}
       MLXFAST_VERIFY_TRANSFORM: ${{ inputs.verify_transform && '1' || '0' }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
