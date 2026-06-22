@@ -21,16 +21,17 @@ Configure the `benchmark-private-prompts` Environment with:
   - `R2_SECRET_ACCESS_KEY`
 
 Normal private benchmark runs download the precomputed
-`correctness_prompts/correctness_golden.json` object from the private R2 bucket.
-The private prompt manifest, `correctness_prompts/private_prompts.json`, is only
-an organizer input for regenerating the golden outside the benchmark workflow.
+`correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`
+object from the private R2 bucket. The private prompt manifest is only an
+organizer input for regenerating the golden outside the benchmark workflow.
 It should not be downloaded by submission benchmark runs, written into the
 repository workspace, uploaded, or cached. The workflow writes the downloaded
 golden only under `$RUNNER_TEMP` and uploads only its hash and byte-count
 sidecars after a deny-list check rejects prompt, golden, model, symlink, and
 oversized artifact paths.
 
-The benchmark workflow also verifies at runtime that it is executing from:
+The benchmark workflow also verifies at runtime that it is executing from the
+configured trusted workflow ref. In production, that trusted ref should be:
 
 ```text
 Layr-Labs/mlxfast-challenge-dev/.github/workflows/benchmark.yml@refs/heads/main
@@ -57,12 +58,14 @@ For `submission_ref` runs:
   files and are not uploaded.
 - The workflow prints only fixed heartbeat lines while submitted code is
   running.
-- `score.json`, `benchmark-integrity.json`, and correctness artifacts are
+- `score.json`, `benchmark-integrity.json`, and golden hash/byte sidecars are
   uploaded only after strict schema and hash validation succeeds.
-- Correctness traces are disabled.
-- Timed benchmark model execution runs in a child worker process that receives
-  prompt tokens, but not the golden file path or expected output tokens. The
-  parent trusted harness performs token comparison.
+- Correctness traces are disabled for full benchmark runs.
+- Timed benchmark model execution runs in a child worker process that is denied
+  network access and direct reads of the private golden path. Submitted model
+  code necessarily sees hidden prompt tokens and teacher-forced previous tokens
+  while doing inference, but it does not receive the golden file path. The
+  trusted harness validates the resulting `score.json` before upload.
 
 This prevents submitted code from using GitHub logs or uploaded artifacts as a
 direct prompt-exfiltration channel.

@@ -4,6 +4,34 @@ import Testing
 @testable import MLXFastCore
 
 @Test
+func checkedInPublicCorrectnessGoldenIsValid() throws {
+    let promptPath = MLXFastConstants.defaultPublicCorrectnessPromptPath
+    let promptData = try Data(contentsOf: URL(fileURLWithPath: promptPath))
+    let promptDigest = SHA256.hash(data: promptData)
+        .map { String(format: "%02x", $0) }
+        .joined()
+
+    #expect(promptDigest == "98f6a5c49523c891300978437074279c97bb8aa7af18cbf2645983cfbf15e781")
+    #expect(promptData.count == 2_735)
+
+    let path = MLXFastConstants.defaultPublicCorrectnessGoldenPath
+    let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    let digest = SHA256.hash(data: data)
+        .map { String(format: "%02x", $0) }
+        .joined()
+
+    #expect(digest == "2a747bf797e16d58f5ffedacc0d4bf5ce0d14be00f2421dc04289a2154cb011d")
+
+    let fixture = try loadGoldenFixture(from: path)
+    #expect(fixture.sha256 == digest)
+    #expect(fixture.benchmark == nil)
+    #expect(fixture.cases.count == 1)
+    #expect(fixture.cases[0].name == "longcopy-gate-english-512")
+    #expect(fixture.cases[0].promptTokens.count == MLXFastConstants.correctnessPromptTokens)
+    #expect(fixture.cases[0].expectedTokens.count == MLXFastConstants.correctnessSteps)
+}
+
+@Test
 func loadGoldenCasesAcceptsValidFixture() throws {
     let directory = try temporaryDirectory()
     let path = directory.appendingPathComponent("golden.json")
@@ -106,109 +134,38 @@ func loadGoldenFixtureRejectsMalformedBenchmarkOracle() throws {
 }
 
 @Test
-func loadGoldenPromptManifestAcceptsPrivatePromptSpec() throws {
+func loadGoldenFixtureStaleBenchmarkOracleErrorMentionsPrecomputedFixture() throws {
     let directory = try temporaryDirectory()
-    let path = directory.appendingPathComponent("prompts.json")
-    let benchmarkPrompt = Array(repeating: 11, count: MLXFastConstants.benchmarkPrefillPromptTokens)
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = arrayJSON(Array(repeating: 9, count: MLXFastConstants.correctnessSteps))
     let json = """
     {
       "version": 1,
       "cases": [
         {
-          "name": "hidden-0",
-          "prompt_tokens": \(correctnessPromptJSON())
+          "name": "case-a",
+          "prompt_tokens": \(correctnessPromptJSON()),
+          "expected_tokens": \(expected)
         }
       ],
       "benchmark": {
-        "name": "timed-hidden",
-        "prompt_tokens": \(benchmarkPrompt)
+        "prefill_prompt_tokens": \(arrayJSON(Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens))),
+        "expected_prefill_token": 2,
+        "decode_seed_tokens": \(arrayJSON(Array(repeating: 3, count: 32))),
+        "expected_decode_seed_token": 4,
+        "expected_decode_tokens": \(arrayJSON(Array(repeating: 5, count: MLXFastConstants.benchmarkDecodeSteps)))
       }
     }
     """
     try json.write(to: path, atomically: true, encoding: .utf8)
 
-    let manifest = try loadGoldenPromptManifest(from: path.path)
-
-    #expect(manifest.cases == [GoldenPromptCase(name: "hidden-0", promptTokens: correctnessPrompt())])
-    #expect(manifest.benchmark.name == "timed-hidden")
-    #expect(manifest.benchmark.promptTokens == benchmarkPrompt)
-}
-
-@Test
-func loadGoldenPromptManifestRejectsShortBenchmarkPrompt() throws {
-    let directory = try temporaryDirectory()
-    let path = directory.appendingPathComponent("prompts.json")
-    let json = """
-    {
-      "version": 1,
-      "cases": [
-        {
-          "name": "hidden-0",
-          "prompt_tokens": \(correctnessPromptJSON())
-        }
-      ],
-      "benchmark": {
-        "prompt_tokens": [1]
-      }
-    }
-    """
-    try json.write(to: path, atomically: true, encoding: .utf8)
-
-    #expect(throws: MLXFastError.self) {
-        _ = try loadGoldenPromptManifest(from: path.path)
-    }
-}
-
-@Test
-func loadGoldenPromptManifestRejectsShortCorrectnessPrompt() throws {
-    let directory = try temporaryDirectory()
-    let path = directory.appendingPathComponent("prompts.json")
-    let benchmarkPrompt = Array(repeating: 11, count: MLXFastConstants.benchmarkPrefillPromptTokens)
-    let json = """
-    {
-      "version": 1,
-      "cases": [
-        {
-          "name": "hidden-0",
-          "prompt_tokens": [1]
-        }
-      ],
-      "benchmark": {
-        "prompt_tokens": \(benchmarkPrompt)
-      }
-    }
-    """
-    try json.write(to: path, atomically: true, encoding: .utf8)
-
-    #expect(throws: MLXFastError.self) {
-        _ = try loadGoldenPromptManifest(from: path.path)
-    }
-}
-
-@Test
-func loadGoldenPromptManifestRejectsWrongMaxOutputTokens() throws {
-    let directory = try temporaryDirectory()
-    let path = directory.appendingPathComponent("prompts.json")
-    let benchmarkPrompt = Array(repeating: 11, count: MLXFastConstants.benchmarkPrefillPromptTokens)
-    let json = """
-    {
-      "version": 1,
-      "max_output_tokens": \(MLXFastConstants.correctnessSteps - 1),
-      "cases": [
-        {
-          "name": "hidden-0",
-          "prompt_tokens": \(correctnessPromptJSON())
-        }
-      ],
-      "benchmark": {
-        "prompt_tokens": \(benchmarkPrompt)
-      }
-    }
-    """
-    try json.write(to: path, atomically: true, encoding: .utf8)
-
-    #expect(throws: MLXFastError.self) {
-        _ = try loadGoldenPromptManifest(from: path.path)
+    do {
+        _ = try loadGoldenFixture(from: path.path)
+        Issue.record("expected stale benchmark oracle error")
+    } catch let MLXFastError.invalidInput(message) {
+        #expect(message.contains("Replace stale local goldens with an updated precomputed golden fixture"))
+    } catch {
+        Issue.record("expected MLXFastError.invalidInput, got \(error)")
     }
 }
 

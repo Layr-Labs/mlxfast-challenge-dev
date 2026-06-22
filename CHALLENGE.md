@@ -27,10 +27,12 @@ The benchmark entrypoint:
 If required artifacts are missing, the harness writes a failed `score.json`
 rather than producing a ranked score.
 
-For local iteration, `./benchmark.sh --quick` uses the same local golden file but
-checks only the first 64 correctness tokens and times only 64 decode tokens. It
-still writes and prints `score.json`; it is a directional local signal, not the
-official ranking run.
+After transform, local users can run the checked-in public correctness gate with
+`.build/release/mlxfast-swift correctness --weights weights`. For benchmark
+iteration, `./benchmark.sh --quick` requires a local golden file that includes
+the benchmark oracle; it checks only the first 64 correctness tokens and times
+only 64 decode tokens. It still writes and prints `score.json`; it is a
+directional local signal, not the official ranking run.
 
 ## Model Artifacts
 
@@ -76,8 +78,10 @@ checkpoint. Submissions may adjust this overlay by changing both
 benchmark results are the authority, not byte equality with the baseline
 layout.
 
-Correctness cases and the timed benchmark token oracle are supplied by the
-benchmark operator and are intentionally not committed to the public repo:
+The public correctness-only prompt and golden are committed under
+`correctness_prompts/` so participants can run a local correctness smoke test.
+The timed benchmark token oracle is supplied by the benchmark operator and is
+intentionally not committed to the public repo:
 
 ```text
 correctness_golden.json
@@ -85,10 +89,12 @@ correctness_golden.json
 
 Use `MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json` when the
 file is provisioned outside the repository root.
-Benchmark CI downloads the private precomputed golden from protected storage.
-Prompt manifests and generated goldens are not committed to the public
-repository. Submission branches can restore or download a golden but do not
-generate goldens from submitted code.
+Benchmark CI consumes the checked-in public golden for correctness-only runs and
+downloads the private precomputed golden from protected storage for full
+benchmark runs. Private prompt manifests and hidden benchmark goldens are not
+committed to the public repository. The workflow does not generate goldens;
+organizers regenerate them offline and upload the resulting file to protected
+storage.
 
 ## Editable Surface
 
@@ -188,11 +194,11 @@ swift test
 MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test
 swift build -c release
 .github/scripts/run-offline.sh .build/release/mlxfast-swift transform
-.build/release/mlxfast-swift correctness
+.build/release/mlxfast-swift correctness --weights weights
 .build/release/mlxfast-swift preflight
 .build/release/mlxfast-swift benchmark --score-path score.json
 .build/release/mlxfast-swift benchmark --quick --score-path score.json
-.build/release/mlxfast-swift make-golden --prompt-file /path/to/private_prompts.json --output correctness_golden.json
+.build/release/mlxfast-swift make-golden --prompt-file /path/to/private_prompts.json --output correctness_golden.json  # organizer/offline
 .build/release/mlxfast-swift verify-transform
 .build/release/mlxfast-swift clone
 .build/release/mlxfast-swift link <benchmark-id-or-name>

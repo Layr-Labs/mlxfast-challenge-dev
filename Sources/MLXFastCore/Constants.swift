@@ -3,6 +3,8 @@ public enum MLXFastConstants {
     public static let defaultReferencePath = "reference_weights/DeepSeek-V4-Flash-4bit"
     public static let defaultWeightsPath = "weights"
     public static let defaultGoldenPath = "correctness_golden.json"
+    public static let defaultPublicCorrectnessPromptPath = "correctness_prompts/public_longcopy_gate_english_512.txt"
+    public static let defaultPublicCorrectnessGoldenPath = "correctness_prompts/public_longcopy_gate_english_512_256.json"
     public static let defaultScorePath = "score.json"
 
     public static let vocabSize = 129_280
@@ -24,7 +26,11 @@ public enum MLXFastConstants {
     public static let benchmarkPrefillPromptTokens = 512
     public static let benchmarkDecodeSteps = 256
     public static let quickBenchmarkDecodeSteps = 64
-    public static let benchmarkDecodeSeedTokens = 32
+    // Seed measured decode with the full prompt. A short instruction-prefix
+    // seed can free-run differently across Apple Silicon/MLX versions even
+    // when teacher-forced correctness agrees, which makes the timed oracle
+    // fragile for reasons unrelated to kernel performance.
+    public static let benchmarkDecodeSeedTokens = 512
     public static let benchmarkPrefillWarmupRuns = 1
     public static let benchmarkPrefillTimedRuns = 1
     public static let defaultMaxTransformedWeightsBytes = 50 * 1024 * 1024 * 1024

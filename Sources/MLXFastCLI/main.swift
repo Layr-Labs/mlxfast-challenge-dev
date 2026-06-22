@@ -39,9 +39,6 @@ private enum MLXFastCLI {
             case "runtime-worker":
                 try runRuntimeWorker(options)
                 return 0
-            case "make-golden":
-                try runMakeGolden(options)
-                return 0
             case "checkpoint-shards":
                 try runCheckpointShards(options)
                 return 0
@@ -158,7 +155,7 @@ private enum MLXFastCLI {
             for: "--golden",
             default: environmentValue(
                 "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-                fallback: MLXFastConstants.defaultGoldenPath
+                fallback: defaultCorrectnessGoldenPath()
             )
         )
         let report = try DeepSeekRuntime.runCorrectness(
@@ -187,7 +184,7 @@ private enum MLXFastCLI {
             for: "--golden",
             default: environmentValue(
                 "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-                fallback: MLXFastConstants.defaultGoldenPath
+                fallback: defaultCorrectnessGoldenPath()
             )
         )
         let stepRaw = options.value(for: "--step", default: "")
@@ -381,79 +378,6 @@ private enum MLXFastCLI {
             )
         )
         try DeepSeekRuntime.runWorker(weightsPath: weightsPath)
-    }
-
-    private static func runMakeGolden(_ options: ParsedOptions) throws {
-        try options.validate(
-            valueOptions: [
-                "--weights",
-                "--output",
-                "--prompt-file",
-                "--name",
-                "--prompt-tokens",
-                "--progress-every",
-            ]
-        )
-        let weightsPath = options.value(
-            for: "--weights",
-            default: environmentValue(
-                "MLXFAST_WEIGHTS_PATH",
-                fallback: MLXFastConstants.defaultWeightsPath
-            )
-        )
-        let outputPath = options.value(for: "--output", default: MLXFastConstants.defaultGoldenPath)
-        let promptFile = options.value(for: "--prompt-file", default: "")
-        let promptTokens = options.value(for: "--prompt-tokens", default: "")
-        let name = options.value(for: "--name", default: "local")
-        let progressIntervalSteps = try parseNonNegativeInt(
-            options.value(
-                for: "--progress-every",
-                default: environmentValue("MLXFAST_GOLDEN_PROGRESS_EVERY", fallback: "64")
-            ),
-            optionName: "--progress-every"
-        )
-
-        let manifest: GoldenPromptManifest
-        if !promptFile.isEmpty {
-            if !promptTokens.isEmpty || options.hasValue(for: "--name") {
-                throw MLXFastError.invalidInput(
-                    "--prompt-file cannot be combined with --name or --prompt-tokens"
-                )
-            }
-            manifest = try loadGoldenPromptManifest(from: promptFile)
-        } else {
-            guard !promptTokens.isEmpty else {
-                throw MLXFastError.invalidInput(
-                    "make-golden requires --prompt-file PATH or --prompt-tokens TOKENS"
-                )
-            }
-            let tokens = try parseTokenList(promptTokens)
-            manifest = GoldenPromptManifest(
-                cases: [
-                    GoldenPromptCase(name: name, promptTokens: tokens),
-                ],
-                benchmark: BenchmarkPromptSpec(name: "benchmark", promptTokens: tokens)
-            )
-            try validateGoldenPromptManifest(manifest)
-        }
-
-        let document = try DeepSeekRuntime.generateGolden(
-            GoldenGenerationOptions(
-                weightsPath: weightsPath,
-                promptManifest: manifest,
-                progressIntervalSteps: progressIntervalSteps
-            )
-        )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        let data = try encoder.encode(document)
-        let outputURL = URL(fileURLWithPath: outputPath)
-        let parent = outputURL.deletingLastPathComponent()
-        if !parent.path.isEmpty {
-            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-        }
-        try data.write(to: outputURL)
-        print("wrote \(outputPath)")
     }
 
     private static func runCheckpointShards(_ options: ParsedOptions) throws {
@@ -740,7 +664,6 @@ private enum MLXFastCLI {
               mlxfast-swift correctness-trace [--weights PATH] [--golden PATH] [--case NAME] --step N [--top-k N]
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--quick] [--weights PATH] [--golden PATH] [--score-path PATH]
-              mlxfast-swift make-golden [--weights PATH] [--output PATH] [--progress-every N] (--prompt-file PATH | --prompt-tokens TOKENS [--name NAME])
               mlxfast-swift checkpoint-shards --index PATH
               mlxfast-swift login [--api-key KEY | KEY] [--api URL] [--no-verify]
               mlxfast-swift config
@@ -757,6 +680,20 @@ private enum MLXFastCLI {
     private static func environmentValue(_ name: String, fallback: String) -> String {
         let value = ProcessInfo.processInfo.environment[name] ?? ""
         return value.isEmpty ? fallback : value
+    }
+
+    private static func defaultCorrectnessGoldenPath() -> String {
+        if FileManager.default.fileExists(atPath: MLXFastConstants.defaultGoldenPath) {
+            return MLXFastConstants.defaultGoldenPath
+        }
+        let publicPath = environmentValue(
+            "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH",
+            fallback: MLXFastConstants.defaultPublicCorrectnessGoldenPath
+        )
+        if FileManager.default.fileExists(atPath: publicPath) {
+            return publicPath
+        }
+        return MLXFastConstants.defaultGoldenPath
     }
 
     private static func parseMaxByteCount(
@@ -1008,32 +945,6 @@ private enum MLXFastCLI {
             )
         }
         return stdout
-    }
-
-    private static func parseTokenList(_ raw: String) throws -> [Int] {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw MLXFastError.invalidInput("--prompt-tokens must not be empty")
-        }
-        let stripped = trimmed
-            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        let parts = stripped.split { character in
-            character == "," || character == " " || character == "\n" || character == "\t"
-        }
-        guard !parts.isEmpty else {
-            throw MLXFastError.invalidInput("--prompt-tokens did not contain any token IDs")
-        }
-        return try parts.enumerated().map { index, part in
-            guard let token = Int(part) else {
-                throw MLXFastError.invalidInput("--prompt-tokens[\(index)] is not an integer: \(part)")
-            }
-            guard token >= 0, token < MLXFastConstants.vocabSize else {
-                throw MLXFastError.invalidInput(
-                    "--prompt-tokens[\(index)]=\(token) is outside DeepSeek vocab range 0..<\(MLXFastConstants.vocabSize)"
-                )
-            }
-            return token
-        }
     }
 
 }

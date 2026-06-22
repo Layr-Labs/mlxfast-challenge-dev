@@ -73,62 +73,6 @@ public struct GoldenFixture: Equatable {
     }
 }
 
-public struct GoldenPromptCase: Codable, Equatable {
-    public let name: String
-    public let promptTokens: [Int]
-
-    enum CodingKeys: String, CodingKey {
-        case name
-        case promptTokens = "prompt_tokens"
-    }
-
-    public init(name: String, promptTokens: [Int]) {
-        self.name = name
-        self.promptTokens = promptTokens
-    }
-}
-
-public struct BenchmarkPromptSpec: Codable, Equatable {
-    public let name: String?
-    public let promptTokens: [Int]
-
-    enum CodingKeys: String, CodingKey {
-        case name
-        case promptTokens = "prompt_tokens"
-    }
-
-    public init(name: String? = nil, promptTokens: [Int]) {
-        self.name = name
-        self.promptTokens = promptTokens
-    }
-}
-
-public struct GoldenPromptManifest: Codable, Equatable {
-    public let version: Int
-    public let cases: [GoldenPromptCase]
-    public let benchmark: BenchmarkPromptSpec
-    public let maxOutputTokens: Int?
-
-    enum CodingKeys: String, CodingKey {
-        case version
-        case cases
-        case benchmark
-        case maxOutputTokens = "max_output_tokens"
-    }
-
-    public init(
-        version: Int = 1,
-        cases: [GoldenPromptCase],
-        benchmark: BenchmarkPromptSpec,
-        maxOutputTokens: Int? = nil
-    ) {
-        self.version = version
-        self.cases = cases
-        self.benchmark = benchmark
-        self.maxOutputTokens = maxOutputTokens
-    }
-}
-
 public struct BenchmarkTokenComparison: Equatable {
     public let passed: Bool
     public let label: String
@@ -189,60 +133,9 @@ public func loadGoldenFixture(
     if let benchmark = decoded.benchmark {
         try validateBenchmarkGolden(benchmark)
     }
-
-
     let digest = SHA256.hash(data: data)
     let hash = digest.map { String(format: "%02x", $0) }.joined()
     return GoldenFixture(cases: decoded.cases, benchmark: decoded.benchmark, sha256: hash)
-}
-
-public func loadGoldenPromptManifest(from path: String) throws -> GoldenPromptManifest {
-    try requireFile(path, description: "golden prompt manifest")
-    let data = try Data(contentsOf: URL(fileURLWithPath: path))
-    let manifest = try JSONDecoder().decode(GoldenPromptManifest.self, from: data)
-    try validateGoldenPromptManifest(manifest)
-    return manifest
-}
-
-public func validateGoldenPromptManifest(_ manifest: GoldenPromptManifest) throws {
-    guard manifest.version == 1 else {
-        throw MLXFastError.invalidInput("golden prompt manifest version must be 1")
-    }
-    guard !manifest.cases.isEmpty else {
-        throw MLXFastError.invalidInput("golden prompt manifest must contain at least one case")
-    }
-    if let maxOutputTokens = manifest.maxOutputTokens {
-        guard maxOutputTokens == MLXFastConstants.correctnessSteps else {
-            throw MLXFastError.invalidInput(
-                "golden prompt manifest max_output_tokens is \(maxOutputTokens); need exactly \(MLXFastConstants.correctnessSteps)"
-            )
-        }
-    }
-
-    var names = Set<String>()
-    for testCase in manifest.cases {
-        try validateCaseName(testCase.name, field: "golden prompt case name")
-        guard names.insert(testCase.name).inserted else {
-            throw MLXFastError.invalidInput("duplicate golden prompt case name \(testCase.name)")
-        }
-        guard testCase.promptTokens.count == MLXFastConstants.correctnessPromptTokens else {
-            throw MLXFastError.invalidInput(
-                "\(testCase.name).prompt_tokens has \(testCase.promptTokens.count) tokens; need exactly \(MLXFastConstants.correctnessPromptTokens)"
-            )
-        }
-        try validateTokens(testCase.promptTokens, field: "\(testCase.name).prompt_tokens")
-    }
-
-    if let name = manifest.benchmark.name {
-        try validateCaseName(name, field: "benchmark prompt name")
-    }
-    let benchmarkPrompt = manifest.benchmark.promptTokens
-    guard benchmarkPrompt.count >= MLXFastConstants.benchmarkPrefillPromptTokens else {
-        throw MLXFastError.invalidInput(
-            "benchmark.prompt_tokens has \(benchmarkPrompt.count) tokens; need at least \(MLXFastConstants.benchmarkPrefillPromptTokens)"
-        )
-    }
-    try validateTokens(benchmarkPrompt, field: "benchmark.prompt_tokens")
 }
 
 public enum BenchmarkOutputValidator {
@@ -357,12 +250,12 @@ public func validateBenchmarkGolden(_ benchmark: BenchmarkGolden) throws {
     }
     guard benchmark.decodeSeedTokens.count == MLXFastConstants.benchmarkDecodeSeedTokens else {
         throw MLXFastError.invalidInput(
-            "benchmark.decode_seed_tokens has \(benchmark.decodeSeedTokens.count) tokens; need exactly \(MLXFastConstants.benchmarkDecodeSeedTokens)"
+            "benchmark.decode_seed_tokens has \(benchmark.decodeSeedTokens.count) tokens; need exactly \(MLXFastConstants.benchmarkDecodeSeedTokens). Replace stale local goldens with an updated precomputed golden fixture."
         )
     }
     guard benchmark.expectedDecodeTokens.count == MLXFastConstants.benchmarkDecodeSteps else {
         throw MLXFastError.invalidInput(
-            "benchmark.expected_decode_tokens has \(benchmark.expectedDecodeTokens.count) tokens; need exactly \(MLXFastConstants.benchmarkDecodeSteps)"
+            "benchmark.expected_decode_tokens has \(benchmark.expectedDecodeTokens.count) tokens; need exactly \(MLXFastConstants.benchmarkDecodeSteps). Replace stale local goldens with an updated precomputed golden fixture."
         )
     }
     try validateTokens(benchmark.prefillPromptTokens, field: "benchmark.prefill_prompt_tokens")

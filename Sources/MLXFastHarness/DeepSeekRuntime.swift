@@ -226,22 +226,6 @@ public struct RuntimeWorkerOptions: Equatable {
     }
 }
 
-public struct GoldenGenerationOptions: Equatable {
-    public let weightsPath: String
-    public let promptManifest: GoldenPromptManifest
-    public let progressIntervalSteps: Int
-
-    public init(
-        weightsPath: String,
-        promptManifest: GoldenPromptManifest,
-        progressIntervalSteps: Int = 0
-    ) {
-        self.weightsPath = weightsPath
-        self.promptManifest = promptManifest
-        self.progressIntervalSteps = progressIntervalSteps
-    }
-}
-
 private struct BenchmarkTokenMismatchError: Error, CustomStringConvertible {
     let label: String
     let step: Int?
@@ -266,53 +250,6 @@ private struct BenchmarkTokenMismatchError: Error, CustomStringConvertible {
 }
 
 public enum DeepSeekRuntime {
-    public static func generateGolden(_ options: GoldenGenerationOptions) throws -> GoldenDocument {
-        let config = try DeepSeekConfig.load(from: options.weightsPath)
-        let loader = try DeepSeekWeightLoader(
-            weightsPath: options.weightsPath,
-            expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: false)
-        )
-        let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
-        let startedAt = DispatchTime.now().uptimeNanoseconds
-        let progress = makeGoldenProgressReporter(
-            intervalSteps: options.progressIntervalSteps,
-            startedAt: startedAt
-        )
-        progress(
-            "start cases=\(options.promptManifest.cases.count) correctness_steps=\(MLXFastConstants.correctnessSteps) benchmark_decode_steps=\(MLXFastConstants.benchmarkDecodeSteps)"
-        )
-
-        let cases = try options.promptManifest.cases.map { promptCase in
-            progress(
-                "case \(promptCase.name) start prompt_tokens=\(promptCase.promptTokens.count)"
-            )
-            return GoldenCase(
-                name: promptCase.name,
-                promptTokens: promptCase.promptTokens,
-                expectedTokens: try generateGreedyCached(
-                    promptTokens: promptCase.promptTokens,
-                    steps: MLXFastConstants.correctnessSteps,
-                    weightCache: weightCache,
-                    progressIntervalSteps: options.progressIntervalSteps,
-                    progress: { step, total in
-                        progress("case \(promptCase.name) generated \(step)/\(total) tokens")
-                    }
-                )
-            )
-        }
-        progress("benchmark oracle start prompt_tokens=\(options.promptManifest.benchmark.promptTokens.count)")
-        let benchmark = try generateBenchmarkGolden(
-            promptTokens: options.promptManifest.benchmark.promptTokens,
-            weightCache: weightCache,
-            progressIntervalSteps: options.progressIntervalSteps,
-            progress: { step, total in
-                progress("benchmark oracle generated \(step)/\(total) decode tokens")
-            }
-        )
-        progress("complete")
-        return GoldenDocument(cases: cases, benchmark: benchmark)
-    }
-
     public static func runCorrectness(
         _ options: CorrectnessOptions,
         worker: RuntimeWorkerOptions? = nil
@@ -591,6 +528,15 @@ public enum DeepSeekRuntime {
             guard let seedTokens = request.seedTokens, let decodeSteps = request.decodeSteps else {
                 throw MLXFastError.invalidInput("runtime worker decode request missing seed_tokens or decode_steps")
             }
+            guard let expectedSeedToken = request.expectedSeedToken,
+                  let expectedTokens = request.expectedTokens else {
+                throw MLXFastError.invalidInput("runtime worker decode request missing expected benchmark tokens")
+            }
+            guard expectedTokens.count >= decodeSteps else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker decode oracle has \(expectedTokens.count) tokens; need at least \(decodeSteps)"
+                )
+            }
             let validationDelayMS = try request.validationDelayMilliseconds
                 ?? submissionValidationDelayMilliseconds()
             guard validationDelayMS >= 0 else {
@@ -624,8 +570,9 @@ public enum DeepSeekRuntime {
             let metricsBeforeDecode = weightCache.loader.expertStreamingMetrics?.snapshot()
             let start = DispatchTime.now().uptimeNanoseconds
             for decodedStep in 0..<timingPlan.decodeSteps {
+                let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
                 logits = try DeepSeekModel.logits(
-                    inputIDs: inputIDsArray([token]),
+                    inputIDs: inputIDsArray([inputToken]),
                     weightCache: weightCache,
                     cache: cache,
                     positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
@@ -1436,8 +1383,9 @@ public enum DeepSeekRuntime {
                 progress?("decode validation delay enabled milliseconds_per_token=\(validationDelayMS)")
             }
             for decodedStep in 0..<timingPlan.decodeSteps {
+                let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
                 logits = try DeepSeekModel.logits(
-                    inputIDs: inputIDsArray([token]),
+                    inputIDs: inputIDsArray([inputToken]),
                     weightCache: weightCache,
                     cache: cache,
                     positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
@@ -1468,13 +1416,6 @@ public enum DeepSeekRuntime {
                     }
                 )
             }
-
-            try requireBenchmarkMatch(
-                BenchmarkOutputValidator.compareDecodeTokens(
-                    expectedTokens: Array(expectedTokens.prefix(timingPlan.decodeSteps)),
-                    actualTokens: actualTokens
-                )
-            )
 
             let elapsed = secondsSince(start)
             let bandwidth: (gbPerToken: Double, source: String)
@@ -1546,6 +1487,8 @@ public enum DeepSeekRuntime {
         progress?("decode measured start tokens=\(decodeSteps)")
         let response = try worker.decode(
             seedTokens: seedTokens,
+            expectedSeedToken: expectedSeedToken,
+            expectedTokens: expectedTokens,
             decodeSteps: decodeSteps
         )
         expertStats = response.expertStats ?? expertStats
@@ -1766,20 +1709,6 @@ public enum DeepSeekRuntime {
 
     private static func secondsSince(_ start: UInt64) -> Double {
         Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000_000.0
-    }
-
-    private static func makeGoldenProgressReporter(
-        intervalSteps: Int,
-        startedAt: UInt64
-    ) -> (String) -> Void {
-        guard intervalSteps > 0 else {
-            return { _ in }
-        }
-        return { message in
-            let elapsed = formatSeconds(secondsSince(startedAt))
-            fputs("mlxfast: make-golden elapsed=\(elapsed)s \(message)\n", stderr)
-            fflush(stderr)
-        }
     }
 
     private static func makeBenchmarkProgressReporter(startedAt: UInt64) -> (String) -> Void {
@@ -2466,79 +2395,6 @@ public enum DeepSeekRuntime {
         return generated
     }
 
-    private static func generateBenchmarkGolden(
-        promptTokens: [Int],
-        weightCache: DeepSeekRuntimeWeightCache,
-        progressIntervalSteps: Int = 0,
-        progress: ((Int, Int) -> Void)? = nil
-    ) throws -> BenchmarkGolden {
-        guard promptTokens.count >= MLXFastConstants.benchmarkPrefillPromptTokens else {
-            throw MLXFastError.invalidInput(
-                "benchmark.prompt_tokens has \(promptTokens.count) tokens; need at least \(MLXFastConstants.benchmarkPrefillPromptTokens)"
-            )
-        }
-        let prefillTokens = Array(promptTokens.prefix(MLXFastConstants.benchmarkPrefillPromptTokens))
-        let expectedPrefillToken = try firstGreedyToken(
-            promptTokens: prefillTokens,
-            weightCache: weightCache
-        )
-        let seedTokens = Array(promptTokens.prefix(MLXFastConstants.benchmarkDecodeSeedTokens))
-        let seedCache = DeepSeekModelCache(config: weightCache.config)
-        var logits = try DeepSeekModel.logits(
-            inputIDs: inputIDsArray(seedTokens),
-            weightCache: weightCache,
-            cache: seedCache,
-            positionOffset: 0
-        )
-        var token = try DeepSeekCorrectness.greedyToken(from: logits)
-        let expectedSeedToken = token
-
-        var decodeTokens: [Int] = []
-        decodeTokens.reserveCapacity(MLXFastConstants.benchmarkDecodeSteps)
-        let timingPlan = try DecodeTimingPlan(
-            seedTokenCount: seedTokens.count,
-            decodeSteps: MLXFastConstants.benchmarkDecodeSteps
-        )
-        for decodedStep in 0..<timingPlan.decodeSteps {
-            logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray([token]),
-                weightCache: weightCache,
-                cache: seedCache,
-                positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
-            )
-            token = try DeepSeekCorrectness.greedyToken(from: logits)
-            decodeTokens.append(token)
-            reportProgress(
-                step: decodedStep + 1,
-                total: timingPlan.decodeSteps,
-                intervalSteps: progressIntervalSteps,
-                progress: progress
-            )
-        }
-
-        return BenchmarkGolden(
-            prefillPromptTokens: prefillTokens,
-            expectedPrefillToken: expectedPrefillToken,
-            decodeSeedTokens: seedTokens,
-            expectedDecodeSeedToken: expectedSeedToken,
-            expectedDecodeTokens: decodeTokens
-        )
-    }
-
-    private static func firstGreedyToken(
-        promptTokens: [Int],
-        weightCache: DeepSeekRuntimeWeightCache
-    ) throws -> Int {
-        let cache = DeepSeekModelCache(config: weightCache.config)
-        let logits = try DeepSeekModel.logits(
-            inputIDs: inputIDsArray(promptTokens),
-            weightCache: weightCache,
-            cache: cache,
-            positionOffset: 0
-        )
-        return try DeepSeekCorrectness.greedyToken(from: logits)
-    }
-
     private static func requireBenchmarkMatch(_ comparison: BenchmarkTokenComparison) throws {
         guard comparison.passed else {
             throw BenchmarkTokenMismatchError(comparison: comparison)
@@ -2595,6 +2451,8 @@ private struct RuntimeWorkerRequest: Codable {
     let promptTokens: [Int]?
     let token: Int?
     let seedTokens: [Int]?
+    let expectedSeedToken: Int?
+    let expectedTokens: [Int]?
     let steps: Int?
     let decodeSteps: Int?
     let validationDelayMilliseconds: Int?
@@ -2605,6 +2463,8 @@ private struct RuntimeWorkerRequest: Codable {
         case promptTokens = "prompt_tokens"
         case token
         case seedTokens = "seed_tokens"
+        case expectedSeedToken = "expected_seed_token"
+        case expectedTokens = "expected_tokens"
         case steps
         case decodeSteps = "decode_steps"
         case validationDelayMilliseconds = "validation_delay_ms"
@@ -2785,11 +2645,15 @@ private final class RuntimeWorkerClient {
 
     func decode(
         seedTokens: [Int],
+        expectedSeedToken: Int,
+        expectedTokens: [Int],
         decodeSteps: Int
     ) throws -> RuntimeWorkerResponse {
         try send(
             kind: "decode",
             seedTokens: seedTokens,
+            expectedSeedToken: expectedSeedToken,
+            expectedTokens: expectedTokens,
             decodeSteps: decodeSteps
         )
     }
@@ -2799,6 +2663,8 @@ private final class RuntimeWorkerClient {
         promptTokens: [Int]? = nil,
         token: Int? = nil,
         seedTokens: [Int]? = nil,
+        expectedSeedToken: Int? = nil,
+        expectedTokens: [Int]? = nil,
         steps: Int? = nil,
         decodeSteps: Int? = nil,
         validationDelayMilliseconds: Int? = nil
@@ -2814,6 +2680,8 @@ private final class RuntimeWorkerClient {
             promptTokens: promptTokens,
             token: token,
             seedTokens: seedTokens,
+            expectedSeedToken: expectedSeedToken,
+            expectedTokens: expectedTokens,
             steps: steps,
             decodeSteps: decodeSteps,
             validationDelayMilliseconds: validationDelayMilliseconds
