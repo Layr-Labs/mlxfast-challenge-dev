@@ -21,9 +21,9 @@ Configure the `benchmark-private-prompts` Environment with:
   - `R2_SECRET_ACCESS_KEY`
 
 Normal private benchmark runs download the precomputed
-`correctness_prompts/correctness_golden.json` object from the private R2 bucket.
-The private prompt manifest, `correctness_prompts/private_prompts.json`, is only
-an organizer input for regenerating the golden outside the benchmark workflow.
+`correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`
+object from the private R2 bucket. The private prompt manifest is only an
+organizer input for regenerating the golden outside the benchmark workflow.
 It should not be downloaded by submission benchmark runs, written into the
 repository workspace, uploaded, or cached. The workflow writes the downloaded
 golden only under `$RUNNER_TEMP` and uploads only its hash and byte-count

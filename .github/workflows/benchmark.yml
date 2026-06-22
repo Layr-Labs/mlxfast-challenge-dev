@@ -18,7 +18,7 @@ on:
         required: false
         type: string
       correctness_golden_url:
-        description: "Optional URL for precomputed correctness_golden.json. If empty, private R2 correctness_prompts/correctness_golden.json is used when configured."
+        description: "Optional URL for precomputed correctness_golden.json. If empty, private R2 golden_prompt_benchmark_transcription_gate_english_512_256.json is used when configured."
         required: false
         type: string
       reference_download_jobs:
@@ -79,9 +79,9 @@ jobs:
       MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
       MLXFAST_CORRECTNESS_GOLDEN_URL_PRESENT: ${{ (inputs.correctness_golden_url != '' || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL != '') && '1' || '0' }}
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
-      MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/correctness_golden.json
-      MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: f43f288c09ec9358a13b9338eca25fc47b6c5c13adbf7ac07ffd38a65f9fee81
-      MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "20435"
+      MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json
+      MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 99a8baddaa2a17a78979b9464657889105e10cf57c6ee28626c0479ed9856685
+      MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "20324"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "256"
       MLXFAST_EXPECTED_CORRECTNESS_CASES: "1"
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
