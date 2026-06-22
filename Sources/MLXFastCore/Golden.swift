@@ -211,12 +211,15 @@ public func validateGoldenPromptManifest(_ manifest: GoldenPromptManifest) throw
     guard !manifest.cases.isEmpty else {
         throw MLXFastError.invalidInput("golden prompt manifest must contain at least one case")
     }
-    if let maxOutputTokens = manifest.maxOutputTokens {
-        guard maxOutputTokens == MLXFastConstants.correctnessSteps else {
-            throw MLXFastError.invalidInput(
-                "golden prompt manifest max_output_tokens is \(maxOutputTokens); need exactly \(MLXFastConstants.correctnessSteps)"
-            )
-        }
+    guard let maxOutputTokens = manifest.maxOutputTokens else {
+        throw MLXFastError.invalidInput(
+            "golden prompt manifest max_output_tokens is missing; need exactly \(MLXFastConstants.correctnessSteps)"
+        )
+    }
+    guard maxOutputTokens == MLXFastConstants.correctnessSteps else {
+        throw MLXFastError.invalidInput(
+            "golden prompt manifest max_output_tokens is \(maxOutputTokens); need exactly \(MLXFastConstants.correctnessSteps)"
+        )
     }
 
     var names = Set<String>()

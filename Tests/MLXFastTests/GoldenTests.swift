@@ -113,6 +113,7 @@ func loadGoldenPromptManifestAcceptsPrivatePromptSpec() throws {
     let json = """
     {
       "version": 1,
+      "max_output_tokens": \(MLXFastConstants.correctnessSteps),
       "cases": [
         {
           "name": "hidden-0",
@@ -132,6 +133,7 @@ func loadGoldenPromptManifestAcceptsPrivatePromptSpec() throws {
     #expect(manifest.cases == [GoldenPromptCase(name: "hidden-0", promptTokens: correctnessPrompt())])
     #expect(manifest.benchmark.name == "timed-hidden")
     #expect(manifest.benchmark.promptTokens == benchmarkPrompt)
+    #expect(manifest.maxOutputTokens == MLXFastConstants.correctnessSteps)
 }
 
 @Test
@@ -141,6 +143,7 @@ func loadGoldenPromptManifestRejectsShortBenchmarkPrompt() throws {
     let json = """
     {
       "version": 1,
+      "max_output_tokens": \(MLXFastConstants.correctnessSteps),
       "cases": [
         {
           "name": "hidden-0",
@@ -167,10 +170,37 @@ func loadGoldenPromptManifestRejectsShortCorrectnessPrompt() throws {
     let json = """
     {
       "version": 1,
+      "max_output_tokens": \(MLXFastConstants.correctnessSteps),
       "cases": [
         {
           "name": "hidden-0",
           "prompt_tokens": [1]
+        }
+      ],
+      "benchmark": {
+        "prompt_tokens": \(benchmarkPrompt)
+      }
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try loadGoldenPromptManifest(from: path.path)
+    }
+}
+
+@Test
+func loadGoldenPromptManifestRejectsMissingMaxOutputTokens() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("prompts.json")
+    let benchmarkPrompt = Array(repeating: 11, count: MLXFastConstants.benchmarkPrefillPromptTokens)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "hidden-0",
+          "prompt_tokens": \(correctnessPromptJSON())
         }
       ],
       "benchmark": {

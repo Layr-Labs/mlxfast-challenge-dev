@@ -432,7 +432,8 @@ private enum MLXFastCLI {
                 cases: [
                     GoldenPromptCase(name: name, promptTokens: tokens),
                 ],
-                benchmark: BenchmarkPromptSpec(name: "benchmark", promptTokens: tokens)
+                benchmark: BenchmarkPromptSpec(name: "benchmark", promptTokens: tokens),
+                maxOutputTokens: MLXFastConstants.correctnessSteps
             )
             try validateGoldenPromptManifest(manifest)
         }
