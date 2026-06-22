@@ -257,7 +257,7 @@ The manifest contains correctness prompts plus a dedicated benchmark prompt
 Each correctness prompt must contain exactly 512 token IDs. The benchmark prompt
 must contain at least 512 token IDs. The generated golden file stores exact
 expected tokens for each 512-token correctness prompt and its 256-token greedy
-continuation, the 512-token prefill check, the 32-token decode seed, and the
+continuation, the 512-token prefill check, the 512-token decode seed, and the
 timed 256-token decode window. During correctness, the harness checks those
 continuation positions teacher-forced: after each accepted step it feeds the
 golden previous token back into the model. This keeps the gate stable across

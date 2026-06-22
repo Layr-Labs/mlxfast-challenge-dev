@@ -591,6 +591,15 @@ public enum DeepSeekRuntime {
             guard let seedTokens = request.seedTokens, let decodeSteps = request.decodeSteps else {
                 throw MLXFastError.invalidInput("runtime worker decode request missing seed_tokens or decode_steps")
             }
+            guard let expectedSeedToken = request.expectedSeedToken,
+                  let expectedTokens = request.expectedTokens else {
+                throw MLXFastError.invalidInput("runtime worker decode request missing expected benchmark tokens")
+            }
+            guard expectedTokens.count >= decodeSteps else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker decode oracle has \(expectedTokens.count) tokens; need at least \(decodeSteps)"
+                )
+            }
             let validationDelayMS = try request.validationDelayMilliseconds
                 ?? submissionValidationDelayMilliseconds()
             guard validationDelayMS >= 0 else {
@@ -624,8 +633,9 @@ public enum DeepSeekRuntime {
             let metricsBeforeDecode = weightCache.loader.expertStreamingMetrics?.snapshot()
             let start = DispatchTime.now().uptimeNanoseconds
             for decodedStep in 0..<timingPlan.decodeSteps {
+                let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
                 logits = try DeepSeekModel.logits(
-                    inputIDs: inputIDsArray([token]),
+                    inputIDs: inputIDsArray([inputToken]),
                     weightCache: weightCache,
                     cache: cache,
                     positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
@@ -1436,8 +1446,9 @@ public enum DeepSeekRuntime {
                 progress?("decode validation delay enabled milliseconds_per_token=\(validationDelayMS)")
             }
             for decodedStep in 0..<timingPlan.decodeSteps {
+                let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
                 logits = try DeepSeekModel.logits(
-                    inputIDs: inputIDsArray([token]),
+                    inputIDs: inputIDsArray([inputToken]),
                     weightCache: weightCache,
                     cache: cache,
                     positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
@@ -1546,6 +1557,8 @@ public enum DeepSeekRuntime {
         progress?("decode measured start tokens=\(decodeSteps)")
         let response = try worker.decode(
             seedTokens: seedTokens,
+            expectedSeedToken: expectedSeedToken,
+            expectedTokens: expectedTokens,
             decodeSteps: decodeSteps
         )
         expertStats = response.expertStats ?? expertStats
@@ -2595,6 +2608,8 @@ private struct RuntimeWorkerRequest: Codable {
     let promptTokens: [Int]?
     let token: Int?
     let seedTokens: [Int]?
+    let expectedSeedToken: Int?
+    let expectedTokens: [Int]?
     let steps: Int?
     let decodeSteps: Int?
     let validationDelayMilliseconds: Int?
@@ -2605,6 +2620,8 @@ private struct RuntimeWorkerRequest: Codable {
         case promptTokens = "prompt_tokens"
         case token
         case seedTokens = "seed_tokens"
+        case expectedSeedToken = "expected_seed_token"
+        case expectedTokens = "expected_tokens"
         case steps
         case decodeSteps = "decode_steps"
         case validationDelayMilliseconds = "validation_delay_ms"
@@ -2785,11 +2802,15 @@ private final class RuntimeWorkerClient {
 
     func decode(
         seedTokens: [Int],
+        expectedSeedToken: Int,
+        expectedTokens: [Int],
         decodeSteps: Int
     ) throws -> RuntimeWorkerResponse {
         try send(
             kind: "decode",
             seedTokens: seedTokens,
+            expectedSeedToken: expectedSeedToken,
+            expectedTokens: expectedTokens,
             decodeSteps: decodeSteps
         )
     }
@@ -2799,6 +2820,8 @@ private final class RuntimeWorkerClient {
         promptTokens: [Int]? = nil,
         token: Int? = nil,
         seedTokens: [Int]? = nil,
+        expectedSeedToken: Int? = nil,
+        expectedTokens: [Int]? = nil,
         steps: Int? = nil,
         decodeSteps: Int? = nil,
         validationDelayMilliseconds: Int? = nil
@@ -2814,6 +2837,8 @@ private final class RuntimeWorkerClient {
             promptTokens: promptTokens,
             token: token,
             seedTokens: seedTokens,
+            expectedSeedToken: expectedSeedToken,
+            expectedTokens: expectedTokens,
             steps: steps,
             decodeSteps: decodeSteps,
             validationDelayMilliseconds: validationDelayMilliseconds

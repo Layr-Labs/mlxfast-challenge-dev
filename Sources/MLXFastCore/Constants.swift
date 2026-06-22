@@ -24,7 +24,11 @@ public enum MLXFastConstants {
     public static let benchmarkPrefillPromptTokens = 512
     public static let benchmarkDecodeSteps = 256
     public static let quickBenchmarkDecodeSteps = 64
-    public static let benchmarkDecodeSeedTokens = 32
+    // Seed measured decode with the full prompt. A short instruction-prefix
+    // seed can free-run differently across Apple Silicon/MLX versions even
+    // when teacher-forced correctness agrees, which makes the timed oracle
+    // fragile for reasons unrelated to kernel performance.
+    public static let benchmarkDecodeSeedTokens = 512
     public static let benchmarkPrefillWarmupRuns = 1
     public static let benchmarkPrefillTimedRuns = 1
     public static let defaultMaxTransformedWeightsBytes = 50 * 1024 * 1024 * 1024
