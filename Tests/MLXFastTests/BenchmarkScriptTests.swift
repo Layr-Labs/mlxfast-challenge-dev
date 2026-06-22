@@ -47,6 +47,42 @@ func benchmarkWorkflowRunsTransformOfflineAfterSetup() throws {
 }
 
 @Test
+func ciSubmissionSmokeTestUsesIsolatedWorkspace() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/ci.yml",
+        encoding: .utf8
+    )
+
+    #expect(workflow.contains("WORKSPACE=\"${RUNNER_TEMP}/mlxfast-submit-smoke\""))
+    #expect(workflow.contains("git -C \"${WORKSPACE}\" -c user.name=\"CI\" -c user.email=\"ci@example.test\" commit -m \"base\""))
+    #expect(workflow.contains("\"${BIN}\" submit --contract \"${WORKSPACE}/benchmark.json\" --base-ref HEAD --output /tmp/mlxfast-submission.zip"))
+    #expect(!workflow.contains(".build/release/mlxfast-swift submit --output /tmp/mlxfast-submission.zip"))
+}
+
+@Test
+func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/reference-cache-probe.yml",
+        encoding: .utf8
+    )
+    let ci = try String(
+        contentsOfFile: ".github/workflows/ci.yml",
+        encoding: .utf8
+    )
+
+    #expect(workflow.contains("name: reference-cache-probe"))
+    #expect(workflow.contains("workflow_dispatch:"))
+    #expect(!workflow.contains("pull_request:"))
+    #expect(!workflow.contains("push:"))
+    #expect(workflow.contains("cache_scope:"))
+    #expect(workflow.contains("actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809"))
+    #expect(workflow.contains("actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809"))
+    #expect(workflow.contains(".github/scripts/download-reference-cache-scope.sh \"${CACHE_SCOPE}\""))
+    #expect(workflow.contains("MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: \"0\""))
+    #expect(ci.contains("bash -n .github/scripts/download-reference-cache-scope.sh"))
+}
+
+@Test
 func benchmarkWorkflowCanBeDispatchedFromCurrentRefForTesting() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/benchmark.yml",
@@ -300,6 +336,9 @@ func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
         prompts.path,
     ]
     process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = ProcessInfo.processInfo.environment.merging([
+        "MLXFAST_GITHUB_ANNOTATIONS": "0",
+    ]) { _, new in new }
 
     try process.run()
     process.waitUntilExit()

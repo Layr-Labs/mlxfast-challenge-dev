@@ -56,6 +56,7 @@ jobs:
           bash -n .github/scripts/verify-correctness-golden.sh
           bash -n .github/scripts/validate-benchmark-artifacts.sh
           bash -n .github/scripts/deny-private-artifacts.sh
+          bash -n .github/scripts/download-reference-cache-scope.sh
 
       - name: Build release CLI
         run: |
@@ -68,7 +69,26 @@ jobs:
 
       - name: Submission packaging smoke test
         run: |
-          .build/release/mlxfast-swift submit --output /tmp/mlxfast-submission.zip
+          BIN="${PWD}/.build/release/mlxfast-swift"
+          WORKSPACE="${RUNNER_TEMP}/mlxfast-submit-smoke"
+          rm -rf "${WORKSPACE}"
+          mkdir -p "${WORKSPACE}/Sources/MLXFastModel" "${WORKSPACE}/Sources/MLXFastTransform"
+          cat > "${WORKSPACE}/benchmark.json" <<'JSON'
+          {
+            "schemaVersion": 1,
+            "name": "mlxfast-submit-smoke",
+            "editablePaths": [
+              "Sources/MLXFastModel",
+              "Sources/MLXFastTransform"
+            ]
+          }
+          JSON
+          printf 'public enum SmokeModel {}\n' > "${WORKSPACE}/Sources/MLXFastModel/SmokeModel.swift"
+          printf 'public enum SmokeTransform {}\n' > "${WORKSPACE}/Sources/MLXFastTransform/SmokeTransform.swift"
+          git -C "${WORKSPACE}" init
+          git -C "${WORKSPACE}" add benchmark.json Sources
+          git -C "${WORKSPACE}" -c user.name="CI" -c user.email="ci@example.test" commit -m "base"
+          "${BIN}" submit --contract "${WORKSPACE}/benchmark.json" --base-ref HEAD --output /tmp/mlxfast-submission.zip
           test -s /tmp/mlxfast-submission.zip
 
       - name: Login smoke test
