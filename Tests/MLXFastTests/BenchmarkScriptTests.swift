@@ -313,6 +313,9 @@ func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
         prompts.path,
     ]
     process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = ProcessInfo.processInfo.environment.merging([
+        "MLXFAST_GITHUB_ANNOTATIONS": "0",
+    ]) { _, new in new }
 
     try process.run()
     process.waitUntilExit()

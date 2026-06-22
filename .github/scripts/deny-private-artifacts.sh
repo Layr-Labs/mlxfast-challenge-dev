@@ -13,7 +13,11 @@ fi
 fail() {
   local path="$1"
   local message="$2"
-  echo "::error file=${path}::${message}" >&2
+  if [[ "${MLXFAST_GITHUB_ANNOTATIONS:-1}" == "0" ]]; then
+    echo "${path}: ${message}" >&2
+  else
+    echo "::error file=${path}::${message}" >&2
+  fi
   exit 1
 }
 
