@@ -28,7 +28,7 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("if ! verify_reference_manifest \"${reference_dir}\"; then"))
     #expect(setup.contains("downloaded ${total}/${total} safetensors shard(s)"))
     #expect(setup.contains("setup.sh: setup complete elapsed="))
-    #expect(setup.contains(".github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference \"${REFERENCE_DIR}\""))
+    #expect(setup.contains("MLXFAST_OFFLINE_WRITABLE_PATHS=\"${PWD}/weights\" .github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference \"${REFERENCE_DIR}\" --output weights"))
     #expect(setup.contains("${SWIFT_BIN} correctness --weights weights"))
 }
 
@@ -44,7 +44,10 @@ func benchmarkWorkflowRunsTransformOfflineAfterSetup() throws {
     #expect(setupRange.lowerBound < transformRange.lowerBound)
     #expect(workflow.contains("MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main"))
     #expect(workflow.contains("MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: \"0\""))
-    #expect(workflow.contains("run: .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --reference \"${MLXFAST_REFERENCE_DIR}\""))
+    #expect(workflow.contains("MLXFAST_OFFLINE_WRITABLE_PATHS=\"${PWD}/weights\""))
+    #expect(workflow.contains(".github/scripts/run-offline.sh .build/release/mlxfast-swift transform"))
+    #expect(workflow.contains("--reference \"${MLXFAST_REFERENCE_DIR}\""))
+    #expect(workflow.contains("--output weights"))
 }
 
 @Test
@@ -141,11 +144,18 @@ func offlineRunnerProvesNetworkIsBlockedBeforeRunningCommand() throws {
         encoding: .utf8
     )
 
-    #expect(runner.contains("sandbox-exec -f \"${SANDBOX_PROFILE}\""))
-    #expect(runner.contains("curl -fsS --max-time 10 https://example.com"))
+    #expect(runner.contains("(deny network*)"))
+    #expect(runner.contains("(deny process-fork)"))
+    #expect(runner.contains("(deny process-exec*)"))
+    #expect(runner.contains("(allow process-exec (literal"))
+    #expect(runner.contains("(deny file-write*)"))
+    #expect(runner.contains("MLXFAST_OFFLINE_WRITABLE_PATHS"))
+    #expect(runner.contains("write_allowed_writes"))
+    #expect(runner.contains("-fsS --max-time 10 https://example.com"))
     #expect(runner.contains("sandbox profile did not block network access; refusing to run"))
-    #expect(runner.contains("HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1"))
-    #expect(runner.contains("HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9"))
+    #expect(runner.contains("network egress and child process execution are blocked"))
+    #expect(runner.contains("export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1"))
+    #expect(runner.contains("export HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9"))
 }
 
 @Test
@@ -158,11 +168,25 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
         contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
         encoding: .utf8
     )
+    let cli = try String(
+        contentsOfFile: "Sources/MLXFastCLI/main.swift",
+        encoding: .utf8
+    )
 
     #expect(benchmark.contains("MLXFAST_PRIVATE_DIR"))
     #expect(benchmark.contains("(deny file-read* (subpath"))
     #expect(benchmark.contains("(deny file-write* (subpath"))
+    #expect(benchmark.contains("(deny process-fork)"))
+    #expect(benchmark.contains("(deny process-exec*)"))
+    #expect(benchmark.contains("(deny file-write*)"))
+    #expect(benchmark.contains("(allow process-exec (literal"))
+    #expect(!benchmark.contains("(allow network* (remote ip \"localhost:*\"))"))
+    #expect(!benchmark.contains("(allow network* (local unix-socket))"))
     #expect(runtime.contains("\"MLXFAST_PRIVATE_DIR\""))
+    #expect(cli.contains("(deny process-fork)"))
+    #expect(cli.contains("(deny process-exec*)"))
+    #expect(cli.contains("(deny file-write*)"))
+    #expect(!cli.contains("(allow network* (remote ip \\\"localhost:*\\\"))"))
 }
 
 @Test
@@ -174,8 +198,40 @@ func benchmarkScriptAvoidsNestedSandboxWithRuntimeWorker() throws {
 
     #expect(benchmark.contains("Blacksmith rejects nested sandbox-exec"))
     #expect(benchmark.contains("if [[ \"${USE_RUNTIME_WORKER}\" != \"1\" && \"${MLXFAST_IN_SANDBOX:-0}\" != \"1\" && \"${MLXFAST_NO_SANDBOX:-0}\" != \"1\" ]]; then"))
-    #expect(benchmark.contains("run_offline_command \"${SWIFT_BIN}\" transform --reference"))
-    #expect(benchmark.contains("run_offline_command \"${SWIFT_BIN}\" verify-transform --reference"))
+    #expect(benchmark.contains("run_offline_writable_command \"$(absolute_path \"${WEIGHTS_PATH}\")\""))
+    #expect(benchmark.contains("run_offline_writable_command \"$(absolute_path \"${VERIFY_TRANSFORM_TMP_PARENT}\")\""))
+    #expect(benchmark.contains("--tmp-parent \"${VERIFY_TRANSFORM_TMP_PARENT}\""))
+}
+
+@Test
+func overlayScriptRejectsDangerousArtifactsAfterCopy() throws {
+    let overlay = try String(
+        contentsOfFile: ".github/scripts/overlay-editable-paths.sh",
+        encoding: .utf8
+    )
+
+    #expect(overlay.contains("validate_overlay_tree \"${target_path}\""))
+    #expect(overlay.contains("overlaid editable paths must not contain symlinks"))
+    #expect(overlay.contains("overlaid editable paths must contain only regular files and directories"))
+    #expect(overlay.contains("-links +1"))
+    #expect(overlay.contains("setuid or setgid"))
+}
+
+@Test
+func runtimeWorkerBenchmarkDecodeDoesNotReceiveBulkOracle() throws {
+    let runtime = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
+        encoding: .utf8
+    )
+
+    #expect(runtime.contains("kind: \"decode_begin\""))
+    #expect(runtime.contains("kind: \"decode_step\""))
+    #expect(runtime.contains("worker.decodeStep(inputToken: inputToken)"))
+    #expect(!runtime.contains("expected_seed_token"))
+    #expect(!runtime.contains("case decodeSteps = \"decode_steps\""))
+    #expect(!runtime.contains("validation_delay_ms"))
+    #expect(!runtime.contains("case secondsPerToken = \"seconds_per_token\""))
+    #expect(!runtime.contains("case bandwidthGBPerToken = \"bandwidth_gb_per_token\""))
 }
 
 @Test

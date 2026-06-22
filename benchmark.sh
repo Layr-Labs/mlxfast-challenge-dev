@@ -58,20 +58,20 @@ write_runtime_worker_sandbox_profile() {
   local profile
   local golden_absolute
   local private_dir_absolute
-  profile="$(mktemp "${TMPDIR:-/tmp}/mlxfast-runtime-worker.XXXXXX.sb")"
+  local swift_absolute
+  profile="$(mktemp "${TMPDIR:-/tmp}/mlxfast-runtime-worker.XXXXXX")"
   golden_absolute="$(absolute_path "${GOLDEN_PATH}")"
+  swift_absolute="$(absolute_path "${SWIFT_BIN}")"
   {
     cat <<EOF
 (version 1)
 (allow default)
 (deny network*)
-(allow network* (remote ip "localhost:*"))
-(allow network* (local unix-socket))
-(allow network* (remote unix-socket))
-(allow network-bind (local ip "localhost:*"))
-(allow network-inbound (local ip "localhost:*"))
+(deny process-fork)
+(deny process-exec*)
+(allow process-exec (literal "$(sandbox_escape "${swift_absolute}")"))
+(deny file-write*)
 (deny file-read* (literal "$(sandbox_escape "${golden_absolute}")"))
-(deny file-write* (literal "$(sandbox_escape "${golden_absolute}")"))
 EOF
     if [[ -n "${MLXFAST_PRIVATE_DIR:-}" ]]; then
       private_dir_absolute="$(absolute_path "${MLXFAST_PRIVATE_DIR}")"
@@ -90,6 +90,16 @@ run_offline_command() {
     return 0
   fi
   .github/scripts/run-offline.sh "$@"
+}
+
+run_offline_writable_command() {
+  local writable_paths="$1"
+  shift
+  if [[ "${MLXFAST_IN_SANDBOX:-0}" == "1" || "${MLXFAST_NO_SANDBOX:-0}" == "1" ]]; then
+    "$@"
+    return 0
+  fi
+  MLXFAST_OFFLINE_WRITABLE_PATHS="${writable_paths}" .github/scripts/run-offline.sh "$@"
 }
 
 score_metric_string() {
@@ -198,7 +208,8 @@ elif [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f "${WEIGHTS_PATH}/config.j
   if [[ -f "${REFERENCE_PATH}/config.json" ]]; then
     echo "benchmark.sh: regenerating weights with Swift transform"
     clear_weights_dir
-    run_offline_command "${SWIFT_BIN}" transform --reference "${REFERENCE_PATH}" --output "${WEIGHTS_PATH}"
+    run_offline_writable_command "$(absolute_path "${WEIGHTS_PATH}")" \
+      "${SWIFT_BIN}" transform --reference "${REFERENCE_PATH}" --output "${WEIGHTS_PATH}"
     if [[ ! -f "${WEIGHTS_PATH}/config.json" ]]; then
       echo "benchmark.sh: Swift transform did not produce ${WEIGHTS_PATH}/config.json" >&2
       exit 1
@@ -221,8 +232,27 @@ if [[ "${MLXFAST_VERIFY_TRANSFORM:-0}" == "1" ]]; then
     echo "benchmark.sh: MLXFAST_VERIFY_TRANSFORM=1 requires reference weights at ${REFERENCE_PATH}" >&2
     exit 1
   fi
+  VERIFY_TRANSFORM_TMP_PARENT="${MLXFAST_VERIFY_TRANSFORM_TMP_PARENT:-.mlxfast-transform-verify}"
+  case "${VERIFY_TRANSFORM_TMP_PARENT}" in
+    ""|"/")
+      echo "benchmark.sh: refusing unsafe transform verification tmp parent '${VERIFY_TRANSFORM_TMP_PARENT}'" >&2
+      exit 1
+      ;;
+  esac
+  rm -rf "${VERIFY_TRANSFORM_TMP_PARENT}"
+  mkdir -p "${VERIFY_TRANSFORM_TMP_PARENT}"
   echo "benchmark.sh: verifying weights match a fresh run of the submitted Swift transform"
-  run_offline_command "${SWIFT_BIN}" verify-transform --reference "${REFERENCE_PATH}" --weights "${WEIGHTS_PATH}"
+  if run_offline_writable_command "$(absolute_path "${VERIFY_TRANSFORM_TMP_PARENT}")" \
+    "${SWIFT_BIN}" verify-transform \
+    --reference "${REFERENCE_PATH}" \
+    --weights "${WEIGHTS_PATH}" \
+    --tmp-parent "${VERIFY_TRANSFORM_TMP_PARENT}"; then
+    rm -rf "${VERIFY_TRANSFORM_TMP_PARENT}"
+  else
+    status="$?"
+    rm -rf "${VERIFY_TRANSFORM_TMP_PARENT}"
+    exit "${status}"
+  fi
 fi
 
 rm -f "${SCORE_PATH}"

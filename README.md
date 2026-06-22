@@ -13,8 +13,10 @@ See [CHALLENGE.md](CHALLENGE.md) for the full problem statement, scoring formula
 
 # Optional: split dense weights into weights/ and write the expert streaming
 # manifest. setup.sh prints this command with the exact reference path it used.
-.github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
-  --reference .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
+MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+  .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+  --reference .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main \
+  --output weights
 
 # Run the checked-in public correctness gate.
 .build/release/mlxfast-swift correctness --weights weights

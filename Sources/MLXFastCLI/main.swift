@@ -320,7 +320,10 @@ private enum MLXFastCLI {
            let blockedGoldenPath,
            !blockedGoldenPath.isEmpty
         {
-            sandboxProfile = try writeRuntimeWorkerSandboxProfile(blockedGoldenPath: blockedGoldenPath)
+            sandboxProfile = try writeRuntimeWorkerSandboxProfile(
+                blockedGoldenPath: blockedGoldenPath,
+                allowedExecutablePath: executablePath
+            )
         }
         return RuntimeWorkerOptions(
             executablePath: executablePath,
@@ -328,7 +331,10 @@ private enum MLXFastCLI {
         )
     }
 
-    private static func writeRuntimeWorkerSandboxProfile(blockedGoldenPath: String) throws -> String {
+    private static func writeRuntimeWorkerSandboxProfile(
+        blockedGoldenPath: String,
+        allowedExecutablePath: String
+    ) throws -> String {
         let sandboxExecutable = "/usr/bin/sandbox-exec"
         guard FileManager.default.isExecutableFile(atPath: sandboxExecutable) else {
             throw MLXFastError.invalidInput("sandbox-exec not found for runtime worker sandbox")
@@ -336,17 +342,16 @@ private enum MLXFastCLI {
         let profileURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("mlxfast-runtime-worker-\(UUID().uuidString).sb")
         let absoluteGoldenPath = absolutePath(blockedGoldenPath)
+        let absoluteExecutablePath = absolutePath(allowedExecutablePath)
         let profile = """
         (version 1)
         (allow default)
         (deny network*)
-        (allow network* (remote ip "localhost:*"))
-        (allow network* (local unix-socket))
-        (allow network* (remote unix-socket))
-        (allow network-bind (local ip "localhost:*"))
-        (allow network-inbound (local ip "localhost:*"))
+        (deny process-fork)
+        (deny process-exec*)
+        (allow process-exec (literal "\(seatbeltEscaped(absoluteExecutablePath))"))
+        (deny file-write*)
         (deny file-read* (literal "\(seatbeltEscaped(absoluteGoldenPath))"))
-        (deny file-write* (literal "\(seatbeltEscaped(absoluteGoldenPath))"))
         """
         try profile.write(to: profileURL, atomically: true, encoding: .utf8)
         return profileURL.path

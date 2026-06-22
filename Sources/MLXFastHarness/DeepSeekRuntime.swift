@@ -524,26 +524,10 @@ public enum DeepSeekRuntime {
                 peakRamGB: currentResidentMemoryGB()
             )
 
-        case "decode":
-            guard let seedTokens = request.seedTokens, let decodeSteps = request.decodeSteps else {
-                throw MLXFastError.invalidInput("runtime worker decode request missing seed_tokens or decode_steps")
+        case "decode_begin":
+            guard let seedTokens = request.seedTokens else {
+                throw MLXFastError.invalidInput("runtime worker decode_begin request missing seed_tokens")
             }
-            guard let expectedSeedToken = request.expectedSeedToken,
-                  let expectedTokens = request.expectedTokens else {
-                throw MLXFastError.invalidInput("runtime worker decode request missing expected benchmark tokens")
-            }
-            guard expectedTokens.count >= decodeSteps else {
-                throw MLXFastError.invalidInput(
-                    "runtime worker decode oracle has \(expectedTokens.count) tokens; need at least \(decodeSteps)"
-                )
-            }
-            let validationDelayMS = try request.validationDelayMilliseconds
-                ?? submissionValidationDelayMilliseconds()
-            guard validationDelayMS >= 0 else {
-                throw MLXFastError.invalidInput("runtime worker validation delay must be non-negative")
-            }
-            let timingPlan = try DecodeTimingPlan(seedTokenCount: seedTokens.count, decodeSteps: decodeSteps)
-
             let warmupCache = DeepSeekModelCache(config: weightCache.config)
             let warmupLogits = try DeepSeekModel.logits(
                 inputIDs: inputIDsArray(seedTokens),
@@ -555,49 +539,56 @@ public enum DeepSeekRuntime {
             Memory.clearCache()
 
             let cache = DeepSeekModelCache(config: weightCache.config)
-            var logits = try DeepSeekModel.logits(
+            let logits = try DeepSeekModel.logits(
                 inputIDs: inputIDsArray(seedTokens),
                 weightCache: weightCache,
                 cache: cache,
                 positionOffset: 0
             )
-            var token = try DeepSeekCorrectness.greedyToken(from: logits)
+            let token = try DeepSeekCorrectness.greedyToken(from: logits)
             let seedToken = token
             cache.materializeCachedState()
+            state.decodeCache = cache
+            state.decodeSeedTokenCount = seedTokens.count
+            state.decodeStep = 0
 
-            var actualTokens: [Int] = []
-            actualTokens.reserveCapacity(timingPlan.decodeSteps)
-            let metricsBeforeDecode = weightCache.loader.expertStreamingMetrics?.snapshot()
-            let start = DispatchTime.now().uptimeNanoseconds
-            for decodedStep in 0..<timingPlan.decodeSteps {
-                let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
-                logits = try DeepSeekModel.logits(
-                    inputIDs: inputIDsArray([inputToken]),
-                    weightCache: weightCache,
-                    cache: cache,
-                    positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
-                )
-                token = try DeepSeekCorrectness.greedyToken(from: logits)
-                actualTokens.append(token)
-                if validationDelayMS > 0 {
-                    Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
-                }
-            }
-            let elapsed = secondsSince(start)
-            let bandwidth = try expertStreamingBandwidthGBPerToken(
-                before: metricsBeforeDecode,
-                after: weightCache.loader.expertStreamingMetrics?.snapshot(),
-                decodedTokens: timingPlan.decodeSteps
-            )
             return RuntimeWorkerResponse(
                 id: request.id,
                 ok: true,
                 seedToken: seedToken,
-                tokens: actualTokens,
+                expertStats: expertStats(from: weightCache),
+                peakRamGB: currentResidentMemoryGB()
+            )
+
+        case "decode_step":
+            guard let inputToken = request.token else {
+                throw MLXFastError.invalidInput("runtime worker decode_step request missing token")
+            }
+            guard let cache = state.decodeCache else {
+                throw MLXFastError.invalidInput("runtime worker decode_step before decode_begin")
+            }
+            let validationDelayMS = try submissionValidationDelayMilliseconds()
+            guard validationDelayMS >= 0 else {
+                throw MLXFastError.invalidInput("runtime worker validation delay must be non-negative")
+            }
+            let start = DispatchTime.now().uptimeNanoseconds
+            let logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray([inputToken]),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: state.decodeSeedTokenCount + state.decodeStep
+            )
+            let token = try DeepSeekCorrectness.greedyToken(from: logits)
+            if validationDelayMS > 0 {
+                Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
+            }
+            let elapsed = secondsSince(start)
+            state.decodeStep += 1
+            return RuntimeWorkerResponse(
+                id: request.id,
+                ok: true,
+                token: token,
                 seconds: elapsed,
-                secondsPerToken: elapsed / Double(timingPlan.decodeSteps),
-                bandwidthGBPerToken: bandwidth.gbPerToken,
-                bandwidthSource: bandwidth.source,
                 expertStats: expertStats(from: weightCache),
                 peakRamGB: currentResidentMemoryGB()
             )
@@ -914,43 +905,45 @@ public enum DeepSeekRuntime {
                     + "benchmark_oracle=\(golden.benchmark == nil ? "missing" : "present")"
             )
 
-            progress("runtime worker start")
-            let worker = try RuntimeWorkerClient(
-                options: workerOptions,
-                weightsPath: options.weightsPath
-            )
-            defer {
-                worker.close()
-            }
-
             let correctnessStart = DispatchTime.now().uptimeNanoseconds
             progress("correctness start cases=\(golden.cases.count)")
             var checkedSteps = 0
             var firstFailingCase: String?
             var firstFailingComparison: CorrectnessTokenComparison?
-            for (caseIndex, testCase) in golden.cases.enumerated() {
-                let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
-                progress("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
-                let result = try compareTeacherForcedWithWorker(
-                    testCase: testCase,
-                    worker: worker,
-                    steps: options.correctnessSteps,
-                    progressIntervalSteps: 64,
-                    progress: { step, total in
-                        progress("correctness case \(caseLabel) checked \(step)/\(total) tokens")
-                    }
+            progress("correctness worker start")
+            do {
+                let correctnessWorker = try RuntimeWorkerClient(
+                    options: workerOptions,
+                    weightsPath: options.weightsPath
                 )
-                lastExpertStats = result.expertStats
-                peakRamGB = max(peakRamGB, result.peakRamGB)
-                let comparison = result.comparison
-                checkedSteps += comparison.checkedSteps
-                if !comparison.passed {
-                    firstFailingCase = testCase.name
-                    firstFailingComparison = comparison
-                    progress("correctness case \(caseLabel) failed step=\(comparison.firstFailingStep ?? -1)")
-                    break
+                defer {
+                    correctnessWorker.close()
                 }
-                progress("correctness case \(caseLabel) complete checked_steps=\(comparison.checkedSteps)")
+
+                for (caseIndex, testCase) in golden.cases.enumerated() {
+                    let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
+                    progress("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
+                    let result = try compareTeacherForcedWithWorker(
+                        testCase: testCase,
+                        worker: correctnessWorker,
+                        steps: options.correctnessSteps,
+                        progressIntervalSteps: 64,
+                        progress: { step, total in
+                            progress("correctness case \(caseLabel) checked \(step)/\(total) tokens")
+                        }
+                    )
+                    lastExpertStats = result.expertStats
+                    peakRamGB = max(peakRamGB, result.peakRamGB)
+                    let comparison = result.comparison
+                    checkedSteps += comparison.checkedSteps
+                    if !comparison.passed {
+                        firstFailingCase = testCase.name
+                        firstFailingComparison = comparison
+                        progress("correctness case \(caseLabel) failed step=\(comparison.firstFailingStep ?? -1)")
+                        break
+                    }
+                    progress("correctness case \(caseLabel) complete checked_steps=\(comparison.checkedSteps)")
+                }
             }
             correctnessSeconds = secondsSince(correctnessStart)
             let correctness = CorrectnessReport(
@@ -995,13 +988,23 @@ public enum DeepSeekRuntime {
                     + "decode_tokens=\(options.benchmarkDecodeSteps)"
             )
             progress("mactop idle measurement skipped; runtime worker uses expert streaming byte fallback")
+            progress("benchmark worker start")
+            let benchmarkWorker = try RuntimeWorkerClient(
+                options: workerOptions,
+                weightsPath: options.weightsPath
+            )
+            defer {
+                benchmarkWorker.close()
+            }
+            peakRamGB = 0
+            lastExpertStats = .zero
 
             let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
             progress("timed benchmark start")
             let prefillSecondsPerToken = try measureWorkerPrefillSecondsPerToken(
                 promptTokens: promptPlan.prefillTokens,
                 expectedToken: promptPlan.expectedPrefillToken,
-                worker: worker,
+                worker: benchmarkWorker,
                 progress: progress,
                 peakRamGB: &peakRamGB,
                 expertStats: &lastExpertStats
@@ -1011,7 +1014,7 @@ public enum DeepSeekRuntime {
                 expectedSeedToken: promptPlan.expectedDecodeSeedToken,
                 expectedTokens: promptPlan.expectedDecodeTokens,
                 decodeSteps: options.benchmarkDecodeSteps,
-                worker: worker,
+                worker: benchmarkWorker,
                 progress: progress,
                 peakRamGB: &peakRamGB,
                 expertStats: &lastExpertStats
@@ -1485,16 +1488,12 @@ public enum DeepSeekRuntime {
             )
         }
         progress?("decode measured start tokens=\(decodeSteps)")
-        let response = try worker.decode(
-            seedTokens: seedTokens,
-            expectedSeedToken: expectedSeedToken,
-            expectedTokens: expectedTokens,
-            decodeSteps: decodeSteps
-        )
-        expertStats = response.expertStats ?? expertStats
-        peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
-        guard let seedToken = response.seedToken else {
-            throw MLXFastError.invalidInput("runtime worker decode response missing seed token")
+        let beginResponse = try worker.beginDecode(seedTokens: seedTokens)
+        let statsBeforeDecode = beginResponse.expertStats
+        expertStats = beginResponse.expertStats ?? expertStats
+        peakRamGB = max(peakRamGB, beginResponse.peakRamGB ?? 0)
+        guard let seedToken = beginResponse.seedToken else {
+            throw MLXFastError.invalidInput("runtime worker decode_begin response missing seed token")
         }
         try requireBenchmarkMatch(
             BenchmarkOutputValidator.compareDecodeSeedToken(
@@ -1502,34 +1501,91 @@ public enum DeepSeekRuntime {
                 actualToken: seedToken
             )
         )
-        let actualTokens = response.tokens ?? []
-        try requireBenchmarkMatch(
-            BenchmarkOutputValidator.compareDecodeTokens(
-                expectedTokens: Array(expectedTokens.prefix(decodeSteps)),
-                actualTokens: actualTokens
+
+        var actualTokens: [Int] = []
+        actualTokens.reserveCapacity(decodeSteps)
+        var measuredSeconds = 0.0
+        for decodedStep in 0..<decodeSteps {
+            let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
+            let response = try worker.decodeStep(inputToken: inputToken)
+            expertStats = response.expertStats ?? expertStats
+            peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
+            guard let token = response.token, let elapsed = response.seconds else {
+                throw MLXFastError.invalidInput("runtime worker decode_step response missing token or seconds")
+            }
+            measuredSeconds += elapsed
+            actualTokens.append(token)
+            let expectedToken = expectedTokens[decodedStep]
+            if token != expectedToken {
+                throw BenchmarkTokenMismatchError(
+                    comparison: BenchmarkTokenComparison(
+                        passed: false,
+                        label: "benchmark decode token",
+                        step: decodedStep,
+                        expectedToken: expectedToken,
+                        actualToken: token
+                    )
+                )
+            }
+            reportProgress(
+                step: decodedStep + 1,
+                total: decodeSteps,
+                intervalSteps: 64,
+                progress: { step, total in
+                    progress?("decode measured generated \(step)/\(total) tokens")
+                }
             )
-        )
-        guard let secondsPerToken = response.secondsPerToken,
-              let bandwidthGBPerToken = response.bandwidthGBPerToken,
-              let bandwidthSource = response.bandwidthSource else {
-            throw MLXFastError.invalidInput("runtime worker decode response missing timing or bandwidth")
         }
+
+        let bandwidth = try expertStreamingBandwidthGBPerToken(
+            before: statsBeforeDecode,
+            after: expertStats,
+            decodedTokens: decodeSteps
+        )
+        let secondsPerToken = measuredSeconds / Double(decodeSteps)
+        let actualTokensComparison = BenchmarkOutputValidator.compareDecodeTokens(
+            expectedTokens: Array(expectedTokens.prefix(decodeSteps)),
+            actualTokens: actualTokens
+        )
+        try requireBenchmarkMatch(actualTokensComparison)
         progress?(
-            "decode measured complete seconds=\(formatSeconds(response.seconds ?? 0)) "
+            "decode measured complete seconds=\(formatSeconds(measuredSeconds)) "
                 + "seconds_per_token=\(formatDouble(secondsPerToken)) "
-                + "bandwidth_gb_per_token=\(formatDouble(bandwidthGBPerToken)) "
-                + "bandwidth_source=\(bandwidthSource)"
+                + "bandwidth_gb_per_token=\(formatDouble(bandwidth.gbPerToken)) "
+                + "bandwidth_source=\(bandwidth.source)"
         )
         return DecodeMeasurement(
             secondsPerToken: secondsPerToken,
-            bandwidthGBPerToken: bandwidthGBPerToken,
-            bandwidthSource: bandwidthSource
+            bandwidthGBPerToken: bandwidth.gbPerToken,
+            bandwidthSource: bandwidth.source
         )
     }
 
     private static func expertStreamingBandwidthGBPerToken(
         before: ExpertStreamingMetrics.Snapshot?,
         after: ExpertStreamingMetrics.Snapshot?,
+        decodedTokens: Int
+    ) throws -> (gbPerToken: Double, source: String) {
+        guard decodedTokens > 0 else {
+            throw MLXFastError.invalidInput("benchmark decode steps must be positive")
+        }
+        guard let after else {
+            throw MLXFastError.invalidInput("expert streaming metrics unavailable for bandwidth fallback")
+        }
+        let beforeBytes = before?.bytesRead ?? 0
+        let bytesRead = after.bytesRead >= beforeBytes ? after.bytesRead - beforeBytes : after.bytesRead
+        guard bytesRead > 0 else {
+            throw MLXFastError.invalidInput("expert streaming bandwidth fallback observed no decoded expert reads")
+        }
+        return (
+            Double(bytesRead) / Double(1 << 30) / Double(decodedTokens),
+            "expert_streaming_reads"
+        )
+    }
+
+    private static func expertStreamingBandwidthGBPerToken(
+        before: ExpertStreamingStats?,
+        after: ExpertStreamingStats?,
         decodedTokens: Int
     ) throws -> (gbPerToken: Double, source: String) {
         guard decodedTokens > 0 else {
@@ -2451,11 +2507,7 @@ private struct RuntimeWorkerRequest: Codable {
     let promptTokens: [Int]?
     let token: Int?
     let seedTokens: [Int]?
-    let expectedSeedToken: Int?
-    let expectedTokens: [Int]?
     let steps: Int?
-    let decodeSteps: Int?
-    let validationDelayMilliseconds: Int?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -2463,11 +2515,7 @@ private struct RuntimeWorkerRequest: Codable {
         case promptTokens = "prompt_tokens"
         case token
         case seedTokens = "seed_tokens"
-        case expectedSeedToken = "expected_seed_token"
-        case expectedTokens = "expected_tokens"
         case steps
-        case decodeSteps = "decode_steps"
-        case validationDelayMilliseconds = "validation_delay_ms"
     }
 }
 
@@ -2475,6 +2523,9 @@ private struct RuntimeWorkerState {
     var correctnessCache: DeepSeekModelCache?
     var correctnessPromptTokenCount = 0
     var correctnessStep = 0
+    var decodeCache: DeepSeekModelCache?
+    var decodeSeedTokenCount = 0
+    var decodeStep = 0
 }
 
 private struct RuntimeWorkerResponse: Codable {
@@ -2486,9 +2537,6 @@ private struct RuntimeWorkerResponse: Codable {
     let seedToken: Int?
     let tokens: [Int]?
     let seconds: Double?
-    let secondsPerToken: Double?
-    let bandwidthGBPerToken: Double?
-    let bandwidthSource: String?
     let expertStats: ExpertStreamingStats?
     let peakRamGB: Double?
 
@@ -2501,9 +2549,6 @@ private struct RuntimeWorkerResponse: Codable {
         seedToken: Int? = nil,
         tokens: [Int]? = nil,
         seconds: Double? = nil,
-        secondsPerToken: Double? = nil,
-        bandwidthGBPerToken: Double? = nil,
-        bandwidthSource: String? = nil,
         expertStats: ExpertStreamingStats? = nil,
         peakRamGB: Double? = nil
     ) {
@@ -2515,9 +2560,6 @@ private struct RuntimeWorkerResponse: Codable {
         self.seedToken = seedToken
         self.tokens = tokens
         self.seconds = seconds
-        self.secondsPerToken = secondsPerToken
-        self.bandwidthGBPerToken = bandwidthGBPerToken
-        self.bandwidthSource = bandwidthSource
         self.expertStats = expertStats
         self.peakRamGB = peakRamGB
     }
@@ -2531,9 +2573,6 @@ private struct RuntimeWorkerResponse: Codable {
         case seedToken = "seed_token"
         case tokens
         case seconds
-        case secondsPerToken = "seconds_per_token"
-        case bandwidthGBPerToken = "bandwidth_gb_per_token"
-        case bandwidthSource = "bandwidth_source"
         case expertStats = "expert_stats"
         case peakRamGB = "peak_ram_gb"
     }
@@ -2643,18 +2682,17 @@ private final class RuntimeWorkerClient {
         )
     }
 
-    func decode(
-        seedTokens: [Int],
-        expectedSeedToken: Int,
-        expectedTokens: [Int],
-        decodeSteps: Int
-    ) throws -> RuntimeWorkerResponse {
+    func beginDecode(seedTokens: [Int]) throws -> RuntimeWorkerResponse {
         try send(
-            kind: "decode",
-            seedTokens: seedTokens,
-            expectedSeedToken: expectedSeedToken,
-            expectedTokens: expectedTokens,
-            decodeSteps: decodeSteps
+            kind: "decode_begin",
+            seedTokens: seedTokens
+        )
+    }
+
+    func decodeStep(inputToken: Int) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "decode_step",
+            token: inputToken
         )
     }
 
@@ -2663,11 +2701,7 @@ private final class RuntimeWorkerClient {
         promptTokens: [Int]? = nil,
         token: Int? = nil,
         seedTokens: [Int]? = nil,
-        expectedSeedToken: Int? = nil,
-        expectedTokens: [Int]? = nil,
-        steps: Int? = nil,
-        decodeSteps: Int? = nil,
-        validationDelayMilliseconds: Int? = nil
+        steps: Int? = nil
     ) throws -> RuntimeWorkerResponse {
         guard process.isRunning else {
             throw MLXFastError.invalidInput("runtime worker exited before request \(kind): \(workerExitDiagnostic())")
@@ -2680,11 +2714,7 @@ private final class RuntimeWorkerClient {
             promptTokens: promptTokens,
             token: token,
             seedTokens: seedTokens,
-            expectedSeedToken: expectedSeedToken,
-            expectedTokens: expectedTokens,
-            steps: steps,
-            decodeSteps: decodeSteps,
-            validationDelayMilliseconds: validationDelayMilliseconds
+            steps: steps
         )
         var data = try encoder.encode(request)
         data.append(0x0a)

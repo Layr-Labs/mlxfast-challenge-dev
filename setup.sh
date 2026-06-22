@@ -80,7 +80,7 @@ Important environment variables:
   MLXFAST_MACTOP_BIN=/path/mactop    Use a specific mactop binary.
 
 After setup:
-  .github/scripts/run-offline.sh .build/release/mlxfast-swift transform
+  MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --output weights
   ./benchmark.sh
 EOF
 }
@@ -152,7 +152,7 @@ setup.sh: summary
   mlx.metallib: ${metallib_line}
   reference checkpoint: ${reference_line}
   next:
-    .github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference "${REFERENCE_DIR}"
+    MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" .github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference "${REFERENCE_DIR}" --output weights
     ${SWIFT_BIN} correctness --weights weights
     ./benchmark.sh  # requires organizer-supplied correctness_golden.json
 EOF

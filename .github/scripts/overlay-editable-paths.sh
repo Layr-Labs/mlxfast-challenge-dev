@@ -33,6 +33,26 @@ validate_contract_path() {
   esac
 }
 
+validate_overlay_tree() {
+  local path="$1"
+  if find "${path}" -type l -print -quit | grep -q .; then
+    echo "::error file=${path}::overlaid editable paths must not contain symlinks" >&2
+    exit 1
+  fi
+  if find "${path}" ! -type f ! -type d -print -quit | grep -q .; then
+    echo "::error file=${path}::overlaid editable paths must contain only regular files and directories" >&2
+    exit 1
+  fi
+  if find "${path}" -type f -links +1 -print -quit | grep -q .; then
+    echo "::error file=${path}::overlaid editable paths must not contain hardlinked files" >&2
+    exit 1
+  fi
+  if find "${path}" \( -perm -4000 -o -perm -2000 \) -print -quit | grep -q .; then
+    echo "::error file=${path}::overlaid editable paths must not contain setuid or setgid files" >&2
+    exit 1
+  fi
+}
+
 while IFS= read -r editable_path; do
   validate_contract_path "${editable_path}"
 
@@ -56,6 +76,7 @@ while IFS= read -r editable_path; do
   else
     cp "${source_path}" "${target_path}"
   fi
+  validate_overlay_tree "${target_path}"
 
   echo "benchmark: overlaid editable path ${editable_path}"
 done < <(jq -r '.editablePaths[]' "${CONTRACT_PATH}")

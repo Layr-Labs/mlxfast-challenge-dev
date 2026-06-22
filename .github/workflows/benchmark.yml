@@ -225,7 +225,13 @@ jobs:
 
       - name: Transform reference checkpoint
         if: ${{ !inputs.preserve_golden_only }}
-        run: .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --reference "${MLXFAST_REFERENCE_DIR}"
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" \
+            --output weights
 
       - name: Prepare correctness golden
         id: prepare-correctness-golden

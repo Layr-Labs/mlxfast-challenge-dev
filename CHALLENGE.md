@@ -193,12 +193,11 @@ help operators review runs but do not change the score formula.
 swift test
 MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test
 swift build -c release
-.github/scripts/run-offline.sh .build/release/mlxfast-swift transform
+MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --output weights
 .build/release/mlxfast-swift correctness --weights weights
 .build/release/mlxfast-swift preflight
 .build/release/mlxfast-swift benchmark --score-path score.json
 .build/release/mlxfast-swift benchmark --quick --score-path score.json
-.build/release/mlxfast-swift make-golden --prompt-file /path/to/private_prompts.json --output correctness_golden.json  # organizer/offline
 .build/release/mlxfast-swift verify-transform
 .build/release/mlxfast-swift clone
 .build/release/mlxfast-swift link <benchmark-id-or-name>
