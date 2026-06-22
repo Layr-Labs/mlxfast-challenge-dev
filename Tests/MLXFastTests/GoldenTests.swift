@@ -4,6 +4,34 @@ import Testing
 @testable import MLXFastCore
 
 @Test
+func checkedInPublicCorrectnessGoldenIsValid() throws {
+    let promptPath = MLXFastConstants.defaultPublicCorrectnessPromptPath
+    let promptData = try Data(contentsOf: URL(fileURLWithPath: promptPath))
+    let promptDigest = SHA256.hash(data: promptData)
+        .map { String(format: "%02x", $0) }
+        .joined()
+
+    #expect(promptDigest == "98f6a5c49523c891300978437074279c97bb8aa7af18cbf2645983cfbf15e781")
+    #expect(promptData.count == 2_735)
+
+    let path = MLXFastConstants.defaultPublicCorrectnessGoldenPath
+    let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    let digest = SHA256.hash(data: data)
+        .map { String(format: "%02x", $0) }
+        .joined()
+
+    #expect(digest == "2a747bf797e16d58f5ffedacc0d4bf5ce0d14be00f2421dc04289a2154cb011d")
+
+    let fixture = try loadGoldenFixture(from: path)
+    #expect(fixture.sha256 == digest)
+    #expect(fixture.benchmark == nil)
+    #expect(fixture.cases.count == 1)
+    #expect(fixture.cases[0].name == "longcopy-gate-english-512")
+    #expect(fixture.cases[0].promptTokens.count == MLXFastConstants.correctnessPromptTokens)
+    #expect(fixture.cases[0].expectedTokens.count == MLXFastConstants.correctnessSteps)
+}
+
+@Test
 func loadGoldenCasesAcceptsValidFixture() throws {
     let directory = try temporaryDirectory()
     let path = directory.appendingPathComponent("golden.json")

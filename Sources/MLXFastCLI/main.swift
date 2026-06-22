@@ -158,7 +158,7 @@ private enum MLXFastCLI {
             for: "--golden",
             default: environmentValue(
                 "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-                fallback: MLXFastConstants.defaultGoldenPath
+                fallback: defaultCorrectnessGoldenPath()
             )
         )
         let report = try DeepSeekRuntime.runCorrectness(
@@ -187,7 +187,7 @@ private enum MLXFastCLI {
             for: "--golden",
             default: environmentValue(
                 "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-                fallback: MLXFastConstants.defaultGoldenPath
+                fallback: defaultCorrectnessGoldenPath()
             )
         )
         let stepRaw = options.value(for: "--step", default: "")
@@ -758,6 +758,20 @@ private enum MLXFastCLI {
     private static func environmentValue(_ name: String, fallback: String) -> String {
         let value = ProcessInfo.processInfo.environment[name] ?? ""
         return value.isEmpty ? fallback : value
+    }
+
+    private static func defaultCorrectnessGoldenPath() -> String {
+        if FileManager.default.fileExists(atPath: MLXFastConstants.defaultGoldenPath) {
+            return MLXFastConstants.defaultGoldenPath
+        }
+        let publicPath = environmentValue(
+            "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH",
+            fallback: MLXFastConstants.defaultPublicCorrectnessGoldenPath
+        )
+        if FileManager.default.fileExists(atPath: publicPath) {
+            return publicPath
+        }
+        return MLXFastConstants.defaultGoldenPath
     }
 
     private static func parseMaxByteCount(

@@ -29,6 +29,7 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("downloaded ${total}/${total} safetensors shard(s)"))
     #expect(setup.contains("setup.sh: setup complete elapsed="))
     #expect(setup.contains(".github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference \"${REFERENCE_DIR}\""))
+    #expect(setup.contains("${SWIFT_BIN} correctness --weights weights"))
 }
 
 @Test
@@ -80,6 +81,7 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
     #expect(workflow.contains(".github/scripts/download-reference-cache-scope.sh \"${CACHE_SCOPE}\""))
     #expect(workflow.contains("MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: \"0\""))
     #expect(ci.contains("bash -n .github/scripts/download-reference-cache-scope.sh"))
+    #expect(ci.contains("bash -n .github/scripts/download-r2-object.sh"))
 }
 
 @Test
@@ -104,13 +106,32 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
         contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
+    let validator = try String(
+        contentsOfFile: ".github/scripts/validate-benchmark-artifacts.sh",
+        encoding: .utf8
+    )
 
     #expect(!workflow.contains("${{ runner.temp }}"))
     #expect(workflow.contains("MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}"))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json"))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt"))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 2a747bf797e16d58f5ffedacc0d4bf5ce0d14be00f2421dc04289a2154cb011d"))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"10320\""))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 830670206859a1b221508ae44a031205a3eba6f5f13e05b40383bf781bdbf067"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: \"26110\""))
+    #expect(workflow.contains("benchmark: using checked-in public correctness golden"))
+    #expect(workflow.contains("[[ -z \"${MLXFAST_CORRECTNESS_GOLDEN_URL:-}\" && \"${MLXFAST_RUN_BENCHMARK}\" == \"1\" && \"${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}\" == \"1\" ]]"))
+    #expect(!workflow.contains("generate_golden_only"))
+    #expect(!workflow.contains("MLXFAST_GENERATE_GOLDEN_ONLY"))
+    #expect(workflow.contains("inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success'"))
+    #expect(!workflow.contains("inputs.submission_ref == '' || steps.validate_benchmark_artifacts.outcome == 'success'"))
+    #expect(workflow.contains("!inputs.run_benchmark && inputs.trace_correctness_step != ''"))
+    #expect(!workflow.contains("results.tsv\n          if-no-files-found"))
+    #expect(validator.contains("and (.metrics.first_failing_case == null)"))
+    #expect(validator.contains("and (.metrics.expected_token == null)"))
+    #expect(validator.contains("and (.metrics.actual_token == null)"))
 }
 
 @Test

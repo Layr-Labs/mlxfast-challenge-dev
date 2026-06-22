@@ -3,6 +3,8 @@ public enum MLXFastConstants {
     public static let defaultReferencePath = "reference_weights/DeepSeek-V4-Flash-4bit"
     public static let defaultWeightsPath = "weights"
     public static let defaultGoldenPath = "correctness_golden.json"
+    public static let defaultPublicCorrectnessPromptPath = "correctness_prompts/public_longcopy_gate_english_512.txt"
+    public static let defaultPublicCorrectnessGoldenPath = "correctness_prompts/public_longcopy_gate_english_512_256.json"
     public static let defaultScorePath = "score.json"
 
     public static let vocabSize = 129_280

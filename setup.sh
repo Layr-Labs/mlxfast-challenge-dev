@@ -153,7 +153,8 @@ setup.sh: summary
   reference checkpoint: ${reference_line}
   next:
     .github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference "${REFERENCE_DIR}"
-    ./benchmark.sh
+    ${SWIFT_BIN} correctness --weights weights
+    ./benchmark.sh  # requires organizer-supplied correctness_golden.json
 EOF
 }
 

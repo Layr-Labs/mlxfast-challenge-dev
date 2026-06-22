@@ -16,16 +16,20 @@ See [CHALLENGE.md](CHALLENGE.md) for the full problem statement, scoring formula
 .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
   --reference .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
 
+# Run the checked-in public correctness gate.
+.build/release/mlxfast-swift correctness --weights weights
+
 # Run the Darkbloom-compatible benchmark entrypoint.
-# Requires the organizer-supplied correctness_golden.json.
+# Official benchmark runs use the organizer-supplied hidden correctness_golden.json.
 ./benchmark.sh
 
-# Faster local iteration: checks the same public/local golden prefix, measures
-# the same 512-token prefill, measures 64 decode tokens, writes score.json, and
-# prints score.json to stdout. The official score still comes from ./benchmark.sh.
+# Faster benchmark iteration when a local golden with a benchmark oracle is
+# available: checks 64 correctness tokens, measures 64 decode tokens, writes
+# score.json, and prints score.json to stdout.
 ./benchmark.sh --quick
 
 # Or call the Swift CLI directly
+.build/release/mlxfast-swift correctness --weights weights
 .build/release/mlxfast-swift preflight
 .build/release/mlxfast-swift benchmark --score-path score.json
 .build/release/mlxfast-swift benchmark --quick --score-path score.json
@@ -36,10 +40,12 @@ See [CHALLENGE.md](CHALLENGE.md) for the full problem statement, scoring formula
 ```
 
 The benchmark writes `score.json` in the format consumed by Darkbloom.
-`score.json` is a generated local output and is not tracked. The fixed
-`correctness_golden.json` is also not tracked in the public repo; the benchmark
-operator supplies it, or points the harness at it with
-`MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json`.
+`score.json` is a generated local output and is not tracked. Public
+correctness-only workflow runs use the checked-in
+`correctness_prompts/public_longcopy_gate_english_512_256.json` golden and
+matching prompt text. Official benchmark runs use a hidden
+`correctness_golden.json` supplied by the benchmark operator, or a harness path
+set with `MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json`.
 `benchmark.sh` also writes `score.json.sha256` and `benchmark-integrity.json`,
 which record the score file hash, golden hash, transformed `weights/` hash, and
 transform source hash for run auditing.
@@ -76,14 +82,17 @@ Blacksmith runner. Set `reference_base_url` to an HTTP prefix containing the
 reference checkpoint files, such as an R2 public bucket or Worker route. The
 workflow downloads the reference checkpoint into the same repo-local
 Hugging Face-style cache path used by local setup, passes that path explicitly
-to the offline transform, then downloads the private correctness golden after
-transform completes. The workflow requires a precomputed
-`correctness_golden.json` through the `correctness_golden_url` input,
-`MLXFAST_CORRECTNESS_GOLDEN_URL` repository secret, or the private R2 object
+to the offline transform, then prepares the correctness golden after transform
+completes. Correctness-only workflow runs use the checked-in public
+`correctness_prompts/public_longcopy_gate_english_512_256.json` fixture. Full
+benchmark runs require a precomputed hidden `correctness_golden.json` through
+the `correctness_golden_url` input, `MLXFAST_CORRECTNESS_GOLDEN_URL`
+repository secret, or the private R2 object
 `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`.
-If none of those is configured, the workflow fails; it will not use a committed
-prompt, committed golden, or Actions cache fallback. Final hidden goldens should
-come from protected storage. Private endpoints can pass headers through
+If none of those is configured, a full benchmark fails; it will not use a
+committed prompt, committed golden, or Actions cache fallback for ranked
+scoring. Final hidden goldens should come from protected storage. Private
+endpoints can pass headers through
 `MLXFAST_REFERENCE_AUTH_HEADER` and `MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER`
 repository secrets. Private R2 golden downloads use the `R2_ACCESS_KEY_ID`,
 `R2_BUCKET_ENDPOINT`, and `R2_SECRET_ACCESS_KEY` secrets. See
@@ -168,9 +177,9 @@ so leaderboards and local comparisons read naturally.
 Bandwidth is measured via **mactop hardware DRAM counters** — not a software model.
 Correctness is a hard gate. See CHALLENGE.md for the full correctness specification.
 The official run checks 256 correctness positions and times a 256-token decode
-window. For local iteration, `--quick` shortens correctness and decode to 64
-token checks against the same public/local golden and prints the resulting
-`score.json`.
+window. Public local correctness uses the checked-in correctness fixture. When
+a local golden with a benchmark oracle is available, `--quick` shortens
+correctness and decode to 64 token checks and prints the resulting `score.json`.
 The score payload also includes audit-only fields for wall-clock benchmark time,
 preflight time, correctness time, timed benchmark time, final process RSS, expert
 streaming counters, and transformed-weights digest. These fields are for
@@ -197,7 +206,8 @@ weights/                     transformed weights (harness loads from here)
     manifest.json            baseline byte ranges for streamed expert tensors
 .cache/huggingface/hub/...   canonical frozen 4-bit reference checkpoint cache
 reference_weights/...        compatibility symlink to the reference cache
-correctness_golden.json      hidden correctness cases and benchmark token oracle
+correctness_prompts/         public correctness prompt and checked-in golden
+correctness_golden.json      hidden benchmark correctness cases and token oracle
 score.json                   written after each benchmark run
 ```
 
@@ -217,7 +227,7 @@ files; it does not require the baseline `weights/` layout. `verify-transform`
 uses the same default cap and can also be changed with
 `mlxfast-swift verify-transform --max-bytes N`.
 
-Organizer golden files can be generated from a private prompt manifest:
+Organizer golden files can be generated offline from a private prompt manifest:
 
 ```bash
 .build/release/mlxfast-swift make-golden \
@@ -226,15 +236,16 @@ Organizer golden files can be generated from a private prompt manifest:
   --output correctness_golden.json
 ```
 
-Private prompt manifests and generated golden files are not committed. In
-private CI, the normal path downloads the precomputed
+The public correctness-only prompt and golden live in `correctness_prompts/`.
+Private prompt manifests and hidden benchmark golden files are not committed. In
+private benchmark CI, the normal path downloads the precomputed
 `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`
 object from R2; the private prompt manifest is only needed when regenerating
-that golden outside the benchmark workflow. Generate final hidden goldens
-outside the public repository and provide the resulting file to benchmark CI
-with R2, `correctness_golden_url`, or `MLXFAST_CORRECTNESS_GOLDEN_URL`. The
-benchmark workflow stores its local golden copy under `$RUNNER_TEMP`, not the
-repository workspace, and uploads only hash
+that hidden golden outside the benchmark workflow. Generate final hidden
+benchmark goldens outside the public repository and provide the resulting file
+to benchmark CI with R2, `correctness_golden_url`, or
+`MLXFAST_CORRECTNESS_GOLDEN_URL`. The benchmark workflow stores its local golden
+copy under `$RUNNER_TEMP`, not the repository workspace, and uploads only hash
 and byte-count sidecars.
 
 The manifest contains correctness prompts plus a dedicated benchmark prompt
