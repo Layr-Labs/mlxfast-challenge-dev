@@ -115,6 +115,23 @@ func submissionValidationDelayDefaultsToZero() throws {
 }
 
 @Test
+func mactopHardwareBandwidthRequirementParsesEnvironment() {
+    #expect(!DeepSeekRuntime.requiresMactopHardwareBandwidth(environment: [:]))
+    #expect(!DeepSeekRuntime.requiresMactopHardwareBandwidth(environment: [
+        "MLXFAST_REQUIRE_MACTOP_BANDWIDTH": "0",
+    ]))
+    #expect(DeepSeekRuntime.requiresMactopHardwareBandwidth(environment: [
+        "MLXFAST_REQUIRE_MACTOP_BANDWIDTH": "1",
+    ]))
+    #expect(DeepSeekRuntime.requiresMactopHardwareBandwidth(environment: [
+        "MLXFAST_REQUIRE_MACTOP_BANDWIDTH": " true ",
+    ]))
+    #expect(DeepSeekRuntime.requiresMactopHardwareBandwidth(environment: [
+        "MLXFAST_REQUIRE_MACTOP_BANDWIDTH": "YES",
+    ]))
+}
+
+@Test
 func benchmarkPromptPlanUsesHiddenBenchmarkOracle() throws {
     let prefill = Array(0..<MLXFastConstants.benchmarkPrefillPromptTokens)
     let seed = Array(0..<MLXFastConstants.benchmarkDecodeSeedTokens)

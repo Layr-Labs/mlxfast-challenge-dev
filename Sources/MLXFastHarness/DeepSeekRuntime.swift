@@ -724,7 +724,7 @@ public enum DeepSeekRuntime {
                     + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
                     + "decode_tokens=\(options.benchmarkDecodeSteps)"
             )
-            let idleGBPerSecond = measureMactopIdleGBPerSecond(progress: progress)
+            let idleGBPerSecond = try measureMactopIdleGBPerSecond(progress: progress)
 
             Memory.peakMemory = 0
             let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
@@ -987,7 +987,7 @@ public enum DeepSeekRuntime {
                     + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
                     + "decode_tokens=\(options.benchmarkDecodeSteps)"
             )
-            progress("mactop idle measurement skipped; runtime worker uses expert streaming byte fallback")
+            let idleGBPerSecond = try measureMactopIdleGBPerSecond(progress: progress)
             progress("benchmark worker start")
             let benchmarkWorker = try RuntimeWorkerClient(
                 options: workerOptions,
@@ -1015,6 +1015,7 @@ public enum DeepSeekRuntime {
                 expectedTokens: promptPlan.expectedDecodeTokens,
                 decodeSteps: options.benchmarkDecodeSteps,
                 worker: benchmarkWorker,
+                idleGBPerSecond: idleGBPerSecond,
                 progress: progress,
                 peakRamGB: &peakRamGB,
                 expertStats: &lastExpertStats
@@ -1162,7 +1163,7 @@ public enum DeepSeekRuntime {
         let bandwidthSource: String
     }
 
-    private static func measureMactopIdleGBPerSecond(progress: ((String) -> Void)? = nil) -> Double? {
+    private static func measureMactopIdleGBPerSecond(progress: ((String) -> Void)? = nil) throws -> Double? {
         do {
             progress?("mactop idle measurement start")
             let idleSamples = try MactopSession.measureIdleSamples()
@@ -1176,6 +1177,11 @@ public enum DeepSeekRuntime {
             )
             return idleGBPerSecond
         } catch {
+            if requiresMactopHardwareBandwidth() {
+                throw MLXFastError.invalidInput(
+                    "mactop hardware bandwidth required but unavailable: \(redactedProgressError("\(error)"))"
+                )
+            }
             progress?(
                 "mactop idle measurement unavailable; using expert streaming byte fallback "
                     + "error=\(redactedProgressError("\(error)"))"
@@ -1370,6 +1376,12 @@ public enum DeepSeekRuntime {
                 session = try MactopSession.start()
                 progress?("decode mactop measurement start")
             } catch {
+                if requiresMactopHardwareBandwidth() {
+                    throw MLXFastError.invalidInput(
+                        "mactop hardware bandwidth required but decode measurement could not start: "
+                            + "\(redactedProgressError("\(error)"))"
+                    )
+                }
                 progress?(
                     "decode mactop measurement unavailable; using expert streaming byte fallback "
                         + "error=\(redactedProgressError("\(error)"))"
@@ -1435,6 +1447,12 @@ public enum DeepSeekRuntime {
                         "mactop_hardware"
                     )
                 } catch {
+                    if requiresMactopHardwareBandwidth() {
+                        throw MLXFastError.invalidInput(
+                            "mactop hardware bandwidth required but decode samples were unusable: "
+                                + "\(redactedProgressError("\(error)"))"
+                        )
+                    }
                     progress?(
                         "decode mactop samples unavailable; using expert streaming byte fallback "
                             + "error=\(redactedProgressError("\(error)"))"
@@ -1475,6 +1493,7 @@ public enum DeepSeekRuntime {
         expectedTokens: [Int],
         decodeSteps: Int = MLXFastConstants.benchmarkDecodeSteps,
         worker: RuntimeWorkerClient,
+        idleGBPerSecond: Double?,
         progress: ((String) -> Void)? = nil,
         peakRamGB: inout Double,
         expertStats: inout ExpertStreamingStats
@@ -1504,44 +1523,106 @@ public enum DeepSeekRuntime {
 
         var actualTokens: [Int] = []
         actualTokens.reserveCapacity(decodeSteps)
-        var measuredSeconds = 0.0
-        for decodedStep in 0..<decodeSteps {
-            let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
-            let response = try worker.decodeStep(inputToken: inputToken)
-            expertStats = response.expertStats ?? expertStats
-            peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
-            guard let token = response.token, let elapsed = response.seconds else {
-                throw MLXFastError.invalidInput("runtime worker decode_step response missing token or seconds")
-            }
-            measuredSeconds += elapsed
-            actualTokens.append(token)
-            let expectedToken = expectedTokens[decodedStep]
-            if token != expectedToken {
-                throw BenchmarkTokenMismatchError(
-                    comparison: BenchmarkTokenComparison(
-                        passed: false,
-                        label: "benchmark decode token",
-                        step: decodedStep,
-                        expectedToken: expectedToken,
-                        actualToken: token
+        let validationDelayMS = try submissionValidationDelayMilliseconds()
+        let session: MactopSession?
+        if idleGBPerSecond != nil {
+            do {
+                session = try MactopSession.start()
+                progress?("decode mactop measurement start")
+            } catch {
+                if requiresMactopHardwareBandwidth() {
+                    throw MLXFastError.invalidInput(
+                        "mactop hardware bandwidth required but decode measurement could not start: "
+                            + "\(redactedProgressError("\(error)"))"
                     )
+                }
+                progress?(
+                    "decode mactop measurement unavailable; using expert streaming byte fallback "
+                        + "error=\(redactedProgressError("\(error)"))"
+                )
+                session = nil
+            }
+        } else {
+            session = nil
+        }
+        var measuredSeconds = 0.0
+        do {
+            if validationDelayMS > 0 {
+                progress?("decode validation delay enabled milliseconds_per_token=\(validationDelayMS)")
+            }
+            for decodedStep in 0..<decodeSteps {
+                let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
+                let response = try worker.decodeStep(inputToken: inputToken)
+                expertStats = response.expertStats ?? expertStats
+                peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
+                guard let token = response.token, let elapsed = response.seconds else {
+                    throw MLXFastError.invalidInput("runtime worker decode_step response missing token or seconds")
+                }
+                measuredSeconds += elapsed
+                actualTokens.append(token)
+                let expectedToken = expectedTokens[decodedStep]
+                if token != expectedToken {
+                    throw BenchmarkTokenMismatchError(
+                        comparison: BenchmarkTokenComparison(
+                            passed: false,
+                            label: "benchmark decode token",
+                            step: decodedStep,
+                            expectedToken: expectedToken,
+                            actualToken: token
+                        )
+                    )
+                }
+                reportProgress(
+                    step: decodedStep + 1,
+                    total: decodeSteps,
+                    intervalSteps: 64,
+                    progress: { step, total in
+                        progress?("decode measured generated \(step)/\(total) tokens")
+                    }
                 )
             }
-            reportProgress(
-                step: decodedStep + 1,
-                total: decodeSteps,
-                intervalSteps: 64,
-                progress: { step, total in
-                    progress?("decode measured generated \(step)/\(total) tokens")
-                }
-            )
+        } catch {
+            _ = try? session?.stop()
+            throw error
         }
 
-        let bandwidth = try expertStreamingBandwidthGBPerToken(
-            before: statsBeforeDecode,
-            after: expertStats,
-            decodedTokens: decodeSteps
-        )
+        let bandwidth: (gbPerToken: Double, source: String)
+        if let session, let idleGBPerSecond {
+            do {
+                let samples = try session.stop()
+                bandwidth = (
+                    try MactopBandwidth.gigabytesPerToken(
+                        samples: samples,
+                        idleGBPerSecond: idleGBPerSecond,
+                        decodeElapsedSeconds: measuredSeconds,
+                        decodedTokens: decodeSteps
+                    ),
+                    "mactop_hardware"
+                )
+            } catch {
+                if requiresMactopHardwareBandwidth() {
+                    throw MLXFastError.invalidInput(
+                        "mactop hardware bandwidth required but decode samples were unusable: "
+                            + "\(redactedProgressError("\(error)"))"
+                    )
+                }
+                progress?(
+                    "decode mactop samples unavailable; using expert streaming byte fallback "
+                        + "error=\(redactedProgressError("\(error)"))"
+                )
+                bandwidth = try expertStreamingBandwidthGBPerToken(
+                    before: statsBeforeDecode,
+                    after: expertStats,
+                    decodedTokens: decodeSteps
+                )
+            }
+        } else {
+            bandwidth = try expertStreamingBandwidthGBPerToken(
+                before: statsBeforeDecode,
+                after: expertStats,
+                decodedTokens: decodeSteps
+            )
+        }
         let secondsPerToken = measuredSeconds / Double(decodeSteps)
         let actualTokensComparison = BenchmarkOutputValidator.compareDecodeTokens(
             expectedTokens: Array(expectedTokens.prefix(decodeSteps)),
@@ -1613,6 +1694,14 @@ public enum DeepSeekRuntime {
             )
         }
         return milliseconds
+    }
+
+    static func requiresMactopHardwareBandwidth(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        let raw = environment["MLXFAST_REQUIRE_MACTOP_BANDWIDTH"] ?? ""
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized == "1" || normalized == "true" || normalized == "yes"
     }
 
     private static func expertStats(from weightCache: DeepSeekRuntimeWeightCache) -> ExpertStreamingStats {

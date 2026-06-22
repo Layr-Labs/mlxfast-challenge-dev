@@ -176,7 +176,11 @@ score = 1 / cost
 Higher score is better. The cost product is still recoverable from the
 component metrics in `score.json`, but the top-level `score` is an up-only value
 so leaderboards and local comparisons read naturally.
-Bandwidth is measured via **mactop hardware DRAM counters** — not a software model.
+Bandwidth prefers **mactop hardware DRAM counters**. On macOS virtualized runners
+that do not expose IOReport DRAM channels, the harness records
+`bandwidth_source=expert_streaming_reads` and uses measured expert-streaming file
+bytes as a fallback. Set `MLXFAST_REQUIRE_MACTOP_BANDWIDTH=1` to fail instead of
+falling back.
 Correctness is a hard gate. See CHALLENGE.md for the full correctness specification.
 The official run checks 256 correctness positions and times a 256-token decode
 window. Public local correctness uses the checked-in correctness fixture. When
@@ -266,4 +270,4 @@ matches the expected token, except for a true top-logit tie within the tiny
   Line Tools may need full Xcode installed, opened once, and licensed with
   `sudo xcodebuild -license accept`
 - CMake, installed by `./setup.sh` via Homebrew when missing and used by `tools/build-mlx-metallib.sh` to build `mlx.metallib`
-- [mactop](https://github.com/metaspartan/mactop) — installed by `./setup.sh` via Homebrew when missing, or supplied with `MLXFAST_MACTOP_BIN=/path/to/mactop`
+- [mactop](https://github.com/metaspartan/mactop) — installed by `./setup.sh` via Homebrew when missing, or supplied with `MLXFAST_MACTOP_BIN=/path/to/mactop`; hardware bandwidth requires macOS IOReport DRAM channels

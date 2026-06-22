@@ -121,6 +121,16 @@ jq -e \
   and (.metrics.runtime == "swift")
   ' "${SCORE_PATH}" >/dev/null
 
+case "${MLXFAST_REQUIRE_MACTOP_BANDWIDTH:-0}" in
+  1|true|TRUE|yes|YES)
+    bandwidth_source="$(jq -r '.metrics.bandwidth_source' "${SCORE_PATH}")"
+    if [[ "${bandwidth_source}" != "mactop_hardware" ]]; then
+      echo "::error file=${SCORE_PATH}::mactop hardware bandwidth was required, got ${bandwidth_source}" >&2
+      exit 1
+    fi
+    ;;
+esac
+
 jq -e '
   def same_keys($expected):
     (keys_unsorted | sort) == ($expected | sort);
