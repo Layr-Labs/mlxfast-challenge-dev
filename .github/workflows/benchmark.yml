@@ -56,6 +56,11 @@ on:
         required: false
         default: "16"
         type: string
+      mactop_diagnostics_only:
+        description: "Run only the Blacksmith mactop/IOReport diagnostic probe."
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: benchmark-${{ github.ref }}-${{ inputs.preserve_golden_only && 'preserve-golden' || (inputs.run_benchmark && 'full' || 'correctness-only') }}
@@ -65,7 +70,20 @@ permissions:
   contents: read
 
 jobs:
+  mactop-diagnostics:
+    if: inputs.mactop_diagnostics_only
+    runs-on: blacksmith-12vcpu-macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Probe mactop
+        run: .github/scripts/probe-mactop.sh
+
   benchmark:
+    if: ${{ !inputs.mactop_diagnostics_only }}
     runs-on: blacksmith-12vcpu-macos-26
     timeout-minutes: 720
     environment: benchmark-private-prompts
