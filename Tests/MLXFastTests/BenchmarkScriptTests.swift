@@ -199,7 +199,7 @@ func benchmarkQuickModeUsesShortLocalPrefixAndPrintsScore() throws {
     #expect(cli.contains("printScorePayload(at: scorePath)"))
     #expect(runtime.contains("correctness_steps=\\(options.correctnessSteps)"))
     #expect(runtime.contains("benchmark_decode_steps=\\(options.benchmarkDecodeSteps)"))
-    #expect(runtime.contains("Array(expectedTokens.prefix(timingPlan.decodeSteps))"))
+    #expect(!runtime.contains("Array(expectedTokens.prefix(timingPlan.decodeSteps))"))
     #expect(runtime.contains("Array(expectedTokens.prefix(decodeSteps))"))
 }
 

@@ -238,8 +238,44 @@ func loadGoldenPromptManifestRejectsMissingMaxOutputTokens() throws {
     """
     try json.write(to: path, atomically: true, encoding: .utf8)
 
-    #expect(throws: MLXFastError.self) {
+    #expect(throws: DecodingError.self) {
         _ = try loadGoldenPromptManifest(from: path.path)
+    }
+}
+
+@Test
+func loadGoldenFixtureStaleBenchmarkOracleErrorMentionsMakeGolden() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = arrayJSON(Array(repeating: 9, count: MLXFastConstants.correctnessSteps))
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "case-a",
+          "prompt_tokens": \(correctnessPromptJSON()),
+          "expected_tokens": \(expected)
+        }
+      ],
+      "benchmark": {
+        "prefill_prompt_tokens": \(arrayJSON(Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens))),
+        "expected_prefill_token": 2,
+        "decode_seed_tokens": \(arrayJSON(Array(repeating: 3, count: 32))),
+        "expected_decode_seed_token": 4,
+        "expected_decode_tokens": \(arrayJSON(Array(repeating: 5, count: MLXFastConstants.benchmarkDecodeSteps)))
+      }
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    do {
+        _ = try loadGoldenFixture(from: path.path)
+        Issue.record("expected stale benchmark oracle error")
+    } catch let MLXFastError.invalidInput(message) {
+        #expect(message.contains("Regenerate stale local goldens with mlxfast-swift make-golden"))
+    } catch {
+        Issue.record("expected MLXFastError.invalidInput, got \(error)")
     }
 }
 

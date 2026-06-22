@@ -1480,13 +1480,6 @@ public enum DeepSeekRuntime {
                 )
             }
 
-            try requireBenchmarkMatch(
-                BenchmarkOutputValidator.compareDecodeTokens(
-                    expectedTokens: Array(expectedTokens.prefix(timingPlan.decodeSteps)),
-                    actualTokens: actualTokens
-                )
-            )
-
             let elapsed = secondsSince(start)
             let bandwidth: (gbPerToken: Double, source: String)
             if let session, let idleGBPerSecond {

@@ -107,7 +107,7 @@ public struct GoldenPromptManifest: Codable, Equatable {
     public let version: Int
     public let cases: [GoldenPromptCase]
     public let benchmark: BenchmarkPromptSpec
-    public let maxOutputTokens: Int?
+    public let maxOutputTokens: Int
 
     enum CodingKeys: String, CodingKey {
         case version
@@ -120,7 +120,7 @@ public struct GoldenPromptManifest: Codable, Equatable {
         version: Int = 1,
         cases: [GoldenPromptCase],
         benchmark: BenchmarkPromptSpec,
-        maxOutputTokens: Int? = nil
+        maxOutputTokens: Int
     ) {
         self.version = version
         self.cases = cases
@@ -211,14 +211,9 @@ public func validateGoldenPromptManifest(_ manifest: GoldenPromptManifest) throw
     guard !manifest.cases.isEmpty else {
         throw MLXFastError.invalidInput("golden prompt manifest must contain at least one case")
     }
-    guard let maxOutputTokens = manifest.maxOutputTokens else {
+    guard manifest.maxOutputTokens == MLXFastConstants.correctnessSteps else {
         throw MLXFastError.invalidInput(
-            "golden prompt manifest max_output_tokens is missing; need exactly \(MLXFastConstants.correctnessSteps)"
-        )
-    }
-    guard maxOutputTokens == MLXFastConstants.correctnessSteps else {
-        throw MLXFastError.invalidInput(
-            "golden prompt manifest max_output_tokens is \(maxOutputTokens); need exactly \(MLXFastConstants.correctnessSteps)"
+            "golden prompt manifest max_output_tokens is \(manifest.maxOutputTokens); need exactly \(MLXFastConstants.correctnessSteps)"
         )
     }
 
@@ -360,12 +355,12 @@ public func validateBenchmarkGolden(_ benchmark: BenchmarkGolden) throws {
     }
     guard benchmark.decodeSeedTokens.count == MLXFastConstants.benchmarkDecodeSeedTokens else {
         throw MLXFastError.invalidInput(
-            "benchmark.decode_seed_tokens has \(benchmark.decodeSeedTokens.count) tokens; need exactly \(MLXFastConstants.benchmarkDecodeSeedTokens)"
+            "benchmark.decode_seed_tokens has \(benchmark.decodeSeedTokens.count) tokens; need exactly \(MLXFastConstants.benchmarkDecodeSeedTokens). Regenerate stale local goldens with mlxfast-swift make-golden."
         )
     }
     guard benchmark.expectedDecodeTokens.count == MLXFastConstants.benchmarkDecodeSteps else {
         throw MLXFastError.invalidInput(
-            "benchmark.expected_decode_tokens has \(benchmark.expectedDecodeTokens.count) tokens; need exactly \(MLXFastConstants.benchmarkDecodeSteps)"
+            "benchmark.expected_decode_tokens has \(benchmark.expectedDecodeTokens.count) tokens; need exactly \(MLXFastConstants.benchmarkDecodeSteps). Regenerate stale local goldens with mlxfast-swift make-golden."
         )
     }
     try validateTokens(benchmark.prefillPromptTokens, field: "benchmark.prefill_prompt_tokens")
