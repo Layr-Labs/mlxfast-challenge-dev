@@ -146,22 +146,38 @@ There is no Python harness path.
 
 ## Correctness Gate
 
-Correctness is a hard gate. For each golden case, the prompt must contain
-exactly 512 token IDs. The harness runs cached greedy generation for 256
-tokens with temperature-zero behavior and compares token IDs exactly. The first
-mismatch records the case, step, expected token, and actual token in the failed
-report.
+Correctness is a hard gate. Each base golden case contains exactly 512 prompt
+token IDs and 256 expected continuation token IDs. The harness checks those
+continuation positions teacher-forced with temperature-zero behavior: after each
+accepted step it feeds the golden previous token back into the model. The first
+mismatch records only the case, step, expected token, and actual token in the
+failed report.
 
 The gate is intended as a first-stage filter: an implementation that fails it is
 not eligible for the longer benchmark.
 
-The gate intentionally does not port the earlier Python hidden-state or top-K
-logit comparison layers. The benchmark contract cares about the externally
-observable greedy token stream for a text-to-text DeepSeek V4 Flash run. Exact
-token-oracle checks are cleaner here because they validate the same output path
-that is timed by the benchmark, avoid ambiguous internal tensor choices around
-normalization/head-combination, and keep the hidden golden fixture small enough
-to manage privately.
+Private golden fixtures may add hidden `correctness_gates` on top of the base
+teacher-forced cases:
+
+- `anchors`: one-token checks at selected hidden contexts. These can require an
+  exact expected token, explicit accepted tokens, or a bounded top-logit rank
+  and delta for near-tie hardware cases.
+- `free_run`: short greedy continuations whose exact prefix must match. These
+  catch bugs that only appear when the model consumes its own generated tokens.
+- `behavior`: GPQA-style or instruction-following prompts whose answer is
+  checked exactly against precomputed accepted answer token sequences. Each
+  accepted answer sequence must have exactly `max_new_tokens` tokens.
+
+These layers keep the official gate deterministic and token-based while making
+prompt memorization or narrow kernel spoofing harder. The benchmark operator
+should keep private prompts and accepted answer sequences outside the public
+repository.
+
+The gate intentionally does not port the earlier Python hidden-state comparison
+layer. The benchmark contract cares about the externally observable text-to-text
+DeepSeek V4 Flash output path, and hidden-state tensors are easier to make
+ambiguous around normalization/head-combination than token-level or logit-anchor
+checks.
 
 VLM/image inputs and speculative/MTP draft decoding are also out of scope for
 this challenge. They should only be added if the official benchmark contract
@@ -169,7 +185,7 @@ changes to score those paths.
 
 The hidden golden file also includes a benchmark oracle. The benchmark validates
 the greedy token after the fixed 512-token prefill prompt, the greedy token
-after the fixed 32-token decode seed, and all 256 tokens produced inside the
+after the fixed 512-token decode seed, and all 256 tokens produced inside the
 timed decode window before accepting a score.
 
 ## Score

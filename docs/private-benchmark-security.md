@@ -30,6 +30,12 @@ golden only under `$RUNNER_TEMP` and uploads only its hash and byte-count
 sidecars after a deny-list check rejects prompt, golden, model, symlink, and
 oversized artifact paths.
 
+Hidden behavioral correctness cases should be stored as precomputed accepted
+answer token sequences in the private golden fixture, with each accepted
+sequence exactly as long as the case's `max_new_tokens`. Do not call an external
+LLM judge from the benchmark runner; that would add a network dependency,
+create prompt-exfiltration risk, and make official scores less reproducible.
+
 The benchmark workflow also verifies at runtime that it is executing from the
 configured trusted workflow ref. In production, that trusted ref should be:
 

@@ -25,10 +25,264 @@ func checkedInPublicCorrectnessGoldenIsValid() throws {
     let fixture = try loadGoldenFixture(from: path)
     #expect(fixture.sha256 == digest)
     #expect(fixture.benchmark == nil)
+    #expect(fixture.correctnessGates == nil)
     #expect(fixture.cases.count == 1)
     #expect(fixture.cases[0].name == "longcopy-gate-english-512")
     #expect(fixture.cases[0].promptTokens.count == MLXFastConstants.correctnessPromptTokens)
     #expect(fixture.cases[0].expectedTokens.count == MLXFastConstants.correctnessSteps)
+}
+
+@Test
+func loadGoldenFixtureAcceptsLayeredCorrectnessGates() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "hidden-0",
+          "prompt_tokens": \(correctnessPromptJSON()),
+          "expected_tokens": \(expected)
+        }
+      ],
+      "correctness_gates": {
+        "anchors": [
+          {
+            "name": "anchor-0",
+            "context_tokens": [1, 2, 3, 4],
+            "expected_token": 5,
+            "accepted_tokens": [6],
+            "max_expected_rank": 2,
+            "max_top_logit_delta": 0.001
+          }
+        ],
+        "free_run": [
+          {
+            "name": "free-run-0",
+            "prompt_tokens": \(correctnessPromptJSON(2)),
+            "expected_tokens": [8, 9, 10],
+            "exact_prefix_tokens": 2
+          }
+        ],
+        "behavior": [
+          {
+            "name": "behavior-0",
+            "prompt_tokens": \(correctnessPromptJSON(3)),
+            "accepted_token_sequences": [[11, 12], [12, 13]],
+            "max_new_tokens": 2
+          }
+        ]
+      }
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    let fixture = try loadGoldenFixture(from: path.path)
+
+    #expect(fixture.cases.count == 1)
+    #expect(fixture.correctnessGates?.anchorCases.count == 1)
+    #expect(fixture.correctnessGates?.freeRunCases.count == 1)
+    #expect(fixture.correctnessGates?.behaviorCases.count == 1)
+    #expect(fixture.totalCorrectnessCaseCount == 4)
+}
+
+@Test
+func loadGoldenFixtureRejectsMalformedLayeredCorrectnessGate() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "hidden-0",
+          "prompt_tokens": \(correctnessPromptJSON()),
+          "expected_tokens": \(expected)
+        }
+      ],
+      "correctness_gates": {
+        "behavior": [
+          {
+            "name": "behavior-0",
+            "prompt_tokens": \(correctnessPromptJSON(3)),
+            "accepted_token_sequences": [[11, 12]],
+            "max_new_tokens": 1
+          }
+        ]
+      }
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try loadGoldenFixture(from: path.path)
+    }
+}
+
+@Test
+func loadGoldenFixtureRejectsDuplicateLayeredCorrectnessNames() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "duplicate",
+          "prompt_tokens": \(correctnessPromptJSON()),
+          "expected_tokens": \(expected)
+        }
+      ],
+      "correctness_gates": {
+        "anchors": [
+          {
+            "name": "duplicate",
+            "context_tokens": [1, 2, 3],
+            "expected_token": 4
+          }
+        ]
+      }
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try loadGoldenFixture(from: path.path)
+    }
+}
+
+@Test
+func loadGoldenFixtureRejectsNoopAnchorDelta() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "hidden-0",
+          "prompt_tokens": \(correctnessPromptJSON()),
+          "expected_tokens": \(expected)
+        }
+      ],
+      "correctness_gates": {
+        "anchors": [
+          {
+            "name": "anchor-0",
+            "context_tokens": [1, 2, 3],
+            "expected_token": 4,
+            "max_top_logit_delta": 0.001
+          }
+        ]
+      }
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try loadGoldenFixture(from: path.path)
+    }
+}
+
+@Test
+func loadGoldenFixtureRejectsUnknownCorrectnessGateKey() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "hidden-0",
+          "prompt_tokens": \(correctnessPromptJSON()),
+          "expected_tokens": \(expected)
+        }
+      ],
+      "correctness_gates": {
+        "free_runs": [
+          {
+            "name": "typo",
+            "prompt_tokens": \(correctnessPromptJSON(2)),
+            "expected_tokens": [8]
+          }
+        ]
+      }
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try loadGoldenFixture(from: path.path)
+    }
+}
+
+@Test
+func loadGoldenFixtureRejectsEmptyCorrectnessGateSection() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "hidden-0",
+          "prompt_tokens": \(correctnessPromptJSON()),
+          "expected_tokens": \(expected)
+        }
+      ],
+      "correctness_gates": {
+        "anchors": []
+      }
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try loadGoldenFixture(from: path.path)
+    }
+}
+
+@Test
+func goldenSequenceMatcherChecksExactPrefixes() {
+    let pass = GoldenSequenceMatcher.firstPrefixMismatch(
+        expected: [1, 2, 3],
+        actual: [1, 2, 9],
+        prefixTokens: 2
+    )
+    #expect(pass.passed)
+
+    let fail = GoldenSequenceMatcher.firstPrefixMismatch(
+        expected: [1, 2, 3],
+        actual: [1, 8, 3],
+        prefixTokens: 3
+    )
+    #expect(!fail.passed)
+    #expect(fail.step == 1)
+    #expect(fail.expectedToken == 2)
+    #expect(fail.actualToken == 8)
+}
+
+@Test
+func goldenSequenceMatcherAcceptsExactAnswerSequences() {
+    let pass = GoldenSequenceMatcher.matchesAnyExactSequence(
+        acceptedSequences: [[10, 11], [20, 21]],
+        actual: [20, 21]
+    )
+    #expect(pass.passed)
+
+    let fail = GoldenSequenceMatcher.matchesAnyExactSequence(
+        acceptedSequences: [[10, 11], [20, 21]],
+        actual: [20, 22, 99]
+    )
+    #expect(!fail.passed)
+    #expect(fail.step == 1 || fail.step == 2)
 }
 
 @Test

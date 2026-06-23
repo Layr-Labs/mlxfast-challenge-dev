@@ -270,15 +270,15 @@ public enum DeepSeekRuntime {
             )
             loader = runtimeLoader
             let weightCache = DeepSeekRuntimeWeightCache(loader: runtimeLoader, config: config)
-            return runCorrectness(
-                cases: golden.cases,
+            return runLayeredCorrectness(
+                golden: golden,
                 weightCache: weightCache,
-                goldenHash: golden.sha256
+                steps: MLXFastConstants.correctnessSteps
             )
         } catch {
             return failedCorrectnessReport(
                 checkedSteps: 0,
-                caseCount: loadedGolden?.cases.count ?? 0,
+                caseCount: loadedGolden?.totalCorrectnessCaseCount ?? 0,
                 goldenHash: loadedGolden?.sha256 ?? "",
                 expertStats: expertStats(from: loader),
                 error: "\(error)"
@@ -293,7 +293,6 @@ public enum DeepSeekRuntime {
         var loadedGolden: GoldenFixture?
         var lastExpertStats = ExpertStreamingStats.zero
         var checkedSteps = 0
-        var currentCase: GoldenCase?
         do {
             try requireRegularFile(options.weightsPath + "/config.json", description: "transformed config")
             try requireRegularFile(options.goldenPath, description: "correctness golden file")
@@ -306,61 +305,18 @@ public enum DeepSeekRuntime {
             defer {
                 worker.close()
             }
-
-            for testCase in golden.cases {
-                currentCase = testCase
-                let result = try compareTeacherForcedWithWorker(
-                    testCase: testCase,
-                    worker: worker
-                )
-                lastExpertStats = result.expertStats
-                let comparison = result.comparison
-                checkedSteps += comparison.checkedSteps
-                if !comparison.passed {
-                    return CorrectnessReport(
-                        passed: false,
-                        checkedSteps: checkedSteps,
-                        caseCount: golden.cases.count,
-                        expertCacheHits: lastExpertStats.cacheHits,
-                        expertCacheMisses: lastExpertStats.cacheMisses,
-                        expertCacheEvictions: lastExpertStats.cacheEvictions,
-                        expertBytesRead: lastExpertStats.bytesRead,
-                        expertReadSeconds: lastExpertStats.readSeconds,
-                        expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
-                        expertHitRate: lastExpertStats.hitRate,
-                        firstFailingCase: testCase.name,
-                        firstFailingStep: comparison.firstFailingStep,
-                        expectedToken: comparison.expectedToken,
-                        actualToken: comparison.actualToken,
-                        goldenHash: golden.sha256,
-                        error: "teacher-forced token mismatch"
-                    )
-                }
-            }
-
-            return CorrectnessReport(
-                passed: true,
-                checkedSteps: checkedSteps,
-                caseCount: golden.cases.count,
-                expertCacheHits: lastExpertStats.cacheHits,
-                expertCacheMisses: lastExpertStats.cacheMisses,
-                expertCacheEvictions: lastExpertStats.cacheEvictions,
-                expertBytesRead: lastExpertStats.bytesRead,
-                expertReadSeconds: lastExpertStats.readSeconds,
-                expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
-                expertHitRate: lastExpertStats.hitRate,
-                firstFailingCase: nil,
-                firstFailingStep: nil,
-                expectedToken: nil,
-                actualToken: nil,
-                goldenHash: golden.sha256,
-                error: ""
+            let result = runLayeredCorrectnessWithWorker(
+                golden: golden,
+                worker: worker,
+                steps: MLXFastConstants.correctnessSteps
             )
+            checkedSteps = result.report.checkedSteps
+            lastExpertStats = result.expertStats
+            return result.report
         } catch {
             return failedCorrectnessReport(
                 checkedSteps: checkedSteps,
-                caseCount: loadedGolden?.cases.count ?? 0,
-                firstFailingCase: currentCase?.name,
+                caseCount: loadedGolden?.totalCorrectnessCaseCount ?? 0,
                 goldenHash: loadedGolden?.sha256 ?? "",
                 expertStats: lastExpertStats,
                 error: "\(error)"
@@ -674,7 +630,7 @@ public enum DeepSeekRuntime {
             progress("golden load start")
             let golden = try loadGoldenFixture(from: options.goldenPath)
             progress(
-                "golden load complete cases=\(golden.cases.count) "
+                "golden load complete cases=\(golden.totalCorrectnessCaseCount) "
                     + "benchmark_oracle=\(golden.benchmark == nil ? "missing" : "present")"
             )
             let config = try DeepSeekConfig.load(from: options.weightsPath)
@@ -685,11 +641,10 @@ public enum DeepSeekRuntime {
             )
             let correctnessCache = DeepSeekRuntimeWeightCache(loader: correctnessLoader, config: config)
             let correctnessStart = DispatchTime.now().uptimeNanoseconds
-            progress("correctness start cases=\(golden.cases.count)")
-            let correctness = runCorrectness(
-                cases: golden.cases,
+            progress("correctness start cases=\(golden.totalCorrectnessCaseCount)")
+            let correctness = runLayeredCorrectness(
+                golden: golden,
                 weightCache: correctnessCache,
-                goldenHash: golden.sha256,
                 steps: options.correctnessSteps,
                 progress: progress
             )
@@ -901,16 +856,14 @@ public enum DeepSeekRuntime {
             progress("golden load start")
             let golden = try loadGoldenFixture(from: options.goldenPath)
             progress(
-                "golden load complete cases=\(golden.cases.count) "
+                "golden load complete cases=\(golden.totalCorrectnessCaseCount) "
                     + "benchmark_oracle=\(golden.benchmark == nil ? "missing" : "present")"
             )
 
             let correctnessStart = DispatchTime.now().uptimeNanoseconds
-            progress("correctness start cases=\(golden.cases.count)")
-            var checkedSteps = 0
-            var firstFailingCase: String?
-            var firstFailingComparison: CorrectnessTokenComparison?
+            progress("correctness start cases=\(golden.totalCorrectnessCaseCount)")
             progress("correctness worker start")
+            let correctnessResult: WorkerLayeredCorrectnessResult
             do {
                 let correctnessWorker = try RuntimeWorkerClient(
                     options: workerOptions,
@@ -919,51 +872,17 @@ public enum DeepSeekRuntime {
                 defer {
                     correctnessWorker.close()
                 }
-
-                for (caseIndex, testCase) in golden.cases.enumerated() {
-                    let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
-                    progress("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
-                    let result = try compareTeacherForcedWithWorker(
-                        testCase: testCase,
-                        worker: correctnessWorker,
-                        steps: options.correctnessSteps,
-                        progressIntervalSteps: 64,
-                        progress: { step, total in
-                            progress("correctness case \(caseLabel) checked \(step)/\(total) tokens")
-                        }
-                    )
-                    lastExpertStats = result.expertStats
-                    peakRamGB = max(peakRamGB, result.peakRamGB)
-                    let comparison = result.comparison
-                    checkedSteps += comparison.checkedSteps
-                    if !comparison.passed {
-                        firstFailingCase = testCase.name
-                        firstFailingComparison = comparison
-                        progress("correctness case \(caseLabel) failed step=\(comparison.firstFailingStep ?? -1)")
-                        break
-                    }
-                    progress("correctness case \(caseLabel) complete checked_steps=\(comparison.checkedSteps)")
-                }
+                correctnessResult = runLayeredCorrectnessWithWorker(
+                    golden: golden,
+                    worker: correctnessWorker,
+                    steps: options.correctnessSteps,
+                    progress: progress
+                )
             }
             correctnessSeconds = secondsSince(correctnessStart)
-            let correctness = CorrectnessReport(
-                passed: firstFailingComparison == nil,
-                checkedSteps: checkedSteps,
-                caseCount: golden.cases.count,
-                expertCacheHits: lastExpertStats.cacheHits,
-                expertCacheMisses: lastExpertStats.cacheMisses,
-                expertCacheEvictions: lastExpertStats.cacheEvictions,
-                expertBytesRead: lastExpertStats.bytesRead,
-                expertReadSeconds: lastExpertStats.readSeconds,
-                expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
-                expertHitRate: lastExpertStats.hitRate,
-                firstFailingCase: firstFailingCase,
-                firstFailingStep: firstFailingComparison?.firstFailingStep,
-                expectedToken: firstFailingComparison?.expectedToken,
-                actualToken: firstFailingComparison?.actualToken,
-                goldenHash: golden.sha256,
-                error: firstFailingComparison == nil ? "" : "teacher-forced token mismatch"
-            )
+            lastExpertStats = correctnessResult.expertStats
+            peakRamGB = max(peakRamGB, correctnessResult.peakRamGB)
+            let correctness = correctnessResult.report
             correctnessReport = correctness
             progress(
                 "correctness complete passed=\(correctness.passed) "
@@ -1076,19 +995,52 @@ public enum DeepSeekRuntime {
         }
     }
 
-    private static func runCorrectness(
-        cases: [GoldenCase],
+    private struct WorkerLayeredCorrectnessResult {
+        let report: CorrectnessReport
+        let expertStats: ExpertStreamingStats
+        let peakRamGB: Double
+    }
+
+    private static func runLayeredCorrectness(
+        golden: GoldenFixture,
         weightCache: DeepSeekRuntimeWeightCache,
-        goldenHash: String,
         steps: Int = MLXFastConstants.correctnessSteps,
         progress: ((String) -> Void)? = nil
     ) -> CorrectnessReport {
+        let caseCount = golden.totalCorrectnessCaseCount
         var checkedSteps = 0
-        var currentCase: GoldenCase?
+        var currentCase: String?
+
+        func failure(
+            caseName: String,
+            comparison: CorrectnessTokenComparison,
+            error: String
+        ) -> CorrectnessReport {
+            let stats = expertStats(from: weightCache)
+            return CorrectnessReport(
+                passed: false,
+                checkedSteps: checkedSteps + comparison.checkedSteps,
+                caseCount: caseCount,
+                expertCacheHits: stats.cacheHits,
+                expertCacheMisses: stats.cacheMisses,
+                expertCacheEvictions: stats.cacheEvictions,
+                expertBytesRead: stats.bytesRead,
+                expertReadSeconds: stats.readSeconds,
+                expertPeakCachedTensors: stats.peakCachedTensors,
+                expertHitRate: stats.hitRate,
+                firstFailingCase: caseName,
+                firstFailingStep: comparison.firstFailingStep,
+                expectedToken: comparison.expectedToken,
+                actualToken: comparison.actualToken,
+                goldenHash: golden.sha256,
+                error: error
+            )
+        }
+
         do {
-            for (caseIndex, testCase) in cases.enumerated() {
-                currentCase = testCase
-                let caseLabel = "\(caseIndex + 1)/\(cases.count)"
+            for (caseIndex, testCase) in golden.cases.enumerated() {
+                currentCase = testCase.name
+                let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
                 progress?("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
                 let comparison = try compareTeacherForcedCached(
                     testCase: testCase,
@@ -1101,60 +1053,270 @@ public enum DeepSeekRuntime {
                 )
                 if !comparison.passed {
                     progress?("correctness case \(caseLabel) failed step=\(comparison.firstFailingStep ?? -1)")
-                    let expertStats = expertStats(from: weightCache)
-                    return CorrectnessReport(
-                        passed: false,
-                        checkedSteps: checkedSteps + comparison.checkedSteps,
-                        caseCount: cases.count,
-                        expertCacheHits: expertStats.cacheHits,
-                        expertCacheMisses: expertStats.cacheMisses,
-                        expertCacheEvictions: expertStats.cacheEvictions,
-                        expertBytesRead: expertStats.bytesRead,
-                        expertReadSeconds: expertStats.readSeconds,
-                        expertPeakCachedTensors: expertStats.peakCachedTensors,
-                        expertHitRate: expertStats.hitRate,
-                        firstFailingCase: testCase.name,
-                        firstFailingStep: comparison.firstFailingStep,
-                        expectedToken: comparison.expectedToken,
-                        actualToken: comparison.actualToken,
-                        goldenHash: goldenHash,
+                    return failure(
+                        caseName: testCase.name,
+                        comparison: comparison,
                         error: "teacher-forced token mismatch"
                     )
                 }
                 progress?("correctness case \(caseLabel) complete checked_steps=\(comparison.checkedSteps)")
                 checkedSteps += comparison.checkedSteps
             }
+
+            let gates = golden.correctnessGates
+            for (caseIndex, anchor) in (gates?.anchorCases ?? []).enumerated() {
+                currentCase = anchor.name
+                let caseLabel = "\(caseIndex + 1)/\(gates?.anchorCases.count ?? 0)"
+                progress?("correctness anchor \(caseLabel) start context_tokens=\(anchor.contextTokens.count)")
+                let comparison = try compareAnchorCached(anchor: anchor, weightCache: weightCache)
+                if !comparison.passed {
+                    progress?("correctness anchor \(caseLabel) failed")
+                    return failure(
+                        caseName: anchor.name,
+                        comparison: comparison,
+                        error: "anchor token mismatch"
+                    )
+                }
+                checkedSteps += comparison.checkedSteps
+                progress?("correctness anchor \(caseLabel) complete")
+            }
+
+            for (caseIndex, freeRun) in (gates?.freeRunCases ?? []).enumerated() {
+                currentCase = freeRun.name
+                let caseLabel = "\(caseIndex + 1)/\(gates?.freeRunCases.count ?? 0)"
+                progress?("correctness free-run \(caseLabel) start tokens=\(freeRun.expectedTokens.count)")
+                let comparison = try compareFreeRunCached(
+                    testCase: freeRun,
+                    weightCache: weightCache,
+                    progressIntervalSteps: 64,
+                    progress: { step, total in
+                        progress?("correctness free-run \(caseLabel) generated \(step)/\(total) tokens")
+                    }
+                )
+                if !comparison.passed {
+                    progress?("correctness free-run \(caseLabel) failed step=\(comparison.firstFailingStep ?? -1)")
+                    return failure(
+                        caseName: freeRun.name,
+                        comparison: comparison,
+                        error: "free-run token mismatch"
+                    )
+                }
+                checkedSteps += comparison.checkedSteps
+                progress?("correctness free-run \(caseLabel) complete checked_steps=\(comparison.checkedSteps)")
+            }
+
+            for (caseIndex, behavior) in (gates?.behaviorCases ?? []).enumerated() {
+                currentCase = behavior.name
+                let caseLabel = "\(caseIndex + 1)/\(gates?.behaviorCases.count ?? 0)"
+                progress?("correctness behavior \(caseLabel) start max_new_tokens=\(behavior.maxNewTokens)")
+                let comparison = try compareBehaviorCached(
+                    testCase: behavior,
+                    weightCache: weightCache
+                )
+                if !comparison.passed {
+                    progress?("correctness behavior \(caseLabel) failed step=\(comparison.firstFailingStep ?? -1)")
+                    return failure(
+                        caseName: behavior.name,
+                        comparison: comparison,
+                        error: "behavior answer mismatch"
+                    )
+                }
+                checkedSteps += comparison.checkedSteps
+                progress?("correctness behavior \(caseLabel) complete checked_steps=\(comparison.checkedSteps)")
+            }
         } catch {
             progress?("correctness error=\(redactedProgressError("\(error)"))")
             return failedCorrectnessReport(
                 checkedSteps: checkedSteps,
-                caseCount: cases.count,
-                firstFailingCase: currentCase?.name,
-                goldenHash: goldenHash,
+                caseCount: caseCount,
+                firstFailingCase: currentCase,
+                goldenHash: golden.sha256,
                 expertStats: expertStats(from: weightCache),
                 error: "\(error)"
             )
         }
 
-        let expertStats = expertStats(from: weightCache)
+        let stats = expertStats(from: weightCache)
         return CorrectnessReport(
             passed: true,
             checkedSteps: checkedSteps,
-            caseCount: cases.count,
-            expertCacheHits: expertStats.cacheHits,
-            expertCacheMisses: expertStats.cacheMisses,
-            expertCacheEvictions: expertStats.cacheEvictions,
-            expertBytesRead: expertStats.bytesRead,
-            expertReadSeconds: expertStats.readSeconds,
-            expertPeakCachedTensors: expertStats.peakCachedTensors,
-            expertHitRate: expertStats.hitRate,
+            caseCount: caseCount,
+            expertCacheHits: stats.cacheHits,
+            expertCacheMisses: stats.cacheMisses,
+            expertCacheEvictions: stats.cacheEvictions,
+            expertBytesRead: stats.bytesRead,
+            expertReadSeconds: stats.readSeconds,
+            expertPeakCachedTensors: stats.peakCachedTensors,
+            expertHitRate: stats.hitRate,
             firstFailingCase: nil,
             firstFailingStep: nil,
             expectedToken: nil,
             actualToken: nil,
-            goldenHash: goldenHash,
+            goldenHash: golden.sha256,
             error: ""
         )
+    }
+
+    private static func runLayeredCorrectnessWithWorker(
+        golden: GoldenFixture,
+        worker: RuntimeWorkerClient,
+        steps: Int = MLXFastConstants.correctnessSteps,
+        progress: ((String) -> Void)? = nil
+    ) -> WorkerLayeredCorrectnessResult {
+        let caseCount = golden.totalCorrectnessCaseCount
+        var checkedSteps = 0
+        var currentCase: String?
+        var lastExpertStats = ExpertStreamingStats.zero
+        var peakRamGB = 0.0
+
+        func result(report: CorrectnessReport) -> WorkerLayeredCorrectnessResult {
+            WorkerLayeredCorrectnessResult(
+                report: report,
+                expertStats: lastExpertStats,
+                peakRamGB: peakRamGB
+            )
+        }
+
+        func failure(
+            caseName: String,
+            comparison: CorrectnessTokenComparison,
+            error: String
+        ) -> WorkerLayeredCorrectnessResult {
+            result(report: CorrectnessReport(
+                passed: false,
+                checkedSteps: checkedSteps + comparison.checkedSteps,
+                caseCount: caseCount,
+                expertCacheHits: lastExpertStats.cacheHits,
+                expertCacheMisses: lastExpertStats.cacheMisses,
+                expertCacheEvictions: lastExpertStats.cacheEvictions,
+                expertBytesRead: lastExpertStats.bytesRead,
+                expertReadSeconds: lastExpertStats.readSeconds,
+                expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
+                expertHitRate: lastExpertStats.hitRate,
+                firstFailingCase: caseName,
+                firstFailingStep: comparison.firstFailingStep,
+                expectedToken: comparison.expectedToken,
+                actualToken: comparison.actualToken,
+                goldenHash: golden.sha256,
+                error: error
+            ))
+        }
+
+        do {
+            for (caseIndex, testCase) in golden.cases.enumerated() {
+                currentCase = testCase.name
+                let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
+                progress?("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
+                let check = try compareTeacherForcedWithWorker(
+                    testCase: testCase,
+                    worker: worker,
+                    steps: steps,
+                    progressIntervalSteps: 64,
+                    progress: { step, total in
+                        progress?("correctness case \(caseLabel) checked \(step)/\(total) tokens")
+                    }
+                )
+                lastExpertStats = check.expertStats
+                peakRamGB = max(peakRamGB, check.peakRamGB)
+                if !check.comparison.passed {
+                    progress?("correctness case \(caseLabel) failed step=\(check.comparison.firstFailingStep ?? -1)")
+                    return failure(
+                        caseName: testCase.name,
+                        comparison: check.comparison,
+                        error: "teacher-forced token mismatch"
+                    )
+                }
+                checkedSteps += check.comparison.checkedSteps
+                progress?("correctness case \(caseLabel) complete checked_steps=\(check.comparison.checkedSteps)")
+            }
+
+            let gates = golden.correctnessGates
+            for (caseIndex, anchor) in (gates?.anchorCases ?? []).enumerated() {
+                currentCase = anchor.name
+                let caseLabel = "\(caseIndex + 1)/\(gates?.anchorCases.count ?? 0)"
+                progress?("correctness anchor \(caseLabel) start context_tokens=\(anchor.contextTokens.count)")
+                let check = try compareAnchorWithWorker(anchor: anchor, worker: worker)
+                lastExpertStats = check.expertStats
+                peakRamGB = max(peakRamGB, check.peakRamGB)
+                if !check.comparison.passed {
+                    progress?("correctness anchor \(caseLabel) failed")
+                    return failure(
+                        caseName: anchor.name,
+                        comparison: check.comparison,
+                        error: "anchor token mismatch"
+                    )
+                }
+                checkedSteps += check.comparison.checkedSteps
+                progress?("correctness anchor \(caseLabel) complete")
+            }
+
+            for (caseIndex, freeRun) in (gates?.freeRunCases ?? []).enumerated() {
+                currentCase = freeRun.name
+                let caseLabel = "\(caseIndex + 1)/\(gates?.freeRunCases.count ?? 0)"
+                progress?("correctness free-run \(caseLabel) start tokens=\(freeRun.expectedTokens.count)")
+                let check = try compareFreeRunWithWorker(testCase: freeRun, worker: worker)
+                lastExpertStats = check.expertStats
+                peakRamGB = max(peakRamGB, check.peakRamGB)
+                if !check.comparison.passed {
+                    progress?("correctness free-run \(caseLabel) failed step=\(check.comparison.firstFailingStep ?? -1)")
+                    return failure(
+                        caseName: freeRun.name,
+                        comparison: check.comparison,
+                        error: "free-run token mismatch"
+                    )
+                }
+                checkedSteps += check.comparison.checkedSteps
+                progress?("correctness free-run \(caseLabel) complete checked_steps=\(check.comparison.checkedSteps)")
+            }
+
+            for (caseIndex, behavior) in (gates?.behaviorCases ?? []).enumerated() {
+                currentCase = behavior.name
+                let caseLabel = "\(caseIndex + 1)/\(gates?.behaviorCases.count ?? 0)"
+                progress?("correctness behavior \(caseLabel) start max_new_tokens=\(behavior.maxNewTokens)")
+                let check = try compareBehaviorWithWorker(testCase: behavior, worker: worker)
+                lastExpertStats = check.expertStats
+                peakRamGB = max(peakRamGB, check.peakRamGB)
+                if !check.comparison.passed {
+                    progress?("correctness behavior \(caseLabel) failed step=\(check.comparison.firstFailingStep ?? -1)")
+                    return failure(
+                        caseName: behavior.name,
+                        comparison: check.comparison,
+                        error: "behavior answer mismatch"
+                    )
+                }
+                checkedSteps += check.comparison.checkedSteps
+                progress?("correctness behavior \(caseLabel) complete checked_steps=\(check.comparison.checkedSteps)")
+            }
+        } catch {
+            progress?("correctness error=\(redactedProgressError("\(error)"))")
+            return result(report: failedCorrectnessReport(
+                checkedSteps: checkedSteps,
+                caseCount: caseCount,
+                firstFailingCase: currentCase,
+                goldenHash: golden.sha256,
+                expertStats: lastExpertStats,
+                error: "\(error)"
+            ))
+        }
+
+        return result(report: CorrectnessReport(
+            passed: true,
+            checkedSteps: checkedSteps,
+            caseCount: caseCount,
+            expertCacheHits: lastExpertStats.cacheHits,
+            expertCacheMisses: lastExpertStats.cacheMisses,
+            expertCacheEvictions: lastExpertStats.cacheEvictions,
+            expertBytesRead: lastExpertStats.bytesRead,
+            expertReadSeconds: lastExpertStats.readSeconds,
+            expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
+            expertHitRate: lastExpertStats.hitRate,
+            firstFailingCase: nil,
+            firstFailingStep: nil,
+            expectedToken: nil,
+            actualToken: nil,
+            goldenHash: golden.sha256,
+            error: ""
+        ))
     }
 
     private struct DecodeMeasurement {
@@ -2163,11 +2325,12 @@ public enum DeepSeekRuntime {
             guard let actualToken = response.token else {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness response missing token")
             }
+            let topLogits = try validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
             let expectedToken = testCase.expectedTokens[step]
             if !correctnessTokenAccepted(
                 expectedToken: expectedToken,
                 actualToken: actualToken,
-                topLogits: response.topLogits
+                topLogits: topLogits
             ) {
                 return WorkerCorrectnessResult(
                     comparison: CorrectnessTokenComparison(
@@ -2208,6 +2371,123 @@ public enum DeepSeekRuntime {
             expertStats: lastExpertStats,
             peakRamGB: peakRamGB
         )
+    }
+
+    private static func compareAnchorWithWorker(
+        anchor: GoldenAnchorCase,
+        worker: RuntimeWorkerClient
+    ) throws -> WorkerCorrectnessResult {
+        let response = try worker.beginTeacherForcedCorrectness(promptTokens: anchor.contextTokens)
+        guard let actualToken = response.token else {
+            throw MLXFastError.invalidInput("runtime worker anchor response missing token")
+        }
+        let topLogits = try validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
+        return WorkerCorrectnessResult(
+            comparison: compareAnchorToken(
+                anchor: anchor,
+                actualToken: actualToken,
+                topLogits: topLogits
+            ),
+            expertStats: response.expertStats ?? .zero,
+            peakRamGB: response.peakRamGB ?? 0
+        )
+    }
+
+    private static func compareFreeRunWithWorker(
+        testCase: GoldenFreeRunCase,
+        worker: RuntimeWorkerClient
+    ) throws -> WorkerCorrectnessResult {
+        let response = try worker.generateCorrectness(
+            promptTokens: testCase.promptTokens,
+            steps: testCase.expectedTokens.count
+        )
+        guard let generated = response.tokens else {
+            throw MLXFastError.invalidInput("runtime worker free-run response missing tokens")
+        }
+        try requireGeneratedTokenCount(
+            generated.count,
+            expected: testCase.expectedTokens.count,
+            label: "free-run"
+        )
+        return WorkerCorrectnessResult(
+            comparison: compareFreeRunTokens(testCase: testCase, generated: generated),
+            expertStats: response.expertStats ?? .zero,
+            peakRamGB: response.peakRamGB ?? 0
+        )
+    }
+
+    private static func compareBehaviorWithWorker(
+        testCase: GoldenBehaviorCase,
+        worker: RuntimeWorkerClient
+    ) throws -> WorkerCorrectnessResult {
+        let response = try worker.generateCorrectness(
+            promptTokens: testCase.promptTokens,
+            steps: testCase.maxNewTokens
+        )
+        guard let generated = response.tokens else {
+            throw MLXFastError.invalidInput("runtime worker behavior response missing tokens")
+        }
+        try requireGeneratedTokenCount(
+            generated.count,
+            expected: testCase.maxNewTokens,
+            label: "behavior"
+        )
+        return WorkerCorrectnessResult(
+            comparison: compareBehaviorTokens(testCase: testCase, generated: generated),
+            expertStats: response.expertStats ?? .zero,
+            peakRamGB: response.peakRamGB ?? 0
+        )
+    }
+
+    private static func validatedWorkerTopLogits(
+        _ topLogits: [CorrectnessTraceLogit]?,
+        actualToken: Int
+    ) throws -> [CorrectnessTraceLogit] {
+        guard let topLogits, !topLogits.isEmpty else {
+            throw MLXFastError.invalidInput("runtime worker response missing top_logits")
+        }
+        guard topLogits.count <= MLXFastConstants.correctnessTopLogits else {
+            throw MLXFastError.invalidInput(
+                "runtime worker returned \(topLogits.count) top_logits; maximum is \(MLXFastConstants.correctnessTopLogits)"
+            )
+        }
+        guard topLogits[0].token == actualToken else {
+            throw MLXFastError.invalidInput("runtime worker top_logits[0] does not match returned token")
+        }
+
+        var seen = Set<Int>()
+        for (index, item) in topLogits.enumerated() {
+            guard item.token >= 0, item.token < MLXFastConstants.vocabSize else {
+                throw MLXFastError.invalidInput("runtime worker top_logits[\(index)].token is outside vocab")
+            }
+            guard item.logit.isFinite else {
+                throw MLXFastError.invalidInput("runtime worker top_logits[\(index)].logit must be finite")
+            }
+            guard seen.insert(item.token).inserted else {
+                throw MLXFastError.invalidInput("runtime worker top_logits contains duplicate token \(item.token)")
+            }
+            if index > 0 {
+                let previous = topLogits[index - 1]
+                guard previous.logit > item.logit
+                    || (previous.logit == item.logit && previous.token < item.token)
+                else {
+                    throw MLXFastError.invalidInput("runtime worker top_logits must be sorted by logit descending")
+                }
+            }
+        }
+        return topLogits
+    }
+
+    private static func requireGeneratedTokenCount(
+        _ actual: Int,
+        expected: Int,
+        label: String
+    ) throws {
+        guard actual == expected else {
+            throw MLXFastError.invalidInput(
+                "runtime worker \(label) returned \(actual) tokens; expected \(expected)"
+            )
+        }
     }
 
     private static func compareGreedyCached(
@@ -2344,6 +2624,142 @@ public enum DeepSeekRuntime {
             expectedToken: nil,
             actualToken: nil
         )
+    }
+
+    private static func compareAnchorCached(
+        anchor: GoldenAnchorCase,
+        weightCache: DeepSeekRuntimeWeightCache
+    ) throws -> CorrectnessTokenComparison {
+        let cache = DeepSeekModelCache(config: weightCache.config)
+        let logits = try DeepSeekModel.logits(
+            inputIDs: inputIDsArray(anchor.contextTokens),
+            weightCache: weightCache,
+            cache: cache,
+            positionOffset: 0
+        )
+        let actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
+        return compareAnchorToken(
+            anchor: anchor,
+            actualToken: actualToken,
+            topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits)
+        )
+    }
+
+    private static func compareFreeRunCached(
+        testCase: GoldenFreeRunCase,
+        weightCache: DeepSeekRuntimeWeightCache,
+        progressIntervalSteps: Int = 0,
+        progress: ((Int, Int) -> Void)? = nil
+    ) throws -> CorrectnessTokenComparison {
+        let generated = try generateGreedyCached(
+            promptTokens: testCase.promptTokens,
+            steps: testCase.expectedTokens.count,
+            weightCache: weightCache,
+            progressIntervalSteps: progressIntervalSteps,
+            progress: progress
+        )
+        return compareFreeRunTokens(testCase: testCase, generated: generated)
+    }
+
+    private static func compareBehaviorCached(
+        testCase: GoldenBehaviorCase,
+        weightCache: DeepSeekRuntimeWeightCache
+    ) throws -> CorrectnessTokenComparison {
+        let generated = try generateGreedyCached(
+            promptTokens: testCase.promptTokens,
+            steps: testCase.maxNewTokens,
+            weightCache: weightCache
+        )
+        return compareBehaviorTokens(testCase: testCase, generated: generated)
+    }
+
+    private static func compareAnchorToken(
+        anchor: GoldenAnchorCase,
+        actualToken: Int,
+        topLogits: [CorrectnessTraceLogit]?
+    ) -> CorrectnessTokenComparison {
+        if anchorTokenAccepted(anchor: anchor, actualToken: actualToken, topLogits: topLogits) {
+            return CorrectnessTokenComparison(
+                passed: true,
+                checkedSteps: 1,
+                firstFailingStep: nil,
+                expectedToken: nil,
+                actualToken: nil
+            )
+        }
+        return CorrectnessTokenComparison(
+            passed: false,
+            checkedSteps: 1,
+            firstFailingStep: 0,
+            expectedToken: anchor.expectedToken,
+            actualToken: actualToken
+        )
+    }
+
+    private static func compareFreeRunTokens(
+        testCase: GoldenFreeRunCase,
+        generated: [Int]
+    ) -> CorrectnessTokenComparison {
+        let prefixTokens = testCase.exactPrefixTokens ?? testCase.expectedTokens.count
+        let comparison = GoldenSequenceMatcher.firstPrefixMismatch(
+            expected: testCase.expectedTokens,
+            actual: generated,
+            prefixTokens: prefixTokens
+        )
+        return CorrectnessTokenComparison(
+            passed: comparison.passed,
+            checkedSteps: comparison.passed ? prefixTokens : (comparison.step ?? 0) + 1,
+            firstFailingStep: comparison.step,
+            expectedToken: comparison.expectedToken,
+            actualToken: comparison.actualToken
+        )
+    }
+
+    private static func compareBehaviorTokens(
+        testCase: GoldenBehaviorCase,
+        generated: [Int]
+    ) -> CorrectnessTokenComparison {
+        let comparison = GoldenSequenceMatcher.matchesAnyExactSequence(
+            acceptedSequences: testCase.acceptedTokenSequences,
+            actual: generated
+        )
+        return CorrectnessTokenComparison(
+            passed: comparison.passed,
+            checkedSteps: comparison.passed ? testCase.maxNewTokens : (comparison.step ?? 0) + 1,
+            firstFailingStep: comparison.step,
+            expectedToken: comparison.expectedToken,
+            actualToken: comparison.actualToken
+        )
+    }
+
+    private static func anchorTokenAccepted(
+        anchor: GoldenAnchorCase,
+        actualToken: Int,
+        topLogits: [CorrectnessTraceLogit]?
+    ) -> Bool {
+        var acceptedTokens = Set(anchor.acceptedTokens ?? [])
+        acceptedTokens.insert(anchor.expectedToken)
+        if acceptedTokens.contains(actualToken) {
+            return true
+        }
+        for acceptedToken in acceptedTokens where correctnessTokenAccepted(
+            expectedToken: acceptedToken,
+            actualToken: actualToken,
+            topLogits: topLogits
+        ) {
+            return true
+        }
+        guard let maxExpectedRank = anchor.maxExpectedRank,
+              let topLogits,
+              let topLogit = topLogits.first?.logit,
+              let expectedIndex = topLogits.firstIndex(where: { $0.token == anchor.expectedToken })
+        else {
+            return false
+        }
+        let expectedRank = expectedIndex + 1
+        let expectedDelta = topLogit - topLogits[expectedIndex].logit
+        let maxDelta = anchor.maxTopLogitDelta ?? MLXFastConstants.correctnessLogitTieTolerance
+        return expectedRank <= maxExpectedRank && expectedDelta <= maxDelta
     }
 
     private static func topLogits(from logits: MLXArray, topK: Int) throws -> [CorrectnessTraceLogit] {

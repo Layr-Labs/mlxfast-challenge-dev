@@ -248,17 +248,25 @@ The Swift `make-golden` generator has been removed from the public harness so CI
 only consumes precomputed fixtures. The last commit on this branch containing
 that generator is `bcc9438fabf95a9b371d5749dd64f2f5ccc60fd5`.
 
-Each correctness prompt must contain exactly 512 token IDs. The benchmark prompt
-must contain at least 512 token IDs. The precomputed golden file stores exact
-expected tokens for each 512-token correctness prompt and its 256-token greedy
-continuation, the 512-token prefill check, the 32-token decode seed, and the
-timed 256-token decode window. During correctness, the harness checks those
+Each base correctness prompt must contain exactly 512 token IDs. The benchmark
+prompt must contain at least 512 token IDs. The precomputed golden file stores
+exact expected tokens for each 512-token correctness prompt and its 256-token
+greedy continuation, the 512-token prefill check, the 512-token decode seed, and
+the timed 256-token decode window. During correctness, the harness checks those
 continuation positions teacher-forced: after each accepted step it feeds the
 golden previous token back into the model. This keeps the gate stable across
 Apple GPU/software differences by preventing one earlier mismatch from
 cascading into unrelated later-token failures. A token is accepted only when it
 matches the expected token, except for a true top-logit tie within the tiny
 `1e-6` logit tolerance used by the harness.
+
+Private fixtures can also include a `correctness_gates` object with hidden
+anchor logits, short free-run prefixes, and exact answer-token behavior checks.
+Those gates are additive: public local correctness still works with the
+checked-in fixture, while official benchmark fixtures can cover more adversarial
+behavior without exposing prompt or answer data. Behavior checks compare the
+full generated answer sequence, so each accepted answer sequence must have
+exactly its case's `max_new_tokens` length.
 
 ## Requirements
 

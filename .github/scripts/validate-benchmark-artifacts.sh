@@ -8,6 +8,7 @@ GOLDEN_PATH="${MLXFAST_CORRECTNESS_GOLDEN_PATH:-correctness_golden.json}"
 : "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256:?MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256 is required}"
 : "${MLXFAST_EXPECTED_CORRECTNESS_STEPS:?MLXFAST_EXPECTED_CORRECTNESS_STEPS is required}"
 : "${MLXFAST_EXPECTED_CORRECTNESS_CASES:?MLXFAST_EXPECTED_CORRECTNESS_CASES is required}"
+: "${MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS:?MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS is required}"
 
 require_file() {
   local path="$1"
@@ -40,7 +41,7 @@ fi
 
 jq -e \
   --arg golden_hash "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}" \
-  --argjson correctness_steps "${MLXFAST_EXPECTED_CORRECTNESS_STEPS}" \
+  --argjson checked_steps "${MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS}" \
   --argjson correctness_cases "${MLXFAST_EXPECTED_CORRECTNESS_CASES}" \
   '
   def same_keys($expected):
@@ -89,7 +90,7 @@ jq -e \
   and (.score | type == "number")
   and (.score >= 0)
   and (.metrics.passed_correctness == true)
-  and (.metrics.checked_steps == $correctness_steps)
+  and (.metrics.checked_steps == $checked_steps)
   and (.metrics.case_count == $correctness_cases)
   and (.metrics.num_layers == 43)
   and (.metrics.golden_hash == $golden_hash)
