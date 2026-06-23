@@ -364,23 +364,33 @@ public enum DeepSeekRuntime {
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
+        // Keep protocol I/O off fd 0/1 so submitted model code cannot read
+        // future request nonces or spoof JSON responses with normal stdio.
+        let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
         var state = RuntimeWorkerState()
 
-        while let line = readLine(strippingNewline: true) {
+        while let line = try protocolIO.readLine() {
             guard !line.isEmpty else {
                 continue
             }
             let response: RuntimeWorkerResponse
             do {
                 let request = try decoder.decode(RuntimeWorkerRequest.self, from: Data(line.utf8))
-                response = try handleWorkerRequest(request, weightCache: weightCache, state: &state)
+                do {
+                    response = try handleWorkerRequest(request, weightCache: weightCache, state: &state)
+                } catch {
+                    response = RuntimeWorkerResponse(
+                        id: request.id,
+                        nonce: request.nonce,
+                        ok: false,
+                        error: "\(error)"
+                    )
+                }
             } catch {
                 response = RuntimeWorkerResponse(id: -1, ok: false, error: "\(error)")
             }
             let data = try encoder.encode(response)
-            FileHandle.standardOutput.write(data)
-            FileHandle.standardOutput.write(Data([0x0a]))
-            fflush(stdout)
+            try protocolIO.writeLine(data)
         }
     }
 
@@ -401,6 +411,7 @@ public enum DeepSeekRuntime {
             )
             return RuntimeWorkerResponse(
                 id: request.id,
+                nonce: request.nonce,
                 ok: true,
                 tokens: tokens,
                 expertStats: expertStats(from: weightCache),
@@ -424,6 +435,7 @@ public enum DeepSeekRuntime {
             state.correctnessStep = 0
             return RuntimeWorkerResponse(
                 id: request.id,
+                nonce: request.nonce,
                 ok: true,
                 token: token,
                 topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
@@ -448,6 +460,7 @@ public enum DeepSeekRuntime {
             state.correctnessStep += 1
             return RuntimeWorkerResponse(
                 id: request.id,
+                nonce: request.nonce,
                 ok: true,
                 token: token,
                 topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
@@ -473,6 +486,7 @@ public enum DeepSeekRuntime {
             Memory.clearCache()
             return RuntimeWorkerResponse(
                 id: request.id,
+                nonce: request.nonce,
                 ok: true,
                 token: token,
                 seconds: elapsed,
@@ -510,6 +524,7 @@ public enum DeepSeekRuntime {
 
             return RuntimeWorkerResponse(
                 id: request.id,
+                nonce: request.nonce,
                 ok: true,
                 seedToken: seedToken,
                 expertStats: expertStats(from: weightCache),
@@ -542,6 +557,7 @@ public enum DeepSeekRuntime {
             state.decodeStep += 1
             return RuntimeWorkerResponse(
                 id: request.id,
+                nonce: request.nonce,
                 ok: true,
                 token: token,
                 seconds: elapsed,
@@ -3008,6 +3024,7 @@ public enum DeepSeekRuntime {
 
 private struct RuntimeWorkerRequest: Codable {
     let id: Int
+    let nonce: String
     let kind: String
     let promptTokens: [Int]?
     let token: Int?
@@ -3016,6 +3033,7 @@ private struct RuntimeWorkerRequest: Codable {
 
     enum CodingKeys: String, CodingKey {
         case id
+        case nonce
         case kind
         case promptTokens = "prompt_tokens"
         case token
@@ -3035,6 +3053,7 @@ private struct RuntimeWorkerState {
 
 private struct RuntimeWorkerResponse: Codable {
     let id: Int
+    let nonce: String?
     let ok: Bool
     let error: String?
     let token: Int?
@@ -3047,6 +3066,7 @@ private struct RuntimeWorkerResponse: Codable {
 
     init(
         id: Int,
+        nonce: String? = nil,
         ok: Bool,
         error: String? = nil,
         token: Int? = nil,
@@ -3058,6 +3078,7 @@ private struct RuntimeWorkerResponse: Codable {
         peakRamGB: Double? = nil
     ) {
         self.id = id
+        self.nonce = nonce
         self.ok = ok
         self.error = error
         self.token = token
@@ -3071,6 +3092,7 @@ private struct RuntimeWorkerResponse: Codable {
 
     enum CodingKeys: String, CodingKey {
         case id
+        case nonce
         case ok
         case error
         case token
@@ -3083,6 +3105,79 @@ private struct RuntimeWorkerResponse: Codable {
     }
 }
 
+private final class RuntimeWorkerProtocolIO {
+    private let input: FileHandle
+    private let output: FileHandle
+
+    private init(inputDescriptor: Int32, outputDescriptor: Int32) {
+        self.input = FileHandle(fileDescriptor: inputDescriptor, closeOnDealloc: true)
+        self.output = FileHandle(fileDescriptor: outputDescriptor, closeOnDealloc: true)
+    }
+
+    static func isolatingStandardIO() throws -> RuntimeWorkerProtocolIO {
+        let inputFD = try duplicatePrivateDescriptor(STDIN_FILENO, label: "stdin")
+        let outputFD = try duplicatePrivateDescriptor(STDOUT_FILENO, label: "stdout")
+        do {
+            try redirectDescriptorToDevNull(STDIN_FILENO, flags: O_RDONLY, label: "stdin")
+            try redirectDescriptorToDevNull(STDOUT_FILENO, flags: O_WRONLY, label: "stdout")
+        } catch {
+            close(inputFD)
+            close(outputFD)
+            throw error
+        }
+        return RuntimeWorkerProtocolIO(inputDescriptor: inputFD, outputDescriptor: outputFD)
+    }
+
+    func readLine() throws -> String? {
+        var data = Data()
+        while true {
+            let byte = input.readData(ofLength: 1)
+            if byte.isEmpty {
+                if data.isEmpty {
+                    return nil
+                }
+                break
+            }
+            if byte[byte.startIndex] == 0x0a {
+                break
+            }
+            data.append(byte)
+        }
+        guard let line = String(data: data, encoding: .utf8) else {
+            throw MLXFastError.invalidInput("runtime worker received non-UTF8 protocol input")
+        }
+        return line
+    }
+
+    func writeLine(_ data: Data) throws {
+        try output.write(contentsOf: data)
+        try output.write(contentsOf: Data([0x0a]))
+    }
+}
+
+private func duplicatePrivateDescriptor(_ descriptor: Int32, label: String) throws -> Int32 {
+    var generator = SystemRandomNumberGenerator()
+    let lowerBound = Int32.random(in: 64...512, using: &generator)
+    let duplicatedFD = fcntl(descriptor, F_DUPFD_CLOEXEC, lowerBound)
+    guard duplicatedFD >= 0 else {
+        throw MLXFastError.invalidInput("runtime worker failed to duplicate \(label) for protocol I/O")
+    }
+    return duplicatedFD
+}
+
+private func redirectDescriptorToDevNull(_ descriptor: Int32, flags: Int32, label: String) throws {
+    let devNullFD = open("/dev/null", flags)
+    guard devNullFD >= 0 else {
+        throw MLXFastError.invalidInput("runtime worker failed to open /dev/null for \(label) redirection")
+    }
+    defer {
+        close(devNullFD)
+    }
+    guard dup2(devNullFD, descriptor) >= 0 else {
+        throw MLXFastError.invalidInput("runtime worker failed to redirect \(label) away from protocol I/O")
+    }
+}
+
 private final class RuntimeWorkerClient {
     private let process: Process
     private let input: FileHandle
@@ -3090,6 +3185,7 @@ private final class RuntimeWorkerClient {
     private let errorOutput: FileHandle
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private let sessionNonce = generateRuntimeWorkerNonce()
     private var nextID = 1
     private var closed = false
 
@@ -3215,6 +3311,7 @@ private final class RuntimeWorkerClient {
         nextID += 1
         let request = RuntimeWorkerRequest(
             id: id,
+            nonce: sessionNonce,
             kind: kind,
             promptTokens: promptTokens,
             token: token,
@@ -3226,6 +3323,9 @@ private final class RuntimeWorkerClient {
         try input.write(contentsOf: data)
 
         let response = try readResponseLine()
+        guard response.nonce == sessionNonce else {
+            throw MLXFastError.invalidInput("runtime worker returned a response with an invalid nonce")
+        }
         guard response.id == id else {
             throw MLXFastError.invalidInput("runtime worker returned response id \(response.id), expected \(id)")
         }
@@ -3286,6 +3386,14 @@ private final class RuntimeWorkerClient {
         }
         return singleLine
     }
+}
+
+private func generateRuntimeWorkerNonce() -> String {
+    var generator = SystemRandomNumberGenerator()
+    return (0..<16)
+        .map { _ in UInt8.random(in: UInt8.min...UInt8.max, using: &generator) }
+        .map { String(format: "%02x", $0) }
+        .joined()
 }
 
 func runtimeWorkerLineLooksLikeJSONResponse(_ data: Data) -> Bool {
