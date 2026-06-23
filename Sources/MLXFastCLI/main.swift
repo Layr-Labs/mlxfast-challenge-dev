@@ -358,13 +358,16 @@ private enum MLXFastCLI {
     }
 
     private static func absolutePath(_ path: String) -> String {
+        let url: URL
         if path.hasPrefix("/") {
-            return URL(fileURLWithPath: path).standardizedFileURL.path
+            url = URL(fileURLWithPath: path)
+        } else {
+            url = URL(
+                fileURLWithPath: path,
+                relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            )
         }
-        return URL(
-            fileURLWithPath: path,
-            relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        ).standardizedFileURL.path
+        return url.standardizedFileURL.resolvingSymlinksInPath().path
     }
 
     private static func seatbeltEscaped(_ value: String) -> String {

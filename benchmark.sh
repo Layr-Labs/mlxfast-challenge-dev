@@ -33,9 +33,9 @@ absolute_path() {
   dir="$(dirname "${path}")"
   base="$(basename "${path}")"
   if [[ "${dir}" = "." ]]; then
-    printf '%s/%s\n' "${PWD}" "${base}"
+    printf '%s/%s\n' "$(pwd -P)" "${base}"
   else
-    (cd "${dir}" 2>/dev/null && printf '%s/%s\n' "${PWD}" "${base}") || printf '%s\n' "${path}"
+    (cd -P "${dir}" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "${base}") || printf '%s\n' "${path}"
   fi
 }
 
@@ -193,6 +193,7 @@ fi
 
 write_runtime_worker_sandbox_profile
 export MLXFAST_USE_RUNTIME_WORKER="${USE_RUNTIME_WORKER}"
+export MLXFAST_RUNTIME_WORKER_EXECUTABLE="$(absolute_path "${SWIFT_BIN}")"
 
 mkdir -p "${WEIGHTS_PATH}"
 wanted_hash="$(source_hash)"

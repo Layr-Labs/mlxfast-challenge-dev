@@ -178,6 +178,9 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     )
 
     #expect(benchmark.contains("MLXFAST_PRIVATE_DIR"))
+    #expect(benchmark.contains("pwd -P"))
+    #expect(benchmark.contains("cd -P"))
+    #expect(benchmark.contains("export MLXFAST_RUNTIME_WORKER_EXECUTABLE=\"$(absolute_path \"${SWIFT_BIN}\")\""))
     #expect(benchmark.contains("(deny file-read* (subpath"))
     #expect(benchmark.contains("(deny file-write* (subpath"))
     #expect(benchmark.contains("(deny process-fork)"))
@@ -187,6 +190,7 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     #expect(!benchmark.contains("(allow network* (remote ip \"localhost:*\"))"))
     #expect(!benchmark.contains("(allow network* (local unix-socket))"))
     #expect(runtime.contains("\"MLXFAST_PRIVATE_DIR\""))
+    #expect(cli.contains("resolvingSymlinksInPath()"))
     #expect(cli.contains("(deny process-fork)"))
     #expect(cli.contains("(deny process-exec*)"))
     #expect(cli.contains("(deny file-write*)"))
