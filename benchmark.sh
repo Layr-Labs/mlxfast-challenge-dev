@@ -71,6 +71,7 @@ write_runtime_worker_sandbox_profile() {
 (deny process-exec*)
 (allow process-exec (literal "$(sandbox_escape "${swift_absolute}")"))
 (deny file-write*)
+(allow file-write* (literal "/dev/null"))
 (deny file-read* (literal "$(sandbox_escape "${golden_absolute}")"))
 EOF
     if [[ -n "${MLXFAST_PRIVATE_DIR:-}" ]]; then

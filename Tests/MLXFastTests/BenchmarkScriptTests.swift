@@ -186,6 +186,7 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     #expect(benchmark.contains("(deny process-fork)"))
     #expect(benchmark.contains("(deny process-exec*)"))
     #expect(benchmark.contains("(deny file-write*)"))
+    #expect(benchmark.contains("(allow file-write* (literal \"/dev/null\"))"))
     #expect(benchmark.contains("(allow process-exec (literal"))
     #expect(!benchmark.contains("(allow network* (remote ip \"localhost:*\"))"))
     #expect(!benchmark.contains("(allow network* (local unix-socket))"))
@@ -194,6 +195,7 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     #expect(cli.contains("(deny process-fork)"))
     #expect(cli.contains("(deny process-exec*)"))
     #expect(cli.contains("(deny file-write*)"))
+    #expect(cli.contains("(allow file-write* (literal \"/dev/null\"))"))
     #expect(!cli.contains("(allow network* (remote ip \\\"localhost:*\\\"))"))
 }
 

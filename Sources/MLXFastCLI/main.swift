@@ -351,6 +351,7 @@ private enum MLXFastCLI {
         (deny process-exec*)
         (allow process-exec (literal "\(seatbeltEscaped(absoluteExecutablePath))"))
         (deny file-write*)
+        (allow file-write* (literal "/dev/null"))
         (deny file-read* (literal "\(seatbeltEscaped(absoluteGoldenPath))"))
         """
         try profile.write(to: profileURL, atomically: true, encoding: .utf8)
