@@ -367,6 +367,12 @@ public enum DeepSeekRuntime {
         // Keep protocol I/O off fd 0/1 so submitted model code cannot read
         // future request nonces or spoof JSON responses with normal stdio.
         let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
+        let sessionNonce = generateRuntimeWorkerNonce()
+        try protocolIO.writeLine(try encoder.encode(RuntimeWorkerResponse(
+            id: 0,
+            nonce: sessionNonce,
+            ok: true
+        )))
         var state = RuntimeWorkerState()
 
         while let line = try protocolIO.readLine() {
@@ -377,17 +383,22 @@ public enum DeepSeekRuntime {
             do {
                 let request = try decoder.decode(RuntimeWorkerRequest.self, from: Data(line.utf8))
                 do {
-                    response = try handleWorkerRequest(request, weightCache: weightCache, state: &state)
+                    response = try handleWorkerRequest(
+                        request,
+                        sessionNonce: sessionNonce,
+                        weightCache: weightCache,
+                        state: &state
+                    )
                 } catch {
                     response = RuntimeWorkerResponse(
                         id: request.id,
-                        nonce: request.nonce,
+                        nonce: sessionNonce,
                         ok: false,
                         error: "\(error)"
                     )
                 }
             } catch {
-                response = RuntimeWorkerResponse(id: -1, ok: false, error: "\(error)")
+                response = RuntimeWorkerResponse(id: -1, nonce: sessionNonce, ok: false, error: "\(error)")
             }
             let data = try encoder.encode(response)
             try protocolIO.writeLine(data)
@@ -396,6 +407,7 @@ public enum DeepSeekRuntime {
 
     private static func handleWorkerRequest(
         _ request: RuntimeWorkerRequest,
+        sessionNonce: String,
         weightCache: DeepSeekRuntimeWeightCache,
         state: inout RuntimeWorkerState
     ) throws -> RuntimeWorkerResponse {
@@ -411,7 +423,7 @@ public enum DeepSeekRuntime {
             )
             return RuntimeWorkerResponse(
                 id: request.id,
-                nonce: request.nonce,
+                nonce: sessionNonce,
                 ok: true,
                 tokens: tokens,
                 expertStats: expertStats(from: weightCache),
@@ -435,7 +447,7 @@ public enum DeepSeekRuntime {
             state.correctnessStep = 0
             return RuntimeWorkerResponse(
                 id: request.id,
-                nonce: request.nonce,
+                nonce: sessionNonce,
                 ok: true,
                 token: token,
                 topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
@@ -460,7 +472,7 @@ public enum DeepSeekRuntime {
             state.correctnessStep += 1
             return RuntimeWorkerResponse(
                 id: request.id,
-                nonce: request.nonce,
+                nonce: sessionNonce,
                 ok: true,
                 token: token,
                 topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
@@ -486,7 +498,7 @@ public enum DeepSeekRuntime {
             Memory.clearCache()
             return RuntimeWorkerResponse(
                 id: request.id,
-                nonce: request.nonce,
+                nonce: sessionNonce,
                 ok: true,
                 token: token,
                 seconds: elapsed,
@@ -524,7 +536,7 @@ public enum DeepSeekRuntime {
 
             return RuntimeWorkerResponse(
                 id: request.id,
-                nonce: request.nonce,
+                nonce: sessionNonce,
                 ok: true,
                 seedToken: seedToken,
                 expertStats: expertStats(from: weightCache),
@@ -557,7 +569,7 @@ public enum DeepSeekRuntime {
             state.decodeStep += 1
             return RuntimeWorkerResponse(
                 id: request.id,
-                nonce: request.nonce,
+                nonce: sessionNonce,
                 ok: true,
                 token: token,
                 seconds: elapsed,
@@ -3024,7 +3036,6 @@ public enum DeepSeekRuntime {
 
 private struct RuntimeWorkerRequest: Codable {
     let id: Int
-    let nonce: String
     let kind: String
     let promptTokens: [Int]?
     let token: Int?
@@ -3033,7 +3044,6 @@ private struct RuntimeWorkerRequest: Codable {
 
     enum CodingKeys: String, CodingKey {
         case id
-        case nonce
         case kind
         case promptTokens = "prompt_tokens"
         case token
@@ -3184,7 +3194,7 @@ private final class RuntimeWorkerClient {
     private let errorOutput: FileHandle
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
-    private let sessionNonce = generateRuntimeWorkerNonce()
+    private var sessionNonce = ""
     private var nextID = 1
     private var closed = false
 
@@ -3235,6 +3245,11 @@ private final class RuntimeWorkerClient {
         self.input = stdin.fileHandleForWriting
         self.output = stdout.fileHandleForReading
         self.errorOutput = stderr.fileHandleForReading
+        let hello = try readResponseLine(validateNonce: false)
+        guard hello.id == 0, hello.ok, let nonce = hello.nonce, !nonce.isEmpty else {
+            throw MLXFastError.invalidInput("runtime worker did not return a valid protocol hello")
+        }
+        self.sessionNonce = nonce
     }
 
     deinit {
@@ -3310,7 +3325,6 @@ private final class RuntimeWorkerClient {
         nextID += 1
         let request = RuntimeWorkerRequest(
             id: id,
-            nonce: sessionNonce,
             kind: kind,
             promptTokens: promptTokens,
             token: token,
@@ -3321,10 +3335,7 @@ private final class RuntimeWorkerClient {
         data.append(0x0a)
         try input.write(contentsOf: data)
 
-        let response = try readResponseLine()
-        guard response.nonce == sessionNonce else {
-            throw MLXFastError.invalidInput("runtime worker returned a response with an invalid nonce")
-        }
+        let response = try readResponseLine(validateNonce: true)
         guard response.id == id else {
             throw MLXFastError.invalidInput("runtime worker returned response id \(response.id), expected \(id)")
         }
@@ -3334,13 +3345,17 @@ private final class RuntimeWorkerClient {
         return response
     }
 
-    private func readResponseLine() throws -> RuntimeWorkerResponse {
+    private func readResponseLine(validateNonce: Bool) throws -> RuntimeWorkerResponse {
         while true {
             let data = try readWorkerOutputLine()
             guard runtimeWorkerLineLooksLikeJSONResponse(data) else {
                 continue
             }
-            return try decoder.decode(RuntimeWorkerResponse.self, from: data)
+            let response = try decoder.decode(RuntimeWorkerResponse.self, from: data)
+            if validateNonce, response.nonce != sessionNonce {
+                throw MLXFastError.invalidInput("runtime worker returned a response with an invalid nonce")
+            }
+            return response
         }
     }
 

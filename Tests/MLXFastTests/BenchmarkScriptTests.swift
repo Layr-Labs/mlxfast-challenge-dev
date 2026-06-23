@@ -241,8 +241,10 @@ func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
         encoding: .utf8
     )
 
-    #expect(runtime.contains("nonce: sessionNonce"))
-    #expect(runtime.contains("response.nonce == sessionNonce"))
+    #expect(runtime.contains("let hello = try readResponseLine(validateNonce: false)"))
+    #expect(runtime.contains("self.sessionNonce = nonce"))
+    #expect(!runtime.contains("RuntimeWorkerRequest(\n            id: id,\n            nonce"))
+    #expect(runtime.contains("response.nonce != sessionNonce"))
     #expect(runtime.contains("RuntimeWorkerProtocolIO.isolatingStandardIO()"))
     #expect(runtime.contains("F_DUPFD_CLOEXEC"))
     #expect(runtime.contains("arc4random_buf(baseAddress, buffer.count)"))
