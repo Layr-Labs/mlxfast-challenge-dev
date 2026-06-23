@@ -145,9 +145,13 @@ func offlineRunnerProvesNetworkIsBlockedBeforeRunningCommand() throws {
     )
 
     #expect(runner.contains("(deny network*)"))
+    #expect(runner.contains("pwd -P"))
+    #expect(runner.contains("cd -P"))
     #expect(runner.contains("(deny process-fork)"))
     #expect(runner.contains("(deny process-exec*)"))
     #expect(runner.contains("(allow process-exec (literal"))
+    #expect(runner.contains("if [[ \"${executable}\" == \"${workspace_root}/\"* ]]; then"))
+    #expect(runner.contains("(allow process-exec (subpath"))
     #expect(runner.contains("(deny file-write*)"))
     #expect(runner.contains("MLXFAST_OFFLINE_WRITABLE_PATHS"))
     #expect(runner.contains("write_allowed_writes"))

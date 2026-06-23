@@ -23,9 +23,9 @@ absolute_path() {
   dir="$(dirname "${path}")"
   base="$(basename "${path}")"
   if [[ "${dir}" = "." ]]; then
-    printf '%s/%s\n' "${PWD}" "${base}"
+    printf '%s/%s\n' "$(pwd -P)" "${base}"
   else
-    (cd "${dir}" 2>/dev/null && printf '%s/%s\n' "${PWD}" "${base}") || printf '%s\n' "${path}"
+    (cd -P "${dir}" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "${base}") || printf '%s\n' "${path}"
   fi
 }
 
@@ -36,7 +36,7 @@ absolute_executable() {
   if [[ "${executable}" == */* ]]; then
     dir="$(dirname "${executable}")"
     base="$(basename "${executable}")"
-    (cd "${dir}" 2>/dev/null && printf '%s/%s\n' "${PWD}" "${base}") || return 1
+    (cd -P "${dir}" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "${base}") || return 1
   else
     command -v "${executable}"
   fi
@@ -62,7 +62,11 @@ write_allowed_writes() {
 
 write_strict_profile() {
   local executable="$1"
+  local executable_dir
   local profile
+  local workspace_root
+  executable_dir="$(dirname "${executable}")"
+  workspace_root="$(pwd -P)"
   profile="$(mktemp "${TMPDIR:-/tmp}/mlxfast-offline.XXXXXX")"
   {
     cat <<EOF
@@ -72,6 +76,11 @@ write_strict_profile() {
 (deny process-fork)
 (deny process-exec*)
 (allow process-exec (literal "$(sandbox_escape "${executable}")"))
+EOF
+    if [[ "${executable}" == "${workspace_root}/"* ]]; then
+      printf '(allow process-exec (subpath "%s"))\n' "$(sandbox_escape "${executable_dir}")"
+    fi
+    cat <<EOF
 (deny file-write*)
 EOF
     write_allowed_writes
