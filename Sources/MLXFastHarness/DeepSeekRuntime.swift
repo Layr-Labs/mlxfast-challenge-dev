@@ -3156,8 +3156,7 @@ private final class RuntimeWorkerProtocolIO {
 }
 
 private func duplicatePrivateDescriptor(_ descriptor: Int32, label: String) throws -> Int32 {
-    var generator = SystemRandomNumberGenerator()
-    let lowerBound = Int32.random(in: 64...512, using: &generator)
+    let lowerBound = Int32(64 + Int(arc4random_uniform(449)))
     let duplicatedFD = fcntl(descriptor, F_DUPFD_CLOEXEC, lowerBound)
     guard duplicatedFD >= 0 else {
         throw MLXFastError.invalidInput("runtime worker failed to duplicate \(label) for protocol I/O")
@@ -3389,9 +3388,13 @@ private final class RuntimeWorkerClient {
 }
 
 private func generateRuntimeWorkerNonce() -> String {
-    var generator = SystemRandomNumberGenerator()
-    return (0..<16)
-        .map { _ in UInt8.random(in: UInt8.min...UInt8.max, using: &generator) }
+    var bytes = [UInt8](repeating: 0, count: 16)
+    bytes.withUnsafeMutableBytes { buffer in
+        if let baseAddress = buffer.baseAddress {
+            arc4random_buf(baseAddress, buffer.count)
+        }
+    }
+    return bytes
         .map { String(format: "%02x", $0) }
         .joined()
 }

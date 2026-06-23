@@ -235,7 +235,7 @@ func runtimeWorkerBenchmarkDecodeDoesNotReceiveBulkOracle() throws {
 }
 
 @Test
-func runtimeWorkerProtocolUsesAuthenticatedPrivateStdout() throws {
+func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
     let runtime = try String(
         contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
         encoding: .utf8
@@ -245,6 +245,7 @@ func runtimeWorkerProtocolUsesAuthenticatedPrivateStdout() throws {
     #expect(runtime.contains("response.nonce == sessionNonce"))
     #expect(runtime.contains("RuntimeWorkerProtocolIO.isolatingStandardIO()"))
     #expect(runtime.contains("F_DUPFD_CLOEXEC"))
+    #expect(runtime.contains("arc4random_buf(baseAddress, buffer.count)"))
     #expect(runtime.contains("redirectDescriptorToDevNull(STDIN_FILENO, flags: O_RDONLY"))
     #expect(runtime.contains("redirectDescriptorToDevNull(STDOUT_FILENO, flags: O_WRONLY"))
     #expect(runtime.contains("dup2(devNullFD, descriptor)"))
