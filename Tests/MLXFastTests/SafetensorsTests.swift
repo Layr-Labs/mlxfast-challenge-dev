@@ -50,6 +50,17 @@ func safetensorsCopySubsetRejectsMissingRequestedTensor() throws {
     }
 }
 
+@Test
+func safetensorsCopySubsetUsesThrowingDestinationCreate() throws {
+    let source = try String(
+        contentsOfFile: "Sources/MLXFastCore/Safetensors.swift",
+        encoding: .utf8
+    )
+
+    #expect(source.contains("try Data().write(to: destination"))
+    #expect(!source.contains("createFile(atPath: destination.path"))
+}
+
 private struct TensorFixture {
     let name: String
     let dtype: String
