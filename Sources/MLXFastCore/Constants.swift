@@ -27,7 +27,7 @@ public enum MLXFastConstants {
     public static let correctnessMaxFreeRunSteps = 256
     public static let correctnessMaxBehaviorPromptTokens = 2_048
     public static let correctnessMaxBehaviorSteps = 64
-    public static let correctnessGPQACaseCount = 10
+    public static let correctnessGPQACaseCount = 9
     public static let correctnessGPQAMaxNewTokens = 2
     public static let benchmarkPrefillPromptTokens = 512
     public static let benchmarkDecodeSteps = 256

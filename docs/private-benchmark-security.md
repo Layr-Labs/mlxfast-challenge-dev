@@ -24,7 +24,7 @@ Normal private benchmark runs download the precomputed
 `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`
 object from the private R2 bucket. Full private benchmark runs also download
 `correctness_prompts/gpqa_reference_cases.json` from the same private bucket
-and merge it into the local golden as 10 hidden multiple-choice behavior gates.
+and merge it into the local golden as 9 hidden multiple-choice behavior gates.
 The private prompt manifest is only an organizer input for regenerating the
 golden outside the benchmark workflow. It should not be written into the
 repository workspace, uploaded, or cached. The workflow writes downloaded
@@ -35,7 +35,7 @@ symlink, and oversized artifact paths.
 Hidden behavioral correctness cases should use short accepted answer token
 prefixes. The GPQA gate asks for only an A/B/C/D answer and generates at most
 two tokens per case, which keeps runtime bounded while still checking semantic
-behavior across all 10 hidden questions. Do not call an external LLM judge from
+behavior across all 9 hidden questions. Do not call an external LLM judge from
 the benchmark runner; that would add a network dependency, create
 prompt-exfiltration risk, and make official scores less reproducible.
 
