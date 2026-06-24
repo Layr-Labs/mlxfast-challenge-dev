@@ -90,6 +90,7 @@ jobs:
     env:
       MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
+      MLXFAST_GPQA_REFERENCE_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/gpqa_reference_cases.json
       MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
       MLXFAST_RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
@@ -99,6 +100,9 @@ jobs:
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 2a747bf797e16d58f5ffedacc0d4bf5ce0d14be00f2421dc04289a2154cb011d
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: "10320"
       MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json
+      MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases.json
+      MLXFAST_GPQA_CASE_COUNT: "10"
+      MLXFAST_GPQA_MAX_NEW_TOKENS: "2"
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 830670206859a1b221508ae44a031205a3eba6f5f13e05b40383bf781bdbf067
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "26110"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "256"
@@ -162,6 +166,10 @@ jobs:
             echo "benchmark: using precomputed R2 private correctness golden"
           else
             echo "benchmark: correctness golden requires correctness_golden_url or private R2 secrets" >&2
+            exit 1
+          fi
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" && "${MLXFAST_PRESERVE_GOLDEN_ONLY}" != "1" && "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
+            echo "benchmark: hidden GPQA behavior gate requires private R2 secrets" >&2
             exit 1
           fi
 
@@ -312,7 +320,18 @@ jobs:
             echo "benchmark: correctness golden missing; configure correctness_golden_url or private R2 correctness_golden.json" >&2
             exit 1
           fi
-          if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" && "${MLXFAST_RUN_BENCHMARK}" == "1" && "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
+            echo "benchmark: downloading precomputed R2 GPQA behavior cases"
+            .github/scripts/download-r2-object.sh \
+              "${MLXFAST_GPQA_R2_PATH}" \
+              "${MLXFAST_GPQA_REFERENCE_PATH}"
+            .build/release/mlxfast-swift attach-gpqa-gates \
+              --golden "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
+              --gpqa "${MLXFAST_GPQA_REFERENCE_PATH}" \
+              --tokenizer weights \
+              --output "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
+              --case-count "${MLXFAST_GPQA_CASE_COUNT}" \
+              --max-new-tokens "${MLXFAST_GPQA_MAX_NEW_TOKENS}"
             actual_hash="$(shasum -a 256 "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | awk '{print $1}')"
             actual_bytes="$(wc -c < "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | tr -d ' ')"
             export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256="${actual_hash}"
@@ -321,7 +340,7 @@ jobs:
               echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"
               echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"
             } >> "${GITHUB_ENV}"
-            echo "benchmark: using private correctness golden ${actual_hash} bytes=${actual_bytes}"
+            echo "benchmark: using private GPQA-augmented correctness golden ${actual_hash} bytes=${actual_bytes}"
           fi
           .github/scripts/verify-correctness-golden.sh
 

@@ -16,6 +16,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.31.4"),
+        .package(url: "https://github.com/huggingface/swift-transformers", exact: "1.3.3"),
     ],
     targets: [
         .target(name: "MLXFastCore"),
@@ -49,6 +50,7 @@ let package = Package(
                 "MLXFastTransform",
                 "MLXFastHarness",
                 "MLXFastSubmission",
+                .product(name: "Tokenizers", package: "swift-transformers"),
             ]
         ),
         .testTarget(

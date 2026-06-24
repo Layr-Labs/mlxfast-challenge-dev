@@ -4,6 +4,7 @@ import MLXFastCore
 import MLXFastHarness
 import MLXFastSubmission
 import MLXFastTransform
+import Tokenizers
 
 let exitCode = MLXFastCLI.run(arguments: Array(CommandLine.arguments.dropFirst()))
 exit(Int32(exitCode))
@@ -35,6 +36,9 @@ private enum MLXFastCLI {
                 return 0
             case "benchmark":
                 try runBenchmark(options)
+                return 0
+            case "attach-gpqa-gates":
+                try runAttachGPQAGates(options)
                 return 0
             case "runtime-worker":
                 try runRuntimeWorker(options)
@@ -291,6 +295,203 @@ private enum MLXFastCLI {
         if data.last != 0x0a {
             print("")
         }
+    }
+
+    private static func runAttachGPQAGates(_ options: ParsedOptions) throws {
+        try options.validate(
+            valueOptions: ["--golden", "--gpqa", "--tokenizer", "--output", "--case-count", "--max-new-tokens"]
+        )
+        let goldenPath = options.value(
+            for: "--golden",
+            default: environmentValue(
+                "MLXFAST_CORRECTNESS_GOLDEN_PATH",
+                fallback: MLXFastConstants.defaultGoldenPath
+            )
+        )
+        let gpqaPath = options.value(
+            for: "--gpqa",
+            default: environmentValue("MLXFAST_GPQA_REFERENCE_PATH", fallback: "")
+        )
+        guard !gpqaPath.isEmpty else {
+            throw MLXFastError.invalidInput("attach-gpqa-gates requires --gpqa or MLXFAST_GPQA_REFERENCE_PATH")
+        }
+        let tokenizerPath = options.value(
+            for: "--tokenizer",
+            default: environmentValue("MLXFAST_TOKENIZER_PATH", fallback: MLXFastConstants.defaultWeightsPath)
+        )
+        let outputPath = options.value(for: "--output", default: goldenPath)
+        let caseCount = try parsePositiveInt(
+            options.value(for: "--case-count", default: "\(MLXFastConstants.correctnessGPQACaseCount)"),
+            optionName: "--case-count"
+        )
+        let maxNewTokens = try parsePositiveInt(
+            options.value(for: "--max-new-tokens", default: "\(MLXFastConstants.correctnessGPQAMaxNewTokens)"),
+            optionName: "--max-new-tokens"
+        )
+        guard maxNewTokens <= MLXFastConstants.correctnessMaxBehaviorSteps else {
+            throw MLXFastError.invalidInput(
+                "--max-new-tokens must be <= \(MLXFastConstants.correctnessMaxBehaviorSteps)"
+            )
+        }
+
+        try requireFile(goldenPath, description: "correctness golden file")
+        try requireFile(gpqaPath, description: "GPQA reference cases file")
+        try requireFile(
+            URL(fileURLWithPath: tokenizerPath).appendingPathComponent("tokenizer.json").path,
+            description: "tokenizer.json"
+        )
+        try requireFile(
+            URL(fileURLWithPath: tokenizerPath).appendingPathComponent("tokenizer_config.json").path,
+            description: "tokenizer_config.json"
+        )
+
+        let tokenizer = try loadLocalTokenizer(at: tokenizerPath)
+        let goldenData = try Data(contentsOf: URL(fileURLWithPath: goldenPath))
+        let golden = try JSONDecoder().decode(GoldenDocument.self, from: goldenData)
+        let gpqaData = try Data(contentsOf: URL(fileURLWithPath: gpqaPath))
+        let gpqa = try JSONDecoder().decode(GPQAReferenceDocument.self, from: gpqaData)
+        guard gpqa.cases.count >= caseCount else {
+            throw MLXFastError.invalidInput("GPQA reference has \(gpqa.cases.count) cases; need \(caseCount)")
+        }
+
+        let behaviorCases = try gpqa.cases.prefix(caseCount).map { testCase in
+            try buildGPQABehaviorCase(
+                testCase,
+                tokenizer: tokenizer,
+                maxNewTokens: maxNewTokens
+            )
+        }
+
+        let existingGates = golden.correctnessGates
+        let existingBehavior = existingGates?.behaviorCases ?? []
+        let mergedGates = GoldenCorrectnessGates(
+            anchors: existingGates?.anchors,
+            freeRun: existingGates?.freeRun,
+            behavior: existingBehavior + behaviorCases
+        )
+        let merged = GoldenDocument(
+            version: golden.version ?? 1,
+            cases: golden.cases,
+            correctnessGates: mergedGates,
+            benchmark: golden.benchmark
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let outputData = try encoder.encode(merged)
+        let outputURL = URL(fileURLWithPath: outputPath)
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try outputData.write(to: outputURL, options: [.atomic])
+        _ = try loadGoldenFixture(from: outputPath)
+        print(
+            "attached GPQA behavior gates cases=\(behaviorCases.count) "
+                + "max_new_tokens=\(maxNewTokens) output=\(outputPath)"
+        )
+    }
+
+    private static func loadLocalTokenizer(at path: String) throws -> any Tokenizer {
+        let modelFolder = URL(fileURLWithPath: path).standardizedFileURL
+        return try runBlockingAsync {
+            try await AutoTokenizer.from(modelFolder: modelFolder, strict: false)
+        }
+    }
+
+    private static func buildGPQABehaviorCase(
+        _ testCase: GPQAReferenceCase,
+        tokenizer: any Tokenizer,
+        maxNewTokens: Int
+    ) throws -> GoldenBehaviorCase {
+        let promptTokens = tokenizer.encode(text: testCase.prompt, addSpecialTokens: false)
+        guard !promptTokens.isEmpty else {
+            throw MLXFastError.invalidInput("\(testCase.identifier).prompt tokenized to zero tokens")
+        }
+        guard promptTokens.count <= MLXFastConstants.correctnessMaxBehaviorPromptTokens else {
+            throw MLXFastError.invalidInput(
+                "\(testCase.identifier).prompt tokenized to \(promptTokens.count) tokens; "
+                    + "maximum is \(MLXFastConstants.correctnessMaxBehaviorPromptTokens)"
+            )
+        }
+        let answer = try testCase.answerLetter()
+        let acceptedSequences = try acceptedAnswerTokenSequences(
+            answer: answer,
+            tokenizer: tokenizer,
+            maxNewTokens: maxNewTokens,
+            caseName: testCase.identifier
+        )
+        return GoldenBehaviorCase(
+            name: testCase.identifier,
+            promptTokens: promptTokens,
+            acceptedTokenSequences: acceptedSequences,
+            maxNewTokens: maxNewTokens
+        )
+    }
+
+    private static func acceptedAnswerTokenSequences(
+        answer: String,
+        tokenizer: any Tokenizer,
+        maxNewTokens: Int,
+        caseName: String
+    ) throws -> [[Int]] {
+        let letters = [answer, answer.lowercased()]
+        let prefixes = ["", " ", "\n"]
+        let suffixes = ["", ".", "\n"]
+        var seen = Set<[Int]>()
+        var sequences: [[Int]] = []
+        for prefix in prefixes {
+            for letter in letters {
+                for suffix in suffixes {
+                    let tokens = tokenizer.encode(text: prefix + letter + suffix, addSpecialTokens: false)
+                    guard !tokens.isEmpty, tokens.count <= maxNewTokens else {
+                        continue
+                    }
+                    if seen.insert(tokens).inserted {
+                        sequences.append(tokens)
+                    }
+                }
+            }
+        }
+        guard !sequences.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "\(caseName) answer \(answer) has no accepted tokenization within \(maxNewTokens) token(s)"
+            )
+        }
+        return sequences.sorted { lhs, rhs in
+            if lhs.count != rhs.count {
+                return lhs.count < rhs.count
+            }
+            return lhs.lexicographicallyPrecedes(rhs)
+        }
+    }
+
+    private final class AsyncResultBox<T>: @unchecked Sendable {
+        var result: Result<T, Error>?
+    }
+
+    private static func runBlockingAsync<T>(
+        _ body: @escaping @Sendable () async throws -> T
+    ) throws -> T {
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = AsyncResultBox<T>()
+        Task {
+            do {
+                box.result = .success(try await body())
+            } catch {
+                box.result = .failure(error)
+            }
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return try box.result!.get()
+    }
+
+    private static func parsePositiveInt(_ rawValue: String, optionName: String) throws -> Int {
+        guard let value = Int(rawValue), value > 0 else {
+            throw MLXFastError.invalidInput("\(optionName) must be a positive integer")
+        }
+        return value
     }
 
     private static func runtimeWorkerOptions(blockedGoldenPath: String? = nil) throws -> RuntimeWorkerOptions? {
@@ -673,6 +874,7 @@ private enum MLXFastCLI {
               mlxfast-swift correctness-trace [--weights PATH] [--golden PATH] [--case NAME] --step N [--top-k N]
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--quick] [--weights PATH] [--golden PATH] [--score-path PATH]
+              mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
               mlxfast-swift login [--api-key KEY | KEY] [--api URL] [--no-verify]
               mlxfast-swift config
@@ -956,6 +1158,40 @@ private enum MLXFastCLI {
         return stdout
     }
 
+}
+
+private struct GPQAReferenceDocument: Decodable {
+    let cases: [GPQAReferenceCase]
+}
+
+private struct GPQAReferenceCase: Decodable {
+    let id: String?
+    let prompt: String
+    let expectedResponse: String?
+    let answerKey: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case prompt
+        case expectedResponse = "expected_response"
+        case answerKey = "answer_key"
+    }
+
+    var identifier: String {
+        let trimmed = id?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "gpqa-private" : trimmed
+    }
+
+    func answerLetter() throws -> String {
+        let raw = expectedResponse ?? answerKey ?? ""
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard let first = trimmed.first,
+              ["A", "B", "C", "D"].contains(String(first))
+        else {
+            throw MLXFastError.invalidInput("\(identifier) expected_response must start with A, B, C, or D")
+        }
+        return String(first)
+    }
 }
 
 private struct ParsedOptions {

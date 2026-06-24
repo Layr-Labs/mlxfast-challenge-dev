@@ -122,16 +122,25 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(!workflow.contains("${{ runner.temp }}"))
     #expect(workflow.contains("MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}"))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json"))
+    #expect(workflow.contains("MLXFAST_GPQA_REFERENCE_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/gpqa_reference_cases.json"))
     #expect(workflow.contains("MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 2a747bf797e16d58f5ffedacc0d4bf5ce0d14be00f2421dc04289a2154cb011d"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"10320\""))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json"))
+    #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases.json"))
+    #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"10\""))
+    #expect(workflow.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"2\""))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 830670206859a1b221508ae44a031205a3eba6f5f13e05b40383bf781bdbf067"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: \"26110\""))
     #expect(workflow.contains("benchmark: using checked-in public correctness golden"))
-    #expect(workflow.contains("[[ -z \"${MLXFAST_CORRECTNESS_GOLDEN_URL:-}\" && \"${MLXFAST_RUN_BENCHMARK}\" == \"1\" && \"${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}\" == \"1\" ]]"))
+    #expect(workflow.contains("hidden GPQA behavior gate requires private R2 secrets"))
+    #expect(workflow.contains("mlxfast-swift attach-gpqa-gates"))
+    #expect(workflow.contains("--case-count \"${MLXFAST_GPQA_CASE_COUNT}\""))
+    #expect(workflow.contains("--max-new-tokens \"${MLXFAST_GPQA_MAX_NEW_TOKENS}\""))
+    #expect(workflow.contains("using private GPQA-augmented correctness golden"))
+    #expect(workflow.contains("[[ \"${MLXFAST_RUN_BENCHMARK}\" == \"1\" ]]"))
     #expect(!workflow.contains("generate_golden_only"))
     #expect(!workflow.contains("MLXFAST_GENERATE_GOLDEN_ONLY"))
     #expect(workflow.contains("inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success'"))
@@ -147,6 +156,26 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(validator.contains("and (.metrics.actual_token == null)"))
     #expect(stageArtifacts.contains("/tmp/mlxfast-artifacts-*"))
     #expect(stageArtifacts.contains(".github/scripts/deny-private-artifacts.sh \"${dest}\""))
+}
+
+@Test
+func cliSupportsHiddenGPQAGateAttachment() throws {
+    let cli = try String(
+        contentsOfFile: "Sources/MLXFastCLI/main.swift",
+        encoding: .utf8
+    )
+    let package = try String(
+        contentsOfFile: "Package.swift",
+        encoding: .utf8
+    )
+
+    #expect(package.contains(".product(name: \"Tokenizers\", package: \"swift-transformers\")"))
+    #expect(cli.contains("case \"attach-gpqa-gates\""))
+    #expect(cli.contains("AutoTokenizer.from(modelFolder: modelFolder, strict: false)"))
+    #expect(cli.contains("acceptedAnswerTokenSequences"))
+    #expect(cli.contains("MLXFastConstants.correctnessGPQACaseCount"))
+    #expect(cli.contains("MLXFastConstants.correctnessGPQAMaxNewTokens"))
+    #expect(!cli.contains("print(testCase.prompt)"))
 }
 
 @Test
@@ -448,10 +477,12 @@ func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
 
     let golden = root.appendingPathComponent("correctness_golden_512_2048.json")
     let prompts = root.appendingPathComponent("my_private_prompts.json")
+    let gpqa = root.appendingPathComponent("gpqa_reference_cases.json")
     let goldenPromptText = root.appendingPathComponent("golden_prompt_benchmark_transcription_gate_english_512.txt")
     let goldenPromptJSON = root.appendingPathComponent("golden_prompt_benchmark_transcription_gate_english_512_256.json")
     try "{}".write(to: golden, atomically: true, encoding: .utf8)
     try "{}".write(to: prompts, atomically: true, encoding: .utf8)
+    try "{}".write(to: gpqa, atomically: true, encoding: .utf8)
     try "hidden prompt".write(to: goldenPromptText, atomically: true, encoding: .utf8)
     try "{}".write(to: goldenPromptJSON, atomically: true, encoding: .utf8)
 
@@ -461,6 +492,7 @@ func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
         ".github/scripts/deny-private-artifacts.sh",
         golden.path,
         prompts.path,
+        gpqa.path,
         goldenPromptText.path,
         goldenPromptJSON.path,
     ]

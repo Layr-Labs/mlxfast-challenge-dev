@@ -366,6 +366,43 @@ public enum GoldenSequenceMatcher {
             actualToken: closestMismatch?.actualToken ?? actual.first
         )
     }
+
+    public static func matchesAnyAcceptedPrefix(
+        acceptedSequences: [[Int]],
+        actual: [Int]
+    ) -> BenchmarkTokenComparison {
+        for sequence in acceptedSequences {
+            let comparison = firstPrefixMismatch(
+                expected: sequence,
+                actual: actual,
+                prefixTokens: sequence.count
+            )
+            if comparison.passed {
+                return BenchmarkTokenComparison(
+                    passed: true,
+                    label: "accepted answer token prefix",
+                    step: nil,
+                    expectedToken: nil,
+                    actualToken: nil
+                )
+            }
+        }
+
+        let firstSequence = acceptedSequences.first ?? []
+        let closestMismatch = acceptedSequences
+            .map { firstPrefixMismatch(expected: $0, actual: actual, prefixTokens: $0.count) }
+            .filter { !$0.passed }
+            .max { lhs, rhs in
+                (lhs.step ?? 0) < (rhs.step ?? 0)
+            }
+        return BenchmarkTokenComparison(
+            passed: false,
+            label: "accepted answer token prefix",
+            step: closestMismatch?.step ?? 0,
+            expectedToken: closestMismatch?.expectedToken ?? firstSequence.first,
+            actualToken: closestMismatch?.actualToken ?? actual.first
+        )
+    }
 }
 
 public enum BenchmarkOutputValidator {
@@ -693,7 +730,7 @@ private func validateGoldenFreeRunCases(
 
 private func validateGoldenBehaviorCases(
     _ cases: [GoldenBehaviorCase],
-    requiredPromptTokens: Int
+    requiredPromptTokens _: Int
 ) throws {
     var names = Set<String>()
     for testCase in cases {
@@ -701,9 +738,12 @@ private func validateGoldenBehaviorCases(
         guard names.insert(testCase.name).inserted else {
             throw MLXFastError.invalidInput("duplicate correctness behavior case name \(testCase.name)")
         }
-        guard testCase.promptTokens.count == requiredPromptTokens else {
+        guard !testCase.promptTokens.isEmpty else {
+            throw MLXFastError.invalidInput("\(testCase.name).prompt_tokens must not be empty")
+        }
+        guard testCase.promptTokens.count <= MLXFastConstants.correctnessMaxBehaviorPromptTokens else {
             throw MLXFastError.invalidInput(
-                "\(testCase.name).prompt_tokens has \(testCase.promptTokens.count) tokens; need exactly \(requiredPromptTokens)"
+                "\(testCase.name).prompt_tokens has \(testCase.promptTokens.count) tokens; maximum is \(MLXFastConstants.correctnessMaxBehaviorPromptTokens)"
             )
         }
         guard testCase.maxNewTokens > 0,
@@ -722,9 +762,9 @@ private func validateGoldenBehaviorCases(
                     "\(testCase.name).accepted_token_sequences[\(index)] must not be empty"
                 )
             }
-            guard sequence.count == testCase.maxNewTokens else {
+            guard sequence.count <= testCase.maxNewTokens else {
                 throw MLXFastError.invalidInput(
-                    "\(testCase.name).accepted_token_sequences[\(index)] has \(sequence.count) tokens; need exactly max_new_tokens \(testCase.maxNewTokens)"
+                    "\(testCase.name).accepted_token_sequences[\(index)] has \(sequence.count) tokens; maximum is max_new_tokens \(testCase.maxNewTokens)"
                 )
             }
             try validateTokens(sequence, field: "\(testCase.name).accepted_token_sequences[\(index)]")

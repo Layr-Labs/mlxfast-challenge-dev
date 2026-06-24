@@ -69,7 +69,7 @@ func loadGoldenFixtureAcceptsLayeredCorrectnessGates() throws {
         "behavior": [
           {
             "name": "behavior-0",
-            "prompt_tokens": \(correctnessPromptJSON(3)),
+            "prompt_tokens": [3, 4, 5],
             "accepted_token_sequences": [[11, 12], [12, 13]],
             "max_new_tokens": 2
           }
@@ -267,6 +267,24 @@ func goldenSequenceMatcherChecksExactPrefixes() {
     #expect(fail.step == 1)
     #expect(fail.expectedToken == 2)
     #expect(fail.actualToken == 8)
+}
+
+@Test
+func goldenSequenceMatcherAcceptsShortBehaviorPrefixes() {
+    let pass = GoldenSequenceMatcher.matchesAnyAcceptedPrefix(
+        acceptedSequences: [[101], [202, 203]],
+        actual: [101, 999]
+    )
+    #expect(pass.passed)
+
+    let fail = GoldenSequenceMatcher.matchesAnyAcceptedPrefix(
+        acceptedSequences: [[101], [202, 203]],
+        actual: [202, 999]
+    )
+    #expect(!fail.passed)
+    #expect(fail.step == 1)
+    #expect(fail.expectedToken == 203)
+    #expect(fail.actualToken == 999)
 }
 
 @Test

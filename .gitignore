@@ -28,11 +28,14 @@ correctness_golden*.json
 local_correctness_golden.json
 private_prompts.json
 private_prompts*.json
+gpqa_reference_cases.json
+gpqa_reference_cases*.json
 correctness_prompts/*correctness_golden*.json
 correctness_prompts/*golden_prompt*.json
 correctness_prompts/*golden_prompt*.txt
 correctness_prompts/*private*.json
 correctness_prompts/*private*.txt
+correctness_prompts/*gpqa_reference_cases*.json
 
 # IDE
 .vscode/

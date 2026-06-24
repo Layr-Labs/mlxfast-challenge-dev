@@ -2747,7 +2747,7 @@ public enum DeepSeekRuntime {
         testCase: GoldenBehaviorCase,
         generated: [Int]
     ) -> CorrectnessTokenComparison {
-        let comparison = GoldenSequenceMatcher.matchesAnyExactSequence(
+        let comparison = GoldenSequenceMatcher.matchesAnyAcceptedPrefix(
             acceptedSequences: testCase.acceptedTokenSequences,
             actual: generated
         )
