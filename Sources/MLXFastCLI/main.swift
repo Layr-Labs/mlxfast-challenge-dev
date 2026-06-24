@@ -350,15 +350,27 @@ private enum MLXFastCLI {
         let golden = try JSONDecoder().decode(GoldenDocument.self, from: goldenData)
         let gpqaData = try Data(contentsOf: URL(fileURLWithPath: gpqaPath))
         let gpqa = try JSONDecoder().decode(GPQAReferenceDocument.self, from: gpqaData)
-        guard gpqa.cases.count >= caseCount else {
-            throw MLXFastError.invalidInput("GPQA reference has \(gpqa.cases.count) cases; need \(caseCount)")
-        }
-
-        let behaviorCases = try gpqa.cases.prefix(caseCount).map { testCase in
-            try buildGPQABehaviorCase(
+        var behaviorCases: [GoldenBehaviorCase] = []
+        var skippedOverBudgetGPQACases = 0
+        for testCase in gpqa.cases {
+            guard behaviorCases.count < caseCount else {
+                break
+            }
+            if let behaviorCase = try buildGPQABehaviorCaseIfWithinPromptBudget(
                 testCase,
                 tokenizer: tokenizer,
                 maxNewTokens: maxNewTokens
+            ) {
+                behaviorCases.append(behaviorCase)
+            } else {
+                skippedOverBudgetGPQACases += 1
+            }
+        }
+        guard behaviorCases.count == caseCount else {
+            throw MLXFastError.invalidInput(
+                "GPQA reference produced \(behaviorCases.count) token-budget-valid cases; "
+                    + "need \(caseCount); skipped_over_budget=\(skippedOverBudgetGPQACases); "
+                    + "max_prompt_tokens=\(MLXFastConstants.correctnessMaxBehaviorPromptTokens)"
             )
         }
 
@@ -388,7 +400,9 @@ private enum MLXFastCLI {
         _ = try loadGoldenFixture(from: outputPath)
         print(
             "attached GPQA behavior gates cases=\(behaviorCases.count) "
-                + "max_new_tokens=\(maxNewTokens) output=\(outputPath)"
+                + "max_new_tokens=\(maxNewTokens) "
+                + "skipped_over_budget=\(skippedOverBudgetGPQACases) "
+                + "output=\(outputPath)"
         )
     }
 
@@ -399,20 +413,17 @@ private enum MLXFastCLI {
         }
     }
 
-    private static func buildGPQABehaviorCase(
+    private static func buildGPQABehaviorCaseIfWithinPromptBudget(
         _ testCase: GPQAReferenceCase,
         tokenizer: any Tokenizer,
         maxNewTokens: Int
-    ) throws -> GoldenBehaviorCase {
+    ) throws -> GoldenBehaviorCase? {
         let promptTokens = tokenizer.encode(text: testCase.prompt, addSpecialTokens: false)
         guard !promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("\(testCase.identifier).prompt tokenized to zero tokens")
         }
         guard promptTokens.count <= MLXFastConstants.correctnessMaxBehaviorPromptTokens else {
-            throw MLXFastError.invalidInput(
-                "\(testCase.identifier).prompt tokenized to \(promptTokens.count) tokens; "
-                    + "maximum is \(MLXFastConstants.correctnessMaxBehaviorPromptTokens)"
-            )
+            return nil
         }
         let answer = try testCase.answerLetter()
         let acceptedSequences = try acceptedAnswerTokenSequences(
