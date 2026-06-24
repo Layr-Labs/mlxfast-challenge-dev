@@ -29,7 +29,10 @@ Each GPQA case must carry accepted reference-model output tokens or responses;
 the GPQA answer key alone is not used as an exact-token correctness oracle.
 Calibrate the private file on the official runner after setup/transform with
 `mlxfast-swift calibrate-gpqa-gates --gpqa PATH --weights weights --tokenizer weights --output PATH`,
-then upload only the calibrated JSON to private R2.
+then upload only the calibrated JSON to private R2. The benchmark workflow has a
+manual `calibrate_gpqa_reference` mode for this: it downloads the private GPQA
+file, calibrates accepted token sequences on the Blacksmith runner, and writes
+the calibrated JSON back to the same private R2 object without artifacting it.
 The private prompt manifest is only an organizer input for regenerating the
 golden outside the benchmark workflow. It should not be written into the
 repository workspace, uploaded, or cached. The workflow writes downloaded

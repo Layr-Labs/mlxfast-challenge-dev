@@ -101,6 +101,9 @@ Generate those accepted token sequences on the official runner with
 `mlxfast-swift calibrate-gpqa-gates --gpqa PATH --weights weights --tokenizer weights --output PATH`.
 The official workflow checks the first generated GPQA answer token for each
 case, using the stable prefix of any longer calibrated reference sequence.
+Because this gate is exact-token based, calibrate it on the official Blacksmith
+runner with the manual `calibrate_gpqa_reference` workflow input; M-series local
+calibration can differ from the official runner even at temperature zero.
 If none of those is configured, a full benchmark fails; it will not use a
 committed prompt, committed golden, or Actions cache fallback for ranked
 scoring. Final hidden goldens should come from protected storage. Private

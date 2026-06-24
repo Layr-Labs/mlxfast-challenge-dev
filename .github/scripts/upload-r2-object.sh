@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$#" -ne 2 ]]; then
+  echo "usage: upload-r2-object.sh OBJECT_PATH INPUT_PATH" >&2
+  exit 2
+fi
+
+object_path="${1#/}"
+input_path="$2"
+
+: "${R2_ACCESS_KEY_ID:?R2_ACCESS_KEY_ID is required}"
+: "${R2_BUCKET_ENDPOINT:?R2_BUCKET_ENDPOINT is required}"
+: "${R2_SECRET_ACCESS_KEY:?R2_SECRET_ACCESS_KEY is required}"
+
+if [[ ! -f "${input_path}" || -L "${input_path}" ]]; then
+  echo "upload-r2-object: input must be a regular non-symlink file: ${input_path}" >&2
+  exit 1
+fi
+
+endpoint="${R2_BUCKET_ENDPOINT%/}"
+case "${endpoint}" in
+  https://*) ;;
+  *)
+    echo "upload-r2-object: R2_BUCKET_ENDPOINT must be an https URL" >&2
+    exit 1
+    ;;
+esac
+
+endpoint_rest="${endpoint#https://}"
+host="${endpoint_rest%%/*}"
+base_path="${endpoint_rest#"${host}"}"
+request_path="${base_path}/${object_path}"
+url="https://${host}${request_path}"
+
+region="${R2_REGION:-auto}"
+service="s3"
+amz_date="$(date -u +%Y%m%dT%H%M%SZ)"
+date_stamp="${amz_date:0:8}"
+payload_hash="$(shasum -a 256 "${input_path}" | awk '{print $1}')"
+signed_headers="host;x-amz-content-sha256;x-amz-date"
+canonical_headers="$(printf 'host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n' "${host}" "${payload_hash}" "${amz_date}")"
+canonical_request="$(printf 'PUT\n%s\n\n%s\n%s\n%s' "${request_path}" "${canonical_headers}" "${signed_headers}" "${payload_hash}")"
+credential_scope="${date_stamp}/${region}/${service}/aws4_request"
+canonical_request_hash="$(printf '%s' "${canonical_request}" | shasum -a 256 | awk '{print $1}')"
+string_to_sign="$(printf 'AWS4-HMAC-SHA256\n%s\n%s\n%s' "${amz_date}" "${credential_scope}" "${canonical_request_hash}")"
+
+hmac_hex() {
+  local key_opt="$1"
+  local message="$2"
+  printf '%s' "${message}" \
+    | openssl dgst -sha256 -mac HMAC -macopt "${key_opt}" -binary \
+    | xxd -p -c 256
+}
+
+k_date="$(hmac_hex "key:AWS4${R2_SECRET_ACCESS_KEY}" "${date_stamp}")"
+k_region="$(hmac_hex "hexkey:${k_date}" "${region}")"
+k_service="$(hmac_hex "hexkey:${k_region}" "${service}")"
+k_signing="$(hmac_hex "hexkey:${k_service}" "aws4_request")"
+signature="$(printf '%s' "${string_to_sign}" \
+  | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${k_signing}" \
+  | awk '{print $2}')"
+
+authorization="AWS4-HMAC-SHA256 Credential=${R2_ACCESS_KEY_ID}/${credential_scope}, SignedHeaders=${signed_headers}, Signature=${signature}"
+
+upload_with_aws_cli() {
+  local trimmed_path="${base_path#/}"
+  local bucket
+  local key_prefix
+  local key
+
+  if [[ -z "${trimmed_path}" || ! -x "$(command -v aws 2>/dev/null)" ]]; then
+    return 1
+  fi
+
+  bucket="${trimmed_path%%/*}"
+  key_prefix="${trimmed_path#"${bucket}"}"
+  key_prefix="${key_prefix#/}"
+  key="${object_path}"
+  if [[ -n "${key_prefix}" ]]; then
+    key="${key_prefix}/${object_path}"
+  fi
+
+  echo "upload-r2-object: using AWS CLI S3 path-style upload"
+  AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}" \
+    AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}" \
+    AWS_DEFAULT_REGION="${region}" \
+    AWS_EC2_METADATA_DISABLED=true \
+    aws \
+      --endpoint-url "https://${host}" \
+      s3 cp \
+      "${input_path}" \
+      "s3://${bucket}/${key}" \
+      --only-show-errors \
+      --no-progress
+}
+
+if upload_with_aws_cli; then
+  echo "upload-r2-object: wrote ${object_path}"
+  exit 0
+fi
+
+echo "upload-r2-object: using signed HTTPS upload"
+curl \
+  --fail \
+  --silent \
+  --show-error \
+  --location \
+  --retry 5 \
+  --retry-all-errors \
+  --retry-delay 2 \
+  --request PUT \
+  -H "Authorization: ${authorization}" \
+  -H "x-amz-content-sha256: ${payload_hash}" \
+  -H "x-amz-date: ${amz_date}" \
+  --upload-file "${input_path}" \
+  "${url}"
+
+echo "upload-r2-object: wrote ${object_path}"
