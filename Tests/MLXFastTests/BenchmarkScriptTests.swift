@@ -210,6 +210,9 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(runtime.contains("compareBehaviorFirstToken"))
     #expect(runtime.contains("testCase.maxNewTokens == 1"))
     #expect(runtime.contains("correctnessTokenAccepted("))
+    #expect(runtime.contains("correctness_teacher_forced_batch"))
+    #expect(runtime.contains("top_logit_rows"))
+    #expect(runtime.contains("teacherForcedCorrectnessBatch"))
 }
 
 @Test
