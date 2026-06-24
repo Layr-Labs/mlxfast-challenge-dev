@@ -266,6 +266,31 @@ public enum DeepSeekRuntime {
         _ options: GreedyGenerationOptions,
         progress: ((Int, Int) -> Void)? = nil
     ) throws -> [Int] {
+        try generateGreedyTokens(options, worker: nil, progress: progress)
+    }
+
+    public static func generateGreedyTokens(
+        _ options: GreedyGenerationOptions,
+        worker workerOptions: RuntimeWorkerOptions?,
+        progress: ((Int, Int) -> Void)? = nil
+    ) throws -> [Int] {
+        if let workerOptions {
+            let worker = try RuntimeWorkerClient(options: workerOptions, weightsPath: options.weightsPath)
+            defer {
+                worker.close()
+            }
+            let response = try worker.generateCorrectness(
+                promptTokens: options.promptTokens,
+                steps: options.steps
+            )
+            guard let tokens = response.tokens else {
+                throw MLXFastError.invalidInput("runtime worker greedy generation response missing tokens")
+            }
+            try requireGeneratedTokenCount(tokens.count, expected: options.steps, label: "greedy generation")
+            progress?(tokens.count, options.steps)
+            return tokens
+        }
+
         let config = try DeepSeekConfig.load(from: options.weightsPath)
         let loader = try DeepSeekWeightLoader(
             weightsPath: options.weightsPath,

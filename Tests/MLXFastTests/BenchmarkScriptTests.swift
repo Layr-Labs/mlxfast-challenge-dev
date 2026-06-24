@@ -187,6 +187,7 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(cli.contains("AutoTokenizer.from(modelFolder: modelFolder, strict: false)"))
     #expect(cli.contains("acceptedReferenceTokenSequences"))
     #expect(cli.contains("DeepSeekRuntime.generateGreedyTokens"))
+    #expect(cli.contains("runtimeWorkerOptions(blockedGoldenPath: gpqaPath)"))
     #expect(cli.contains("calibrated_reference_outputs"))
     #expect(cli.contains("existingSequences + [generated]"))
     #expect(cli.contains("accepted_sequences="))

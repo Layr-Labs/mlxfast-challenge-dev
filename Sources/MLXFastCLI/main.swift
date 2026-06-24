@@ -466,6 +466,7 @@ private enum MLXFastCLI {
             throw MLXFastError.invalidInput("GPQA reference must be a JSON object with a cases array")
         }
 
+        let worker = try runtimeWorkerOptions(blockedGoldenPath: gpqaPath)
         var calibratedCount = 0
         var skippedOverBudget = 0
         for index in cases.indices {
@@ -491,6 +492,7 @@ private enum MLXFastCLI {
                     promptTokens: promptTokens,
                     steps: maxNewTokens
                 ),
+                worker: worker,
                 progress: { step, total in
                     fputs("calibrate-gpqa-gates: \(caseID) generated \(step)/\(total) tokens\n", stderr)
                 }
