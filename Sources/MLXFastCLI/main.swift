@@ -500,7 +500,7 @@ private enum MLXFastCLI {
             cases[index]["needs_reference_output"] = false
             calibratedCount += 1
             fputs(
-                "calibrate-gpqa-gates: calibrated \(caseID) prompt_tokens=\(promptTokens.count) tokens=\(generated)\n",
+                "calibrate-gpqa-gates: calibrated \(caseID) prompt_tokens=\(promptTokens.count)\n",
                 stderr
             )
         }
