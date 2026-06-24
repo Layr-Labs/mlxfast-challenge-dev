@@ -180,6 +180,10 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
         contentsOfFile: "Package.swift",
         encoding: .utf8
     )
+    let runtime = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
+        encoding: .utf8
+    )
 
     #expect(package.contains(".product(name: \"Tokenizers\", package: \"swift-transformers\")"))
     #expect(cli.contains("case \"attach-gpqa-gates\""))
@@ -202,6 +206,10 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(cli.contains("MLXFastConstants.correctnessGPQACaseCount"))
     #expect(cli.contains("MLXFastConstants.correctnessGPQAMaxNewTokens"))
     #expect(!cli.contains("print(testCase.prompt)"))
+
+    #expect(runtime.contains("compareBehaviorFirstToken"))
+    #expect(runtime.contains("testCase.maxNewTokens == 1"))
+    #expect(runtime.contains("correctnessTokenAccepted("))
 }
 
 @Test

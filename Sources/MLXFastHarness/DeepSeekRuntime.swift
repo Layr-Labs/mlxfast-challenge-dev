@@ -2504,6 +2504,23 @@ public enum DeepSeekRuntime {
         testCase: GoldenBehaviorCase,
         worker: RuntimeWorkerClient
     ) throws -> WorkerCorrectnessResult {
+        if testCase.maxNewTokens == 1 {
+            let response = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
+            guard let actualToken = response.token else {
+                throw MLXFastError.invalidInput("runtime worker behavior response missing token")
+            }
+            let topLogits = try validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
+            return WorkerCorrectnessResult(
+                comparison: compareBehaviorFirstToken(
+                    testCase: testCase,
+                    actualToken: actualToken,
+                    topLogits: topLogits
+                ),
+                expertStats: response.expertStats ?? .zero,
+                peakRamGB: response.peakRamGB ?? 0
+            )
+        }
+
         let response = try worker.generateCorrectness(
             promptTokens: testCase.promptTokens,
             steps: testCase.maxNewTokens
@@ -2749,6 +2766,22 @@ public enum DeepSeekRuntime {
         testCase: GoldenBehaviorCase,
         weightCache: DeepSeekRuntimeWeightCache
     ) throws -> CorrectnessTokenComparison {
+        if testCase.maxNewTokens == 1 {
+            let cache = DeepSeekModelCache(config: weightCache.config)
+            let logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray(testCase.promptTokens),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: 0
+            )
+            let actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
+            return compareBehaviorFirstToken(
+                testCase: testCase,
+                actualToken: actualToken,
+                topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits)
+            )
+        }
+
         let generated = try generateGreedyCached(
             promptTokens: testCase.promptTokens,
             steps: testCase.maxNewTokens,
@@ -2813,6 +2846,43 @@ public enum DeepSeekRuntime {
             firstFailingStep: comparison.step,
             expectedToken: comparison.expectedToken,
             actualToken: comparison.actualToken
+        )
+    }
+
+    private static func compareBehaviorFirstToken(
+        testCase: GoldenBehaviorCase,
+        actualToken: Int,
+        topLogits: [CorrectnessTraceLogit]?
+    ) -> CorrectnessTokenComparison {
+        let acceptedTokens = Set(testCase.acceptedTokenSequences.compactMap(\.first))
+        if acceptedTokens.contains(actualToken) {
+            return CorrectnessTokenComparison(
+                passed: true,
+                checkedSteps: 1,
+                firstFailingStep: nil,
+                expectedToken: nil,
+                actualToken: nil
+            )
+        }
+        for acceptedToken in acceptedTokens where correctnessTokenAccepted(
+            expectedToken: acceptedToken,
+            actualToken: actualToken,
+            topLogits: topLogits
+        ) {
+            return CorrectnessTokenComparison(
+                passed: true,
+                checkedSteps: 1,
+                firstFailingStep: nil,
+                expectedToken: nil,
+                actualToken: nil
+            )
+        }
+        return CorrectnessTokenComparison(
+            passed: false,
+            checkedSteps: 1,
+            firstFailingStep: 0,
+            expectedToken: acceptedTokens.sorted().first,
+            actualToken: actualToken
         )
     }
 
