@@ -5,6 +5,7 @@ dist/
 .build/
 .tools/
 .mlxfast-cache/
+.mlxfast-private/
 .cache/
 
 # Reference weights are large and downloaded by setup.sh

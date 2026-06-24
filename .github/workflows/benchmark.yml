@@ -90,6 +90,7 @@ jobs:
     env:
       MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
+      MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
       MLXFAST_RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
       MLXFAST_PRESERVE_GOLDEN_ONLY: ${{ inputs.preserve_golden_only && '1' || '0' }}
@@ -221,14 +222,22 @@ jobs:
             "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
             "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes"
 
-      - name: Upload preserved correctness golden metadata
+      - name: Stage preserved correctness golden metadata
+        id: stage_preserved_correctness_metadata
         if: inputs.preserve_golden_only
+        run: |
+          set -euo pipefail
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/correctness-golden-metadata" \
+            golden.sha256="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
+            golden.bytes="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes"
+
+      - name: Upload preserved correctness golden metadata
+        if: inputs.preserve_golden_only && steps.stage_preserved_correctness_metadata.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: correctness-golden-metadata-${{ github.run_id }}
-          path: |
-            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.sha256
-            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.bytes
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/correctness-golden-metadata
           if-no-files-found: error
 
       - name: Setup Swift harness and reference checkpoint
@@ -440,17 +449,25 @@ jobs:
             score.json.sha256 \
             benchmark-integrity.json
 
-      - name: Upload benchmark artifacts
+      - name: Stage benchmark artifacts
+        id: stage_benchmark_artifacts
         if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success'
+        run: |
+          set -euo pipefail
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/benchmark-results" \
+            golden.sha256="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
+            golden.bytes="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes" \
+            score.json=score.json \
+            score.sha256=score.json.sha256 \
+            benchmark-integrity.json=benchmark-integrity.json
+
+      - name: Upload benchmark artifacts
+        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && steps.stage_benchmark_artifacts.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: benchmark-results-${{ github.run_id }}
-          path: |
-            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.sha256
-            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.bytes
-            score.json
-            score.json.sha256
-            benchmark-integrity.json
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results
           if-no-files-found: error
 
       - name: Check correctness artifact paths
@@ -462,15 +479,23 @@ jobs:
             "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
             "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes"
 
-      - name: Upload correctness artifacts
+      - name: Stage correctness artifacts
+        id: stage_correctness_artifacts
         if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && (inputs.submission_ref == '' || steps.validate_correctness_artifacts.outcome == 'success')
+        run: |
+          set -euo pipefail
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/correctness-results" \
+            correctness-report.json=correctness-report.json \
+            golden.sha256="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
+            golden.bytes="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes"
+
+      - name: Upload correctness artifacts
+        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && steps.stage_correctness_artifacts.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: correctness-results-${{ github.run_id }}
-          path: |
-            correctness-report.json
-            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.sha256
-            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.bytes
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/correctness-results
           if-no-files-found: error
 
       - name: Check correctness trace artifact paths
@@ -479,10 +504,19 @@ jobs:
           set -euo pipefail
           .github/scripts/deny-private-artifacts.sh correctness-trace.json
 
-      - name: Upload correctness trace artifact
+      - name: Stage correctness trace artifact
+        id: stage_correctness_trace_artifact
         if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && inputs.trace_correctness_step != '' && inputs.submission_ref == '' && !startsWith(github.ref_name, 'submissions/')
+        run: |
+          set -euo pipefail
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/correctness-trace" \
+            correctness-trace.json=correctness-trace.json
+
+      - name: Upload correctness trace artifact
+        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && steps.stage_correctness_trace_artifact.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: correctness-trace-${{ github.run_id }}
-          path: correctness-trace.json
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/correctness-trace
           if-no-files-found: error
