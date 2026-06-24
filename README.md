@@ -97,6 +97,8 @@ Full benchmark runs also require the private R2
 them as short-answer behavior gates before correctness runs. Each private GPQA
 case must include reference-calibrated `accepted_token_sequences` or
 `accepted_responses`; GPQA answer keys are metadata, not an exact-token oracle.
+Generate those accepted token sequences on the official runner with
+`mlxfast-swift calibrate-gpqa-gates --gpqa PATH --weights weights --tokenizer weights --output PATH`.
 If none of those is configured, a full benchmark fails; it will not use a
 committed prompt, committed golden, or Actions cache fallback for ranked
 scoring. Final hidden goldens should come from protected storage. Private

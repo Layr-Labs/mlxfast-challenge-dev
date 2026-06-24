@@ -37,6 +37,18 @@ public struct CorrectnessTraceOptions: Equatable {
     }
 }
 
+public struct GreedyGenerationOptions: Equatable {
+    public let weightsPath: String
+    public let promptTokens: [Int]
+    public let steps: Int
+
+    public init(weightsPath: String, promptTokens: [Int], steps: Int) {
+        self.weightsPath = weightsPath
+        self.promptTokens = promptTokens
+        self.steps = steps
+    }
+}
+
 public struct CorrectnessTraceLogit: Codable, Equatable {
     public let token: Int
     public let logit: Double
@@ -250,6 +262,25 @@ private struct BenchmarkTokenMismatchError: Error, CustomStringConvertible {
 }
 
 public enum DeepSeekRuntime {
+    public static func generateGreedyTokens(
+        _ options: GreedyGenerationOptions,
+        progress: ((Int, Int) -> Void)? = nil
+    ) throws -> [Int] {
+        let config = try DeepSeekConfig.load(from: options.weightsPath)
+        let loader = try DeepSeekWeightLoader(
+            weightsPath: options.weightsPath,
+            expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: true)
+        )
+        let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
+        return try generateGreedyCached(
+            promptTokens: options.promptTokens,
+            steps: options.steps,
+            weightCache: weightCache,
+            progressIntervalSteps: 1,
+            progress: progress
+        )
+    }
+
     public static func runCorrectness(
         _ options: CorrectnessOptions,
         worker: RuntimeWorkerOptions? = nil

@@ -175,8 +175,11 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
 
     #expect(package.contains(".product(name: \"Tokenizers\", package: \"swift-transformers\")"))
     #expect(cli.contains("case \"attach-gpqa-gates\""))
+    #expect(cli.contains("case \"calibrate-gpqa-gates\""))
     #expect(cli.contains("AutoTokenizer.from(modelFolder: modelFolder, strict: false)"))
     #expect(cli.contains("acceptedReferenceTokenSequences"))
+    #expect(cli.contains("DeepSeekRuntime.generateGreedyTokens"))
+    #expect(cli.contains("calibrated_reference_outputs"))
     #expect(cli.contains("accepted_token_sequences or accepted_responses generated from the reference model"))
     #expect(cli.contains("uniqueSortedTokenSequences"))
     #expect(cli.contains("buildGPQABehaviorCaseIfWithinPromptBudget"))

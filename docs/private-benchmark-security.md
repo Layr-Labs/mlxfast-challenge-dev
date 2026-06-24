@@ -27,6 +27,9 @@ object from the private R2 bucket. Full private benchmark runs also download
 and merge it into the local golden as 9 hidden multiple-choice behavior gates.
 Each GPQA case must carry accepted reference-model output tokens or responses;
 the GPQA answer key alone is not used as an exact-token correctness oracle.
+Calibrate the private file on the official runner after setup/transform with
+`mlxfast-swift calibrate-gpqa-gates --gpqa PATH --weights weights --tokenizer weights --output PATH`,
+then upload only the calibrated JSON to private R2.
 The private prompt manifest is only an organizer input for regenerating the
 golden outside the benchmark workflow. It should not be written into the
 repository workspace, uploaded, or cached. The workflow writes downloaded
