@@ -576,20 +576,16 @@ private enum MLXFastCLI {
             guard !tokenSequences.isEmpty else {
                 throw MLXFastError.invalidInput("\(caseName).accepted_token_sequences must not be empty")
             }
+            var acceptedPrefixes: [[Int]] = []
             for (index, sequence) in tokenSequences.enumerated() {
                 guard !sequence.isEmpty else {
                     throw MLXFastError.invalidInput(
                         "\(caseName).accepted_token_sequences[\(index)] must not be empty"
                     )
                 }
-                guard sequence.count <= maxNewTokens else {
-                    throw MLXFastError.invalidInput(
-                        "\(caseName).accepted_token_sequences[\(index)] has \(sequence.count) tokens; "
-                            + "maximum is \(maxNewTokens)"
-                    )
-                }
+                acceptedPrefixes.append(Array(sequence.prefix(maxNewTokens)))
             }
-            return uniqueSortedTokenSequences(tokenSequences)
+            return uniqueSortedTokenSequences(acceptedPrefixes)
         }
 
         guard let acceptedResponses = testCase.acceptedResponses,

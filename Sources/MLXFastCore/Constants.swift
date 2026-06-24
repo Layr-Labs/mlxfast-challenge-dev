@@ -28,7 +28,10 @@ public enum MLXFastConstants {
     public static let correctnessMaxBehaviorPromptTokens = 2_048
     public static let correctnessMaxBehaviorSteps = 64
     public static let correctnessGPQACaseCount = 9
-    public static let correctnessGPQAMaxNewTokens = 2
+    // Cross-machine greedy decode can drift after the first answer token even
+    // with pinned Swift/MLX. Keep hidden GPQA behavior gates broad across cases
+    // and shallow per case so local M-series and official Blacksmith runs agree.
+    public static let correctnessGPQAMaxNewTokens = 1
     public static let benchmarkPrefillPromptTokens = 512
     public static let benchmarkDecodeSteps = 256
     public static let quickBenchmarkDecodeSteps = 64

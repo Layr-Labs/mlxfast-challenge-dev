@@ -39,10 +39,12 @@ symlink, and oversized artifact paths.
 
 Hidden behavioral correctness cases should use short accepted token prefixes
 captured from the official reference model on the official runner. The GPQA
-gate generates at most two tokens per case, which keeps runtime bounded while
-still checking behavior across all 9 hidden questions. Do not call an external
-LLM judge from the benchmark runner; that would add a network dependency,
-create prompt-exfiltration risk, and make official scores less reproducible.
+gate checks one generated token per case, which avoids cross-machine drift after
+the first answer token while still checking behavior across all 9 hidden
+questions. Longer calibrated reference sequences may be kept in private R2; the
+workflow uses their stable prefix. Do not call an external LLM judge from the
+benchmark runner; that would add a network dependency, create
+prompt-exfiltration risk, and make official scores less reproducible.
 
 The benchmark workflow also verifies at runtime that it is executing from the
 configured trusted workflow ref. In production, that trusted ref should be:

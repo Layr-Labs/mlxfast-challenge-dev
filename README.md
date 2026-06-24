@@ -99,6 +99,8 @@ case must include reference-calibrated `accepted_token_sequences` or
 `accepted_responses`; GPQA answer keys are metadata, not an exact-token oracle.
 Generate those accepted token sequences on the official runner with
 `mlxfast-swift calibrate-gpqa-gates --gpqa PATH --weights weights --tokenizer weights --output PATH`.
+The official workflow checks the first generated GPQA answer token for each
+case, using the stable prefix of any longer calibrated reference sequence.
 If none of those is configured, a full benchmark fails; it will not use a
 committed prompt, committed golden, or Actions cache fallback for ranked
 scoring. Final hidden goldens should come from protected storage. Private
@@ -248,7 +250,7 @@ downloads the precomputed
 `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`
 object from R2, then downloads
 `correctness_prompts/gpqa_reference_cases.json` and merges it into the local
-golden as 9 hidden two-token GPQA behavior checks. Generate
+golden as 9 hidden one-token GPQA behavior checks. Generate
 final hidden benchmark goldens outside the public repository and provide the
 resulting file to benchmark CI with R2, `correctness_golden_url`, or
 `MLXFAST_CORRECTNESS_GOLDEN_URL`. The benchmark workflow stores its local golden
