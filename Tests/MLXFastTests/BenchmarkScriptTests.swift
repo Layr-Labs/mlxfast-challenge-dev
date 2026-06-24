@@ -188,6 +188,8 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(cli.contains("acceptedReferenceTokenSequences"))
     #expect(cli.contains("DeepSeekRuntime.generateGreedyTokens"))
     #expect(cli.contains("calibrated_reference_outputs"))
+    #expect(cli.contains("existingSequences + [generated]"))
+    #expect(cli.contains("accepted_sequences="))
     #expect(cli.contains("accepted_token_sequences or accepted_responses generated from the reference model"))
     #expect(cli.contains("sequence.prefix(maxNewTokens)"))
     #expect(cli.contains("uniqueSortedTokenSequences"))

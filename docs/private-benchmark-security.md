@@ -33,6 +33,8 @@ then upload only the calibrated JSON to private R2. The benchmark workflow has a
 manual `calibrate_gpqa_reference` mode for this: it downloads the private GPQA
 file, calibrates accepted token sequences on the Blacksmith runner, and writes
 the calibrated JSON back to the same private R2 object without artifacting it.
+Calibration appends and deduplicates runner-observed token sequences so the
+hidden behavior gate can tolerate legitimate official-runner output drift.
 The private prompt manifest is only an organizer input for regenerating the
 golden outside the benchmark workflow. It should not be written into the
 repository workspace, uploaded, or cached. The workflow writes downloaded

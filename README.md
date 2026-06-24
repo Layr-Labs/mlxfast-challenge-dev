@@ -99,6 +99,8 @@ case must include reference-calibrated `accepted_token_sequences` or
 `accepted_responses`; GPQA answer keys are metadata, not an exact-token oracle.
 Generate those accepted token sequences on the official runner with
 `mlxfast-swift calibrate-gpqa-gates --gpqa PATH --weights weights --tokenizer weights --output PATH`.
+Calibration is cumulative: rerunning it appends and deduplicates the
+runner-observed token sequence instead of replacing older accepted sequences.
 The official workflow checks the first generated GPQA answer token for each
 case, using the stable prefix of any longer calibrated reference sequence.
 Because this gate is exact-token based, calibrate it on the official Blacksmith

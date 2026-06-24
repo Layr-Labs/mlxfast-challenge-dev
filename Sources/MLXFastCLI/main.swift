@@ -495,12 +495,21 @@ private enum MLXFastCLI {
                     fputs("calibrate-gpqa-gates: \(caseID) generated \(step)/\(total) tokens\n", stderr)
                 }
             )
-            cases[index]["accepted_token_sequences"] = [generated]
+            let existingSequences = try jsonTokenSequences(
+                from: cases[index]["accepted_token_sequences"],
+                caseName: caseID
+            )
+            let mergedSequences = uniqueSortedTokenSequences(
+                (existingSequences + [generated]).map { Array($0.prefix(maxNewTokens)) }
+            )
+            cases[index]["accepted_token_sequences"] = mergedSequences
             cases[index]["accepted_responses"] = []
             cases[index]["needs_reference_output"] = false
             calibratedCount += 1
             fputs(
-                "calibrate-gpqa-gates: calibrated \(caseID) prompt_tokens=\(promptTokens.count)\n",
+                "calibrate-gpqa-gates: calibrated \(caseID) "
+                    + "prompt_tokens=\(promptTokens.count) "
+                    + "accepted_sequences=\(mergedSequences.count)\n",
                 stderr
             )
         }
@@ -531,6 +540,63 @@ private enum MLXFastCLI {
                 + "skipped_over_budget=\(skippedOverBudget) "
                 + "output=\(outputPath)"
         )
+    }
+
+    private static func jsonTokenSequences(from value: Any?, caseName: String) throws -> [[Int]] {
+        guard let value else {
+            return []
+        }
+        guard let rawSequences = value as? [Any] else {
+            throw MLXFastError.invalidInput("\(caseName).accepted_token_sequences must be an array")
+        }
+
+        var sequences: [[Int]] = []
+        for (sequenceIndex, rawSequence) in rawSequences.enumerated() {
+            guard let rawTokens = rawSequence as? [Any] else {
+                throw MLXFastError.invalidInput(
+                    "\(caseName).accepted_token_sequences[\(sequenceIndex)] must be an array"
+                )
+            }
+            guard !rawTokens.isEmpty else {
+                throw MLXFastError.invalidInput(
+                    "\(caseName).accepted_token_sequences[\(sequenceIndex)] must not be empty"
+                )
+            }
+
+            var tokens: [Int] = []
+            for (tokenIndex, rawToken) in rawTokens.enumerated() {
+                let token: Int
+                if let intToken = rawToken as? Int {
+                    token = intToken
+                } else if let numberToken = rawToken as? NSNumber {
+                    let doubleToken = numberToken.doubleValue
+                    guard doubleToken.rounded() == doubleToken,
+                          doubleToken >= 0,
+                          doubleToken <= Double(Int.max)
+                    else {
+                        throw MLXFastError.invalidInput(
+                            "\(caseName).accepted_token_sequences[\(sequenceIndex)][\(tokenIndex)] "
+                                + "must be a non-negative integer token"
+                        )
+                    }
+                    token = numberToken.intValue
+                } else {
+                    throw MLXFastError.invalidInput(
+                        "\(caseName).accepted_token_sequences[\(sequenceIndex)][\(tokenIndex)] "
+                            + "must be a non-negative integer token"
+                    )
+                }
+                guard token >= 0 else {
+                    throw MLXFastError.invalidInput(
+                        "\(caseName).accepted_token_sequences[\(sequenceIndex)][\(tokenIndex)] "
+                            + "must be a non-negative integer token"
+                    )
+                }
+                tokens.append(token)
+            }
+            sequences.append(tokens)
+        }
+        return sequences
     }
 
     private static func loadLocalTokenizer(at path: String) throws -> any Tokenizer {
