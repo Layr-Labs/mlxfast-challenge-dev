@@ -458,7 +458,7 @@ jobs:
             > correctness-trace.json
 
       - name: Check benchmark artifact paths
-        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success'
+        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && hashFiles('score.json') != '' && hashFiles('score.json.sha256') != '' && hashFiles('benchmark-integrity.json') != ''
         run: |
           set -euo pipefail
           .github/scripts/deny-private-artifacts.sh \
@@ -470,7 +470,7 @@ jobs:
 
       - name: Stage benchmark artifacts
         id: stage_benchmark_artifacts
-        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success'
+        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && hashFiles('score.json') != '' && hashFiles('score.json.sha256') != '' && hashFiles('benchmark-integrity.json') != ''
         run: |
           set -euo pipefail
           .github/scripts/stage-benchmark-artifacts.sh \

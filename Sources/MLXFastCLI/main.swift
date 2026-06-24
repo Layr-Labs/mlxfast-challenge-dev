@@ -425,9 +425,8 @@ private enum MLXFastCLI {
         guard promptTokens.count <= MLXFastConstants.correctnessMaxBehaviorPromptTokens else {
             return nil
         }
-        let answer = try testCase.answerLetter()
-        let acceptedSequences = try acceptedAnswerTokenSequences(
-            answer: answer,
+        let acceptedSequences = try acceptedReferenceTokenSequences(
+            testCase: testCase,
             tokenizer: tokenizer,
             maxNewTokens: maxNewTokens,
             caseName: testCase.identifier
@@ -440,21 +439,52 @@ private enum MLXFastCLI {
         )
     }
 
-    private static func acceptedAnswerTokenSequences(
-        answer: String,
+    private static func acceptedReferenceTokenSequences(
+        testCase: GPQAReferenceCase,
         tokenizer: any Tokenizer,
         maxNewTokens: Int,
         caseName: String
     ) throws -> [[Int]] {
-        let letters = [answer, answer.lowercased()]
+        if let tokenSequences = testCase.acceptedTokenSequences {
+            guard !tokenSequences.isEmpty else {
+                throw MLXFastError.invalidInput("\(caseName).accepted_token_sequences must not be empty")
+            }
+            for (index, sequence) in tokenSequences.enumerated() {
+                guard !sequence.isEmpty else {
+                    throw MLXFastError.invalidInput(
+                        "\(caseName).accepted_token_sequences[\(index)] must not be empty"
+                    )
+                }
+                guard sequence.count <= maxNewTokens else {
+                    throw MLXFastError.invalidInput(
+                        "\(caseName).accepted_token_sequences[\(index)] has \(sequence.count) tokens; "
+                            + "maximum is \(maxNewTokens)"
+                    )
+                }
+            }
+            return uniqueSortedTokenSequences(tokenSequences)
+        }
+
+        guard let acceptedResponses = testCase.acceptedResponses,
+              !acceptedResponses.isEmpty
+        else {
+            throw MLXFastError.invalidInput(
+                "\(caseName) requires accepted_token_sequences or accepted_responses generated from the reference model"
+            )
+        }
+
         let prefixes = ["", " ", "\n"]
         let suffixes = ["", ".", "\n"]
         var seen = Set<[Int]>()
         var sequences: [[Int]] = []
-        for prefix in prefixes {
-            for letter in letters {
+        for response in acceptedResponses {
+            let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                continue
+            }
+            for prefix in prefixes {
                 for suffix in suffixes {
-                    let tokens = tokenizer.encode(text: prefix + letter + suffix, addSpecialTokens: false)
+                    let tokens = tokenizer.encode(text: prefix + trimmed + suffix, addSpecialTokens: false)
                     guard !tokens.isEmpty, tokens.count <= maxNewTokens else {
                         continue
                     }
@@ -466,8 +496,22 @@ private enum MLXFastCLI {
         }
         guard !sequences.isEmpty else {
             throw MLXFastError.invalidInput(
-                "\(caseName) answer \(answer) has no accepted tokenization within \(maxNewTokens) token(s)"
+                "\(caseName) accepted_responses have no tokenization within \(maxNewTokens) token(s)"
             )
+        }
+        return sequences.sorted { lhs, rhs in
+            if lhs.count != rhs.count {
+                return lhs.count < rhs.count
+            }
+            return lhs.lexicographicallyPrecedes(rhs)
+        }
+    }
+
+    private static func uniqueSortedTokenSequences(_ tokenSequences: [[Int]]) -> [[Int]] {
+        var seen = Set<[Int]>()
+        var sequences: [[Int]] = []
+        for sequence in tokenSequences where seen.insert(sequence).inserted {
+            sequences.append(sequence)
         }
         return sequences.sorted { lhs, rhs in
             if lhs.count != rhs.count {
@@ -1180,12 +1224,16 @@ private struct GPQAReferenceCase: Decodable {
     let prompt: String
     let expectedResponse: String?
     let answerKey: String?
+    let acceptedTokenSequences: [[Int]]?
+    let acceptedResponses: [String]?
 
     enum CodingKeys: String, CodingKey {
         case id
         case prompt
         case expectedResponse = "expected_response"
         case answerKey = "answer_key"
+        case acceptedTokenSequences = "accepted_token_sequences"
+        case acceptedResponses = "accepted_responses"
     }
 
     var identifier: String {
@@ -1193,16 +1241,6 @@ private struct GPQAReferenceCase: Decodable {
         return trimmed.isEmpty ? "gpqa-private" : trimmed
     }
 
-    func answerLetter() throws -> String {
-        let raw = expectedResponse ?? answerKey ?? ""
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        guard let first = trimmed.first,
-              ["A", "B", "C", "D"].contains(String(first))
-        else {
-            throw MLXFastError.invalidInput("\(identifier) expected_response must start with A, B, C, or D")
-        }
-        return String(first)
-    }
 }
 
 private struct ParsedOptions {

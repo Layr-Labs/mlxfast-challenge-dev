@@ -25,6 +25,8 @@ Normal private benchmark runs download the precomputed
 object from the private R2 bucket. Full private benchmark runs also download
 `correctness_prompts/gpqa_reference_cases.json` from the same private bucket
 and merge it into the local golden as 9 hidden multiple-choice behavior gates.
+Each GPQA case must carry accepted reference-model output tokens or responses;
+the GPQA answer key alone is not used as an exact-token correctness oracle.
 The private prompt manifest is only an organizer input for regenerating the
 golden outside the benchmark workflow. It should not be written into the
 repository workspace, uploaded, or cached. The workflow writes downloaded
@@ -32,12 +34,12 @@ private files only under `$RUNNER_TEMP` and uploads only golden hash and
 byte-count sidecars after a deny-list check rejects prompt, golden, GPQA, model,
 symlink, and oversized artifact paths.
 
-Hidden behavioral correctness cases should use short accepted answer token
-prefixes. The GPQA gate asks for only an A/B/C/D answer and generates at most
-two tokens per case, which keeps runtime bounded while still checking semantic
-behavior across all 9 hidden questions. Do not call an external LLM judge from
-the benchmark runner; that would add a network dependency, create
-prompt-exfiltration risk, and make official scores less reproducible.
+Hidden behavioral correctness cases should use short accepted token prefixes
+captured from the official reference model on the official runner. The GPQA
+gate generates at most two tokens per case, which keeps runtime bounded while
+still checking behavior across all 9 hidden questions. Do not call an external
+LLM judge from the benchmark runner; that would add a network dependency,
+create prompt-exfiltration risk, and make official scores less reproducible.
 
 The benchmark workflow also verifies at runtime that it is executing from the
 configured trusted workflow ref. In production, that trusted ref should be:
