@@ -4,7 +4,6 @@ on:
   pull_request:
   push:
   workflow_dispatch:
-
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -14,7 +13,7 @@ permissions:
 
 jobs:
   swift:
-    runs-on: blacksmith-12vcpu-macos-26
+    runs-on: tenki-standard-large-plus-16c-32g
     timeout-minutes: 45
     env:
       CLANG_MODULE_CACHE_PATH: ${{ github.workspace }}/.build/clang-module-cache
