@@ -42,6 +42,14 @@ public enum MLXFastConstants {
     public static let benchmarkDecodeSeedTokens = 512
     public static let benchmarkPrefillWarmupRuns = 1
     public static let benchmarkPrefillTimedRuns = 1
+    // Official baseline measured on the Blacksmith runner for the current
+    // 512-token prefill / 256-token decode benchmark oracle. The ranked score is
+    // normalized to this baseline; raw RAM, bandwidth, and read metrics remain
+    // audit fields instead of primary score factors.
+    public static let officialBaselinePrefillSecondsPerToken = 0.1417240929375
+    public static let officialBaselineDecodeSecondsPerToken = 3.018321923023438
+    public static let scorePrefillWeight = 0.25
+    public static let scoreDecodeWeight = 0.75
     public static let defaultMaxTransformedWeightsBytes = 50 * 1024 * 1024 * 1024
     public static let defaultMaxSubmissionSourceBytes = 256 * 1024 * 1024
 }

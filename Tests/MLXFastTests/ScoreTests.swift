@@ -3,22 +3,27 @@ import Testing
 @testable import MLXFastCore
 
 @Test
-func benchmarkScoreIsInverseOfCostProduct() {
-    let cost = BenchmarkScore.cost(
-        peakRamGB: 40,
-        bandwidthGBPerToken: 0.01,
-        decodeSecondsPerToken: 2,
-        prefillSecondsPerToken: 0.125
-    )
+func benchmarkScoreUsesWeightedBaselineSpeedups() {
     let score = BenchmarkScore.score(
-        peakRamGB: 40,
-        bandwidthGBPerToken: 0.01,
-        decodeSecondsPerToken: 2,
-        prefillSecondsPerToken: 0.125
+        decodeSecondsPerToken: 1.5,
+        prefillSecondsPerToken: 0.25,
+        baselineDecodeSecondsPerToken: 3,
+        baselinePrefillSecondsPerToken: 0.25,
+        decodeWeight: 0.75,
+        prefillWeight: 0.25
+    )
+    let decodeSpeedup = BenchmarkScore.speedup(
+        baselineSecondsPerToken: 3,
+        candidateSecondsPerToken: 1.5
+    )
+    let prefillSpeedup = BenchmarkScore.speedup(
+        baselineSecondsPerToken: 0.25,
+        candidateSecondsPerToken: 0.25
     )
 
-    #expect(abs(cost - 0.1) < 1e-12)
-    #expect(abs(score - 10) < 1e-12)
+    #expect(abs(decodeSpeedup - 2) < 1e-12)
+    #expect(abs(prefillSpeedup - 1) < 1e-12)
+    #expect(abs(score - pow(2, 0.75)) < 1e-12)
 }
 
 @Test
@@ -51,6 +56,10 @@ func writeScorePayloadEmitsDarkbloomShape() throws {
     #expect(decoded.metrics.weightsHash == "")
     #expect(decoded.metrics.weightsByteCount == 0)
     #expect(decoded.metrics.weightsFileCount == 0)
+    #expect(decoded.metrics.baselineDecodeSecondsPerToken == MLXFastConstants.officialBaselineDecodeSecondsPerToken)
+    #expect(decoded.metrics.baselinePrefillSecondsPerToken == MLXFastConstants.officialBaselinePrefillSecondsPerToken)
+    #expect(decoded.metrics.decodeSpeedup == 0)
+    #expect(decoded.metrics.prefillSpeedup == 0)
     #expect(decoded.metrics.benchmarkWallSeconds == 0)
     #expect(decoded.metrics.preflightSeconds == 0)
     #expect(decoded.metrics.correctnessSeconds == 0)
@@ -139,6 +148,10 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(raw.contains("\"weights_hash\" : \"weights-hash\""))
     #expect(raw.contains("\"weights_byte_count\" : 4096"))
     #expect(raw.contains("\"weights_file_count\" : 7"))
+    #expect(raw.contains("\"baseline_decode_seconds_per_token\" : \(MLXFastConstants.officialBaselineDecodeSecondsPerToken)"))
+    #expect(raw.contains("\"baseline_prefill_seconds_per_token\" : \(MLXFastConstants.officialBaselinePrefillSecondsPerToken)"))
+    #expect(raw.contains("\"decode_speedup\" : 0"))
+    #expect(raw.contains("\"prefill_speedup\" : 0"))
     #expect(raw.contains("\"benchmark_wall_seconds\" : 11"))
     #expect(raw.contains("\"preflight_seconds\" : 1"))
     #expect(raw.contains("\"correctness_seconds\" : 2"))
@@ -162,6 +175,10 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(decoded.metrics.weightsHash == "weights-hash")
     #expect(decoded.metrics.weightsByteCount == 4096)
     #expect(decoded.metrics.weightsFileCount == 7)
+    #expect(decoded.metrics.baselineDecodeSecondsPerToken == MLXFastConstants.officialBaselineDecodeSecondsPerToken)
+    #expect(decoded.metrics.baselinePrefillSecondsPerToken == MLXFastConstants.officialBaselinePrefillSecondsPerToken)
+    #expect(decoded.metrics.decodeSpeedup == 0)
+    #expect(decoded.metrics.prefillSpeedup == 0)
     #expect(decoded.metrics.benchmarkWallSeconds == 11)
     #expect(decoded.metrics.preflightSeconds == 1)
     #expect(decoded.metrics.correctnessSeconds == 2)
@@ -213,6 +230,10 @@ func scoreMetricsDecodeOlderPayloadWithoutWeightsIntegrityFields() throws {
     #expect(decoded.metrics.weightsHash == "")
     #expect(decoded.metrics.weightsByteCount == 0)
     #expect(decoded.metrics.weightsFileCount == 0)
+    #expect(decoded.metrics.baselineDecodeSecondsPerToken == MLXFastConstants.officialBaselineDecodeSecondsPerToken)
+    #expect(decoded.metrics.baselinePrefillSecondsPerToken == MLXFastConstants.officialBaselinePrefillSecondsPerToken)
+    #expect(decoded.metrics.decodeSpeedup == 0)
+    #expect(decoded.metrics.prefillSpeedup == 0)
     #expect(decoded.metrics.benchmarkWallSeconds == 0)
     #expect(decoded.metrics.preflightSeconds == 0)
     #expect(decoded.metrics.correctnessSeconds == 0)

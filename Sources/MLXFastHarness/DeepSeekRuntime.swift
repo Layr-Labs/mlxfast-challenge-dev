@@ -841,10 +841,16 @@ public enum DeepSeekRuntime {
             timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
             let peakRamGB = Double(Memory.peakMemory) / Double(1 << 30)
             let score = BenchmarkScore.score(
-                peakRamGB: peakRamGB,
-                bandwidthGBPerToken: decode.bandwidthGBPerToken,
                 decodeSecondsPerToken: decode.secondsPerToken,
                 prefillSecondsPerToken: prefillSecondsPerToken
+            )
+            let decodeSpeedup = BenchmarkScore.speedup(
+                baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+                candidateSecondsPerToken: decode.secondsPerToken
+            )
+            let prefillSpeedup = BenchmarkScore.speedup(
+                baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+                candidateSecondsPerToken: prefillSecondsPerToken
             )
             let expertStats = expertStats(from: runtimeBenchmarkLoader)
 
@@ -859,6 +865,8 @@ public enum DeepSeekRuntime {
             }
             progress(
                 "complete score=\(formatDouble(score)) "
+                    + "decode_speedup=\(formatDouble(decodeSpeedup)) "
+                    + "prefill_speedup=\(formatDouble(prefillSpeedup)) "
                     + "wall_seconds=\(formatSeconds(secondsSince(benchmarkStart))) "
                     + "timed_seconds=\(formatSeconds(timedBenchmarkSeconds))"
             )
@@ -1080,10 +1088,16 @@ public enum DeepSeekRuntime {
             )
             timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
             let score = BenchmarkScore.score(
-                peakRamGB: peakRamGB,
-                bandwidthGBPerToken: decode.bandwidthGBPerToken,
                 decodeSecondsPerToken: decode.secondsPerToken,
                 prefillSecondsPerToken: prefillSecondsPerToken
+            )
+            let decodeSpeedup = BenchmarkScore.speedup(
+                baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+                candidateSecondsPerToken: decode.secondsPerToken
+            )
+            let prefillSpeedup = BenchmarkScore.speedup(
+                baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+                candidateSecondsPerToken: prefillSecondsPerToken
             )
 
             guard score.isFinite, score >= 0 else {
@@ -1095,6 +1109,8 @@ public enum DeepSeekRuntime {
             }
             progress(
                 "complete score=\(formatDouble(score)) "
+                    + "decode_speedup=\(formatDouble(decodeSpeedup)) "
+                    + "prefill_speedup=\(formatDouble(prefillSpeedup)) "
                     + "wall_seconds=\(formatSeconds(secondsSince(benchmarkStart))) "
                     + "timed_seconds=\(formatSeconds(timedBenchmarkSeconds))"
             )

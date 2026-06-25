@@ -191,20 +191,23 @@ timed decode window before accepting a score.
 ## Score
 
 ```text
-cost = peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill_sec_per_token
-score = 1 / cost
+decode_speedup = baseline_decode_sec_per_token / decode_sec_per_token
+prefill_speedup = baseline_prefill_sec_per_token / prefill_sec_per_token
+score = decode_speedup^0.75 * prefill_speedup^0.25
 ```
 
-Higher is better. The component metrics remain in `score.json`, so operators can
-still inspect the raw cost factors that produced the score.
+Higher is better. A baseline implementation on the official runner scores about
+`1.0`. Decode is weighted more heavily because it dominates interactive
+generation, while prefill still contributes to the ranked score.
 
 `bandwidth_GB_per_token` prefers `mactop` hardware DRAM counters during the
 decode window. `setup.sh` installs `mactop` with Homebrew when needed; set
 `MLXFAST_MACTOP_BIN=/path/to/mactop` to use a local binary instead. If mactop
 cannot collect IOReport DRAM samples, the score records
-`bandwidth_source=expert_streaming_reads` and uses the measured expert-streaming
-file bytes. Set `MLXFAST_REQUIRE_MACTOP_BANDWIDTH=1` to fail instead of falling
-back.
+`bandwidth_source=expert_streaming_reads` and reports the measured
+expert-streaming file bytes. Bandwidth, RAM, and expert-read metrics are
+diagnostics and guardrail candidates, not primary score factors. Set
+`MLXFAST_REQUIRE_MACTOP_BANDWIDTH=1` to fail instead of falling back.
 `score.json` also carries audit-only wall-clock phase timings, final process RSS,
 expert streaming counters, and transformed-weights digest fields. These values
 help operators review runs but do not change the score formula.

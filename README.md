@@ -184,33 +184,29 @@ live submit retry use a stable backend idempotency key.
 ## Scoring
 
 ```
-cost = peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill_sec_per_token
-score = 1 / cost
+decode_speedup = baseline_decode_sec_per_token / decode_sec_per_token
+prefill_speedup = baseline_prefill_sec_per_token / prefill_sec_per_token
+score = decode_speedup^0.75 * prefill_speedup^0.25
 ```
 
-Higher score is better. The cost product is still recoverable from the
-component metrics in `score.json`, but the top-level `score` is an up-only value
-so leaderboards and local comparisons read naturally.
+Higher score is better. A baseline implementation on the official runner scores
+about `1.0`; improvements should move the score upward. Decode is weighted more
+heavily because it dominates interactive generation, while prefill still matters
+for prompt processing.
 Bandwidth prefers **mactop hardware DRAM counters**. On macOS virtualized runners
 that do not expose IOReport DRAM channels, the harness records
 `bandwidth_source=expert_streaming_reads` and uses measured expert-streaming file
-bytes as a fallback. Set `MLXFAST_REQUIRE_MACTOP_BANDWIDTH=1` to fail instead of
-falling back.
+bytes as a fallback. Bandwidth, RAM, and expert-read metrics are reported for
+operator review and future guardrails; they are not primary score factors. Set
+`MLXFAST_REQUIRE_MACTOP_BANDWIDTH=1` to fail instead of falling back.
 Correctness is a hard gate. See CHALLENGE.md for the full correctness specification.
 The official run checks 256 correctness positions and times a 256-token decode
 window. Public local correctness uses the checked-in correctness fixture. When
 a local golden with a benchmark oracle is available, `--quick` shortens
 correctness and decode to 64 token checks and prints the resulting `score.json`.
-The score payload also includes audit-only fields for wall-clock benchmark time,
-preflight time, correctness time, timed benchmark time, final process RSS, expert
-streaming counters, and transformed-weights digest. These fields are for
-operator review and are not additional scoring factors.
-
-**Baseline (TBD — reference M5 Max 128 GB):**
-
-| Peak RAM | Bandwidth | Decode | Prefill | Score |
-|---|---|---|---|---|
-| TBD | TBD | TBD | TBD | TBD |
+The score payload includes the official baseline timings, computed speedups,
+wall-clock phase timings, final process RSS, expert streaming counters, and
+transformed-weights digest.
 
 ## Architecture
 

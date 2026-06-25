@@ -53,12 +53,15 @@ jq -e \
     "actual_token",
     "bandwidth_gb_per_token",
     "bandwidth_source",
+    "baseline_decode_seconds_per_token",
+    "baseline_prefill_seconds_per_token",
     "benchmark_wall_seconds",
     "case_count",
     "checked_steps",
     "commit",
     "correctness_seconds",
     "decode_seconds_per_token",
+    "decode_speedup",
     "error",
     "expected_token",
     "expert_bytes_read",
@@ -78,6 +81,7 @@ jq -e \
     "passed_correctness",
     "peak_ram_gb",
     "prefill_seconds_per_token",
+    "prefill_speedup",
     "preflight_seconds",
     "process_resident_memory_gb",
     "runtime",
@@ -89,7 +93,7 @@ jq -e \
   ]))
   and .passed == true
   and (.score | type == "number")
-  and (.score >= 0)
+  and (.score > 0)
   and (.metrics.passed_correctness == true)
   and (.metrics.checked_steps == $checked_steps)
   and (.metrics.case_count == $correctness_cases)
@@ -104,6 +108,14 @@ jq -e \
   and (.metrics.decode_seconds_per_token > 0)
   and (.metrics.prefill_seconds_per_token | type == "number")
   and (.metrics.prefill_seconds_per_token > 0)
+  and (.metrics.baseline_decode_seconds_per_token | type == "number")
+  and (.metrics.baseline_decode_seconds_per_token > 0)
+  and (.metrics.baseline_prefill_seconds_per_token | type == "number")
+  and (.metrics.baseline_prefill_seconds_per_token > 0)
+  and (.metrics.decode_speedup | type == "number")
+  and (.metrics.decode_speedup > 0)
+  and (.metrics.prefill_speedup | type == "number")
+  and (.metrics.prefill_speedup > 0)
   and (.metrics.correctness_seconds | type == "number")
   and (.metrics.correctness_seconds > 0)
   and (.metrics.timed_benchmark_seconds | type == "number")
