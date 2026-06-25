@@ -197,9 +197,13 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(stageArtifacts.contains(".github/scripts/deny-private-artifacts.sh \"${dest}\""))
     #expect(ci.contains("bash -n .github/scripts/run-semantic-gpqa-gate.sh"))
     #expect(semanticGate.contains("ANTHROPIC_API_KEY is required"))
+    #expect(semanticGate.contains("unset ANTHROPIC_API_KEY"))
+    #expect(semanticGate.contains("env -u ANTHROPIC_API_KEY curl"))
+    #expect(semanticGate.contains("header = \"x-api-key: %s\""))
     #expect(semanticGate.contains("anthropic-version: 2023-06-01"))
     #expect(semanticGate.contains(".metrics.semantic_gpqa_passed = $semantic_passed"))
     #expect(semanticGate.contains(".score_sha256 = $score_hash"))
+    #expect(!semanticGate.contains("--header \"x-api-key: ${ANTHROPIC_API_KEY}\""))
     #expect(!semanticGate.contains("--arg question \"$(jq"))
     #expect(!semanticGate.contains("candidate_answer\" >&2"))
 }
