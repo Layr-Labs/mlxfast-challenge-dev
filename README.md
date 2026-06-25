@@ -103,9 +103,15 @@ Calibration is cumulative: rerunning it appends and deduplicates the
 runner-observed token sequence instead of replacing older accepted sequences.
 The official workflow checks the first generated GPQA answer token for each
 case, using the stable prefix of any longer calibrated reference sequence.
-Because this gate is exact-token based, calibrate it on the official Blacksmith
-runner with the manual `calibrate_gpqa_reference` workflow input; M-series local
-calibration can differ from the official runner even at temperature zero.
+After timing, the workflow also generates short hidden GPQA answers and sends
+only those private answer bundles to Claude for a semantic pass/fail judge. This
+requires the `ANTHROPIC_API_KEY` repository secret. The score artifact records
+only aggregate semantic counts and the judge model name; prompts, references,
+candidate answers, and judge text stay in the private runner directory.
+Because the one-token GPQA behavior gate is exact-token based, calibrate that
+layer on the official Blacksmith runner with the manual
+`calibrate_gpqa_reference` workflow input; M-series local calibration can differ
+from the official runner even at temperature zero.
 If none of those is configured, a full benchmark fails; it will not use a
 committed prompt, committed golden, or Actions cache fallback for ranked
 scoring. Final hidden goldens should come from protected storage. Private
@@ -256,7 +262,8 @@ final hidden benchmark goldens outside the public repository and provide the
 resulting file to benchmark CI with R2, `correctness_golden_url`, or
 `MLXFAST_CORRECTNESS_GOLDEN_URL`. The benchmark workflow stores its local golden
 copy under `$RUNNER_TEMP`, not the repository workspace, and uploads only hash
-and byte-count sidecars.
+and byte-count sidecars. The semantic GPQA answer and judge result files are
+also kept under the private runner directory and are not uploaded.
 
 The Swift `make-golden` generator has been removed from the public harness so CI
 only consumes precomputed fixtures. The last commit on this branch containing

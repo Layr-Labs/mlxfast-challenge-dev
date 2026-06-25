@@ -43,6 +43,9 @@ private enum MLXFastCLI {
             case "calibrate-gpqa-gates":
                 try runCalibrateGPQAGates(options)
                 return 0
+            case "generate-gpqa-answers":
+                try runGenerateGPQAAnswers(options)
+                return 0
             case "runtime-worker":
                 try runRuntimeWorker(options)
                 return 0
@@ -544,6 +547,134 @@ private enum MLXFastCLI {
         )
     }
 
+    private static func runGenerateGPQAAnswers(_ options: ParsedOptions) throws {
+        try options.validate(
+            valueOptions: ["--gpqa", "--weights", "--tokenizer", "--output", "--case-count", "--max-new-tokens"]
+        )
+        let gpqaPath = options.value(
+            for: "--gpqa",
+            default: environmentValue("MLXFAST_GPQA_REFERENCE_PATH", fallback: "")
+        )
+        guard !gpqaPath.isEmpty else {
+            throw MLXFastError.invalidInput("generate-gpqa-answers requires --gpqa or MLXFAST_GPQA_REFERENCE_PATH")
+        }
+        let weightsPath = options.value(
+            for: "--weights",
+            default: environmentValue("MLXFAST_WEIGHTS_PATH", fallback: MLXFastConstants.defaultWeightsPath)
+        )
+        let tokenizerPath = options.value(
+            for: "--tokenizer",
+            default: environmentValue("MLXFAST_TOKENIZER_PATH", fallback: weightsPath)
+        )
+        let outputPath = options.value(
+            for: "--output",
+            default: environmentValue("MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH", fallback: "")
+        )
+        guard !outputPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "generate-gpqa-answers requires --output or MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH"
+            )
+        }
+        try requirePrivateOutputPath(outputPath, description: "semantic GPQA answer output")
+        let caseCount = try parsePositiveInt(
+            options.value(for: "--case-count", default: "\(MLXFastConstants.semanticGPQACaseCount)"),
+            optionName: "--case-count"
+        )
+        let maxNewTokens = try parsePositiveInt(
+            options.value(for: "--max-new-tokens", default: "\(MLXFastConstants.semanticGPQAMaxNewTokens)"),
+            optionName: "--max-new-tokens"
+        )
+        guard maxNewTokens <= MLXFastConstants.correctnessMaxBehaviorSteps else {
+            throw MLXFastError.invalidInput(
+                "--max-new-tokens must be <= \(MLXFastConstants.correctnessMaxBehaviorSteps)"
+            )
+        }
+
+        try requireFile(gpqaPath, description: "GPQA reference cases file")
+        try requireFile(
+            URL(fileURLWithPath: tokenizerPath).appendingPathComponent("tokenizer.json").path,
+            description: "tokenizer.json"
+        )
+        try requireFile(
+            URL(fileURLWithPath: tokenizerPath).appendingPathComponent("tokenizer_config.json").path,
+            description: "tokenizer_config.json"
+        )
+        try requireFile(
+            URL(fileURLWithPath: weightsPath).appendingPathComponent("config.json").path,
+            description: "weights config.json"
+        )
+
+        let tokenizer = try loadLocalTokenizer(at: tokenizerPath)
+        let data = try Data(contentsOf: URL(fileURLWithPath: gpqaPath))
+        let gpqa = try JSONDecoder().decode(GPQAReferenceDocument.self, from: data)
+        let worker = try runtimeWorkerOptions(blockedGoldenPath: gpqaPath)
+
+        var answers: [SemanticGPQAAnswerCase] = []
+        var skippedOverBudget = 0
+        for testCase in gpqa.cases {
+            guard answers.count < caseCount else {
+                break
+            }
+            let promptTokens = tokenizer.encode(text: testCase.prompt, addSpecialTokens: false)
+            guard !promptTokens.isEmpty else {
+                throw MLXFastError.invalidInput("\(testCase.identifier).prompt tokenized to zero tokens")
+            }
+            guard promptTokens.count <= MLXFastConstants.correctnessMaxBehaviorPromptTokens else {
+                skippedOverBudget += 1
+                continue
+            }
+
+            let generated = try DeepSeekRuntime.generateGreedyTokens(
+                GreedyGenerationOptions(
+                    weightsPath: weightsPath,
+                    promptTokens: promptTokens,
+                    steps: maxNewTokens
+                ),
+                worker: worker
+            )
+            let decoded = tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            answers.append(
+                SemanticGPQAAnswerCase(
+                    id: testCase.identifier,
+                    domain: testCase.domain,
+                    subdomain: testCase.subdomain,
+                    prompt: testCase.prompt,
+                    answerKey: testCase.answerKey,
+                    referenceAnswer: referenceAnswer(for: testCase),
+                    candidateAnswer: decoded,
+                    candidateTokens: generated,
+                    maxNewTokens: maxNewTokens
+                )
+            )
+            fputs(
+                "generate-gpqa-answers: generated \(answers.count)/\(caseCount) "
+                    + "tokens=\(generated.count)\n",
+                stderr
+            )
+        }
+        guard answers.count == caseCount else {
+            throw MLXFastError.invalidInput(
+                "GPQA reference produced \(answers.count) token-budget-valid semantic cases; "
+                    + "need \(caseCount); skipped_over_budget=\(skippedOverBudget)"
+            )
+        }
+
+        let document = SemanticGPQAAnswerDocument(
+            version: 1,
+            cases: answers
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let outputURL = URL(fileURLWithPath: outputPath)
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try encoder.encode(document).write(to: outputURL, options: [.atomic])
+        print("generated semantic GPQA answer cases=\(answers.count) output=\(outputPath)")
+    }
+
     private static func jsonTokenSequences(from value: Any?, caseName: String) throws -> [[Int]] {
         guard let value else {
             return []
@@ -606,6 +737,54 @@ private enum MLXFastCLI {
         return try runBlockingAsync {
             try await AutoTokenizer.from(modelFolder: modelFolder, strict: false)
         }
+    }
+
+    private static func requirePrivateOutputPath(_ path: String, description: String) throws {
+        let privateDir = environmentValue("MLXFAST_PRIVATE_DIR", fallback: "")
+        guard !privateDir.isEmpty else {
+            return
+        }
+        let outputPath = absolutePath(path)
+        let privatePath = absolutePath(privateDir)
+        guard outputPath.hasPrefix(privatePath + "/") else {
+            throw MLXFastError.invalidInput("\(description) must be under MLXFAST_PRIVATE_DIR")
+        }
+    }
+
+    private static func referenceAnswer(for testCase: GPQAReferenceCase) -> String {
+        if let expected = trimmedNonEmpty(testCase.expectedResponse) {
+            return expected
+        }
+        if let accepted = testCase.acceptedResponses?.compactMap({ trimmedNonEmpty($0) }), !accepted.isEmpty {
+            return accepted.joined(separator: "\n")
+        }
+        if let answerKey = trimmedNonEmpty(testCase.answerKey) {
+            if let answerText = multipleChoiceAnswerText(in: testCase.prompt, answerKey: answerKey) {
+                return "\(answerKey). \(answerText)"
+            }
+            return "Correct option: \(answerKey)"
+        }
+        return ""
+    }
+
+    private static func multipleChoiceAnswerText(in prompt: String, answerKey: String) -> String? {
+        let normalizedKey = answerKey.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard normalizedKey.count == 1 else {
+            return nil
+        }
+        for rawLine in prompt.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            for marker in ["\(normalizedKey).", "\(normalizedKey):", "\(normalizedKey))", "\(normalizedKey)"]
+                where line.hasPrefix(marker)
+            {
+                let start = line.index(line.startIndex, offsetBy: marker.count)
+                let value = line[start...].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !value.isEmpty {
+                    return value
+                }
+            }
+        }
+        return nil
     }
 
     private static func buildGPQABehaviorCaseIfWithinPromptBudget(
@@ -790,6 +969,15 @@ private enum MLXFastCLI {
             .appendingPathComponent("mlxfast-runtime-worker-\(UUID().uuidString).sb")
         let absoluteGoldenPath = absolutePath(blockedGoldenPath)
         let absoluteExecutablePath = absolutePath(allowedExecutablePath)
+        var deniedReadRules = [
+            "(deny file-read* (literal \"\(seatbeltEscaped(absoluteGoldenPath))\"))",
+        ]
+        let privateDir = environmentValue("MLXFAST_PRIVATE_DIR", fallback: "")
+        if !privateDir.isEmpty {
+            deniedReadRules.append(
+                "(deny file-read* (subpath \"\(seatbeltEscaped(absolutePath(privateDir)))\"))"
+            )
+        }
         let profile = """
         (version 1)
         (allow default)
@@ -799,7 +987,7 @@ private enum MLXFastCLI {
         (allow process-exec (literal "\(seatbeltEscaped(absoluteExecutablePath))"))
         (deny file-write*)
         (allow file-write* (literal "/dev/null"))
-        (deny file-read* (literal "\(seatbeltEscaped(absoluteGoldenPath))"))
+        \(deniedReadRules.joined(separator: "\n"))
         """
         try profile.write(to: profileURL, atomically: true, encoding: .utf8)
         return profileURL.path
@@ -1122,6 +1310,7 @@ private enum MLXFastCLI {
               mlxfast-swift benchmark [--quick] [--weights PATH] [--golden PATH] [--score-path PATH]
               mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
               mlxfast-swift calibrate-gpqa-gates --gpqa PATH [--weights PATH] [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
+              mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
               mlxfast-swift login [--api-key KEY | KEY] [--api URL] [--no-verify]
               mlxfast-swift config
@@ -1418,6 +1607,8 @@ private struct GPQAReferenceCase: Decodable {
     let answerKey: String?
     let acceptedTokenSequences: [[Int]]?
     let acceptedResponses: [String]?
+    let domain: String?
+    let subdomain: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -1426,6 +1617,8 @@ private struct GPQAReferenceCase: Decodable {
         case answerKey = "answer_key"
         case acceptedTokenSequences = "accepted_token_sequences"
         case acceptedResponses = "accepted_responses"
+        case domain
+        case subdomain
     }
 
     var identifier: String {
@@ -1433,6 +1626,35 @@ private struct GPQAReferenceCase: Decodable {
         return trimmed.isEmpty ? "gpqa-private" : trimmed
     }
 
+}
+
+private struct SemanticGPQAAnswerDocument: Encodable {
+    let version: Int
+    let cases: [SemanticGPQAAnswerCase]
+}
+
+private struct SemanticGPQAAnswerCase: Encodable {
+    let id: String
+    let domain: String?
+    let subdomain: String?
+    let prompt: String
+    let answerKey: String?
+    let referenceAnswer: String
+    let candidateAnswer: String
+    let candidateTokens: [Int]
+    let maxNewTokens: Int
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case domain
+        case subdomain
+        case prompt
+        case answerKey = "answer_key"
+        case referenceAnswer = "reference_answer"
+        case candidateAnswer = "candidate_answer"
+        case candidateTokens = "candidate_tokens"
+        case maxNewTokens = "max_new_tokens"
+    }
 }
 
 private struct ParsedOptions {

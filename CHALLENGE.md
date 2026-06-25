@@ -168,10 +168,17 @@ teacher-forced cases:
   checked exactly against precomputed accepted answer token sequences. Each
   accepted answer sequence must have exactly `max_new_tokens` tokens.
 
-These layers keep the official gate deterministic and token-based while making
-prompt memorization or narrow kernel spoofing harder. The benchmark operator
-should keep private prompts and accepted answer sequences outside the public
-repository.
+Full benchmark CI adds one more private layer after timing: it generates short
+answers for hidden GPQA cases and asks a Claude judge whether each candidate is
+semantically equivalent to the private reference answer. That semantic gate is
+pass/fail only and does not affect the timing score. The uploaded score records
+only aggregate semantic counts and the judge model name.
+
+These layers keep the official gate mostly deterministic and token-based while
+adding a small semantic backstop against implementations that pass the exact
+prefix but damage answer meaning. The benchmark operator should keep private
+prompts, accepted answer sequences, reference answers, and judge transcripts
+outside the public repository.
 
 The gate intentionally does not port the earlier Python hidden-state comparison
 layer. The benchmark contract cares about the externally observable text-to-text

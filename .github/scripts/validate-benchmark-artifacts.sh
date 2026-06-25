@@ -24,6 +24,8 @@ require_file "${GOLDEN_PATH}.bytes"
 : "${MLXFAST_EXPECTED_CORRECTNESS_STEPS:?MLXFAST_EXPECTED_CORRECTNESS_STEPS is required}"
 : "${MLXFAST_EXPECTED_CORRECTNESS_CASES:?MLXFAST_EXPECTED_CORRECTNESS_CASES is required}"
 : "${MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS:?MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS is required}"
+: "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT:?MLXFAST_SEMANTIC_GPQA_CASE_COUNT is required}"
+: "${MLXFAST_SEMANTIC_GPQA_MIN_PASS:?MLXFAST_SEMANTIC_GPQA_MIN_PASS is required}"
 
 shasum -a 256 -c "${SCORE_PATH}.sha256"
 
@@ -44,6 +46,8 @@ jq -e \
   --arg golden_hash "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}" \
   --argjson checked_steps "${MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS}" \
   --argjson correctness_cases "${MLXFAST_EXPECTED_CORRECTNESS_CASES}" \
+  --argjson semantic_cases "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT}" \
+  --argjson semantic_min_pass "${MLXFAST_SEMANTIC_GPQA_MIN_PASS}" \
   '
   def same_keys($expected):
     (keys_unsorted | sort) == ($expected | sort);
@@ -85,6 +89,10 @@ jq -e \
     "preflight_seconds",
     "process_resident_memory_gb",
     "runtime",
+    "semantic_gpqa_case_count",
+    "semantic_gpqa_model",
+    "semantic_gpqa_pass_count",
+    "semantic_gpqa_passed",
     "timed_benchmark_seconds",
     "timestamp",
     "weights_byte_count",
@@ -97,6 +105,13 @@ jq -e \
   and (.metrics.passed_correctness == true)
   and (.metrics.checked_steps == $checked_steps)
   and (.metrics.case_count == $correctness_cases)
+  and (.metrics.semantic_gpqa_passed == true)
+  and (.metrics.semantic_gpqa_case_count == $semantic_cases)
+  and (.metrics.semantic_gpqa_pass_count | type == "number")
+  and (.metrics.semantic_gpqa_pass_count >= $semantic_min_pass)
+  and (.metrics.semantic_gpqa_pass_count <= .metrics.semantic_gpqa_case_count)
+  and (.metrics.semantic_gpqa_model | type == "string")
+  and (.metrics.semantic_gpqa_model | length > 0)
   and (.metrics.num_layers == 43)
   and (.metrics.golden_hash == $golden_hash)
   and (.metrics.first_failing_case == null)

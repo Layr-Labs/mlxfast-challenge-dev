@@ -97,6 +97,10 @@ public struct ScoreMetrics: Codable, Equatable {
     public let preflightSeconds: Double
     public let correctnessSeconds: Double
     public let timedBenchmarkSeconds: Double
+    public let semanticGPQAPassed: Bool
+    public let semanticGPQAPassCount: Int
+    public let semanticGPQACaseCount: Int
+    public let semanticGPQAModel: String
     public let processResidentMemoryGB: Double
     public let passedCorrectness: Bool
     public let numLayers: Int
@@ -139,6 +143,10 @@ public struct ScoreMetrics: Codable, Equatable {
         case preflightSeconds = "preflight_seconds"
         case correctnessSeconds = "correctness_seconds"
         case timedBenchmarkSeconds = "timed_benchmark_seconds"
+        case semanticGPQAPassed = "semantic_gpqa_passed"
+        case semanticGPQAPassCount = "semantic_gpqa_pass_count"
+        case semanticGPQACaseCount = "semantic_gpqa_case_count"
+        case semanticGPQAModel = "semantic_gpqa_model"
         case processResidentMemoryGB = "process_resident_memory_gb"
         case passedCorrectness = "passed_correctness"
         case numLayers = "num_layers"
@@ -182,6 +190,10 @@ public struct ScoreMetrics: Codable, Equatable {
         preflightSeconds: Double = 0,
         correctnessSeconds: Double = 0,
         timedBenchmarkSeconds: Double = 0,
+        semanticGPQAPassed: Bool = false,
+        semanticGPQAPassCount: Int = 0,
+        semanticGPQACaseCount: Int = 0,
+        semanticGPQAModel: String = "",
         processResidentMemoryGB: Double = 0,
         passedCorrectness: Bool,
         numLayers: Int,
@@ -229,6 +241,10 @@ public struct ScoreMetrics: Codable, Equatable {
         self.preflightSeconds = preflightSeconds
         self.correctnessSeconds = correctnessSeconds
         self.timedBenchmarkSeconds = timedBenchmarkSeconds
+        self.semanticGPQAPassed = semanticGPQAPassed
+        self.semanticGPQAPassCount = semanticGPQAPassCount
+        self.semanticGPQACaseCount = semanticGPQACaseCount
+        self.semanticGPQAModel = semanticGPQAModel
         self.processResidentMemoryGB = processResidentMemoryGB
         self.passedCorrectness = passedCorrectness
         self.numLayers = numLayers
@@ -287,6 +303,10 @@ public struct ScoreMetrics: Codable, Equatable {
         self.preflightSeconds = try container.decodeIfPresent(Double.self, forKey: .preflightSeconds) ?? 0
         self.correctnessSeconds = try container.decodeIfPresent(Double.self, forKey: .correctnessSeconds) ?? 0
         self.timedBenchmarkSeconds = try container.decodeIfPresent(Double.self, forKey: .timedBenchmarkSeconds) ?? 0
+        self.semanticGPQAPassed = try container.decodeIfPresent(Bool.self, forKey: .semanticGPQAPassed) ?? false
+        self.semanticGPQAPassCount = try container.decodeIfPresent(Int.self, forKey: .semanticGPQAPassCount) ?? 0
+        self.semanticGPQACaseCount = try container.decodeIfPresent(Int.self, forKey: .semanticGPQACaseCount) ?? 0
+        self.semanticGPQAModel = try container.decodeIfPresent(String.self, forKey: .semanticGPQAModel) ?? ""
         self.processResidentMemoryGB = try container.decodeIfPresent(Double.self, forKey: .processResidentMemoryGB) ?? 0
         self.passedCorrectness = try container.decode(Bool.self, forKey: .passedCorrectness)
         self.numLayers = try container.decode(Int.self, forKey: .numLayers)
@@ -331,6 +351,10 @@ public struct ScoreMetrics: Codable, Equatable {
         try container.encode(preflightSeconds, forKey: .preflightSeconds)
         try container.encode(correctnessSeconds, forKey: .correctnessSeconds)
         try container.encode(timedBenchmarkSeconds, forKey: .timedBenchmarkSeconds)
+        try container.encode(semanticGPQAPassed, forKey: .semanticGPQAPassed)
+        try container.encode(semanticGPQAPassCount, forKey: .semanticGPQAPassCount)
+        try container.encode(semanticGPQACaseCount, forKey: .semanticGPQACaseCount)
+        try container.encode(semanticGPQAModel, forKey: .semanticGPQAModel)
         try container.encode(processResidentMemoryGB, forKey: .processResidentMemoryGB)
         try container.encode(passedCorrectness, forKey: .passedCorrectness)
         try container.encode(numLayers, forKey: .numLayers)

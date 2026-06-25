@@ -96,8 +96,11 @@ jobs:
       MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
       MLXFAST_GPQA_REFERENCE_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/gpqa_reference_cases.json
+      MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_answers.json
+      MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json
       MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
+      MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ANTHROPIC_API_KEY != '' && '1' || '0' }}
       MLXFAST_RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
       MLXFAST_PRESERVE_GOLDEN_ONLY: ${{ inputs.preserve_golden_only && '1' || '0' }}
       MLXFAST_CALIBRATE_GPQA_REFERENCE: ${{ inputs.calibrate_gpqa_reference && '1' || '0' }}
@@ -109,6 +112,10 @@ jobs:
       MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases.json
       MLXFAST_GPQA_CASE_COUNT: "9"
       MLXFAST_GPQA_MAX_NEW_TOKENS: "1"
+      MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "9"
+      MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: "10"
+      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "8"
+      MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 830670206859a1b221508ae44a031205a3eba6f5f13e05b40383bf781bdbf067
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "26110"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "256"
@@ -186,6 +193,10 @@ jobs:
           fi
           if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" && "${MLXFAST_PRESERVE_GOLDEN_ONLY}" != "1" && "${MLXFAST_CALIBRATE_GPQA_REFERENCE}" != "1" && "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
             echo "benchmark: hidden GPQA behavior gate requires private R2 secrets" >&2
+            exit 1
+          fi
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" && "${MLXFAST_PRESERVE_GOLDEN_ONLY}" != "1" && "${MLXFAST_CALIBRATE_GPQA_REFERENCE}" != "1" && "${MLXFAST_ANTHROPIC_PRESENT}" != "1" ]]; then
+            echo "benchmark: semantic GPQA gate requires ANTHROPIC_API_KEY" >&2
             exit 1
           fi
 
@@ -490,6 +501,31 @@ jobs:
           else
             ./benchmark.sh
           fi
+
+      - name: Semantic GPQA gate
+        if: ${{ !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MLXFAST_SUBMISSION_REF: ${{ inputs.submission_ref }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+            echo "benchmark: semantic GPQA gate requires ANTHROPIC_API_KEY" >&2
+            exit 1
+          fi
+          echo "benchmark: generating hidden semantic GPQA candidate answers"
+          if ! .build/release/mlxfast-swift generate-gpqa-answers \
+              --gpqa "${MLXFAST_GPQA_REFERENCE_PATH}" \
+              --weights weights \
+              --tokenizer weights \
+              --output "${MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH}" \
+              --case-count "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT}" \
+              --max-new-tokens "${MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS}" \
+              > "${RUNNER_TEMP}/mlxfast-semantic-gpqa-private.log" 2>&1; then
+            echo "benchmark: hidden semantic GPQA candidate generation failed" >&2
+            exit 1
+          fi
+          .github/scripts/run-semantic-gpqa-gate.sh
 
       - name: Validate benchmark artifacts
         id: validate_benchmark_artifacts

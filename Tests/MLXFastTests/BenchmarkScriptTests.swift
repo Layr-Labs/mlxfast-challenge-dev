@@ -73,7 +73,6 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
         contentsOfFile: ".github/workflows/ci.yml",
         encoding: .utf8
     )
-
     #expect(workflow.contains("name: reference-cache-probe"))
     #expect(workflow.contains("workflow_dispatch:"))
     #expect(!workflow.contains("pull_request:"))
@@ -119,12 +118,23 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
         contentsOfFile: ".github/scripts/stage-benchmark-artifacts.sh",
         encoding: .utf8
     )
+    let ci = try String(
+        contentsOfFile: ".github/workflows/ci.yml",
+        encoding: .utf8
+    )
+    let semanticGate = try String(
+        contentsOfFile: ".github/scripts/run-semantic-gpqa-gate.sh",
+        encoding: .utf8
+    )
 
     #expect(!workflow.contains("${{ runner.temp }}"))
     #expect(workflow.contains("MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}"))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json"))
     #expect(workflow.contains("MLXFAST_GPQA_REFERENCE_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/gpqa_reference_cases.json"))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_answers.json"))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json"))
     #expect(workflow.contains("MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}"))
+    #expect(workflow.contains("MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ANTHROPIC_API_KEY != '' && '1' || '0' }}"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 2a747bf797e16d58f5ffedacc0d4bf5ce0d14be00f2421dc04289a2154cb011d"))
@@ -133,6 +143,10 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases.json"))
     #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"9\""))
     #expect(workflow.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"1\""))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_CASE_COUNT: \"9\""))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: \"10\""))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MIN_PASS: \"8\""))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929"))
     #expect(workflow.contains("calibrate_gpqa_reference:"))
     #expect(workflow.contains("MLXFAST_CALIBRATE_GPQA_REFERENCE: ${{ inputs.calibrate_gpqa_reference && '1' || '0' }}"))
     #expect(workflow.contains("calibrate_gpqa_reference cannot be combined with preserve_golden_only"))
@@ -143,9 +157,16 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: \"26110\""))
     #expect(workflow.contains("benchmark: using checked-in public correctness golden"))
     #expect(workflow.contains("hidden GPQA behavior gate requires private R2 secrets"))
+    #expect(workflow.contains("semantic GPQA gate requires ANTHROPIC_API_KEY"))
     #expect(workflow.contains("mlxfast-swift attach-gpqa-gates"))
     #expect(workflow.contains("--case-count \"${MLXFAST_GPQA_CASE_COUNT}\""))
     #expect(workflow.contains("--max-new-tokens \"${MLXFAST_GPQA_MAX_NEW_TOKENS}\""))
+    #expect(workflow.contains("- name: Semantic GPQA gate"))
+    #expect(workflow.contains("ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}"))
+    #expect(workflow.contains("mlxfast-swift generate-gpqa-answers"))
+    #expect(workflow.contains("--case-count \"${MLXFAST_SEMANTIC_GPQA_CASE_COUNT}\""))
+    #expect(workflow.contains("--max-new-tokens \"${MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS}\""))
+    #expect(workflow.contains(".github/scripts/run-semantic-gpqa-gate.sh"))
     #expect(workflow.contains("using private GPQA-augmented correctness golden"))
     #expect(workflow.contains("[[ \"${MLXFAST_RUN_BENCHMARK}\" == \"1\" ]]"))
     #expect(!workflow.contains("generate_golden_only"))
@@ -163,11 +184,23 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(validator.contains("and (.metrics.first_failing_case == null)"))
     #expect(validator.contains("and (.metrics.expected_token == null)"))
     #expect(validator.contains("and (.metrics.actual_token == null)"))
+    #expect(validator.contains("MLXFAST_SEMANTIC_GPQA_CASE_COUNT is required"))
+    #expect(validator.contains("MLXFAST_SEMANTIC_GPQA_MIN_PASS is required"))
+    #expect(validator.contains("\"semantic_gpqa_passed\""))
+    #expect(validator.contains("and (.metrics.semantic_gpqa_passed == true)"))
+    #expect(validator.contains("and (.metrics.semantic_gpqa_pass_count >= $semantic_min_pass)"))
     let scoreArtifactCheck = try #require(validator.range(of: "require_file \"${SCORE_PATH}\""))
     let checkedStepsEnvCheck = try #require(validator.range(of: "MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS is required"))
     #expect(scoreArtifactCheck.lowerBound < checkedStepsEnvCheck.lowerBound)
     #expect(stageArtifacts.contains("/tmp/mlxfast-artifacts-*"))
     #expect(stageArtifacts.contains(".github/scripts/deny-private-artifacts.sh \"${dest}\""))
+    #expect(ci.contains("bash -n .github/scripts/run-semantic-gpqa-gate.sh"))
+    #expect(semanticGate.contains("ANTHROPIC_API_KEY is required"))
+    #expect(semanticGate.contains("anthropic-version: 2023-06-01"))
+    #expect(semanticGate.contains(".metrics.semantic_gpqa_passed = $semantic_passed"))
+    #expect(semanticGate.contains(".score_sha256 = $score_hash"))
+    #expect(!semanticGate.contains("--arg question \"$(jq"))
+    #expect(!semanticGate.contains("candidate_answer\" >&2"))
 }
 
 @Test
@@ -188,11 +221,16 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(package.contains(".product(name: \"Tokenizers\", package: \"swift-transformers\")"))
     #expect(cli.contains("case \"attach-gpqa-gates\""))
     #expect(cli.contains("case \"calibrate-gpqa-gates\""))
+    #expect(cli.contains("case \"generate-gpqa-answers\""))
     #expect(cli.contains("AutoTokenizer.from(modelFolder: modelFolder, strict: false)"))
     #expect(cli.contains("acceptedReferenceTokenSequences"))
     #expect(cli.contains("DeepSeekRuntime.generateGreedyTokens"))
     #expect(cli.contains("runtimeWorkerOptions(blockedGoldenPath: gpqaPath)"))
     #expect(cli.contains("calibrated_reference_outputs"))
+    #expect(cli.contains("SemanticGPQAAnswerDocument"))
+    #expect(cli.contains("referenceAnswer(for: testCase)"))
+    #expect(cli.contains("generate-gpqa-answers requires --output or MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH"))
+    #expect(cli.contains("semantic GPQA answer output"))
     #expect(cli.contains("existingSequences + [generated]"))
     #expect(cli.contains("accepted_sequences="))
     #expect(cli.contains("accepted_token_sequences or accepted_responses generated from the reference model"))
@@ -274,6 +312,8 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     #expect(cli.contains("(deny process-exec*)"))
     #expect(cli.contains("(deny file-write*)"))
     #expect(cli.contains("(allow file-write* (literal \"/dev/null\"))"))
+    #expect(cli.contains("(deny file-read* (subpath"))
+    #expect(cli.contains("absolutePath(privateDir)"))
     #expect(!cli.contains("(allow network* (remote ip \\\"localhost:*\\\"))"))
 }
 

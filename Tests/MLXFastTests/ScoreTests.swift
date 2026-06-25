@@ -64,6 +64,10 @@ func writeScorePayloadEmitsDarkbloomShape() throws {
     #expect(decoded.metrics.preflightSeconds == 0)
     #expect(decoded.metrics.correctnessSeconds == 0)
     #expect(decoded.metrics.timedBenchmarkSeconds == 0)
+    #expect(decoded.metrics.semanticGPQAPassed == false)
+    #expect(decoded.metrics.semanticGPQAPassCount == 0)
+    #expect(decoded.metrics.semanticGPQACaseCount == 0)
+    #expect(decoded.metrics.semanticGPQAModel == "")
     #expect(decoded.metrics.processResidentMemoryGB == 0)
     #expect(decoded.metrics.firstFailingLayer == nil)
     #expect(decoded.metrics.firstFailingCase == nil)
@@ -93,6 +97,10 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
                 preflightSeconds: 1,
                 correctnessSeconds: 2,
                 timedBenchmarkSeconds: 8,
+                semanticGPQAPassed: true,
+                semanticGPQAPassCount: 8,
+                semanticGPQACaseCount: 9,
+                semanticGPQAModel: "claude-sonnet-4-5-20250929",
                 processResidentMemoryGB: 3.5,
                 passedCorrectness: false,
                 numLayers: MLXFastConstants.numHiddenLayers,
@@ -156,6 +164,10 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(raw.contains("\"preflight_seconds\" : 1"))
     #expect(raw.contains("\"correctness_seconds\" : 2"))
     #expect(raw.contains("\"timed_benchmark_seconds\" : 8"))
+    #expect(raw.contains("\"semantic_gpqa_passed\" : true"))
+    #expect(raw.contains("\"semantic_gpqa_pass_count\" : 8"))
+    #expect(raw.contains("\"semantic_gpqa_case_count\" : 9"))
+    #expect(raw.contains("\"semantic_gpqa_model\" : \"claude-sonnet-4-5-20250929\""))
     #expect(raw.contains("\"process_resident_memory_gb\" : 3.5"))
     #expect(decoded.metrics.firstFailingLayer == nil)
     #expect(decoded.metrics.firstFailingCase == "case-b")
@@ -183,6 +195,10 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(decoded.metrics.preflightSeconds == 1)
     #expect(decoded.metrics.correctnessSeconds == 2)
     #expect(decoded.metrics.timedBenchmarkSeconds == 8)
+    #expect(decoded.metrics.semanticGPQAPassed == true)
+    #expect(decoded.metrics.semanticGPQAPassCount == 8)
+    #expect(decoded.metrics.semanticGPQACaseCount == 9)
+    #expect(decoded.metrics.semanticGPQAModel == "claude-sonnet-4-5-20250929")
     #expect(decoded.metrics.processResidentMemoryGB == 3.5)
 }
 
@@ -238,6 +254,10 @@ func scoreMetricsDecodeOlderPayloadWithoutWeightsIntegrityFields() throws {
     #expect(decoded.metrics.preflightSeconds == 0)
     #expect(decoded.metrics.correctnessSeconds == 0)
     #expect(decoded.metrics.timedBenchmarkSeconds == 0)
+    #expect(decoded.metrics.semanticGPQAPassed == false)
+    #expect(decoded.metrics.semanticGPQAPassCount == 0)
+    #expect(decoded.metrics.semanticGPQACaseCount == 0)
+    #expect(decoded.metrics.semanticGPQAModel == "")
     #expect(decoded.metrics.processResidentMemoryGB == 0)
 }
 

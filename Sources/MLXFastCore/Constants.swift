@@ -32,6 +32,11 @@ public enum MLXFastConstants {
     // with pinned Swift/MLX. Keep hidden GPQA behavior gates broad across cases
     // and shallow per case so local M-series and official Blacksmith runs agree.
     public static let correctnessGPQAMaxNewTokens = 1
+    // Semantic judging uses short hidden GPQA answers as a pass/fail backstop
+    // for optimizations that preserve the exact prefix but damage answer sense.
+    public static let semanticGPQACaseCount = 9
+    public static let semanticGPQAMaxNewTokens = 10
+    public static let semanticGPQAMinPassCount = 8
     public static let benchmarkPrefillPromptTokens = 512
     public static let benchmarkDecodeSteps = 256
     public static let quickBenchmarkDecodeSteps = 64
