@@ -774,7 +774,7 @@ private enum MLXFastCLI {
         }
         for rawLine in prompt.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            for marker in ["\(normalizedKey).", "\(normalizedKey):", "\(normalizedKey))", "\(normalizedKey)"]
+            for marker in ["\(normalizedKey).", "\(normalizedKey):", "\(normalizedKey))"]
                 where line.hasPrefix(marker)
             {
                 let start = line.index(line.startIndex, offsetBy: marker.count)

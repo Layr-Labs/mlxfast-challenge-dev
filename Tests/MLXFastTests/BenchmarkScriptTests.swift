@@ -232,6 +232,8 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(cli.contains("referenceAnswer(for: testCase)"))
     #expect(cli.contains("generate-gpqa-answers requires --output or MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH"))
     #expect(cli.contains("semantic GPQA answer output"))
+    #expect(cli.contains("[\"\\(normalizedKey).\", \"\\(normalizedKey):\", \"\\(normalizedKey))\"]"))
+    #expect(!cli.contains("[\"\\(normalizedKey).\", \"\\(normalizedKey):\", \"\\(normalizedKey))\", \"\\(normalizedKey)\"]"))
     #expect(cli.contains("existingSequences + [generated]"))
     #expect(cli.contains("accepted_sequences="))
     #expect(cli.contains("accepted_token_sequences or accepted_responses generated from the reference model"))
