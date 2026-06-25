@@ -3456,10 +3456,17 @@ private final class RuntimeWorkerClient {
         var environment = ProcessInfo.processInfo.environment
         environment["MLXFAST_USE_RUNTIME_WORKER"] = "0"
         for key in [
+            "ANTHROPIC_API_KEY",
             "MLXFAST_CORRECTNESS_GOLDEN_PATH",
             "MLXFAST_CORRECTNESS_GOLDEN_URL",
             "MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER",
+            "MLXFAST_GPQA_REFERENCE_PATH",
+            "MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH",
+            "MLXFAST_SEMANTIC_GPQA_RESULTS_PATH",
+            "MLXFAST_SEMANTIC_GPQA_MODEL",
             "MLXFAST_PRIVATE_DIR",
+            "MLXFAST_PRIVATE_PROMPTS_R2_PRESENT",
+            "MLXFAST_ANTHROPIC_PRESENT",
             "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE",
             "R2_ACCESS_KEY_ID",
             "R2_BUCKET_ENDPOINT",
