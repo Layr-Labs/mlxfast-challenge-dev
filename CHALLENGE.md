@@ -20,9 +20,7 @@ The benchmark entrypoint:
 4. Validates the benchmark prefill/decode tokens against the hidden benchmark
    oracle in `correctness_golden.json`.
 5. Measures prefill latency, 256-step greedy decode latency, MLX peak memory, and
-   bandwidth. Bandwidth uses `mactop` hardware DRAM counters when available and
-   falls back to expert-streaming read bytes when the runner does not expose
-   IOReport DRAM channels.
+   expert-streaming read-byte diagnostics.
 6. Writes `score.json` in the Darkbloom-compatible schema, plus
    `score.json.sha256` and `benchmark-integrity.json` audit sidecars.
 
@@ -214,14 +212,10 @@ Higher is better. A baseline implementation on the official runner scores about
 `1.0`. Decode is weighted more heavily because it dominates interactive
 generation, while prefill still contributes to the ranked score.
 
-`bandwidth_GB_per_token` prefers `mactop` hardware DRAM counters during the
-decode window. `setup.sh` installs `mactop` with Homebrew when needed; set
-`MLXFAST_MACTOP_BIN=/path/to/mactop` to use a local binary instead. If mactop
-cannot collect IOReport DRAM samples, the score records
-`bandwidth_source=expert_streaming_reads` and reports the measured
-expert-streaming file bytes. Bandwidth, RAM, and expert-read metrics are
-diagnostics and guardrail candidates, not primary score factors. Set
-`MLXFAST_REQUIRE_MACTOP_BANDWIDTH=1` to fail instead of falling back.
+`bandwidth_GB_per_token` is derived from measured expert-streaming file bytes
+during the decode window and is reported with
+`bandwidth_source=expert_streaming_reads`. Bandwidth, RAM, and expert-read
+metrics are diagnostics and guardrail candidates, not primary score factors.
 `score.json` also carries audit-only wall-clock phase timings, final process RSS,
 expert streaming counters, and transformed-weights digest fields. These values
 help operators review runs but do not change the score formula.

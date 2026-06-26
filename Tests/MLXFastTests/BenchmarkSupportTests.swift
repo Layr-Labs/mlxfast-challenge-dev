@@ -5,32 +5,6 @@ import Foundation
 import Testing
 
 @Test
-func mactopBandwidthParsesJSONArraySamples() {
-    let data = """
-    [
-      {"soc_metrics": {"dram_bw_combined_gbs": 10.5}},
-      {"soc_metrics": {"dram_bw_combined_gbs": 11}},
-      {"soc_metrics": {"ignored": 99}},
-      {"other": true}
-    ]
-    """.data(using: .utf8)!
-
-    #expect(MactopBandwidth.parseSamples(from: data) == [10.5, 11.0])
-}
-
-@Test
-func mactopBandwidthParsesNDJSONSamples() {
-    let data = """
-    {"soc_metrics": {"dram_bw_combined_gbs": 3.25}}
-    {"soc_metrics": {"dram_bw_combined_gbs": 4.75}}
-    not json
-    {"soc_metrics": {"dram_bw_combined_gbs": 0}}
-    """.data(using: .utf8)!
-
-    #expect(MactopBandwidth.parseSamples(from: data) == [3.25, 4.75, 0])
-}
-
-@Test
 func runtimeWorkerClientSkipsNonJSONStdoutLines() {
     #expect(runtimeWorkerLineLooksLikeJSONResponse(Data("  {\"id\":1,\"ok\":true}".utf8)))
     #expect(!runtimeWorkerLineLooksLikeJSONResponse(Data("Metal device initialized".utf8)))
@@ -56,30 +30,6 @@ func correctnessAcceptsOnlyExactTopLogitTies() {
         ]
     ))
     #expect(!correctnessTokenAccepted(expectedToken: 30, actualToken: 1, topLogits: nil))
-}
-
-@Test
-func mactopBandwidthComputesIdleSubtractedGigabytesPerToken() throws {
-    let value = try MactopBandwidth.gigabytesPerToken(
-        samples: [10, 12, 8],
-        idleGBPerSecond: 2,
-        decodeElapsedSeconds: 4,
-        decodedTokens: 8
-    )
-
-    #expect(abs(value - 4.0) < 1e-9)
-}
-
-@Test
-func mactopBandwidthRejectsNoUsableNetSamples() {
-    #expect(throws: MLXFastError.self) {
-        _ = try MactopBandwidth.gigabytesPerToken(
-            samples: [1, 2],
-            idleGBPerSecond: 3,
-            decodeElapsedSeconds: 1,
-            decodedTokens: 1
-        )
-    }
 }
 
 @Test
@@ -112,23 +62,6 @@ func decodeTimingPlanRejectsInvalidRanges() throws {
 func submissionValidationDelayDefaultsToZero() throws {
     #expect(DeepSeekSubmissionControls.measuredDecodeDelayMilliseconds == 0)
     #expect(try DeepSeekRuntime.submissionValidationDelayMilliseconds() == 0)
-}
-
-@Test
-func mactopHardwareBandwidthRequirementParsesEnvironment() {
-    #expect(!DeepSeekRuntime.requiresMactopHardwareBandwidth(environment: [:]))
-    #expect(!DeepSeekRuntime.requiresMactopHardwareBandwidth(environment: [
-        "MLXFAST_REQUIRE_MACTOP_BANDWIDTH": "0",
-    ]))
-    #expect(DeepSeekRuntime.requiresMactopHardwareBandwidth(environment: [
-        "MLXFAST_REQUIRE_MACTOP_BANDWIDTH": "1",
-    ]))
-    #expect(DeepSeekRuntime.requiresMactopHardwareBandwidth(environment: [
-        "MLXFAST_REQUIRE_MACTOP_BANDWIDTH": " true ",
-    ]))
-    #expect(DeepSeekRuntime.requiresMactopHardwareBandwidth(environment: [
-        "MLXFAST_REQUIRE_MACTOP_BANDWIDTH": "YES",
-    ]))
 }
 
 @Test
@@ -165,80 +98,17 @@ func benchmarkPromptPlanRejectsMalformedBenchmarkOracle() {
 }
 
 @Test
-func mactopLocatorUsesExplicitExecutableOverride() throws {
-    let directory = try temporaryDirectory()
-    let executable = directory.appendingPathComponent("mactop")
-    try "#!/bin/sh\nexit 0\n".write(to: executable, atomically: true, encoding: .utf8)
-    try FileManager.default.setAttributes(
-        [.posixPermissions: 0o755],
-        ofItemAtPath: executable.path
-    )
-
-    let resolved = try MactopLocator.executablePath(environment: [
-        "MLXFAST_MACTOP_BIN": executable.path,
-    ])
-
-    #expect(resolved == executable.path)
-}
-
-@Test
-func mactopIdleMeasurementStopsAfterEnoughSamples() throws {
-    let directory = try temporaryDirectory()
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let executable = try writeExecutableScript(
-        directory.appendingPathComponent("mactop"),
-        contents: """
-        #!/bin/sh
-        printf '%s\\n' '{"soc_metrics":{"dram_bw_combined_gbs":6}}'
-        printf '%s\\n' '{"soc_metrics":{"dram_bw_combined_gbs":7}}'
-        sleep 5
-        """
-    )
-
-    let samples = try MactopSession.measureIdleSamples(
-        sampleCount: 2,
-        timeoutSeconds: 1,
-        environment: ["MLXFAST_MACTOP_BIN": executable.path]
-    )
-
-    #expect(samples == [6, 7])
-}
-
-@Test
-func mactopIdleMeasurementTimesOutWithoutSamples() throws {
-    let directory = try temporaryDirectory()
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let executable = try writeExecutableScript(
-        directory.appendingPathComponent("mactop"),
-        contents: """
-        #!/bin/sh
-        sleep 5
-        """
-    )
-
-    #expect(throws: MLXFastError.self) {
-        _ = try MactopSession.measureIdleSamples(
-            sampleCount: 1,
-            timeoutSeconds: 0.2,
-            environment: ["MLXFAST_MACTOP_BIN": executable.path]
-        )
-    }
-}
-
-@Test
 func benchmarkPreflightAcceptsRequiredArtifacts() throws {
     let fixture = try makePreflightFixture()
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     let report = try BenchmarkPreflight.check(
         weightsPath: fixture.weights.path,
-        goldenPath: fixture.golden.path,
-        environment: ["MLXFAST_MACTOP_BIN": fixture.mactop.path]
+        goldenPath: fixture.golden.path
     )
 
     #expect(report.weightsPath == fixture.weights.path)
     #expect(report.goldenPath == fixture.golden.path)
-    #expect(report.mactopPath == fixture.mactop.path)
     #expect(report.weightsByteCount > 0)
     #expect(report.maxWeightsByteCount == MLXFastConstants.defaultMaxTransformedWeightsBytes)
 }
@@ -255,8 +125,7 @@ func benchmarkPreflightRejectsWeightsAboveDefaultByteLimit() throws {
     #expect(throws: MLXFastError.self) {
         _ = try BenchmarkPreflight.check(
             weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path,
-            environment: ["MLXFAST_MACTOP_BIN": fixture.mactop.path]
+            goldenPath: fixture.golden.path
         )
     }
 }
@@ -275,7 +144,6 @@ func benchmarkPreflightHonorsConfiguredWeightsByteLimit() throws {
         weightsPath: fixture.weights.path,
         goldenPath: fixture.golden.path,
         environment: [
-            "MLXFAST_MACTOP_BIN": fixture.mactop.path,
             "MLXFAST_MAX_WEIGHTS_BYTES": "\(override)",
         ]
     )
@@ -292,8 +160,7 @@ func benchmarkPreflightRejectsMissingExpertManifest() throws {
     #expect(throws: MLXFastError.self) {
         _ = try BenchmarkPreflight.check(
             weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path,
-            environment: ["MLXFAST_MACTOP_BIN": fixture.mactop.path]
+            goldenPath: fixture.golden.path
         )
     }
 }
@@ -306,8 +173,7 @@ func benchmarkPreflightRejectsMalformedGolden() throws {
     #expect(throws: Error.self) {
         _ = try BenchmarkPreflight.check(
             weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path,
-            environment: ["MLXFAST_MACTOP_BIN": fixture.mactop.path]
+            goldenPath: fixture.golden.path
         )
     }
 }
@@ -320,8 +186,7 @@ func benchmarkPreflightRejectsShortBenchmarkPrompt() throws {
     #expect(throws: MLXFastError.self) {
         _ = try BenchmarkPreflight.check(
             weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path,
-            environment: ["MLXFAST_MACTOP_BIN": fixture.mactop.path]
+            goldenPath: fixture.golden.path
         )
     }
 }
@@ -346,8 +211,7 @@ func benchmarkPreflightRejectsMissingBenchmarkOracle() throws {
     #expect(throws: MLXFastError.self) {
         _ = try BenchmarkPreflight.check(
             weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path,
-            environment: ["MLXFAST_MACTOP_BIN": fixture.mactop.path]
+            goldenPath: fixture.golden.path
         )
     }
 }
@@ -360,8 +224,7 @@ func benchmarkPreflightRejectsMissingSemanticTensor() throws {
     #expect(throws: MLXFastError.self) {
         _ = try BenchmarkPreflight.check(
             weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path,
-            environment: ["MLXFAST_MACTOP_BIN": fixture.mactop.path]
+            goldenPath: fixture.golden.path
         )
     }
 }
@@ -374,8 +237,7 @@ func benchmarkPreflightRejectsUnreadableExpertByteRange() throws {
     #expect(throws: MLXFastError.self) {
         _ = try BenchmarkPreflight.check(
             weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path,
-            environment: ["MLXFAST_MACTOP_BIN": fixture.mactop.path]
+            goldenPath: fixture.golden.path
         )
     }
 }
@@ -384,7 +246,6 @@ private struct PreflightFixture {
     let root: URL
     let weights: URL
     let golden: URL
-    let mactop: URL
 }
 
 private struct TensorFixture {
@@ -442,14 +303,7 @@ private func makePreflightFixture(
     let golden = directory.appendingPathComponent("correctness_golden.json")
     try (goldenContents ?? validGoldenJSON()).write(to: golden, atomically: true, encoding: .utf8)
 
-    let mactop = directory.appendingPathComponent("mactop")
-    try "#!/bin/sh\nexit 0\n".write(to: mactop, atomically: true, encoding: .utf8)
-    try FileManager.default.setAttributes(
-        [.posixPermissions: 0o755],
-        ofItemAtPath: mactop.path
-    )
-
-    return PreflightFixture(root: directory, weights: weights, golden: golden, mactop: mactop)
+    return PreflightFixture(root: directory, weights: weights, golden: golden)
 }
 
 private func minimalDeepSeekConfigJSON() -> String {

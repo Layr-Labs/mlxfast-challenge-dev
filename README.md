@@ -203,12 +203,10 @@ Higher score is better. A baseline implementation on the official runner scores
 about `1.0`; improvements should move the score upward. Decode is weighted more
 heavily because it dominates interactive generation, while prefill still matters
 for prompt processing.
-Bandwidth prefers **mactop hardware DRAM counters**. On macOS virtualized runners
-that do not expose IOReport DRAM channels, the harness records
-`bandwidth_source=expert_streaming_reads` and uses measured expert-streaming file
-bytes as a fallback. Bandwidth, RAM, and expert-read metrics are reported for
-operator review and future guardrails; they are not primary score factors. Set
-`MLXFAST_REQUIRE_MACTOP_BANDWIDTH=1` to fail instead of falling back.
+The harness records `bandwidth_source=expert_streaming_reads` and derives
+`bandwidth_gb_per_token` from measured expert-streaming file bytes during the
+decode window. Bandwidth, RAM, and expert-read metrics are reported for operator
+review and future guardrails; they are not primary score factors.
 Correctness is a hard gate. See CHALLENGE.md for the full correctness specification.
 The official run checks 256 correctness positions and times a 256-token decode
 window. Public local correctness uses the checked-in correctness fixture. When
@@ -307,4 +305,3 @@ tokenizer whitespace variants.
   Line Tools may need full Xcode installed, opened once, and licensed with
   `sudo xcodebuild -license accept`
 - CMake, installed by `./setup.sh` via Homebrew when missing and used by `tools/build-mlx-metallib.sh` to build `mlx.metallib`
-- [mactop](https://github.com/metaspartan/mactop) — installed by `./setup.sh` via Homebrew when missing, or supplied with `MLXFAST_MACTOP_BIN=/path/to/mactop`; hardware bandwidth requires macOS IOReport DRAM channels

@@ -178,23 +178,13 @@ jq -e \
   and (.metrics.weights_file_count > 0)
   and (.metrics.weights_byte_count | type == "number")
   and (.metrics.weights_byte_count > 0)
-  and (.metrics.bandwidth_source == "expert_streaming_reads" or .metrics.bandwidth_source == "mactop_hardware")
+  and (.metrics.bandwidth_source == "expert_streaming_reads")
   and (.metrics.error == "")
   and (.metrics.commit | test("^[0-9a-f]{7,40}$"))
   and (.metrics.harness_hash | test("^[0-9a-f]{64}$"))
   and (.metrics.timestamp | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))
   and (.metrics.runtime == "swift")
   ' "${SCORE_PATH}" >/dev/null
-
-case "${MLXFAST_REQUIRE_MACTOP_BANDWIDTH:-0}" in
-  1|true|TRUE|yes|YES)
-    bandwidth_source="$(jq -r '.metrics.bandwidth_source' "${SCORE_PATH}")"
-    if [[ "${bandwidth_source}" != "mactop_hardware" ]]; then
-      echo "::error file=${SCORE_PATH}::mactop hardware bandwidth was required, got ${bandwidth_source}" >&2
-      exit 1
-    fi
-    ;;
-esac
 
 jq -e '
   def same_keys($expected):
