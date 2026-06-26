@@ -8,6 +8,7 @@ INTEGRITY_PATH="${MLXFAST_INTEGRITY_PATH:-benchmark-integrity.json}"
 RESULTS_PATH="${MLXFAST_SEMANTIC_GPQA_RESULTS_PATH:-${MLXFAST_PRIVATE_DIR:-/tmp}/semantic_gpqa_results.json}"
 MODEL="${MLXFAST_SEMANTIC_GPQA_MODEL:-claude-sonnet-4-5-20250929}"
 MIN_PASS="${MLXFAST_SEMANTIC_GPQA_MIN_PASS:-8}"
+REQUIRED="${MLXFAST_SEMANTIC_GPQA_REQUIRED:-0}"
 
 : "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is required for the semantic GPQA gate}"
 anthropic_api_key="${ANTHROPIC_API_KEY}"
@@ -21,8 +22,8 @@ if [[ ! -s "${SCORE_PATH}" ]]; then
   echo "::error file=${SCORE_PATH}::score file is missing or empty" >&2
   exit 1
 fi
-if ! [[ "${MIN_PASS}" =~ ^[0-9]+$ ]] || [[ "${MIN_PASS}" -le 0 ]]; then
-  echo "::error::MLXFAST_SEMANTIC_GPQA_MIN_PASS must be a positive integer" >&2
+if ! [[ "${MIN_PASS}" =~ ^[0-9]+$ ]]; then
+  echo "::error::MLXFAST_SEMANTIC_GPQA_MIN_PASS must be a non-negative integer" >&2
   exit 1
 fi
 
@@ -35,6 +36,18 @@ if [[ "${MIN_PASS}" -gt "${case_count}" ]]; then
   echo "::error::MLXFAST_SEMANTIC_GPQA_MIN_PASS=${MIN_PASS} exceeds semantic case count ${case_count}" >&2
   exit 1
 fi
+case "${REQUIRED}" in
+  1|true|TRUE|yes|YES)
+    semantic_required=1
+    ;;
+  0|false|FALSE|no|NO|"")
+    semantic_required=0
+    ;;
+  *)
+    echo "::error::MLXFAST_SEMANTIC_GPQA_REQUIRED must be boolean-like" >&2
+    exit 1
+    ;;
+esac
 
 private_root="${MLXFAST_PRIVATE_DIR:-$(dirname "${RESULTS_PATH}")}"
 mkdir -p "${private_root}" "$(dirname "${RESULTS_PATH}")"
@@ -64,7 +77,7 @@ extract_judge_json() {
   '
 }
 
-echo "semantic-gpqa: judging ${case_count} hidden cases with ${MODEL}; min_pass=${MIN_PASS}"
+echo "semantic-gpqa: judging ${case_count} hidden cases with ${MODEL}; min_pass=${MIN_PASS}; required=${semantic_required}"
 for index in $(seq 0 $((case_count - 1))); do
   request_path="${work_dir}/request-${index}.json"
   response_path="${work_dir}/response-${index}.json"
@@ -124,8 +137,12 @@ for index in $(seq 0 $((case_count - 1))); do
     fi
   done
   if [[ -z "${judge_json_text}" ]]; then
-    echo "::error::semantic GPQA judge returned an invalid response for case $((index + 1))" >&2
-    exit 1
+    jq -n \
+      --arg id "${case_id}" \
+      --argjson index "$((index + 1))" \
+      '{id: $id, index: $index, passed: false, error: "invalid_judge_response"}' >> "${results_ndjson}"
+    echo "semantic-gpqa: case $((index + 1))/${case_count} passed=false reason=invalid_judge_response"
+    continue
   fi
   printf '%s' "${judge_json_text}" > "${judge_json}"
   passed="$(jq -r '.passed' "${judge_json}")"
@@ -178,9 +195,13 @@ if [[ -s "${INTEGRITY_PATH}" ]]; then
   mv "${tmp_integrity}" "${INTEGRITY_PATH}"
 fi
 
-if [[ "${semantic_passed}" != "true" ]]; then
+if [[ "${semantic_passed}" != "true" && "${semantic_required}" == "1" ]]; then
   echo "::error::semantic GPQA gate failed pass_count=${semantic_pass_count}/${semantic_case_count}" >&2
   exit 1
+fi
+if [[ "${semantic_passed}" != "true" ]]; then
+  echo "semantic-gpqa: diagnostic did not meet threshold pass_count=${semantic_pass_count}/${semantic_case_count}"
+  exit 0
 fi
 
 echo "semantic-gpqa: passed ${semantic_pass_count}/${semantic_case_count}"

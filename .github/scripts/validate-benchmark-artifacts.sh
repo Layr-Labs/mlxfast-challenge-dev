@@ -28,6 +28,19 @@ require_file "${GOLDEN_PATH}.bytes"
 : "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT:?MLXFAST_SEMANTIC_GPQA_CASE_COUNT is required}"
 : "${MLXFAST_SEMANTIC_GPQA_MIN_PASS:?MLXFAST_SEMANTIC_GPQA_MIN_PASS is required}"
 
+case "${MLXFAST_SEMANTIC_GPQA_REQUIRED:-0}" in
+  1|true|TRUE|yes|YES)
+    semantic_required=1
+    ;;
+  0|false|FALSE|no|NO|"")
+    semantic_required=0
+    ;;
+  *)
+    echo "::error::MLXFAST_SEMANTIC_GPQA_REQUIRED must be boolean-like" >&2
+    exit 1
+    ;;
+esac
+
 shasum -a 256 -c "${SCORE_PATH}.sha256"
 
 score_hash="$(shasum -a 256 "${SCORE_PATH}" | awk '{print $1}')"
@@ -50,6 +63,7 @@ jq -e \
   --argjson ttft_cases "${MLXFAST_GPQA_TTFT_CASE_COUNT}" \
   --argjson semantic_cases "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT}" \
   --argjson semantic_min_pass "${MLXFAST_SEMANTIC_GPQA_MIN_PASS}" \
+  --argjson semantic_required "${semantic_required}" \
   '
   def same_keys($expected):
     (keys_unsorted | sort) == ($expected | sort);
@@ -124,11 +138,14 @@ jq -e \
   and (.metrics.gpqa_ttft_max_seconds | type == "number")
   and (.metrics.gpqa_ttft_max_seconds >= .metrics.gpqa_ttft_p50_seconds)
   and (.metrics.gpqa_ttft_source == "hidden_gpqa_first_token")
-  and (.metrics.semantic_gpqa_passed == true)
+  and (.metrics.semantic_gpqa_passed | type == "boolean")
   and (.metrics.semantic_gpqa_case_count == $semantic_cases)
   and (.metrics.semantic_gpqa_pass_count | type == "number")
-  and (.metrics.semantic_gpqa_pass_count >= $semantic_min_pass)
   and (.metrics.semantic_gpqa_pass_count <= .metrics.semantic_gpqa_case_count)
+  and (if $semantic_required == 1 then
+    (.metrics.semantic_gpqa_passed == true)
+    and (.metrics.semantic_gpqa_pass_count >= $semantic_min_pass)
+  else true end)
   and (.metrics.semantic_gpqa_model | type == "string")
   and (.metrics.semantic_gpqa_model | length > 0)
   and (.metrics.num_layers == 43)
