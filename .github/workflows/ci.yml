@@ -108,3 +108,84 @@ jobs:
           assert data["api_base_url"] == "https://yukon.example.test"
           assert stat.S_IMODE(path.stat().st_mode) == 0o600
           PY
+
+      - name: mactop IOReport access probe
+        continue-on-error: true
+        run: |
+          echo "--- mactop probe: checking IOReport access on this runner ---"
+
+          # Install mactop if not present
+          if ! command -v mactop &>/dev/null; then
+            echo "Installing mactop via Homebrew..."
+            brew install mactop
+          fi
+          echo "mactop path: $(which mactop)"
+          mactop --version || true
+
+          # Run mactop in headless JSON mode for 3 seconds (~30 samples at 100ms)
+          echo "Running: mactop --headless --interval 100 --format json (3s)"
+          MACTOP_OUT=/tmp/mactop-probe-out.txt
+          MACTOP_ERR=/tmp/mactop-probe-err.txt
+          timeout 3s mactop --headless --interval 100 --format json >"${MACTOP_OUT}" 2>"${MACTOP_ERR}" || true
+
+          echo "--- stdout (first 2000 bytes) ---"
+          head -c 2000 "${MACTOP_OUT}" || true
+          echo ""
+          echo "--- stderr ---"
+          cat "${MACTOP_ERR}" || true
+
+          # Parse and validate: require at least 1 sample with non-zero bandwidth
+          python3 - "${MACTOP_OUT}" <<'PY'
+          import json, sys
+
+          raw = open(sys.argv[1]).read()
+
+          # Try JSON array first (mactop v2+ bulk format), then line-by-line NDJSON
+          samples = []
+          try:
+              parsed = json.loads(raw)
+              if isinstance(parsed, list):
+                  samples = parsed
+                  print(f"Parsed as JSON array: {len(samples)} samples")
+              else:
+                  samples = [parsed]
+                  print(f"Parsed as single JSON object")
+          except Exception:
+              for line in raw.splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      samples.append(json.loads(line))
+                  except Exception:
+                      pass
+              print(f"Parsed as NDJSON: {len(samples)} samples")
+
+          if not samples:
+              print("FAIL: mactop produced no parseable output — IOReport may be blocked in this VM")
+              sys.exit(1)
+
+          # Print all keys from first sample so we can see the field names
+          if samples:
+              print(f"Sample keys: {list(samples[0].keys())}")
+
+          bw_values = []
+          for s in samples:
+              for key in ("bandwidth_gbps", "memoryBandwidth", "bandwidth", "bw_gbps"):
+                  if key in s:
+                      try:
+                          bw_values.append(float(s[key]))
+                      except (TypeError, ValueError):
+                          pass
+                      break
+
+          if not bw_values:
+              print("WARN: samples present but no recognized bandwidth field — dumping first sample:")
+              print(json.dumps(samples[0], indent=2) if samples else "(empty)")
+          elif all(v == 0.0 for v in bw_values):
+              print(f"FAIL: all {len(bw_values)} bandwidth values are 0.0 — IOReport counters may be zeroed in this VM")
+              sys.exit(1)
+          else:
+              nonzero = [v for v in bw_values if v > 0]
+              print(f"PASS: {len(nonzero)}/{len(bw_values)} samples have non-zero bandwidth (max={max(bw_values):.3f} GB/s)")
+          PY
