@@ -49,6 +49,23 @@ public struct GreedyGenerationOptions: Equatable {
     }
 }
 
+public struct FirstTokenTimingOptions: Equatable {
+    public let weightsPath: String
+    public let promptTokenSets: [[Int]]
+
+    public init(weightsPath: String, promptTokenSets: [[Int]]) {
+        self.weightsPath = weightsPath
+        self.promptTokenSets = promptTokenSets
+    }
+}
+
+public struct FirstTokenTimingResult: Equatable {
+    public let token: Int
+    public let seconds: Double
+    public let peakRamGB: Double
+    public let expertStats: ExpertStreamingStats
+}
+
 public struct CorrectnessTraceLogit: Codable, Equatable {
     public let token: Int
     public let logit: Double
@@ -304,6 +321,90 @@ public enum DeepSeekRuntime {
             progressIntervalSteps: 1,
             progress: progress
         )
+    }
+
+    public static func measureFirstTokenTimings(
+        _ options: FirstTokenTimingOptions,
+        worker workerOptions: RuntimeWorkerOptions?,
+        progress: ((Int, Int) -> Void)? = nil
+    ) throws -> [FirstTokenTimingResult] {
+        guard !options.promptTokenSets.isEmpty else {
+            throw MLXFastError.invalidInput("first-token timing requires at least one prompt")
+        }
+
+        if let workerOptions {
+            let worker = try RuntimeWorkerClient(options: workerOptions, weightsPath: options.weightsPath)
+            defer {
+                worker.close()
+            }
+            var results: [FirstTokenTimingResult] = []
+            results.reserveCapacity(options.promptTokenSets.count)
+            for (index, promptTokens) in options.promptTokenSets.enumerated() {
+                guard !promptTokens.isEmpty else {
+                    throw MLXFastError.invalidInput("first-token timing prompt \(index + 1) must not be empty")
+                }
+                let response = try worker.beginDecode(seedTokens: promptTokens)
+                guard let token = response.seedToken, let seconds = response.seconds else {
+                    throw MLXFastError.invalidInput("runtime worker decode_begin response missing seed token or seconds")
+                }
+                results.append(
+                    FirstTokenTimingResult(
+                        token: token,
+                        seconds: seconds,
+                        peakRamGB: response.peakRamGB ?? 0,
+                        expertStats: response.expertStats ?? .zero
+                    )
+                )
+                progress?(index + 1, options.promptTokenSets.count)
+            }
+            return results
+        }
+
+        let config = try DeepSeekConfig.load(from: options.weightsPath)
+        let loader = try DeepSeekWeightLoader(
+            weightsPath: options.weightsPath,
+            expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: true)
+        )
+        let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
+        var results: [FirstTokenTimingResult] = []
+        results.reserveCapacity(options.promptTokenSets.count)
+        for (index, promptTokens) in options.promptTokenSets.enumerated() {
+            guard !promptTokens.isEmpty else {
+                throw MLXFastError.invalidInput("first-token timing prompt \(index + 1) must not be empty")
+            }
+            let warmupCache = DeepSeekModelCache(config: weightCache.config)
+            let warmupLogits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray(promptTokens),
+                weightCache: weightCache,
+                cache: warmupCache,
+                positionOffset: 0
+            )
+            _ = try DeepSeekCorrectness.greedyToken(from: warmupLogits)
+            Memory.clearCache()
+
+            let cache = DeepSeekModelCache(config: weightCache.config)
+            let start = DispatchTime.now().uptimeNanoseconds
+            let logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray(promptTokens),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: 0
+            )
+            let token = try DeepSeekCorrectness.greedyToken(from: logits)
+            cache.materializeCachedState()
+            let elapsed = secondsSince(start)
+            results.append(
+                FirstTokenTimingResult(
+                    token: token,
+                    seconds: elapsed,
+                    peakRamGB: currentResidentMemoryGB(),
+                    expertStats: expertStats(from: weightCache)
+                )
+            )
+            progress?(index + 1, options.promptTokenSets.count)
+            Memory.clearCache()
+        }
+        return results
     }
 
     public static func runCorrectness(
@@ -632,6 +733,7 @@ public enum DeepSeekRuntime {
             Memory.clearCache()
 
             let cache = DeepSeekModelCache(config: weightCache.config)
+            let start = DispatchTime.now().uptimeNanoseconds
             let logits = try DeepSeekModel.logits(
                 inputIDs: inputIDsArray(seedTokens),
                 weightCache: weightCache,
@@ -644,12 +746,14 @@ public enum DeepSeekRuntime {
             state.decodeCache = cache
             state.decodeSeedTokenCount = seedTokens.count
             state.decodeStep = 0
+            let elapsed = secondsSince(start)
 
             return RuntimeWorkerResponse(
                 id: request.id,
                 nonce: sessionNonce,
                 ok: true,
                 seedToken: seedToken,
+                seconds: elapsed,
                 expertStats: expertStats(from: weightCache),
                 peakRamGB: currentResidentMemoryGB()
             )
@@ -3461,6 +3565,7 @@ private final class RuntimeWorkerClient {
             "MLXFAST_CORRECTNESS_GOLDEN_URL",
             "MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER",
             "MLXFAST_GPQA_REFERENCE_PATH",
+            "MLXFAST_GPQA_TTFT_RESULTS_PATH",
             "MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH",
             "MLXFAST_SEMANTIC_GPQA_RESULTS_PATH",
             "MLXFAST_SEMANTIC_GPQA_MODEL",

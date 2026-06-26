@@ -96,6 +96,7 @@ jobs:
       MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
       MLXFAST_GPQA_REFERENCE_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/gpqa_reference_cases.json
+      MLXFAST_GPQA_TTFT_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/gpqa_ttft_results.json
       MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_answers.json
       MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json
       MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
@@ -112,6 +113,7 @@ jobs:
       MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases.json
       MLXFAST_GPQA_CASE_COUNT: "9"
       MLXFAST_GPQA_MAX_NEW_TOKENS: "1"
+      MLXFAST_GPQA_TTFT_CASE_COUNT: "9"
       MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "9"
       MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: "10"
       MLXFAST_SEMANTIC_GPQA_MIN_PASS: "8"
@@ -385,13 +387,17 @@ jobs:
           .github/scripts/download-r2-object.sh \
             "${MLXFAST_GPQA_R2_PATH}" \
             "${input_path}"
-          .build/release/mlxfast-swift calibrate-gpqa-gates \
-            --gpqa "${input_path}" \
-            --weights weights \
-            --tokenizer weights \
-            --output "${output_path}" \
-            --case-count "${MLXFAST_GPQA_CASE_COUNT}" \
-            --max-new-tokens "${MLXFAST_GPQA_MAX_NEW_TOKENS}"
+          if ! .build/release/mlxfast-swift calibrate-gpqa-gates \
+              --gpqa "${input_path}" \
+              --weights weights \
+              --tokenizer weights \
+              --output "${output_path}" \
+              --case-count "${MLXFAST_GPQA_CASE_COUNT}" \
+              --max-new-tokens "${MLXFAST_GPQA_MAX_NEW_TOKENS}" \
+              > "${RUNNER_TEMP}/mlxfast-gpqa-calibration-private.log" 2>&1; then
+            echo "benchmark: hidden GPQA calibration failed" >&2
+            exit 1
+          fi
           jq -e \
             --argjson case_count "${MLXFAST_GPQA_CASE_COUNT}" \
             '
@@ -501,6 +507,23 @@ jobs:
           else
             ./benchmark.sh
           fi
+
+      - name: Measure GPQA TTFT gate
+        if: ${{ !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference }}
+        run: |
+          set -euo pipefail
+          echo "benchmark: measuring hidden GPQA TTFT first-token gate"
+          if ! .build/release/mlxfast-swift measure-gpqa-ttft \
+              --gpqa "${MLXFAST_GPQA_REFERENCE_PATH}" \
+              --weights weights \
+              --tokenizer weights \
+              --output "${MLXFAST_GPQA_TTFT_RESULTS_PATH}" \
+              --case-count "${MLXFAST_GPQA_TTFT_CASE_COUNT}" \
+              > "${RUNNER_TEMP}/mlxfast-gpqa-ttft-private.log" 2>&1; then
+            echo "benchmark: hidden GPQA TTFT first-token gate failed" >&2
+            exit 1
+          fi
+          .github/scripts/patch-gpqa-ttft-metrics.sh
 
       - name: Generate semantic GPQA answers
         if: ${{ !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference }}

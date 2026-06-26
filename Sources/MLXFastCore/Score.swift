@@ -97,6 +97,13 @@ public struct ScoreMetrics: Codable, Equatable {
     public let preflightSeconds: Double
     public let correctnessSeconds: Double
     public let timedBenchmarkSeconds: Double
+    public let gpqaTTFTPassed: Bool
+    public let gpqaTTFTPassCount: Int
+    public let gpqaTTFTCaseCount: Int
+    public let gpqaTTFTSeconds: Double
+    public let gpqaTTFTP50Seconds: Double
+    public let gpqaTTFTMaxSeconds: Double
+    public let gpqaTTFTSource: String
     public let semanticGPQAPassed: Bool
     public let semanticGPQAPassCount: Int
     public let semanticGPQACaseCount: Int
@@ -143,6 +150,13 @@ public struct ScoreMetrics: Codable, Equatable {
         case preflightSeconds = "preflight_seconds"
         case correctnessSeconds = "correctness_seconds"
         case timedBenchmarkSeconds = "timed_benchmark_seconds"
+        case gpqaTTFTPassed = "gpqa_ttft_passed"
+        case gpqaTTFTPassCount = "gpqa_ttft_pass_count"
+        case gpqaTTFTCaseCount = "gpqa_ttft_case_count"
+        case gpqaTTFTSeconds = "gpqa_ttft_seconds"
+        case gpqaTTFTP50Seconds = "gpqa_ttft_p50_seconds"
+        case gpqaTTFTMaxSeconds = "gpqa_ttft_max_seconds"
+        case gpqaTTFTSource = "gpqa_ttft_source"
         case semanticGPQAPassed = "semantic_gpqa_passed"
         case semanticGPQAPassCount = "semantic_gpqa_pass_count"
         case semanticGPQACaseCount = "semantic_gpqa_case_count"
@@ -190,6 +204,13 @@ public struct ScoreMetrics: Codable, Equatable {
         preflightSeconds: Double = 0,
         correctnessSeconds: Double = 0,
         timedBenchmarkSeconds: Double = 0,
+        gpqaTTFTPassed: Bool = false,
+        gpqaTTFTPassCount: Int = 0,
+        gpqaTTFTCaseCount: Int = 0,
+        gpqaTTFTSeconds: Double = 0,
+        gpqaTTFTP50Seconds: Double = 0,
+        gpqaTTFTMaxSeconds: Double = 0,
+        gpqaTTFTSource: String = "",
         semanticGPQAPassed: Bool = false,
         semanticGPQAPassCount: Int = 0,
         semanticGPQACaseCount: Int = 0,
@@ -241,6 +262,13 @@ public struct ScoreMetrics: Codable, Equatable {
         self.preflightSeconds = preflightSeconds
         self.correctnessSeconds = correctnessSeconds
         self.timedBenchmarkSeconds = timedBenchmarkSeconds
+        self.gpqaTTFTPassed = gpqaTTFTPassed
+        self.gpqaTTFTPassCount = gpqaTTFTPassCount
+        self.gpqaTTFTCaseCount = gpqaTTFTCaseCount
+        self.gpqaTTFTSeconds = gpqaTTFTSeconds
+        self.gpqaTTFTP50Seconds = gpqaTTFTP50Seconds
+        self.gpqaTTFTMaxSeconds = gpqaTTFTMaxSeconds
+        self.gpqaTTFTSource = gpqaTTFTSource
         self.semanticGPQAPassed = semanticGPQAPassed
         self.semanticGPQAPassCount = semanticGPQAPassCount
         self.semanticGPQACaseCount = semanticGPQACaseCount
@@ -303,6 +331,13 @@ public struct ScoreMetrics: Codable, Equatable {
         self.preflightSeconds = try container.decodeIfPresent(Double.self, forKey: .preflightSeconds) ?? 0
         self.correctnessSeconds = try container.decodeIfPresent(Double.self, forKey: .correctnessSeconds) ?? 0
         self.timedBenchmarkSeconds = try container.decodeIfPresent(Double.self, forKey: .timedBenchmarkSeconds) ?? 0
+        self.gpqaTTFTPassed = try container.decodeIfPresent(Bool.self, forKey: .gpqaTTFTPassed) ?? false
+        self.gpqaTTFTPassCount = try container.decodeIfPresent(Int.self, forKey: .gpqaTTFTPassCount) ?? 0
+        self.gpqaTTFTCaseCount = try container.decodeIfPresent(Int.self, forKey: .gpqaTTFTCaseCount) ?? 0
+        self.gpqaTTFTSeconds = try container.decodeIfPresent(Double.self, forKey: .gpqaTTFTSeconds) ?? 0
+        self.gpqaTTFTP50Seconds = try container.decodeIfPresent(Double.self, forKey: .gpqaTTFTP50Seconds) ?? 0
+        self.gpqaTTFTMaxSeconds = try container.decodeIfPresent(Double.self, forKey: .gpqaTTFTMaxSeconds) ?? 0
+        self.gpqaTTFTSource = try container.decodeIfPresent(String.self, forKey: .gpqaTTFTSource) ?? ""
         self.semanticGPQAPassed = try container.decodeIfPresent(Bool.self, forKey: .semanticGPQAPassed) ?? false
         self.semanticGPQAPassCount = try container.decodeIfPresent(Int.self, forKey: .semanticGPQAPassCount) ?? 0
         self.semanticGPQACaseCount = try container.decodeIfPresent(Int.self, forKey: .semanticGPQACaseCount) ?? 0
@@ -351,6 +386,13 @@ public struct ScoreMetrics: Codable, Equatable {
         try container.encode(preflightSeconds, forKey: .preflightSeconds)
         try container.encode(correctnessSeconds, forKey: .correctnessSeconds)
         try container.encode(timedBenchmarkSeconds, forKey: .timedBenchmarkSeconds)
+        try container.encode(gpqaTTFTPassed, forKey: .gpqaTTFTPassed)
+        try container.encode(gpqaTTFTPassCount, forKey: .gpqaTTFTPassCount)
+        try container.encode(gpqaTTFTCaseCount, forKey: .gpqaTTFTCaseCount)
+        try container.encode(gpqaTTFTSeconds, forKey: .gpqaTTFTSeconds)
+        try container.encode(gpqaTTFTP50Seconds, forKey: .gpqaTTFTP50Seconds)
+        try container.encode(gpqaTTFTMaxSeconds, forKey: .gpqaTTFTMaxSeconds)
+        try container.encode(gpqaTTFTSource, forKey: .gpqaTTFTSource)
         try container.encode(semanticGPQAPassed, forKey: .semanticGPQAPassed)
         try container.encode(semanticGPQAPassCount, forKey: .semanticGPQAPassCount)
         try container.encode(semanticGPQACaseCount, forKey: .semanticGPQACaseCount)

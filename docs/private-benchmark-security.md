@@ -47,9 +47,17 @@ captured from the official reference model on the official runner. The GPQA
 gate checks one generated token per case, which avoids cross-machine drift after
 the first answer token while still checking behavior across all 9 hidden
 questions. Longer calibrated reference sequences may be kept in private R2; the
-workflow uses their stable prefix. Do not call an external LLM judge from the
-benchmark runner; that would add a network dependency, create
-prompt-exfiltration risk, and make official scores less reproducible.
+workflow uses their stable prefix. After the timed benchmark, the workflow also
+measures hidden GPQA TTFT from prompt prefill through the first greedy answer
+token and fails the run if that first token is not accepted. TTFT result files
+are aggregate-only; they do not contain prompt text, expected token IDs,
+generated token IDs, accepted token sets, or per-case prompt lengths.
+
+The semantic GPQA judge runs after candidate answers are written into the
+private runner directory. Only aggregate semantic pass counts and the judge
+model name are patched into `score.json`; prompts, references, candidate
+answers, and judge transcripts remain private and are covered by artifact
+deny-list checks.
 
 The benchmark workflow also verifies at runtime that it is executing from the
 configured trusted workflow ref. In production, that trusted ref should be:

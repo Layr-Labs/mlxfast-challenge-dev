@@ -43,7 +43,7 @@ check_file() {
 
   base="$(basename "${path}")"
   case "${base}" in
-    *correctness_golden*.json|*golden_prompt*.json|*golden_prompt*.txt|*private_prompts*.json|*gpqa_reference_cases*.json|*.safetensors|*.bin|*.gguf)
+    *correctness_golden*.json|*golden_prompt*.json|*golden_prompt*.txt|*private_prompts*.json|*gpqa_reference_cases*.json|*gpqa_ttft_results*.json|*.safetensors|*.bin|*.gguf)
       fail "${path}" "private prompt, golden, or model files must not be uploaded or cached"
       ;;
   esac

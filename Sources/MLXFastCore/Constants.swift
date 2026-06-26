@@ -37,6 +37,7 @@ public enum MLXFastConstants {
     public static let semanticGPQACaseCount = 9
     public static let semanticGPQAMaxNewTokens = 10
     public static let semanticGPQAMinPassCount = 8
+    public static let ttftGPQACaseCount = 9
     public static let benchmarkPrefillPromptTokens = 512
     public static let benchmarkDecodeSteps = 256
     public static let quickBenchmarkDecodeSteps = 64

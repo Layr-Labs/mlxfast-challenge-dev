@@ -24,6 +24,7 @@ require_file "${GOLDEN_PATH}.bytes"
 : "${MLXFAST_EXPECTED_CORRECTNESS_STEPS:?MLXFAST_EXPECTED_CORRECTNESS_STEPS is required}"
 : "${MLXFAST_EXPECTED_CORRECTNESS_CASES:?MLXFAST_EXPECTED_CORRECTNESS_CASES is required}"
 : "${MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS:?MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS is required}"
+: "${MLXFAST_GPQA_TTFT_CASE_COUNT:?MLXFAST_GPQA_TTFT_CASE_COUNT is required}"
 : "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT:?MLXFAST_SEMANTIC_GPQA_CASE_COUNT is required}"
 : "${MLXFAST_SEMANTIC_GPQA_MIN_PASS:?MLXFAST_SEMANTIC_GPQA_MIN_PASS is required}"
 
@@ -46,6 +47,7 @@ jq -e \
   --arg golden_hash "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}" \
   --argjson checked_steps "${MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS}" \
   --argjson correctness_cases "${MLXFAST_EXPECTED_CORRECTNESS_CASES}" \
+  --argjson ttft_cases "${MLXFAST_GPQA_TTFT_CASE_COUNT}" \
   --argjson semantic_cases "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT}" \
   --argjson semantic_min_pass "${MLXFAST_SEMANTIC_GPQA_MIN_PASS}" \
   '
@@ -79,6 +81,13 @@ jq -e \
     "first_failing_layer",
     "first_failing_step",
     "golden_hash",
+    "gpqa_ttft_case_count",
+    "gpqa_ttft_max_seconds",
+    "gpqa_ttft_p50_seconds",
+    "gpqa_ttft_pass_count",
+    "gpqa_ttft_passed",
+    "gpqa_ttft_seconds",
+    "gpqa_ttft_source",
     "harness_hash",
     "max_abs_diff",
     "num_layers",
@@ -105,6 +114,16 @@ jq -e \
   and (.metrics.passed_correctness == true)
   and (.metrics.checked_steps == $checked_steps)
   and (.metrics.case_count == $correctness_cases)
+  and (.metrics.gpqa_ttft_passed == true)
+  and (.metrics.gpqa_ttft_case_count == $ttft_cases)
+  and (.metrics.gpqa_ttft_pass_count == .metrics.gpqa_ttft_case_count)
+  and (.metrics.gpqa_ttft_seconds | type == "number")
+  and (.metrics.gpqa_ttft_seconds > 0)
+  and (.metrics.gpqa_ttft_p50_seconds | type == "number")
+  and (.metrics.gpqa_ttft_p50_seconds > 0)
+  and (.metrics.gpqa_ttft_max_seconds | type == "number")
+  and (.metrics.gpqa_ttft_max_seconds >= .metrics.gpqa_ttft_p50_seconds)
+  and (.metrics.gpqa_ttft_source == "hidden_gpqa_first_token")
   and (.metrics.semantic_gpqa_passed == true)
   and (.metrics.semantic_gpqa_case_count == $semantic_cases)
   and (.metrics.semantic_gpqa_pass_count | type == "number")

@@ -64,6 +64,13 @@ func writeScorePayloadEmitsDarkbloomShape() throws {
     #expect(decoded.metrics.preflightSeconds == 0)
     #expect(decoded.metrics.correctnessSeconds == 0)
     #expect(decoded.metrics.timedBenchmarkSeconds == 0)
+    #expect(decoded.metrics.gpqaTTFTPassed == false)
+    #expect(decoded.metrics.gpqaTTFTPassCount == 0)
+    #expect(decoded.metrics.gpqaTTFTCaseCount == 0)
+    #expect(decoded.metrics.gpqaTTFTSeconds == 0)
+    #expect(decoded.metrics.gpqaTTFTP50Seconds == 0)
+    #expect(decoded.metrics.gpqaTTFTMaxSeconds == 0)
+    #expect(decoded.metrics.gpqaTTFTSource == "")
     #expect(decoded.metrics.semanticGPQAPassed == false)
     #expect(decoded.metrics.semanticGPQAPassCount == 0)
     #expect(decoded.metrics.semanticGPQACaseCount == 0)
@@ -97,6 +104,13 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
                 preflightSeconds: 1,
                 correctnessSeconds: 2,
                 timedBenchmarkSeconds: 8,
+                gpqaTTFTPassed: true,
+                gpqaTTFTPassCount: 9,
+                gpqaTTFTCaseCount: 9,
+                gpqaTTFTSeconds: 72.5,
+                gpqaTTFTP50Seconds: 72,
+                gpqaTTFTMaxSeconds: 75,
+                gpqaTTFTSource: "hidden_gpqa_first_token",
                 semanticGPQAPassed: true,
                 semanticGPQAPassCount: 8,
                 semanticGPQACaseCount: 9,
@@ -164,6 +178,13 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(raw.contains("\"preflight_seconds\" : 1"))
     #expect(raw.contains("\"correctness_seconds\" : 2"))
     #expect(raw.contains("\"timed_benchmark_seconds\" : 8"))
+    #expect(raw.contains("\"gpqa_ttft_passed\" : true"))
+    #expect(raw.contains("\"gpqa_ttft_pass_count\" : 9"))
+    #expect(raw.contains("\"gpqa_ttft_case_count\" : 9"))
+    #expect(raw.contains("\"gpqa_ttft_seconds\" : 72.5"))
+    #expect(raw.contains("\"gpqa_ttft_p50_seconds\" : 72"))
+    #expect(raw.contains("\"gpqa_ttft_max_seconds\" : 75"))
+    #expect(raw.contains("\"gpqa_ttft_source\" : \"hidden_gpqa_first_token\""))
     #expect(raw.contains("\"semantic_gpqa_passed\" : true"))
     #expect(raw.contains("\"semantic_gpqa_pass_count\" : 8"))
     #expect(raw.contains("\"semantic_gpqa_case_count\" : 9"))
@@ -195,6 +216,13 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(decoded.metrics.preflightSeconds == 1)
     #expect(decoded.metrics.correctnessSeconds == 2)
     #expect(decoded.metrics.timedBenchmarkSeconds == 8)
+    #expect(decoded.metrics.gpqaTTFTPassed == true)
+    #expect(decoded.metrics.gpqaTTFTPassCount == 9)
+    #expect(decoded.metrics.gpqaTTFTCaseCount == 9)
+    #expect(decoded.metrics.gpqaTTFTSeconds == 72.5)
+    #expect(decoded.metrics.gpqaTTFTP50Seconds == 72)
+    #expect(decoded.metrics.gpqaTTFTMaxSeconds == 75)
+    #expect(decoded.metrics.gpqaTTFTSource == "hidden_gpqa_first_token")
     #expect(decoded.metrics.semanticGPQAPassed == true)
     #expect(decoded.metrics.semanticGPQAPassCount == 8)
     #expect(decoded.metrics.semanticGPQACaseCount == 9)
@@ -254,6 +282,13 @@ func scoreMetricsDecodeOlderPayloadWithoutWeightsIntegrityFields() throws {
     #expect(decoded.metrics.preflightSeconds == 0)
     #expect(decoded.metrics.correctnessSeconds == 0)
     #expect(decoded.metrics.timedBenchmarkSeconds == 0)
+    #expect(decoded.metrics.gpqaTTFTPassed == false)
+    #expect(decoded.metrics.gpqaTTFTPassCount == 0)
+    #expect(decoded.metrics.gpqaTTFTCaseCount == 0)
+    #expect(decoded.metrics.gpqaTTFTSeconds == 0)
+    #expect(decoded.metrics.gpqaTTFTP50Seconds == 0)
+    #expect(decoded.metrics.gpqaTTFTMaxSeconds == 0)
+    #expect(decoded.metrics.gpqaTTFTSource == "")
     #expect(decoded.metrics.semanticGPQAPassed == false)
     #expect(decoded.metrics.semanticGPQAPassCount == 0)
     #expect(decoded.metrics.semanticGPQACaseCount == 0)
