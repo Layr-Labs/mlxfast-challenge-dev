@@ -103,9 +103,8 @@ Calibration is cumulative: rerunning it appends and deduplicates the
 runner-observed token sequence instead of replacing older accepted sequences.
 The official workflow checks the first generated GPQA answer token for each
 case, using the stable prefix of any longer calibrated reference sequence.
-After the timed benchmark, it also measures hidden GPQA TTFT by timing prompt
-prefill through the first greedy answer token, then rejects the run unless that
-first token is in the same calibrated accepted set. The uploaded score records
+During that hidden behavior correctness pass, it also records TTFT by timing
+prompt prefill through the first greedy answer token. The uploaded score records
 only aggregate TTFT counts and timings; generated first-token IDs, accepted
 token IDs, prompts, and answers stay out of GitHub logs and artifacts.
 After timing, the workflow also generates short hidden GPQA answers and sends

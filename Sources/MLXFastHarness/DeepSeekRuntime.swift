@@ -49,23 +49,6 @@ public struct GreedyGenerationOptions: Equatable {
     }
 }
 
-public struct FirstTokenTimingOptions: Equatable {
-    public let weightsPath: String
-    public let promptTokenSets: [[Int]]
-
-    public init(weightsPath: String, promptTokenSets: [[Int]]) {
-        self.weightsPath = weightsPath
-        self.promptTokenSets = promptTokenSets
-    }
-}
-
-public struct FirstTokenTimingResult: Equatable {
-    public let token: Int
-    public let seconds: Double
-    public let peakRamGB: Double
-    public let expertStats: ExpertStreamingStats
-}
-
 public struct CorrectnessTraceLogit: Codable, Equatable {
     public let token: Int
     public let logit: Double
@@ -323,90 +306,6 @@ public enum DeepSeekRuntime {
         )
     }
 
-    public static func measureFirstTokenTimings(
-        _ options: FirstTokenTimingOptions,
-        worker workerOptions: RuntimeWorkerOptions?,
-        progress: ((Int, Int) -> Void)? = nil
-    ) throws -> [FirstTokenTimingResult] {
-        guard !options.promptTokenSets.isEmpty else {
-            throw MLXFastError.invalidInput("first-token timing requires at least one prompt")
-        }
-
-        if let workerOptions {
-            let worker = try RuntimeWorkerClient(options: workerOptions, weightsPath: options.weightsPath)
-            defer {
-                worker.close()
-            }
-            var results: [FirstTokenTimingResult] = []
-            results.reserveCapacity(options.promptTokenSets.count)
-            for (index, promptTokens) in options.promptTokenSets.enumerated() {
-                guard !promptTokens.isEmpty else {
-                    throw MLXFastError.invalidInput("first-token timing prompt \(index + 1) must not be empty")
-                }
-                let response = try worker.beginDecode(seedTokens: promptTokens)
-                guard let token = response.seedToken, let seconds = response.seconds else {
-                    throw MLXFastError.invalidInput("runtime worker decode_begin response missing seed token or seconds")
-                }
-                results.append(
-                    FirstTokenTimingResult(
-                        token: token,
-                        seconds: seconds,
-                        peakRamGB: response.peakRamGB ?? 0,
-                        expertStats: response.expertStats ?? .zero
-                    )
-                )
-                progress?(index + 1, options.promptTokenSets.count)
-            }
-            return results
-        }
-
-        let config = try DeepSeekConfig.load(from: options.weightsPath)
-        let loader = try DeepSeekWeightLoader(
-            weightsPath: options.weightsPath,
-            expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: true)
-        )
-        let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
-        var results: [FirstTokenTimingResult] = []
-        results.reserveCapacity(options.promptTokenSets.count)
-        for (index, promptTokens) in options.promptTokenSets.enumerated() {
-            guard !promptTokens.isEmpty else {
-                throw MLXFastError.invalidInput("first-token timing prompt \(index + 1) must not be empty")
-            }
-            let warmupCache = DeepSeekModelCache(config: weightCache.config)
-            let warmupLogits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray(promptTokens),
-                weightCache: weightCache,
-                cache: warmupCache,
-                positionOffset: 0
-            )
-            _ = try DeepSeekCorrectness.greedyToken(from: warmupLogits)
-            Memory.clearCache()
-
-            let cache = DeepSeekModelCache(config: weightCache.config)
-            let start = DispatchTime.now().uptimeNanoseconds
-            let logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray(promptTokens),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: 0
-            )
-            let token = try DeepSeekCorrectness.greedyToken(from: logits)
-            cache.materializeCachedState()
-            let elapsed = secondsSince(start)
-            results.append(
-                FirstTokenTimingResult(
-                    token: token,
-                    seconds: elapsed,
-                    peakRamGB: currentResidentMemoryGB(),
-                    expertStats: expertStats(from: weightCache)
-                )
-            )
-            progress?(index + 1, options.promptTokenSets.count)
-            Memory.clearCache()
-        }
-        return results
-    }
-
     public static func runCorrectness(
         _ options: CorrectnessOptions,
         worker: RuntimeWorkerOptions? = nil
@@ -592,6 +491,7 @@ public enum DeepSeekRuntime {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing prompt_tokens")
             }
             let cache = DeepSeekModelCache(config: weightCache.config)
+            let start = DispatchTime.now().uptimeNanoseconds
             let logits = try DeepSeekModel.logits(
                 inputIDs: inputIDsArray(promptTokens),
                 weightCache: weightCache,
@@ -602,12 +502,14 @@ public enum DeepSeekRuntime {
             state.correctnessCache = cache
             state.correctnessPromptTokenCount = promptTokens.count
             state.correctnessStep = 0
+            let elapsed = secondsSince(start)
             return RuntimeWorkerResponse(
                 id: request.id,
                 nonce: sessionNonce,
                 ok: true,
                 token: token,
                 topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
+                seconds: elapsed,
                 expertStats: expertStats(from: weightCache),
                 peakRamGB: currentResidentMemoryGB()
             )
@@ -989,7 +891,8 @@ public enum DeepSeekRuntime {
                 correctness: correctness,
                 expertStats: expertStats,
                 bandwidthSource: decode.bandwidthSource,
-                weightsDigest: transformedWeightsDigest
+                weightsDigest: transformedWeightsDigest,
+                gpqaTTFT: .zero
             )
         } catch let mismatch as BenchmarkTokenMismatchError {
             return makeFailedScore(
@@ -1140,11 +1043,28 @@ public enum DeepSeekRuntime {
                     + "checked_steps=\(correctness.checkedSteps) "
                     + "seconds=\(formatSeconds(correctnessSeconds))"
             )
+            if correctnessResult.gpqaTTFT.caseCount > 0 {
+                let gpqaTTFT = correctnessResult.gpqaTTFT
+                progress(
+                    "gpqa ttft complete cases=\(gpqaTTFT.caseCount) "
+                        + "pass_count=\(gpqaTTFT.passCount) "
+                        + "mean_seconds=\(formatSeconds(gpqaTTFT.meanSeconds)) "
+                        + "p50_seconds=\(formatSeconds(gpqaTTFT.p50Seconds)) "
+                        + "max_seconds=\(formatSeconds(gpqaTTFT.maxSeconds))"
+                )
+            }
             guard correctness.passed else {
                 return makeFailedScore(
                     error: correctness.error.isEmpty ? "correctness gate failed" : correctness.error,
                     correctness: correctness,
                     passedCorrectness: false
+                )
+            }
+            guard correctnessResult.gpqaTTFT.caseCount == 0 || correctnessResult.gpqaTTFT.passed else {
+                return makeFailedScore(
+                    error: "hidden GPQA TTFT gate failed",
+                    correctness: correctness,
+                    passedCorrectness: true
                 )
             }
 
@@ -1233,7 +1153,8 @@ public enum DeepSeekRuntime {
                 correctness: correctness,
                 expertStats: lastExpertStats,
                 bandwidthSource: decode.bandwidthSource,
-                weightsDigest: transformedWeightsDigest
+                weightsDigest: transformedWeightsDigest,
+                gpqaTTFT: correctnessResult.gpqaTTFT
             )
         } catch let mismatch as BenchmarkTokenMismatchError {
             return makeFailedScore(
@@ -1258,6 +1179,42 @@ public enum DeepSeekRuntime {
         let report: CorrectnessReport
         let expertStats: ExpertStreamingStats
         let peakRamGB: Double
+        let gpqaTTFT: GPQATTFTSummary
+    }
+
+    private struct GPQATTFTSummary {
+        static let zero = GPQATTFTSummary(passCount: 0, caseCount: 0, seconds: [])
+
+        let passCount: Int
+        let caseCount: Int
+        let seconds: [Double]
+
+        var passed: Bool {
+            caseCount > 0 && passCount == caseCount && seconds.count == caseCount
+        }
+
+        var source: String {
+            caseCount > 0 ? "hidden_gpqa_first_token" : ""
+        }
+
+        var meanSeconds: Double {
+            guard !seconds.isEmpty else {
+                return 0
+            }
+            return seconds.reduce(0, +) / Double(seconds.count)
+        }
+
+        var p50Seconds: Double {
+            guard !seconds.isEmpty else {
+                return 0
+            }
+            let sortedSeconds = seconds.sorted()
+            return sortedSeconds[sortedSeconds.count / 2]
+        }
+
+        var maxSeconds: Double {
+            seconds.max() ?? 0
+        }
     }
 
     private static func runLayeredCorrectness(
@@ -1427,12 +1384,20 @@ public enum DeepSeekRuntime {
         var currentCase: String?
         var lastExpertStats = ExpertStreamingStats.zero
         var peakRamGB = 0.0
+        var gpqaTTFTPassCount = 0
+        var gpqaTTFTCaseCount = 0
+        var gpqaTTFTSeconds: [Double] = []
 
         func result(report: CorrectnessReport) -> WorkerLayeredCorrectnessResult {
             WorkerLayeredCorrectnessResult(
                 report: report,
                 expertStats: lastExpertStats,
-                peakRamGB: peakRamGB
+                peakRamGB: peakRamGB,
+                gpqaTTFT: GPQATTFTSummary(
+                    passCount: gpqaTTFTPassCount,
+                    caseCount: gpqaTTFTCaseCount,
+                    seconds: gpqaTTFTSeconds
+                )
             )
         }
 
@@ -1535,6 +1500,13 @@ public enum DeepSeekRuntime {
                 let check = try compareBehaviorWithWorker(testCase: behavior, worker: worker)
                 lastExpertStats = check.expertStats
                 peakRamGB = max(peakRamGB, check.peakRamGB)
+                if behavior.maxNewTokens == 1 {
+                    gpqaTTFTCaseCount += 1
+                    if check.comparison.passed, let ttftSeconds = check.ttftSeconds, ttftSeconds > 0 {
+                        gpqaTTFTPassCount += 1
+                        gpqaTTFTSeconds.append(ttftSeconds)
+                    }
+                }
                 if !check.comparison.passed {
                     progress?("correctness behavior \(caseLabel) failed step=\(check.comparison.firstFailingStep ?? -1)")
                     return failure(
@@ -2147,7 +2119,8 @@ public enum DeepSeekRuntime {
         correctness: CorrectnessReport,
         expertStats: ExpertStreamingStats,
         bandwidthSource: String,
-        weightsDigest: DirectoryDigest?
+        weightsDigest: DirectoryDigest?,
+        gpqaTTFT: GPQATTFTSummary
     ) -> ScorePayload {
         ScorePayload(
             score: score,
@@ -2161,6 +2134,13 @@ public enum DeepSeekRuntime {
                 preflightSeconds: preflightSeconds,
                 correctnessSeconds: correctnessSeconds,
                 timedBenchmarkSeconds: timedBenchmarkSeconds,
+                gpqaTTFTPassed: gpqaTTFT.passed,
+                gpqaTTFTPassCount: gpqaTTFT.passCount,
+                gpqaTTFTCaseCount: gpqaTTFT.caseCount,
+                gpqaTTFTSeconds: gpqaTTFT.meanSeconds,
+                gpqaTTFTP50Seconds: gpqaTTFT.p50Seconds,
+                gpqaTTFTMaxSeconds: gpqaTTFT.maxSeconds,
+                gpqaTTFTSource: gpqaTTFT.source,
                 processResidentMemoryGB: currentResidentMemoryGB(),
                 passedCorrectness: true,
                 numLayers: numLayers,
@@ -2556,6 +2536,19 @@ public enum DeepSeekRuntime {
         let comparison: CorrectnessTokenComparison
         let expertStats: ExpertStreamingStats
         let peakRamGB: Double
+        let ttftSeconds: Double?
+
+        init(
+            comparison: CorrectnessTokenComparison,
+            expertStats: ExpertStreamingStats,
+            peakRamGB: Double,
+            ttftSeconds: Double? = nil
+        ) {
+            self.comparison = comparison
+            self.expertStats = expertStats
+            self.peakRamGB = peakRamGB
+            self.ttftSeconds = ttftSeconds
+        }
     }
 
     private static func compareTeacherForcedWithWorker(
@@ -2697,7 +2690,8 @@ public enum DeepSeekRuntime {
                     topLogits: topLogits
                 ),
                 expertStats: response.expertStats ?? .zero,
-                peakRamGB: response.peakRamGB ?? 0
+                peakRamGB: response.peakRamGB ?? 0,
+                ttftSeconds: response.seconds
             )
         }
 
@@ -3565,7 +3559,6 @@ private final class RuntimeWorkerClient {
             "MLXFAST_CORRECTNESS_GOLDEN_URL",
             "MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER",
             "MLXFAST_GPQA_REFERENCE_PATH",
-            "MLXFAST_GPQA_TTFT_RESULTS_PATH",
             "MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH",
             "MLXFAST_SEMANTIC_GPQA_RESULTS_PATH",
             "MLXFAST_SEMANTIC_GPQA_MODEL",

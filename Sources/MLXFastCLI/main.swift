@@ -46,9 +46,6 @@ private enum MLXFastCLI {
             case "generate-gpqa-answers":
                 try runGenerateGPQAAnswers(options)
                 return 0
-            case "measure-gpqa-ttft":
-                try runMeasureGPQATTFT(options)
-                return 0
             case "runtime-worker":
                 try runRuntimeWorker(options)
                 return 0
@@ -680,137 +677,6 @@ private enum MLXFastCLI {
         print("generated semantic GPQA answer cases=\(answers.count) output=\(outputPath)")
     }
 
-    private static func runMeasureGPQATTFT(_ options: ParsedOptions) throws {
-        try options.validate(
-            valueOptions: ["--gpqa", "--weights", "--tokenizer", "--output", "--case-count"]
-        )
-        let gpqaPath = options.value(
-            for: "--gpqa",
-            default: environmentValue("MLXFAST_GPQA_REFERENCE_PATH", fallback: "")
-        )
-        guard !gpqaPath.isEmpty else {
-            throw MLXFastError.invalidInput("measure-gpqa-ttft requires --gpqa or MLXFAST_GPQA_REFERENCE_PATH")
-        }
-        let weightsPath = options.value(
-            for: "--weights",
-            default: environmentValue("MLXFAST_WEIGHTS_PATH", fallback: MLXFastConstants.defaultWeightsPath)
-        )
-        let tokenizerPath = options.value(
-            for: "--tokenizer",
-            default: environmentValue("MLXFAST_TOKENIZER_PATH", fallback: weightsPath)
-        )
-        let outputPath = options.value(
-            for: "--output",
-            default: environmentValue("MLXFAST_GPQA_TTFT_RESULTS_PATH", fallback: "")
-        )
-        guard !outputPath.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "measure-gpqa-ttft requires --output or MLXFAST_GPQA_TTFT_RESULTS_PATH"
-            )
-        }
-        try requirePrivateOutputPath(outputPath, description: "GPQA TTFT result output")
-        let caseCount = try parsePositiveInt(
-            options.value(for: "--case-count", default: "\(MLXFastConstants.ttftGPQACaseCount)"),
-            optionName: "--case-count"
-        )
-
-        try requireFile(gpqaPath, description: "GPQA reference cases file")
-        try requireFile(
-            URL(fileURLWithPath: tokenizerPath).appendingPathComponent("tokenizer.json").path,
-            description: "tokenizer.json"
-        )
-        try requireFile(
-            URL(fileURLWithPath: tokenizerPath).appendingPathComponent("tokenizer_config.json").path,
-            description: "tokenizer_config.json"
-        )
-        try requireFile(
-            URL(fileURLWithPath: weightsPath).appendingPathComponent("config.json").path,
-            description: "weights config.json"
-        )
-
-        let tokenizer = try loadLocalTokenizer(at: tokenizerPath)
-        let data = try Data(contentsOf: URL(fileURLWithPath: gpqaPath))
-        let gpqa = try JSONDecoder().decode(GPQAReferenceDocument.self, from: data)
-        let worker = try runtimeWorkerOptions(blockedGoldenPath: gpqaPath)
-
-        var selectedPrompts: [[Int]] = []
-        var acceptedFirstTokenSets: [Set<Int>] = []
-        var skippedOverBudget = 0
-        for testCase in gpqa.cases {
-            guard selectedPrompts.count < caseCount else {
-                break
-            }
-            let promptTokens = tokenizer.encode(text: testCase.prompt, addSpecialTokens: false)
-            guard !promptTokens.isEmpty else {
-                throw MLXFastError.invalidInput("\(testCase.identifier).prompt tokenized to zero tokens")
-            }
-            guard promptTokens.count <= MLXFastConstants.correctnessMaxBehaviorPromptTokens else {
-                skippedOverBudget += 1
-                continue
-            }
-            let acceptedFirstTokens = Set(
-                try acceptedReferenceTokenSequences(
-                    testCase: testCase,
-                    tokenizer: tokenizer,
-                    maxNewTokens: 1,
-                    caseName: testCase.identifier
-                ).compactMap(\.first)
-            )
-            guard !acceptedFirstTokens.isEmpty else {
-                throw MLXFastError.invalidInput("\(testCase.identifier) produced no accepted first tokens")
-            }
-            selectedPrompts.append(promptTokens)
-            acceptedFirstTokenSets.append(acceptedFirstTokens)
-        }
-        guard selectedPrompts.count == caseCount else {
-            throw MLXFastError.invalidInput(
-                "GPQA reference produced \(selectedPrompts.count) token-budget-valid TTFT cases; "
-                    + "need \(caseCount); skipped_over_budget=\(skippedOverBudget)"
-            )
-        }
-
-        let timingResults = try DeepSeekRuntime.measureFirstTokenTimings(
-            FirstTokenTimingOptions(weightsPath: weightsPath, promptTokenSets: selectedPrompts),
-            worker: worker,
-            progress: { completed, total in
-                fputs("measure-gpqa-ttft: measured \(completed)/\(total) hidden cases\n", stderr)
-            }
-        )
-        let passCount = timingResults.enumerated().filter { index, result in
-            acceptedFirstTokenSets[index].contains(result.token)
-        }.count
-        let seconds = timingResults.map(\.seconds)
-        let document = GPQATTFTResultDocument(
-            version: 1,
-            source: "hidden_gpqa_first_token",
-            passed: passCount == timingResults.count,
-            passCount: passCount,
-            caseCount: timingResults.count,
-            meanSeconds: mean(seconds),
-            p50Seconds: percentile50(seconds),
-            maxSeconds: seconds.max() ?? 0
-        )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        let outputURL = URL(fileURLWithPath: outputPath)
-        try FileManager.default.createDirectory(
-            at: outputURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try encoder.encode(document).write(to: outputURL, options: [.atomic])
-
-        guard document.passed else {
-            throw MLXFastError.invalidInput(
-                "GPQA TTFT first-token gate failed pass_count=\(passCount)/\(timingResults.count)"
-            )
-        }
-        print(
-            "measured GPQA TTFT cases=\(timingResults.count) "
-                + "mean_seconds=\(document.meanSeconds) "
-                + "output=\(outputPath)"
-        )
-    }
-
     private static func jsonTokenSequences(from value: Any?, caseName: String) throws -> [[Int]] {
         guard let value else {
             return []
@@ -1025,21 +891,6 @@ private enum MLXFastCLI {
             }
             return lhs.lexicographicallyPrecedes(rhs)
         }
-    }
-
-    private static func mean(_ values: [Double]) -> Double {
-        guard !values.isEmpty else {
-            return 0
-        }
-        return values.reduce(0, +) / Double(values.count)
-    }
-
-    private static func percentile50(_ values: [Double]) -> Double {
-        guard !values.isEmpty else {
-            return 0
-        }
-        let sortedValues = values.sorted()
-        return sortedValues[sortedValues.count / 2]
     }
 
     private final class AsyncResultBox<T>: @unchecked Sendable {
@@ -1462,7 +1313,6 @@ private enum MLXFastCLI {
               mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
               mlxfast-swift calibrate-gpqa-gates --gpqa PATH [--weights PATH] [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
-              mlxfast-swift measure-gpqa-ttft --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N]
               mlxfast-swift checkpoint-shards --index PATH
               mlxfast-swift login [--api-key KEY | KEY] [--api URL] [--no-verify]
               mlxfast-swift config
@@ -1806,28 +1656,6 @@ private struct SemanticGPQAAnswerCase: Encodable {
         case candidateAnswer = "candidate_answer"
         case candidateTokens = "candidate_tokens"
         case maxNewTokens = "max_new_tokens"
-    }
-}
-
-private struct GPQATTFTResultDocument: Encodable {
-    let version: Int
-    let source: String
-    let passed: Bool
-    let passCount: Int
-    let caseCount: Int
-    let meanSeconds: Double
-    let p50Seconds: Double
-    let maxSeconds: Double
-
-    enum CodingKeys: String, CodingKey {
-        case version
-        case source
-        case passed
-        case passCount = "pass_count"
-        case caseCount = "case_count"
-        case meanSeconds = "mean_seconds"
-        case p50Seconds = "p50_seconds"
-        case maxSeconds = "max_seconds"
     }
 }
 

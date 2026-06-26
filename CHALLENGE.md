@@ -174,9 +174,10 @@ semantically equivalent to the private reference answer. That semantic gate is
 pass/fail only and does not affect the timing score. The uploaded score records
 only aggregate semantic counts and the judge model name.
 
-The same hidden GPQA cases are also used for a TTFT guardrail: the workflow
-times prompt prefill through the first greedy answer token and verifies that
-the first token is accepted for that case. The uploaded score records only
+The same hidden GPQA cases are also used for a TTFT guardrail: during the
+hidden behavior correctness pass, the workflow times prompt prefill through
+the first greedy answer token and verifies that the first token is accepted for
+that case. The uploaded score records only
 aggregate TTFT pass counts and timing statistics; first-token values and
 accepted token sets are not logged or artifacted.
 
