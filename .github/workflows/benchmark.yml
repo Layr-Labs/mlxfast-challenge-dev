@@ -66,7 +66,7 @@ permissions:
 
 jobs:
   benchmark:
-    runs-on: blacksmith-12vcpu-macos-26
+    runs-on: tenki-standard-large-plus-16c-32g
     timeout-minutes: 720
     environment: benchmark-private-prompts
     env:

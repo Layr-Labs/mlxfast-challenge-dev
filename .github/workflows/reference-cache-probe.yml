@@ -55,7 +55,7 @@ permissions:
 
 jobs:
   probe:
-    runs-on: blacksmith-12vcpu-macos-26
+    runs-on: tenki-standard-large-plus-16c-32g
     timeout-minutes: 360
     env:
       MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
