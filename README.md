@@ -110,7 +110,7 @@ only aggregate TTFT counts and timings; generated first-token IDs, accepted
 token IDs, prompts, and answers stay out of GitHub logs and artifacts.
 After timing, the workflow also generates short hidden GPQA answers and sends
 only those private answer bundles to Claude for a semantic pass/fail judge. This
-requires the `ANTHROPIC_API_KEY` repository secret. The score artifact records
+requires the `ORG_ANTHROPIC_API_KEY` repository secret. The score artifact records
 only aggregate semantic counts and the judge model name; prompts, references,
 candidate answers, and judge text stay in the private runner directory.
 Because the one-token GPQA behavior gate is exact-token based, calibrate that

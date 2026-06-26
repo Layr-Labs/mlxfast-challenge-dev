@@ -101,7 +101,7 @@ jobs:
       MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json
       MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
-      MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ANTHROPIC_API_KEY != '' && '1' || '0' }}
+      MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}
       MLXFAST_RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
       MLXFAST_PRESERVE_GOLDEN_ONLY: ${{ inputs.preserve_golden_only && '1' || '0' }}
       MLXFAST_CALIBRATE_GPQA_REFERENCE: ${{ inputs.calibrate_gpqa_reference && '1' || '0' }}
@@ -198,7 +198,7 @@ jobs:
             exit 1
           fi
           if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" && "${MLXFAST_PRESERVE_GOLDEN_ONLY}" != "1" && "${MLXFAST_CALIBRATE_GPQA_REFERENCE}" != "1" && "${MLXFAST_ANTHROPIC_PRESENT}" != "1" ]]; then
-            echo "benchmark: semantic GPQA gate requires ANTHROPIC_API_KEY" >&2
+            echo "benchmark: semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
             exit 1
           fi
 
@@ -545,11 +545,11 @@ jobs:
       - name: Semantic GPQA gate
         if: ${{ !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference }}
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
           if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-            echo "benchmark: semantic GPQA gate requires ANTHROPIC_API_KEY" >&2
+            echo "benchmark: semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
             exit 1
           fi
           .github/scripts/run-semantic-gpqa-gate.sh
