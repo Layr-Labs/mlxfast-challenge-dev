@@ -211,6 +211,17 @@ score = decode_speedup^0.75 * prefill_speedup^0.25
 Higher is better. A baseline implementation on the official runner scores about
 `1.0`. Decode is weighted more heavily because it dominates interactive
 generation, while prefill still contributes to the ranked score.
+The official run also enforces component floors:
+
+```text
+decode_speedup >= 0.95
+prefill_speedup >= 0.95
+```
+
+With the current Blacksmith M4 baseline, those floors allow at most
+`3.177180971604` seconds/token for decode and `0.149183255724` seconds/token for
+prefill. A run below either floor fails eligibility even if the weighted score
+would otherwise be above baseline.
 
 `bandwidth_GB_per_token` is derived from measured expert-streaming file bytes
 during the decode window and is reported with

@@ -46,6 +46,22 @@ public enum BenchmarkScore {
         return pow(decodeSpeedup, decodeWeight / totalWeight)
             * pow(prefillSpeedup, prefillWeight / totalWeight)
     }
+
+    public static func passesSpeedupFloors(
+        decodeSpeedup: Double,
+        prefillSpeedup: Double,
+        decodeFloor: Double = MLXFastConstants.scoreDecodeSpeedupFloor,
+        prefillFloor: Double = MLXFastConstants.scorePrefillSpeedupFloor
+    ) -> Bool {
+        guard decodeSpeedup.isFinite,
+              prefillSpeedup.isFinite,
+              decodeFloor.isFinite,
+              prefillFloor.isFinite
+        else {
+            return false
+        }
+        return decodeSpeedup >= decodeFloor && prefillSpeedup >= prefillFloor
+    }
 }
 
 public struct ScorePayload: Codable, Equatable {
@@ -93,6 +109,10 @@ public struct ScoreMetrics: Codable, Equatable {
     public let baselinePrefillSecondsPerToken: Double
     public let decodeSpeedup: Double
     public let prefillSpeedup: Double
+    public let decodeSpeedupFloor: Double
+    public let prefillSpeedupFloor: Double
+    public let passedDecodeSpeedupFloor: Bool
+    public let passedPrefillSpeedupFloor: Bool
     public let benchmarkWallSeconds: Double
     public let preflightSeconds: Double
     public let correctnessSeconds: Double
@@ -146,6 +166,10 @@ public struct ScoreMetrics: Codable, Equatable {
         case baselinePrefillSecondsPerToken = "baseline_prefill_seconds_per_token"
         case decodeSpeedup = "decode_speedup"
         case prefillSpeedup = "prefill_speedup"
+        case decodeSpeedupFloor = "decode_speedup_floor"
+        case prefillSpeedupFloor = "prefill_speedup_floor"
+        case passedDecodeSpeedupFloor = "passed_decode_speedup_floor"
+        case passedPrefillSpeedupFloor = "passed_prefill_speedup_floor"
         case benchmarkWallSeconds = "benchmark_wall_seconds"
         case preflightSeconds = "preflight_seconds"
         case correctnessSeconds = "correctness_seconds"
@@ -200,6 +224,10 @@ public struct ScoreMetrics: Codable, Equatable {
         baselinePrefillSecondsPerToken: Double = MLXFastConstants.officialBaselinePrefillSecondsPerToken,
         decodeSpeedup: Double? = nil,
         prefillSpeedup: Double? = nil,
+        decodeSpeedupFloor: Double = MLXFastConstants.scoreDecodeSpeedupFloor,
+        prefillSpeedupFloor: Double = MLXFastConstants.scorePrefillSpeedupFloor,
+        passedDecodeSpeedupFloor: Bool? = nil,
+        passedPrefillSpeedupFloor: Bool? = nil,
         benchmarkWallSeconds: Double = 0,
         preflightSeconds: Double = 0,
         correctnessSeconds: Double = 0,
@@ -258,6 +286,10 @@ public struct ScoreMetrics: Codable, Equatable {
             baselineSecondsPerToken: baselinePrefillSecondsPerToken,
             candidateSecondsPerToken: prefillSecondsPerToken
         )
+        self.decodeSpeedupFloor = decodeSpeedupFloor
+        self.prefillSpeedupFloor = prefillSpeedupFloor
+        self.passedDecodeSpeedupFloor = passedDecodeSpeedupFloor ?? (self.decodeSpeedup >= decodeSpeedupFloor)
+        self.passedPrefillSpeedupFloor = passedPrefillSpeedupFloor ?? (self.prefillSpeedup >= prefillSpeedupFloor)
         self.benchmarkWallSeconds = benchmarkWallSeconds
         self.preflightSeconds = preflightSeconds
         self.correctnessSeconds = correctnessSeconds
@@ -327,6 +359,22 @@ public struct ScoreMetrics: Codable, Equatable {
                 baselineSecondsPerToken: baselinePrefillSecondsPerToken,
                 candidateSecondsPerToken: prefillSecondsPerToken
             )
+        self.decodeSpeedupFloor = try container.decodeIfPresent(
+            Double.self,
+            forKey: .decodeSpeedupFloor
+        ) ?? MLXFastConstants.scoreDecodeSpeedupFloor
+        self.prefillSpeedupFloor = try container.decodeIfPresent(
+            Double.self,
+            forKey: .prefillSpeedupFloor
+        ) ?? MLXFastConstants.scorePrefillSpeedupFloor
+        self.passedDecodeSpeedupFloor = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .passedDecodeSpeedupFloor
+        ) ?? (self.decodeSpeedup >= self.decodeSpeedupFloor)
+        self.passedPrefillSpeedupFloor = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .passedPrefillSpeedupFloor
+        ) ?? (self.prefillSpeedup >= self.prefillSpeedupFloor)
         self.benchmarkWallSeconds = try container.decodeIfPresent(Double.self, forKey: .benchmarkWallSeconds) ?? 0
         self.preflightSeconds = try container.decodeIfPresent(Double.self, forKey: .preflightSeconds) ?? 0
         self.correctnessSeconds = try container.decodeIfPresent(Double.self, forKey: .correctnessSeconds) ?? 0
@@ -382,6 +430,10 @@ public struct ScoreMetrics: Codable, Equatable {
         try container.encode(baselinePrefillSecondsPerToken, forKey: .baselinePrefillSecondsPerToken)
         try container.encode(decodeSpeedup, forKey: .decodeSpeedup)
         try container.encode(prefillSpeedup, forKey: .prefillSpeedup)
+        try container.encode(decodeSpeedupFloor, forKey: .decodeSpeedupFloor)
+        try container.encode(prefillSpeedupFloor, forKey: .prefillSpeedupFloor)
+        try container.encode(passedDecodeSpeedupFloor, forKey: .passedDecodeSpeedupFloor)
+        try container.encode(passedPrefillSpeedupFloor, forKey: .passedPrefillSpeedupFloor)
         try container.encode(benchmarkWallSeconds, forKey: .benchmarkWallSeconds)
         try container.encode(preflightSeconds, forKey: .preflightSeconds)
         try container.encode(correctnessSeconds, forKey: .correctnessSeconds)

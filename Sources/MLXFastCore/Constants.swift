@@ -55,6 +55,8 @@ public enum MLXFastConstants {
     public static let officialBaselineDecodeSecondsPerToken = 3.018321923023438
     public static let scorePrefillWeight = 0.25
     public static let scoreDecodeWeight = 0.75
+    public static let scorePrefillSpeedupFloor = 0.95
+    public static let scoreDecodeSpeedupFloor = 0.95
     public static let defaultMaxTransformedWeightsBytes = 50 * 1024 * 1024 * 1024
     public static let defaultMaxSubmissionSourceBytes = 256 * 1024 * 1024
 }

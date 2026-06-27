@@ -203,6 +203,17 @@ Higher score is better. A baseline implementation on the official runner scores
 about `1.0`; improvements should move the score upward. Decode is weighted more
 heavily because it dominates interactive generation, while prefill still matters
 for prompt processing.
+Both phases must also stay within 5% of the official baseline:
+
+```
+decode_speedup >= 0.95
+prefill_speedup >= 0.95
+```
+
+On the current Blacksmith M4 baseline, that means decode must be at most
+`3.177180971604` seconds/token and prefill must be at most
+`0.149183255724` seconds/token. The floor prevents a submission from sacrificing
+one serving phase badly to improve the other.
 The harness records `bandwidth_source=expert_streaming_reads` and derives
 `bandwidth_gb_per_token` from measured expert-streaming file bytes during the
 decode window. Bandwidth, RAM, and expert-read metrics are reported for operator

@@ -27,6 +27,13 @@ func benchmarkScoreUsesWeightedBaselineSpeedups() {
 }
 
 @Test
+func benchmarkScoreChecksComponentFloors() {
+    #expect(BenchmarkScore.passesSpeedupFloors(decodeSpeedup: 1.01, prefillSpeedup: 0.95))
+    #expect(!BenchmarkScore.passesSpeedupFloors(decodeSpeedup: 0.94, prefillSpeedup: 1.20))
+    #expect(!BenchmarkScore.passesSpeedupFloors(decodeSpeedup: 1.20, prefillSpeedup: 0.94))
+}
+
+@Test
 func writeScorePayloadEmitsDarkbloomShape() throws {
     let directory = try temporaryDirectory()
     let path = directory.appendingPathComponent("score.json")
@@ -60,6 +67,10 @@ func writeScorePayloadEmitsDarkbloomShape() throws {
     #expect(decoded.metrics.baselinePrefillSecondsPerToken == MLXFastConstants.officialBaselinePrefillSecondsPerToken)
     #expect(decoded.metrics.decodeSpeedup == 0)
     #expect(decoded.metrics.prefillSpeedup == 0)
+    #expect(decoded.metrics.decodeSpeedupFloor == MLXFastConstants.scoreDecodeSpeedupFloor)
+    #expect(decoded.metrics.prefillSpeedupFloor == MLXFastConstants.scorePrefillSpeedupFloor)
+    #expect(decoded.metrics.passedDecodeSpeedupFloor == false)
+    #expect(decoded.metrics.passedPrefillSpeedupFloor == false)
     #expect(decoded.metrics.benchmarkWallSeconds == 0)
     #expect(decoded.metrics.preflightSeconds == 0)
     #expect(decoded.metrics.correctnessSeconds == 0)
@@ -174,6 +185,10 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(raw.contains("\"baseline_prefill_seconds_per_token\" : \(MLXFastConstants.officialBaselinePrefillSecondsPerToken)"))
     #expect(raw.contains("\"decode_speedup\" : 0"))
     #expect(raw.contains("\"prefill_speedup\" : 0"))
+    #expect(raw.contains("\"decode_speedup_floor\" : \(MLXFastConstants.scoreDecodeSpeedupFloor)"))
+    #expect(raw.contains("\"prefill_speedup_floor\" : \(MLXFastConstants.scorePrefillSpeedupFloor)"))
+    #expect(raw.contains("\"passed_decode_speedup_floor\" : false"))
+    #expect(raw.contains("\"passed_prefill_speedup_floor\" : false"))
     #expect(raw.contains("\"benchmark_wall_seconds\" : 11"))
     #expect(raw.contains("\"preflight_seconds\" : 1"))
     #expect(raw.contains("\"correctness_seconds\" : 2"))
@@ -212,6 +227,10 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(decoded.metrics.baselinePrefillSecondsPerToken == MLXFastConstants.officialBaselinePrefillSecondsPerToken)
     #expect(decoded.metrics.decodeSpeedup == 0)
     #expect(decoded.metrics.prefillSpeedup == 0)
+    #expect(decoded.metrics.decodeSpeedupFloor == MLXFastConstants.scoreDecodeSpeedupFloor)
+    #expect(decoded.metrics.prefillSpeedupFloor == MLXFastConstants.scorePrefillSpeedupFloor)
+    #expect(decoded.metrics.passedDecodeSpeedupFloor == false)
+    #expect(decoded.metrics.passedPrefillSpeedupFloor == false)
     #expect(decoded.metrics.benchmarkWallSeconds == 11)
     #expect(decoded.metrics.preflightSeconds == 1)
     #expect(decoded.metrics.correctnessSeconds == 2)
@@ -278,6 +297,10 @@ func scoreMetricsDecodeOlderPayloadWithoutWeightsIntegrityFields() throws {
     #expect(decoded.metrics.baselinePrefillSecondsPerToken == MLXFastConstants.officialBaselinePrefillSecondsPerToken)
     #expect(decoded.metrics.decodeSpeedup == 0)
     #expect(decoded.metrics.prefillSpeedup == 0)
+    #expect(decoded.metrics.decodeSpeedupFloor == MLXFastConstants.scoreDecodeSpeedupFloor)
+    #expect(decoded.metrics.prefillSpeedupFloor == MLXFastConstants.scorePrefillSpeedupFloor)
+    #expect(decoded.metrics.passedDecodeSpeedupFloor == false)
+    #expect(decoded.metrics.passedPrefillSpeedupFloor == false)
     #expect(decoded.metrics.benchmarkWallSeconds == 0)
     #expect(decoded.metrics.preflightSeconds == 0)
     #expect(decoded.metrics.correctnessSeconds == 0)

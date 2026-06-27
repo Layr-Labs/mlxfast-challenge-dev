@@ -82,6 +82,7 @@ jq -e \
     "correctness_seconds",
     "decode_seconds_per_token",
     "decode_speedup",
+    "decode_speedup_floor",
     "error",
     "expected_token",
     "expert_bytes_read",
@@ -107,8 +108,11 @@ jq -e \
     "num_layers",
     "passed_correctness",
     "peak_ram_gb",
+    "passed_decode_speedup_floor",
+    "passed_prefill_speedup_floor",
     "prefill_seconds_per_token",
     "prefill_speedup",
+    "prefill_speedup_floor",
     "preflight_seconds",
     "process_resident_memory_gb",
     "runtime",
@@ -165,8 +169,16 @@ jq -e \
   and (.metrics.baseline_prefill_seconds_per_token > 0)
   and (.metrics.decode_speedup | type == "number")
   and (.metrics.decode_speedup > 0)
+  and (.metrics.decode_speedup_floor | type == "number")
+  and (.metrics.decode_speedup_floor == 0.95)
+  and (.metrics.passed_decode_speedup_floor == true)
+  and (.metrics.decode_speedup >= .metrics.decode_speedup_floor)
   and (.metrics.prefill_speedup | type == "number")
   and (.metrics.prefill_speedup > 0)
+  and (.metrics.prefill_speedup_floor | type == "number")
+  and (.metrics.prefill_speedup_floor == 0.95)
+  and (.metrics.passed_prefill_speedup_floor == true)
+  and (.metrics.prefill_speedup >= .metrics.prefill_speedup_floor)
   and (.metrics.correctness_seconds | type == "number")
   and (.metrics.correctness_seconds > 0)
   and (.metrics.timed_benchmark_seconds | type == "number")

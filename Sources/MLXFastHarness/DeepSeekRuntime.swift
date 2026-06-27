@@ -730,7 +730,13 @@ public enum DeepSeekRuntime {
             firstFailingStep explicitFirstFailingStep: Int? = nil,
             expectedToken explicitExpectedToken: Int? = nil,
             actualToken explicitActualToken: Int? = nil,
-            weightsDigest: DirectoryDigest? = nil
+            weightsDigest: DirectoryDigest? = nil,
+            peakRamGB: Double = 0,
+            bandwidthGBPerToken: Double = 0,
+            decodeSecondsPerToken: Double = 0,
+            prefillSecondsPerToken: Double = 0,
+            bandwidthSource: String = "",
+            gpqaTTFT: GPQATTFTSummary = .zero
         ) -> ScorePayload {
             progress("failed passed_correctness=\(passedCorrectness) error=\(redactedProgressError(error))")
             return failedScore(
@@ -747,7 +753,13 @@ public enum DeepSeekRuntime {
                 preflightSeconds: preflightSeconds,
                 correctnessSeconds: correctnessSeconds,
                 timedBenchmarkSeconds: timedBenchmarkSeconds,
-                processResidentMemoryGB: currentResidentMemoryGB()
+                processResidentMemoryGB: currentResidentMemoryGB(),
+                peakRamGB: peakRamGB,
+                bandwidthGBPerToken: bandwidthGBPerToken,
+                decodeSecondsPerToken: decodeSecondsPerToken,
+                prefillSecondsPerToken: prefillSecondsPerToken,
+                bandwidthSource: bandwidthSource,
+                gpqaTTFT: gpqaTTFT
             )
         }
 
@@ -867,6 +879,26 @@ public enum DeepSeekRuntime {
                     weightsDigest: transformedWeightsDigest
                 )
             }
+            guard BenchmarkScore.passesSpeedupFloors(
+                decodeSpeedup: decodeSpeedup,
+                prefillSpeedup: prefillSpeedup
+            ) else {
+                return makeFailedScore(
+                    error: speedupFloorFailureMessage(
+                        decodeSpeedup: decodeSpeedup,
+                        prefillSpeedup: prefillSpeedup
+                    ),
+                    correctness: correctnessReport,
+                    passedCorrectness: true,
+                    expertStats: expertStats,
+                    weightsDigest: transformedWeightsDigest,
+                    peakRamGB: peakRamGB,
+                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                    decodeSecondsPerToken: decode.secondsPerToken,
+                    prefillSecondsPerToken: prefillSecondsPerToken,
+                    bandwidthSource: decode.bandwidthSource
+                )
+            }
             progress(
                 "complete score=\(formatDouble(score)) "
                     + "decode_speedup=\(formatDouble(decodeSpeedup)) "
@@ -960,7 +992,13 @@ public enum DeepSeekRuntime {
             firstFailingCase explicitFirstFailingCase: String? = nil,
             firstFailingStep explicitFirstFailingStep: Int? = nil,
             expectedToken explicitExpectedToken: Int? = nil,
-            actualToken explicitActualToken: Int? = nil
+            actualToken explicitActualToken: Int? = nil,
+            peakRamGB: Double = 0,
+            bandwidthGBPerToken: Double = 0,
+            decodeSecondsPerToken: Double = 0,
+            prefillSecondsPerToken: Double = 0,
+            bandwidthSource: String = "",
+            gpqaTTFT: GPQATTFTSummary = .zero
         ) -> ScorePayload {
             progress("failed passed_correctness=\(passedCorrectness) error=\(redactedProgressError(error))")
             return failedScore(
@@ -977,7 +1015,13 @@ public enum DeepSeekRuntime {
                 preflightSeconds: preflightSeconds,
                 correctnessSeconds: correctnessSeconds,
                 timedBenchmarkSeconds: timedBenchmarkSeconds,
-                processResidentMemoryGB: currentResidentMemoryGB()
+                processResidentMemoryGB: currentResidentMemoryGB(),
+                peakRamGB: peakRamGB,
+                bandwidthGBPerToken: bandwidthGBPerToken,
+                decodeSecondsPerToken: decodeSecondsPerToken,
+                prefillSecondsPerToken: prefillSecondsPerToken,
+                bandwidthSource: bandwidthSource,
+                gpqaTTFT: gpqaTTFT
             )
         }
 
@@ -1125,6 +1169,25 @@ public enum DeepSeekRuntime {
                     error: "computed score was not finite",
                     correctness: correctnessReport,
                     passedCorrectness: true
+                )
+            }
+            guard BenchmarkScore.passesSpeedupFloors(
+                decodeSpeedup: decodeSpeedup,
+                prefillSpeedup: prefillSpeedup
+            ) else {
+                return makeFailedScore(
+                    error: speedupFloorFailureMessage(
+                        decodeSpeedup: decodeSpeedup,
+                        prefillSpeedup: prefillSpeedup
+                    ),
+                    correctness: correctnessReport,
+                    passedCorrectness: true,
+                    peakRamGB: peakRamGB,
+                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                    decodeSecondsPerToken: decode.secondsPerToken,
+                    prefillSecondsPerToken: prefillSecondsPerToken,
+                    bandwidthSource: decode.bandwidthSource,
+                    gpqaTTFT: correctnessResult.gpqaTTFT
                 )
             }
             progress(
@@ -2030,21 +2093,34 @@ public enum DeepSeekRuntime {
         preflightSeconds: Double = 0,
         correctnessSeconds: Double = 0,
         timedBenchmarkSeconds: Double = 0,
-        processResidentMemoryGB: Double = 0
+        processResidentMemoryGB: Double = 0,
+        peakRamGB: Double = 0,
+        bandwidthGBPerToken: Double = 0,
+        decodeSecondsPerToken: Double = 0,
+        prefillSecondsPerToken: Double = 0,
+        bandwidthSource: String = "",
+        gpqaTTFT: GPQATTFTSummary = .zero
     ) -> ScorePayload {
         let expertStats = explicitExpertStats ?? correctness?.expertStreamingStats ?? .zero
         return ScorePayload(
             score: nil,
             passed: false,
             metrics: ScoreMetrics(
-                peakRamGB: 0,
-                bandwidthGBPerToken: 0,
-                decodeSecondsPerToken: 0,
-                prefillSecondsPerToken: 0,
+                peakRamGB: peakRamGB,
+                bandwidthGBPerToken: bandwidthGBPerToken,
+                decodeSecondsPerToken: decodeSecondsPerToken,
+                prefillSecondsPerToken: prefillSecondsPerToken,
                 benchmarkWallSeconds: benchmarkWallSeconds,
                 preflightSeconds: preflightSeconds,
                 correctnessSeconds: correctnessSeconds,
                 timedBenchmarkSeconds: timedBenchmarkSeconds,
+                gpqaTTFTPassed: gpqaTTFT.passed,
+                gpqaTTFTPassCount: gpqaTTFT.passCount,
+                gpqaTTFTCaseCount: gpqaTTFT.caseCount,
+                gpqaTTFTSeconds: gpqaTTFT.meanSeconds,
+                gpqaTTFTP50Seconds: gpqaTTFT.p50Seconds,
+                gpqaTTFTMaxSeconds: gpqaTTFT.maxSeconds,
+                gpqaTTFTSource: gpqaTTFT.source,
                 processResidentMemoryGB: processResidentMemoryGB,
                 passedCorrectness: passedCorrectness,
                 numLayers: MLXFastConstants.numHiddenLayers,
@@ -2064,7 +2140,7 @@ public enum DeepSeekRuntime {
                 actualToken: nil,
                 maxAbsDiff: 0,
                 goldenHash: correctness?.goldenHash ?? "",
-                bandwidthSource: "",
+                bandwidthSource: bandwidthSource,
                 error: error,
                 commit: commitIdentifier(),
                 timestamp: ISO8601DateFormatter().string(from: Date()),
@@ -2075,6 +2151,16 @@ public enum DeepSeekRuntime {
                 runtime: "swift"
             )
         )
+    }
+
+    private static func speedupFloorFailureMessage(
+        decodeSpeedup: Double,
+        prefillSpeedup: Double
+    ) -> String {
+        "performance floor failed: decode_speedup=\(formatDouble(decodeSpeedup)) "
+            + "floor=\(formatDouble(MLXFastConstants.scoreDecodeSpeedupFloor)) "
+            + "prefill_speedup=\(formatDouble(prefillSpeedup)) "
+            + "floor=\(formatDouble(MLXFastConstants.scorePrefillSpeedupFloor))"
     }
 
     private static func currentResidentMemoryGB() -> Double {
