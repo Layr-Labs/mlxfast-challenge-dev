@@ -2113,7 +2113,7 @@ public enum DeepSeekRuntime {
         }
         return (
             Double(bytesRead) / Double(1 << 30) / Double(decodedTokens),
-            "expert_streaming_reads"
+            ExpertStreamingMetrics.bandwidthSource
         )
     }
 
@@ -2135,7 +2135,7 @@ public enum DeepSeekRuntime {
         }
         return (
             Double(bytesRead) / Double(1 << 30) / Double(decodedTokens),
-            "expert_streaming_reads"
+            ExpertStreamingMetrics.bandwidthSource
         )
     }
 

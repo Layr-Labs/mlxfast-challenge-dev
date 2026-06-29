@@ -190,7 +190,7 @@ jq -e \
   and (.metrics.weights_file_count > 0)
   and (.metrics.weights_byte_count | type == "number")
   and (.metrics.weights_byte_count > 0)
-  and (.metrics.bandwidth_source == "expert_streaming_reads")
+  and (.metrics.bandwidth_source == "trusted_core_expert_slot_bank_reads")
   and (.metrics.error == "")
   and (.metrics.commit | test("^[0-9a-f]{7,40}$"))
   and (.metrics.harness_hash | test("^[0-9a-f]{64}$"))

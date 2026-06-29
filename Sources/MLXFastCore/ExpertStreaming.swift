@@ -1,5 +1,4 @@
 import Foundation
-import MLXFastCore
 
 public struct ExpertStreamingConfig: Equatable, Sendable {
     public enum Mode: String, Equatable, Sendable {
@@ -63,6 +62,8 @@ public struct ExpertStreamingConfig: Equatable, Sendable {
 }
 
 public final class ExpertStreamingMetrics: @unchecked Sendable {
+    public static let bandwidthSource = "trusted_core_expert_slot_bank_reads"
+
     public struct Snapshot: Equatable, Sendable {
         public let cacheHits: UInt64
         public let cacheMisses: UInt64
@@ -101,13 +102,13 @@ public final class ExpertStreamingMetrics: @unchecked Sendable {
 
     public init() {}
 
-    public func recordCacheHit() {
+    func recordCacheHit() {
         lock.lock()
         cacheHits += 1
         lock.unlock()
     }
 
-    public func recordCacheMiss(bytes: Int, nanoseconds: UInt64) {
+    func recordCacheMiss(bytes: Int, nanoseconds: UInt64) {
         lock.lock()
         cacheMisses += 1
         bytesRead += UInt64(max(0, bytes))
@@ -115,13 +116,13 @@ public final class ExpertStreamingMetrics: @unchecked Sendable {
         lock.unlock()
     }
 
-    public func recordCacheEviction() {
+    func recordCacheEviction() {
         lock.lock()
         cacheEvictions += 1
         lock.unlock()
     }
 
-    public func recordCacheOccupancy(_ count: Int) {
+    func recordCacheOccupancy(_ count: Int) {
         lock.lock()
         peakCachedTensors = max(peakCachedTensors, UInt64(max(0, count)))
         lock.unlock()
