@@ -223,10 +223,10 @@ For scoring, decode is trusted parent wall-clock time for decode setup plus the
 checked decode-token window, not worker-reported per-step time. That charges
 prompt-specific seed prefill to the decode phase so submitted model code cannot
 hide speculative decode work before the timer starts.
-The harness records `bandwidth_source=expert_streaming_reads` and derives
-`bandwidth_gb_per_token` from measured expert-streaming file bytes during the
-decode window. Bandwidth, RAM, and expert-read metrics are reported for operator
-review and future guardrails; they are not primary score factors.
+The harness records `bandwidth_source=trusted_core_expert_slot_bank_reads` and
+derives `bandwidth_gb_per_token` from trusted-core expert slot-bank file bytes
+during the decode window. Bandwidth, RAM, and expert-read metrics are reported
+for operator review and future guardrails; they are not primary score factors.
 Correctness is a hard gate. See CHALLENGE.md for the full correctness specification.
 The official run times the benchmark before correctness so the correctness gate
 cannot warm the measured model path. It then checks 256 correctness positions.

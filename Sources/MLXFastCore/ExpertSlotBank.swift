@@ -1,6 +1,5 @@
 import Darwin
 import Foundation
-import MLXFastCore
 
 public struct ExpertTensorRecord: Codable, Equatable {
     public let name: String
@@ -151,14 +150,14 @@ public final class ExpertSlotBank {
         recordsByName[name]
     }
 
-    public func tensorBytes(named name: String) throws -> Data {
+    func tensorBytes(named name: String) throws -> Data {
         guard let record = recordsByName[name] else {
             throw MLXFastError.invalidInput("expert tensor not found in manifest: \(name)")
         }
         return try tensorBytes(for: record)
     }
 
-    public func tensorBytes(for record: ExpertTensorRecord) throws -> Data {
+    func tensorBytes(for record: ExpertTensorRecord) throws -> Data {
         try cachedBytes(
             cacheKey: record.name,
             name: record.name,

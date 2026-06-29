@@ -409,6 +409,37 @@ func runtimeWorkerBenchmarkDecodeDoesNotReceiveBulkOracle() throws {
 }
 
 @Test
+func expertStreamingDiagnosticsUseTrustedCoreCounters() throws {
+    let fileManager = FileManager.default
+    #expect(fileManager.fileExists(atPath: "Sources/MLXFastCore/ExpertSlotBank.swift"))
+    #expect(!fileManager.fileExists(atPath: "Sources/MLXFastModel/ExpertSlotBank.swift"))
+    #expect(fileManager.fileExists(atPath: "Sources/MLXFastCore/ExpertStreaming.swift"))
+    #expect(!fileManager.fileExists(atPath: "Sources/MLXFastModel/ExpertStreaming.swift"))
+
+    let contract = try String(contentsOfFile: "benchmark.json", encoding: .utf8)
+    #expect(!contract.contains("Sources/MLXFastCore"))
+
+    let metrics = try String(
+        contentsOfFile: "Sources/MLXFastCore/ExpertStreaming.swift",
+        encoding: .utf8
+    )
+    #expect(metrics.contains("bandwidthSource = \"trusted_core_expert_slot_bank_reads\""))
+    #expect(!metrics.contains("public func recordCache"))
+
+    let slotBank = try String(
+        contentsOfFile: "Sources/MLXFastCore/ExpertSlotBank.swift",
+        encoding: .utf8
+    )
+    #expect(!slotBank.contains("public func tensorBytes"))
+
+    let runtime = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
+        encoding: .utf8
+    )
+    #expect(runtime.contains("ExpertStreamingMetrics.bandwidthSource"))
+}
+
+@Test
 func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
     let runtime = try String(
         contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
