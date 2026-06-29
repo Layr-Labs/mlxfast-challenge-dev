@@ -61,10 +61,6 @@ on:
         required: false
         default: "16"
         type: string
-concurrency:
-  group: benchmark-${{ github.ref }}-${{ inputs.calibrate_gpqa_reference && 'calibrate-gpqa' || (inputs.preserve_golden_only && 'preserve-golden' || (inputs.run_benchmark && 'full' || 'correctness-only')) }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
 
