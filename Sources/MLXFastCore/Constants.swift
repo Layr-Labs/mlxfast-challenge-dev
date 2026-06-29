@@ -40,6 +40,9 @@ public enum MLXFastConstants {
     public static let semanticGPQAMaxNewTokens = 10
     public static let semanticGPQAMinPassCount = 3
     public static let benchmarkPrefillPromptTokens = 512
+    // Scored decode is parent-measured wall time for decode setup plus this
+    // many checked token steps. Charging setup prevents submitted model code
+    // from precomputing future decode tokens in an unscored seed-prefill phase.
     public static let benchmarkDecodeSteps = 128
     public static let quickBenchmarkDecodeSteps = 64
     // Seed measured decode with the full prompt. A short instruction-prefix
@@ -56,8 +59,8 @@ public enum MLXFastConstants {
     // changing timed windows, run one trusted baseline validation before using
     // scores for the public leaderboard. Raw RAM, bandwidth, and read metrics
     // remain audit fields instead of primary score factors.
-    public static let officialBaselinePrefillSecondsPerToken = 0.17387153881835937
-    public static let officialBaselineDecodeSecondsPerToken = 3.0280505878359376
+    public static let officialBaselinePrefillSecondsPerToken = 0.17330563175390626
+    public static let officialBaselineDecodeSecondsPerToken = 4.220506571617188
     public static let scorePrefillWeight = 0.25
     public static let scoreDecodeWeight = 0.75
     public static let scorePrefillSpeedupFloor = 0.95
