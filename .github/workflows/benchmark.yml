@@ -96,8 +96,11 @@ jobs:
       MLXFAST_GPQA_TTFT_CASE_COUNT: "5"
       MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "5"
       MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: "10"
-      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "4"
-      MLXFAST_SEMANTIC_GPQA_REQUIRED: "0"
+      # Baseline DeepSeek V4 Flash currently passes 3/5 hidden short-answer
+      # semantic GPQA judgments, so the hard gate is calibrated to preserve
+      # baseline behavior rather than demand better-than-baseline GPQA quality.
+      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "3"
+      MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
       MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 830670206859a1b221508ae44a031205a3eba6f5f13e05b40383bf781bdbf067
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "26110"

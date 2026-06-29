@@ -112,6 +112,9 @@ only those private answer bundles to Claude for a semantic pass/fail judge. This
 requires the `ORG_ANTHROPIC_API_KEY` repository secret. The score artifact records
 only aggregate semantic counts and the judge model name; prompts, references,
 candidate answers, and judge text stay in the private runner directory.
+The private workflow treats semantic GPQA as a hard gate with a 3/5 threshold,
+calibrated to the unmodified DeepSeek V4 Flash baseline rather than to
+better-than-baseline GPQA answer quality.
 Because the one-token GPQA behavior gate is exact-token based, calibrate that
 layer on the official Blacksmith runner with the manual
 `calibrate_gpqa_reference` workflow input; M-series local calibration can differ
@@ -276,10 +279,7 @@ resulting file to benchmark CI with R2, `correctness_golden_url`, or
 `MLXFAST_CORRECTNESS_GOLDEN_URL`. The benchmark workflow stores its local golden
 copy under `$RUNNER_TEMP`, not the repository workspace, and uploads only hash
 and byte-count sidecars. The semantic GPQA answer and judge result files are
-also kept under the private runner directory and are not uploaded. Semantic
-GPQA is recorded into `score.json` as a diagnostic by default; set
-`MLXFAST_SEMANTIC_GPQA_REQUIRED=1` in private CI only after the hidden cases are
-calibrated tightly enough to make the judge a hard gate.
+also kept under the private runner directory and are not uploaded.
 
 The Swift `make-golden` generator has been removed from the public harness so CI
 only consumes precomputed fixtures. The last commit on this branch containing

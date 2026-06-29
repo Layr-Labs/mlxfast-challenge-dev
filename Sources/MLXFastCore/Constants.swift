@@ -32,13 +32,13 @@ public enum MLXFastConstants {
     // with pinned Swift/MLX. Exact GPQA behavior accepts the stable first-token
     // prefix, while the short continuation feeds the private semantic judge.
     public static let correctnessGPQAMaxNewTokens = 10
-    // Semantic judging uses short hidden GPQA answers as a diagnostic backstop
-    // for optimizations that preserve the exact prefix but damage answer sense.
-    // Five cases keeps the full GitHub job near the 30-minute budget while the
-    // teacher-forced gate and benchmark oracle still cover exact-token behavior.
+    // Semantic judging uses short hidden GPQA answers as a baseline-calibrated
+    // hard gate for optimizations that preserve the exact prefix but damage
+    // answer sense. Five cases keeps the full GitHub job near the 30-minute
+    // budget; baseline DeepSeek currently establishes a 3/5 threshold.
     public static let semanticGPQACaseCount = 5
     public static let semanticGPQAMaxNewTokens = 10
-    public static let semanticGPQAMinPassCount = 4
+    public static let semanticGPQAMinPassCount = 3
     public static let benchmarkPrefillPromptTokens = 512
     public static let benchmarkDecodeSteps = 128
     public static let quickBenchmarkDecodeSteps = 64
