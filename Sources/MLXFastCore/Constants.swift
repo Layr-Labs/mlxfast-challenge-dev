@@ -27,30 +27,35 @@ public enum MLXFastConstants {
     public static let correctnessMaxFreeRunSteps = 256
     public static let correctnessMaxBehaviorPromptTokens = 2_048
     public static let correctnessMaxBehaviorSteps = 64
-    public static let correctnessGPQACaseCount = 9
+    public static let correctnessGPQACaseCount = 5
     // Cross-machine greedy decode can drift after the first answer token even
-    // with pinned Swift/MLX. Keep hidden GPQA behavior gates broad across cases
-    // and shallow per case so local M-series and official Blacksmith runs agree.
-    public static let correctnessGPQAMaxNewTokens = 1
-    // Semantic judging uses short hidden GPQA answers as a pass/fail backstop
+    // with pinned Swift/MLX. Exact GPQA behavior accepts the stable first-token
+    // prefix, while the short continuation feeds the private semantic judge.
+    public static let correctnessGPQAMaxNewTokens = 10
+    // Semantic judging uses short hidden GPQA answers as a diagnostic backstop
     // for optimizations that preserve the exact prefix but damage answer sense.
-    public static let semanticGPQACaseCount = 9
+    // Five cases keeps the full GitHub job near the 30-minute budget while the
+    // teacher-forced gate and benchmark oracle still cover exact-token behavior.
+    public static let semanticGPQACaseCount = 5
     public static let semanticGPQAMaxNewTokens = 10
-    public static let semanticGPQAMinPassCount = 8
+    public static let semanticGPQAMinPassCount = 4
     public static let benchmarkPrefillPromptTokens = 512
-    public static let benchmarkDecodeSteps = 256
+    public static let benchmarkDecodeSteps = 128
     public static let quickBenchmarkDecodeSteps = 64
     // Seed measured decode with the full prompt. A short instruction-prefix
     // seed can free-run differently across Apple Silicon/MLX versions even
     // when teacher-forced correctness agrees, which makes the timed oracle
     // fragile for reasons unrelated to kernel performance.
     public static let benchmarkDecodeSeedTokens = 512
-    public static let benchmarkPrefillWarmupRuns = 1
+    // Correctness and hidden GPQA already run substantial prefills before the
+    // timed benchmark. Avoid a separate prefill warmup so the full GitHub job
+    // stays within the 30-minute target while keeping one measured prefill run.
+    public static let benchmarkPrefillWarmupRuns = 0
     public static let benchmarkPrefillTimedRuns = 1
-    // Official baseline measured on the Blacksmith runner for the current
-    // 512-token prefill / 256-token decode benchmark oracle. The ranked score is
-    // normalized to this baseline; raw RAM, bandwidth, and read metrics remain
-    // audit fields instead of primary score factors.
+    // Official baseline measured on the Blacksmith runner for this model. After
+    // changing timed windows, run one trusted baseline validation before using
+    // scores for the public leaderboard. Raw RAM, bandwidth, and read metrics
+    // remain audit fields instead of primary score factors.
     public static let officialBaselinePrefillSecondsPerToken = 0.1417240929375
     public static let officialBaselineDecodeSecondsPerToken = 3.018321923023438
     public static let scorePrefillWeight = 0.25

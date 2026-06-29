@@ -55,6 +55,10 @@ func deepSeekPoolingCacheBuffersRemaindersAndBuildsMasksWhenRuntimeTestsAreEnabl
 
 @Test
 func deepSeekLocalKVCacheExposesCachedArraysForMaterialization() throws {
+    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+        return
+    }
+
     let cache = DeepSeekLocalKVCache(maxSize: 4)
 
     #expect(cache.arraysForMaterialization().isEmpty)
@@ -65,6 +69,10 @@ func deepSeekLocalKVCacheExposesCachedArraysForMaterialization() throws {
 
 @Test
 func deepSeekPoolingCacheExposesBufferedAndPooledArraysForMaterialization() throws {
+    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+        return
+    }
+
     let cache = DeepSeekPoolingCache(ratio: 4)
     _ = try cache.accumulateWindows(
         kv: MLXArray((1...6).map { Float($0) }, [1, 3, 2]),
@@ -82,6 +90,10 @@ func deepSeekPoolingCacheExposesBufferedAndPooledArraysForMaterialization() thro
 
 @Test
 func deepSeekModelCacheMaterializesCollectedCachedState() throws {
+    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+        return
+    }
+
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
     try """

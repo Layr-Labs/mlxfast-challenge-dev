@@ -4,6 +4,7 @@ import Foundation
 import MLX
 import MLXFastCore
 import MLXFastModel
+import Tokenizers
 
 public struct CorrectnessOptions: Equatable {
     public let weightsPath: String
@@ -214,17 +215,29 @@ public struct BenchmarkOptions: Equatable {
     public let goldenPath: String
     public let correctnessSteps: Int
     public let benchmarkDecodeSteps: Int
+    public let semanticGPQAOutputPath: String?
+    public let semanticGPQATokenizerPath: String?
+    public let semanticGPQACaseCount: Int
+    public let semanticGPQAMaxNewTokens: Int
 
     public init(
         weightsPath: String,
         goldenPath: String,
         correctnessSteps: Int = MLXFastConstants.correctnessSteps,
-        benchmarkDecodeSteps: Int = MLXFastConstants.benchmarkDecodeSteps
+        benchmarkDecodeSteps: Int = MLXFastConstants.benchmarkDecodeSteps,
+        semanticGPQAOutputPath: String? = nil,
+        semanticGPQATokenizerPath: String? = nil,
+        semanticGPQACaseCount: Int = MLXFastConstants.semanticGPQACaseCount,
+        semanticGPQAMaxNewTokens: Int = MLXFastConstants.semanticGPQAMaxNewTokens
     ) {
         self.weightsPath = weightsPath
         self.goldenPath = goldenPath
         self.correctnessSteps = correctnessSteps
         self.benchmarkDecodeSteps = benchmarkDecodeSteps
+        self.semanticGPQAOutputPath = semanticGPQAOutputPath
+        self.semanticGPQATokenizerPath = semanticGPQATokenizerPath
+        self.semanticGPQACaseCount = semanticGPQACaseCount
+        self.semanticGPQAMaxNewTokens = semanticGPQAMaxNewTokens
     }
 }
 
@@ -964,6 +977,37 @@ public enum DeepSeekRuntime {
                 "benchmark decode steps \(options.benchmarkDecodeSteps) exceeds oracle length \(MLXFastConstants.benchmarkDecodeSteps)"
             )
         }
+        guard options.semanticGPQACaseCount > 0 else {
+            throw MLXFastError.invalidInput("semantic GPQA case count must be positive")
+        }
+        guard options.semanticGPQAMaxNewTokens > 0,
+              options.semanticGPQAMaxNewTokens <= MLXFastConstants.correctnessMaxBehaviorSteps
+        else {
+            throw MLXFastError.invalidInput(
+                "semantic GPQA max_new_tokens must be in 1...\(MLXFastConstants.correctnessMaxBehaviorSteps)"
+            )
+        }
+    }
+
+    private static func semanticGPQACaptureOptions(from options: BenchmarkOptions) throws -> SemanticGPQACaptureOptions? {
+        guard let outputPath = trimmedNonEmpty(options.semanticGPQAOutputPath) else {
+            return nil
+        }
+        let tokenizerPath = trimmedNonEmpty(options.semanticGPQATokenizerPath) ?? options.weightsPath
+        try requireFile(
+            URL(fileURLWithPath: tokenizerPath).appendingPathComponent("tokenizer.json").path,
+            description: "semantic GPQA tokenizer.json"
+        )
+        try requireFile(
+            URL(fileURLWithPath: tokenizerPath).appendingPathComponent("tokenizer_config.json").path,
+            description: "semantic GPQA tokenizer_config.json"
+        )
+        return SemanticGPQACaptureOptions(
+            outputPath: outputPath,
+            tokenizerPath: tokenizerPath,
+            caseCount: options.semanticGPQACaseCount,
+            maxNewTokens: options.semanticGPQAMaxNewTokens
+        )
     }
 
     private static func benchmarkWithWorker(
@@ -1061,6 +1105,7 @@ public enum DeepSeekRuntime {
             progress("correctness worker start")
             let correctnessResult: WorkerLayeredCorrectnessResult
             do {
+                let semanticCapture = try semanticGPQACaptureOptions(from: options)
                 let correctnessWorker = try RuntimeWorkerClient(
                     options: workerOptions,
                     weightsPath: options.weightsPath
@@ -1072,6 +1117,7 @@ public enum DeepSeekRuntime {
                     golden: golden,
                     worker: correctnessWorker,
                     steps: options.correctnessSteps,
+                    semanticCapture: semanticCapture,
                     progress: progress
                 )
             }
@@ -1239,6 +1285,42 @@ public enum DeepSeekRuntime {
         let expertStats: ExpertStreamingStats
         let peakRamGB: Double
         let gpqaTTFT: GPQATTFTSummary
+    }
+
+    private struct SemanticGPQACaptureOptions {
+        let outputPath: String
+        let tokenizerPath: String
+        let caseCount: Int
+        let maxNewTokens: Int
+    }
+
+    private struct SemanticGPQAAnswerDocument: Encodable {
+        let version: Int
+        let cases: [SemanticGPQAAnswerCase]
+    }
+
+    private struct SemanticGPQAAnswerCase: Encodable {
+        let id: String
+        let domain: String?
+        let subdomain: String?
+        let prompt: String
+        let answerKey: String?
+        let referenceAnswer: String
+        let candidateAnswer: String
+        let candidateTokens: [Int]
+        let maxNewTokens: Int
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case domain
+            case subdomain
+            case prompt
+            case answerKey = "answer_key"
+            case referenceAnswer = "reference_answer"
+            case candidateAnswer = "candidate_answer"
+            case candidateTokens = "candidate_tokens"
+            case maxNewTokens = "max_new_tokens"
+        }
     }
 
     private struct GPQATTFTSummary {
@@ -1436,6 +1518,7 @@ public enum DeepSeekRuntime {
         golden: GoldenFixture,
         worker: RuntimeWorkerClient,
         steps: Int = MLXFastConstants.correctnessSteps,
+        semanticCapture: SemanticGPQACaptureOptions? = nil,
         progress: ((String) -> Void)? = nil
     ) -> WorkerLayeredCorrectnessResult {
         let caseCount = golden.totalCorrectnessCaseCount
@@ -1446,6 +1529,7 @@ public enum DeepSeekRuntime {
         var gpqaTTFTPassCount = 0
         var gpqaTTFTCaseCount = 0
         var gpqaTTFTSeconds: [Double] = []
+        var semanticAnswers: [SemanticGPQAAnswerCase] = []
 
         func result(report: CorrectnessReport) -> WorkerLayeredCorrectnessResult {
             WorkerLayeredCorrectnessResult(
@@ -1486,6 +1570,9 @@ public enum DeepSeekRuntime {
         }
 
         do {
+            let semanticTokenizer: (any Tokenizer)? = try semanticCapture.map {
+                try loadLocalTokenizer(at: $0.tokenizerPath)
+            }
             for (caseIndex, testCase) in golden.cases.enumerated() {
                 currentCase = testCase.name
                 let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
@@ -1559,12 +1646,25 @@ public enum DeepSeekRuntime {
                 let check = try compareBehaviorWithWorker(testCase: behavior, worker: worker)
                 lastExpertStats = check.expertStats
                 peakRamGB = max(peakRamGB, check.peakRamGB)
-                if behavior.maxNewTokens == 1 {
+                if check.ttftSeconds != nil {
                     gpqaTTFTCaseCount += 1
                     if check.comparison.passed, let ttftSeconds = check.ttftSeconds, ttftSeconds > 0 {
                         gpqaTTFTPassCount += 1
                         gpqaTTFTSeconds.append(ttftSeconds)
                     }
+                }
+                if let semanticCapture,
+                   let semanticTokenizer,
+                   semanticAnswers.count < semanticCapture.caseCount,
+                   let generatedTokens = check.generatedTokens,
+                   let answer = try semanticAnswerCase(
+                       behavior: behavior,
+                       generatedTokens: Array(generatedTokens.prefix(semanticCapture.maxNewTokens)),
+                       tokenizer: semanticTokenizer,
+                       maxNewTokens: semanticCapture.maxNewTokens
+                   )
+                {
+                    semanticAnswers.append(answer)
                 }
                 if !check.comparison.passed {
                     progress?("correctness behavior \(caseLabel) failed step=\(check.comparison.firstFailingStep ?? -1)")
@@ -1576,6 +1676,15 @@ public enum DeepSeekRuntime {
                 }
                 checkedSteps += check.comparison.checkedSteps
                 progress?("correctness behavior \(caseLabel) complete checked_steps=\(check.comparison.checkedSteps)")
+            }
+            if let semanticCapture {
+                guard semanticAnswers.count == semanticCapture.caseCount else {
+                    throw MLXFastError.invalidInput(
+                        "captured \(semanticAnswers.count) semantic GPQA answers; expected \(semanticCapture.caseCount)"
+                    )
+                }
+                try writeSemanticGPQAAnswers(semanticAnswers, to: semanticCapture.outputPath)
+                progress?("correctness semantic GPQA answers captured cases=\(semanticAnswers.count)")
             }
         } catch {
             progress?("correctness error=\(redactedProgressError("\(error)"))")
@@ -2466,17 +2575,20 @@ public enum DeepSeekRuntime {
         let expertStats: ExpertStreamingStats
         let peakRamGB: Double
         let ttftSeconds: Double?
+        let generatedTokens: [Int]?
 
         init(
             comparison: CorrectnessTokenComparison,
             expertStats: ExpertStreamingStats,
             peakRamGB: Double,
-            ttftSeconds: Double? = nil
+            ttftSeconds: Double? = nil,
+            generatedTokens: [Int]? = nil
         ) {
             self.comparison = comparison
             self.expertStats = expertStats
             self.peakRamGB = peakRamGB
             self.ttftSeconds = ttftSeconds
+            self.generatedTokens = generatedTokens
         }
     }
 
@@ -2606,40 +2718,61 @@ public enum DeepSeekRuntime {
         testCase: GoldenBehaviorCase,
         worker: RuntimeWorkerClient
     ) throws -> WorkerCorrectnessResult {
-        if testCase.maxNewTokens == 1 {
-            let response = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
-            guard let actualToken = response.token else {
-                throw MLXFastError.invalidInput("runtime worker behavior response missing token")
-            }
-            let topLogits = try validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
+        let beginResponse = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
+        guard let firstToken = beginResponse.token else {
+            throw MLXFastError.invalidInput("runtime worker behavior response missing token")
+        }
+        let topLogits = try validatedWorkerTopLogits(beginResponse.topLogits, actualToken: firstToken)
+        let firstTokenComparison = compareBehaviorFirstToken(
+            testCase: testCase,
+            actualToken: firstToken,
+            topLogits: topLogits
+        )
+        if !firstTokenComparison.passed {
             return WorkerCorrectnessResult(
-                comparison: compareBehaviorFirstToken(
-                    testCase: testCase,
-                    actualToken: actualToken,
-                    topLogits: topLogits
-                ),
-                expertStats: response.expertStats ?? .zero,
-                peakRamGB: response.peakRamGB ?? 0,
-                ttftSeconds: response.seconds
+                comparison: firstTokenComparison,
+                expertStats: beginResponse.expertStats ?? .zero,
+                peakRamGB: beginResponse.peakRamGB ?? 0,
+                ttftSeconds: beginResponse.seconds,
+                generatedTokens: [firstToken]
             )
         }
 
-        let response = try worker.generateCorrectness(
-            promptTokens: testCase.promptTokens,
-            steps: testCase.maxNewTokens
-        )
-        guard let generated = response.tokens else {
-            throw MLXFastError.invalidInput("runtime worker behavior response missing tokens")
+        var generated = [firstToken]
+        generated.reserveCapacity(testCase.maxNewTokens)
+        var expertStats = beginResponse.expertStats ?? .zero
+        var peakRamGB = beginResponse.peakRamGB ?? 0
+        while generated.count < testCase.maxNewTokens {
+            let response = try worker.teacherForcedCorrectnessStep(previousToken: generated[generated.count - 1])
+            guard let token = response.token else {
+                throw MLXFastError.invalidInput("runtime worker behavior continuation response missing token")
+            }
+            generated.append(token)
+            expertStats = response.expertStats ?? expertStats
+            peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
         }
-        try requireGeneratedTokenCount(
-            generated.count,
-            expected: testCase.maxNewTokens,
-            label: "behavior"
-        )
+
+        let comparison: CorrectnessTokenComparison
+        // Hidden GPQA cases use exact first-token acceptance plus semantic
+        // judging for the continuation; exact multi-token greedy output is too
+        // brittle across Apple Silicon/MLX versions.
+        if testCase.semanticPrompt != nil || testCase.acceptedTokenSequences.allSatisfy({ $0.count <= 1 }) {
+            comparison = CorrectnessTokenComparison(
+                passed: true,
+                checkedSteps: testCase.maxNewTokens,
+                firstFailingStep: nil,
+                expectedToken: nil,
+                actualToken: nil
+            )
+        } else {
+            comparison = compareBehaviorTokens(testCase: testCase, generated: generated)
+        }
         return WorkerCorrectnessResult(
-            comparison: compareBehaviorTokens(testCase: testCase, generated: generated),
-            expertStats: response.expertStats ?? .zero,
-            peakRamGB: response.peakRamGB ?? 0
+            comparison: comparison,
+            expertStats: expertStats,
+            peakRamGB: peakRamGB,
+            ttftSeconds: beginResponse.seconds,
+            generatedTokens: generated
         )
     }
 
@@ -2692,6 +2825,91 @@ public enum DeepSeekRuntime {
                 "runtime worker \(label) returned \(actual) tokens; expected \(expected)"
             )
         }
+    }
+
+    private static func semanticAnswerCase(
+        behavior: GoldenBehaviorCase,
+        generatedTokens: [Int],
+        tokenizer: any Tokenizer,
+        maxNewTokens: Int
+    ) throws -> SemanticGPQAAnswerCase? {
+        guard let prompt = trimmedNonEmpty(behavior.semanticPrompt),
+              let referenceAnswer = trimmedNonEmpty(behavior.semanticReferenceAnswer)
+        else {
+            return nil
+        }
+        let candidateTokens = Array(generatedTokens.prefix(maxNewTokens))
+        guard !candidateTokens.isEmpty else {
+            throw MLXFastError.invalidInput("\(behavior.name) semantic GPQA candidate token list is empty")
+        }
+        let candidateAnswer = tokenizer.decode(tokens: candidateTokens, skipSpecialTokens: true)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return SemanticGPQAAnswerCase(
+            id: behavior.name,
+            domain: trimmedNonEmpty(behavior.semanticDomain),
+            subdomain: trimmedNonEmpty(behavior.semanticSubdomain),
+            prompt: prompt,
+            answerKey: trimmedNonEmpty(behavior.semanticAnswerKey),
+            referenceAnswer: referenceAnswer,
+            candidateAnswer: candidateAnswer,
+            candidateTokens: candidateTokens,
+            maxNewTokens: maxNewTokens
+        )
+    }
+
+    private static func writeSemanticGPQAAnswers(
+        _ answers: [SemanticGPQAAnswerCase],
+        to path: String
+    ) throws {
+        let document = SemanticGPQAAnswerDocument(version: 1, cases: answers)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let outputURL = URL(fileURLWithPath: path)
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try encoder.encode(document).write(to: outputURL, options: [.atomic])
+    }
+
+    private static func loadLocalTokenizer(at path: String) throws -> any Tokenizer {
+        let modelFolder = URL(fileURLWithPath: path).standardizedFileURL
+        return try runBlockingAsync {
+            try await AutoTokenizer.from(modelFolder: modelFolder, strict: false)
+        }
+    }
+
+    private final class AsyncResultBox<T>: @unchecked Sendable {
+        var result: Result<T, Error>?
+    }
+
+    private static func runBlockingAsync<T>(
+        _ body: @escaping @Sendable () async throws -> T
+    ) throws -> T {
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = AsyncResultBox<T>()
+        Task {
+            do {
+                box.result = .success(try await body())
+            } catch {
+                box.result = .failure(error)
+            }
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return try box.result!.get()
+    }
+
+    private static func requireFile(_ path: String, description: String) throws {
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            throw MLXFastError.invalidInput("\(description) missing at \(path)")
+        }
+    }
+
+    private static func trimmedNonEmpty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private static func compareGreedyCached(

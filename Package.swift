@@ -37,6 +37,7 @@ let package = Package(
                 "MLXFastCore",
                 "MLXFastModel",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
             ]
         ),
         .target(

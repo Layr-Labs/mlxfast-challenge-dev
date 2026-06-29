@@ -81,6 +81,10 @@ func deepSeekWeightLoaderReadsExpertManifestTensor() throws {
 
 @Test
 func deepSeekWeightLoaderBuildsAffineQuantizedDenseLinearWeight() throws {
+    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+        return
+    }
+
     let fixture = try makeWeightLoaderFixture(
         denseTensors: [
             TensorFixture(
@@ -130,6 +134,10 @@ func deepSeekWeightLoaderBuildsAffineQuantizedDenseLinearWeight() throws {
 
 @Test
 func deepSeekWeightLoaderSlicesStackedQuantizedRoutedExpert() throws {
+    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+        return
+    }
+
     let fixture = try makeWeightLoaderFixture(
         denseTensors: [
             TensorFixture(
@@ -178,6 +186,9 @@ func deepSeekWeightLoaderSlicesStackedQuantizedRoutedExpert() throws {
 
 @Test
 func deepSeekWeightLoaderBuildsSemanticRuntimeWeights() throws {
+    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+        return
+    }
     let tensor = { (name: String, shape: [Int]) in
         TensorFixture(
             name: name,

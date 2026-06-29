@@ -84,24 +84,44 @@ public struct GoldenBehaviorCase: Codable, Equatable {
     public let promptTokens: [Int]
     public let acceptedTokenSequences: [[Int]]
     public let maxNewTokens: Int
+    public let semanticPrompt: String?
+    public let semanticAnswerKey: String?
+    public let semanticReferenceAnswer: String?
+    public let semanticDomain: String?
+    public let semanticSubdomain: String?
 
     enum CodingKeys: String, CodingKey {
         case name
         case promptTokens = "prompt_tokens"
         case acceptedTokenSequences = "accepted_token_sequences"
         case maxNewTokens = "max_new_tokens"
+        case semanticPrompt = "semantic_prompt"
+        case semanticAnswerKey = "semantic_answer_key"
+        case semanticReferenceAnswer = "semantic_reference_answer"
+        case semanticDomain = "semantic_domain"
+        case semanticSubdomain = "semantic_subdomain"
     }
 
     public init(
         name: String,
         promptTokens: [Int],
         acceptedTokenSequences: [[Int]],
-        maxNewTokens: Int
+        maxNewTokens: Int,
+        semanticPrompt: String? = nil,
+        semanticAnswerKey: String? = nil,
+        semanticReferenceAnswer: String? = nil,
+        semanticDomain: String? = nil,
+        semanticSubdomain: String? = nil
     ) {
         self.name = name
         self.promptTokens = promptTokens
         self.acceptedTokenSequences = acceptedTokenSequences
         self.maxNewTokens = maxNewTokens
+        self.semanticPrompt = semanticPrompt
+        self.semanticAnswerKey = semanticAnswerKey
+        self.semanticReferenceAnswer = semanticReferenceAnswer
+        self.semanticDomain = semanticDomain
+        self.semanticSubdomain = semanticSubdomain
     }
 }
 
@@ -520,9 +540,9 @@ public func validateBenchmarkGolden(_ benchmark: BenchmarkGolden) throws {
             "benchmark.decode_seed_tokens has \(benchmark.decodeSeedTokens.count) tokens; need exactly \(MLXFastConstants.benchmarkDecodeSeedTokens). Replace stale local goldens with an updated precomputed golden fixture."
         )
     }
-    guard benchmark.expectedDecodeTokens.count == MLXFastConstants.benchmarkDecodeSteps else {
+    guard benchmark.expectedDecodeTokens.count >= MLXFastConstants.benchmarkDecodeSteps else {
         throw MLXFastError.invalidInput(
-            "benchmark.expected_decode_tokens has \(benchmark.expectedDecodeTokens.count) tokens; need exactly \(MLXFastConstants.benchmarkDecodeSteps). Replace stale local goldens with an updated precomputed golden fixture."
+            "benchmark.expected_decode_tokens has \(benchmark.expectedDecodeTokens.count) tokens; need at least \(MLXFastConstants.benchmarkDecodeSteps). Replace stale local goldens with an updated precomputed golden fixture."
         )
     }
     try validateTokens(benchmark.prefillPromptTokens, field: "benchmark.prefill_prompt_tokens")
