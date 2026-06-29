@@ -409,6 +409,29 @@ func runtimeWorkerBenchmarkDecodeDoesNotReceiveBulkOracle() throws {
 }
 
 @Test
+func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
+    let runtime = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
+        encoding: .utf8
+    )
+    let workerStart = try #require(runtime.range(of: "private static func benchmarkWithWorker"))
+    let workerRuntime = String(runtime[workerStart.lowerBound...])
+
+    #expect(workerRuntime.contains("benchmark prefill worker start"))
+    #expect(workerRuntime.contains("benchmark decode worker start"))
+    #expect(workerRuntime.contains("worker-reported per-step timing"))
+    #expect(workerRuntime.contains("let decodePhaseStart = DispatchTime.now().uptimeNanoseconds"))
+    #expect(workerRuntime.contains("includes_seed_prefill=true"))
+    #expect(workerRuntime.contains("let measuredSeconds = secondsSince(decodePhaseStart)"))
+
+    let timedBenchmarkRange = try #require(workerRuntime.range(of: "progress(\"timed benchmark start\")"))
+    let weightsDigestRange = try #require(workerRuntime.range(of: "progress(\"weights digest start\")"))
+    let correctnessRange = try #require(workerRuntime.range(of: "progress(\"correctness start cases=\\(golden.totalCorrectnessCaseCount)\")"))
+    #expect(timedBenchmarkRange.lowerBound < weightsDigestRange.lowerBound)
+    #expect(weightsDigestRange.lowerBound < correctnessRange.lowerBound)
+}
+
+@Test
 func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
     let runtime = try String(
         contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",

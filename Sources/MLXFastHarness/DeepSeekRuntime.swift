@@ -1080,6 +1080,81 @@ public enum DeepSeekRuntime {
             preflightSeconds = secondsSince(preflightStart)
             progress("preflight complete seconds=\(formatSeconds(preflightSeconds))")
 
+            progress("golden load start")
+            let golden = try loadGoldenFixture(from: options.goldenPath)
+            progress(
+                "golden load complete cases=\(golden.totalCorrectnessCaseCount) "
+                    + "benchmark_oracle=\(golden.benchmark == nil ? "missing" : "present")"
+            )
+
+            guard let benchmarkGolden = golden.benchmark else {
+                throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
+            }
+            let promptPlan = try BenchmarkPrompt.plan(from: benchmarkGolden)
+            progress(
+                "benchmark oracle ready prefill_tokens=\(promptPlan.prefillTokens.count) "
+                    + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
+                    + "decode_tokens=\(options.benchmarkDecodeSteps)"
+            )
+            peakRamGB = 0
+            lastExpertStats = .zero
+
+            let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
+            progress("timed benchmark start")
+            progress("benchmark prefill worker start")
+            let prefillSecondsPerToken: Double
+            do {
+                let prefillWorker = try RuntimeWorkerClient(
+                    options: workerOptions,
+                    weightsPath: options.weightsPath
+                )
+                defer {
+                    prefillWorker.close()
+                }
+                prefillSecondsPerToken = try measureWorkerPrefillSecondsPerToken(
+                    promptTokens: promptPlan.prefillTokens,
+                    expectedToken: promptPlan.expectedPrefillToken,
+                    worker: prefillWorker,
+                    progress: progress,
+                    peakRamGB: &peakRamGB,
+                    expertStats: &lastExpertStats
+                )
+            }
+            progress("benchmark decode worker start")
+            let decode: DecodeMeasurement
+            do {
+                let decodeWorker = try RuntimeWorkerClient(
+                    options: workerOptions,
+                    weightsPath: options.weightsPath
+                )
+                defer {
+                    decodeWorker.close()
+                }
+                decode = try measureWorkerDecode(
+                    seedTokens: promptPlan.decodeSeedTokens,
+                    expectedSeedToken: promptPlan.expectedDecodeSeedToken,
+                    expectedTokens: promptPlan.expectedDecodeTokens,
+                    decodeSteps: options.benchmarkDecodeSteps,
+                    worker: decodeWorker,
+                    progress: progress,
+                    peakRamGB: &peakRamGB,
+                    expertStats: &lastExpertStats
+                )
+            }
+            timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
+            let score = BenchmarkScore.score(
+                decodeSecondsPerToken: decode.secondsPerToken,
+                prefillSecondsPerToken: prefillSecondsPerToken
+            )
+            let decodeSpeedup = BenchmarkScore.speedup(
+                baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+                candidateSecondsPerToken: decode.secondsPerToken
+            )
+            let prefillSpeedup = BenchmarkScore.speedup(
+                baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+                candidateSecondsPerToken: prefillSecondsPerToken
+            )
+
             progress("weights digest start")
             transformedWeightsDigest = try directoryDigest(
                 rootPath: options.weightsPath,
@@ -1093,12 +1168,38 @@ public enum DeepSeekRuntime {
                 )
             }
 
-            progress("golden load start")
-            let golden = try loadGoldenFixture(from: options.goldenPath)
-            progress(
-                "golden load complete cases=\(golden.totalCorrectnessCaseCount) "
-                    + "benchmark_oracle=\(golden.benchmark == nil ? "missing" : "present")"
-            )
+            guard score.isFinite, score >= 0 else {
+                return makeFailedScore(
+                    error: "computed score was not finite",
+                    correctness: correctnessReport,
+                    passedCorrectness: false,
+                    peakRamGB: peakRamGB,
+                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                    decodeSecondsPerToken: decode.secondsPerToken,
+                    prefillSecondsPerToken: prefillSecondsPerToken,
+                    bandwidthSource: decode.bandwidthSource
+                )
+            }
+            guard BenchmarkScore.passesSpeedupFloors(
+                decodeSpeedup: decodeSpeedup,
+                prefillSpeedup: prefillSpeedup
+            ) else {
+                return makeFailedScore(
+                    error: speedupFloorFailureMessage(
+                        decodeSpeedup: decodeSpeedup,
+                        prefillSpeedup: prefillSpeedup
+                    ),
+                    correctness: correctnessReport,
+                    passedCorrectness: false,
+                    peakRamGB: peakRamGB,
+                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                    decodeSecondsPerToken: decode.secondsPerToken,
+                    prefillSecondsPerToken: prefillSecondsPerToken,
+                    bandwidthSource: decode.bandwidthSource
+                )
+            }
+            let benchmarkPeakRamGB = peakRamGB
+            let benchmarkExpertStats = lastExpertStats
 
             let correctnessStart = DispatchTime.now().uptimeNanoseconds
             progress("correctness start cases=\(golden.totalCorrectnessCaseCount)")
@@ -1122,8 +1223,6 @@ public enum DeepSeekRuntime {
                 )
             }
             correctnessSeconds = secondsSince(correctnessStart)
-            lastExpertStats = correctnessResult.expertStats
-            peakRamGB = max(peakRamGB, correctnessResult.peakRamGB)
             let correctness = correctnessResult.report
             correctnessReport = correctness
             progress(
@@ -1145,90 +1244,8 @@ public enum DeepSeekRuntime {
                 return makeFailedScore(
                     error: correctness.error.isEmpty ? "correctness gate failed" : correctness.error,
                     correctness: correctness,
-                    passedCorrectness: false
-                )
-            }
-            guard correctnessResult.gpqaTTFT.caseCount == 0 || correctnessResult.gpqaTTFT.passed else {
-                return makeFailedScore(
-                    error: "hidden GPQA TTFT gate failed",
-                    correctness: correctness,
-                    passedCorrectness: true
-                )
-            }
-
-            guard let benchmarkGolden = golden.benchmark else {
-                throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
-            }
-            let promptPlan = try BenchmarkPrompt.plan(from: benchmarkGolden)
-            progress(
-                "benchmark oracle ready prefill_tokens=\(promptPlan.prefillTokens.count) "
-                    + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
-                    + "decode_tokens=\(options.benchmarkDecodeSteps)"
-            )
-            progress("benchmark worker start")
-            let benchmarkWorker = try RuntimeWorkerClient(
-                options: workerOptions,
-                weightsPath: options.weightsPath
-            )
-            defer {
-                benchmarkWorker.close()
-            }
-            peakRamGB = 0
-            lastExpertStats = .zero
-
-            let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
-            progress("timed benchmark start")
-            let prefillSecondsPerToken = try measureWorkerPrefillSecondsPerToken(
-                promptTokens: promptPlan.prefillTokens,
-                expectedToken: promptPlan.expectedPrefillToken,
-                worker: benchmarkWorker,
-                progress: progress,
-                peakRamGB: &peakRamGB,
-                expertStats: &lastExpertStats
-            )
-            let decode = try measureWorkerDecode(
-                seedTokens: promptPlan.decodeSeedTokens,
-                expectedSeedToken: promptPlan.expectedDecodeSeedToken,
-                expectedTokens: promptPlan.expectedDecodeTokens,
-                decodeSteps: options.benchmarkDecodeSteps,
-                worker: benchmarkWorker,
-                progress: progress,
-                peakRamGB: &peakRamGB,
-                expertStats: &lastExpertStats
-            )
-            timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
-            let score = BenchmarkScore.score(
-                decodeSecondsPerToken: decode.secondsPerToken,
-                prefillSecondsPerToken: prefillSecondsPerToken
-            )
-            let decodeSpeedup = BenchmarkScore.speedup(
-                baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
-                candidateSecondsPerToken: decode.secondsPerToken
-            )
-            let prefillSpeedup = BenchmarkScore.speedup(
-                baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken,
-                candidateSecondsPerToken: prefillSecondsPerToken
-            )
-
-            guard score.isFinite, score >= 0 else {
-                return makeFailedScore(
-                    error: "computed score was not finite",
-                    correctness: correctnessReport,
-                    passedCorrectness: true
-                )
-            }
-            guard BenchmarkScore.passesSpeedupFloors(
-                decodeSpeedup: decodeSpeedup,
-                prefillSpeedup: prefillSpeedup
-            ) else {
-                return makeFailedScore(
-                    error: speedupFloorFailureMessage(
-                        decodeSpeedup: decodeSpeedup,
-                        prefillSpeedup: prefillSpeedup
-                    ),
-                    correctness: correctnessReport,
-                    passedCorrectness: true,
-                    peakRamGB: peakRamGB,
+                    passedCorrectness: false,
+                    peakRamGB: benchmarkPeakRamGB,
                     bandwidthGBPerToken: decode.bandwidthGBPerToken,
                     decodeSecondsPerToken: decode.secondsPerToken,
                     prefillSecondsPerToken: prefillSecondsPerToken,
@@ -1236,6 +1253,20 @@ public enum DeepSeekRuntime {
                     gpqaTTFT: correctnessResult.gpqaTTFT
                 )
             }
+            guard correctnessResult.gpqaTTFT.caseCount == 0 || correctnessResult.gpqaTTFT.passed else {
+                return makeFailedScore(
+                    error: "hidden GPQA TTFT gate failed",
+                    correctness: correctness,
+                    passedCorrectness: true,
+                    peakRamGB: benchmarkPeakRamGB,
+                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                    decodeSecondsPerToken: decode.secondsPerToken,
+                    prefillSecondsPerToken: prefillSecondsPerToken,
+                    bandwidthSource: decode.bandwidthSource,
+                    gpqaTTFT: correctnessResult.gpqaTTFT
+                )
+            }
+
             progress(
                 "complete score=\(formatDouble(score)) "
                     + "decode_speedup=\(formatDouble(decodeSpeedup)) "
@@ -1246,7 +1277,7 @@ public enum DeepSeekRuntime {
 
             return passedScore(
                 score: score,
-                peakRamGB: peakRamGB,
+                peakRamGB: benchmarkPeakRamGB,
                 bandwidthGBPerToken: decode.bandwidthGBPerToken,
                 decodeSecondsPerToken: decode.secondsPerToken,
                 prefillSecondsPerToken: prefillSecondsPerToken,
@@ -1256,7 +1287,7 @@ public enum DeepSeekRuntime {
                 timedBenchmarkSeconds: timedBenchmarkSeconds,
                 numLayers: MLXFastConstants.numHiddenLayers,
                 correctness: correctness,
-                expertStats: lastExpertStats,
+                expertStats: benchmarkExpertStats,
                 bandwidthSource: decode.bandwidthSource,
                 weightsDigest: transformedWeightsDigest,
                 gpqaTTFT: correctnessResult.gpqaTTFT
@@ -1869,6 +1900,11 @@ public enum DeepSeekRuntime {
             decodeSteps: decodeSteps
         )
 
+        // Start the scored decode phase before prompt-specific warmup and seed
+        // prefill. Otherwise submitted model code can hide speculative work for
+        // future decode steps in setup that is not charged to the score.
+        let decodePhaseStart = DispatchTime.now().uptimeNanoseconds
+        progress?("decode measured start tokens=\(timingPlan.decodeSteps) includes_seed_prefill=true")
         progress?("decode warmup start seed_tokens=\(seedTokens.count)")
         let warmupCache = DeepSeekModelCache(config: weightCache.config)
         let warmupLogits = try DeepSeekModel.logits(
@@ -1903,8 +1939,6 @@ public enum DeepSeekRuntime {
         actualTokens.reserveCapacity(timingPlan.decodeSteps)
         let metricsBeforeDecode = weightCache.loader.expertStreamingMetrics?.snapshot()
         let validationDelayMS = try submissionValidationDelayMilliseconds()
-        let start = DispatchTime.now().uptimeNanoseconds
-        progress?("decode measured start tokens=\(timingPlan.decodeSteps)")
         if validationDelayMS > 0 {
             progress?("decode validation delay enabled milliseconds_per_token=\(validationDelayMS)")
         }
@@ -1943,7 +1977,7 @@ public enum DeepSeekRuntime {
             )
         }
 
-        let elapsed = secondsSince(start)
+        let elapsed = secondsSince(decodePhaseStart)
         let bandwidth = try expertStreamingBandwidthGBPerToken(
             before: metricsBeforeDecode,
             after: weightCache.loader.expertStreamingMetrics?.snapshot(),
@@ -1980,7 +2014,11 @@ public enum DeepSeekRuntime {
                 "benchmark decode oracle has \(expectedTokens.count) tokens; need at least \(decodeSteps)"
             )
         }
-        progress?("decode measured start tokens=\(decodeSteps)")
+        // The worker contains submitted model code, so do not trust
+        // worker-reported per-step timing as the score source. The trusted
+        // parent measures decode_begin plus checked decode steps as one phase.
+        let decodePhaseStart = DispatchTime.now().uptimeNanoseconds
+        progress?("decode measured start tokens=\(decodeSteps) includes_seed_prefill=true")
         let beginResponse = try worker.beginDecode(seedTokens: seedTokens)
         let statsBeforeDecode = beginResponse.expertStats
         expertStats = beginResponse.expertStats ?? expertStats
@@ -1998,7 +2036,6 @@ public enum DeepSeekRuntime {
         var actualTokens: [Int] = []
         actualTokens.reserveCapacity(decodeSteps)
         let validationDelayMS = try submissionValidationDelayMilliseconds()
-        var measuredSeconds = 0.0
         if validationDelayMS > 0 {
             progress?("decode validation delay enabled milliseconds_per_token=\(validationDelayMS)")
         }
@@ -2007,10 +2044,9 @@ public enum DeepSeekRuntime {
             let response = try worker.decodeStep(inputToken: inputToken)
             expertStats = response.expertStats ?? expertStats
             peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
-            guard let token = response.token, let elapsed = response.seconds else {
-                throw MLXFastError.invalidInput("runtime worker decode_step response missing token or seconds")
+            guard let token = response.token else {
+                throw MLXFastError.invalidInput("runtime worker decode_step response missing token")
             }
-            measuredSeconds += elapsed
             actualTokens.append(token)
             let expectedToken = expectedTokens[decodedStep]
             if token != expectedToken {
@@ -2039,6 +2075,7 @@ public enum DeepSeekRuntime {
             after: expertStats,
             decodedTokens: decodeSteps
         )
+        let measuredSeconds = secondsSince(decodePhaseStart)
         let secondsPerToken = measuredSeconds / Double(decodeSteps)
         let actualTokensComparison = BenchmarkOutputValidator.compareDecodeTokens(
             expectedTokens: Array(expectedTokens.prefix(decodeSteps)),
