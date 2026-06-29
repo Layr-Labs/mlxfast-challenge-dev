@@ -20,7 +20,7 @@ The benchmark entrypoint:
 4. Validates the benchmark prefill/decode tokens against the hidden benchmark
    oracle in `correctness_golden.json`.
 5. Measures prefill latency, 256-step greedy decode latency, MLX peak memory, and
-   `mactop` hardware DRAM bandwidth.
+   expert-streaming read-byte diagnostics.
 6. Writes `score.json` in the Darkbloom-compatible schema, plus
    `score.json.sha256` and `benchmark-integrity.json` audit sidecars.
 
@@ -144,22 +144,52 @@ There is no Python harness path.
 
 ## Correctness Gate
 
-Correctness is a hard gate. For each golden case, the prompt must contain
-exactly 512 token IDs. The harness runs cached greedy generation for 256
-tokens with temperature-zero behavior and compares token IDs exactly. The first
-mismatch records the case, step, expected token, and actual token in the failed
-report.
+Correctness is a hard gate. Each base golden case contains exactly 512 prompt
+token IDs and 256 expected continuation token IDs. The harness checks those
+continuation positions teacher-forced with temperature-zero behavior: after each
+accepted step it feeds the golden previous token back into the model. The first
+mismatch records only the case, step, expected token, and actual token in the
+failed report.
 
 The gate is intended as a first-stage filter: an implementation that fails it is
 not eligible for the longer benchmark.
 
-The gate intentionally does not port the earlier Python hidden-state or top-K
-logit comparison layers. The benchmark contract cares about the externally
-observable greedy token stream for a text-to-text DeepSeek V4 Flash run. Exact
-token-oracle checks are cleaner here because they validate the same output path
-that is timed by the benchmark, avoid ambiguous internal tensor choices around
-normalization/head-combination, and keep the hidden golden fixture small enough
-to manage privately.
+Private golden fixtures may add hidden `correctness_gates` on top of the base
+teacher-forced cases:
+
+- `anchors`: one-token checks at selected hidden contexts. These can require an
+  exact expected token, explicit accepted tokens, or a bounded top-logit rank
+  and delta for near-tie hardware cases.
+- `free_run`: short greedy continuations whose exact prefix must match. These
+  catch bugs that only appear when the model consumes its own generated tokens.
+- `behavior`: GPQA-style or instruction-following prompts whose answer is
+  checked exactly against precomputed accepted answer token sequences. Each
+  accepted answer sequence must have exactly `max_new_tokens` tokens.
+
+Full benchmark CI adds one more private layer after timing: it generates short
+answers for hidden GPQA cases and asks a Claude judge whether each candidate is
+semantically equivalent to the private reference answer. That semantic gate is
+pass/fail only and does not affect the timing score. The uploaded score records
+only aggregate semantic counts and the judge model name.
+
+The same hidden GPQA cases are also used for a TTFT guardrail: during the
+hidden behavior correctness pass, the workflow times prompt prefill through
+the first greedy answer token and verifies that the first token is accepted for
+that case. The uploaded score records only
+aggregate TTFT pass counts and timing statistics; first-token values and
+accepted token sets are not logged or artifacted.
+
+These layers keep the official gate mostly deterministic and token-based while
+adding a small semantic backstop against implementations that pass the exact
+prefix but damage answer meaning. The benchmark operator should keep private
+prompts, accepted answer sequences, reference answers, and judge transcripts
+outside the public repository.
+
+The gate intentionally does not port the earlier Python hidden-state comparison
+layer. The benchmark contract cares about the externally observable text-to-text
+DeepSeek V4 Flash output path, and hidden-state tensors are easier to make
+ambiguous around normalization/head-combination than token-level or logit-anchor
+checks.
 
 VLM/image inputs and speculative/MTP draft decoding are also out of scope for
 this challenge. They should only be added if the official benchmark contract
@@ -167,22 +197,36 @@ changes to score those paths.
 
 The hidden golden file also includes a benchmark oracle. The benchmark validates
 the greedy token after the fixed 512-token prefill prompt, the greedy token
-after the fixed 32-token decode seed, and all 256 tokens produced inside the
+after the fixed 512-token decode seed, and all 256 tokens produced inside the
 timed decode window before accepting a score.
 
 ## Score
 
 ```text
-cost = peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill_sec_per_token
-score = 1 / cost
+decode_speedup = baseline_decode_sec_per_token / decode_sec_per_token
+prefill_speedup = baseline_prefill_sec_per_token / prefill_sec_per_token
+score = decode_speedup^0.75 * prefill_speedup^0.25
 ```
 
-Higher is better. The component metrics remain in `score.json`, so operators can
-still inspect the raw cost factors that produced the score.
+Higher is better. A baseline implementation on the official runner scores about
+`1.0`. Decode is weighted more heavily because it dominates interactive
+generation, while prefill still contributes to the ranked score.
+The official run also enforces component floors:
 
-`bandwidth_GB_per_token` is measured with `mactop` hardware DRAM counters during
-the decode window. `setup.sh` installs `mactop` with Homebrew when needed; set
-`MLXFAST_MACTOP_BIN=/path/to/mactop` to use a local binary instead.
+```text
+decode_speedup >= 0.95
+prefill_speedup >= 0.95
+```
+
+With the current Blacksmith M4 baseline, those floors allow at most
+`3.177180971604` seconds/token for decode and `0.149183255724` seconds/token for
+prefill. A run below either floor fails eligibility even if the weighted score
+would otherwise be above baseline.
+
+`bandwidth_GB_per_token` is derived from measured expert-streaming file bytes
+during the decode window and is reported with
+`bandwidth_source=expert_streaming_reads`. Bandwidth, RAM, and expert-read
+metrics are diagnostics and guardrail candidates, not primary score factors.
 `score.json` also carries audit-only wall-clock phase timings, final process RSS,
 expert streaming counters, and transformed-weights digest fields. These values
 help operators review runs but do not change the score formula.
@@ -193,12 +237,11 @@ help operators review runs but do not change the score formula.
 swift test
 MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test
 swift build -c release
-.github/scripts/run-offline.sh .build/release/mlxfast-swift transform
+MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --output weights
 .build/release/mlxfast-swift correctness --weights weights
 .build/release/mlxfast-swift preflight
 .build/release/mlxfast-swift benchmark --score-path score.json
 .build/release/mlxfast-swift benchmark --quick --score-path score.json
-.build/release/mlxfast-swift make-golden --prompt-file /path/to/private_prompts.json --output correctness_golden.json  # organizer/offline
 .build/release/mlxfast-swift verify-transform
 .build/release/mlxfast-swift clone
 .build/release/mlxfast-swift link <benchmark-id-or-name>

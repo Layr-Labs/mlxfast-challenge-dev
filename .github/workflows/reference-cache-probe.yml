@@ -65,7 +65,6 @@ jobs:
       MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
       MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
       MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
-      MLXFAST_SKIP_MACTOP_INSTALL: "1"
       MLXFAST_SKIP_MLX_METALLIB: "1"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5

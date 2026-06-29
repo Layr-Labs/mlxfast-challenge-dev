@@ -46,6 +46,11 @@ on:
         required: false
         default: false
         type: boolean
+      calibrate_gpqa_reference:
+        description: "Maintainer-only: regenerate GPQA accepted_token_sequences on this Blacksmith runner and upload them to private R2."
+        required: false
+        default: false
+        type: boolean
       trace_correctness_step:
         description: "Optional maintainer diagnostic: trace logits at a 0-based correctness decode step. Disabled on submission branches."
         required: false
@@ -56,9 +61,8 @@ on:
         required: false
         default: "16"
         type: string
-
 concurrency:
-  group: benchmark-${{ github.ref }}-${{ inputs.preserve_golden_only && 'preserve-golden' || (inputs.run_benchmark && 'full' || 'correctness-only') }}
+  group: benchmark-${{ github.ref }}-${{ inputs.calibrate_gpqa_reference && 'calibrate-gpqa' || (inputs.preserve_golden_only && 'preserve-golden' || (inputs.run_benchmark && 'full' || 'correctness-only')) }}
   cancel-in-progress: true
 
 permissions:
@@ -72,18 +76,33 @@ jobs:
     env:
       MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
+      MLXFAST_GPQA_REFERENCE_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/gpqa_reference_cases.json
+      MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_answers.json
+      MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json
+      MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
+      MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}
       MLXFAST_RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
       MLXFAST_PRESERVE_GOLDEN_ONLY: ${{ inputs.preserve_golden_only && '1' || '0' }}
+      MLXFAST_CALIBRATE_GPQA_REFERENCE: ${{ inputs.calibrate_gpqa_reference && '1' || '0' }}
       MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 2a747bf797e16d58f5ffedacc0d4bf5ce0d14be00f2421dc04289a2154cb011d
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: "10320"
       MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json
+      MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases.json
+      MLXFAST_GPQA_CASE_COUNT: "9"
+      MLXFAST_GPQA_MAX_NEW_TOKENS: "1"
+      MLXFAST_GPQA_TTFT_CASE_COUNT: "9"
+      MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "9"
+      MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: "10"
+      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "8"
+      MLXFAST_SEMANTIC_GPQA_REQUIRED: "0"
+      MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 830670206859a1b221508ae44a031205a3eba6f5f13e05b40383bf781bdbf067
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "26110"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "256"
-      MLXFAST_EXPECTED_CORRECTNESS_CASES: "1"
+      MLXFAST_EXPECTED_CORRECTNESS_CASES: "10"
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
       MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
       MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}
@@ -133,7 +152,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$(dirname "${MLXFAST_CORRECTNESS_GOLDEN_PATH}")"
-          if [[ "${MLXFAST_RUN_BENCHMARK}" != "1" && "${MLXFAST_PRESERVE_GOLDEN_ONLY}" != "1" ]]; then
+          if [[ "${MLXFAST_CALIBRATE_GPQA_REFERENCE}" == "1" && "${MLXFAST_PRESERVE_GOLDEN_ONLY}" == "1" ]]; then
+            echo "benchmark: calibrate_gpqa_reference cannot be combined with preserve_golden_only" >&2
+            exit 1
+          fi
+          if [[ "${MLXFAST_CALIBRATE_GPQA_REFERENCE}" == "1" ]]; then
+            if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
+              echo "benchmark: GPQA calibration requires private R2 secrets" >&2
+              exit 1
+            fi
+            echo "benchmark: calibrating private GPQA reference on this runner"
+          elif [[ "${MLXFAST_RUN_BENCHMARK}" != "1" && "${MLXFAST_PRESERVE_GOLDEN_ONLY}" != "1" ]]; then
             test -s "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}"
             test -s "${MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH}"
             echo "benchmark: using checked-in public correctness golden"
@@ -143,6 +172,14 @@ jobs:
             echo "benchmark: using precomputed R2 private correctness golden"
           else
             echo "benchmark: correctness golden requires correctness_golden_url or private R2 secrets" >&2
+            exit 1
+          fi
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" && "${MLXFAST_PRESERVE_GOLDEN_ONLY}" != "1" && "${MLXFAST_CALIBRATE_GPQA_REFERENCE}" != "1" && "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
+            echo "benchmark: hidden GPQA behavior gate requires private R2 secrets" >&2
+            exit 1
+          fi
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" && "${MLXFAST_PRESERVE_GOLDEN_ONLY}" != "1" && "${MLXFAST_CALIBRATE_GPQA_REFERENCE}" != "1" && "${MLXFAST_ANTHROPIC_PRESENT}" != "1" ]]; then
+            echo "benchmark: semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
             exit 1
           fi
 
@@ -203,14 +240,22 @@ jobs:
             "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
             "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes"
 
-      - name: Upload preserved correctness golden metadata
+      - name: Stage preserved correctness golden metadata
+        id: stage_preserved_correctness_metadata
         if: inputs.preserve_golden_only
+        run: |
+          set -euo pipefail
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/correctness-golden-metadata" \
+            golden.sha256="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
+            golden.bytes="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes"
+
+      - name: Upload preserved correctness golden metadata
+        if: inputs.preserve_golden_only && steps.stage_preserved_correctness_metadata.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: correctness-golden-metadata-${{ github.run_id }}
-          path: |
-            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.sha256
-            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.bytes
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/correctness-golden-metadata
           if-no-files-found: error
 
       - name: Setup Swift harness and reference checkpoint
@@ -225,11 +270,17 @@ jobs:
 
       - name: Transform reference checkpoint
         if: ${{ !inputs.preserve_golden_only }}
-        run: .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --reference "${MLXFAST_REFERENCE_DIR}"
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" \
+            --output weights
 
       - name: Prepare correctness golden
         id: prepare-correctness-golden
-        if: ${{ !inputs.preserve_golden_only }}
+        if: ${{ !inputs.preserve_golden_only && !inputs.calibrate_gpqa_reference }}
         env:
           MLXFAST_CORRECTNESS_GOLDEN_URL: ${{ inputs.correctness_golden_url || secrets.MLXFAST_CORRECTNESS_GOLDEN_URL }}
           MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER: ${{ secrets.MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER }}
@@ -279,7 +330,18 @@ jobs:
             echo "benchmark: correctness golden missing; configure correctness_golden_url or private R2 correctness_golden.json" >&2
             exit 1
           fi
-          if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_URL:-}" && "${MLXFAST_RUN_BENCHMARK}" == "1" && "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
+            echo "benchmark: downloading precomputed R2 GPQA behavior cases"
+            .github/scripts/download-r2-object.sh \
+              "${MLXFAST_GPQA_R2_PATH}" \
+              "${MLXFAST_GPQA_REFERENCE_PATH}"
+            .build/release/mlxfast-swift attach-gpqa-gates \
+              --golden "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
+              --gpqa "${MLXFAST_GPQA_REFERENCE_PATH}" \
+              --tokenizer weights \
+              --output "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
+              --case-count "${MLXFAST_GPQA_CASE_COUNT}" \
+              --max-new-tokens "${MLXFAST_GPQA_MAX_NEW_TOKENS}"
             actual_hash="$(shasum -a 256 "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | awk '{print $1}')"
             actual_bytes="$(wc -c < "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | tr -d ' ')"
             export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256="${actual_hash}"
@@ -288,12 +350,50 @@ jobs:
               echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"
               echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"
             } >> "${GITHUB_ENV}"
-            echo "benchmark: using private correctness golden ${actual_hash} bytes=${actual_bytes}"
+            echo "benchmark: using private GPQA-augmented correctness golden ${actual_hash} bytes=${actual_bytes}"
           fi
           .github/scripts/verify-correctness-golden.sh
 
+      - name: Calibrate GPQA reference
+        if: ${{ !inputs.preserve_golden_only && inputs.calibrate_gpqa_reference }}
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          input_path="${MLXFAST_GPQA_REFERENCE_PATH}.input"
+          output_path="${MLXFAST_GPQA_REFERENCE_PATH}.calibrated"
+          echo "benchmark: downloading private GPQA reference cases for calibration"
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_GPQA_R2_PATH}" \
+            "${input_path}"
+          if ! .build/release/mlxfast-swift calibrate-gpqa-gates \
+              --gpqa "${input_path}" \
+              --weights weights \
+              --tokenizer weights \
+              --output "${output_path}" \
+              --case-count "${MLXFAST_GPQA_CASE_COUNT}" \
+              --max-new-tokens "${MLXFAST_GPQA_MAX_NEW_TOKENS}" \
+              > "${RUNNER_TEMP}/mlxfast-gpqa-calibration-private.log" 2>&1; then
+            echo "benchmark: hidden GPQA calibration failed" >&2
+            exit 1
+          fi
+          jq -e \
+            --argjson case_count "${MLXFAST_GPQA_CASE_COUNT}" \
+            '
+            .status == "calibrated_reference_outputs"
+            and (.cases | length) >= $case_count
+            and ([.cases[:$case_count][] | (.accepted_token_sequences // []) | length > 0] | all)
+            ' \
+            "${output_path}" >/dev/null
+          .github/scripts/upload-r2-object.sh \
+            "${MLXFAST_GPQA_R2_PATH}" \
+            "${output_path}"
+          echo "benchmark: uploaded calibrated GPQA reference cases to private R2"
+
       - name: Correctness
-        if: ${{ !inputs.preserve_golden_only && !inputs.run_benchmark }}
+        if: ${{ !inputs.preserve_golden_only && !inputs.run_benchmark && !inputs.calibrate_gpqa_reference }}
         env:
           MLXFAST_SUBMISSION_REF: ${{ inputs.submission_ref }}
         run: |
@@ -323,13 +423,13 @@ jobs:
 
       - name: Validate correctness artifacts
         id: validate_correctness_artifacts
-        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark
+        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && !inputs.calibrate_gpqa_reference
         run: |
           set -euo pipefail
           test -s correctness-report.json
           jq -e \
             --arg golden_hash "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}" \
-            --argjson correctness_steps "${MLXFAST_EXPECTED_CORRECTNESS_STEPS}" \
+            --argjson checked_steps "${MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS}" \
             --argjson correctness_cases "${MLXFAST_EXPECTED_CORRECTNESS_CASES}" \
             '
             def same_keys($expected):
@@ -354,7 +454,7 @@ jobs:
               "passed"
             ])
             and .passed == true
-            and .checked_steps == $correctness_steps
+            and .checked_steps == $checked_steps
             and .case_count == $correctness_cases
             and .golden_hash == $golden_hash
             and .error == ""
@@ -366,7 +466,7 @@ jobs:
             correctness-report.json >/dev/null
 
       - name: Benchmark
-        if: ${{ !inputs.preserve_golden_only && inputs.run_benchmark }}
+        if: ${{ !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference }}
         env:
           MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
           MLXFAST_SKIP_TRANSFORM: "1"
@@ -389,13 +489,42 @@ jobs:
             ./benchmark.sh
           fi
 
+      - name: Generate semantic GPQA answers
+        if: ${{ !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference }}
+        run: |
+          set -euo pipefail
+          echo "benchmark: generating hidden semantic GPQA candidate answers"
+          if ! .build/release/mlxfast-swift generate-gpqa-answers \
+              --gpqa "${MLXFAST_GPQA_REFERENCE_PATH}" \
+              --weights weights \
+              --tokenizer weights \
+              --output "${MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH}" \
+              --case-count "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT}" \
+              --max-new-tokens "${MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS}" \
+              > "${RUNNER_TEMP}/mlxfast-semantic-gpqa-private.log" 2>&1; then
+            echo "benchmark: hidden semantic GPQA candidate generation failed" >&2
+            exit 1
+          fi
+
+      - name: Semantic GPQA gate
+        if: ${{ !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+            echo "benchmark: semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
+            exit 1
+          fi
+          .github/scripts/run-semantic-gpqa-gate.sh
+
       - name: Validate benchmark artifacts
         id: validate_benchmark_artifacts
-        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark
+        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference
         run: .github/scripts/validate-benchmark-artifacts.sh
 
       - name: Trace correctness mismatch
-        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && inputs.trace_correctness_step != '' && inputs.submission_ref == '' && !startsWith(github.ref_name, 'submissions/')
+        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && !inputs.calibrate_gpqa_reference && inputs.trace_correctness_step != '' && inputs.submission_ref == '' && !startsWith(github.ref_name, 'submissions/')
         run: |
           set -euo pipefail
           .build/release/mlxfast-swift correctness-trace \
@@ -406,7 +535,7 @@ jobs:
             > correctness-trace.json
 
       - name: Check benchmark artifact paths
-        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success'
+        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference && hashFiles('score.json') != '' && hashFiles('score.json.sha256') != '' && hashFiles('benchmark-integrity.json') != ''
         run: |
           set -euo pipefail
           .github/scripts/deny-private-artifacts.sh \
@@ -416,21 +545,29 @@ jobs:
             score.json.sha256 \
             benchmark-integrity.json
 
+      - name: Stage benchmark artifacts
+        id: stage_benchmark_artifacts
+        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference && hashFiles('score.json') != '' && hashFiles('score.json.sha256') != '' && hashFiles('benchmark-integrity.json') != ''
+        run: |
+          set -euo pipefail
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/benchmark-results" \
+            golden.sha256="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
+            golden.bytes="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes" \
+            score.json=score.json \
+            score.sha256=score.json.sha256 \
+            benchmark-integrity.json=benchmark-integrity.json
+
       - name: Upload benchmark artifacts
-        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success'
+        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference && steps.stage_benchmark_artifacts.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: benchmark-results-${{ github.run_id }}
-          path: |
-            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.sha256
-            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.bytes
-            score.json
-            score.json.sha256
-            benchmark-integrity.json
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results
           if-no-files-found: error
 
       - name: Check correctness artifact paths
-        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && (inputs.submission_ref == '' || steps.validate_correctness_artifacts.outcome == 'success')
+        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && !inputs.calibrate_gpqa_reference && (inputs.submission_ref == '' || steps.validate_correctness_artifacts.outcome == 'success')
         run: |
           set -euo pipefail
           .github/scripts/deny-private-artifacts.sh \
@@ -438,27 +575,44 @@ jobs:
             "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
             "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes"
 
+      - name: Stage correctness artifacts
+        id: stage_correctness_artifacts
+        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && !inputs.calibrate_gpqa_reference && (inputs.submission_ref == '' || steps.validate_correctness_artifacts.outcome == 'success')
+        run: |
+          set -euo pipefail
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/correctness-results" \
+            correctness-report.json=correctness-report.json \
+            golden.sha256="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
+            golden.bytes="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes"
+
       - name: Upload correctness artifacts
-        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && (inputs.submission_ref == '' || steps.validate_correctness_artifacts.outcome == 'success')
+        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && !inputs.calibrate_gpqa_reference && steps.stage_correctness_artifacts.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: correctness-results-${{ github.run_id }}
-          path: |
-            correctness-report.json
-            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.sha256
-            ${{ env.MLXFAST_CORRECTNESS_GOLDEN_PATH }}.bytes
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/correctness-results
           if-no-files-found: error
 
       - name: Check correctness trace artifact paths
-        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && inputs.trace_correctness_step != '' && inputs.submission_ref == '' && !startsWith(github.ref_name, 'submissions/')
+        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && !inputs.calibrate_gpqa_reference && inputs.trace_correctness_step != '' && inputs.submission_ref == '' && !startsWith(github.ref_name, 'submissions/')
         run: |
           set -euo pipefail
           .github/scripts/deny-private-artifacts.sh correctness-trace.json
 
+      - name: Stage correctness trace artifact
+        id: stage_correctness_trace_artifact
+        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && !inputs.calibrate_gpqa_reference && inputs.trace_correctness_step != '' && inputs.submission_ref == '' && !startsWith(github.ref_name, 'submissions/')
+        run: |
+          set -euo pipefail
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/correctness-trace" \
+            correctness-trace.json=correctness-trace.json
+
       - name: Upload correctness trace artifact
-        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && inputs.trace_correctness_step != '' && inputs.submission_ref == '' && !startsWith(github.ref_name, 'submissions/')
+        if: always() && !inputs.preserve_golden_only && !inputs.run_benchmark && !inputs.calibrate_gpqa_reference && steps.stage_correctness_trace_artifact.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: correctness-trace-${{ github.run_id }}
-          path: correctness-trace.json
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/correctness-trace
           if-no-files-found: error

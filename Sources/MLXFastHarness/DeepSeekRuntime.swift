@@ -37,6 +37,18 @@ public struct CorrectnessTraceOptions: Equatable {
     }
 }
 
+public struct GreedyGenerationOptions: Equatable {
+    public let weightsPath: String
+    public let promptTokens: [Int]
+    public let steps: Int
+
+    public init(weightsPath: String, promptTokens: [Int], steps: Int) {
+        self.weightsPath = weightsPath
+        self.promptTokens = promptTokens
+        self.steps = steps
+    }
+}
+
 public struct CorrectnessTraceLogit: Codable, Equatable {
     public let token: Int
     public let logit: Double
@@ -250,6 +262,50 @@ private struct BenchmarkTokenMismatchError: Error, CustomStringConvertible {
 }
 
 public enum DeepSeekRuntime {
+    public static func generateGreedyTokens(
+        _ options: GreedyGenerationOptions,
+        progress: ((Int, Int) -> Void)? = nil
+    ) throws -> [Int] {
+        try generateGreedyTokens(options, worker: nil, progress: progress)
+    }
+
+    public static func generateGreedyTokens(
+        _ options: GreedyGenerationOptions,
+        worker workerOptions: RuntimeWorkerOptions?,
+        progress: ((Int, Int) -> Void)? = nil
+    ) throws -> [Int] {
+        if let workerOptions {
+            let worker = try RuntimeWorkerClient(options: workerOptions, weightsPath: options.weightsPath)
+            defer {
+                worker.close()
+            }
+            let response = try worker.generateCorrectness(
+                promptTokens: options.promptTokens,
+                steps: options.steps
+            )
+            guard let tokens = response.tokens else {
+                throw MLXFastError.invalidInput("runtime worker greedy generation response missing tokens")
+            }
+            try requireGeneratedTokenCount(tokens.count, expected: options.steps, label: "greedy generation")
+            progress?(tokens.count, options.steps)
+            return tokens
+        }
+
+        let config = try DeepSeekConfig.load(from: options.weightsPath)
+        let loader = try DeepSeekWeightLoader(
+            weightsPath: options.weightsPath,
+            expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: true)
+        )
+        let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
+        return try generateGreedyCached(
+            promptTokens: options.promptTokens,
+            steps: options.steps,
+            weightCache: weightCache,
+            progressIntervalSteps: 1,
+            progress: progress
+        )
+    }
+
     public static func runCorrectness(
         _ options: CorrectnessOptions,
         worker: RuntimeWorkerOptions? = nil
@@ -270,15 +326,15 @@ public enum DeepSeekRuntime {
             )
             loader = runtimeLoader
             let weightCache = DeepSeekRuntimeWeightCache(loader: runtimeLoader, config: config)
-            return runCorrectness(
-                cases: golden.cases,
+            return runLayeredCorrectness(
+                golden: golden,
                 weightCache: weightCache,
-                goldenHash: golden.sha256
+                steps: MLXFastConstants.correctnessSteps
             )
         } catch {
             return failedCorrectnessReport(
                 checkedSteps: 0,
-                caseCount: loadedGolden?.cases.count ?? 0,
+                caseCount: loadedGolden?.totalCorrectnessCaseCount ?? 0,
                 goldenHash: loadedGolden?.sha256 ?? "",
                 expertStats: expertStats(from: loader),
                 error: "\(error)"
@@ -293,7 +349,6 @@ public enum DeepSeekRuntime {
         var loadedGolden: GoldenFixture?
         var lastExpertStats = ExpertStreamingStats.zero
         var checkedSteps = 0
-        var currentCase: GoldenCase?
         do {
             try requireRegularFile(options.weightsPath + "/config.json", description: "transformed config")
             try requireRegularFile(options.goldenPath, description: "correctness golden file")
@@ -306,61 +361,18 @@ public enum DeepSeekRuntime {
             defer {
                 worker.close()
             }
-
-            for testCase in golden.cases {
-                currentCase = testCase
-                let result = try compareTeacherForcedWithWorker(
-                    testCase: testCase,
-                    worker: worker
-                )
-                lastExpertStats = result.expertStats
-                let comparison = result.comparison
-                checkedSteps += comparison.checkedSteps
-                if !comparison.passed {
-                    return CorrectnessReport(
-                        passed: false,
-                        checkedSteps: checkedSteps,
-                        caseCount: golden.cases.count,
-                        expertCacheHits: lastExpertStats.cacheHits,
-                        expertCacheMisses: lastExpertStats.cacheMisses,
-                        expertCacheEvictions: lastExpertStats.cacheEvictions,
-                        expertBytesRead: lastExpertStats.bytesRead,
-                        expertReadSeconds: lastExpertStats.readSeconds,
-                        expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
-                        expertHitRate: lastExpertStats.hitRate,
-                        firstFailingCase: testCase.name,
-                        firstFailingStep: comparison.firstFailingStep,
-                        expectedToken: comparison.expectedToken,
-                        actualToken: comparison.actualToken,
-                        goldenHash: golden.sha256,
-                        error: "teacher-forced token mismatch"
-                    )
-                }
-            }
-
-            return CorrectnessReport(
-                passed: true,
-                checkedSteps: checkedSteps,
-                caseCount: golden.cases.count,
-                expertCacheHits: lastExpertStats.cacheHits,
-                expertCacheMisses: lastExpertStats.cacheMisses,
-                expertCacheEvictions: lastExpertStats.cacheEvictions,
-                expertBytesRead: lastExpertStats.bytesRead,
-                expertReadSeconds: lastExpertStats.readSeconds,
-                expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
-                expertHitRate: lastExpertStats.hitRate,
-                firstFailingCase: nil,
-                firstFailingStep: nil,
-                expectedToken: nil,
-                actualToken: nil,
-                goldenHash: golden.sha256,
-                error: ""
+            let result = runLayeredCorrectnessWithWorker(
+                golden: golden,
+                worker: worker,
+                steps: MLXFastConstants.correctnessSteps
             )
+            checkedSteps = result.report.checkedSteps
+            lastExpertStats = result.expertStats
+            return result.report
         } catch {
             return failedCorrectnessReport(
                 checkedSteps: checkedSteps,
-                caseCount: loadedGolden?.cases.count ?? 0,
-                firstFailingCase: currentCase?.name,
+                caseCount: loadedGolden?.totalCorrectnessCaseCount ?? 0,
                 goldenHash: loadedGolden?.sha256 ?? "",
                 expertStats: lastExpertStats,
                 error: "\(error)"
@@ -408,28 +420,50 @@ public enum DeepSeekRuntime {
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
+        // Keep protocol I/O off fd 0/1 so submitted model code cannot read
+        // future request nonces or spoof JSON responses with normal stdio.
+        let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
+        let sessionNonce = generateRuntimeWorkerNonce()
+        try protocolIO.writeLine(try encoder.encode(RuntimeWorkerResponse(
+            id: 0,
+            nonce: sessionNonce,
+            ok: true
+        )))
         var state = RuntimeWorkerState()
 
-        while let line = readLine(strippingNewline: true) {
+        while let line = try protocolIO.readLine() {
             guard !line.isEmpty else {
                 continue
             }
             let response: RuntimeWorkerResponse
             do {
                 let request = try decoder.decode(RuntimeWorkerRequest.self, from: Data(line.utf8))
-                response = try handleWorkerRequest(request, weightCache: weightCache, state: &state)
+                do {
+                    response = try handleWorkerRequest(
+                        request,
+                        sessionNonce: sessionNonce,
+                        weightCache: weightCache,
+                        state: &state
+                    )
+                } catch {
+                    response = RuntimeWorkerResponse(
+                        id: request.id,
+                        nonce: sessionNonce,
+                        ok: false,
+                        error: "\(error)"
+                    )
+                }
             } catch {
-                response = RuntimeWorkerResponse(id: -1, ok: false, error: "\(error)")
+                response = RuntimeWorkerResponse(id: -1, nonce: sessionNonce, ok: false, error: "\(error)")
             }
             let data = try encoder.encode(response)
-            FileHandle.standardOutput.write(data)
-            FileHandle.standardOutput.write(Data([0x0a]))
-            fflush(stdout)
+            try protocolIO.writeLine(data)
         }
     }
 
     private static func handleWorkerRequest(
         _ request: RuntimeWorkerRequest,
+        sessionNonce: String,
         weightCache: DeepSeekRuntimeWeightCache,
         state: inout RuntimeWorkerState
     ) throws -> RuntimeWorkerResponse {
@@ -445,6 +479,7 @@ public enum DeepSeekRuntime {
             )
             return RuntimeWorkerResponse(
                 id: request.id,
+                nonce: sessionNonce,
                 ok: true,
                 tokens: tokens,
                 expertStats: expertStats(from: weightCache),
@@ -456,6 +491,7 @@ public enum DeepSeekRuntime {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing prompt_tokens")
             }
             let cache = DeepSeekModelCache(config: weightCache.config)
+            let start = DispatchTime.now().uptimeNanoseconds
             let logits = try DeepSeekModel.logits(
                 inputIDs: inputIDsArray(promptTokens),
                 weightCache: weightCache,
@@ -466,11 +502,69 @@ public enum DeepSeekRuntime {
             state.correctnessCache = cache
             state.correctnessPromptTokenCount = promptTokens.count
             state.correctnessStep = 0
+            let elapsed = secondsSince(start)
             return RuntimeWorkerResponse(
                 id: request.id,
+                nonce: sessionNonce,
                 ok: true,
                 token: token,
                 topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
+                seconds: elapsed,
+                expertStats: expertStats(from: weightCache),
+                peakRamGB: currentResidentMemoryGB()
+            )
+
+        case "correctness_teacher_forced_batch":
+            guard let promptTokens = request.promptTokens,
+                  let expectedTokens = request.expectedTokens,
+                  let steps = request.steps
+            else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker batched teacher-forced request missing prompt_tokens, expected_tokens, or steps"
+                )
+            }
+            guard !promptTokens.isEmpty else {
+                throw MLXFastError.invalidInput("runtime worker batched teacher-forced prompt_tokens must not be empty")
+            }
+            guard steps > 0 else {
+                throw MLXFastError.invalidInput("runtime worker batched teacher-forced steps must be positive")
+            }
+            guard expectedTokens.count >= steps else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker batched teacher-forced expected_tokens has \(expectedTokens.count) tokens; expected at least \(steps)"
+                )
+            }
+            let teacherForcedInput = promptTokens + Array(expectedTokens.prefix(max(steps - 1, 0)))
+            let cache = DeepSeekModelCache(config: weightCache.config)
+            let logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray(teacherForcedInput),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: 0
+            )
+            var tokens: [Int] = []
+            var topLogitRows: [[CorrectnessTraceLogit]] = []
+            tokens.reserveCapacity(steps)
+            topLogitRows.reserveCapacity(steps)
+            let firstLogitRow = promptTokens.count - 1
+            for step in 0..<steps {
+                let topLogits = try topLogits(
+                    from: logits,
+                    row: firstLogitRow + step,
+                    topK: MLXFastConstants.correctnessTopLogits
+                )
+                guard let token = topLogits.first?.token else {
+                    throw MLXFastError.invalidInput("runtime worker batched teacher-forced top logits missing token")
+                }
+                tokens.append(token)
+                topLogitRows.append(topLogits)
+            }
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                topLogitRows: topLogitRows,
+                tokens: tokens,
                 expertStats: expertStats(from: weightCache),
                 peakRamGB: currentResidentMemoryGB()
             )
@@ -492,6 +586,7 @@ public enum DeepSeekRuntime {
             state.correctnessStep += 1
             return RuntimeWorkerResponse(
                 id: request.id,
+                nonce: sessionNonce,
                 ok: true,
                 token: token,
                 topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
@@ -517,6 +612,7 @@ public enum DeepSeekRuntime {
             Memory.clearCache()
             return RuntimeWorkerResponse(
                 id: request.id,
+                nonce: sessionNonce,
                 ok: true,
                 token: token,
                 seconds: elapsed,
@@ -524,26 +620,10 @@ public enum DeepSeekRuntime {
                 peakRamGB: currentResidentMemoryGB()
             )
 
-        case "decode":
-            guard let seedTokens = request.seedTokens, let decodeSteps = request.decodeSteps else {
-                throw MLXFastError.invalidInput("runtime worker decode request missing seed_tokens or decode_steps")
+        case "decode_begin":
+            guard let seedTokens = request.seedTokens else {
+                throw MLXFastError.invalidInput("runtime worker decode_begin request missing seed_tokens")
             }
-            guard let expectedSeedToken = request.expectedSeedToken,
-                  let expectedTokens = request.expectedTokens else {
-                throw MLXFastError.invalidInput("runtime worker decode request missing expected benchmark tokens")
-            }
-            guard expectedTokens.count >= decodeSteps else {
-                throw MLXFastError.invalidInput(
-                    "runtime worker decode oracle has \(expectedTokens.count) tokens; need at least \(decodeSteps)"
-                )
-            }
-            let validationDelayMS = try request.validationDelayMilliseconds
-                ?? submissionValidationDelayMilliseconds()
-            guard validationDelayMS >= 0 else {
-                throw MLXFastError.invalidInput("runtime worker validation delay must be non-negative")
-            }
-            let timingPlan = try DecodeTimingPlan(seedTokenCount: seedTokens.count, decodeSteps: decodeSteps)
-
             let warmupCache = DeepSeekModelCache(config: weightCache.config)
             let warmupLogits = try DeepSeekModel.logits(
                 inputIDs: inputIDsArray(seedTokens),
@@ -555,49 +635,61 @@ public enum DeepSeekRuntime {
             Memory.clearCache()
 
             let cache = DeepSeekModelCache(config: weightCache.config)
-            var logits = try DeepSeekModel.logits(
+            let start = DispatchTime.now().uptimeNanoseconds
+            let logits = try DeepSeekModel.logits(
                 inputIDs: inputIDsArray(seedTokens),
                 weightCache: weightCache,
                 cache: cache,
                 positionOffset: 0
             )
-            var token = try DeepSeekCorrectness.greedyToken(from: logits)
+            let token = try DeepSeekCorrectness.greedyToken(from: logits)
             let seedToken = token
             cache.materializeCachedState()
-
-            var actualTokens: [Int] = []
-            actualTokens.reserveCapacity(timingPlan.decodeSteps)
-            let metricsBeforeDecode = weightCache.loader.expertStreamingMetrics?.snapshot()
-            let start = DispatchTime.now().uptimeNanoseconds
-            for decodedStep in 0..<timingPlan.decodeSteps {
-                let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
-                logits = try DeepSeekModel.logits(
-                    inputIDs: inputIDsArray([inputToken]),
-                    weightCache: weightCache,
-                    cache: cache,
-                    positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
-                )
-                token = try DeepSeekCorrectness.greedyToken(from: logits)
-                actualTokens.append(token)
-                if validationDelayMS > 0 {
-                    Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
-                }
-            }
+            state.decodeCache = cache
+            state.decodeSeedTokenCount = seedTokens.count
+            state.decodeStep = 0
             let elapsed = secondsSince(start)
-            let bandwidth = try expertStreamingBandwidthGBPerToken(
-                before: metricsBeforeDecode,
-                after: weightCache.loader.expertStreamingMetrics?.snapshot(),
-                decodedTokens: timingPlan.decodeSteps
-            )
+
             return RuntimeWorkerResponse(
                 id: request.id,
+                nonce: sessionNonce,
                 ok: true,
                 seedToken: seedToken,
-                tokens: actualTokens,
                 seconds: elapsed,
-                secondsPerToken: elapsed / Double(timingPlan.decodeSteps),
-                bandwidthGBPerToken: bandwidth.gbPerToken,
-                bandwidthSource: bandwidth.source,
+                expertStats: expertStats(from: weightCache),
+                peakRamGB: currentResidentMemoryGB()
+            )
+
+        case "decode_step":
+            guard let inputToken = request.token else {
+                throw MLXFastError.invalidInput("runtime worker decode_step request missing token")
+            }
+            guard let cache = state.decodeCache else {
+                throw MLXFastError.invalidInput("runtime worker decode_step before decode_begin")
+            }
+            let validationDelayMS = try submissionValidationDelayMilliseconds()
+            guard validationDelayMS >= 0 else {
+                throw MLXFastError.invalidInput("runtime worker validation delay must be non-negative")
+            }
+            let start = DispatchTime.now().uptimeNanoseconds
+            let logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray([inputToken]),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: state.decodeSeedTokenCount + state.decodeStep
+            )
+            let token = try DeepSeekCorrectness.greedyToken(from: logits)
+            if validationDelayMS > 0 {
+                Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
+            }
+            let elapsed = secondsSince(start)
+            state.decodeStep += 1
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                token: token,
+                seconds: elapsed,
                 expertStats: expertStats(from: weightCache),
                 peakRamGB: currentResidentMemoryGB()
             )
@@ -638,7 +730,13 @@ public enum DeepSeekRuntime {
             firstFailingStep explicitFirstFailingStep: Int? = nil,
             expectedToken explicitExpectedToken: Int? = nil,
             actualToken explicitActualToken: Int? = nil,
-            weightsDigest: DirectoryDigest? = nil
+            weightsDigest: DirectoryDigest? = nil,
+            peakRamGB: Double = 0,
+            bandwidthGBPerToken: Double = 0,
+            decodeSecondsPerToken: Double = 0,
+            prefillSecondsPerToken: Double = 0,
+            bandwidthSource: String = "",
+            gpqaTTFT: GPQATTFTSummary = .zero
         ) -> ScorePayload {
             progress("failed passed_correctness=\(passedCorrectness) error=\(redactedProgressError(error))")
             return failedScore(
@@ -655,7 +753,13 @@ public enum DeepSeekRuntime {
                 preflightSeconds: preflightSeconds,
                 correctnessSeconds: correctnessSeconds,
                 timedBenchmarkSeconds: timedBenchmarkSeconds,
-                processResidentMemoryGB: currentResidentMemoryGB()
+                processResidentMemoryGB: currentResidentMemoryGB(),
+                peakRamGB: peakRamGB,
+                bandwidthGBPerToken: bandwidthGBPerToken,
+                decodeSecondsPerToken: decodeSecondsPerToken,
+                prefillSecondsPerToken: prefillSecondsPerToken,
+                bandwidthSource: bandwidthSource,
+                gpqaTTFT: gpqaTTFT
             )
         }
 
@@ -683,7 +787,7 @@ public enum DeepSeekRuntime {
             progress("golden load start")
             let golden = try loadGoldenFixture(from: options.goldenPath)
             progress(
-                "golden load complete cases=\(golden.cases.count) "
+                "golden load complete cases=\(golden.totalCorrectnessCaseCount) "
                     + "benchmark_oracle=\(golden.benchmark == nil ? "missing" : "present")"
             )
             let config = try DeepSeekConfig.load(from: options.weightsPath)
@@ -694,11 +798,10 @@ public enum DeepSeekRuntime {
             )
             let correctnessCache = DeepSeekRuntimeWeightCache(loader: correctnessLoader, config: config)
             let correctnessStart = DispatchTime.now().uptimeNanoseconds
-            progress("correctness start cases=\(golden.cases.count)")
-            let correctness = runCorrectness(
-                cases: golden.cases,
+            progress("correctness start cases=\(golden.totalCorrectnessCaseCount)")
+            let correctness = runLayeredCorrectness(
+                golden: golden,
                 weightCache: correctnessCache,
-                goldenHash: golden.sha256,
                 steps: options.correctnessSteps,
                 progress: progress
             )
@@ -733,7 +836,6 @@ public enum DeepSeekRuntime {
                     + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
                     + "decode_tokens=\(options.benchmarkDecodeSteps)"
             )
-            let idleGBPerSecond = measureMactopIdleGBPerSecond(progress: progress)
 
             Memory.peakMemory = 0
             let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
@@ -750,16 +852,21 @@ public enum DeepSeekRuntime {
                 expectedTokens: promptPlan.expectedDecodeTokens,
                 decodeSteps: options.benchmarkDecodeSteps,
                 weightCache: benchmarkCache,
-                idleGBPerSecond: idleGBPerSecond,
                 progress: progress
             )
             timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
             let peakRamGB = Double(Memory.peakMemory) / Double(1 << 30)
             let score = BenchmarkScore.score(
-                peakRamGB: peakRamGB,
-                bandwidthGBPerToken: decode.bandwidthGBPerToken,
                 decodeSecondsPerToken: decode.secondsPerToken,
                 prefillSecondsPerToken: prefillSecondsPerToken
+            )
+            let decodeSpeedup = BenchmarkScore.speedup(
+                baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+                candidateSecondsPerToken: decode.secondsPerToken
+            )
+            let prefillSpeedup = BenchmarkScore.speedup(
+                baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+                candidateSecondsPerToken: prefillSecondsPerToken
             )
             let expertStats = expertStats(from: runtimeBenchmarkLoader)
 
@@ -772,8 +879,30 @@ public enum DeepSeekRuntime {
                     weightsDigest: transformedWeightsDigest
                 )
             }
+            guard BenchmarkScore.passesSpeedupFloors(
+                decodeSpeedup: decodeSpeedup,
+                prefillSpeedup: prefillSpeedup
+            ) else {
+                return makeFailedScore(
+                    error: speedupFloorFailureMessage(
+                        decodeSpeedup: decodeSpeedup,
+                        prefillSpeedup: prefillSpeedup
+                    ),
+                    correctness: correctnessReport,
+                    passedCorrectness: true,
+                    expertStats: expertStats,
+                    weightsDigest: transformedWeightsDigest,
+                    peakRamGB: peakRamGB,
+                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                    decodeSecondsPerToken: decode.secondsPerToken,
+                    prefillSecondsPerToken: prefillSecondsPerToken,
+                    bandwidthSource: decode.bandwidthSource
+                )
+            }
             progress(
                 "complete score=\(formatDouble(score)) "
+                    + "decode_speedup=\(formatDouble(decodeSpeedup)) "
+                    + "prefill_speedup=\(formatDouble(prefillSpeedup)) "
                     + "wall_seconds=\(formatSeconds(secondsSince(benchmarkStart))) "
                     + "timed_seconds=\(formatSeconds(timedBenchmarkSeconds))"
             )
@@ -792,7 +921,8 @@ public enum DeepSeekRuntime {
                 correctness: correctness,
                 expertStats: expertStats,
                 bandwidthSource: decode.bandwidthSource,
-                weightsDigest: transformedWeightsDigest
+                weightsDigest: transformedWeightsDigest,
+                gpqaTTFT: .zero
             )
         } catch let mismatch as BenchmarkTokenMismatchError {
             return makeFailedScore(
@@ -862,7 +992,13 @@ public enum DeepSeekRuntime {
             firstFailingCase explicitFirstFailingCase: String? = nil,
             firstFailingStep explicitFirstFailingStep: Int? = nil,
             expectedToken explicitExpectedToken: Int? = nil,
-            actualToken explicitActualToken: Int? = nil
+            actualToken explicitActualToken: Int? = nil,
+            peakRamGB: Double = 0,
+            bandwidthGBPerToken: Double = 0,
+            decodeSecondsPerToken: Double = 0,
+            prefillSecondsPerToken: Double = 0,
+            bandwidthSource: String = "",
+            gpqaTTFT: GPQATTFTSummary = .zero
         ) -> ScorePayload {
             progress("failed passed_correctness=\(passedCorrectness) error=\(redactedProgressError(error))")
             return failedScore(
@@ -879,7 +1015,13 @@ public enum DeepSeekRuntime {
                 preflightSeconds: preflightSeconds,
                 correctnessSeconds: correctnessSeconds,
                 timedBenchmarkSeconds: timedBenchmarkSeconds,
-                processResidentMemoryGB: currentResidentMemoryGB()
+                processResidentMemoryGB: currentResidentMemoryGB(),
+                peakRamGB: peakRamGB,
+                bandwidthGBPerToken: bandwidthGBPerToken,
+                decodeSecondsPerToken: decodeSecondsPerToken,
+                prefillSecondsPerToken: prefillSecondsPerToken,
+                bandwidthSource: bandwidthSource,
+                gpqaTTFT: gpqaTTFT
             )
         }
 
@@ -910,78 +1052,61 @@ public enum DeepSeekRuntime {
             progress("golden load start")
             let golden = try loadGoldenFixture(from: options.goldenPath)
             progress(
-                "golden load complete cases=\(golden.cases.count) "
+                "golden load complete cases=\(golden.totalCorrectnessCaseCount) "
                     + "benchmark_oracle=\(golden.benchmark == nil ? "missing" : "present")"
             )
 
-            progress("runtime worker start")
-            let worker = try RuntimeWorkerClient(
-                options: workerOptions,
-                weightsPath: options.weightsPath
-            )
-            defer {
-                worker.close()
-            }
-
             let correctnessStart = DispatchTime.now().uptimeNanoseconds
-            progress("correctness start cases=\(golden.cases.count)")
-            var checkedSteps = 0
-            var firstFailingCase: String?
-            var firstFailingComparison: CorrectnessTokenComparison?
-            for (caseIndex, testCase) in golden.cases.enumerated() {
-                let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
-                progress("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
-                let result = try compareTeacherForcedWithWorker(
-                    testCase: testCase,
-                    worker: worker,
-                    steps: options.correctnessSteps,
-                    progressIntervalSteps: 64,
-                    progress: { step, total in
-                        progress("correctness case \(caseLabel) checked \(step)/\(total) tokens")
-                    }
+            progress("correctness start cases=\(golden.totalCorrectnessCaseCount)")
+            progress("correctness worker start")
+            let correctnessResult: WorkerLayeredCorrectnessResult
+            do {
+                let correctnessWorker = try RuntimeWorkerClient(
+                    options: workerOptions,
+                    weightsPath: options.weightsPath
                 )
-                lastExpertStats = result.expertStats
-                peakRamGB = max(peakRamGB, result.peakRamGB)
-                let comparison = result.comparison
-                checkedSteps += comparison.checkedSteps
-                if !comparison.passed {
-                    firstFailingCase = testCase.name
-                    firstFailingComparison = comparison
-                    progress("correctness case \(caseLabel) failed step=\(comparison.firstFailingStep ?? -1)")
-                    break
+                defer {
+                    correctnessWorker.close()
                 }
-                progress("correctness case \(caseLabel) complete checked_steps=\(comparison.checkedSteps)")
+                correctnessResult = runLayeredCorrectnessWithWorker(
+                    golden: golden,
+                    worker: correctnessWorker,
+                    steps: options.correctnessSteps,
+                    progress: progress
+                )
             }
             correctnessSeconds = secondsSince(correctnessStart)
-            let correctness = CorrectnessReport(
-                passed: firstFailingComparison == nil,
-                checkedSteps: checkedSteps,
-                caseCount: golden.cases.count,
-                expertCacheHits: lastExpertStats.cacheHits,
-                expertCacheMisses: lastExpertStats.cacheMisses,
-                expertCacheEvictions: lastExpertStats.cacheEvictions,
-                expertBytesRead: lastExpertStats.bytesRead,
-                expertReadSeconds: lastExpertStats.readSeconds,
-                expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
-                expertHitRate: lastExpertStats.hitRate,
-                firstFailingCase: firstFailingCase,
-                firstFailingStep: firstFailingComparison?.firstFailingStep,
-                expectedToken: firstFailingComparison?.expectedToken,
-                actualToken: firstFailingComparison?.actualToken,
-                goldenHash: golden.sha256,
-                error: firstFailingComparison == nil ? "" : "teacher-forced token mismatch"
-            )
+            lastExpertStats = correctnessResult.expertStats
+            peakRamGB = max(peakRamGB, correctnessResult.peakRamGB)
+            let correctness = correctnessResult.report
             correctnessReport = correctness
             progress(
                 "correctness complete passed=\(correctness.passed) "
                     + "checked_steps=\(correctness.checkedSteps) "
                     + "seconds=\(formatSeconds(correctnessSeconds))"
             )
+            if correctnessResult.gpqaTTFT.caseCount > 0 {
+                let gpqaTTFT = correctnessResult.gpqaTTFT
+                progress(
+                    "gpqa ttft complete cases=\(gpqaTTFT.caseCount) "
+                        + "pass_count=\(gpqaTTFT.passCount) "
+                        + "mean_seconds=\(formatSeconds(gpqaTTFT.meanSeconds)) "
+                        + "p50_seconds=\(formatSeconds(gpqaTTFT.p50Seconds)) "
+                        + "max_seconds=\(formatSeconds(gpqaTTFT.maxSeconds))"
+                )
+            }
             guard correctness.passed else {
                 return makeFailedScore(
                     error: correctness.error.isEmpty ? "correctness gate failed" : correctness.error,
                     correctness: correctness,
                     passedCorrectness: false
+                )
+            }
+            guard correctnessResult.gpqaTTFT.caseCount == 0 || correctnessResult.gpqaTTFT.passed else {
+                return makeFailedScore(
+                    error: "hidden GPQA TTFT gate failed",
+                    correctness: correctness,
+                    passedCorrectness: true
                 )
             }
 
@@ -994,14 +1119,23 @@ public enum DeepSeekRuntime {
                     + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
                     + "decode_tokens=\(options.benchmarkDecodeSteps)"
             )
-            progress("mactop idle measurement skipped; runtime worker uses expert streaming byte fallback")
+            progress("benchmark worker start")
+            let benchmarkWorker = try RuntimeWorkerClient(
+                options: workerOptions,
+                weightsPath: options.weightsPath
+            )
+            defer {
+                benchmarkWorker.close()
+            }
+            peakRamGB = 0
+            lastExpertStats = .zero
 
             let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
             progress("timed benchmark start")
             let prefillSecondsPerToken = try measureWorkerPrefillSecondsPerToken(
                 promptTokens: promptPlan.prefillTokens,
                 expectedToken: promptPlan.expectedPrefillToken,
-                worker: worker,
+                worker: benchmarkWorker,
                 progress: progress,
                 peakRamGB: &peakRamGB,
                 expertStats: &lastExpertStats
@@ -1011,17 +1145,23 @@ public enum DeepSeekRuntime {
                 expectedSeedToken: promptPlan.expectedDecodeSeedToken,
                 expectedTokens: promptPlan.expectedDecodeTokens,
                 decodeSteps: options.benchmarkDecodeSteps,
-                worker: worker,
+                worker: benchmarkWorker,
                 progress: progress,
                 peakRamGB: &peakRamGB,
                 expertStats: &lastExpertStats
             )
             timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
             let score = BenchmarkScore.score(
-                peakRamGB: peakRamGB,
-                bandwidthGBPerToken: decode.bandwidthGBPerToken,
                 decodeSecondsPerToken: decode.secondsPerToken,
                 prefillSecondsPerToken: prefillSecondsPerToken
+            )
+            let decodeSpeedup = BenchmarkScore.speedup(
+                baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+                candidateSecondsPerToken: decode.secondsPerToken
+            )
+            let prefillSpeedup = BenchmarkScore.speedup(
+                baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+                candidateSecondsPerToken: prefillSecondsPerToken
             )
 
             guard score.isFinite, score >= 0 else {
@@ -1031,8 +1171,29 @@ public enum DeepSeekRuntime {
                     passedCorrectness: true
                 )
             }
+            guard BenchmarkScore.passesSpeedupFloors(
+                decodeSpeedup: decodeSpeedup,
+                prefillSpeedup: prefillSpeedup
+            ) else {
+                return makeFailedScore(
+                    error: speedupFloorFailureMessage(
+                        decodeSpeedup: decodeSpeedup,
+                        prefillSpeedup: prefillSpeedup
+                    ),
+                    correctness: correctnessReport,
+                    passedCorrectness: true,
+                    peakRamGB: peakRamGB,
+                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                    decodeSecondsPerToken: decode.secondsPerToken,
+                    prefillSecondsPerToken: prefillSecondsPerToken,
+                    bandwidthSource: decode.bandwidthSource,
+                    gpqaTTFT: correctnessResult.gpqaTTFT
+                )
+            }
             progress(
                 "complete score=\(formatDouble(score)) "
+                    + "decode_speedup=\(formatDouble(decodeSpeedup)) "
+                    + "prefill_speedup=\(formatDouble(prefillSpeedup)) "
                     + "wall_seconds=\(formatSeconds(secondsSince(benchmarkStart))) "
                     + "timed_seconds=\(formatSeconds(timedBenchmarkSeconds))"
             )
@@ -1051,7 +1212,8 @@ public enum DeepSeekRuntime {
                 correctness: correctness,
                 expertStats: lastExpertStats,
                 bandwidthSource: decode.bandwidthSource,
-                weightsDigest: transformedWeightsDigest
+                weightsDigest: transformedWeightsDigest,
+                gpqaTTFT: correctnessResult.gpqaTTFT
             )
         } catch let mismatch as BenchmarkTokenMismatchError {
             return makeFailedScore(
@@ -1072,19 +1234,88 @@ public enum DeepSeekRuntime {
         }
     }
 
-    private static func runCorrectness(
-        cases: [GoldenCase],
+    private struct WorkerLayeredCorrectnessResult {
+        let report: CorrectnessReport
+        let expertStats: ExpertStreamingStats
+        let peakRamGB: Double
+        let gpqaTTFT: GPQATTFTSummary
+    }
+
+    private struct GPQATTFTSummary {
+        static let zero = GPQATTFTSummary(passCount: 0, caseCount: 0, seconds: [])
+
+        let passCount: Int
+        let caseCount: Int
+        let seconds: [Double]
+
+        var passed: Bool {
+            caseCount > 0 && passCount == caseCount && seconds.count == caseCount
+        }
+
+        var source: String {
+            caseCount > 0 ? "hidden_gpqa_first_token" : ""
+        }
+
+        var meanSeconds: Double {
+            guard !seconds.isEmpty else {
+                return 0
+            }
+            return seconds.reduce(0, +) / Double(seconds.count)
+        }
+
+        var p50Seconds: Double {
+            guard !seconds.isEmpty else {
+                return 0
+            }
+            let sortedSeconds = seconds.sorted()
+            return sortedSeconds[sortedSeconds.count / 2]
+        }
+
+        var maxSeconds: Double {
+            seconds.max() ?? 0
+        }
+    }
+
+    private static func runLayeredCorrectness(
+        golden: GoldenFixture,
         weightCache: DeepSeekRuntimeWeightCache,
-        goldenHash: String,
         steps: Int = MLXFastConstants.correctnessSteps,
         progress: ((String) -> Void)? = nil
     ) -> CorrectnessReport {
+        let caseCount = golden.totalCorrectnessCaseCount
         var checkedSteps = 0
-        var currentCase: GoldenCase?
+        var currentCase: String?
+
+        func failure(
+            caseName: String,
+            comparison: CorrectnessTokenComparison,
+            error: String
+        ) -> CorrectnessReport {
+            let stats = expertStats(from: weightCache)
+            return CorrectnessReport(
+                passed: false,
+                checkedSteps: checkedSteps + comparison.checkedSteps,
+                caseCount: caseCount,
+                expertCacheHits: stats.cacheHits,
+                expertCacheMisses: stats.cacheMisses,
+                expertCacheEvictions: stats.cacheEvictions,
+                expertBytesRead: stats.bytesRead,
+                expertReadSeconds: stats.readSeconds,
+                expertPeakCachedTensors: stats.peakCachedTensors,
+                expertHitRate: stats.hitRate,
+                firstFailingCase: caseName,
+                firstFailingStep: comparison.firstFailingStep,
+                expectedToken: comparison.expectedToken,
+                actualToken: comparison.actualToken,
+                goldenHash: golden.sha256,
+                error: error
+            )
+        }
+
         do {
-            for (caseIndex, testCase) in cases.enumerated() {
-                currentCase = testCase
-                let caseLabel = "\(caseIndex + 1)/\(cases.count)"
+            for (caseIndex, testCase) in golden.cases.enumerated() {
+                currentCase = testCase.name
+                let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
                 progress?("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
                 let comparison = try compareTeacherForcedCached(
                     testCase: testCase,
@@ -1097,88 +1328,291 @@ public enum DeepSeekRuntime {
                 )
                 if !comparison.passed {
                     progress?("correctness case \(caseLabel) failed step=\(comparison.firstFailingStep ?? -1)")
-                    let expertStats = expertStats(from: weightCache)
-                    return CorrectnessReport(
-                        passed: false,
-                        checkedSteps: checkedSteps + comparison.checkedSteps,
-                        caseCount: cases.count,
-                        expertCacheHits: expertStats.cacheHits,
-                        expertCacheMisses: expertStats.cacheMisses,
-                        expertCacheEvictions: expertStats.cacheEvictions,
-                        expertBytesRead: expertStats.bytesRead,
-                        expertReadSeconds: expertStats.readSeconds,
-                        expertPeakCachedTensors: expertStats.peakCachedTensors,
-                        expertHitRate: expertStats.hitRate,
-                        firstFailingCase: testCase.name,
-                        firstFailingStep: comparison.firstFailingStep,
-                        expectedToken: comparison.expectedToken,
-                        actualToken: comparison.actualToken,
-                        goldenHash: goldenHash,
+                    return failure(
+                        caseName: testCase.name,
+                        comparison: comparison,
                         error: "teacher-forced token mismatch"
                     )
                 }
                 progress?("correctness case \(caseLabel) complete checked_steps=\(comparison.checkedSteps)")
                 checkedSteps += comparison.checkedSteps
             }
+
+            let gates = golden.correctnessGates
+            for (caseIndex, anchor) in (gates?.anchorCases ?? []).enumerated() {
+                currentCase = anchor.name
+                let caseLabel = "\(caseIndex + 1)/\(gates?.anchorCases.count ?? 0)"
+                progress?("correctness anchor \(caseLabel) start context_tokens=\(anchor.contextTokens.count)")
+                let comparison = try compareAnchorCached(anchor: anchor, weightCache: weightCache)
+                if !comparison.passed {
+                    progress?("correctness anchor \(caseLabel) failed")
+                    return failure(
+                        caseName: anchor.name,
+                        comparison: comparison,
+                        error: "anchor token mismatch"
+                    )
+                }
+                checkedSteps += comparison.checkedSteps
+                progress?("correctness anchor \(caseLabel) complete")
+            }
+
+            for (caseIndex, freeRun) in (gates?.freeRunCases ?? []).enumerated() {
+                currentCase = freeRun.name
+                let caseLabel = "\(caseIndex + 1)/\(gates?.freeRunCases.count ?? 0)"
+                progress?("correctness free-run \(caseLabel) start tokens=\(freeRun.expectedTokens.count)")
+                let comparison = try compareFreeRunCached(
+                    testCase: freeRun,
+                    weightCache: weightCache,
+                    progressIntervalSteps: 64,
+                    progress: { step, total in
+                        progress?("correctness free-run \(caseLabel) generated \(step)/\(total) tokens")
+                    }
+                )
+                if !comparison.passed {
+                    progress?("correctness free-run \(caseLabel) failed step=\(comparison.firstFailingStep ?? -1)")
+                    return failure(
+                        caseName: freeRun.name,
+                        comparison: comparison,
+                        error: "free-run token mismatch"
+                    )
+                }
+                checkedSteps += comparison.checkedSteps
+                progress?("correctness free-run \(caseLabel) complete checked_steps=\(comparison.checkedSteps)")
+            }
+
+            for (caseIndex, behavior) in (gates?.behaviorCases ?? []).enumerated() {
+                currentCase = behavior.name
+                let caseLabel = "\(caseIndex + 1)/\(gates?.behaviorCases.count ?? 0)"
+                progress?("correctness behavior \(caseLabel) start max_new_tokens=\(behavior.maxNewTokens)")
+                let comparison = try compareBehaviorCached(
+                    testCase: behavior,
+                    weightCache: weightCache
+                )
+                if !comparison.passed {
+                    progress?("correctness behavior \(caseLabel) failed step=\(comparison.firstFailingStep ?? -1)")
+                    return failure(
+                        caseName: behavior.name,
+                        comparison: comparison,
+                        error: "behavior answer mismatch"
+                    )
+                }
+                checkedSteps += comparison.checkedSteps
+                progress?("correctness behavior \(caseLabel) complete checked_steps=\(comparison.checkedSteps)")
+            }
         } catch {
             progress?("correctness error=\(redactedProgressError("\(error)"))")
             return failedCorrectnessReport(
                 checkedSteps: checkedSteps,
-                caseCount: cases.count,
-                firstFailingCase: currentCase?.name,
-                goldenHash: goldenHash,
+                caseCount: caseCount,
+                firstFailingCase: currentCase,
+                goldenHash: golden.sha256,
                 expertStats: expertStats(from: weightCache),
                 error: "\(error)"
             )
         }
 
-        let expertStats = expertStats(from: weightCache)
+        let stats = expertStats(from: weightCache)
         return CorrectnessReport(
             passed: true,
             checkedSteps: checkedSteps,
-            caseCount: cases.count,
-            expertCacheHits: expertStats.cacheHits,
-            expertCacheMisses: expertStats.cacheMisses,
-            expertCacheEvictions: expertStats.cacheEvictions,
-            expertBytesRead: expertStats.bytesRead,
-            expertReadSeconds: expertStats.readSeconds,
-            expertPeakCachedTensors: expertStats.peakCachedTensors,
-            expertHitRate: expertStats.hitRate,
+            caseCount: caseCount,
+            expertCacheHits: stats.cacheHits,
+            expertCacheMisses: stats.cacheMisses,
+            expertCacheEvictions: stats.cacheEvictions,
+            expertBytesRead: stats.bytesRead,
+            expertReadSeconds: stats.readSeconds,
+            expertPeakCachedTensors: stats.peakCachedTensors,
+            expertHitRate: stats.hitRate,
             firstFailingCase: nil,
             firstFailingStep: nil,
             expectedToken: nil,
             actualToken: nil,
-            goldenHash: goldenHash,
+            goldenHash: golden.sha256,
             error: ""
         )
+    }
+
+    private static func runLayeredCorrectnessWithWorker(
+        golden: GoldenFixture,
+        worker: RuntimeWorkerClient,
+        steps: Int = MLXFastConstants.correctnessSteps,
+        progress: ((String) -> Void)? = nil
+    ) -> WorkerLayeredCorrectnessResult {
+        let caseCount = golden.totalCorrectnessCaseCount
+        var checkedSteps = 0
+        var currentCase: String?
+        var lastExpertStats = ExpertStreamingStats.zero
+        var peakRamGB = 0.0
+        var gpqaTTFTPassCount = 0
+        var gpqaTTFTCaseCount = 0
+        var gpqaTTFTSeconds: [Double] = []
+
+        func result(report: CorrectnessReport) -> WorkerLayeredCorrectnessResult {
+            WorkerLayeredCorrectnessResult(
+                report: report,
+                expertStats: lastExpertStats,
+                peakRamGB: peakRamGB,
+                gpqaTTFT: GPQATTFTSummary(
+                    passCount: gpqaTTFTPassCount,
+                    caseCount: gpqaTTFTCaseCount,
+                    seconds: gpqaTTFTSeconds
+                )
+            )
+        }
+
+        func failure(
+            caseName: String,
+            comparison: CorrectnessTokenComparison,
+            error: String
+        ) -> WorkerLayeredCorrectnessResult {
+            result(report: CorrectnessReport(
+                passed: false,
+                checkedSteps: checkedSteps + comparison.checkedSteps,
+                caseCount: caseCount,
+                expertCacheHits: lastExpertStats.cacheHits,
+                expertCacheMisses: lastExpertStats.cacheMisses,
+                expertCacheEvictions: lastExpertStats.cacheEvictions,
+                expertBytesRead: lastExpertStats.bytesRead,
+                expertReadSeconds: lastExpertStats.readSeconds,
+                expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
+                expertHitRate: lastExpertStats.hitRate,
+                firstFailingCase: caseName,
+                firstFailingStep: comparison.firstFailingStep,
+                expectedToken: comparison.expectedToken,
+                actualToken: comparison.actualToken,
+                goldenHash: golden.sha256,
+                error: error
+            ))
+        }
+
+        do {
+            for (caseIndex, testCase) in golden.cases.enumerated() {
+                currentCase = testCase.name
+                let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
+                progress?("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
+                let check = try compareTeacherForcedWithWorker(
+                    testCase: testCase,
+                    worker: worker,
+                    steps: steps,
+                    progressIntervalSteps: 64,
+                    progress: { step, total in
+                        progress?("correctness case \(caseLabel) checked \(step)/\(total) tokens")
+                    }
+                )
+                lastExpertStats = check.expertStats
+                peakRamGB = max(peakRamGB, check.peakRamGB)
+                if !check.comparison.passed {
+                    progress?("correctness case \(caseLabel) failed step=\(check.comparison.firstFailingStep ?? -1)")
+                    return failure(
+                        caseName: testCase.name,
+                        comparison: check.comparison,
+                        error: "teacher-forced token mismatch"
+                    )
+                }
+                checkedSteps += check.comparison.checkedSteps
+                progress?("correctness case \(caseLabel) complete checked_steps=\(check.comparison.checkedSteps)")
+            }
+
+            let gates = golden.correctnessGates
+            for (caseIndex, anchor) in (gates?.anchorCases ?? []).enumerated() {
+                currentCase = anchor.name
+                let caseLabel = "\(caseIndex + 1)/\(gates?.anchorCases.count ?? 0)"
+                progress?("correctness anchor \(caseLabel) start context_tokens=\(anchor.contextTokens.count)")
+                let check = try compareAnchorWithWorker(anchor: anchor, worker: worker)
+                lastExpertStats = check.expertStats
+                peakRamGB = max(peakRamGB, check.peakRamGB)
+                if !check.comparison.passed {
+                    progress?("correctness anchor \(caseLabel) failed")
+                    return failure(
+                        caseName: anchor.name,
+                        comparison: check.comparison,
+                        error: "anchor token mismatch"
+                    )
+                }
+                checkedSteps += check.comparison.checkedSteps
+                progress?("correctness anchor \(caseLabel) complete")
+            }
+
+            for (caseIndex, freeRun) in (gates?.freeRunCases ?? []).enumerated() {
+                currentCase = freeRun.name
+                let caseLabel = "\(caseIndex + 1)/\(gates?.freeRunCases.count ?? 0)"
+                progress?("correctness free-run \(caseLabel) start tokens=\(freeRun.expectedTokens.count)")
+                let check = try compareFreeRunWithWorker(testCase: freeRun, worker: worker)
+                lastExpertStats = check.expertStats
+                peakRamGB = max(peakRamGB, check.peakRamGB)
+                if !check.comparison.passed {
+                    progress?("correctness free-run \(caseLabel) failed step=\(check.comparison.firstFailingStep ?? -1)")
+                    return failure(
+                        caseName: freeRun.name,
+                        comparison: check.comparison,
+                        error: "free-run token mismatch"
+                    )
+                }
+                checkedSteps += check.comparison.checkedSteps
+                progress?("correctness free-run \(caseLabel) complete checked_steps=\(check.comparison.checkedSteps)")
+            }
+
+            for (caseIndex, behavior) in (gates?.behaviorCases ?? []).enumerated() {
+                currentCase = behavior.name
+                let caseLabel = "\(caseIndex + 1)/\(gates?.behaviorCases.count ?? 0)"
+                progress?("correctness behavior \(caseLabel) start max_new_tokens=\(behavior.maxNewTokens)")
+                let check = try compareBehaviorWithWorker(testCase: behavior, worker: worker)
+                lastExpertStats = check.expertStats
+                peakRamGB = max(peakRamGB, check.peakRamGB)
+                if behavior.maxNewTokens == 1 {
+                    gpqaTTFTCaseCount += 1
+                    if check.comparison.passed, let ttftSeconds = check.ttftSeconds, ttftSeconds > 0 {
+                        gpqaTTFTPassCount += 1
+                        gpqaTTFTSeconds.append(ttftSeconds)
+                    }
+                }
+                if !check.comparison.passed {
+                    progress?("correctness behavior \(caseLabel) failed step=\(check.comparison.firstFailingStep ?? -1)")
+                    return failure(
+                        caseName: behavior.name,
+                        comparison: check.comparison,
+                        error: "behavior answer mismatch"
+                    )
+                }
+                checkedSteps += check.comparison.checkedSteps
+                progress?("correctness behavior \(caseLabel) complete checked_steps=\(check.comparison.checkedSteps)")
+            }
+        } catch {
+            progress?("correctness error=\(redactedProgressError("\(error)"))")
+            return result(report: failedCorrectnessReport(
+                checkedSteps: checkedSteps,
+                caseCount: caseCount,
+                firstFailingCase: currentCase,
+                goldenHash: golden.sha256,
+                expertStats: lastExpertStats,
+                error: "\(error)"
+            ))
+        }
+
+        return result(report: CorrectnessReport(
+            passed: true,
+            checkedSteps: checkedSteps,
+            caseCount: caseCount,
+            expertCacheHits: lastExpertStats.cacheHits,
+            expertCacheMisses: lastExpertStats.cacheMisses,
+            expertCacheEvictions: lastExpertStats.cacheEvictions,
+            expertBytesRead: lastExpertStats.bytesRead,
+            expertReadSeconds: lastExpertStats.readSeconds,
+            expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
+            expertHitRate: lastExpertStats.hitRate,
+            firstFailingCase: nil,
+            firstFailingStep: nil,
+            expectedToken: nil,
+            actualToken: nil,
+            goldenHash: golden.sha256,
+            error: ""
+        ))
     }
 
     private struct DecodeMeasurement {
         let secondsPerToken: Double
         let bandwidthGBPerToken: Double
         let bandwidthSource: String
-    }
-
-    private static func measureMactopIdleGBPerSecond(progress: ((String) -> Void)? = nil) -> Double? {
-        do {
-            progress?("mactop idle measurement start")
-            let idleSamples = try MactopSession.measureIdleSamples()
-            guard !idleSamples.isEmpty else {
-                throw MLXFastError.invalidInput("mactop idle measurement produced no samples")
-            }
-            let idleGBPerSecond = idleSamples.reduce(0, +) / Double(idleSamples.count)
-            progress?(
-                "mactop idle measurement complete samples=\(idleSamples.count) "
-                    + "idle_gb_per_second=\(formatDouble(idleGBPerSecond))"
-            )
-            return idleGBPerSecond
-        } catch {
-            progress?(
-                "mactop idle measurement unavailable; using expert streaming byte fallback "
-                    + "error=\(redactedProgressError("\(error)"))"
-            )
-            return nil
-        }
     }
 
     private static func measurePrefillSecondsPerToken(
@@ -1311,7 +1745,6 @@ public enum DeepSeekRuntime {
         expectedTokens: [Int],
         decodeSteps: Int = MLXFastConstants.benchmarkDecodeSteps,
         weightCache: DeepSeekRuntimeWeightCache,
-        idleGBPerSecond: Double?,
         progress: ((String) -> Void)? = nil
     ) throws -> DecodeMeasurement {
         guard !seedTokens.isEmpty else {
@@ -1361,109 +1794,63 @@ public enum DeepSeekRuntime {
         actualTokens.reserveCapacity(timingPlan.decodeSteps)
         let metricsBeforeDecode = weightCache.loader.expertStreamingMetrics?.snapshot()
         let validationDelayMS = try submissionValidationDelayMilliseconds()
-        let session: MactopSession?
-        if idleGBPerSecond != nil {
-            do {
-                session = try MactopSession.start()
-                progress?("decode mactop measurement start")
-            } catch {
-                progress?(
-                    "decode mactop measurement unavailable; using expert streaming byte fallback "
-                        + "error=\(redactedProgressError("\(error)"))"
-                )
-                session = nil
-            }
-        } else {
-            session = nil
-        }
         let start = DispatchTime.now().uptimeNanoseconds
-        do {
-            progress?("decode measured start tokens=\(timingPlan.decodeSteps)")
-            if validationDelayMS > 0 {
-                progress?("decode validation delay enabled milliseconds_per_token=\(validationDelayMS)")
-            }
-            for decodedStep in 0..<timingPlan.decodeSteps {
-                let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
-                logits = try DeepSeekModel.logits(
-                    inputIDs: inputIDsArray([inputToken]),
-                    weightCache: weightCache,
-                    cache: cache,
-                    positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
-                )
-                token = try DeepSeekCorrectness.greedyToken(from: logits)
-                actualTokens.append(token)
-                let expectedToken = expectedTokens[decodedStep]
-                if token != expectedToken {
-                    throw BenchmarkTokenMismatchError(
-                        comparison: BenchmarkTokenComparison(
-                            passed: false,
-                            label: "benchmark decode token",
-                            step: decodedStep,
-                            expectedToken: expectedToken,
-                            actualToken: token
-                        )
-                    )
-                }
-                if validationDelayMS > 0 {
-                    Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
-                }
-                reportProgress(
-                    step: decodedStep + 1,
-                    total: timingPlan.decodeSteps,
-                    intervalSteps: 64,
-                    progress: { step, total in
-                        progress?("decode measured generated \(step)/\(total) tokens")
-                    }
-                )
-            }
-
-            let elapsed = secondsSince(start)
-            let bandwidth: (gbPerToken: Double, source: String)
-            if let session, let idleGBPerSecond {
-                do {
-                    let samples = try session.stop()
-                    bandwidth = (
-                        try MactopBandwidth.gigabytesPerToken(
-                            samples: samples,
-                            idleGBPerSecond: idleGBPerSecond,
-                            decodeElapsedSeconds: elapsed,
-                            decodedTokens: timingPlan.decodeSteps
-                        ),
-                        "mactop_hardware"
-                    )
-                } catch {
-                    progress?(
-                        "decode mactop samples unavailable; using expert streaming byte fallback "
-                            + "error=\(redactedProgressError("\(error)"))"
-                    )
-                    bandwidth = try expertStreamingBandwidthGBPerToken(
-                        before: metricsBeforeDecode,
-                        after: weightCache.loader.expertStreamingMetrics?.snapshot(),
-                        decodedTokens: timingPlan.decodeSteps
-                    )
-                }
-            } else {
-                bandwidth = try expertStreamingBandwidthGBPerToken(
-                    before: metricsBeforeDecode,
-                    after: weightCache.loader.expertStreamingMetrics?.snapshot(),
-                    decodedTokens: timingPlan.decodeSteps
-                )
-            }
-            progress?(
-                "decode measured complete seconds=\(formatSeconds(elapsed)) "
-                    + "seconds_per_token=\(formatDouble(elapsed / Double(timingPlan.decodeSteps))) "
-                    + "bandwidth_gb_per_token=\(formatDouble(bandwidth.gbPerToken)) "
-                    + "bandwidth_source=\(bandwidth.source)"
-            )
-            return DecodeMeasurement(
-                secondsPerToken: elapsed / Double(timingPlan.decodeSteps),
-                bandwidthGBPerToken: bandwidth.gbPerToken,
-                bandwidthSource: bandwidth.source
-            )
-        } catch {
-            _ = try? session?.stop()
-            throw error
+        progress?("decode measured start tokens=\(timingPlan.decodeSteps)")
+        if validationDelayMS > 0 {
+            progress?("decode validation delay enabled milliseconds_per_token=\(validationDelayMS)")
         }
+        for decodedStep in 0..<timingPlan.decodeSteps {
+            let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
+            logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray([inputToken]),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
+            )
+            token = try DeepSeekCorrectness.greedyToken(from: logits)
+            actualTokens.append(token)
+            let expectedToken = expectedTokens[decodedStep]
+            if token != expectedToken {
+                throw BenchmarkTokenMismatchError(
+                    comparison: BenchmarkTokenComparison(
+                        passed: false,
+                        label: "benchmark decode token",
+                        step: decodedStep,
+                        expectedToken: expectedToken,
+                        actualToken: token
+                    )
+                )
+            }
+            if validationDelayMS > 0 {
+                Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
+            }
+            reportProgress(
+                step: decodedStep + 1,
+                total: timingPlan.decodeSteps,
+                intervalSteps: 64,
+                progress: { step, total in
+                    progress?("decode measured generated \(step)/\(total) tokens")
+                }
+            )
+        }
+
+        let elapsed = secondsSince(start)
+        let bandwidth = try expertStreamingBandwidthGBPerToken(
+            before: metricsBeforeDecode,
+            after: weightCache.loader.expertStreamingMetrics?.snapshot(),
+            decodedTokens: timingPlan.decodeSteps
+        )
+        progress?(
+            "decode measured complete seconds=\(formatSeconds(elapsed)) "
+                + "seconds_per_token=\(formatDouble(elapsed / Double(timingPlan.decodeSteps))) "
+                + "bandwidth_gb_per_token=\(formatDouble(bandwidth.gbPerToken)) "
+                + "bandwidth_source=\(bandwidth.source)"
+        )
+        return DecodeMeasurement(
+            secondsPerToken: elapsed / Double(timingPlan.decodeSteps),
+            bandwidthGBPerToken: bandwidth.gbPerToken,
+            bandwidthSource: bandwidth.source
+        )
     }
 
     private static func measureWorkerDecode(
@@ -1485,16 +1872,12 @@ public enum DeepSeekRuntime {
             )
         }
         progress?("decode measured start tokens=\(decodeSteps)")
-        let response = try worker.decode(
-            seedTokens: seedTokens,
-            expectedSeedToken: expectedSeedToken,
-            expectedTokens: expectedTokens,
-            decodeSteps: decodeSteps
-        )
-        expertStats = response.expertStats ?? expertStats
-        peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
-        guard let seedToken = response.seedToken else {
-            throw MLXFastError.invalidInput("runtime worker decode response missing seed token")
+        let beginResponse = try worker.beginDecode(seedTokens: seedTokens)
+        let statsBeforeDecode = beginResponse.expertStats
+        expertStats = beginResponse.expertStats ?? expertStats
+        peakRamGB = max(peakRamGB, beginResponse.peakRamGB ?? 0)
+        guard let seedToken = beginResponse.seedToken else {
+            throw MLXFastError.invalidInput("runtime worker decode_begin response missing seed token")
         }
         try requireBenchmarkMatch(
             BenchmarkOutputValidator.compareDecodeSeedToken(
@@ -1502,28 +1885,67 @@ public enum DeepSeekRuntime {
                 actualToken: seedToken
             )
         )
-        let actualTokens = response.tokens ?? []
-        try requireBenchmarkMatch(
-            BenchmarkOutputValidator.compareDecodeTokens(
-                expectedTokens: Array(expectedTokens.prefix(decodeSteps)),
-                actualTokens: actualTokens
-            )
-        )
-        guard let secondsPerToken = response.secondsPerToken,
-              let bandwidthGBPerToken = response.bandwidthGBPerToken,
-              let bandwidthSource = response.bandwidthSource else {
-            throw MLXFastError.invalidInput("runtime worker decode response missing timing or bandwidth")
+
+        var actualTokens: [Int] = []
+        actualTokens.reserveCapacity(decodeSteps)
+        let validationDelayMS = try submissionValidationDelayMilliseconds()
+        var measuredSeconds = 0.0
+        if validationDelayMS > 0 {
+            progress?("decode validation delay enabled milliseconds_per_token=\(validationDelayMS)")
         }
+        for decodedStep in 0..<decodeSteps {
+            let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
+            let response = try worker.decodeStep(inputToken: inputToken)
+            expertStats = response.expertStats ?? expertStats
+            peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
+            guard let token = response.token, let elapsed = response.seconds else {
+                throw MLXFastError.invalidInput("runtime worker decode_step response missing token or seconds")
+            }
+            measuredSeconds += elapsed
+            actualTokens.append(token)
+            let expectedToken = expectedTokens[decodedStep]
+            if token != expectedToken {
+                throw BenchmarkTokenMismatchError(
+                    comparison: BenchmarkTokenComparison(
+                        passed: false,
+                        label: "benchmark decode token",
+                        step: decodedStep,
+                        expectedToken: expectedToken,
+                        actualToken: token
+                    )
+                )
+            }
+            reportProgress(
+                step: decodedStep + 1,
+                total: decodeSteps,
+                intervalSteps: 64,
+                progress: { step, total in
+                    progress?("decode measured generated \(step)/\(total) tokens")
+                }
+            )
+        }
+
+        let bandwidth = try expertStreamingBandwidthGBPerToken(
+            before: statsBeforeDecode,
+            after: expertStats,
+            decodedTokens: decodeSteps
+        )
+        let secondsPerToken = measuredSeconds / Double(decodeSteps)
+        let actualTokensComparison = BenchmarkOutputValidator.compareDecodeTokens(
+            expectedTokens: Array(expectedTokens.prefix(decodeSteps)),
+            actualTokens: actualTokens
+        )
+        try requireBenchmarkMatch(actualTokensComparison)
         progress?(
-            "decode measured complete seconds=\(formatSeconds(response.seconds ?? 0)) "
+            "decode measured complete seconds=\(formatSeconds(measuredSeconds)) "
                 + "seconds_per_token=\(formatDouble(secondsPerToken)) "
-                + "bandwidth_gb_per_token=\(formatDouble(bandwidthGBPerToken)) "
-                + "bandwidth_source=\(bandwidthSource)"
+                + "bandwidth_gb_per_token=\(formatDouble(bandwidth.gbPerToken)) "
+                + "bandwidth_source=\(bandwidth.source)"
         )
         return DecodeMeasurement(
             secondsPerToken: secondsPerToken,
-            bandwidthGBPerToken: bandwidthGBPerToken,
-            bandwidthSource: bandwidthSource
+            bandwidthGBPerToken: bandwidth.gbPerToken,
+            bandwidthSource: bandwidth.source
         )
     }
 
@@ -1536,12 +1958,34 @@ public enum DeepSeekRuntime {
             throw MLXFastError.invalidInput("benchmark decode steps must be positive")
         }
         guard let after else {
-            throw MLXFastError.invalidInput("expert streaming metrics unavailable for bandwidth fallback")
+            throw MLXFastError.invalidInput("expert streaming metrics unavailable for bandwidth diagnostic")
         }
         let beforeBytes = before?.bytesRead ?? 0
         let bytesRead = after.bytesRead >= beforeBytes ? after.bytesRead - beforeBytes : after.bytesRead
         guard bytesRead > 0 else {
-            throw MLXFastError.invalidInput("expert streaming bandwidth fallback observed no decoded expert reads")
+            throw MLXFastError.invalidInput("expert streaming bandwidth diagnostic observed no decoded expert reads")
+        }
+        return (
+            Double(bytesRead) / Double(1 << 30) / Double(decodedTokens),
+            "expert_streaming_reads"
+        )
+    }
+
+    private static func expertStreamingBandwidthGBPerToken(
+        before: ExpertStreamingStats?,
+        after: ExpertStreamingStats?,
+        decodedTokens: Int
+    ) throws -> (gbPerToken: Double, source: String) {
+        guard decodedTokens > 0 else {
+            throw MLXFastError.invalidInput("benchmark decode steps must be positive")
+        }
+        guard let after else {
+            throw MLXFastError.invalidInput("expert streaming metrics unavailable for bandwidth diagnostic")
+        }
+        let beforeBytes = before?.bytesRead ?? 0
+        let bytesRead = after.bytesRead >= beforeBytes ? after.bytesRead - beforeBytes : after.bytesRead
+        guard bytesRead > 0 else {
+            throw MLXFastError.invalidInput("expert streaming bandwidth diagnostic observed no decoded expert reads")
         }
         return (
             Double(bytesRead) / Double(1 << 30) / Double(decodedTokens),
@@ -1581,7 +2025,8 @@ public enum DeepSeekRuntime {
         correctness: CorrectnessReport,
         expertStats: ExpertStreamingStats,
         bandwidthSource: String,
-        weightsDigest: DirectoryDigest?
+        weightsDigest: DirectoryDigest?,
+        gpqaTTFT: GPQATTFTSummary
     ) -> ScorePayload {
         ScorePayload(
             score: score,
@@ -1595,6 +2040,13 @@ public enum DeepSeekRuntime {
                 preflightSeconds: preflightSeconds,
                 correctnessSeconds: correctnessSeconds,
                 timedBenchmarkSeconds: timedBenchmarkSeconds,
+                gpqaTTFTPassed: gpqaTTFT.passed,
+                gpqaTTFTPassCount: gpqaTTFT.passCount,
+                gpqaTTFTCaseCount: gpqaTTFT.caseCount,
+                gpqaTTFTSeconds: gpqaTTFT.meanSeconds,
+                gpqaTTFTP50Seconds: gpqaTTFT.p50Seconds,
+                gpqaTTFTMaxSeconds: gpqaTTFT.maxSeconds,
+                gpqaTTFTSource: gpqaTTFT.source,
                 processResidentMemoryGB: currentResidentMemoryGB(),
                 passedCorrectness: true,
                 numLayers: numLayers,
@@ -1641,21 +2093,34 @@ public enum DeepSeekRuntime {
         preflightSeconds: Double = 0,
         correctnessSeconds: Double = 0,
         timedBenchmarkSeconds: Double = 0,
-        processResidentMemoryGB: Double = 0
+        processResidentMemoryGB: Double = 0,
+        peakRamGB: Double = 0,
+        bandwidthGBPerToken: Double = 0,
+        decodeSecondsPerToken: Double = 0,
+        prefillSecondsPerToken: Double = 0,
+        bandwidthSource: String = "",
+        gpqaTTFT: GPQATTFTSummary = .zero
     ) -> ScorePayload {
         let expertStats = explicitExpertStats ?? correctness?.expertStreamingStats ?? .zero
         return ScorePayload(
             score: nil,
             passed: false,
             metrics: ScoreMetrics(
-                peakRamGB: 0,
-                bandwidthGBPerToken: 0,
-                decodeSecondsPerToken: 0,
-                prefillSecondsPerToken: 0,
+                peakRamGB: peakRamGB,
+                bandwidthGBPerToken: bandwidthGBPerToken,
+                decodeSecondsPerToken: decodeSecondsPerToken,
+                prefillSecondsPerToken: prefillSecondsPerToken,
                 benchmarkWallSeconds: benchmarkWallSeconds,
                 preflightSeconds: preflightSeconds,
                 correctnessSeconds: correctnessSeconds,
                 timedBenchmarkSeconds: timedBenchmarkSeconds,
+                gpqaTTFTPassed: gpqaTTFT.passed,
+                gpqaTTFTPassCount: gpqaTTFT.passCount,
+                gpqaTTFTCaseCount: gpqaTTFT.caseCount,
+                gpqaTTFTSeconds: gpqaTTFT.meanSeconds,
+                gpqaTTFTP50Seconds: gpqaTTFT.p50Seconds,
+                gpqaTTFTMaxSeconds: gpqaTTFT.maxSeconds,
+                gpqaTTFTSource: gpqaTTFT.source,
                 processResidentMemoryGB: processResidentMemoryGB,
                 passedCorrectness: passedCorrectness,
                 numLayers: MLXFastConstants.numHiddenLayers,
@@ -1671,11 +2136,11 @@ public enum DeepSeekRuntime {
                 firstFailingLayer: nil,
                 firstFailingCase: explicitFirstFailingCase ?? correctness?.firstFailingCase,
                 firstFailingStep: explicitFirstFailingStep ?? correctness?.firstFailingStep,
-                expectedToken: explicitExpectedToken ?? correctness?.expectedToken,
-                actualToken: explicitActualToken ?? correctness?.actualToken,
+                expectedToken: nil,
+                actualToken: nil,
                 maxAbsDiff: 0,
                 goldenHash: correctness?.goldenHash ?? "",
-                bandwidthSource: "",
+                bandwidthSource: bandwidthSource,
                 error: error,
                 commit: commitIdentifier(),
                 timestamp: ISO8601DateFormatter().string(from: Date()),
@@ -1686,6 +2151,16 @@ public enum DeepSeekRuntime {
                 runtime: "swift"
             )
         )
+    }
+
+    private static func speedupFloorFailureMessage(
+        decodeSpeedup: Double,
+        prefillSpeedup: Double
+    ) -> String {
+        "performance floor failed: decode_speedup=\(formatDouble(decodeSpeedup)) "
+            + "floor=\(formatDouble(MLXFastConstants.scoreDecodeSpeedupFloor)) "
+            + "prefill_speedup=\(formatDouble(prefillSpeedup)) "
+            + "floor=\(formatDouble(MLXFastConstants.scorePrefillSpeedupFloor))"
     }
 
     private static func currentResidentMemoryGB() -> Double {
@@ -1990,6 +2465,19 @@ public enum DeepSeekRuntime {
         let comparison: CorrectnessTokenComparison
         let expertStats: ExpertStreamingStats
         let peakRamGB: Double
+        let ttftSeconds: Double?
+
+        init(
+            comparison: CorrectnessTokenComparison,
+            expertStats: ExpertStreamingStats,
+            peakRamGB: Double,
+            ttftSeconds: Double? = nil
+        ) {
+            self.comparison = comparison
+            self.expertStats = expertStats
+            self.peakRamGB = peakRamGB
+            self.ttftSeconds = ttftSeconds
+        }
     }
 
     private static func compareTeacherForcedWithWorker(
@@ -2008,21 +2496,35 @@ public enum DeepSeekRuntime {
             )
         }
 
-        var lastExpertStats = ExpertStreamingStats.zero
-        var peakRamGB = 0.0
-        var response = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
-        lastExpertStats = response.expertStats ?? lastExpertStats
-        peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
-
+        let response = try worker.teacherForcedCorrectnessBatch(
+            promptTokens: testCase.promptTokens,
+            expectedTokens: Array(testCase.expectedTokens.prefix(steps)),
+            steps: steps
+        )
+        guard let actualTokens = response.tokens else {
+            throw MLXFastError.invalidInput("runtime worker batched teacher-forced response missing tokens")
+        }
+        guard actualTokens.count == steps else {
+            throw MLXFastError.invalidInput(
+                "runtime worker batched teacher-forced response returned \(actualTokens.count) tokens; expected \(steps)"
+            )
+        }
+        guard let topLogitRows = response.topLogitRows else {
+            throw MLXFastError.invalidInput("runtime worker batched teacher-forced response missing top_logit_rows")
+        }
+        guard topLogitRows.count == steps else {
+            throw MLXFastError.invalidInput(
+                "runtime worker batched teacher-forced response returned \(topLogitRows.count) top_logit_rows; expected \(steps)"
+            )
+        }
         for step in 0..<steps {
-            guard let actualToken = response.token else {
-                throw MLXFastError.invalidInput("runtime worker teacher-forced correctness response missing token")
-            }
+            let actualToken = actualTokens[step]
+            let topLogits = try validatedWorkerTopLogits(topLogitRows[step], actualToken: actualToken)
             let expectedToken = testCase.expectedTokens[step]
             if !correctnessTokenAccepted(
                 expectedToken: expectedToken,
                 actualToken: actualToken,
-                topLogits: response.topLogits
+                topLogits: topLogits
             ) {
                 return WorkerCorrectnessResult(
                     comparison: CorrectnessTokenComparison(
@@ -2032,8 +2534,8 @@ public enum DeepSeekRuntime {
                         expectedToken: expectedToken,
                         actualToken: actualToken
                     ),
-                    expertStats: lastExpertStats,
-                    peakRamGB: peakRamGB
+                    expertStats: response.expertStats ?? .zero,
+                    peakRamGB: response.peakRamGB ?? 0
                 )
             }
             reportProgress(
@@ -2042,14 +2544,6 @@ public enum DeepSeekRuntime {
                 intervalSteps: progressIntervalSteps,
                 progress: progress
             )
-
-            if step == steps - 1 {
-                break
-            }
-
-            response = try worker.teacherForcedCorrectnessStep(previousToken: expectedToken)
-            lastExpertStats = response.expertStats ?? lastExpertStats
-            peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
         }
 
         return WorkerCorrectnessResult(
@@ -2060,9 +2554,144 @@ public enum DeepSeekRuntime {
                 expectedToken: nil,
                 actualToken: nil
             ),
-            expertStats: lastExpertStats,
-            peakRamGB: peakRamGB
+            expertStats: response.expertStats ?? .zero,
+            peakRamGB: response.peakRamGB ?? 0
         )
+    }
+
+    private static func compareAnchorWithWorker(
+        anchor: GoldenAnchorCase,
+        worker: RuntimeWorkerClient
+    ) throws -> WorkerCorrectnessResult {
+        let response = try worker.beginTeacherForcedCorrectness(promptTokens: anchor.contextTokens)
+        guard let actualToken = response.token else {
+            throw MLXFastError.invalidInput("runtime worker anchor response missing token")
+        }
+        let topLogits = try validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
+        return WorkerCorrectnessResult(
+            comparison: compareAnchorToken(
+                anchor: anchor,
+                actualToken: actualToken,
+                topLogits: topLogits
+            ),
+            expertStats: response.expertStats ?? .zero,
+            peakRamGB: response.peakRamGB ?? 0
+        )
+    }
+
+    private static func compareFreeRunWithWorker(
+        testCase: GoldenFreeRunCase,
+        worker: RuntimeWorkerClient
+    ) throws -> WorkerCorrectnessResult {
+        let response = try worker.generateCorrectness(
+            promptTokens: testCase.promptTokens,
+            steps: testCase.expectedTokens.count
+        )
+        guard let generated = response.tokens else {
+            throw MLXFastError.invalidInput("runtime worker free-run response missing tokens")
+        }
+        try requireGeneratedTokenCount(
+            generated.count,
+            expected: testCase.expectedTokens.count,
+            label: "free-run"
+        )
+        return WorkerCorrectnessResult(
+            comparison: compareFreeRunTokens(testCase: testCase, generated: generated),
+            expertStats: response.expertStats ?? .zero,
+            peakRamGB: response.peakRamGB ?? 0
+        )
+    }
+
+    private static func compareBehaviorWithWorker(
+        testCase: GoldenBehaviorCase,
+        worker: RuntimeWorkerClient
+    ) throws -> WorkerCorrectnessResult {
+        if testCase.maxNewTokens == 1 {
+            let response = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
+            guard let actualToken = response.token else {
+                throw MLXFastError.invalidInput("runtime worker behavior response missing token")
+            }
+            let topLogits = try validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
+            return WorkerCorrectnessResult(
+                comparison: compareBehaviorFirstToken(
+                    testCase: testCase,
+                    actualToken: actualToken,
+                    topLogits: topLogits
+                ),
+                expertStats: response.expertStats ?? .zero,
+                peakRamGB: response.peakRamGB ?? 0,
+                ttftSeconds: response.seconds
+            )
+        }
+
+        let response = try worker.generateCorrectness(
+            promptTokens: testCase.promptTokens,
+            steps: testCase.maxNewTokens
+        )
+        guard let generated = response.tokens else {
+            throw MLXFastError.invalidInput("runtime worker behavior response missing tokens")
+        }
+        try requireGeneratedTokenCount(
+            generated.count,
+            expected: testCase.maxNewTokens,
+            label: "behavior"
+        )
+        return WorkerCorrectnessResult(
+            comparison: compareBehaviorTokens(testCase: testCase, generated: generated),
+            expertStats: response.expertStats ?? .zero,
+            peakRamGB: response.peakRamGB ?? 0
+        )
+    }
+
+    private static func validatedWorkerTopLogits(
+        _ topLogits: [CorrectnessTraceLogit]?,
+        actualToken: Int
+    ) throws -> [CorrectnessTraceLogit] {
+        guard let topLogits, !topLogits.isEmpty else {
+            throw MLXFastError.invalidInput("runtime worker response missing top_logits")
+        }
+        guard topLogits.count <= MLXFastConstants.correctnessTopLogits else {
+            throw MLXFastError.invalidInput(
+                "runtime worker returned \(topLogits.count) top_logits; maximum is \(MLXFastConstants.correctnessTopLogits)"
+            )
+        }
+        guard topLogits[0].token == actualToken else {
+            throw MLXFastError.invalidInput("runtime worker top_logits[0] does not match returned token")
+        }
+
+        var seen = Set<Int>()
+        for (index, item) in topLogits.enumerated() {
+            guard item.token >= 0, item.token < MLXFastConstants.vocabSize else {
+                throw MLXFastError.invalidInput("runtime worker top_logits[\(index)].token is outside vocab")
+            }
+            guard item.logit.isFinite else {
+                throw MLXFastError.invalidInput("runtime worker top_logits[\(index)].logit must be finite")
+            }
+            guard seen.insert(item.token).inserted else {
+                throw MLXFastError.invalidInput("runtime worker top_logits contains duplicate token \(item.token)")
+            }
+            if index > 0 {
+                let previous = topLogits[index - 1]
+                guard previous.logit > item.logit
+                    || (previous.logit == item.logit && previous.token < item.token)
+                else {
+                    throw MLXFastError.invalidInput("runtime worker top_logits must be sorted by logit descending")
+                }
+            }
+        }
+        return topLogits
+    }
+
+    private static func requireGeneratedTokenCount(
+        _ actual: Int,
+        expected: Int,
+        label: String
+    ) throws {
+        guard actual == expected else {
+            throw MLXFastError.invalidInput(
+                "runtime worker \(label) returned \(actual) tokens; expected \(expected)"
+            )
+        }
     }
 
     private static func compareGreedyCached(
@@ -2201,14 +2830,227 @@ public enum DeepSeekRuntime {
         )
     }
 
+    private static func compareAnchorCached(
+        anchor: GoldenAnchorCase,
+        weightCache: DeepSeekRuntimeWeightCache
+    ) throws -> CorrectnessTokenComparison {
+        let cache = DeepSeekModelCache(config: weightCache.config)
+        let logits = try DeepSeekModel.logits(
+            inputIDs: inputIDsArray(anchor.contextTokens),
+            weightCache: weightCache,
+            cache: cache,
+            positionOffset: 0
+        )
+        let actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
+        return compareAnchorToken(
+            anchor: anchor,
+            actualToken: actualToken,
+            topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits)
+        )
+    }
+
+    private static func compareFreeRunCached(
+        testCase: GoldenFreeRunCase,
+        weightCache: DeepSeekRuntimeWeightCache,
+        progressIntervalSteps: Int = 0,
+        progress: ((Int, Int) -> Void)? = nil
+    ) throws -> CorrectnessTokenComparison {
+        let generated = try generateGreedyCached(
+            promptTokens: testCase.promptTokens,
+            steps: testCase.expectedTokens.count,
+            weightCache: weightCache,
+            progressIntervalSteps: progressIntervalSteps,
+            progress: progress
+        )
+        return compareFreeRunTokens(testCase: testCase, generated: generated)
+    }
+
+    private static func compareBehaviorCached(
+        testCase: GoldenBehaviorCase,
+        weightCache: DeepSeekRuntimeWeightCache
+    ) throws -> CorrectnessTokenComparison {
+        if testCase.maxNewTokens == 1 {
+            let cache = DeepSeekModelCache(config: weightCache.config)
+            let logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray(testCase.promptTokens),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: 0
+            )
+            let actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
+            return compareBehaviorFirstToken(
+                testCase: testCase,
+                actualToken: actualToken,
+                topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits)
+            )
+        }
+
+        let generated = try generateGreedyCached(
+            promptTokens: testCase.promptTokens,
+            steps: testCase.maxNewTokens,
+            weightCache: weightCache
+        )
+        return compareBehaviorTokens(testCase: testCase, generated: generated)
+    }
+
+    private static func compareAnchorToken(
+        anchor: GoldenAnchorCase,
+        actualToken: Int,
+        topLogits: [CorrectnessTraceLogit]?
+    ) -> CorrectnessTokenComparison {
+        if anchorTokenAccepted(anchor: anchor, actualToken: actualToken, topLogits: topLogits) {
+            return CorrectnessTokenComparison(
+                passed: true,
+                checkedSteps: 1,
+                firstFailingStep: nil,
+                expectedToken: nil,
+                actualToken: nil
+            )
+        }
+        return CorrectnessTokenComparison(
+            passed: false,
+            checkedSteps: 1,
+            firstFailingStep: 0,
+            expectedToken: anchor.expectedToken,
+            actualToken: actualToken
+        )
+    }
+
+    private static func compareFreeRunTokens(
+        testCase: GoldenFreeRunCase,
+        generated: [Int]
+    ) -> CorrectnessTokenComparison {
+        let prefixTokens = testCase.exactPrefixTokens ?? testCase.expectedTokens.count
+        let comparison = GoldenSequenceMatcher.firstPrefixMismatch(
+            expected: testCase.expectedTokens,
+            actual: generated,
+            prefixTokens: prefixTokens
+        )
+        return CorrectnessTokenComparison(
+            passed: comparison.passed,
+            checkedSteps: comparison.passed ? prefixTokens : (comparison.step ?? 0) + 1,
+            firstFailingStep: comparison.step,
+            expectedToken: comparison.expectedToken,
+            actualToken: comparison.actualToken
+        )
+    }
+
+    private static func compareBehaviorTokens(
+        testCase: GoldenBehaviorCase,
+        generated: [Int]
+    ) -> CorrectnessTokenComparison {
+        let comparison = GoldenSequenceMatcher.matchesAnyAcceptedPrefix(
+            acceptedSequences: testCase.acceptedTokenSequences,
+            actual: generated
+        )
+        return CorrectnessTokenComparison(
+            passed: comparison.passed,
+            checkedSteps: comparison.passed ? testCase.maxNewTokens : (comparison.step ?? 0) + 1,
+            firstFailingStep: comparison.step,
+            expectedToken: comparison.expectedToken,
+            actualToken: comparison.actualToken
+        )
+    }
+
+    private static func compareBehaviorFirstToken(
+        testCase: GoldenBehaviorCase,
+        actualToken: Int,
+        topLogits: [CorrectnessTraceLogit]?
+    ) -> CorrectnessTokenComparison {
+        let acceptedTokens = Set(testCase.acceptedTokenSequences.compactMap(\.first))
+        if acceptedTokens.contains(actualToken) {
+            return CorrectnessTokenComparison(
+                passed: true,
+                checkedSteps: 1,
+                firstFailingStep: nil,
+                expectedToken: nil,
+                actualToken: nil
+            )
+        }
+        for acceptedToken in acceptedTokens where correctnessTokenAccepted(
+            expectedToken: acceptedToken,
+            actualToken: actualToken,
+            topLogits: topLogits
+        ) {
+            return CorrectnessTokenComparison(
+                passed: true,
+                checkedSteps: 1,
+                firstFailingStep: nil,
+                expectedToken: nil,
+                actualToken: nil
+            )
+        }
+        return CorrectnessTokenComparison(
+            passed: false,
+            checkedSteps: 1,
+            firstFailingStep: 0,
+            expectedToken: acceptedTokens.sorted().first,
+            actualToken: actualToken
+        )
+    }
+
+    private static func anchorTokenAccepted(
+        anchor: GoldenAnchorCase,
+        actualToken: Int,
+        topLogits: [CorrectnessTraceLogit]?
+    ) -> Bool {
+        var acceptedTokens = Set(anchor.acceptedTokens ?? [])
+        acceptedTokens.insert(anchor.expectedToken)
+        if acceptedTokens.contains(actualToken) {
+            return true
+        }
+        for acceptedToken in acceptedTokens where correctnessTokenAccepted(
+            expectedToken: acceptedToken,
+            actualToken: actualToken,
+            topLogits: topLogits
+        ) {
+            return true
+        }
+        guard let maxExpectedRank = anchor.maxExpectedRank,
+              let topLogits,
+              let topLogit = topLogits.first?.logit,
+              let expectedIndex = topLogits.firstIndex(where: { $0.token == anchor.expectedToken })
+        else {
+            return false
+        }
+        let expectedRank = expectedIndex + 1
+        let expectedDelta = topLogit - topLogits[expectedIndex].logit
+        let maxDelta = anchor.maxTopLogitDelta ?? MLXFastConstants.correctnessLogitTieTolerance
+        return expectedRank <= maxExpectedRank && expectedDelta <= maxDelta
+    }
+
     private static func topLogits(from logits: MLXArray, topK: Int) throws -> [CorrectnessTraceLogit] {
         guard let vocabSize = logits.shape.last, vocabSize > 0 else {
             throw MLXFastError.invalidInput("correctness logits must have a non-empty vocab dimension")
         }
         let rows = logits.reshaped([-1, vocabSize])
-        let last = rows[-1]
-        eval(last)
-        let values = last.asArray(Float.self).map(Double.init)
+        return try topLogits(fromRows: rows, row: rows.shape[0] - 1, vocabSize: vocabSize, topK: topK)
+    }
+
+    private static func topLogits(
+        from logits: MLXArray,
+        row: Int,
+        topK: Int
+    ) throws -> [CorrectnessTraceLogit] {
+        guard let vocabSize = logits.shape.last, vocabSize > 0 else {
+            throw MLXFastError.invalidInput("correctness logits must have a non-empty vocab dimension")
+        }
+        let rows = logits.reshaped([-1, vocabSize])
+        return try topLogits(fromRows: rows, row: row, vocabSize: vocabSize, topK: topK)
+    }
+
+    private static func topLogits(
+        fromRows rows: MLXArray,
+        row: Int,
+        vocabSize: Int,
+        topK: Int
+    ) throws -> [CorrectnessTraceLogit] {
+        guard row >= 0, row < rows.shape[0] else {
+            throw MLXFastError.invalidInput("correctness logits row \(row) is outside available rows \(rows.shape[0])")
+        }
+        let selected = rows[row]
+        eval(selected)
+        let values = selected.asArray(Float.self).map(Double.init)
         guard values.count == vocabSize else {
             throw MLXFastError.invalidInput(
                 "correctness logits materialized \(values.count) values, expected \(vocabSize)"
@@ -2449,25 +3291,19 @@ private struct RuntimeWorkerRequest: Codable {
     let id: Int
     let kind: String
     let promptTokens: [Int]?
+    let expectedTokens: [Int]?
     let token: Int?
     let seedTokens: [Int]?
-    let expectedSeedToken: Int?
-    let expectedTokens: [Int]?
     let steps: Int?
-    let decodeSteps: Int?
-    let validationDelayMilliseconds: Int?
 
     enum CodingKeys: String, CodingKey {
         case id
         case kind
         case promptTokens = "prompt_tokens"
+        case expectedTokens = "expected_tokens"
         case token
         case seedTokens = "seed_tokens"
-        case expectedSeedToken = "expected_seed_token"
-        case expectedTokens = "expected_tokens"
         case steps
-        case decodeSteps = "decode_steps"
-        case validationDelayMilliseconds = "validation_delay_ms"
     }
 }
 
@@ -2475,67 +3311,138 @@ private struct RuntimeWorkerState {
     var correctnessCache: DeepSeekModelCache?
     var correctnessPromptTokenCount = 0
     var correctnessStep = 0
+    var decodeCache: DeepSeekModelCache?
+    var decodeSeedTokenCount = 0
+    var decodeStep = 0
 }
 
 private struct RuntimeWorkerResponse: Codable {
     let id: Int
+    let nonce: String?
     let ok: Bool
     let error: String?
     let token: Int?
     let topLogits: [CorrectnessTraceLogit]?
+    let topLogitRows: [[CorrectnessTraceLogit]]?
     let seedToken: Int?
     let tokens: [Int]?
     let seconds: Double?
-    let secondsPerToken: Double?
-    let bandwidthGBPerToken: Double?
-    let bandwidthSource: String?
     let expertStats: ExpertStreamingStats?
     let peakRamGB: Double?
 
     init(
         id: Int,
+        nonce: String? = nil,
         ok: Bool,
         error: String? = nil,
         token: Int? = nil,
         topLogits: [CorrectnessTraceLogit]? = nil,
+        topLogitRows: [[CorrectnessTraceLogit]]? = nil,
         seedToken: Int? = nil,
         tokens: [Int]? = nil,
         seconds: Double? = nil,
-        secondsPerToken: Double? = nil,
-        bandwidthGBPerToken: Double? = nil,
-        bandwidthSource: String? = nil,
         expertStats: ExpertStreamingStats? = nil,
         peakRamGB: Double? = nil
     ) {
         self.id = id
+        self.nonce = nonce
         self.ok = ok
         self.error = error
         self.token = token
         self.topLogits = topLogits
+        self.topLogitRows = topLogitRows
         self.seedToken = seedToken
         self.tokens = tokens
         self.seconds = seconds
-        self.secondsPerToken = secondsPerToken
-        self.bandwidthGBPerToken = bandwidthGBPerToken
-        self.bandwidthSource = bandwidthSource
         self.expertStats = expertStats
         self.peakRamGB = peakRamGB
     }
 
     enum CodingKeys: String, CodingKey {
         case id
+        case nonce
         case ok
         case error
         case token
         case topLogits = "top_logits"
+        case topLogitRows = "top_logit_rows"
         case seedToken = "seed_token"
         case tokens
         case seconds
-        case secondsPerToken = "seconds_per_token"
-        case bandwidthGBPerToken = "bandwidth_gb_per_token"
-        case bandwidthSource = "bandwidth_source"
         case expertStats = "expert_stats"
         case peakRamGB = "peak_ram_gb"
+    }
+}
+
+private final class RuntimeWorkerProtocolIO {
+    private let input: FileHandle
+    private let output: FileHandle
+
+    private init(inputDescriptor: Int32, outputDescriptor: Int32) {
+        self.input = FileHandle(fileDescriptor: inputDescriptor, closeOnDealloc: true)
+        self.output = FileHandle(fileDescriptor: outputDescriptor, closeOnDealloc: true)
+    }
+
+    static func isolatingStandardIO() throws -> RuntimeWorkerProtocolIO {
+        let inputFD = try duplicatePrivateDescriptor(STDIN_FILENO, label: "stdin")
+        let outputFD = try duplicatePrivateDescriptor(STDOUT_FILENO, label: "stdout")
+        do {
+            try redirectDescriptorToDevNull(STDIN_FILENO, flags: O_RDONLY, label: "stdin")
+            try redirectDescriptorToDevNull(STDOUT_FILENO, flags: O_WRONLY, label: "stdout")
+        } catch {
+            close(inputFD)
+            close(outputFD)
+            throw error
+        }
+        return RuntimeWorkerProtocolIO(inputDescriptor: inputFD, outputDescriptor: outputFD)
+    }
+
+    func readLine() throws -> String? {
+        var data = Data()
+        while true {
+            let byte = input.readData(ofLength: 1)
+            if byte.isEmpty {
+                if data.isEmpty {
+                    return nil
+                }
+                break
+            }
+            if byte[byte.startIndex] == 0x0a {
+                break
+            }
+            data.append(byte)
+        }
+        guard let line = String(data: data, encoding: .utf8) else {
+            throw MLXFastError.invalidInput("runtime worker received non-UTF8 protocol input")
+        }
+        return line
+    }
+
+    func writeLine(_ data: Data) throws {
+        try output.write(contentsOf: data)
+        try output.write(contentsOf: Data([0x0a]))
+    }
+}
+
+private func duplicatePrivateDescriptor(_ descriptor: Int32, label: String) throws -> Int32 {
+    let lowerBound = Int32(64 + Int(arc4random_uniform(449)))
+    let duplicatedFD = fcntl(descriptor, F_DUPFD_CLOEXEC, lowerBound)
+    guard duplicatedFD >= 0 else {
+        throw MLXFastError.invalidInput("runtime worker failed to duplicate \(label) for protocol I/O")
+    }
+    return duplicatedFD
+}
+
+private func redirectDescriptorToDevNull(_ descriptor: Int32, flags: Int32, label: String) throws {
+    let devNullFD = open("/dev/null", flags)
+    guard devNullFD >= 0 else {
+        throw MLXFastError.invalidInput("runtime worker failed to open /dev/null for \(label) redirection")
+    }
+    defer {
+        close(devNullFD)
+    }
+    guard dup2(devNullFD, descriptor) >= 0 else {
+        throw MLXFastError.invalidInput("runtime worker failed to redirect \(label) away from protocol I/O")
     }
 }
 
@@ -2546,6 +3453,7 @@ private final class RuntimeWorkerClient {
     private let errorOutput: FileHandle
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private var sessionNonce = ""
     private var nextID = 1
     private var closed = false
 
@@ -2575,10 +3483,17 @@ private final class RuntimeWorkerClient {
         var environment = ProcessInfo.processInfo.environment
         environment["MLXFAST_USE_RUNTIME_WORKER"] = "0"
         for key in [
+            "ANTHROPIC_API_KEY",
             "MLXFAST_CORRECTNESS_GOLDEN_PATH",
             "MLXFAST_CORRECTNESS_GOLDEN_URL",
             "MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER",
+            "MLXFAST_GPQA_REFERENCE_PATH",
+            "MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH",
+            "MLXFAST_SEMANTIC_GPQA_RESULTS_PATH",
+            "MLXFAST_SEMANTIC_GPQA_MODEL",
             "MLXFAST_PRIVATE_DIR",
+            "MLXFAST_PRIVATE_PROMPTS_R2_PRESENT",
+            "MLXFAST_ANTHROPIC_PRESENT",
             "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE",
             "R2_ACCESS_KEY_ID",
             "R2_BUCKET_ENDPOINT",
@@ -2596,6 +3511,11 @@ private final class RuntimeWorkerClient {
         self.input = stdin.fileHandleForWriting
         self.output = stdout.fileHandleForReading
         self.errorOutput = stderr.fileHandleForReading
+        let hello = try readResponseLine(validateNonce: false)
+        guard hello.id == 0, hello.ok, let nonce = hello.nonce, !nonce.isEmpty else {
+            throw MLXFastError.invalidInput("runtime worker did not return a valid protocol hello")
+        }
+        self.sessionNonce = nonce
     }
 
     deinit {
@@ -2629,6 +3549,19 @@ private final class RuntimeWorkerClient {
         )
     }
 
+    func teacherForcedCorrectnessBatch(
+        promptTokens: [Int],
+        expectedTokens: [Int],
+        steps: Int
+    ) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "correctness_teacher_forced_batch",
+            promptTokens: promptTokens,
+            expectedTokens: expectedTokens,
+            steps: steps
+        )
+    }
+
     func teacherForcedCorrectnessStep(previousToken: Int) throws -> RuntimeWorkerResponse {
         try send(
             kind: "correctness_step",
@@ -2643,31 +3576,27 @@ private final class RuntimeWorkerClient {
         )
     }
 
-    func decode(
-        seedTokens: [Int],
-        expectedSeedToken: Int,
-        expectedTokens: [Int],
-        decodeSteps: Int
-    ) throws -> RuntimeWorkerResponse {
+    func beginDecode(seedTokens: [Int]) throws -> RuntimeWorkerResponse {
         try send(
-            kind: "decode",
-            seedTokens: seedTokens,
-            expectedSeedToken: expectedSeedToken,
-            expectedTokens: expectedTokens,
-            decodeSteps: decodeSteps
+            kind: "decode_begin",
+            seedTokens: seedTokens
+        )
+    }
+
+    func decodeStep(inputToken: Int) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "decode_step",
+            token: inputToken
         )
     }
 
     private func send(
         kind: String,
         promptTokens: [Int]? = nil,
+        expectedTokens: [Int]? = nil,
         token: Int? = nil,
         seedTokens: [Int]? = nil,
-        expectedSeedToken: Int? = nil,
-        expectedTokens: [Int]? = nil,
-        steps: Int? = nil,
-        decodeSteps: Int? = nil,
-        validationDelayMilliseconds: Int? = nil
+        steps: Int? = nil
     ) throws -> RuntimeWorkerResponse {
         guard process.isRunning else {
             throw MLXFastError.invalidInput("runtime worker exited before request \(kind): \(workerExitDiagnostic())")
@@ -2678,19 +3607,16 @@ private final class RuntimeWorkerClient {
             id: id,
             kind: kind,
             promptTokens: promptTokens,
+            expectedTokens: expectedTokens,
             token: token,
             seedTokens: seedTokens,
-            expectedSeedToken: expectedSeedToken,
-            expectedTokens: expectedTokens,
-            steps: steps,
-            decodeSteps: decodeSteps,
-            validationDelayMilliseconds: validationDelayMilliseconds
+            steps: steps
         )
         var data = try encoder.encode(request)
         data.append(0x0a)
         try input.write(contentsOf: data)
 
-        let response = try readResponseLine()
+        let response = try readResponseLine(validateNonce: true)
         guard response.id == id else {
             throw MLXFastError.invalidInput("runtime worker returned response id \(response.id), expected \(id)")
         }
@@ -2700,13 +3626,17 @@ private final class RuntimeWorkerClient {
         return response
     }
 
-    private func readResponseLine() throws -> RuntimeWorkerResponse {
+    private func readResponseLine(validateNonce: Bool) throws -> RuntimeWorkerResponse {
         while true {
             let data = try readWorkerOutputLine()
             guard runtimeWorkerLineLooksLikeJSONResponse(data) else {
                 continue
             }
-            return try decoder.decode(RuntimeWorkerResponse.self, from: data)
+            let response = try decoder.decode(RuntimeWorkerResponse.self, from: data)
+            if validateNonce, response.nonce != sessionNonce {
+                throw MLXFastError.invalidInput("runtime worker returned a response with an invalid nonce")
+            }
+            return response
         }
     }
 
@@ -2751,6 +3681,18 @@ private final class RuntimeWorkerClient {
         }
         return singleLine
     }
+}
+
+private func generateRuntimeWorkerNonce() -> String {
+    var bytes = [UInt8](repeating: 0, count: 16)
+    bytes.withUnsafeMutableBytes { buffer in
+        if let baseAddress = buffer.baseAddress {
+            arc4random_buf(baseAddress, buffer.count)
+        }
+    }
+    return bytes
+        .map { String(format: "%02x", $0) }
+        .joined()
 }
 
 func runtimeWorkerLineLooksLikeJSONResponse(_ data: Data) -> Bool {

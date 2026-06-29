@@ -23,6 +23,20 @@ public enum MLXFastConstants {
     public static let quickCorrectnessSteps = 64
     public static let correctnessTopLogits = 8
     public static let correctnessLogitTieTolerance = 1e-6
+    public static let correctnessMaxAnchorContextTokens = 1_024
+    public static let correctnessMaxFreeRunSteps = 256
+    public static let correctnessMaxBehaviorPromptTokens = 2_048
+    public static let correctnessMaxBehaviorSteps = 64
+    public static let correctnessGPQACaseCount = 9
+    // Cross-machine greedy decode can drift after the first answer token even
+    // with pinned Swift/MLX. Keep hidden GPQA behavior gates broad across cases
+    // and shallow per case so local M-series and official Blacksmith runs agree.
+    public static let correctnessGPQAMaxNewTokens = 1
+    // Semantic judging uses short hidden GPQA answers as a pass/fail backstop
+    // for optimizations that preserve the exact prefix but damage answer sense.
+    public static let semanticGPQACaseCount = 9
+    public static let semanticGPQAMaxNewTokens = 10
+    public static let semanticGPQAMinPassCount = 8
     public static let benchmarkPrefillPromptTokens = 512
     public static let benchmarkDecodeSteps = 256
     public static let quickBenchmarkDecodeSteps = 64
@@ -33,6 +47,16 @@ public enum MLXFastConstants {
     public static let benchmarkDecodeSeedTokens = 512
     public static let benchmarkPrefillWarmupRuns = 1
     public static let benchmarkPrefillTimedRuns = 1
+    // Official baseline measured on the Blacksmith runner for the current
+    // 512-token prefill / 256-token decode benchmark oracle. The ranked score is
+    // normalized to this baseline; raw RAM, bandwidth, and read metrics remain
+    // audit fields instead of primary score factors.
+    public static let officialBaselinePrefillSecondsPerToken = 0.1417240929375
+    public static let officialBaselineDecodeSecondsPerToken = 3.018321923023438
+    public static let scorePrefillWeight = 0.25
+    public static let scoreDecodeWeight = 0.75
+    public static let scorePrefillSpeedupFloor = 0.95
+    public static let scoreDecodeSpeedupFloor = 0.95
     public static let defaultMaxTransformedWeightsBytes = 50 * 1024 * 1024 * 1024
     public static let defaultMaxSubmissionSourceBytes = 256 * 1024 * 1024
 }

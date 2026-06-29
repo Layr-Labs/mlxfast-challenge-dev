@@ -22,13 +22,43 @@ Configure the `benchmark-private-prompts` Environment with:
 
 Normal private benchmark runs download the precomputed
 `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`
-object from the private R2 bucket. The private prompt manifest is only an
-organizer input for regenerating the golden outside the benchmark workflow.
-It should not be downloaded by submission benchmark runs, written into the
-repository workspace, uploaded, or cached. The workflow writes the downloaded
-golden only under `$RUNNER_TEMP` and uploads only its hash and byte-count
-sidecars after a deny-list check rejects prompt, golden, model, symlink, and
-oversized artifact paths.
+object from the private R2 bucket. Full private benchmark runs also download
+`correctness_prompts/gpqa_reference_cases.json` from the same private bucket
+and merge it into the local golden as 9 hidden multiple-choice behavior gates.
+Each GPQA case must carry accepted reference-model output tokens or responses;
+the GPQA answer key alone is not used as an exact-token correctness oracle.
+Calibrate the private file on the official runner after setup/transform with
+`mlxfast-swift calibrate-gpqa-gates --gpqa PATH --weights weights --tokenizer weights --output PATH`,
+then upload only the calibrated JSON to private R2. The benchmark workflow has a
+manual `calibrate_gpqa_reference` mode for this: it downloads the private GPQA
+file, calibrates accepted token sequences on the Blacksmith runner, and writes
+the calibrated JSON back to the same private R2 object without artifacting it.
+Calibration appends and deduplicates runner-observed token sequences so the
+hidden behavior gate can tolerate legitimate official-runner output drift.
+The private prompt manifest is only an organizer input for regenerating the
+golden outside the benchmark workflow. It should not be written into the
+repository workspace, uploaded, or cached. The workflow writes downloaded
+private files only under `$RUNNER_TEMP` and uploads only golden hash and
+byte-count sidecars after a deny-list check rejects prompt, golden, GPQA, model,
+symlink, and oversized artifact paths.
+
+Hidden behavioral correctness cases should use short accepted token prefixes
+captured from the official reference model on the official runner. The GPQA
+gate checks one generated token per case, which avoids cross-machine drift after
+the first answer token while still checking behavior across all 9 hidden
+questions. Longer calibrated reference sequences may be kept in private R2; the
+workflow uses their stable prefix. During the hidden behavior correctness pass,
+the workflow also measures hidden GPQA TTFT from prompt prefill through the
+first greedy answer token and fails the run if that first token is not accepted.
+Only aggregate TTFT fields are written to `score.json`; they do not contain
+prompt text, expected token IDs, generated token IDs, accepted token sets, or
+per-case prompt lengths.
+
+The semantic GPQA judge runs after candidate answers are written into the
+private runner directory. Only aggregate semantic pass counts and the judge
+model name are patched into `score.json`; prompts, references, candidate
+answers, and judge transcripts remain private and are covered by artifact
+deny-list checks.
 
 The benchmark workflow also verifies at runtime that it is executing from the
 configured trusted workflow ref. In production, that trusted ref should be:

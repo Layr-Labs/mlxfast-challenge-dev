@@ -28,7 +28,7 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("if ! verify_reference_manifest \"${reference_dir}\"; then"))
     #expect(setup.contains("downloaded ${total}/${total} safetensors shard(s)"))
     #expect(setup.contains("setup.sh: setup complete elapsed="))
-    #expect(setup.contains(".github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference \"${REFERENCE_DIR}\""))
+    #expect(setup.contains("MLXFAST_OFFLINE_WRITABLE_PATHS=\"${PWD}/weights\" .github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference \"${REFERENCE_DIR}\" --output weights"))
     #expect(setup.contains("${SWIFT_BIN} correctness --weights weights"))
 }
 
@@ -44,7 +44,10 @@ func benchmarkWorkflowRunsTransformOfflineAfterSetup() throws {
     #expect(setupRange.lowerBound < transformRange.lowerBound)
     #expect(workflow.contains("MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main"))
     #expect(workflow.contains("MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: \"0\""))
-    #expect(workflow.contains("run: .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --reference \"${MLXFAST_REFERENCE_DIR}\""))
+    #expect(workflow.contains("MLXFAST_OFFLINE_WRITABLE_PATHS=\"${PWD}/weights\""))
+    #expect(workflow.contains(".github/scripts/run-offline.sh .build/release/mlxfast-swift transform"))
+    #expect(workflow.contains("--reference \"${MLXFAST_REFERENCE_DIR}\""))
+    #expect(workflow.contains("--output weights"))
 }
 
 @Test
@@ -70,7 +73,6 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
         contentsOfFile: ".github/workflows/ci.yml",
         encoding: .utf8
     )
-
     #expect(workflow.contains("name: reference-cache-probe"))
     #expect(workflow.contains("workflow_dispatch:"))
     #expect(!workflow.contains("pull_request:"))
@@ -82,6 +84,8 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
     #expect(workflow.contains("MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: \"0\""))
     #expect(ci.contains("bash -n .github/scripts/download-reference-cache-scope.sh"))
     #expect(ci.contains("bash -n .github/scripts/download-r2-object.sh"))
+    #expect(ci.contains("bash -n .github/scripts/upload-r2-object.sh"))
+    #expect(ci.contains("bash -n .github/scripts/stage-benchmark-artifacts.sh"))
 }
 
 @Test
@@ -110,28 +114,180 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
         contentsOfFile: ".github/scripts/validate-benchmark-artifacts.sh",
         encoding: .utf8
     )
+    let stageArtifacts = try String(
+        contentsOfFile: ".github/scripts/stage-benchmark-artifacts.sh",
+        encoding: .utf8
+    )
+    let ci = try String(
+        contentsOfFile: ".github/workflows/ci.yml",
+        encoding: .utf8
+    )
+    let semanticGate = try String(
+        contentsOfFile: ".github/scripts/run-semantic-gpqa-gate.sh",
+        encoding: .utf8
+    )
 
     #expect(!workflow.contains("${{ runner.temp }}"))
     #expect(workflow.contains("MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}"))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json"))
+    #expect(workflow.contains("MLXFAST_GPQA_REFERENCE_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/gpqa_reference_cases.json"))
+    #expect(!workflow.contains("MLXFAST_GPQA_TTFT_RESULTS_PATH"))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_answers.json"))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json"))
+    #expect(workflow.contains("MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}"))
+    #expect(workflow.contains("MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 2a747bf797e16d58f5ffedacc0d4bf5ce0d14be00f2421dc04289a2154cb011d"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"10320\""))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json"))
+    #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases.json"))
+    #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"9\""))
+    #expect(workflow.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"1\""))
+    #expect(workflow.contains("MLXFAST_GPQA_TTFT_CASE_COUNT: \"9\""))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_CASE_COUNT: \"9\""))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: \"10\""))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MIN_PASS: \"8\""))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_REQUIRED: \"0\""))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929"))
+    #expect(workflow.contains("calibrate_gpqa_reference:"))
+    #expect(workflow.contains("MLXFAST_CALIBRATE_GPQA_REFERENCE: ${{ inputs.calibrate_gpqa_reference && '1' || '0' }}"))
+    #expect(workflow.contains("calibrate_gpqa_reference cannot be combined with preserve_golden_only"))
+    #expect(workflow.contains("mlxfast-swift calibrate-gpqa-gates"))
+    #expect(workflow.contains("mlxfast-gpqa-calibration-private.log"))
+    #expect(workflow.contains(".github/scripts/upload-r2-object.sh"))
+    #expect(workflow.contains("uploaded calibrated GPQA reference cases to private R2"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 830670206859a1b221508ae44a031205a3eba6f5f13e05b40383bf781bdbf067"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: \"26110\""))
+    #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_CASES: \"10\""))
     #expect(workflow.contains("benchmark: using checked-in public correctness golden"))
-    #expect(workflow.contains("[[ -z \"${MLXFAST_CORRECTNESS_GOLDEN_URL:-}\" && \"${MLXFAST_RUN_BENCHMARK}\" == \"1\" && \"${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}\" == \"1\" ]]"))
+    #expect(workflow.contains("hidden GPQA behavior gate requires private R2 secrets"))
+    #expect(workflow.contains("semantic GPQA gate requires ORG_ANTHROPIC_API_KEY"))
+    #expect(workflow.contains("mlxfast-swift attach-gpqa-gates"))
+    #expect(workflow.contains("--case-count \"${MLXFAST_GPQA_CASE_COUNT}\""))
+    #expect(workflow.contains("--max-new-tokens \"${MLXFAST_GPQA_MAX_NEW_TOKENS}\""))
+    #expect(workflow.contains("- name: Generate semantic GPQA answers"))
+    #expect(!workflow.contains("- name: Measure GPQA TTFT gate"))
+    #expect(workflow.contains("- name: Semantic GPQA gate"))
+    #expect(!workflow.contains("mlxfast-swift measure-gpqa-ttft"))
+    #expect(!workflow.contains(".github/scripts/patch-gpqa-ttft-metrics.sh"))
+    #expect(workflow.contains("ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}"))
+    #expect(workflow.contains("mlxfast-swift generate-gpqa-answers"))
+    #expect(workflow.contains("--case-count \"${MLXFAST_SEMANTIC_GPQA_CASE_COUNT}\""))
+    #expect(workflow.contains("--max-new-tokens \"${MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS}\""))
+    #expect(workflow.contains(".github/scripts/run-semantic-gpqa-gate.sh"))
+    #expect(workflow.contains("using private GPQA-augmented correctness golden"))
+    #expect(workflow.contains("[[ \"${MLXFAST_RUN_BENCHMARK}\" == \"1\" ]]"))
     #expect(!workflow.contains("generate_golden_only"))
     #expect(!workflow.contains("MLXFAST_GENERATE_GOLDEN_ONLY"))
-    #expect(workflow.contains("inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success'"))
+    #expect(workflow.contains("hashFiles('score.json') != ''"))
+    #expect(!workflow.contains("inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success'"))
+    #expect(workflow.contains(".github/scripts/stage-benchmark-artifacts.sh"))
+    #expect(workflow.contains("inputs.run_benchmark && !inputs.calibrate_gpqa_reference"))
+    #expect(workflow.contains("golden.sha256=\"${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256\""))
+    #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results"))
+    #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/correctness-results"))
     #expect(!workflow.contains("inputs.submission_ref == '' || steps.validate_benchmark_artifacts.outcome == 'success'"))
-    #expect(workflow.contains("!inputs.run_benchmark && inputs.trace_correctness_step != ''"))
+    #expect(workflow.contains("!inputs.run_benchmark && !inputs.calibrate_gpqa_reference && inputs.trace_correctness_step != ''"))
     #expect(!workflow.contains("results.tsv\n          if-no-files-found"))
     #expect(validator.contains("and (.metrics.first_failing_case == null)"))
     #expect(validator.contains("and (.metrics.expected_token == null)"))
     #expect(validator.contains("and (.metrics.actual_token == null)"))
+    #expect(validator.contains("MLXFAST_SEMANTIC_GPQA_CASE_COUNT is required"))
+    #expect(validator.contains("MLXFAST_SEMANTIC_GPQA_MIN_PASS is required"))
+    #expect(validator.contains("MLXFAST_SEMANTIC_GPQA_REQUIRED"))
+    #expect(validator.contains("MLXFAST_GPQA_TTFT_CASE_COUNT is required"))
+    #expect(validator.contains("\"gpqa_ttft_passed\""))
+    #expect(validator.contains("and (.metrics.gpqa_ttft_passed == true)"))
+    #expect(validator.contains("and (.metrics.gpqa_ttft_case_count == $ttft_cases)"))
+    #expect(validator.contains("\"semantic_gpqa_passed\""))
+    #expect(validator.contains("and (.metrics.semantic_gpqa_passed | type == \"boolean\")"))
+    #expect(validator.contains("if $semantic_required == 1 then"))
+    #expect(validator.contains("and (.metrics.semantic_gpqa_pass_count >= $semantic_min_pass)"))
+    #expect(validator.contains("\"decode_speedup_floor\""))
+    #expect(validator.contains("\"prefill_speedup_floor\""))
+    #expect(validator.contains("and (.metrics.passed_decode_speedup_floor == true)"))
+    #expect(validator.contains("and (.metrics.passed_prefill_speedup_floor == true)"))
+    #expect(validator.contains("and (.metrics.decode_speedup >= .metrics.decode_speedup_floor)"))
+    #expect(validator.contains("and (.metrics.prefill_speedup >= .metrics.prefill_speedup_floor)"))
+    let scoreArtifactCheck = try #require(validator.range(of: "require_file \"${SCORE_PATH}\""))
+    let checkedStepsEnvCheck = try #require(validator.range(of: "MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS is required"))
+    #expect(scoreArtifactCheck.lowerBound < checkedStepsEnvCheck.lowerBound)
+    #expect(stageArtifacts.contains("/tmp/mlxfast-artifacts-*"))
+    #expect(stageArtifacts.contains(".github/scripts/deny-private-artifacts.sh \"${dest}\""))
+    #expect(!ci.contains("bash -n .github/scripts/patch-gpqa-ttft-metrics.sh"))
+    #expect(ci.contains("bash -n .github/scripts/run-semantic-gpqa-gate.sh"))
+    #expect(semanticGate.contains("ANTHROPIC_API_KEY is required"))
+    #expect(semanticGate.contains("unset ANTHROPIC_API_KEY"))
+    #expect(semanticGate.contains("env -u ANTHROPIC_API_KEY curl"))
+    #expect(semanticGate.contains("header = \"x-api-key: %s\""))
+    #expect(semanticGate.contains("anthropic-version: 2023-06-01"))
+    #expect(semanticGate.contains("extract_judge_json()"))
+    #expect(semanticGate.contains("```(?:json)?"))
+    #expect(semanticGate.contains("judge response was not parseable JSON; retrying"))
+    #expect(semanticGate.contains("MLXFAST_SEMANTIC_GPQA_REQUIRED"))
+    #expect(semanticGate.contains("invalid_judge_response"))
+    #expect(semanticGate.contains("diagnostic did not meet threshold"))
+    #expect(semanticGate.contains(".metrics.semantic_gpqa_passed = $semantic_passed"))
+    #expect(semanticGate.contains(".score_sha256 = $score_hash"))
+    #expect(!semanticGate.contains("--header \"x-api-key: ${ANTHROPIC_API_KEY}\""))
+    #expect(!semanticGate.contains("--arg question \"$(jq"))
+    #expect(!semanticGate.contains("candidate_answer\" >&2"))
+}
+
+@Test
+func cliSupportsHiddenGPQAGateAttachment() throws {
+    let cli = try String(
+        contentsOfFile: "Sources/MLXFastCLI/main.swift",
+        encoding: .utf8
+    )
+    let package = try String(
+        contentsOfFile: "Package.swift",
+        encoding: .utf8
+    )
+    let runtime = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
+        encoding: .utf8
+    )
+
+    #expect(package.contains(".product(name: \"Tokenizers\", package: \"swift-transformers\")"))
+    #expect(cli.contains("case \"attach-gpqa-gates\""))
+    #expect(cli.contains("case \"calibrate-gpqa-gates\""))
+    #expect(cli.contains("case \"generate-gpqa-answers\""))
+    #expect(!cli.contains("case \"measure-gpqa-ttft\""))
+    #expect(cli.contains("AutoTokenizer.from(modelFolder: modelFolder, strict: false)"))
+    #expect(cli.contains("acceptedReferenceTokenSequences"))
+    #expect(cli.contains("DeepSeekRuntime.generateGreedyTokens"))
+    #expect(cli.contains("runtimeWorkerOptions(blockedGoldenPath: gpqaPath)"))
+    #expect(cli.contains("calibrated_reference_outputs"))
+    #expect(cli.contains("SemanticGPQAAnswerDocument"))
+    #expect(cli.contains("referenceAnswer(for: testCase)"))
+    #expect(cli.contains("generate-gpqa-answers requires --output or MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH"))
+    #expect(cli.contains("semantic GPQA answer output"))
+    #expect(!cli.contains("measure-gpqa-ttft"))
+    #expect(!cli.contains("FirstTokenTimingOptions(weightsPath: weightsPath, promptTokenSets: selectedPrompts)"))
+    #expect(cli.contains("[\"\\(normalizedKey).\", \"\\(normalizedKey):\", \"\\(normalizedKey))\"]"))
+    #expect(!cli.contains("[\"\\(normalizedKey).\", \"\\(normalizedKey):\", \"\\(normalizedKey))\", \"\\(normalizedKey)\"]"))
+    #expect(cli.contains("existingSequences + [generated]"))
+    #expect(!cli.contains("accepted_sequences="))
+    #expect(cli.contains("accepted_token_sequences or accepted_responses generated from the reference model"))
+    #expect(cli.contains("sequence.prefix(maxNewTokens)"))
+    #expect(cli.contains("uniqueSortedTokenSequences"))
+    #expect(cli.contains("buildGPQABehaviorCaseIfWithinPromptBudget"))
+    #expect(cli.contains("skippedOverBudgetGPQACases"))
+    #expect(cli.contains("GPQA reference produced"))
+    #expect(!cli.contains("gpqa.cases.prefix(caseCount)"))
+    #expect(!cli.contains("answerKey ??"))
+    #expect(cli.contains("MLXFastConstants.correctnessGPQACaseCount"))
+    #expect(cli.contains("MLXFastConstants.correctnessGPQAMaxNewTokens"))
+    #expect(!cli.contains("print(testCase.prompt)"))
+
+    #expect(runtime.contains("compareBehaviorFirstToken"))
+    #expect(runtime.contains("testCase.maxNewTokens == 1"))
+    #expect(runtime.contains("correctnessTokenAccepted("))
+    #expect(runtime.contains("correctness_teacher_forced_batch"))
+    #expect(runtime.contains("top_logit_rows"))
+    #expect(runtime.contains("teacherForcedCorrectnessBatch"))
 }
 
 @Test
@@ -141,11 +297,22 @@ func offlineRunnerProvesNetworkIsBlockedBeforeRunningCommand() throws {
         encoding: .utf8
     )
 
-    #expect(runner.contains("sandbox-exec -f \"${SANDBOX_PROFILE}\""))
-    #expect(runner.contains("curl -fsS --max-time 10 https://example.com"))
+    #expect(runner.contains("(deny network*)"))
+    #expect(runner.contains("pwd -P"))
+    #expect(runner.contains("cd -P"))
+    #expect(runner.contains("(deny process-fork)"))
+    #expect(runner.contains("(deny process-exec*)"))
+    #expect(runner.contains("(allow process-exec (literal"))
+    #expect(runner.contains("if [[ \"${executable}\" == \"${workspace_root}/\"* ]]; then"))
+    #expect(runner.contains("(allow process-exec (subpath"))
+    #expect(runner.contains("(deny file-write*)"))
+    #expect(runner.contains("MLXFAST_OFFLINE_WRITABLE_PATHS"))
+    #expect(runner.contains("write_allowed_writes"))
+    #expect(runner.contains("-fsS --max-time 10 https://example.com"))
     #expect(runner.contains("sandbox profile did not block network access; refusing to run"))
-    #expect(runner.contains("HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1"))
-    #expect(runner.contains("HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9"))
+    #expect(runner.contains("network egress and child process execution are blocked"))
+    #expect(runner.contains("export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1"))
+    #expect(runner.contains("export HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9"))
 }
 
 @Test
@@ -158,11 +325,39 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
         contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
         encoding: .utf8
     )
+    let cli = try String(
+        contentsOfFile: "Sources/MLXFastCLI/main.swift",
+        encoding: .utf8
+    )
 
     #expect(benchmark.contains("MLXFAST_PRIVATE_DIR"))
+    #expect(benchmark.contains("pwd -P"))
+    #expect(benchmark.contains("cd -P"))
+    #expect(benchmark.contains("export MLXFAST_RUNTIME_WORKER_EXECUTABLE=\"$(absolute_path \"${SWIFT_BIN}\")\""))
     #expect(benchmark.contains("(deny file-read* (subpath"))
     #expect(benchmark.contains("(deny file-write* (subpath"))
+    #expect(benchmark.contains("(deny process-fork)"))
+    #expect(benchmark.contains("(deny process-exec*)"))
+    #expect(benchmark.contains("(deny file-write*)"))
+    #expect(benchmark.contains("(allow file-write* (literal \"/dev/null\"))"))
+    #expect(benchmark.contains("(allow process-exec (literal"))
+    #expect(!benchmark.contains("(allow network* (remote ip \"localhost:*\"))"))
+    #expect(!benchmark.contains("(allow network* (local unix-socket))"))
     #expect(runtime.contains("\"MLXFAST_PRIVATE_DIR\""))
+    #expect(runtime.contains("\"ANTHROPIC_API_KEY\""))
+    #expect(runtime.contains("\"MLXFAST_GPQA_REFERENCE_PATH\""))
+    #expect(runtime.contains("\"MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH\""))
+    #expect(runtime.contains("\"MLXFAST_SEMANTIC_GPQA_RESULTS_PATH\""))
+    #expect(runtime.contains("gpqaTTFT: correctnessResult.gpqaTTFT"))
+    #expect(runtime.contains("gpqaTTFTSource: gpqaTTFT.source"))
+    #expect(cli.contains("resolvingSymlinksInPath()"))
+    #expect(cli.contains("(deny process-fork)"))
+    #expect(cli.contains("(deny process-exec*)"))
+    #expect(cli.contains("(deny file-write*)"))
+    #expect(cli.contains("(allow file-write* (literal \"/dev/null\"))"))
+    #expect(cli.contains("(deny file-read* (subpath"))
+    #expect(cli.contains("absolutePath(privateDir)"))
+    #expect(!cli.contains("(allow network* (remote ip \\\"localhost:*\\\"))"))
 }
 
 @Test
@@ -174,8 +369,61 @@ func benchmarkScriptAvoidsNestedSandboxWithRuntimeWorker() throws {
 
     #expect(benchmark.contains("Blacksmith rejects nested sandbox-exec"))
     #expect(benchmark.contains("if [[ \"${USE_RUNTIME_WORKER}\" != \"1\" && \"${MLXFAST_IN_SANDBOX:-0}\" != \"1\" && \"${MLXFAST_NO_SANDBOX:-0}\" != \"1\" ]]; then"))
-    #expect(benchmark.contains("run_offline_command \"${SWIFT_BIN}\" transform --reference"))
-    #expect(benchmark.contains("run_offline_command \"${SWIFT_BIN}\" verify-transform --reference"))
+    #expect(benchmark.contains("run_offline_writable_command \"$(absolute_path \"${WEIGHTS_PATH}\")\""))
+    #expect(benchmark.contains("run_offline_writable_command \"$(absolute_path \"${VERIFY_TRANSFORM_TMP_PARENT}\")\""))
+    #expect(benchmark.contains("--tmp-parent \"${VERIFY_TRANSFORM_TMP_PARENT}\""))
+}
+
+@Test
+func overlayScriptRejectsDangerousArtifactsAfterCopy() throws {
+    let overlay = try String(
+        contentsOfFile: ".github/scripts/overlay-editable-paths.sh",
+        encoding: .utf8
+    )
+
+    #expect(overlay.contains("validate_overlay_tree \"${target_path}\""))
+    #expect(overlay.contains("overlaid editable paths must not contain symlinks"))
+    #expect(overlay.contains("overlaid editable paths must contain only regular files and directories"))
+    #expect(overlay.contains("-links +1"))
+    #expect(overlay.contains("setuid or setgid"))
+}
+
+@Test
+func runtimeWorkerBenchmarkDecodeDoesNotReceiveBulkOracle() throws {
+    let runtime = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
+        encoding: .utf8
+    )
+
+    #expect(runtime.contains("kind: \"decode_begin\""))
+    #expect(runtime.contains("kind: \"decode_step\""))
+    #expect(runtime.contains("worker.decodeStep(inputToken: inputToken)"))
+    #expect(!runtime.contains("expected_seed_token"))
+    #expect(!runtime.contains("case decodeSteps = \"decode_steps\""))
+    #expect(!runtime.contains("validation_delay_ms"))
+    #expect(!runtime.contains("case secondsPerToken = \"seconds_per_token\""))
+    #expect(!runtime.contains("case bandwidthGBPerToken = \"bandwidth_gb_per_token\""))
+}
+
+@Test
+func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
+    let runtime = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
+        encoding: .utf8
+    )
+
+    #expect(runtime.contains("let hello = try readResponseLine(validateNonce: false)"))
+    #expect(runtime.contains("self.sessionNonce = nonce"))
+    #expect(!runtime.contains("RuntimeWorkerRequest(\n            id: id,\n            nonce"))
+    #expect(runtime.contains("response.nonce != sessionNonce"))
+    #expect(runtime.contains("RuntimeWorkerProtocolIO.isolatingStandardIO()"))
+    #expect(runtime.contains("F_DUPFD_CLOEXEC"))
+    #expect(runtime.contains("arc4random_buf(baseAddress, buffer.count)"))
+    #expect(runtime.contains("redirectDescriptorToDevNull(STDIN_FILENO, flags: O_RDONLY"))
+    #expect(runtime.contains("redirectDescriptorToDevNull(STDOUT_FILENO, flags: O_WRONLY"))
+    #expect(runtime.contains("dup2(devNullFD, descriptor)"))
+    #expect(runtime.contains("try protocolIO.writeLine(data)"))
+    #expect(!runtime.contains("FileHandle.standardOutput.write(data)"))
 }
 
 @Test
@@ -349,10 +597,12 @@ func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
 
     let golden = root.appendingPathComponent("correctness_golden_512_2048.json")
     let prompts = root.appendingPathComponent("my_private_prompts.json")
+    let gpqa = root.appendingPathComponent("gpqa_reference_cases.json")
     let goldenPromptText = root.appendingPathComponent("golden_prompt_benchmark_transcription_gate_english_512.txt")
     let goldenPromptJSON = root.appendingPathComponent("golden_prompt_benchmark_transcription_gate_english_512_256.json")
     try "{}".write(to: golden, atomically: true, encoding: .utf8)
     try "{}".write(to: prompts, atomically: true, encoding: .utf8)
+    try "{}".write(to: gpqa, atomically: true, encoding: .utf8)
     try "hidden prompt".write(to: goldenPromptText, atomically: true, encoding: .utf8)
     try "{}".write(to: goldenPromptJSON, atomically: true, encoding: .utf8)
 
@@ -362,6 +612,7 @@ func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
         ".github/scripts/deny-private-artifacts.sh",
         golden.path,
         prompts.path,
+        gpqa.path,
         goldenPromptText.path,
         goldenPromptJSON.path,
     ]

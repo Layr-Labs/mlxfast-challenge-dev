@@ -76,11 +76,9 @@ Important environment variables:
                                      verified by size and hash. CI-only speedup.
   MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1    Build tools only; do not download weights.
   MLXFAST_SKIP_MLX_METALLIB=1        Skip mlx.metallib build.
-  MLXFAST_SKIP_MACTOP_INSTALL=1      Skip mactop install/check.
-  MLXFAST_MACTOP_BIN=/path/mactop    Use a specific mactop binary.
 
 After setup:
-  .github/scripts/run-offline.sh .build/release/mlxfast-swift transform
+  MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --output weights
   ./benchmark.sh
 EOF
 }
@@ -152,7 +150,7 @@ setup.sh: summary
   mlx.metallib: ${metallib_line}
   reference checkpoint: ${reference_line}
   next:
-    .github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference "${REFERENCE_DIR}"
+    MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" .github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference "${REFERENCE_DIR}" --output weights
     ${SWIFT_BIN} correctness --weights weights
     ./benchmark.sh  # requires organizer-supplied correctness_golden.json
 EOF
@@ -211,40 +209,6 @@ ensure_homebrew() {
   if ! load_homebrew_shellenv || ! command -v brew >/dev/null 2>&1; then
     echo "setup.sh: Homebrew installation finished, but brew is still not on PATH" >&2
     echo "setup.sh: open a new shell or run Homebrew's shellenv command, then retry" >&2
-    return 1
-  fi
-}
-
-ensure_mactop() {
-  if [[ "${MLXFAST_SKIP_MACTOP_INSTALL:-0}" == "1" ]]; then
-    echo "setup.sh: skipping mactop install"
-    return 0
-  fi
-
-  if [[ -n "${MLXFAST_MACTOP_BIN:-}" ]]; then
-    if [[ -x "${MLXFAST_MACTOP_BIN}" ]]; then
-      echo "setup.sh: using mactop at ${MLXFAST_MACTOP_BIN}"
-      return 0
-    fi
-    echo "setup.sh: MLXFAST_MACTOP_BIN is set but not executable: ${MLXFAST_MACTOP_BIN}" >&2
-    return 1
-  fi
-
-  if [[ "$(uname -s)" != "Darwin" ]]; then
-    echo "setup.sh: skipping mactop install; mactop is only available on macOS"
-    return 0
-  fi
-
-  if command -v mactop >/dev/null 2>&1 || [[ -x "/opt/homebrew/bin/mactop" || -x "/usr/local/bin/mactop" ]]; then
-    return 0
-  fi
-
-  ensure_homebrew
-  echo "setup.sh: installing mactop with Homebrew"
-  brew install mactop
-
-  if ! command -v mactop >/dev/null 2>&1 && [[ ! -x "/opt/homebrew/bin/mactop" && ! -x "/usr/local/bin/mactop" ]]; then
-    echo "setup.sh: mactop installation finished, but the mactop binary was not found" >&2
     return 1
   fi
 }
@@ -1439,8 +1403,6 @@ EOF
 }
 
 ensure_swift_toolchain
-
-ensure_mactop
 
 echo "setup.sh: building Swift harness"
 mkdir -p .build/clang-module-cache

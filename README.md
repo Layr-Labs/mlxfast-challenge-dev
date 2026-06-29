@@ -13,8 +13,10 @@ See [CHALLENGE.md](CHALLENGE.md) for the full problem statement, scoring formula
 
 # Optional: split dense weights into weights/ and write the expert streaming
 # manifest. setup.sh prints this command with the exact reference path it used.
-.github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
-  --reference .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
+MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+  .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+  --reference .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main \
+  --output weights
 
 # Run the checked-in public correctness gate.
 .build/release/mlxfast-swift correctness --weights weights
@@ -89,6 +91,31 @@ benchmark runs require a precomputed hidden `correctness_golden.json` through
 the `correctness_golden_url` input, `MLXFAST_CORRECTNESS_GOLDEN_URL`
 repository secret, or the private R2 object
 `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`.
+Full benchmark runs also require the private R2
+`correctness_prompts/gpqa_reference_cases.json` object. The workflow tokenizes
+9 token-budget-valid hidden GPQA multiple-choice prompts locally and attaches
+them as short-answer behavior gates before correctness runs. Each private GPQA
+case must include reference-calibrated `accepted_token_sequences` or
+`accepted_responses`; GPQA answer keys are metadata, not an exact-token oracle.
+Generate those accepted token sequences on the official runner with
+`mlxfast-swift calibrate-gpqa-gates --gpqa PATH --weights weights --tokenizer weights --output PATH`.
+Calibration is cumulative: rerunning it appends and deduplicates the
+runner-observed token sequence instead of replacing older accepted sequences.
+The official workflow checks the first generated GPQA answer token for each
+case, using the stable prefix of any longer calibrated reference sequence.
+During that hidden behavior correctness pass, it also records TTFT by timing
+prompt prefill through the first greedy answer token. The uploaded score records
+only aggregate TTFT counts and timings; generated first-token IDs, accepted
+token IDs, prompts, and answers stay out of GitHub logs and artifacts.
+After timing, the workflow also generates short hidden GPQA answers and sends
+only those private answer bundles to Claude for a semantic pass/fail judge. This
+requires the `ORG_ANTHROPIC_API_KEY` repository secret. The score artifact records
+only aggregate semantic counts and the judge model name; prompts, references,
+candidate answers, and judge text stay in the private runner directory.
+Because the one-token GPQA behavior gate is exact-token based, calibrate that
+layer on the official Blacksmith runner with the manual
+`calibrate_gpqa_reference` workflow input; M-series local calibration can differ
+from the official runner even at temperature zero.
 If none of those is configured, a full benchmark fails; it will not use a
 committed prompt, committed golden, or Actions cache fallback for ranked
 scoring. Final hidden goldens should come from protected storage. Private
@@ -167,29 +194,38 @@ live submit retry use a stable backend idempotency key.
 ## Scoring
 
 ```
-cost = peak_ram_GB × bandwidth_GB_per_token × decode_sec_per_token × prefill_sec_per_token
-score = 1 / cost
+decode_speedup = baseline_decode_sec_per_token / decode_sec_per_token
+prefill_speedup = baseline_prefill_sec_per_token / prefill_sec_per_token
+score = decode_speedup^0.75 * prefill_speedup^0.25
 ```
 
-Higher score is better. The cost product is still recoverable from the
-component metrics in `score.json`, but the top-level `score` is an up-only value
-so leaderboards and local comparisons read naturally.
-Bandwidth is measured via **mactop hardware DRAM counters** — not a software model.
+Higher score is better. A baseline implementation on the official runner scores
+about `1.0`; improvements should move the score upward. Decode is weighted more
+heavily because it dominates interactive generation, while prefill still matters
+for prompt processing.
+Both phases must also stay within 5% of the official baseline:
+
+```
+decode_speedup >= 0.95
+prefill_speedup >= 0.95
+```
+
+On the current Blacksmith M4 baseline, that means decode must be at most
+`3.177180971604` seconds/token and prefill must be at most
+`0.149183255724` seconds/token. The floor prevents a submission from sacrificing
+one serving phase badly to improve the other.
+The harness records `bandwidth_source=expert_streaming_reads` and derives
+`bandwidth_gb_per_token` from measured expert-streaming file bytes during the
+decode window. Bandwidth, RAM, and expert-read metrics are reported for operator
+review and future guardrails; they are not primary score factors.
 Correctness is a hard gate. See CHALLENGE.md for the full correctness specification.
 The official run checks 256 correctness positions and times a 256-token decode
 window. Public local correctness uses the checked-in correctness fixture. When
 a local golden with a benchmark oracle is available, `--quick` shortens
 correctness and decode to 64 token checks and prints the resulting `score.json`.
-The score payload also includes audit-only fields for wall-clock benchmark time,
-preflight time, correctness time, timed benchmark time, final process RSS, expert
-streaming counters, and transformed-weights digest. These fields are for
-operator review and are not additional scoring factors.
-
-**Baseline (TBD — reference M5 Max 128 GB):**
-
-| Peak RAM | Bandwidth | Decode | Prefill | Score |
-|---|---|---|---|---|
-| TBD | TBD | TBD | TBD | TBD |
+The score payload includes the official baseline timings, computed speedups,
+wall-clock phase timings, final process RSS, expert streaming counters, and
+transformed-weights digest.
 
 ## Architecture
 
@@ -232,27 +268,43 @@ Private prompt manifests and hidden benchmark golden files are not committed or
 generated by the benchmark workflow. In private benchmark CI, the normal path
 downloads the precomputed
 `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`
-object from R2. Generate final hidden benchmark goldens outside the public
-repository and provide the resulting file to benchmark CI with R2,
-`correctness_golden_url`, or `MLXFAST_CORRECTNESS_GOLDEN_URL`. The benchmark
-workflow stores its local golden copy under `$RUNNER_TEMP`, not the repository
-workspace, and uploads only hash and byte-count sidecars.
+object from R2, then downloads
+`correctness_prompts/gpqa_reference_cases.json` and merges it into the local
+golden as 9 hidden one-token GPQA behavior checks. Generate
+final hidden benchmark goldens outside the public repository and provide the
+resulting file to benchmark CI with R2, `correctness_golden_url`, or
+`MLXFAST_CORRECTNESS_GOLDEN_URL`. The benchmark workflow stores its local golden
+copy under `$RUNNER_TEMP`, not the repository workspace, and uploads only hash
+and byte-count sidecars. The semantic GPQA answer and judge result files are
+also kept under the private runner directory and are not uploaded. Semantic
+GPQA is recorded into `score.json` as a diagnostic by default; set
+`MLXFAST_SEMANTIC_GPQA_REQUIRED=1` in private CI only after the hidden cases are
+calibrated tightly enough to make the judge a hard gate.
 
 The Swift `make-golden` generator has been removed from the public harness so CI
 only consumes precomputed fixtures. The last commit on this branch containing
 that generator is `bcc9438fabf95a9b371d5749dd64f2f5ccc60fd5`.
 
-Each correctness prompt must contain exactly 512 token IDs. The benchmark prompt
-must contain at least 512 token IDs. The precomputed golden file stores exact
-expected tokens for each 512-token correctness prompt and its 256-token greedy
-continuation, the 512-token prefill check, the 32-token decode seed, and the
-timed 256-token decode window. During correctness, the harness checks those
+Each base correctness prompt must contain exactly 512 token IDs. The benchmark
+prompt must contain at least 512 token IDs. The precomputed golden file stores
+exact expected tokens for each 512-token correctness prompt and its 256-token
+greedy continuation, the 512-token prefill check, the 512-token decode seed, and
+the timed 256-token decode window. During correctness, the harness checks those
 continuation positions teacher-forced: after each accepted step it feeds the
 golden previous token back into the model. This keeps the gate stable across
 Apple GPU/software differences by preventing one earlier mismatch from
 cascading into unrelated later-token failures. A token is accepted only when it
 matches the expected token, except for a true top-logit tie within the tiny
 `1e-6` logit tolerance used by the harness.
+
+Private fixtures can also include a `correctness_gates` object with hidden
+anchor logits, short free-run prefixes, and answer-token behavior checks.
+Those gates are additive: public local correctness still works with the
+checked-in fixture, while official benchmark fixtures can cover more adversarial
+behavior without exposing prompt or answer data. Behavior checks compare
+accepted answer prefixes against up to `max_new_tokens` generated tokens, which
+lets hidden GPQA questions require only a one-letter answer while tolerating
+tokenizer whitespace variants.
 
 ## Requirements
 
@@ -264,4 +316,3 @@ matches the expected token, except for a true top-logit tie within the tiny
   Line Tools may need full Xcode installed, opened once, and licensed with
   `sudo xcodebuild -license accept`
 - CMake, installed by `./setup.sh` via Homebrew when missing and used by `tools/build-mlx-metallib.sh` to build `mlx.metallib`
-- [mactop](https://github.com/metaspartan/mactop) — installed by `./setup.sh` via Homebrew when missing, or supplied with `MLXFAST_MACTOP_BIN=/path/to/mactop`

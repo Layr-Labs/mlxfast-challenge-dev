@@ -1,27 +1,66 @@
 import Foundation
 
 public enum BenchmarkScore {
-    public static func cost(
-        peakRamGB: Double,
-        bandwidthGBPerToken: Double,
-        decodeSecondsPerToken: Double,
-        prefillSecondsPerToken: Double
+    public static func speedup(
+        baselineSecondsPerToken: Double,
+        candidateSecondsPerToken: Double
     ) -> Double {
-        peakRamGB * bandwidthGBPerToken * decodeSecondsPerToken * prefillSecondsPerToken
+        guard baselineSecondsPerToken.isFinite,
+              candidateSecondsPerToken.isFinite,
+              baselineSecondsPerToken > 0,
+              candidateSecondsPerToken > 0
+        else {
+            return 0
+        }
+        return baselineSecondsPerToken / candidateSecondsPerToken
     }
 
     public static func score(
-        peakRamGB: Double,
-        bandwidthGBPerToken: Double,
         decodeSecondsPerToken: Double,
-        prefillSecondsPerToken: Double
+        prefillSecondsPerToken: Double,
+        baselineDecodeSecondsPerToken: Double = MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+        baselinePrefillSecondsPerToken: Double = MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+        decodeWeight: Double = MLXFastConstants.scoreDecodeWeight,
+        prefillWeight: Double = MLXFastConstants.scorePrefillWeight
     ) -> Double {
-        1.0 / cost(
-            peakRamGB: peakRamGB,
-            bandwidthGBPerToken: bandwidthGBPerToken,
-            decodeSecondsPerToken: decodeSecondsPerToken,
-            prefillSecondsPerToken: prefillSecondsPerToken
+        let decodeSpeedup = speedup(
+            baselineSecondsPerToken: baselineDecodeSecondsPerToken,
+            candidateSecondsPerToken: decodeSecondsPerToken
         )
+        let prefillSpeedup = speedup(
+            baselineSecondsPerToken: baselinePrefillSecondsPerToken,
+            candidateSecondsPerToken: prefillSecondsPerToken
+        )
+        guard decodeSpeedup > 0,
+              prefillSpeedup > 0,
+              decodeWeight.isFinite,
+              prefillWeight.isFinite,
+              decodeWeight >= 0,
+              prefillWeight >= 0,
+              decodeWeight + prefillWeight > 0
+        else {
+            return .nan
+        }
+
+        let totalWeight = decodeWeight + prefillWeight
+        return pow(decodeSpeedup, decodeWeight / totalWeight)
+            * pow(prefillSpeedup, prefillWeight / totalWeight)
+    }
+
+    public static func passesSpeedupFloors(
+        decodeSpeedup: Double,
+        prefillSpeedup: Double,
+        decodeFloor: Double = MLXFastConstants.scoreDecodeSpeedupFloor,
+        prefillFloor: Double = MLXFastConstants.scorePrefillSpeedupFloor
+    ) -> Bool {
+        guard decodeSpeedup.isFinite,
+              prefillSpeedup.isFinite,
+              decodeFloor.isFinite,
+              prefillFloor.isFinite
+        else {
+            return false
+        }
+        return decodeSpeedup >= decodeFloor && prefillSpeedup >= prefillFloor
     }
 }
 
@@ -66,10 +105,29 @@ public struct ScoreMetrics: Codable, Equatable {
     public let bandwidthGBPerToken: Double
     public let decodeSecondsPerToken: Double
     public let prefillSecondsPerToken: Double
+    public let baselineDecodeSecondsPerToken: Double
+    public let baselinePrefillSecondsPerToken: Double
+    public let decodeSpeedup: Double
+    public let prefillSpeedup: Double
+    public let decodeSpeedupFloor: Double
+    public let prefillSpeedupFloor: Double
+    public let passedDecodeSpeedupFloor: Bool
+    public let passedPrefillSpeedupFloor: Bool
     public let benchmarkWallSeconds: Double
     public let preflightSeconds: Double
     public let correctnessSeconds: Double
     public let timedBenchmarkSeconds: Double
+    public let gpqaTTFTPassed: Bool
+    public let gpqaTTFTPassCount: Int
+    public let gpqaTTFTCaseCount: Int
+    public let gpqaTTFTSeconds: Double
+    public let gpqaTTFTP50Seconds: Double
+    public let gpqaTTFTMaxSeconds: Double
+    public let gpqaTTFTSource: String
+    public let semanticGPQAPassed: Bool
+    public let semanticGPQAPassCount: Int
+    public let semanticGPQACaseCount: Int
+    public let semanticGPQAModel: String
     public let processResidentMemoryGB: Double
     public let passedCorrectness: Bool
     public let numLayers: Int
@@ -104,10 +162,29 @@ public struct ScoreMetrics: Codable, Equatable {
         case bandwidthGBPerToken = "bandwidth_gb_per_token"
         case decodeSecondsPerToken = "decode_seconds_per_token"
         case prefillSecondsPerToken = "prefill_seconds_per_token"
+        case baselineDecodeSecondsPerToken = "baseline_decode_seconds_per_token"
+        case baselinePrefillSecondsPerToken = "baseline_prefill_seconds_per_token"
+        case decodeSpeedup = "decode_speedup"
+        case prefillSpeedup = "prefill_speedup"
+        case decodeSpeedupFloor = "decode_speedup_floor"
+        case prefillSpeedupFloor = "prefill_speedup_floor"
+        case passedDecodeSpeedupFloor = "passed_decode_speedup_floor"
+        case passedPrefillSpeedupFloor = "passed_prefill_speedup_floor"
         case benchmarkWallSeconds = "benchmark_wall_seconds"
         case preflightSeconds = "preflight_seconds"
         case correctnessSeconds = "correctness_seconds"
         case timedBenchmarkSeconds = "timed_benchmark_seconds"
+        case gpqaTTFTPassed = "gpqa_ttft_passed"
+        case gpqaTTFTPassCount = "gpqa_ttft_pass_count"
+        case gpqaTTFTCaseCount = "gpqa_ttft_case_count"
+        case gpqaTTFTSeconds = "gpqa_ttft_seconds"
+        case gpqaTTFTP50Seconds = "gpqa_ttft_p50_seconds"
+        case gpqaTTFTMaxSeconds = "gpqa_ttft_max_seconds"
+        case gpqaTTFTSource = "gpqa_ttft_source"
+        case semanticGPQAPassed = "semantic_gpqa_passed"
+        case semanticGPQAPassCount = "semantic_gpqa_pass_count"
+        case semanticGPQACaseCount = "semantic_gpqa_case_count"
+        case semanticGPQAModel = "semantic_gpqa_model"
         case processResidentMemoryGB = "process_resident_memory_gb"
         case passedCorrectness = "passed_correctness"
         case numLayers = "num_layers"
@@ -143,10 +220,29 @@ public struct ScoreMetrics: Codable, Equatable {
         bandwidthGBPerToken: Double,
         decodeSecondsPerToken: Double,
         prefillSecondsPerToken: Double,
+        baselineDecodeSecondsPerToken: Double = MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+        baselinePrefillSecondsPerToken: Double = MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+        decodeSpeedup: Double? = nil,
+        prefillSpeedup: Double? = nil,
+        decodeSpeedupFloor: Double = MLXFastConstants.scoreDecodeSpeedupFloor,
+        prefillSpeedupFloor: Double = MLXFastConstants.scorePrefillSpeedupFloor,
+        passedDecodeSpeedupFloor: Bool? = nil,
+        passedPrefillSpeedupFloor: Bool? = nil,
         benchmarkWallSeconds: Double = 0,
         preflightSeconds: Double = 0,
         correctnessSeconds: Double = 0,
         timedBenchmarkSeconds: Double = 0,
+        gpqaTTFTPassed: Bool = false,
+        gpqaTTFTPassCount: Int = 0,
+        gpqaTTFTCaseCount: Int = 0,
+        gpqaTTFTSeconds: Double = 0,
+        gpqaTTFTP50Seconds: Double = 0,
+        gpqaTTFTMaxSeconds: Double = 0,
+        gpqaTTFTSource: String = "",
+        semanticGPQAPassed: Bool = false,
+        semanticGPQAPassCount: Int = 0,
+        semanticGPQACaseCount: Int = 0,
+        semanticGPQAModel: String = "",
         processResidentMemoryGB: Double = 0,
         passedCorrectness: Bool,
         numLayers: Int,
@@ -180,10 +276,35 @@ public struct ScoreMetrics: Codable, Equatable {
         self.bandwidthGBPerToken = bandwidthGBPerToken
         self.decodeSecondsPerToken = decodeSecondsPerToken
         self.prefillSecondsPerToken = prefillSecondsPerToken
+        self.baselineDecodeSecondsPerToken = baselineDecodeSecondsPerToken
+        self.baselinePrefillSecondsPerToken = baselinePrefillSecondsPerToken
+        self.decodeSpeedup = decodeSpeedup ?? BenchmarkScore.speedup(
+            baselineSecondsPerToken: baselineDecodeSecondsPerToken,
+            candidateSecondsPerToken: decodeSecondsPerToken
+        )
+        self.prefillSpeedup = prefillSpeedup ?? BenchmarkScore.speedup(
+            baselineSecondsPerToken: baselinePrefillSecondsPerToken,
+            candidateSecondsPerToken: prefillSecondsPerToken
+        )
+        self.decodeSpeedupFloor = decodeSpeedupFloor
+        self.prefillSpeedupFloor = prefillSpeedupFloor
+        self.passedDecodeSpeedupFloor = passedDecodeSpeedupFloor ?? (self.decodeSpeedup >= decodeSpeedupFloor)
+        self.passedPrefillSpeedupFloor = passedPrefillSpeedupFloor ?? (self.prefillSpeedup >= prefillSpeedupFloor)
         self.benchmarkWallSeconds = benchmarkWallSeconds
         self.preflightSeconds = preflightSeconds
         self.correctnessSeconds = correctnessSeconds
         self.timedBenchmarkSeconds = timedBenchmarkSeconds
+        self.gpqaTTFTPassed = gpqaTTFTPassed
+        self.gpqaTTFTPassCount = gpqaTTFTPassCount
+        self.gpqaTTFTCaseCount = gpqaTTFTCaseCount
+        self.gpqaTTFTSeconds = gpqaTTFTSeconds
+        self.gpqaTTFTP50Seconds = gpqaTTFTP50Seconds
+        self.gpqaTTFTMaxSeconds = gpqaTTFTMaxSeconds
+        self.gpqaTTFTSource = gpqaTTFTSource
+        self.semanticGPQAPassed = semanticGPQAPassed
+        self.semanticGPQAPassCount = semanticGPQAPassCount
+        self.semanticGPQACaseCount = semanticGPQACaseCount
+        self.semanticGPQAModel = semanticGPQAModel
         self.processResidentMemoryGB = processResidentMemoryGB
         self.passedCorrectness = passedCorrectness
         self.numLayers = numLayers
@@ -220,10 +341,55 @@ public struct ScoreMetrics: Codable, Equatable {
         self.bandwidthGBPerToken = try container.decode(Double.self, forKey: .bandwidthGBPerToken)
         self.decodeSecondsPerToken = try container.decode(Double.self, forKey: .decodeSecondsPerToken)
         self.prefillSecondsPerToken = try container.decode(Double.self, forKey: .prefillSecondsPerToken)
+        self.baselineDecodeSecondsPerToken = try container.decodeIfPresent(
+            Double.self,
+            forKey: .baselineDecodeSecondsPerToken
+        ) ?? MLXFastConstants.officialBaselineDecodeSecondsPerToken
+        self.baselinePrefillSecondsPerToken = try container.decodeIfPresent(
+            Double.self,
+            forKey: .baselinePrefillSecondsPerToken
+        ) ?? MLXFastConstants.officialBaselinePrefillSecondsPerToken
+        self.decodeSpeedup = try container.decodeIfPresent(Double.self, forKey: .decodeSpeedup)
+            ?? BenchmarkScore.speedup(
+                baselineSecondsPerToken: baselineDecodeSecondsPerToken,
+                candidateSecondsPerToken: decodeSecondsPerToken
+            )
+        self.prefillSpeedup = try container.decodeIfPresent(Double.self, forKey: .prefillSpeedup)
+            ?? BenchmarkScore.speedup(
+                baselineSecondsPerToken: baselinePrefillSecondsPerToken,
+                candidateSecondsPerToken: prefillSecondsPerToken
+            )
+        self.decodeSpeedupFloor = try container.decodeIfPresent(
+            Double.self,
+            forKey: .decodeSpeedupFloor
+        ) ?? MLXFastConstants.scoreDecodeSpeedupFloor
+        self.prefillSpeedupFloor = try container.decodeIfPresent(
+            Double.self,
+            forKey: .prefillSpeedupFloor
+        ) ?? MLXFastConstants.scorePrefillSpeedupFloor
+        self.passedDecodeSpeedupFloor = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .passedDecodeSpeedupFloor
+        ) ?? (self.decodeSpeedup >= self.decodeSpeedupFloor)
+        self.passedPrefillSpeedupFloor = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .passedPrefillSpeedupFloor
+        ) ?? (self.prefillSpeedup >= self.prefillSpeedupFloor)
         self.benchmarkWallSeconds = try container.decodeIfPresent(Double.self, forKey: .benchmarkWallSeconds) ?? 0
         self.preflightSeconds = try container.decodeIfPresent(Double.self, forKey: .preflightSeconds) ?? 0
         self.correctnessSeconds = try container.decodeIfPresent(Double.self, forKey: .correctnessSeconds) ?? 0
         self.timedBenchmarkSeconds = try container.decodeIfPresent(Double.self, forKey: .timedBenchmarkSeconds) ?? 0
+        self.gpqaTTFTPassed = try container.decodeIfPresent(Bool.self, forKey: .gpqaTTFTPassed) ?? false
+        self.gpqaTTFTPassCount = try container.decodeIfPresent(Int.self, forKey: .gpqaTTFTPassCount) ?? 0
+        self.gpqaTTFTCaseCount = try container.decodeIfPresent(Int.self, forKey: .gpqaTTFTCaseCount) ?? 0
+        self.gpqaTTFTSeconds = try container.decodeIfPresent(Double.self, forKey: .gpqaTTFTSeconds) ?? 0
+        self.gpqaTTFTP50Seconds = try container.decodeIfPresent(Double.self, forKey: .gpqaTTFTP50Seconds) ?? 0
+        self.gpqaTTFTMaxSeconds = try container.decodeIfPresent(Double.self, forKey: .gpqaTTFTMaxSeconds) ?? 0
+        self.gpqaTTFTSource = try container.decodeIfPresent(String.self, forKey: .gpqaTTFTSource) ?? ""
+        self.semanticGPQAPassed = try container.decodeIfPresent(Bool.self, forKey: .semanticGPQAPassed) ?? false
+        self.semanticGPQAPassCount = try container.decodeIfPresent(Int.self, forKey: .semanticGPQAPassCount) ?? 0
+        self.semanticGPQACaseCount = try container.decodeIfPresent(Int.self, forKey: .semanticGPQACaseCount) ?? 0
+        self.semanticGPQAModel = try container.decodeIfPresent(String.self, forKey: .semanticGPQAModel) ?? ""
         self.processResidentMemoryGB = try container.decodeIfPresent(Double.self, forKey: .processResidentMemoryGB) ?? 0
         self.passedCorrectness = try container.decode(Bool.self, forKey: .passedCorrectness)
         self.numLayers = try container.decode(Int.self, forKey: .numLayers)
@@ -260,10 +426,29 @@ public struct ScoreMetrics: Codable, Equatable {
         try container.encode(bandwidthGBPerToken, forKey: .bandwidthGBPerToken)
         try container.encode(decodeSecondsPerToken, forKey: .decodeSecondsPerToken)
         try container.encode(prefillSecondsPerToken, forKey: .prefillSecondsPerToken)
+        try container.encode(baselineDecodeSecondsPerToken, forKey: .baselineDecodeSecondsPerToken)
+        try container.encode(baselinePrefillSecondsPerToken, forKey: .baselinePrefillSecondsPerToken)
+        try container.encode(decodeSpeedup, forKey: .decodeSpeedup)
+        try container.encode(prefillSpeedup, forKey: .prefillSpeedup)
+        try container.encode(decodeSpeedupFloor, forKey: .decodeSpeedupFloor)
+        try container.encode(prefillSpeedupFloor, forKey: .prefillSpeedupFloor)
+        try container.encode(passedDecodeSpeedupFloor, forKey: .passedDecodeSpeedupFloor)
+        try container.encode(passedPrefillSpeedupFloor, forKey: .passedPrefillSpeedupFloor)
         try container.encode(benchmarkWallSeconds, forKey: .benchmarkWallSeconds)
         try container.encode(preflightSeconds, forKey: .preflightSeconds)
         try container.encode(correctnessSeconds, forKey: .correctnessSeconds)
         try container.encode(timedBenchmarkSeconds, forKey: .timedBenchmarkSeconds)
+        try container.encode(gpqaTTFTPassed, forKey: .gpqaTTFTPassed)
+        try container.encode(gpqaTTFTPassCount, forKey: .gpqaTTFTPassCount)
+        try container.encode(gpqaTTFTCaseCount, forKey: .gpqaTTFTCaseCount)
+        try container.encode(gpqaTTFTSeconds, forKey: .gpqaTTFTSeconds)
+        try container.encode(gpqaTTFTP50Seconds, forKey: .gpqaTTFTP50Seconds)
+        try container.encode(gpqaTTFTMaxSeconds, forKey: .gpqaTTFTMaxSeconds)
+        try container.encode(gpqaTTFTSource, forKey: .gpqaTTFTSource)
+        try container.encode(semanticGPQAPassed, forKey: .semanticGPQAPassed)
+        try container.encode(semanticGPQAPassCount, forKey: .semanticGPQAPassCount)
+        try container.encode(semanticGPQACaseCount, forKey: .semanticGPQACaseCount)
+        try container.encode(semanticGPQAModel, forKey: .semanticGPQAModel)
         try container.encode(processResidentMemoryGB, forKey: .processResidentMemoryGB)
         try container.encode(passedCorrectness, forKey: .passedCorrectness)
         try container.encode(numLayers, forKey: .numLayers)

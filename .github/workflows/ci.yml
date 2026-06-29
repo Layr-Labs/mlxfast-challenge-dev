@@ -55,8 +55,11 @@ jobs:
           bash -n .github/scripts/overlay-editable-paths.sh
           bash -n .github/scripts/verify-correctness-golden.sh
           bash -n .github/scripts/validate-benchmark-artifacts.sh
+          bash -n .github/scripts/run-semantic-gpqa-gate.sh
           bash -n .github/scripts/deny-private-artifacts.sh
+          bash -n .github/scripts/stage-benchmark-artifacts.sh
           bash -n .github/scripts/download-r2-object.sh
+          bash -n .github/scripts/upload-r2-object.sh
           bash -n .github/scripts/download-reference-cache-scope.sh
 
       - name: Build release CLI

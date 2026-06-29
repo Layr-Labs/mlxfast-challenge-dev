@@ -5,9 +5,6 @@ set -euo pipefail
 SCORE_PATH="${MLXFAST_SCORE_PATH:-score.json}"
 INTEGRITY_PATH="${MLXFAST_INTEGRITY_PATH:-benchmark-integrity.json}"
 GOLDEN_PATH="${MLXFAST_CORRECTNESS_GOLDEN_PATH:-correctness_golden.json}"
-: "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256:?MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256 is required}"
-: "${MLXFAST_EXPECTED_CORRECTNESS_STEPS:?MLXFAST_EXPECTED_CORRECTNESS_STEPS is required}"
-: "${MLXFAST_EXPECTED_CORRECTNESS_CASES:?MLXFAST_EXPECTED_CORRECTNESS_CASES is required}"
 
 require_file() {
   local path="$1"
@@ -22,6 +19,27 @@ require_file "${SCORE_PATH}.sha256"
 require_file "${INTEGRITY_PATH}"
 require_file "${GOLDEN_PATH}.sha256"
 require_file "${GOLDEN_PATH}.bytes"
+
+: "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256:?MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256 is required}"
+: "${MLXFAST_EXPECTED_CORRECTNESS_STEPS:?MLXFAST_EXPECTED_CORRECTNESS_STEPS is required}"
+: "${MLXFAST_EXPECTED_CORRECTNESS_CASES:?MLXFAST_EXPECTED_CORRECTNESS_CASES is required}"
+: "${MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS:?MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS is required}"
+: "${MLXFAST_GPQA_TTFT_CASE_COUNT:?MLXFAST_GPQA_TTFT_CASE_COUNT is required}"
+: "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT:?MLXFAST_SEMANTIC_GPQA_CASE_COUNT is required}"
+: "${MLXFAST_SEMANTIC_GPQA_MIN_PASS:?MLXFAST_SEMANTIC_GPQA_MIN_PASS is required}"
+
+case "${MLXFAST_SEMANTIC_GPQA_REQUIRED:-0}" in
+  1|true|TRUE|yes|YES)
+    semantic_required=1
+    ;;
+  0|false|FALSE|no|NO|"")
+    semantic_required=0
+    ;;
+  *)
+    echo "::error::MLXFAST_SEMANTIC_GPQA_REQUIRED must be boolean-like" >&2
+    exit 1
+    ;;
+esac
 
 shasum -a 256 -c "${SCORE_PATH}.sha256"
 
@@ -40,8 +58,12 @@ fi
 
 jq -e \
   --arg golden_hash "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}" \
-  --argjson correctness_steps "${MLXFAST_EXPECTED_CORRECTNESS_STEPS}" \
+  --argjson checked_steps "${MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS}" \
   --argjson correctness_cases "${MLXFAST_EXPECTED_CORRECTNESS_CASES}" \
+  --argjson ttft_cases "${MLXFAST_GPQA_TTFT_CASE_COUNT}" \
+  --argjson semantic_cases "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT}" \
+  --argjson semantic_min_pass "${MLXFAST_SEMANTIC_GPQA_MIN_PASS}" \
+  --argjson semantic_required "${semantic_required}" \
   '
   def same_keys($expected):
     (keys_unsorted | sort) == ($expected | sort);
@@ -51,12 +73,16 @@ jq -e \
     "actual_token",
     "bandwidth_gb_per_token",
     "bandwidth_source",
+    "baseline_decode_seconds_per_token",
+    "baseline_prefill_seconds_per_token",
     "benchmark_wall_seconds",
     "case_count",
     "checked_steps",
     "commit",
     "correctness_seconds",
     "decode_seconds_per_token",
+    "decode_speedup",
+    "decode_speedup_floor",
     "error",
     "expected_token",
     "expert_bytes_read",
@@ -70,15 +96,30 @@ jq -e \
     "first_failing_layer",
     "first_failing_step",
     "golden_hash",
+    "gpqa_ttft_case_count",
+    "gpqa_ttft_max_seconds",
+    "gpqa_ttft_p50_seconds",
+    "gpqa_ttft_pass_count",
+    "gpqa_ttft_passed",
+    "gpqa_ttft_seconds",
+    "gpqa_ttft_source",
     "harness_hash",
     "max_abs_diff",
     "num_layers",
     "passed_correctness",
     "peak_ram_gb",
+    "passed_decode_speedup_floor",
+    "passed_prefill_speedup_floor",
     "prefill_seconds_per_token",
+    "prefill_speedup",
+    "prefill_speedup_floor",
     "preflight_seconds",
     "process_resident_memory_gb",
     "runtime",
+    "semantic_gpqa_case_count",
+    "semantic_gpqa_model",
+    "semantic_gpqa_pass_count",
+    "semantic_gpqa_passed",
     "timed_benchmark_seconds",
     "timestamp",
     "weights_byte_count",
@@ -87,10 +128,30 @@ jq -e \
   ]))
   and .passed == true
   and (.score | type == "number")
-  and (.score >= 0)
+  and (.score > 0)
   and (.metrics.passed_correctness == true)
-  and (.metrics.checked_steps == $correctness_steps)
+  and (.metrics.checked_steps == $checked_steps)
   and (.metrics.case_count == $correctness_cases)
+  and (.metrics.gpqa_ttft_passed == true)
+  and (.metrics.gpqa_ttft_case_count == $ttft_cases)
+  and (.metrics.gpqa_ttft_pass_count == .metrics.gpqa_ttft_case_count)
+  and (.metrics.gpqa_ttft_seconds | type == "number")
+  and (.metrics.gpqa_ttft_seconds > 0)
+  and (.metrics.gpqa_ttft_p50_seconds | type == "number")
+  and (.metrics.gpqa_ttft_p50_seconds > 0)
+  and (.metrics.gpqa_ttft_max_seconds | type == "number")
+  and (.metrics.gpqa_ttft_max_seconds >= .metrics.gpqa_ttft_p50_seconds)
+  and (.metrics.gpqa_ttft_source == "hidden_gpqa_first_token")
+  and (.metrics.semantic_gpqa_passed | type == "boolean")
+  and (.metrics.semantic_gpqa_case_count == $semantic_cases)
+  and (.metrics.semantic_gpqa_pass_count | type == "number")
+  and (.metrics.semantic_gpqa_pass_count <= .metrics.semantic_gpqa_case_count)
+  and (if $semantic_required == 1 then
+    (.metrics.semantic_gpqa_passed == true)
+    and (.metrics.semantic_gpqa_pass_count >= $semantic_min_pass)
+  else true end)
+  and (.metrics.semantic_gpqa_model | type == "string")
+  and (.metrics.semantic_gpqa_model | length > 0)
   and (.metrics.num_layers == 43)
   and (.metrics.golden_hash == $golden_hash)
   and (.metrics.first_failing_case == null)
@@ -102,6 +163,22 @@ jq -e \
   and (.metrics.decode_seconds_per_token > 0)
   and (.metrics.prefill_seconds_per_token | type == "number")
   and (.metrics.prefill_seconds_per_token > 0)
+  and (.metrics.baseline_decode_seconds_per_token | type == "number")
+  and (.metrics.baseline_decode_seconds_per_token > 0)
+  and (.metrics.baseline_prefill_seconds_per_token | type == "number")
+  and (.metrics.baseline_prefill_seconds_per_token > 0)
+  and (.metrics.decode_speedup | type == "number")
+  and (.metrics.decode_speedup > 0)
+  and (.metrics.decode_speedup_floor | type == "number")
+  and (.metrics.decode_speedup_floor == 0.95)
+  and (.metrics.passed_decode_speedup_floor == true)
+  and (.metrics.decode_speedup >= .metrics.decode_speedup_floor)
+  and (.metrics.prefill_speedup | type == "number")
+  and (.metrics.prefill_speedup > 0)
+  and (.metrics.prefill_speedup_floor | type == "number")
+  and (.metrics.prefill_speedup_floor == 0.95)
+  and (.metrics.passed_prefill_speedup_floor == true)
+  and (.metrics.prefill_speedup >= .metrics.prefill_speedup_floor)
   and (.metrics.correctness_seconds | type == "number")
   and (.metrics.correctness_seconds > 0)
   and (.metrics.timed_benchmark_seconds | type == "number")
@@ -113,7 +190,7 @@ jq -e \
   and (.metrics.weights_file_count > 0)
   and (.metrics.weights_byte_count | type == "number")
   and (.metrics.weights_byte_count > 0)
-  and (.metrics.bandwidth_source == "expert_streaming_reads" or .metrics.bandwidth_source == "mactop_hardware")
+  and (.metrics.bandwidth_source == "expert_streaming_reads")
   and (.metrics.error == "")
   and (.metrics.commit | test("^[0-9a-f]{7,40}$"))
   and (.metrics.harness_hash | test("^[0-9a-f]{64}$"))

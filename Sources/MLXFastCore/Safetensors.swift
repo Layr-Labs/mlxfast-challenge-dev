@@ -131,7 +131,9 @@ public enum Safetensors {
         if FileManager.default.fileExists(atPath: destination.path) {
             try FileManager.default.removeItem(at: destination)
         }
-        FileManager.default.createFile(atPath: destination.path, contents: nil)
+        // FileManager.createFile can return false under macOS Seatbelt even when
+        // direct writes are allowed; Data.write gives us a real throwing create.
+        try Data().write(to: destination, options: [])
 
         let input = try FileHandle(forReadingFrom: source)
         let output = try FileHandle(forWritingTo: destination)

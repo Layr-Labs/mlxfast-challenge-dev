@@ -3,22 +3,34 @@ import Testing
 @testable import MLXFastCore
 
 @Test
-func benchmarkScoreIsInverseOfCostProduct() {
-    let cost = BenchmarkScore.cost(
-        peakRamGB: 40,
-        bandwidthGBPerToken: 0.01,
-        decodeSecondsPerToken: 2,
-        prefillSecondsPerToken: 0.125
-    )
+func benchmarkScoreUsesWeightedBaselineSpeedups() {
     let score = BenchmarkScore.score(
-        peakRamGB: 40,
-        bandwidthGBPerToken: 0.01,
-        decodeSecondsPerToken: 2,
-        prefillSecondsPerToken: 0.125
+        decodeSecondsPerToken: 1.5,
+        prefillSecondsPerToken: 0.25,
+        baselineDecodeSecondsPerToken: 3,
+        baselinePrefillSecondsPerToken: 0.25,
+        decodeWeight: 0.75,
+        prefillWeight: 0.25
+    )
+    let decodeSpeedup = BenchmarkScore.speedup(
+        baselineSecondsPerToken: 3,
+        candidateSecondsPerToken: 1.5
+    )
+    let prefillSpeedup = BenchmarkScore.speedup(
+        baselineSecondsPerToken: 0.25,
+        candidateSecondsPerToken: 0.25
     )
 
-    #expect(abs(cost - 0.1) < 1e-12)
-    #expect(abs(score - 10) < 1e-12)
+    #expect(abs(decodeSpeedup - 2) < 1e-12)
+    #expect(abs(prefillSpeedup - 1) < 1e-12)
+    #expect(abs(score - pow(2, 0.75)) < 1e-12)
+}
+
+@Test
+func benchmarkScoreChecksComponentFloors() {
+    #expect(BenchmarkScore.passesSpeedupFloors(decodeSpeedup: 1.01, prefillSpeedup: 0.95))
+    #expect(!BenchmarkScore.passesSpeedupFloors(decodeSpeedup: 0.94, prefillSpeedup: 1.20))
+    #expect(!BenchmarkScore.passesSpeedupFloors(decodeSpeedup: 1.20, prefillSpeedup: 0.94))
 }
 
 @Test
@@ -51,10 +63,29 @@ func writeScorePayloadEmitsDarkbloomShape() throws {
     #expect(decoded.metrics.weightsHash == "")
     #expect(decoded.metrics.weightsByteCount == 0)
     #expect(decoded.metrics.weightsFileCount == 0)
+    #expect(decoded.metrics.baselineDecodeSecondsPerToken == MLXFastConstants.officialBaselineDecodeSecondsPerToken)
+    #expect(decoded.metrics.baselinePrefillSecondsPerToken == MLXFastConstants.officialBaselinePrefillSecondsPerToken)
+    #expect(decoded.metrics.decodeSpeedup == 0)
+    #expect(decoded.metrics.prefillSpeedup == 0)
+    #expect(decoded.metrics.decodeSpeedupFloor == MLXFastConstants.scoreDecodeSpeedupFloor)
+    #expect(decoded.metrics.prefillSpeedupFloor == MLXFastConstants.scorePrefillSpeedupFloor)
+    #expect(decoded.metrics.passedDecodeSpeedupFloor == false)
+    #expect(decoded.metrics.passedPrefillSpeedupFloor == false)
     #expect(decoded.metrics.benchmarkWallSeconds == 0)
     #expect(decoded.metrics.preflightSeconds == 0)
     #expect(decoded.metrics.correctnessSeconds == 0)
     #expect(decoded.metrics.timedBenchmarkSeconds == 0)
+    #expect(decoded.metrics.gpqaTTFTPassed == false)
+    #expect(decoded.metrics.gpqaTTFTPassCount == 0)
+    #expect(decoded.metrics.gpqaTTFTCaseCount == 0)
+    #expect(decoded.metrics.gpqaTTFTSeconds == 0)
+    #expect(decoded.metrics.gpqaTTFTP50Seconds == 0)
+    #expect(decoded.metrics.gpqaTTFTMaxSeconds == 0)
+    #expect(decoded.metrics.gpqaTTFTSource == "")
+    #expect(decoded.metrics.semanticGPQAPassed == false)
+    #expect(decoded.metrics.semanticGPQAPassCount == 0)
+    #expect(decoded.metrics.semanticGPQACaseCount == 0)
+    #expect(decoded.metrics.semanticGPQAModel == "")
     #expect(decoded.metrics.processResidentMemoryGB == 0)
     #expect(decoded.metrics.firstFailingLayer == nil)
     #expect(decoded.metrics.firstFailingCase == nil)
@@ -84,6 +115,17 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
                 preflightSeconds: 1,
                 correctnessSeconds: 2,
                 timedBenchmarkSeconds: 8,
+                gpqaTTFTPassed: true,
+                gpqaTTFTPassCount: 9,
+                gpqaTTFTCaseCount: 9,
+                gpqaTTFTSeconds: 72.5,
+                gpqaTTFTP50Seconds: 72,
+                gpqaTTFTMaxSeconds: 75,
+                gpqaTTFTSource: "hidden_gpqa_first_token",
+                semanticGPQAPassed: true,
+                semanticGPQAPassCount: 8,
+                semanticGPQACaseCount: 9,
+                semanticGPQAModel: "claude-sonnet-4-5-20250929",
                 processResidentMemoryGB: 3.5,
                 passedCorrectness: false,
                 numLayers: MLXFastConstants.numHiddenLayers,
@@ -139,10 +181,29 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(raw.contains("\"weights_hash\" : \"weights-hash\""))
     #expect(raw.contains("\"weights_byte_count\" : 4096"))
     #expect(raw.contains("\"weights_file_count\" : 7"))
+    #expect(raw.contains("\"baseline_decode_seconds_per_token\" : \(MLXFastConstants.officialBaselineDecodeSecondsPerToken)"))
+    #expect(raw.contains("\"baseline_prefill_seconds_per_token\" : \(MLXFastConstants.officialBaselinePrefillSecondsPerToken)"))
+    #expect(raw.contains("\"decode_speedup\" : 0"))
+    #expect(raw.contains("\"prefill_speedup\" : 0"))
+    #expect(raw.contains("\"decode_speedup_floor\" : \(MLXFastConstants.scoreDecodeSpeedupFloor)"))
+    #expect(raw.contains("\"prefill_speedup_floor\" : \(MLXFastConstants.scorePrefillSpeedupFloor)"))
+    #expect(raw.contains("\"passed_decode_speedup_floor\" : false"))
+    #expect(raw.contains("\"passed_prefill_speedup_floor\" : false"))
     #expect(raw.contains("\"benchmark_wall_seconds\" : 11"))
     #expect(raw.contains("\"preflight_seconds\" : 1"))
     #expect(raw.contains("\"correctness_seconds\" : 2"))
     #expect(raw.contains("\"timed_benchmark_seconds\" : 8"))
+    #expect(raw.contains("\"gpqa_ttft_passed\" : true"))
+    #expect(raw.contains("\"gpqa_ttft_pass_count\" : 9"))
+    #expect(raw.contains("\"gpqa_ttft_case_count\" : 9"))
+    #expect(raw.contains("\"gpqa_ttft_seconds\" : 72.5"))
+    #expect(raw.contains("\"gpqa_ttft_p50_seconds\" : 72"))
+    #expect(raw.contains("\"gpqa_ttft_max_seconds\" : 75"))
+    #expect(raw.contains("\"gpqa_ttft_source\" : \"hidden_gpqa_first_token\""))
+    #expect(raw.contains("\"semantic_gpqa_passed\" : true"))
+    #expect(raw.contains("\"semantic_gpqa_pass_count\" : 8"))
+    #expect(raw.contains("\"semantic_gpqa_case_count\" : 9"))
+    #expect(raw.contains("\"semantic_gpqa_model\" : \"claude-sonnet-4-5-20250929\""))
     #expect(raw.contains("\"process_resident_memory_gb\" : 3.5"))
     #expect(decoded.metrics.firstFailingLayer == nil)
     #expect(decoded.metrics.firstFailingCase == "case-b")
@@ -162,10 +223,29 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(decoded.metrics.weightsHash == "weights-hash")
     #expect(decoded.metrics.weightsByteCount == 4096)
     #expect(decoded.metrics.weightsFileCount == 7)
+    #expect(decoded.metrics.baselineDecodeSecondsPerToken == MLXFastConstants.officialBaselineDecodeSecondsPerToken)
+    #expect(decoded.metrics.baselinePrefillSecondsPerToken == MLXFastConstants.officialBaselinePrefillSecondsPerToken)
+    #expect(decoded.metrics.decodeSpeedup == 0)
+    #expect(decoded.metrics.prefillSpeedup == 0)
+    #expect(decoded.metrics.decodeSpeedupFloor == MLXFastConstants.scoreDecodeSpeedupFloor)
+    #expect(decoded.metrics.prefillSpeedupFloor == MLXFastConstants.scorePrefillSpeedupFloor)
+    #expect(decoded.metrics.passedDecodeSpeedupFloor == false)
+    #expect(decoded.metrics.passedPrefillSpeedupFloor == false)
     #expect(decoded.metrics.benchmarkWallSeconds == 11)
     #expect(decoded.metrics.preflightSeconds == 1)
     #expect(decoded.metrics.correctnessSeconds == 2)
     #expect(decoded.metrics.timedBenchmarkSeconds == 8)
+    #expect(decoded.metrics.gpqaTTFTPassed == true)
+    #expect(decoded.metrics.gpqaTTFTPassCount == 9)
+    #expect(decoded.metrics.gpqaTTFTCaseCount == 9)
+    #expect(decoded.metrics.gpqaTTFTSeconds == 72.5)
+    #expect(decoded.metrics.gpqaTTFTP50Seconds == 72)
+    #expect(decoded.metrics.gpqaTTFTMaxSeconds == 75)
+    #expect(decoded.metrics.gpqaTTFTSource == "hidden_gpqa_first_token")
+    #expect(decoded.metrics.semanticGPQAPassed == true)
+    #expect(decoded.metrics.semanticGPQAPassCount == 8)
+    #expect(decoded.metrics.semanticGPQACaseCount == 9)
+    #expect(decoded.metrics.semanticGPQAModel == "claude-sonnet-4-5-20250929")
     #expect(decoded.metrics.processResidentMemoryGB == 3.5)
 }
 
@@ -213,10 +293,29 @@ func scoreMetricsDecodeOlderPayloadWithoutWeightsIntegrityFields() throws {
     #expect(decoded.metrics.weightsHash == "")
     #expect(decoded.metrics.weightsByteCount == 0)
     #expect(decoded.metrics.weightsFileCount == 0)
+    #expect(decoded.metrics.baselineDecodeSecondsPerToken == MLXFastConstants.officialBaselineDecodeSecondsPerToken)
+    #expect(decoded.metrics.baselinePrefillSecondsPerToken == MLXFastConstants.officialBaselinePrefillSecondsPerToken)
+    #expect(decoded.metrics.decodeSpeedup == 0)
+    #expect(decoded.metrics.prefillSpeedup == 0)
+    #expect(decoded.metrics.decodeSpeedupFloor == MLXFastConstants.scoreDecodeSpeedupFloor)
+    #expect(decoded.metrics.prefillSpeedupFloor == MLXFastConstants.scorePrefillSpeedupFloor)
+    #expect(decoded.metrics.passedDecodeSpeedupFloor == false)
+    #expect(decoded.metrics.passedPrefillSpeedupFloor == false)
     #expect(decoded.metrics.benchmarkWallSeconds == 0)
     #expect(decoded.metrics.preflightSeconds == 0)
     #expect(decoded.metrics.correctnessSeconds == 0)
     #expect(decoded.metrics.timedBenchmarkSeconds == 0)
+    #expect(decoded.metrics.gpqaTTFTPassed == false)
+    #expect(decoded.metrics.gpqaTTFTPassCount == 0)
+    #expect(decoded.metrics.gpqaTTFTCaseCount == 0)
+    #expect(decoded.metrics.gpqaTTFTSeconds == 0)
+    #expect(decoded.metrics.gpqaTTFTP50Seconds == 0)
+    #expect(decoded.metrics.gpqaTTFTMaxSeconds == 0)
+    #expect(decoded.metrics.gpqaTTFTSource == "")
+    #expect(decoded.metrics.semanticGPQAPassed == false)
+    #expect(decoded.metrics.semanticGPQAPassCount == 0)
+    #expect(decoded.metrics.semanticGPQACaseCount == 0)
+    #expect(decoded.metrics.semanticGPQAModel == "")
     #expect(decoded.metrics.processResidentMemoryGB == 0)
 }
 
