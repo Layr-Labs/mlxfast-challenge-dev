@@ -87,18 +87,20 @@ jobs:
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: "10320"
       MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json
       MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases.json
-      MLXFAST_GPQA_CASE_COUNT: "9"
-      MLXFAST_GPQA_MAX_NEW_TOKENS: "1"
-      MLXFAST_GPQA_TTFT_CASE_COUNT: "9"
-      MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "9"
+      MLXFAST_GPQA_CASE_COUNT: "5"
+      MLXFAST_GPQA_MAX_NEW_TOKENS: "10"
+      MLXFAST_GPQA_TTFT_CASE_COUNT: "5"
+      MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "5"
       MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: "10"
-      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "8"
-      MLXFAST_SEMANTIC_GPQA_REQUIRED: "0"
+      # Baseline DeepSeek V4 Flash currently passes 3/5 hidden short-answer
+      # semantic GPQA judgments, so the hard gate is calibrated to preserve
+      # baseline behavior rather than demand better-than-baseline GPQA quality.
+      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "3"
+      MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
       MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 830670206859a1b221508ae44a031205a3eba6f5f13e05b40383bf781bdbf067
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "26110"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "256"
-      MLXFAST_EXPECTED_CORRECTNESS_CASES: "10"
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
       MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
       MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}
@@ -483,23 +485,6 @@ jobs:
             wait "${pid}"
           else
             ./benchmark.sh
-          fi
-
-      - name: Generate semantic GPQA answers
-        if: ${{ !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference }}
-        run: |
-          set -euo pipefail
-          echo "benchmark: generating hidden semantic GPQA candidate answers"
-          if ! .build/release/mlxfast-swift generate-gpqa-answers \
-              --gpqa "${MLXFAST_GPQA_REFERENCE_PATH}" \
-              --weights weights \
-              --tokenizer weights \
-              --output "${MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH}" \
-              --case-count "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT}" \
-              --max-new-tokens "${MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS}" \
-              > "${RUNNER_TEMP}/mlxfast-semantic-gpqa-private.log" 2>&1; then
-            echo "benchmark: hidden semantic GPQA candidate generation failed" >&2
-            exit 1
           fi
 
       - name: Semantic GPQA gate

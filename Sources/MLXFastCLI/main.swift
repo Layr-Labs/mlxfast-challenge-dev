@@ -277,13 +277,35 @@ private enum MLXFastCLI {
                 fallback: MLXFastConstants.defaultScorePath
             )
         )
+        let semanticOutputPath = environmentValue("MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH", fallback: "")
+        let semanticCaseCount = try parsePositiveInt(
+            environmentValue(
+                "MLXFAST_SEMANTIC_GPQA_CASE_COUNT",
+                fallback: "\(MLXFastConstants.semanticGPQACaseCount)"
+            ),
+            optionName: "MLXFAST_SEMANTIC_GPQA_CASE_COUNT"
+        )
+        let semanticMaxNewTokens = try parsePositiveInt(
+            environmentValue(
+                "MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS",
+                fallback: "\(MLXFastConstants.semanticGPQAMaxNewTokens)"
+            ),
+            optionName: "MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS"
+        )
+        if !semanticOutputPath.isEmpty {
+            try requirePrivateOutputPath(semanticOutputPath, description: "semantic GPQA answer output")
+        }
         let quick = options.hasFlag("--quick")
         let payload = DeepSeekRuntime.benchmark(
             BenchmarkOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
                 correctnessSteps: quick ? MLXFastConstants.quickCorrectnessSteps : MLXFastConstants.correctnessSteps,
-                benchmarkDecodeSteps: quick ? MLXFastConstants.quickBenchmarkDecodeSteps : MLXFastConstants.benchmarkDecodeSteps
+                benchmarkDecodeSteps: quick ? MLXFastConstants.quickBenchmarkDecodeSteps : MLXFastConstants.benchmarkDecodeSteps,
+                semanticGPQAOutputPath: semanticOutputPath.isEmpty ? nil : semanticOutputPath,
+                semanticGPQATokenizerPath: weightsPath,
+                semanticGPQACaseCount: semanticCaseCount,
+                semanticGPQAMaxNewTokens: semanticMaxNewTokens
             ),
             worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
         )
@@ -811,7 +833,12 @@ private enum MLXFastCLI {
             name: testCase.identifier,
             promptTokens: promptTokens,
             acceptedTokenSequences: acceptedSequences,
-            maxNewTokens: maxNewTokens
+            maxNewTokens: maxNewTokens,
+            semanticPrompt: testCase.prompt,
+            semanticAnswerKey: trimmedNonEmpty(testCase.answerKey),
+            semanticReferenceAnswer: referenceAnswer(for: testCase),
+            semanticDomain: trimmedNonEmpty(testCase.domain),
+            semanticSubdomain: trimmedNonEmpty(testCase.subdomain)
         )
     }
 

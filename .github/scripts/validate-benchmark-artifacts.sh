@@ -28,7 +28,7 @@ require_file "${GOLDEN_PATH}.bytes"
 : "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT:?MLXFAST_SEMANTIC_GPQA_CASE_COUNT is required}"
 : "${MLXFAST_SEMANTIC_GPQA_MIN_PASS:?MLXFAST_SEMANTIC_GPQA_MIN_PASS is required}"
 
-case "${MLXFAST_SEMANTIC_GPQA_REQUIRED:-0}" in
+case "${MLXFAST_SEMANTIC_GPQA_REQUIRED:-1}" in
   1|true|TRUE|yes|YES)
     semantic_required=1
     ;;

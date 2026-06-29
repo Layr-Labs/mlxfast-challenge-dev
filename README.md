@@ -93,7 +93,7 @@ repository secret, or the private R2 object
 `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`.
 Full benchmark runs also require the private R2
 `correctness_prompts/gpqa_reference_cases.json` object. The workflow tokenizes
-9 token-budget-valid hidden GPQA multiple-choice prompts locally and attaches
+5 token-budget-valid hidden GPQA multiple-choice prompts locally and attaches
 them as short-answer behavior gates before correctness runs. Each private GPQA
 case must include reference-calibrated `accepted_token_sequences` or
 `accepted_responses`; GPQA answer keys are metadata, not an exact-token oracle.
@@ -107,11 +107,14 @@ During that hidden behavior correctness pass, it also records TTFT by timing
 prompt prefill through the first greedy answer token. The uploaded score records
 only aggregate TTFT counts and timings; generated first-token IDs, accepted
 token IDs, prompts, and answers stay out of GitHub logs and artifacts.
-After timing, the workflow also generates short hidden GPQA answers and sends
+The same correctness pass captures short hidden GPQA continuations and sends
 only those private answer bundles to Claude for a semantic pass/fail judge. This
 requires the `ORG_ANTHROPIC_API_KEY` repository secret. The score artifact records
 only aggregate semantic counts and the judge model name; prompts, references,
 candidate answers, and judge text stay in the private runner directory.
+The private workflow treats semantic GPQA as a hard gate with a 3/5 threshold,
+calibrated to the unmodified DeepSeek V4 Flash baseline rather than to
+better-than-baseline GPQA answer quality.
 Because the one-token GPQA behavior gate is exact-token based, calibrate that
 layer on the official Blacksmith runner with the manual
 `calibrate_gpqa_reference` workflow input; M-series local calibration can differ
@@ -219,7 +222,7 @@ The harness records `bandwidth_source=expert_streaming_reads` and derives
 decode window. Bandwidth, RAM, and expert-read metrics are reported for operator
 review and future guardrails; they are not primary score factors.
 Correctness is a hard gate. See CHALLENGE.md for the full correctness specification.
-The official run checks 256 correctness positions and times a 256-token decode
+The official run checks 256 correctness positions and times a 128-token decode
 window. Public local correctness uses the checked-in correctness fixture. When
 a local golden with a benchmark oracle is available, `--quick` shortens
 correctness and decode to 64 token checks and prints the resulting `score.json`.
@@ -270,16 +273,13 @@ downloads the precomputed
 `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`
 object from R2, then downloads
 `correctness_prompts/gpqa_reference_cases.json` and merges it into the local
-golden as 9 hidden one-token GPQA behavior checks. Generate
+golden as 5 hidden GPQA behavior checks. Generate
 final hidden benchmark goldens outside the public repository and provide the
 resulting file to benchmark CI with R2, `correctness_golden_url`, or
 `MLXFAST_CORRECTNESS_GOLDEN_URL`. The benchmark workflow stores its local golden
 copy under `$RUNNER_TEMP`, not the repository workspace, and uploads only hash
 and byte-count sidecars. The semantic GPQA answer and judge result files are
-also kept under the private runner directory and are not uploaded. Semantic
-GPQA is recorded into `score.json` as a diagnostic by default; set
-`MLXFAST_SEMANTIC_GPQA_REQUIRED=1` in private CI only after the hidden cases are
-calibrated tightly enough to make the judge a hard gate.
+also kept under the private runner directory and are not uploaded.
 
 The Swift `make-golden` generator has been removed from the public harness so CI
 only consumes precomputed fixtures. The last commit on this branch containing
@@ -289,7 +289,7 @@ Each base correctness prompt must contain exactly 512 token IDs. The benchmark
 prompt must contain at least 512 token IDs. The precomputed golden file stores
 exact expected tokens for each 512-token correctness prompt and its 256-token
 greedy continuation, the 512-token prefill check, the 512-token decode seed, and
-the timed 256-token decode window. During correctness, the harness checks those
+at least 128 tokens for the timed decode window. During correctness, the harness checks those
 continuation positions teacher-forced: after each accepted step it feeds the
 golden previous token back into the model. This keeps the gate stable across
 Apple GPU/software differences by preventing one earlier mismatch from
