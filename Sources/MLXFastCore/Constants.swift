@@ -59,8 +59,8 @@ public enum MLXFastConstants {
     // changing timed windows, run one trusted baseline validation before using
     // scores for the public leaderboard. Raw RAM, bandwidth, and read metrics
     // remain audit fields instead of primary score factors.
-    public static let officialBaselinePrefillSecondsPerToken = 0.17387153881835937
-    public static let officialBaselineDecodeSecondsPerToken = 3.0280505878359376
+    public static let officialBaselinePrefillSecondsPerToken = 0.17330563175390626
+    public static let officialBaselineDecodeSecondsPerToken = 4.220506571617188
     public static let scorePrefillWeight = 0.25
     public static let scoreDecodeWeight = 0.75
     public static let scorePrefillSpeedupFloor = 0.95
