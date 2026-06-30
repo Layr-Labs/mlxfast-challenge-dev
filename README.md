@@ -79,17 +79,15 @@ explicit CLI flags take precedence. Set `MLXFAST_REFERENCE_BASE_URL` to use
 another HTTP checkpoint prefix, including Hugging Face. Run `./setup.sh --help`
 for the full local setup knobs.
 
-For manual GitHub Actions benchmark runs, dispatch `benchmark.yml` on a macOS
-Blacksmith runner. Set `reference_base_url` to an HTTP prefix containing the
-reference checkpoint files, such as an R2 public bucket or Worker route. The
-workflow downloads the reference checkpoint into the same repo-local
-Hugging Face-style cache path used by local setup, passes that path explicitly
-to the offline transform, then prepares the correctness golden after transform
-completes. Correctness-only workflow runs use the checked-in public
+For manual GitHub Actions benchmark runs, dispatch `benchmark.yml` on the
+trusted repository workflow. The workflow uses the protected
+`MLXFAST_REFERENCE_BASE_URL` secret when present, otherwise the fixed Darkbloom
+reference mirror. It downloads the reference checkpoint into the same
+repo-local Hugging Face-style cache path used by local setup, passes that path
+explicitly to the offline transform, then prepares the correctness golden after
+transform completes. Correctness-only workflow runs use the checked-in public
 `correctness_prompts/public_longcopy_gate_english_512_256.json` fixture. Full
-benchmark runs require a precomputed hidden `correctness_golden.json` through
-the `correctness_golden_url` input, `MLXFAST_CORRECTNESS_GOLDEN_URL`
-repository secret, or the private R2 object
+benchmark runs require the precomputed hidden R2 object
 `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`.
 Full benchmark runs also require the private R2
 `correctness_prompts/gpqa_reference_cases.json` object. The workflow tokenizes
@@ -281,12 +279,12 @@ downloads the precomputed
 object from R2, then downloads
 `correctness_prompts/gpqa_reference_cases.json` and merges it into the local
 golden as 5 hidden GPQA behavior checks. Generate
-final hidden benchmark goldens outside the public repository and provide the
-resulting file to benchmark CI with R2, `correctness_golden_url`, or
-`MLXFAST_CORRECTNESS_GOLDEN_URL`. The benchmark workflow stores its local golden
-copy under `$RUNNER_TEMP`, not the repository workspace, and uploads only hash
-and byte-count sidecars. The semantic GPQA answer and judge result files are
-also kept under the private runner directory and are not uploaded.
+final hidden benchmark goldens outside the public repository and upload the
+resulting file to the protected private R2 path. The benchmark workflow stores
+its local golden copy under `$RUNNER_TEMP`, not the repository workspace, and
+uploads only hash and byte-count sidecars. The semantic GPQA answer and judge
+result files are also kept under the private runner directory and are not
+uploaded.
 
 The Swift `make-golden` generator has been removed from the public harness so CI
 only consumes precomputed fixtures. The last commit on this branch containing
