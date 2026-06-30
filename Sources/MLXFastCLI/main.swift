@@ -271,6 +271,7 @@ private enum MLXFastCLI {
             let decodeSteps = localSubmit
                 ? MLXFastConstants.localSubmitBenchmarkDecodeSteps
                 : MLXFastConstants.localIterateBenchmarkDecodeSteps
+            let timingRepeats = localSubmit ? MLXFastConstants.localSubmitBenchmarkRepeats : 1
             let modeName = localSubmit ? "local-submit" : "local-iterate"
             let runtime = localSubmit ? "swift-local-submit" : "swift-local-iterate"
             let payload = DeepSeekRuntime.localIterate(
@@ -278,6 +279,7 @@ private enum MLXFastCLI {
                     weightsPath: weightsPath,
                     goldenPath: goldenPath,
                     benchmarkDecodeSteps: decodeSteps,
+                    timingRepeats: timingRepeats,
                     modeName: modeName,
                     runtime: runtime
                 ),

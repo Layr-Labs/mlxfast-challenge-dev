@@ -19,10 +19,12 @@ extension DeepSeekRuntime {
         var expertStats = ExpertStreamingStats.zero
         var peakRamGB = 0.0
         let modeName = options.modeName
+        let checkedStepsPerPass = options.benchmarkDecodeSteps + 1
+        let totalCheckedSteps = checkedStepsPerPass * options.timingRepeats
 
         progress(
-            "\(modeName) start checked_tokens=\(options.benchmarkDecodeSteps + 1) "
-                + "decode_steps=\(options.benchmarkDecodeSteps)"
+            "\(modeName) start checked_tokens=\(totalCheckedSteps) "
+                + "decode_steps=\(options.benchmarkDecodeSteps) repeats=\(options.timingRepeats)"
         )
 
         func failed(
@@ -94,6 +96,7 @@ extension DeepSeekRuntime {
                     testCase: localCase,
                     goldenHash: golden.sha256,
                     decodeSteps: options.benchmarkDecodeSteps,
+                    timingRepeats: options.timingRepeats,
                     modeName: modeName,
                     workerOptions: worker,
                     progress: progress
@@ -104,6 +107,7 @@ extension DeepSeekRuntime {
                     testCase: localCase,
                     goldenHash: golden.sha256,
                     decodeSteps: options.benchmarkDecodeSteps,
+                    timingRepeats: options.timingRepeats,
                     modeName: modeName,
                     progress: progress
                 )
@@ -155,6 +159,9 @@ extension DeepSeekRuntime {
         guard options.benchmarkDecodeSteps > 0 else {
             throw MLXFastError.invalidInput("\(options.modeName) decode steps must be positive")
         }
+        guard options.timingRepeats > 0 else {
+            throw MLXFastError.invalidInput("\(options.modeName) timing repeats must be positive")
+        }
     }
 
     struct LocalIterateTimingResult {
@@ -170,6 +177,7 @@ extension DeepSeekRuntime {
         testCase: GoldenCase,
         goldenHash: String,
         decodeSteps: Int,
+        timingRepeats: Int,
         modeName: String,
         progress: ((String) -> Void)?
     ) throws -> LocalIterateTimingResult {
@@ -189,77 +197,94 @@ extension DeepSeekRuntime {
             )
         }
 
-        let cache = DeepSeekModelCache(config: weightCache.config)
-        let prefillStart = DispatchTime.now().uptimeNanoseconds
-        var logits = try DeepSeekModel.logits(
-            inputIDs: inputIDsArray(testCase.promptTokens),
-            weightCache: weightCache,
-            cache: cache,
-            positionOffset: 0
-        )
-        var actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
-        let prefillElapsed = secondsSince(prefillStart)
-        let expectedSeedToken = testCase.expectedTokens[0]
-        var latestStats = DeepSeekRuntime.expertStats(from: weightCache)
+        var totalPrefillSeconds = 0.0
+        var totalDecodeSeconds = 0.0
+        var totalDecodeBytesRead: UInt64 = 0
+        var latestStats = ExpertStreamingStats.zero
         var failureStep: Int?
         var failureExpected: Int?
         var failureActual: Int?
-        if !correctnessTokenAccepted(
-            expectedToken: expectedSeedToken,
-            actualToken: actualToken,
-            topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits)
-        ) {
-            failureStep = 0
-            failureExpected = expectedSeedToken
-            failureActual = actualToken
-        }
-        cache.materializeCachedState()
-        let metricsBeforeDecode = weightCache.loader.expertStreamingMetrics?.snapshot()
+        let checkedStepsPerPass = decodeSteps + 1
+        let totalDecodeSteps = decodeSteps * timingRepeats
 
-        let decodeStart = DispatchTime.now().uptimeNanoseconds
-        for decodedStep in 0..<decodeSteps {
-            let previousToken = testCase.expectedTokens[decodedStep]
-            logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray([previousToken]),
+        for repeatIndex in 0..<timingRepeats {
+            if timingRepeats > 1 {
+                progress?("\(modeName) checked pass \(repeatIndex + 1)/\(timingRepeats) start")
+            }
+            let cache = DeepSeekModelCache(config: weightCache.config)
+            let prefillStart = DispatchTime.now().uptimeNanoseconds
+            var logits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray(testCase.promptTokens),
                 weightCache: weightCache,
                 cache: cache,
-                positionOffset: testCase.promptTokens.count + decodedStep
+                positionOffset: 0
             )
-            actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
-            let expectedToken = testCase.expectedTokens[decodedStep + 1]
+            var actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
+            totalPrefillSeconds += secondsSince(prefillStart)
+            let expectedSeedToken = testCase.expectedTokens[0]
+            latestStats = DeepSeekRuntime.expertStats(from: weightCache)
             if failureStep == nil,
                !correctnessTokenAccepted(
-                   expectedToken: expectedToken,
+                   expectedToken: expectedSeedToken,
                    actualToken: actualToken,
                    topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits)
                )
             {
-                failureStep = decodedStep + 1
-                failureExpected = expectedToken
+                failureStep = repeatIndex * checkedStepsPerPass
+                failureExpected = expectedSeedToken
                 failureActual = actualToken
             }
-            latestStats = DeepSeekRuntime.expertStats(from: weightCache)
-            reportProgress(
-                step: decodedStep + 1,
-                total: decodeSteps,
-                intervalSteps: 8,
-                progress: { step, total in
-                    progress?("\(modeName) checked decode \(step)/\(total) tokens")
+            cache.materializeCachedState()
+            let metricsBeforeDecode = weightCache.loader.expertStreamingMetrics?.snapshot()
+
+            let decodeStart = DispatchTime.now().uptimeNanoseconds
+            for decodedStep in 0..<decodeSteps {
+                let previousToken = testCase.expectedTokens[decodedStep]
+                logits = try DeepSeekModel.logits(
+                    inputIDs: inputIDsArray([previousToken]),
+                    weightCache: weightCache,
+                    cache: cache,
+                    positionOffset: testCase.promptTokens.count + decodedStep
+                )
+                actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
+                let expectedToken = testCase.expectedTokens[decodedStep + 1]
+                if failureStep == nil,
+                   !correctnessTokenAccepted(
+                       expectedToken: expectedToken,
+                       actualToken: actualToken,
+                       topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits)
+                   )
+                {
+                    failureStep = repeatIndex * checkedStepsPerPass + decodedStep + 1
+                    failureExpected = expectedToken
+                    failureActual = actualToken
                 }
+                latestStats = DeepSeekRuntime.expertStats(from: weightCache)
+                reportProgress(
+                    step: repeatIndex * decodeSteps + decodedStep + 1,
+                    total: totalDecodeSteps,
+                    intervalSteps: timingRepeats > 1 ? 64 : 8,
+                    progress: { step, total in
+                        progress?("\(modeName) checked decode \(step)/\(total) tokens")
+                    }
+                )
+            }
+            totalDecodeSeconds += secondsSince(decodeStart)
+            totalDecodeBytesRead += expertBytesReadDelta(
+                before: metricsBeforeDecode?.stats,
+                after: weightCache.loader.expertStreamingMetrics?.snapshot().stats
             )
         }
 
-        let decodeElapsed = secondsSince(decodeStart)
         let bandwidth = localIterateBandwidthGBPerToken(
-            before: metricsBeforeDecode?.stats,
-            after: weightCache.loader.expertStreamingMetrics?.snapshot().stats,
-            decodedTokens: decodeSteps
+            bytesRead: totalDecodeBytesRead,
+            decodedTokens: totalDecodeSteps
         )
         latestStats = DeepSeekRuntime.expertStats(from: weightCache)
         let correctness = localIterateCorrectnessReport(
             passed: failureStep == nil,
-            checkedSteps: failureStep.map { $0 + 1 } ?? decodeSteps + 1,
-            caseCount: 1,
+            checkedSteps: failureStep.map { $0 + 1 } ?? checkedStepsPerPass * timingRepeats,
+            caseCount: timingRepeats,
             firstFailingStep: failureStep,
             expectedToken: failureExpected,
             actualToken: failureActual,
@@ -270,9 +295,9 @@ extension DeepSeekRuntime {
         )
         return LocalIterateTimingResult(
             correctness: correctness,
-            prefillSecondsPerToken: prefillElapsed / Double(testCase.promptTokens.count),
+            prefillSecondsPerToken: totalPrefillSeconds / Double(testCase.promptTokens.count * timingRepeats),
             decode: DecodeMeasurement(
-                secondsPerToken: decodeElapsed / Double(decodeSteps),
+                secondsPerToken: totalDecodeSeconds / Double(totalDecodeSteps),
                 bandwidthGBPerToken: bandwidth.gbPerToken,
                 bandwidthSource: bandwidth.source
             ),
@@ -286,6 +311,7 @@ extension DeepSeekRuntime {
         testCase: GoldenCase,
         goldenHash: String,
         decodeSteps: Int,
+        timingRepeats: Int,
         modeName: String,
         workerOptions: RuntimeWorkerOptions,
         progress: ((String) -> Void)?
@@ -305,69 +331,87 @@ extension DeepSeekRuntime {
             worker.close()
         }
 
-        let prefillStart = DispatchTime.now().uptimeNanoseconds
-        var response = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
-        let prefillElapsed = secondsSince(prefillStart)
-        var latestStats = response.expertStats ?? .zero
-        var peakRamGB = response.peakRamGB ?? 0
-        guard var actualToken = response.token else {
-            throw MLXFastError.invalidInput("runtime worker \(modeName) prefill response missing token")
-        }
-        let expectedSeedToken = testCase.expectedTokens[0]
+        var totalPrefillSeconds = 0.0
+        var totalDecodeSeconds = 0.0
+        var totalDecodeBytesRead: UInt64 = 0
+        var latestStats = ExpertStreamingStats.zero
+        var peakRamGB = 0.0
         var failureStep: Int?
         var failureExpected: Int?
         var failureActual: Int?
-        if !correctnessTokenAccepted(
-            expectedToken: expectedSeedToken,
-            actualToken: actualToken,
-            topLogits: try validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
-        ) {
-            failureStep = 0
-            failureExpected = expectedSeedToken
-            failureActual = actualToken
-        }
-        let statsBeforeDecode = response.expertStats
+        let checkedStepsPerPass = decodeSteps + 1
+        let totalDecodeSteps = decodeSteps * timingRepeats
 
-        let decodeStart = DispatchTime.now().uptimeNanoseconds
-        for decodedStep in 0..<decodeSteps {
-            response = try worker.teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[decodedStep])
+        for repeatIndex in 0..<timingRepeats {
+            if timingRepeats > 1 {
+                progress?("\(modeName) checked pass \(repeatIndex + 1)/\(timingRepeats) start")
+            }
+            let prefillStart = DispatchTime.now().uptimeNanoseconds
+            var response = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
+            totalPrefillSeconds += secondsSince(prefillStart)
             latestStats = response.expertStats ?? latestStats
             peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
-            guard let token = response.token else {
-                throw MLXFastError.invalidInput("runtime worker \(modeName) decode response missing token")
+            guard var actualToken = response.token else {
+                throw MLXFastError.invalidInput("runtime worker \(modeName) prefill response missing token")
             }
-            actualToken = token
-            let expectedToken = testCase.expectedTokens[decodedStep + 1]
+            let expectedSeedToken = testCase.expectedTokens[0]
             if failureStep == nil,
                !correctnessTokenAccepted(
-                   expectedToken: expectedToken,
+                   expectedToken: expectedSeedToken,
                    actualToken: actualToken,
                    topLogits: try validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
                )
             {
-                failureStep = decodedStep + 1
-                failureExpected = expectedToken
+                failureStep = repeatIndex * checkedStepsPerPass
+                failureExpected = expectedSeedToken
                 failureActual = actualToken
             }
-            reportProgress(
-                step: decodedStep + 1,
-                total: decodeSteps,
-                intervalSteps: 8,
-                progress: { step, total in
-                    progress?("\(modeName) checked decode \(step)/\(total) tokens")
+            let statsBeforeDecode = response.expertStats
+
+            let decodeStart = DispatchTime.now().uptimeNanoseconds
+            for decodedStep in 0..<decodeSteps {
+                response = try worker.teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[decodedStep])
+                latestStats = response.expertStats ?? latestStats
+                peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
+                guard let token = response.token else {
+                    throw MLXFastError.invalidInput("runtime worker \(modeName) decode response missing token")
                 }
-            )
+                actualToken = token
+                let expectedToken = testCase.expectedTokens[decodedStep + 1]
+                if failureStep == nil,
+                   !correctnessTokenAccepted(
+                       expectedToken: expectedToken,
+                       actualToken: actualToken,
+                       topLogits: try validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
+                   )
+                {
+                    failureStep = repeatIndex * checkedStepsPerPass + decodedStep + 1
+                    failureExpected = expectedToken
+                    failureActual = actualToken
+                }
+                reportProgress(
+                    step: repeatIndex * decodeSteps + decodedStep + 1,
+                    total: totalDecodeSteps,
+                    intervalSteps: timingRepeats > 1 ? 64 : 8,
+                    progress: { step, total in
+                        progress?("\(modeName) checked decode \(step)/\(total) tokens")
+                    }
+                )
+            }
+            totalDecodeSeconds += secondsSince(decodeStart)
+            totalDecodeBytesRead += expertBytesReadDelta(before: statsBeforeDecode, after: latestStats)
+            if timingRepeats > 1 {
+                progress?("\(modeName) checked pass \(repeatIndex + 1)/\(timingRepeats) complete")
+            }
         }
-        let decodeElapsed = secondsSince(decodeStart)
         let bandwidth = localIterateBandwidthGBPerToken(
-            before: statsBeforeDecode,
-            after: latestStats,
-            decodedTokens: decodeSteps
+            bytesRead: totalDecodeBytesRead,
+            decodedTokens: totalDecodeSteps
         )
         let correctness = localIterateCorrectnessReport(
             passed: failureStep == nil,
-            checkedSteps: failureStep.map { $0 + 1 } ?? decodeSteps + 1,
-            caseCount: 1,
+            checkedSteps: failureStep.map { $0 + 1 } ?? checkedStepsPerPass * timingRepeats,
+            caseCount: timingRepeats,
             firstFailingStep: failureStep,
             expectedToken: failureExpected,
             actualToken: failureActual,
@@ -378,9 +422,9 @@ extension DeepSeekRuntime {
         )
         return LocalIterateTimingResult(
             correctness: correctness,
-            prefillSecondsPerToken: prefillElapsed / Double(testCase.promptTokens.count),
+            prefillSecondsPerToken: totalPrefillSeconds / Double(testCase.promptTokens.count * timingRepeats),
             decode: DecodeMeasurement(
-                secondsPerToken: decodeElapsed / Double(decodeSteps),
+                secondsPerToken: totalDecodeSeconds / Double(totalDecodeSteps),
                 bandwidthGBPerToken: bandwidth.gbPerToken,
                 bandwidthSource: bandwidth.source
             ),
@@ -429,8 +473,17 @@ extension DeepSeekRuntime {
         guard decodedTokens > 0, let after else {
             return (0, "")
         }
-        let beforeBytes = before?.bytesRead ?? 0
-        let bytesRead = after.bytesRead >= beforeBytes ? after.bytesRead - beforeBytes : after.bytesRead
+        let bytesRead = expertBytesReadDelta(before: before, after: after)
+        return localIterateBandwidthGBPerToken(bytesRead: bytesRead, decodedTokens: decodedTokens)
+    }
+
+    static func localIterateBandwidthGBPerToken(
+        bytesRead: UInt64,
+        decodedTokens: Int
+    ) -> (gbPerToken: Double, source: String) {
+        guard decodedTokens > 0 else {
+            return (0, "")
+        }
         guard bytesRead > 0 else {
             return (0, ExpertStreamingMetrics.bandwidthSource)
         }
@@ -438,6 +491,17 @@ extension DeepSeekRuntime {
             Double(bytesRead) / Double(1 << 30) / Double(decodedTokens),
             ExpertStreamingMetrics.bandwidthSource
         )
+    }
+
+    static func expertBytesReadDelta(
+        before: ExpertStreamingStats?,
+        after: ExpertStreamingStats?
+    ) -> UInt64 {
+        guard let after else {
+            return 0
+        }
+        let beforeBytes = before?.bytesRead ?? 0
+        return after.bytesRead >= beforeBytes ? after.bytesRead - beforeBytes : after.bytesRead
     }
 
     static func localIterateScore(

@@ -595,7 +595,7 @@ func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
 }
 
 @Test
-func benchmarkLocalSubmitModeUsesShortLocalPrefixAndPrintsScore() throws {
+func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
     let contract = try String(
         contentsOfFile: "benchmark.json",
         encoding: .utf8
@@ -615,11 +615,14 @@ func benchmarkLocalSubmitModeUsesShortLocalPrefixAndPrintsScore() throws {
     )
 
     #expect(contract.contains("\"preSubmitCommand\": [\"bash\", \"-lc\", \"./benchmark.sh --local-submit\"]"))
-    #expect(constants.contains("public static let localSubmitBenchmarkDecodeSteps = 64"))
+    #expect(constants.contains("public static let localSubmitBenchmarkDecodeSteps = 255"))
+    #expect(constants.contains("public static let localSubmitBenchmarkRepeats = 4"))
     #expect(cli.contains("flagOptions: [\"--local-submit\", \"--local-iterate\"]"))
     #expect(cli.contains("fallback: localSubmit || localIterate"))
     #expect(cli.contains("let decodeSteps = localSubmit"))
     #expect(cli.contains("? MLXFastConstants.localSubmitBenchmarkDecodeSteps"))
+    #expect(cli.contains("let timingRepeats = localSubmit ? MLXFastConstants.localSubmitBenchmarkRepeats : 1"))
+    #expect(cli.contains("timingRepeats: timingRepeats"))
     #expect(cli.contains("let runtime = localSubmit ? \"swift-local-submit\" : \"swift-local-iterate\""))
     #expect(cli.contains("DeepSeekRuntime.localIterate("))
     #expect(cli.contains("printScorePayload(at: scorePath)"))

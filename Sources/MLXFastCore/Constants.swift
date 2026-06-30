@@ -45,7 +45,12 @@ public enum MLXFastConstants {
     // from precomputing future decode tokens in an unscored seed-prefill phase.
     public static let benchmarkDecodeSteps = 128
     public static let localIterateBenchmarkDecodeSteps = 16
-    public static let localSubmitBenchmarkDecodeSteps = 64
+    // The public local-submit fixture has 256 generated tokens. Check the
+    // prefill next token plus all remaining teacher-forced decode tokens, and
+    // repeat that full window to make the Yukon pre-submit hook a real local
+    // benchmark without committing a longer public golden.
+    public static let localSubmitBenchmarkDecodeSteps = 255
+    public static let localSubmitBenchmarkRepeats = 4
     // Seed measured decode with the full prompt. A short instruction-prefix
     // seed can free-run differently across Apple Silicon/MLX versions even
     // when teacher-forced correctness agrees, which makes the timed oracle

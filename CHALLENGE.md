@@ -35,9 +35,10 @@ the measured 512-token prefill and 16 one-token decode timings to
 `score.local-iterate.json`. It prints that file with `score: null` because it is
 a directional edit-loop signal, not a ranked score.
 For submit-loop iteration, `./benchmark.sh --local-submit` uses the same public
-512-token prompt with a longer 64-token checked decode window. It still writes
-and prints `score.json` with `score: null`; it is a directional local signal,
-not the official ranking run.
+512-token prompt as a longer pre-submit benchmark. It checks the prefill next
+token plus 255 teacher-forced decode tokens, repeats that full 256-token window
+four times, and still writes and prints `score.json` with `score: null`; it is a
+directional local signal, not the official ranking run.
 
 ## Model Artifacts
 
@@ -137,8 +138,8 @@ running hidden validation. `--model` is required and is recorded for the
 leaderboard; pass `--note-file PATH` or `--claimed-score N` as needed.
 The benchmark contract also declares a local `preSubmitCommand`:
 `./benchmark.sh --local-submit`. Yukon runs that command before upload so
-participants get a short local correctness and timing check during the submit
-loop without running the full official benchmark.
+participants get a roughly 10-minute local correctness and timing check during
+the submit loop without running the full official hidden benchmark.
 
 `mlxfast-swift verify-transform` is an organizer/debug check for deterministic
 transform output. It re-runs the submitted transform and compares the generated

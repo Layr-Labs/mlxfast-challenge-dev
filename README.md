@@ -30,9 +30,9 @@ MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
 # Official benchmark runs use the organizer-supplied hidden correctness_golden.json.
 ./benchmark.sh
 
-# Local submit check used by Yukon before upload: uses the public 512-token
-# correctness prompt, checks/times 64 teacher-forced decode tokens, writes
-# score.json with score: null, and prints it to stdout.
+# Local submit check used by Yukon before upload: runs the public 512-token
+# prompt through a longer checked timing window, writes score.json with
+# score: null, and prints it to stdout.
 ./benchmark.sh --local-submit
 
 # Or call the Swift CLI directly
@@ -236,9 +236,10 @@ edit-loop signal is enough, `--local-iterate` uses that public 512-token prompt,
 checks the prefill next token plus 16 teacher-forced decode tokens, writes
 `score.local-iterate.json`, prints it, and leaves `score` null because it is not
 a ranked benchmark score. The submit hook `--local-submit` uses the same public
-fixture with a longer 64-token checked decode window, writes `score.json`, and
-also leaves `score` null because official ranking still requires the hidden
-benchmark oracle on the trusted runner.
+fixture as a longer pre-submit benchmark: it checks the prefill next token plus
+255 teacher-forced decode tokens, repeats that full 256-token window four times,
+writes `score.json`, and also leaves `score` null because official ranking still
+requires the hidden benchmark oracle on the trusted runner.
 The score payload includes the official baseline timings, computed speedups,
 wall-clock phase timings, final process RSS, expert streaming counters, and
 transformed-weights digest.
