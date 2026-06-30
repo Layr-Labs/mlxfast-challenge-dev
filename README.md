@@ -189,10 +189,23 @@ surface server-side after upload. `--model` is required and is recorded for the
 leaderboard. `MLXFAST_API_URL` / `MLXFAST_API_TOKEN` (or the `YUKON_*`
 equivalents) configure the endpoint and token for scripted runs.
 Before uploading, Yukon runs the contract `preSubmitCommand`, which is
-`./benchmark.sh --local-submit` for this benchmark. That local-submit pass is the local
-submit gate: it uses the public/local oracle, writes and prints `score.json`,
-and stops obviously broken or slower changes before they spend official runner
-time.
+`./benchmark.sh --local-submit` for this benchmark. That local-submit pass is
+the local submit gate: it uses the public/local oracle, writes and prints
+`score.json`, and stops obviously broken or slower changes before they spend
+official runner time.
+
+## Local Commands
+
+Use these two benchmark modes for local development:
+
+| Command | Purpose | What it checks | Output |
+|---|---|---|---|
+| `./benchmark.sh --local-iterate` | Fast edit-loop signal, usually under 2 minutes after setup. | Public 512-token prompt, prefill next-token check, and 16 teacher-forced decode checks. | `score.local-iterate.json` with `score: null`. |
+| `./benchmark.sh --local-submit` | Yukon pre-submit gate, intended to be about 10 minutes after setup. | Same public prompt, prefill next-token check, 255 teacher-forced decode checks, repeated 4 times. | `score.json` with `score: null`. |
+
+Neither local mode produces an official leaderboard score. Official ranking
+still runs the hidden benchmark oracle and hidden correctness gates on the
+trusted runner.
 
 ## Scoring
 
