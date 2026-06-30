@@ -62,9 +62,9 @@ extension DeepSeekRuntime {
         }
     }
 
-    static func compareTeacherForcedWithWorker(
+    static func compareTeacherForced(
         testCase: GoldenCase,
-        worker: RuntimeWorkerClient,
+        session: RuntimeInferenceSession,
         steps: Int = MLXFastConstants.correctnessSteps,
         progressIntervalSteps: Int = 0,
         progress: ((Int, Int) -> Void)? = nil
@@ -78,7 +78,7 @@ extension DeepSeekRuntime {
             )
         }
 
-        let response = try worker.teacherForcedCorrectnessBatch(
+        let response = try session.teacherForcedCorrectnessBatch(
             promptTokens: testCase.promptTokens,
             expectedTokens: Array(testCase.expectedTokens.prefix(steps)),
             steps: steps
@@ -141,11 +141,11 @@ extension DeepSeekRuntime {
         )
     }
 
-    static func compareAnchorWithWorker(
+    static func compareAnchor(
         anchor: GoldenAnchorCase,
-        worker: RuntimeWorkerClient
+        session: RuntimeInferenceSession
     ) throws -> WorkerCorrectnessResult {
-        let response = try worker.beginTeacherForcedCorrectness(promptTokens: anchor.contextTokens)
+        let response = try session.beginTeacherForcedCorrectness(promptTokens: anchor.contextTokens)
         guard let actualToken = response.token else {
             throw MLXFastError.invalidInput("runtime worker anchor response missing token")
         }
@@ -161,11 +161,11 @@ extension DeepSeekRuntime {
         )
     }
 
-    static func compareFreeRunWithWorker(
+    static func compareFreeRun(
         testCase: GoldenFreeRunCase,
-        worker: RuntimeWorkerClient
+        session: RuntimeInferenceSession
     ) throws -> WorkerCorrectnessResult {
-        let response = try worker.generateCorrectness(
+        let response = try session.generateCorrectness(
             promptTokens: testCase.promptTokens,
             steps: testCase.expectedTokens.count
         )
@@ -184,11 +184,11 @@ extension DeepSeekRuntime {
         )
     }
 
-    static func compareBehaviorWithWorker(
+    static func compareBehavior(
         testCase: GoldenBehaviorCase,
-        worker: RuntimeWorkerClient
+        session: RuntimeInferenceSession
     ) throws -> WorkerCorrectnessResult {
-        let beginResponse = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
+        let beginResponse = try session.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
         guard let firstToken = beginResponse.token else {
             throw MLXFastError.invalidInput("runtime worker behavior response missing token")
         }
@@ -213,7 +213,7 @@ extension DeepSeekRuntime {
         var expertStats = beginResponse.expertStats ?? .zero
         var peakRamGB = beginResponse.peakRamGB ?? 0
         while generated.count < testCase.maxNewTokens {
-            let response = try worker.teacherForcedCorrectnessStep(previousToken: generated[generated.count - 1])
+            let response = try session.teacherForcedCorrectnessStep(previousToken: generated[generated.count - 1])
             guard let token = response.token else {
                 throw MLXFastError.invalidInput("runtime worker behavior continuation response missing token")
             }
@@ -295,205 +295,6 @@ extension DeepSeekRuntime {
                 "runtime worker \(label) returned \(actual) tokens; expected \(expected)"
             )
         }
-    }
-
-    static func compareGreedyCached(
-        testCase: GoldenCase,
-        weightCache: DeepSeekRuntimeWeightCache,
-        progressIntervalSteps: Int = 0,
-        progress: ((Int, Int) -> Void)? = nil
-    ) throws -> CorrectnessTokenComparison {
-        let steps = MLXFastConstants.correctnessSteps
-        guard !testCase.promptTokens.isEmpty else {
-            throw MLXFastError.invalidInput("greedy correctness prompt must not be empty")
-        }
-        guard testCase.expectedTokens.count == steps else {
-            throw MLXFastError.invalidInput(
-                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need exactly \(steps)"
-            )
-        }
-
-        let config = weightCache.config
-        let cache = DeepSeekModelCache(config: config)
-
-        var logits = try DeepSeekModel.logits(
-            inputIDs: inputIDsArray(testCase.promptTokens),
-            weightCache: weightCache,
-            cache: cache,
-            positionOffset: 0
-        )
-        var token = try DeepSeekCorrectness.greedyToken(from: logits)
-        var generated: [Int] = []
-        generated.reserveCapacity(steps)
-
-        for step in 0..<steps {
-            generated.append(token)
-            let comparison = DeepSeekCorrectness.compareTokens(
-                expected: testCase.expectedTokens,
-                actual: generated,
-                steps: step + 1
-            )
-            if !comparison.passed {
-                return comparison
-            }
-            reportProgress(
-                step: step + 1,
-                total: steps,
-                intervalSteps: progressIntervalSteps,
-                progress: progress
-            )
-
-            if step == steps - 1 {
-                break
-            }
-
-            let positionOffset = testCase.promptTokens.count + step
-            logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray([token]),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: positionOffset
-            )
-            token = try DeepSeekCorrectness.greedyToken(from: logits)
-        }
-
-        return DeepSeekCorrectness.compareTokens(
-            expected: testCase.expectedTokens,
-            actual: generated,
-            steps: steps
-        )
-    }
-
-    static func compareTeacherForcedCached(
-        testCase: GoldenCase,
-        weightCache: DeepSeekRuntimeWeightCache,
-        steps: Int = MLXFastConstants.correctnessSteps,
-        progressIntervalSteps: Int = 0,
-        progress: ((Int, Int) -> Void)? = nil
-    ) throws -> CorrectnessTokenComparison {
-        guard !testCase.promptTokens.isEmpty else {
-            throw MLXFastError.invalidInput("teacher-forced correctness prompt must not be empty")
-        }
-        guard testCase.expectedTokens.count >= steps else {
-            throw MLXFastError.invalidInput(
-                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need at least \(steps)"
-            )
-        }
-
-        let cache = DeepSeekModelCache(config: weightCache.config)
-        var logits = try DeepSeekModel.logits(
-            inputIDs: inputIDsArray(testCase.promptTokens),
-            weightCache: weightCache,
-            cache: cache,
-            positionOffset: 0
-        )
-        var actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
-
-        for step in 0..<steps {
-            let expectedToken = testCase.expectedTokens[step]
-            if !correctnessTokenAccepted(
-                expectedToken: expectedToken,
-                actualToken: actualToken,
-                topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits)
-            ) {
-                return CorrectnessTokenComparison(
-                    passed: false,
-                    checkedSteps: step + 1,
-                    firstFailingStep: step,
-                    expectedToken: expectedToken,
-                    actualToken: actualToken
-                )
-            }
-            reportProgress(
-                step: step + 1,
-                total: steps,
-                intervalSteps: progressIntervalSteps,
-                progress: progress
-            )
-
-            if step == steps - 1 {
-                break
-            }
-
-            logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray([expectedToken]),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: testCase.promptTokens.count + step
-            )
-            actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
-        }
-
-        return CorrectnessTokenComparison(
-            passed: true,
-            checkedSteps: steps,
-            firstFailingStep: nil,
-            expectedToken: nil,
-            actualToken: nil
-        )
-    }
-
-    static func compareAnchorCached(
-        anchor: GoldenAnchorCase,
-        weightCache: DeepSeekRuntimeWeightCache
-    ) throws -> CorrectnessTokenComparison {
-        let cache = DeepSeekModelCache(config: weightCache.config)
-        let logits = try DeepSeekModel.logits(
-            inputIDs: inputIDsArray(anchor.contextTokens),
-            weightCache: weightCache,
-            cache: cache,
-            positionOffset: 0
-        )
-        let actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
-        return compareAnchorToken(
-            anchor: anchor,
-            actualToken: actualToken,
-            topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits)
-        )
-    }
-
-    static func compareFreeRunCached(
-        testCase: GoldenFreeRunCase,
-        weightCache: DeepSeekRuntimeWeightCache,
-        progressIntervalSteps: Int = 0,
-        progress: ((Int, Int) -> Void)? = nil
-    ) throws -> CorrectnessTokenComparison {
-        let generated = try generateGreedyCached(
-            promptTokens: testCase.promptTokens,
-            steps: testCase.expectedTokens.count,
-            weightCache: weightCache,
-            progressIntervalSteps: progressIntervalSteps,
-            progress: progress
-        )
-        return compareFreeRunTokens(testCase: testCase, generated: generated)
-    }
-
-    static func compareBehaviorCached(
-        testCase: GoldenBehaviorCase,
-        weightCache: DeepSeekRuntimeWeightCache
-    ) throws -> CorrectnessTokenComparison {
-        if testCase.maxNewTokens == 1 {
-            let cache = DeepSeekModelCache(config: weightCache.config)
-            let logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray(testCase.promptTokens),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: 0
-            )
-            let actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
-            return compareBehaviorFirstToken(
-                testCase: testCase,
-                actualToken: actualToken,
-                topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits)
-            )
-        }
-
-        let generated = try generateGreedyCached(
-            promptTokens: testCase.promptTokens,
-            steps: testCase.maxNewTokens,
-            weightCache: weightCache
-        )
-        return compareBehaviorTokens(testCase: testCase, generated: generated)
     }
 
     static func compareAnchorToken(

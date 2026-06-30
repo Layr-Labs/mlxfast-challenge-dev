@@ -29,7 +29,7 @@ extension DeepSeekRuntime {
             nonce: sessionNonce,
             ok: true
         )))
-        var state = RuntimeWorkerState()
+        let session = InProcessInferenceSession(weightCache: weightCache)
 
         while let line = try protocolIO.readLine() {
             guard !line.isEmpty else {
@@ -42,8 +42,7 @@ extension DeepSeekRuntime {
                     response = try handleWorkerRequest(
                         request,
                         sessionNonce: sessionNonce,
-                        weightCache: weightCache,
-                        state: &state
+                        session: session
                     )
                 } catch {
                     response = RuntimeWorkerResponse(
@@ -64,55 +63,21 @@ extension DeepSeekRuntime {
     static func handleWorkerRequest(
         _ request: RuntimeWorkerRequest,
         sessionNonce: String,
-        weightCache: DeepSeekRuntimeWeightCache,
-        state: inout RuntimeWorkerState
+        session: InProcessInferenceSession
     ) throws -> RuntimeWorkerResponse {
+        let result: RuntimeWorkerResponse
         switch request.kind {
         case "correctness":
             guard let promptTokens = request.promptTokens, let steps = request.steps else {
                 throw MLXFastError.invalidInput("runtime worker correctness request missing prompt_tokens or steps")
             }
-            let tokens = try generateGreedyCached(
-                promptTokens: promptTokens,
-                steps: steps,
-                weightCache: weightCache
-            )
-            return RuntimeWorkerResponse(
-                id: request.id,
-                nonce: sessionNonce,
-                ok: true,
-                tokens: tokens,
-                expertStats: expertStats(from: weightCache),
-                peakRamGB: currentResidentMemoryGB()
-            )
+            result = try session.generateCorrectness(promptTokens: promptTokens, steps: steps)
 
         case "correctness_begin":
             guard let promptTokens = request.promptTokens else {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing prompt_tokens")
             }
-            let cache = DeepSeekModelCache(config: weightCache.config)
-            let start = DispatchTime.now().uptimeNanoseconds
-            let logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray(promptTokens),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: 0
-            )
-            let token = try DeepSeekCorrectness.greedyToken(from: logits)
-            state.correctnessCache = cache
-            state.correctnessPromptTokenCount = promptTokens.count
-            state.correctnessStep = 0
-            let elapsed = secondsSince(start)
-            return RuntimeWorkerResponse(
-                id: request.id,
-                nonce: sessionNonce,
-                ok: true,
-                token: token,
-                topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
-                seconds: elapsed,
-                expertStats: expertStats(from: weightCache),
-                peakRamGB: currentResidentMemoryGB()
-            )
+            result = try session.beginTeacherForcedCorrectness(promptTokens: promptTokens)
 
         case "correctness_teacher_forced_batch":
             guard let promptTokens = request.promptTokens,
@@ -123,180 +88,40 @@ extension DeepSeekRuntime {
                     "runtime worker batched teacher-forced request missing prompt_tokens, expected_tokens, or steps"
                 )
             }
-            guard !promptTokens.isEmpty else {
-                throw MLXFastError.invalidInput("runtime worker batched teacher-forced prompt_tokens must not be empty")
-            }
-            guard steps > 0 else {
-                throw MLXFastError.invalidInput("runtime worker batched teacher-forced steps must be positive")
-            }
-            guard expectedTokens.count >= steps else {
-                throw MLXFastError.invalidInput(
-                    "runtime worker batched teacher-forced expected_tokens has \(expectedTokens.count) tokens; expected at least \(steps)"
-                )
-            }
-            let teacherForcedInput = promptTokens + Array(expectedTokens.prefix(max(steps - 1, 0)))
-            let cache = DeepSeekModelCache(config: weightCache.config)
-            let logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray(teacherForcedInput),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: 0
-            )
-            var tokens: [Int] = []
-            var topLogitRows: [[CorrectnessTraceLogit]] = []
-            tokens.reserveCapacity(steps)
-            topLogitRows.reserveCapacity(steps)
-            let firstLogitRow = promptTokens.count - 1
-            for step in 0..<steps {
-                let topLogits = try topLogits(
-                    from: logits,
-                    row: firstLogitRow + step,
-                    topK: MLXFastConstants.correctnessTopLogits
-                )
-                guard let token = topLogits.first?.token else {
-                    throw MLXFastError.invalidInput("runtime worker batched teacher-forced top logits missing token")
-                }
-                tokens.append(token)
-                topLogitRows.append(topLogits)
-            }
-            return RuntimeWorkerResponse(
-                id: request.id,
-                nonce: sessionNonce,
-                ok: true,
-                topLogitRows: topLogitRows,
-                tokens: tokens,
-                expertStats: expertStats(from: weightCache),
-                peakRamGB: currentResidentMemoryGB()
+            result = try session.teacherForcedCorrectnessBatch(
+                promptTokens: promptTokens,
+                expectedTokens: expectedTokens,
+                steps: steps
             )
 
         case "correctness_step":
             guard let previousToken = request.token else {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing token")
             }
-            guard let cache = state.correctnessCache else {
-                throw MLXFastError.invalidInput("runtime worker teacher-forced correctness step before begin")
-            }
-            let logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray([previousToken]),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: state.correctnessPromptTokenCount + state.correctnessStep
-            )
-            let token = try DeepSeekCorrectness.greedyToken(from: logits)
-            state.correctnessStep += 1
-            return RuntimeWorkerResponse(
-                id: request.id,
-                nonce: sessionNonce,
-                ok: true,
-                token: token,
-                topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
-                expertStats: expertStats(from: weightCache),
-                peakRamGB: currentResidentMemoryGB()
-            )
+            result = try session.teacherForcedCorrectnessStep(previousToken: previousToken)
 
         case "prefill":
             guard let promptTokens = request.promptTokens else {
                 throw MLXFastError.invalidInput("runtime worker prefill request missing prompt_tokens")
             }
-            let cache = DeepSeekModelCache(config: weightCache.config)
-            let start = DispatchTime.now().uptimeNanoseconds
-            let logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray(promptTokens),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: 0
-            )
-            eval(logits)
-            let token = try DeepSeekCorrectness.greedyToken(from: logits)
-            let elapsed = secondsSince(start)
-            Memory.clearCache()
-            return RuntimeWorkerResponse(
-                id: request.id,
-                nonce: sessionNonce,
-                ok: true,
-                token: token,
-                seconds: elapsed,
-                expertStats: expertStats(from: weightCache),
-                peakRamGB: currentResidentMemoryGB()
-            )
+            result = try session.prefill(promptTokens: promptTokens)
 
         case "decode_begin":
             guard let seedTokens = request.seedTokens else {
                 throw MLXFastError.invalidInput("runtime worker decode_begin request missing seed_tokens")
             }
-            let warmupCache = DeepSeekModelCache(config: weightCache.config)
-            let warmupLogits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray(seedTokens),
-                weightCache: weightCache,
-                cache: warmupCache,
-                positionOffset: 0
-            )
-            _ = try DeepSeekCorrectness.greedyToken(from: warmupLogits)
-            Memory.clearCache()
-
-            let cache = DeepSeekModelCache(config: weightCache.config)
-            let start = DispatchTime.now().uptimeNanoseconds
-            let logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray(seedTokens),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: 0
-            )
-            let token = try DeepSeekCorrectness.greedyToken(from: logits)
-            let seedToken = token
-            cache.materializeCachedState()
-            state.decodeCache = cache
-            state.decodeSeedTokenCount = seedTokens.count
-            state.decodeStep = 0
-            let elapsed = secondsSince(start)
-
-            return RuntimeWorkerResponse(
-                id: request.id,
-                nonce: sessionNonce,
-                ok: true,
-                seedToken: seedToken,
-                seconds: elapsed,
-                expertStats: expertStats(from: weightCache),
-                peakRamGB: currentResidentMemoryGB()
-            )
+            result = try session.beginDecode(seedTokens: seedTokens)
 
         case "decode_step":
             guard let inputToken = request.token else {
                 throw MLXFastError.invalidInput("runtime worker decode_step request missing token")
             }
-            guard let cache = state.decodeCache else {
-                throw MLXFastError.invalidInput("runtime worker decode_step before decode_begin")
-            }
-            let validationDelayMS = try submissionValidationDelayMilliseconds()
-            guard validationDelayMS >= 0 else {
-                throw MLXFastError.invalidInput("runtime worker validation delay must be non-negative")
-            }
-            let start = DispatchTime.now().uptimeNanoseconds
-            let logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray([inputToken]),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: state.decodeSeedTokenCount + state.decodeStep
-            )
-            let token = try DeepSeekCorrectness.greedyToken(from: logits)
-            if validationDelayMS > 0 {
-                Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
-            }
-            let elapsed = secondsSince(start)
-            state.decodeStep += 1
-            return RuntimeWorkerResponse(
-                id: request.id,
-                nonce: sessionNonce,
-                ok: true,
-                token: token,
-                seconds: elapsed,
-                expertStats: expertStats(from: weightCache),
-                peakRamGB: currentResidentMemoryGB()
-            )
+            result = try session.decodeStep(inputToken: inputToken)
 
         default:
             throw MLXFastError.invalidInput("runtime worker received unknown request kind \(request.kind)")
         }
+        return result.withEnvelope(id: request.id, nonce: sessionNonce)
     }
 
 }
@@ -319,15 +144,6 @@ struct RuntimeWorkerRequest: Codable {
         case seedTokens = "seed_tokens"
         case steps
     }
-}
-
-struct RuntimeWorkerState {
-    var correctnessCache: DeepSeekModelCache?
-    var correctnessPromptTokenCount = 0
-    var correctnessStep = 0
-    var decodeCache: DeepSeekModelCache?
-    var decodeSeedTokenCount = 0
-    var decodeStep = 0
 }
 
 struct RuntimeWorkerResponse: Codable {
@@ -385,6 +201,25 @@ struct RuntimeWorkerResponse: Codable {
         case seconds
         case expertStats = "expert_stats"
         case peakRamGB = "peak_ram_gb"
+    }
+}
+
+extension RuntimeWorkerResponse {
+    func withEnvelope(id: Int, nonce: String) -> RuntimeWorkerResponse {
+        RuntimeWorkerResponse(
+            id: id,
+            nonce: nonce,
+            ok: ok,
+            error: error,
+            token: token,
+            topLogits: topLogits,
+            topLogitRows: topLogitRows,
+            seedToken: seedToken,
+            tokens: tokens,
+            seconds: seconds,
+            expertStats: expertStats,
+            peakRamGB: peakRamGB
+        )
     }
 }
 
