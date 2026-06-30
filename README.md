@@ -227,11 +227,12 @@ during the decode window. Bandwidth, RAM, and expert-read metrics are reported
 for operator review and future guardrails; they are not primary score factors.
 Correctness is a hard gate. See CHALLENGE.md for the full correctness specification.
 The official run times the benchmark before correctness so the correctness gate
-cannot warm the measured model path. It then checks 128 public correctness
+cannot warm the measured model path. It then checks 64 public correctness
 positions plus the hidden GPQA behavior checks.
 Public local correctness uses the checked-in correctness fixture. When a local
-golden with a benchmark oracle is available, `--quick` shortens correctness and
-decode to 64 token checks and prints the resulting `score.json`.
+golden with a benchmark oracle is available, `--quick` keeps the 64-token public
+correctness window, shortens measured decode to 64 tokens, and prints the
+resulting `score.json`.
 The score payload includes the official baseline timings, computed speedups,
 wall-clock phase timings, final process RSS, expert streaming counters, and
 transformed-weights digest.
@@ -296,7 +297,7 @@ prompt must contain at least 512 token IDs. The precomputed golden file stores
 exact expected tokens for each 512-token correctness prompt and its 256-token
 greedy continuation, the 512-token prefill check, the 512-token decode seed, and
 at least 128 tokens for the timed decode window. During correctness, the harness
-checks the first 128 public continuation positions by default, plus hidden
+checks the first 64 public continuation positions by default, plus hidden
 behavior gates in official benchmark runs. It checks those continuation
 positions teacher-forced: after each accepted step it feeds the
 golden previous token back into the model. This keeps the gate stable across

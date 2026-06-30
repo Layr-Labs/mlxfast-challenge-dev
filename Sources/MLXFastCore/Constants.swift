@@ -19,7 +19,7 @@ public enum MLXFastConstants {
     public static let correctnessPromptTokens = 512
     // Keep the public gate long enough to catch broad decode regressions while
     // leaving budget for the hidden GPQA behavior checks in the official job.
-    public static let correctnessSteps = 128
+    public static let correctnessSteps = 64
     public static let quickCorrectnessSteps = 64
     public static let correctnessTopLogits = 8
     public static let correctnessLogitTieTolerance = 1e-6

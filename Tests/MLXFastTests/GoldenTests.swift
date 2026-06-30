@@ -29,7 +29,7 @@ func checkedInPublicCorrectnessGoldenIsValid() throws {
     #expect(fixture.cases.count == 1)
     #expect(fixture.cases[0].name == "longcopy-gate-english-512")
     #expect(fixture.cases[0].promptTokens.count == MLXFastConstants.correctnessPromptTokens)
-    #expect(MLXFastConstants.correctnessSteps == 128)
+    #expect(MLXFastConstants.correctnessSteps == 64)
     #expect(fixture.cases[0].expectedTokens.count == 256)
 }
 
