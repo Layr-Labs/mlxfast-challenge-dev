@@ -34,6 +34,7 @@ let package = Package(
             name: "MLXFastHarness",
             dependencies: [
                 "MLXFastCore",
+                "MLXFastTransform",
                 "MLXFastModel",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "Tokenizers", package: "swift-transformers"),

@@ -26,7 +26,9 @@ else
   SCORE_PATH="${MLXFAST_SCORE_PATH:-score.json}"
 fi
 WEIGHTS_PATH="${MLXFAST_WEIGHTS_PATH:-weights}"
-if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" && ( "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ) ]]; then
+if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" && "${LOCAL_SUBMIT}" == "1" ]]; then
+  GOLDEN_PATH="correctness_prompts/public_longcopy_gate_english_512_1024.json"
+elif [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" && "${LOCAL_ITERATE}" == "1" ]]; then
   GOLDEN_PATH="correctness_prompts/public_longcopy_gate_english_512_256.json"
 else
   GOLDEN_PATH="${MLXFAST_CORRECTNESS_GOLDEN_PATH:-correctness_golden.json}"

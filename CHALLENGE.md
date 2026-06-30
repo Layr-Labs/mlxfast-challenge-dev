@@ -36,9 +36,9 @@ the measured 512-token prefill and 16 one-token decode timings to
 a directional edit-loop signal, not a ranked score.
 For submit-loop iteration, `./benchmark.sh --local-submit` uses the same public
 512-token prompt as a longer pre-submit benchmark. It checks the prefill next
-token plus 255 teacher-forced decode tokens, repeats that full 256-token window
-four times, and still writes and prints `score.json` with `score: null`; it is a
-directional local signal, not the official ranking run.
+token plus 1023 teacher-forced decode tokens from a longer public fixture, and
+still writes and prints `score.json` with `score: null`; it is a directional
+local signal, not the official ranking run.
 
 ## Model Artifacts
 

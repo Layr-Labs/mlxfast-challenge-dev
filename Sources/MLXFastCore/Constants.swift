@@ -5,6 +5,7 @@ public enum MLXFastConstants {
     public static let defaultGoldenPath = "correctness_golden.json"
     public static let defaultPublicCorrectnessPromptPath = "correctness_prompts/public_longcopy_gate_english_512.txt"
     public static let defaultPublicCorrectnessGoldenPath = "correctness_prompts/public_longcopy_gate_english_512_256.json"
+    public static let defaultPublicLocalSubmitGoldenPath = "correctness_prompts/public_longcopy_gate_english_512_1024.json"
     public static let defaultScorePath = "score.json"
     public static let defaultLocalIterateScorePath = "score.local-iterate.json"
 
@@ -45,12 +46,11 @@ public enum MLXFastConstants {
     // from precomputing future decode tokens in an unscored seed-prefill phase.
     public static let benchmarkDecodeSteps = 128
     public static let localIterateBenchmarkDecodeSteps = 16
-    // The public local-submit fixture has 256 generated tokens. Check the
-    // prefill next token plus all remaining teacher-forced decode tokens, and
-    // repeat that full window to make the Yukon pre-submit hook a real local
-    // benchmark without committing a longer public golden.
-    public static let localSubmitBenchmarkDecodeSteps = 255
-    public static let localSubmitBenchmarkRepeats = 4
+    // Local submit uses a longer public fixture so the Yukon pre-submit hook
+    // exercises one continuous decode trajectory for about ten minutes instead
+    // of repeating the short local-iterate correctness window.
+    public static let localSubmitBenchmarkDecodeSteps = 1023
+    public static let localSubmitBenchmarkRepeats = 1
     // Seed measured decode with the full prompt. A short instruction-prefix
     // seed can free-run differently across Apple Silicon/MLX versions even
     // when teacher-forced correctness agrees, which makes the timed oracle

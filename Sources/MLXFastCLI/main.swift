@@ -253,9 +253,11 @@ private enum MLXFastCLI {
             for: "--golden",
             default: environmentValue(
                 "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-                fallback: localSubmit || localIterate
-                    ? MLXFastConstants.defaultPublicCorrectnessGoldenPath
-                    : MLXFastConstants.defaultGoldenPath
+                fallback: localSubmit
+                    ? MLXFastConstants.defaultPublicLocalSubmitGoldenPath
+                    : localIterate
+                        ? MLXFastConstants.defaultPublicCorrectnessGoldenPath
+                        : MLXFastConstants.defaultGoldenPath
             )
         )
         let scorePath = options.value(

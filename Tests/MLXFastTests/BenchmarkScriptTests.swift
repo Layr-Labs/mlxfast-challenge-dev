@@ -615,10 +615,12 @@ func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
     )
 
     #expect(contract.contains("\"preSubmitCommand\": [\"bash\", \"-lc\", \"./benchmark.sh --local-submit\"]"))
-    #expect(constants.contains("public static let localSubmitBenchmarkDecodeSteps = 255"))
-    #expect(constants.contains("public static let localSubmitBenchmarkRepeats = 4"))
+    #expect(constants.contains("public static let defaultPublicLocalSubmitGoldenPath"))
+    #expect(constants.contains("public static let localSubmitBenchmarkDecodeSteps = 1023"))
+    #expect(constants.contains("public static let localSubmitBenchmarkRepeats = 1"))
     #expect(cli.contains("flagOptions: [\"--local-submit\", \"--local-iterate\"]"))
-    #expect(cli.contains("fallback: localSubmit || localIterate"))
+    #expect(cli.contains("? MLXFastConstants.defaultPublicLocalSubmitGoldenPath"))
+    #expect(cli.contains("? MLXFastConstants.defaultPublicCorrectnessGoldenPath"))
     #expect(cli.contains("let decodeSteps = localSubmit"))
     #expect(cli.contains("? MLXFastConstants.localSubmitBenchmarkDecodeSteps"))
     #expect(cli.contains("let timingRepeats = localSubmit ? MLXFastConstants.localSubmitBenchmarkRepeats : 1"))
@@ -742,7 +744,7 @@ func benchmarkScriptForwardsLocalSubmitFlagToSwiftBenchmark() throws {
     #expect(process.terminationStatus == 0)
     #expect(args.contains("benchmark\n"))
     #expect(args.contains("--golden\n"))
-    #expect(args.contains("correctness_prompts/public_longcopy_gate_english_512_256.json\n"))
+    #expect(args.contains("correctness_prompts/public_longcopy_gate_english_512_1024.json\n"))
     #expect(args.contains("--local-submit\n"))
 }
 
