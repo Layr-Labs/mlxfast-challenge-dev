@@ -36,12 +36,18 @@ directional local signal, not the official ranking run.
 
 ## Model Artifacts
 
-By default, `setup.sh` stores the frozen reference checkpoint in a repo-local
-Hugging Face-style cache:
+By default, `setup.sh` stores the frozen reference checkpoint in a shared,
+user-global Hugging Face-style cache, so it is downloaded once and reused by
+every clone:
 
 ```text
-.cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main/
+~/.cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main/
 ```
+
+If the checkpoint already exists there — or at a path listed in
+`MLXFAST_REFERENCE_SEARCH_DIRS`, or pointed to by `MLXFAST_REFERENCE_DIR` —
+`setup.sh` reuses it instead of downloading again. Set `MLXFAST_HF_HOME` or
+`HF_HOME` to relocate the cache.
 
 It also creates this compatibility symlink unless the path already exists:
 

@@ -19,7 +19,7 @@ SETUP_PARALLEL_METALLIB="${MLXFAST_SETUP_PARALLEL_METALLIB:-${MLXFAST_SETUP_PARA
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
 DEFAULT_REFERENCE_DIR="reference_weights/DeepSeek-V4-Flash-4bit"
-DEFAULT_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${PWD}/.cache/huggingface}}"
+DEFAULT_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME}/.cache/huggingface}}"
 DEFAULT_HF_HUB_CACHE="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${DEFAULT_HF_HOME}/hub}}"
 REFERENCE_CACHE_DIR="${MLXFAST_REFERENCE_CACHE_DIR:-${DEFAULT_HF_HUB_CACHE}/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}}"
 if [[ -n "${MLXFAST_REFERENCE_DIR:-}" ]]; then
@@ -28,6 +28,33 @@ elif [[ -e "${DEFAULT_REFERENCE_DIR}" && ! -L "${DEFAULT_REFERENCE_DIR}" ]]; the
   REFERENCE_DIR="${DEFAULT_REFERENCE_DIR}"
 else
   REFERENCE_DIR="${REFERENCE_CACHE_DIR}"
+  # Reuse an already-downloaded checkpoint instead of re-fetching ~141 GiB. When the default cache
+  # path is empty, adopt the first known location that already holds the checkpoint (identified by
+  # the two required metadata files). The real lock/SHA256 verification still runs later in
+  # download_reference_weights, so a stale/partial candidate is repaired rather than trusted blindly.
+  # Extra locations can be supplied via MLXFAST_REFERENCE_SEARCH_DIRS (colon-separated).
+  if [[ ! -f "${REFERENCE_DIR}/config.json" ]]; then
+    reference_search_dirs=()
+    if [[ -n "${MLXFAST_REFERENCE_SEARCH_DIRS:-}" ]]; then
+      IFS=':' read -r -a extra_reference_search_dirs <<< "${MLXFAST_REFERENCE_SEARCH_DIRS}"
+      reference_search_dirs+=("${extra_reference_search_dirs[@]}")
+    fi
+    # The standard Hugging Face cache, plus the repo-local path used by older setup.sh defaults, so
+    # a checkpoint already downloaded by either is reused rather than re-fetched.
+    reference_search_dirs+=(
+      "${HOME}/.cache/huggingface/hub/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}"
+      "${PWD}/.cache/huggingface/hub/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}"
+    )
+    for reference_candidate in "${reference_search_dirs[@]}"; do
+      if [[ -n "${reference_candidate}" \
+            && -f "${reference_candidate}/config.json" \
+            && -f "${reference_candidate}/model.safetensors.index.json" ]]; then
+        REFERENCE_DIR="${reference_candidate}"
+        echo "setup.sh: reusing existing reference checkpoint at ${reference_candidate}" >&2
+        break
+      fi
+    done
+  fi
 fi
 REFERENCE_COMPAT_LINK="${MLXFAST_REFERENCE_COMPAT_LINK:-${DEFAULT_REFERENCE_DIR}}"
 REFERENCE_CACHE_LOCK_PATH="${MLXFAST_REFERENCE_CACHE_LOCK_PATH:-${REFERENCE_DIR}/.mlxfast-reference-cache.lock}"
@@ -56,10 +83,14 @@ checkpoint when it is not already present.
 Important environment variables:
   MLXFAST_REFERENCE_DIR              Reference checkpoint directory.
                                      Default: ${REFERENCE_DIR}
-  MLXFAST_REFERENCE_CACHE_DIR        Repo-local Hugging Face-style cache path
-                                     used for new downloads when
-                                     MLXFAST_REFERENCE_DIR is not set.
+  MLXFAST_REFERENCE_CACHE_DIR        Shared user-global Hugging Face-style cache
+                                     path used for new downloads when
+                                     MLXFAST_REFERENCE_DIR is not set; reused by
+                                     every clone so the checkpoint downloads once.
                                      Default: ${REFERENCE_CACHE_DIR}
+  MLXFAST_REFERENCE_SEARCH_DIRS      Extra checkpoint locations (colon-separated)
+                                     to reuse before downloading, in addition to
+                                     the standard ~/.cache/huggingface cache.
   MLXFAST_REFERENCE_BASE_URL         HTTP prefix for checkpoint files.
                                      Default: ${DEFAULT_REFERENCE_BASE_URL}
   MLXFAST_REFERENCE_MANIFEST_PATH    SHA256 manifest for the reference files.
@@ -270,6 +301,28 @@ ensure_cmake() {
   fi
 }
 
+# A full Xcode is required for the Metal/MLX build, but `xcodebuild` fails when the active
+# developer directory points at the Command Line Tools instead of Xcode.app. If a full Xcode is
+# installed, transparently target it for this script's tools via DEVELOPER_DIR — no sudo and no
+# global `xcode-select -s` needed. No-op when xcodebuild already works or DEVELOPER_DIR is set.
+prefer_full_xcode() {
+  local active_developer_dir xcode_app
+  if xcodebuild -version >/dev/null 2>&1 || [[ -n "${DEVELOPER_DIR:-}" ]]; then
+    return 0
+  fi
+  active_developer_dir="$(xcode-select -p 2>/dev/null || true)"
+  if [[ "${active_developer_dir}" == *"/Xcode"*".app/"* ]]; then
+    return 0
+  fi
+  for xcode_app in "/Applications/Xcode.app" /Applications/Xcode*.app; do
+    if [[ -x "${xcode_app}/Contents/Developer/usr/bin/xcodebuild" ]]; then
+      export DEVELOPER_DIR="${xcode_app}/Contents/Developer"
+      echo "setup.sh: active developer dir is the Command Line Tools; using ${xcode_app} via DEVELOPER_DIR" >&2
+      return 0
+    fi
+  done
+}
+
 ensure_swift_toolchain() {
   if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "setup.sh: this Swift harness targets macOS on Apple Silicon" >&2
@@ -291,13 +344,21 @@ ensure_swift_toolchain() {
     exit 1
   fi
 
+  prefer_full_xcode
+
   if ! xcodebuild -version >/dev/null 2>&1; then
     cat >&2 <<EOF
 setup.sh: xcodebuild is installed but not usable.
 
-Open Xcode once, select its command line tools, and accept the license, then retry:
+The active developer directory points at the Command Line Tools, or Xcode's
+first-launch/license step has not been completed. Point Xcode at the full app
+and accept its license, then retry:
 
+  sudo xcode-select -s /Applications/Xcode.app
   sudo xcodebuild -license accept
+  xcodebuild -runFirstLaunch
+
+If Xcode is not installed, install it from the App Store or Apple Developer.
 
 EOF
     exit 1

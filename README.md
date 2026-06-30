@@ -15,7 +15,7 @@ See [CHALLENGE.md](CHALLENGE.md) for the full problem statement, scoring formula
 # manifest. setup.sh prints this command with the exact reference path it used.
 MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
   .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
-  --reference .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main \
+  --reference ~/.cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main \
   --output weights
 
 # Run the checked-in public correctness gate.
@@ -54,8 +54,11 @@ transform source hash for run auditing.
 Full model setup needs a large local or mounted SSD. The reference checkpoint is
 `mlx-community/DeepSeek-V4-Flash-4bit`, with 33 safetensors shards totaling about
 141 GiB. `setup.sh` downloads the checkpoint from the fast Darkbloom/R2 mirror by
-default into a repo-local Hugging Face-style cache under
-`.cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main/`.
+default into a shared, user-global Hugging Face-style cache under
+`~/.cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main/`,
+so a second clone reuses the same download instead of re-fetching 141 GiB. If the
+checkpoint already exists there, at a path in `MLXFAST_REFERENCE_SEARCH_DIRS`, or
+at `MLXFAST_REFERENCE_DIR`, setup adopts it without downloading.
 It verifies cached files against `fixtures/reference_deepseek_v4_flash_4bit.sha256`
 and redownloads only files that are missing, truncated, or hash-mismatched. A
 compatibility symlink is created at `reference_weights/DeepSeek-V4-Flash-4bit`
@@ -81,9 +84,10 @@ for the full local setup knobs.
 For manual GitHub Actions benchmark runs, dispatch `benchmark.yml` on a macOS
 Blacksmith runner. Set `reference_base_url` to an HTTP prefix containing the
 reference checkpoint files, such as an R2 public bucket or Worker route. The
-workflow downloads the reference checkpoint into the same repo-local
-Hugging Face-style cache path used by local setup, passes that path explicitly
-to the offline transform, then prepares the correctness golden after transform
+workflow pins `MLXFAST_REFERENCE_DIR` to a repo-local
+`.cache/huggingface/hub/...` path (so the runner can cache it between jobs),
+passes that path explicitly to the offline transform, then prepares the
+correctness golden after transform
 completes. Correctness-only workflow runs use the checked-in public
 `correctness_prompts/public_longcopy_gate_english_512_256.json` fixture. Full
 benchmark runs require a precomputed hidden `correctness_golden.json` through
@@ -237,7 +241,7 @@ Sources/
 weights/                     transformed weights (harness loads from here)
   experts/
     manifest.json            baseline byte ranges for streamed expert tensors
-.cache/huggingface/hub/...   canonical frozen 4-bit reference checkpoint cache
+~/.cache/huggingface/hub/... canonical frozen 4-bit reference checkpoint cache (shared, user-global)
 reference_weights/...        compatibility symlink to the reference cache
 correctness_prompts/         public correctness prompt and checked-in golden
 correctness_golden.json      hidden benchmark correctness cases and token oracle
