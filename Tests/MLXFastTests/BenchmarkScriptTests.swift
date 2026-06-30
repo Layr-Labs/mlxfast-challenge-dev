@@ -14,6 +14,7 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("REFERENCE_CACHE_DIR=\"${MLXFAST_REFERENCE_CACHE_DIR:-${DEFAULT_HF_HUB_CACHE}/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}}\""))
     #expect(setup.contains("REFERENCE_CACHE_LOCK_PATH=\"${MLXFAST_REFERENCE_CACHE_LOCK_PATH:-${REFERENCE_DIR}/.mlxfast-reference-cache.lock}\""))
     #expect(setup.contains("REFERENCE_POST_DOWNLOAD_FULL_VERIFY=\"${MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY:-1}\""))
+    #expect(setup.contains("SETUP_PARALLEL_BUILD=\"${MLXFAST_SETUP_PARALLEL_BUILD:-1}\""))
     #expect(setup.contains("Usage: ./setup.sh"))
     #expect(setup.contains("reference_file_is_current"))
     #expect(setup.contains("reference_cache_lock_is_current"))
@@ -27,6 +28,12 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("compatibility reference path exists and is not a symlink"))
     #expect(setup.contains("if ! verify_reference_manifest \"${reference_dir}\"; then"))
     #expect(setup.contains("downloaded ${total}/${total} safetensors shard(s)"))
+    #expect(setup.contains("start_swift_harness_build"))
+    #expect(setup.contains("wait_for_swift_harness_build"))
+    #expect(setup.contains("start_mlx_metallib_build"))
+    #expect(setup.contains("MLXFAST_SETUP_PARALLEL_BUILD must be 0 or 1"))
+    #expect(setup.contains("setup.sh: Swift harness build running in background"))
+    #expect(setup.contains("setup.sh: mlx.metallib build running in background"))
     #expect(setup.contains("setup.sh: setup complete elapsed="))
     #expect(setup.contains("MLXFAST_OFFLINE_WRITABLE_PATHS=\"${PWD}/weights\" .github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference \"${REFERENCE_DIR}\" --output weights"))
     #expect(setup.contains("${SWIFT_BIN} correctness --weights weights"))
@@ -38,16 +45,41 @@ func benchmarkWorkflowRunsTransformOfflineAfterSetup() throws {
         contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
+    let ci = try String(
+        contentsOfFile: ".github/workflows/ci.yml",
+        encoding: .utf8
+    )
     let setupRange = try #require(workflow.range(of: "- name: Setup Swift harness and reference checkpoint"))
     let transformRange = try #require(workflow.range(of: "- name: Transform reference checkpoint"))
+    let restoreCacheRange = try #require(workflow.range(of: "- name: Restore SwiftPM cache"))
+    let saveCacheRange = try #require(workflow.range(of: "- name: Save SwiftPM cache"))
 
+    #expect(restoreCacheRange.lowerBound < setupRange.lowerBound)
     #expect(setupRange.lowerBound < transformRange.lowerBound)
+    #expect(setupRange.lowerBound < saveCacheRange.lowerBound)
+    #expect(saveCacheRange.lowerBound < transformRange.lowerBound)
     #expect(workflow.contains("MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main"))
     #expect(workflow.contains("MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: \"0\""))
+    #expect(workflow.contains("default: \"12\""))
+    #expect(workflow.contains("actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809"))
+    #expect(workflow.contains("actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809"))
+    #expect(workflow.contains(".build/checkouts"))
+    #expect(workflow.contains(".build/repositories"))
+    #expect(workflow.contains(".build/artifacts"))
+    #expect(!workflow.contains("path: .cache/huggingface"))
     #expect(workflow.contains("MLXFAST_OFFLINE_WRITABLE_PATHS=\"${PWD}/weights\""))
     #expect(workflow.contains(".github/scripts/run-offline.sh .build/release/mlxfast-swift transform"))
     #expect(workflow.contains("--reference \"${MLXFAST_REFERENCE_DIR}\""))
     #expect(workflow.contains("--output weights"))
+    #expect(ci.contains("push:\n    branches:\n      - main"))
+    #expect(ci.contains("- name: Restore SwiftPM cache"))
+    #expect(ci.contains("- name: Save SwiftPM cache"))
+    #expect(ci.contains("github.event.pull_request.head.repo.full_name == github.repository"))
+    #expect(ci.contains("actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809"))
+    #expect(ci.contains("actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809"))
+    #expect(ci.contains(".build/checkouts"))
+    #expect(ci.contains(".build/repositories"))
+    #expect(ci.contains(".build/artifacts"))
 }
 
 @Test
