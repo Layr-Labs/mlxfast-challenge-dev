@@ -12,7 +12,6 @@ let package = Package(
         .library(name: "MLXFastTransform", targets: ["MLXFastTransform"]),
         .library(name: "MLXFastModel", targets: ["MLXFastModel"]),
         .library(name: "MLXFastHarness", targets: ["MLXFastHarness"]),
-        .library(name: "MLXFastSubmission", targets: ["MLXFastSubmission"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.31.4"),
@@ -40,17 +39,12 @@ let package = Package(
                 .product(name: "Tokenizers", package: "swift-transformers"),
             ]
         ),
-        .target(
-            name: "MLXFastSubmission",
-            dependencies: ["MLXFastCore"]
-        ),
         .executableTarget(
             name: "MLXFastCLI",
             dependencies: [
                 "MLXFastCore",
                 "MLXFastTransform",
                 "MLXFastHarness",
-                "MLXFastSubmission",
                 .product(name: "Tokenizers", package: "swift-transformers"),
             ]
         ),
@@ -61,7 +55,6 @@ let package = Package(
                 "MLXFastTransform",
                 "MLXFastModel",
                 "MLXFastHarness",
-                "MLXFastSubmission",
             ]
         ),
     ]

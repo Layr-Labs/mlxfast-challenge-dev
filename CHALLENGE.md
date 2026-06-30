@@ -106,31 +106,30 @@ The active editable surface is Swift-only and is defined by `benchmark.json`:
 | `Sources/MLXFastTransform/` | Offline safetensors transform and expert manifest generation. |
 
 `Sources/MLXFastCore/`, `Sources/MLXFastHarness/`,
-`Sources/MLXFastCLI/`, `Sources/MLXFastSubmission/`, scripts, tests,
-`benchmark.json`, generated
+`Sources/MLXFastCLI/`, scripts, tests, `benchmark.json`, generated
 `weights/`, reference checkpoints, golden fixtures, and local scores are
 harness/operator files, not submission surface. Correctness, scoring, timing,
-golden generation, benchmark-oracle validation, provenance checks, and
-submission packaging live in that trusted harness layer. `mlxfast-swift submit`
-packages only `editablePaths`, rejects symlinks and generated/model artifact
-paths, skips macOS metadata files, and applies a 256 MiB default source archive
-input cap. Override the cap with `MLXFAST_MAX_SUBMISSION_BYTES` or
-`mlxfast-swift submit --max-bytes`. Before packaging or upload, submit checks
-the local Git diff against the trusted base ref and rejects any committed,
-staged, unstaged, or untracked source changes outside `editablePaths`. The base
-ref normally comes from `mlxfast-swift clone`/`link`; submit fails if no base ref
-can be resolved, so pass `--base-ref REF` for manual checkouts.
+golden generation, benchmark-oracle validation, and provenance checks live in
+that trusted harness layer.
 
-Use `mlxfast-swift submit --dry-run --output mlxfast-submission.zip` for local
-inspection. For Yukon upload, run `mlxfast-swift login <api-key> --api <url>`
-once, then `mlxfast-swift link <benchmark-id-or-name>` for an existing checkout
-or `mlxfast-swift clone <benchmark-id-or-name>` for a fresh checkout. Upload
-with `mlxfast-swift submit <benchmark-id-or-name> --note "..."`. Uploads are
-sent as a gzip tar archive with bearer-token auth; the backend applies the
-archive to the frozen benchmark checkout and runs hidden validation. Use
-`mlxfast-swift submissions <benchmark-id-or-name>` to inspect submitted jobs.
-Pass `--idempotency-key KEY` when a live submit should be safely retried with a
-stable backend idempotency key.
+Account and submission management — login, clone, submit, and listing
+submissions — are handled by the **Yukon CLI (`mlxfast`)**, not by
+`mlxfast-swift`. The Swift binary now runs the benchmark domain only (transform,
+correctness, benchmark, preflight, verify-transform); it no longer logs in or
+uploads. Submit with:
+
+```bash
+mlxfast login <api-key> --api <url>
+mlxfast clone <benchmark-id-or-name>     # fresh checkout; an existing repo auto-links by its git remote
+mlxfast submit --model "<model name>" --note "..."
+mlxfast submissions
+```
+
+`mlxfast submit` reads `benchmark.json` and uploads only `editablePaths` as a
+gzip tar archive with bearer-token auth; the backend applies it to the frozen
+benchmark checkout and re-enforces the editable surface server-side before
+running hidden validation. `--model` is required and is recorded for the
+leaderboard; pass `--note-file PATH` or `--claimed-score N` as needed.
 
 `mlxfast-swift verify-transform` is an organizer/debug check for deterministic
 transform output. It re-runs the submitted transform and compares the generated
@@ -243,8 +242,9 @@ MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" .github/scripts/run-offline.sh .
 .build/release/mlxfast-swift benchmark --score-path score.json
 .build/release/mlxfast-swift benchmark --quick --score-path score.json
 .build/release/mlxfast-swift verify-transform
-.build/release/mlxfast-swift clone
-.build/release/mlxfast-swift link <benchmark-id-or-name>
-.build/release/mlxfast-swift submit --dry-run --output mlxfast-submission.zip
-.build/release/mlxfast-swift submissions <benchmark-id-or-name>
+
+# Submitting is done with the Yukon CLI (mlxfast), not mlxfast-swift:
+mlxfast clone <benchmark-id-or-name>
+mlxfast submit --model "<model name>" --note "..."
+mlxfast submissions
 ```

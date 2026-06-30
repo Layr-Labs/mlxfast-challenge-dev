@@ -132,19 +132,6 @@ func benchmarkWorkflowProbesAndEnforcesRuntimeWorkerSandbox() throws {
 }
 
 @Test
-func ciSubmissionSmokeTestUsesIsolatedWorkspace() throws {
-    let workflow = try String(
-        contentsOfFile: ".github/workflows/ci.yml",
-        encoding: .utf8
-    )
-
-    #expect(workflow.contains("WORKSPACE=\"${RUNNER_TEMP}/mlxfast-submit-smoke\""))
-    #expect(workflow.contains("git -C \"${WORKSPACE}\" -c user.name=\"CI\" -c user.email=\"ci@example.test\" commit -m \"base\""))
-    #expect(workflow.contains("\"${BIN}\" submit --contract \"${WORKSPACE}/benchmark.json\" --base-ref HEAD --output /tmp/mlxfast-submission.zip"))
-    #expect(!workflow.contains(".build/release/mlxfast-swift submit --output /tmp/mlxfast-submission.zip"))
-}
-
-@Test
 func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/reference-cache-probe.yml",
@@ -371,10 +358,7 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
         contentsOfFile: "Package.swift",
         encoding: .utf8
     )
-    let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
-        encoding: .utf8
-    )
+    let runtime = try harnessRuntimeSource()
 
     #expect(package.contains(".product(name: \"Tokenizers\", package: \"swift-transformers\")"))
     #expect(cli.contains("case \"attach-gpqa-gates\""))
@@ -450,10 +434,7 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
         contentsOfFile: "benchmark.sh",
         encoding: .utf8
     )
-    let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
-        encoding: .utf8
-    )
+    let runtime = try harnessRuntimeSource()
     let cli = try String(
         contentsOfFile: "Sources/MLXFastCLI/main.swift",
         encoding: .utf8
@@ -520,10 +501,7 @@ func overlayScriptRejectsDangerousArtifactsAfterCopy() throws {
 
 @Test
 func runtimeWorkerBenchmarkDecodeDoesNotReceiveBulkOracle() throws {
-    let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
-        encoding: .utf8
-    )
+    let runtime = try harnessRuntimeSource()
 
     #expect(runtime.contains("kind: \"decode_begin\""))
     #expect(runtime.contains("kind: \"decode_step\""))
@@ -562,20 +540,14 @@ func expertStreamingDiagnosticsUseTrustedCoreCounters() throws {
     )
     #expect(!slotBank.contains("public func tensorBytes"))
 
-    let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
-        encoding: .utf8
-    )
+    let runtime = try harnessRuntimeSource()
     #expect(runtime.contains("ExpertStreamingMetrics.bandwidthSource"))
 }
 
 @Test
 func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
-    let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
-        encoding: .utf8
-    )
-    let workerStart = try #require(runtime.range(of: "private static func benchmarkWithWorker"))
+    let runtime = try harnessRuntimeSource()
+    let workerStart = try #require(runtime.range(of: "static func benchmarkWithWorker"))
     let workerRuntime = String(runtime[workerStart.lowerBound...])
 
     #expect(workerRuntime.contains("benchmark prefill worker start"))
@@ -606,10 +578,7 @@ func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
 
 @Test
 func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
-    let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
-        encoding: .utf8
-    )
+    let runtime = try harnessRuntimeSource()
 
     #expect(runtime.contains("let hello = try readResponseLine(validateNonce: false)"))
     #expect(runtime.contains("self.sessionNonce = nonce"))
@@ -635,10 +604,7 @@ func benchmarkQuickModeUsesShortLocalPrefixAndPrintsScore() throws {
         contentsOfFile: "Sources/MLXFastCLI/main.swift",
         encoding: .utf8
     )
-    let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
-        encoding: .utf8
-    )
+    let runtime = try harnessRuntimeSource()
 
     #expect(constants.contains("public static let quickCorrectnessSteps = 64"))
     #expect(constants.contains("public static let quickBenchmarkDecodeSteps = 64"))
@@ -824,6 +790,18 @@ func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
     process.waitUntilExit()
 
     #expect(process.terminationStatus != 0)
+}
+
+// DeepSeekRuntime was split across DeepSeekRuntime*.swift; concatenate them so
+// source-level assertions stay agnostic to which split file the code lives in.
+private func harnessRuntimeSource() throws -> String {
+    let directory = "Sources/MLXFastHarness"
+    let files = try FileManager.default.contentsOfDirectory(atPath: directory)
+        .filter { $0.hasPrefix("DeepSeekRuntime") && $0.hasSuffix(".swift") }
+        .sorted()
+    return try files
+        .map { try String(contentsOfFile: "\(directory)/\($0)", encoding: .utf8) }
+        .joined(separator: "\n")
 }
 
 private func temporaryDirectory() throws -> URL {
