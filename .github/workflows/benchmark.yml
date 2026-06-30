@@ -57,6 +57,7 @@ jobs:
       MLXFAST_GPQA_REFERENCE_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/gpqa_reference_cases.json
       MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_answers.json
       MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json
+      MLXFAST_SUBMISSION_STATIC_REVIEW_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/submission_static_review.json
       MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
@@ -159,6 +160,14 @@ jobs:
         env:
           SUBMISSION_WORKTREE: .mlxfast-submission-src
         run: .github/scripts/overlay-editable-paths.sh
+
+      - name: Review submitted code for benchmark bypasses
+        if: inputs.submission_ref != '' && !inputs.calibrate_gpqa_reference
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          .github/scripts/run-submission-static-review.sh
 
       - name: Enforce modifiable surface
         if: inputs.submission_ref == '' && (startsWith(github.ref_name, 'submissions/') || startsWith(github.ref_name, 'yukon/submissions/'))
