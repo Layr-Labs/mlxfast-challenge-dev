@@ -98,6 +98,11 @@ func benchmarkPromptPlanRejectsMalformedBenchmarkOracle() {
 }
 
 @Test
+func defaultTransformedWeightsLimitIsTenGiB() {
+    #expect(MLXFastConstants.defaultMaxTransformedWeightsBytes == 10 * 1024 * 1024 * 1024)
+}
+
+@Test
 func benchmarkPreflightAcceptsRequiredArtifacts() throws {
     let fixture = try makePreflightFixture()
     defer { try? FileManager.default.removeItem(at: fixture.root) }
