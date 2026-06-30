@@ -213,6 +213,7 @@ fi
 write_runtime_worker_sandbox_profile
 export MLXFAST_USE_RUNTIME_WORKER="${USE_RUNTIME_WORKER}"
 export MLXFAST_RUNTIME_WORKER_EXECUTABLE="$(absolute_path "${SWIFT_BIN}")"
+export MLXFAST_REFERENCE_DIR="${REFERENCE_PATH}"
 
 mkdir -p "${WEIGHTS_PATH}"
 wanted_hash="$(source_hash)"

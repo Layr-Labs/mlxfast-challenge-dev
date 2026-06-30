@@ -204,7 +204,6 @@ struct BenchmarkTokenMismatchError: Error, CustomStringConvertible {
         if let step {
             message += " at step \(step)"
         }
-        message += ": expected \(expectedToken.map { String($0) } ?? "nil"), actual \(actualToken.map { String($0) } ?? "nil")"
         return message
     }
 }

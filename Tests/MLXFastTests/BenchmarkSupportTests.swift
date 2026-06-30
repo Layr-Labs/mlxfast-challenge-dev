@@ -107,10 +107,7 @@ func benchmarkPreflightAcceptsRequiredArtifacts() throws {
     let fixture = try makePreflightFixture()
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
-    let report = try BenchmarkPreflight.check(
-        weightsPath: fixture.weights.path,
-        goldenPath: fixture.golden.path
-    )
+    let report = try checkPreflight(fixture)
 
     #expect(report.weightsPath == fixture.weights.path)
     #expect(report.goldenPath == fixture.golden.path)
@@ -128,10 +125,7 @@ func benchmarkPreflightRejectsWeightsAboveDefaultByteLimit() throws {
     )
 
     #expect(throws: MLXFastError.self) {
-        _ = try BenchmarkPreflight.check(
-            weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path
-        )
+        _ = try checkPreflight(fixture)
     }
 }
 
@@ -145,9 +139,8 @@ func benchmarkPreflightHonorsConfiguredWeightsByteLimit() throws {
     )
     let override = MLXFastConstants.defaultMaxTransformedWeightsBytes * 2
 
-    let report = try BenchmarkPreflight.check(
-        weightsPath: fixture.weights.path,
-        goldenPath: fixture.golden.path,
+    let report = try checkPreflight(
+        fixture,
         environment: [
             "MLXFAST_MAX_WEIGHTS_BYTES": "\(override)",
         ]
@@ -163,10 +156,7 @@ func benchmarkPreflightRejectsMissingExpertManifest() throws {
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
-        _ = try BenchmarkPreflight.check(
-            weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path
-        )
+        _ = try checkPreflight(fixture)
     }
 }
 
@@ -176,10 +166,7 @@ func benchmarkPreflightRejectsMalformedGolden() throws {
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: Error.self) {
-        _ = try BenchmarkPreflight.check(
-            weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path
-        )
+        _ = try checkPreflight(fixture)
     }
 }
 
@@ -189,10 +176,7 @@ func benchmarkPreflightRejectsShortBenchmarkPrompt() throws {
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
-        _ = try BenchmarkPreflight.check(
-            weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path
-        )
+        _ = try checkPreflight(fixture)
     }
 }
 
@@ -214,10 +198,7 @@ func benchmarkPreflightRejectsMissingBenchmarkOracle() throws {
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
-        _ = try BenchmarkPreflight.check(
-            weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path
-        )
+        _ = try checkPreflight(fixture)
     }
 }
 
@@ -227,10 +208,7 @@ func benchmarkPreflightRejectsMissingSemanticTensor() throws {
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
-        _ = try BenchmarkPreflight.check(
-            weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path
-        )
+        _ = try checkPreflight(fixture)
     }
 }
 
@@ -240,9 +218,32 @@ func benchmarkPreflightRejectsUnreadableExpertByteRange() throws {
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
+        _ = try checkPreflight(fixture)
+    }
+}
+
+@Test
+func benchmarkPreflightAllowsConfiguredExternalReferenceRoot() throws {
+    let fixture = try makePreflightFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    let report = try checkPreflight(fixture)
+
+    #expect(report.weightsPath == fixture.weights.path)
+}
+
+@Test
+func benchmarkPreflightRejectsExpertManifestOutsideAllowedReferenceRoots() throws {
+    let fixture = try makePreflightFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    #expect(throws: MLXFastError.self) {
         _ = try BenchmarkPreflight.check(
             weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path
+            goldenPath: fixture.golden.path,
+            environment: [
+                "MLXFAST_REFERENCE_DIR": fixture.root.appendingPathComponent("different-reference").path,
+            ]
         )
     }
 }
@@ -250,6 +251,7 @@ func benchmarkPreflightRejectsUnreadableExpertByteRange() throws {
 private struct PreflightFixture {
     let root: URL
     let weights: URL
+    let reference: URL
     let golden: URL
 }
 
@@ -258,6 +260,19 @@ private struct TensorFixture {
     let dtype: String
     let shape: [Int]
     let data: Data
+}
+
+private func checkPreflight(
+    _ fixture: PreflightFixture,
+    environment extraEnvironment: [String: String] = [:]
+) throws -> BenchmarkPreflightReport {
+    var environment = extraEnvironment
+    environment["MLXFAST_REFERENCE_DIR"] = fixture.reference.path
+    return try BenchmarkPreflight.check(
+        weightsPath: fixture.weights.path,
+        goldenPath: fixture.golden.path,
+        environment: environment
+    )
 }
 
 private func makePreflightFixture(
@@ -308,7 +323,7 @@ private func makePreflightFixture(
     let golden = directory.appendingPathComponent("correctness_golden.json")
     try (goldenContents ?? validGoldenJSON()).write(to: golden, atomically: true, encoding: .utf8)
 
-    return PreflightFixture(root: directory, weights: weights, golden: golden)
+    return PreflightFixture(root: directory, weights: weights, reference: reference, golden: golden)
 }
 
 private func minimalDeepSeekConfigJSON() -> String {

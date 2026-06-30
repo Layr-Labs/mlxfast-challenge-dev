@@ -122,6 +122,36 @@ public struct ExpertManifest: Codable, Equatable {
             }
         }
     }
+
+    public func validateReferencePath(allowedRoots: [String]) throws {
+        guard !allowedRoots.isEmpty else {
+            return
+        }
+        let reference = try Self.canonicalDirectoryPath(referencePath, description: "expert manifest reference_path")
+        let allowed = allowedRoots.compactMap { root in
+            try? Self.canonicalDirectoryPath(root, description: "expert manifest allowed reference root")
+        }
+        guard !allowed.isEmpty else {
+            throw MLXFastError.invalidInput("expert manifest has no existing allowed reference roots")
+        }
+        guard allowed.contains(where: { path(reference, isInsideOrEqualTo: $0) }) else {
+            throw MLXFastError.invalidInput(
+                "expert manifest reference_path must be under transformed weights or configured reference checkpoint"
+            )
+        }
+    }
+
+    private static func canonicalDirectoryPath(_ path: String, description: String) throws -> String {
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        if values.isSymbolicLink == true {
+            throw MLXFastError.invalidInput("\(description) must not be a symlink: \(path)")
+        }
+        guard values.isDirectory == true else {
+            throw MLXFastError.missingFile("\(description) directory missing at \(path)")
+        }
+        return url.resolvingSymlinksInPath().standardizedFileURL.path
+    }
 }
 
 public final class ExpertSlotBank {
@@ -132,18 +162,24 @@ public final class ExpertSlotBank {
     private var recordsByName: [String: ExpertTensorRecord]
     private var cache: [String: Data] = [:]
     private var lru: [String] = []
+    private let referenceBaseURL: URL
+    private let referenceBasePath: String
 
     public init(
         manifestPath: String,
         capacity: Int = ExpertStreamingConfig.defaultTensorCacheCapacity,
-        metrics: ExpertStreamingMetrics? = nil
+        metrics: ExpertStreamingMetrics? = nil,
+        allowedReferenceRoots: [String] = []
     ) throws {
         self.manifest = try ExpertManifest.load(from: manifestPath)
+        try self.manifest.validateReferencePath(allowedRoots: allowedReferenceRoots)
         self.capacity = max(0, capacity)
         self.metrics = metrics
         self.recordsByName = Dictionary(
             uniqueKeysWithValues: manifest.expertTensors.map { ($0.name, $0) }
         )
+        self.referenceBaseURL = URL(fileURLWithPath: manifest.referencePath).standardizedFileURL
+        self.referenceBasePath = referenceBaseURL.resolvingSymlinksInPath().standardizedFileURL.path
     }
 
     public func record(named name: String) -> ExpertTensorRecord? {
@@ -214,10 +250,9 @@ public final class ExpertSlotBank {
     }
 
     public func validateReadableByteRanges(fileManager: FileManager = .default) throws {
-        let baseURL = URL(fileURLWithPath: manifest.referencePath)
         let recordsByShard = Dictionary(grouping: manifest.expertTensors) { $0.shard }
         for shard in recordsByShard.keys.sorted() {
-            let shardPath = baseURL.appendingPathComponent(shard).path
+            let shardPath = try validatedShardURL(shard).path
             let attributes = try fileManager.attributesOfItem(atPath: shardPath)
             let byteCount = try fileSizeByteCount(from: attributes, path: shardPath)
             for record in recordsByShard[shard, default: []] {
@@ -288,9 +323,7 @@ public final class ExpertSlotBank {
         byteOffset: Int,
         byteLength: Int
     ) throws -> Data {
-        let shardPath = URL(fileURLWithPath: manifest.referencePath)
-            .appendingPathComponent(shard)
-            .path
+        let shardPath = try validatedShardURL(shard).path
         let fd = open(shardPath, O_RDONLY)
         guard fd >= 0 else {
             throw MLXFastError.missingFile(
@@ -316,4 +349,28 @@ public final class ExpertSlotBank {
         }
         return output
     }
+
+    private func validatedShardURL(_ shard: String) throws -> URL {
+        let shardURL = referenceBaseURL.appendingPathComponent(shard).standardizedFileURL
+        let shardPath = shardURL.resolvingSymlinksInPath().standardizedFileURL.path
+        guard path(shardPath, isInsideOrEqualTo: referenceBasePath) else {
+            throw MLXFastError.invalidInput("expert shard path escaped reference root: \(shard)")
+        }
+        let values = try shardURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        if values.isSymbolicLink == true {
+            throw MLXFastError.invalidInput("expert shard must not be a symlink: \(shard)")
+        }
+        guard values.isRegularFile == true else {
+            throw MLXFastError.missingFile("expert shard missing at \(shardURL.path)")
+        }
+        return shardURL
+    }
+}
+
+private func path(_ path: String, isInsideOrEqualTo root: String) -> Bool {
+    if path == root {
+        return true
+    }
+    let prefix = root == "/" ? "/" : root + "/"
+    return path.hasPrefix(prefix)
 }

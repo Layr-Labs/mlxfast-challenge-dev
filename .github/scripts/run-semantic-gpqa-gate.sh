@@ -177,12 +177,21 @@ jq \
   --argjson semantic_passed "${semantic_passed}" \
   --argjson semantic_pass_count "${semantic_pass_count}" \
   --argjson semantic_case_count "${semantic_case_count}" \
+  --argjson semantic_required "${semantic_required}" \
   --arg semantic_model "${MODEL}" \
   '
   .metrics.semantic_gpqa_passed = $semantic_passed
   | .metrics.semantic_gpqa_pass_count = $semantic_pass_count
   | .metrics.semantic_gpqa_case_count = $semantic_case_count
   | .metrics.semantic_gpqa_model = $semantic_model
+  | if ($semantic_required == 1 and ($semantic_passed | not)) then
+      .passed = false
+      | .score = null
+      | .metrics.error = "semantic GPQA gate failed"
+      | .metrics.first_failing_case = "semantic_gpqa"
+    else
+      .
+    end
   ' "${SCORE_PATH}" > "${tmp_score}"
 mv "${tmp_score}" "${SCORE_PATH}"
 shasum -a 256 "${SCORE_PATH}" > "${SCORE_PATH}.sha256"

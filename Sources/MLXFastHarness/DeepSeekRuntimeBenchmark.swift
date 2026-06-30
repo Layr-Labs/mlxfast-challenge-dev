@@ -243,8 +243,8 @@ extension DeepSeekRuntime {
                 expertStats: expertStats(from: benchmarkLoader),
                 firstFailingCase: "benchmark",
                 firstFailingStep: mismatch.step,
-                expectedToken: mismatch.expectedToken,
-                actualToken: mismatch.actualToken,
+                expectedToken: nil,
+                actualToken: nil,
                 weightsDigest: transformedWeightsDigest
             )
         } catch {
@@ -371,12 +371,25 @@ extension DeepSeekRuntime {
             try validateBenchmarkOptions(options)
             progress("preflight start")
             let preflightStart = DispatchTime.now().uptimeNanoseconds
-            try checkWorkerBenchmarkInputs(
+            _ = try BenchmarkPreflight.check(
                 weightsPath: options.weightsPath,
                 goldenPath: options.goldenPath
             )
             preflightSeconds = secondsSince(preflightStart)
             progress("preflight complete seconds=\(formatSeconds(preflightSeconds))")
+
+            progress("weights digest start")
+            transformedWeightsDigest = try directoryDigest(
+                rootPath: options.weightsPath,
+                ignoredRelativePaths: [".benchmark-source.sha256", ".gitkeep"]
+            )
+            if let transformedWeightsDigest {
+                try enforceTransformedWeightsByteLimit(transformedWeightsDigest.byteCount)
+                progress(
+                    "weights digest complete files=\(transformedWeightsDigest.fileCount) "
+                        + "bytes=\(transformedWeightsDigest.byteCount)"
+                )
+            }
 
             progress("golden load start")
             let golden = try loadGoldenFixture(from: options.goldenPath)
@@ -452,19 +465,6 @@ extension DeepSeekRuntime {
                 baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken,
                 candidateSecondsPerToken: prefillSecondsPerToken
             )
-
-            progress("weights digest start")
-            transformedWeightsDigest = try directoryDigest(
-                rootPath: options.weightsPath,
-                ignoredRelativePaths: [".benchmark-source.sha256", ".gitkeep"]
-            )
-            if let transformedWeightsDigest {
-                try enforceTransformedWeightsByteLimit(transformedWeightsDigest.byteCount)
-                progress(
-                    "weights digest complete files=\(transformedWeightsDigest.fileCount) "
-                        + "bytes=\(transformedWeightsDigest.byteCount)"
-                )
-            }
 
             guard score.isFinite, score >= 0 else {
                 return makeFailedScore(
@@ -597,8 +597,8 @@ extension DeepSeekRuntime {
                 passedCorrectness: correctnessReport?.passed == true,
                 firstFailingCase: "benchmark",
                 firstFailingStep: mismatch.step,
-                expectedToken: mismatch.expectedToken,
-                actualToken: mismatch.actualToken
+                expectedToken: nil,
+                actualToken: nil
             )
         } catch {
             return makeFailedScore(
@@ -715,11 +715,16 @@ extension DeepSeekRuntime {
                 "prefill \(runLabel) \(runOrdinal)/\(runTotal) start "
                     + "prompt_tokens=\(promptTokens.count)"
             )
+            // The worker contains submitted model code, so do not trust its
+            // reported prefill duration as the score source. The trusted
+            // parent measures the full request/response wall time.
+            let prefillStart = DispatchTime.now().uptimeNanoseconds
             let response = try worker.prefill(promptTokens: promptTokens)
+            let elapsed = secondsSince(prefillStart)
             expertStats = response.expertStats ?? expertStats
             peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
-            guard let token = response.token, let elapsed = response.seconds else {
-                throw MLXFastError.invalidInput("runtime worker prefill response missing token or seconds")
+            guard let token = response.token else {
+                throw MLXFastError.invalidInput("runtime worker prefill response missing token")
             }
             try requireBenchmarkMatch(
                 BenchmarkOutputValidator.comparePrefillToken(

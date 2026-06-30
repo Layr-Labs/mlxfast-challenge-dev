@@ -78,30 +78,23 @@ extension DeepSeekRuntime {
             )
         }
 
-        let response = try worker.teacherForcedCorrectnessBatch(
-            promptTokens: testCase.promptTokens,
-            expectedTokens: Array(testCase.expectedTokens.prefix(steps)),
-            steps: steps
-        )
-        guard let actualTokens = response.tokens else {
-            throw MLXFastError.invalidInput("runtime worker batched teacher-forced response missing tokens")
+        guard steps > 0 else {
+            throw MLXFastError.invalidInput("teacher-forced correctness steps must be positive")
         }
-        guard actualTokens.count == steps else {
-            throw MLXFastError.invalidInput(
-                "runtime worker batched teacher-forced response returned \(actualTokens.count) tokens; expected \(steps)"
-            )
-        }
-        guard let topLogitRows = response.topLogitRows else {
-            throw MLXFastError.invalidInput("runtime worker batched teacher-forced response missing top_logit_rows")
-        }
-        guard topLogitRows.count == steps else {
-            throw MLXFastError.invalidInput(
-                "runtime worker batched teacher-forced response returned \(topLogitRows.count) top_logit_rows; expected \(steps)"
-            )
-        }
+
+        var response = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
+        var latestExpertStats = response.expertStats ?? .zero
+        var peakRamGB = response.peakRamGB ?? 0
         for step in 0..<steps {
-            let actualToken = actualTokens[step]
-            let topLogits = try validatedWorkerTopLogits(topLogitRows[step], actualToken: actualToken)
+            if step > 0 {
+                response = try worker.teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[step - 1])
+                latestExpertStats = response.expertStats ?? latestExpertStats
+                peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
+            }
+            guard let actualToken = response.token else {
+                throw MLXFastError.invalidInput("runtime worker teacher-forced correctness response missing token")
+            }
+            let topLogits = try validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
             let expectedToken = testCase.expectedTokens[step]
             if !correctnessTokenAccepted(
                 expectedToken: expectedToken,
@@ -116,8 +109,8 @@ extension DeepSeekRuntime {
                         expectedToken: expectedToken,
                         actualToken: actualToken
                     ),
-                    expertStats: response.expertStats ?? .zero,
-                    peakRamGB: response.peakRamGB ?? 0
+                    expertStats: latestExpertStats,
+                    peakRamGB: peakRamGB
                 )
             }
             reportProgress(
@@ -136,8 +129,8 @@ extension DeepSeekRuntime {
                 expectedToken: nil,
                 actualToken: nil
             ),
-            expertStats: response.expertStats ?? .zero,
-            peakRamGB: response.peakRamGB ?? 0
+            expertStats: latestExpertStats,
+            peakRamGB: peakRamGB
         )
     }
 
@@ -188,7 +181,11 @@ extension DeepSeekRuntime {
         testCase: GoldenBehaviorCase,
         worker: RuntimeWorkerClient
     ) throws -> WorkerCorrectnessResult {
+        // Hidden GPQA TTFT is a timing gate, so measure it in the trusted parent
+        // instead of trusting the submitted-code worker's reported seconds.
+        let ttftStart = DispatchTime.now().uptimeNanoseconds
         let beginResponse = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
+        let ttftSeconds = secondsSince(ttftStart)
         guard let firstToken = beginResponse.token else {
             throw MLXFastError.invalidInput("runtime worker behavior response missing token")
         }
@@ -203,7 +200,7 @@ extension DeepSeekRuntime {
                 comparison: firstTokenComparison,
                 expertStats: beginResponse.expertStats ?? .zero,
                 peakRamGB: beginResponse.peakRamGB ?? 0,
-                ttftSeconds: beginResponse.seconds,
+                ttftSeconds: ttftSeconds,
                 generatedTokens: [firstToken]
             )
         }
@@ -241,7 +238,7 @@ extension DeepSeekRuntime {
             comparison: comparison,
             expertStats: expertStats,
             peakRamGB: peakRamGB,
-            ttftSeconds: beginResponse.seconds,
+            ttftSeconds: ttftSeconds,
             generatedTokens: generated
         )
     }
@@ -307,9 +304,9 @@ extension DeepSeekRuntime {
         guard !testCase.promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("greedy correctness prompt must not be empty")
         }
-        guard testCase.expectedTokens.count == steps else {
+        guard testCase.expectedTokens.count >= steps else {
             throw MLXFastError.invalidInput(
-                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need exactly \(steps)"
+                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need at least \(steps)"
             )
         }
 

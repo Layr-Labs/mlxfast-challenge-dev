@@ -114,61 +114,6 @@ extension DeepSeekRuntime {
                 peakRamGB: currentResidentMemoryGB()
             )
 
-        case "correctness_teacher_forced_batch":
-            guard let promptTokens = request.promptTokens,
-                  let expectedTokens = request.expectedTokens,
-                  let steps = request.steps
-            else {
-                throw MLXFastError.invalidInput(
-                    "runtime worker batched teacher-forced request missing prompt_tokens, expected_tokens, or steps"
-                )
-            }
-            guard !promptTokens.isEmpty else {
-                throw MLXFastError.invalidInput("runtime worker batched teacher-forced prompt_tokens must not be empty")
-            }
-            guard steps > 0 else {
-                throw MLXFastError.invalidInput("runtime worker batched teacher-forced steps must be positive")
-            }
-            guard expectedTokens.count >= steps else {
-                throw MLXFastError.invalidInput(
-                    "runtime worker batched teacher-forced expected_tokens has \(expectedTokens.count) tokens; expected at least \(steps)"
-                )
-            }
-            let teacherForcedInput = promptTokens + Array(expectedTokens.prefix(max(steps - 1, 0)))
-            let cache = DeepSeekModelCache(config: weightCache.config)
-            let logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray(teacherForcedInput),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: 0
-            )
-            var tokens: [Int] = []
-            var topLogitRows: [[CorrectnessTraceLogit]] = []
-            tokens.reserveCapacity(steps)
-            topLogitRows.reserveCapacity(steps)
-            let firstLogitRow = promptTokens.count - 1
-            for step in 0..<steps {
-                let topLogits = try topLogits(
-                    from: logits,
-                    row: firstLogitRow + step,
-                    topK: MLXFastConstants.correctnessTopLogits
-                )
-                guard let token = topLogits.first?.token else {
-                    throw MLXFastError.invalidInput("runtime worker batched teacher-forced top logits missing token")
-                }
-                tokens.append(token)
-                topLogitRows.append(topLogits)
-            }
-            return RuntimeWorkerResponse(
-                id: request.id,
-                nonce: sessionNonce,
-                ok: true,
-                topLogitRows: topLogitRows,
-                tokens: tokens,
-                expertStats: expertStats(from: weightCache),
-                peakRamGB: currentResidentMemoryGB()
-            )
-
         case "correctness_step":
             guard let previousToken = request.token else {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing token")
@@ -305,7 +250,6 @@ struct RuntimeWorkerRequest: Codable {
     let id: Int
     let kind: String
     let promptTokens: [Int]?
-    let expectedTokens: [Int]?
     let token: Int?
     let seedTokens: [Int]?
     let steps: Int?
@@ -314,7 +258,6 @@ struct RuntimeWorkerRequest: Codable {
         case id
         case kind
         case promptTokens = "prompt_tokens"
-        case expectedTokens = "expected_tokens"
         case token
         case seedTokens = "seed_tokens"
         case steps
@@ -563,19 +506,6 @@ final class RuntimeWorkerClient {
         )
     }
 
-    func teacherForcedCorrectnessBatch(
-        promptTokens: [Int],
-        expectedTokens: [Int],
-        steps: Int
-    ) throws -> RuntimeWorkerResponse {
-        try send(
-            kind: "correctness_teacher_forced_batch",
-            promptTokens: promptTokens,
-            expectedTokens: expectedTokens,
-            steps: steps
-        )
-    }
-
     func teacherForcedCorrectnessStep(previousToken: Int) throws -> RuntimeWorkerResponse {
         try send(
             kind: "correctness_step",
@@ -607,7 +537,6 @@ final class RuntimeWorkerClient {
     private func send(
         kind: String,
         promptTokens: [Int]? = nil,
-        expectedTokens: [Int]? = nil,
         token: Int? = nil,
         seedTokens: [Int]? = nil,
         steps: Int? = nil
@@ -621,7 +550,6 @@ final class RuntimeWorkerClient {
             id: id,
             kind: kind,
             promptTokens: promptTokens,
-            expectedTokens: expectedTokens,
             token: token,
             seedTokens: seedTokens,
             steps: steps
