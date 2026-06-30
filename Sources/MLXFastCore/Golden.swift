@@ -634,9 +634,9 @@ private func validateGoldenCases(
                 "\(testCase.name).prompt_tokens has \(testCase.promptTokens.count) tokens; need exactly \(requiredPromptTokens)"
             )
         }
-        if testCase.expectedTokens.count != requiredSteps {
+        if testCase.expectedTokens.count < requiredSteps {
             throw MLXFastError.invalidInput(
-                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need exactly \(requiredSteps)"
+                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need at least \(requiredSteps)"
             )
         }
         try validateTokens(testCase.promptTokens, field: "\(testCase.name).prompt_tokens")

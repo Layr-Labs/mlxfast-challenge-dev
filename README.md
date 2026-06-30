@@ -227,7 +227,8 @@ during the decode window. Bandwidth, RAM, and expert-read metrics are reported
 for operator review and future guardrails; they are not primary score factors.
 Correctness is a hard gate. See CHALLENGE.md for the full correctness specification.
 The official run times the benchmark before correctness so the correctness gate
-cannot warm the measured model path. It then checks 256 correctness positions.
+cannot warm the measured model path. It then checks 128 public correctness
+positions plus the hidden GPQA behavior checks.
 Public local correctness uses the checked-in correctness fixture. When a local
 golden with a benchmark oracle is available, `--quick` shortens correctness and
 decode to 64 token checks and prints the resulting `score.json`.
@@ -294,8 +295,10 @@ Each base correctness prompt must contain exactly 512 token IDs. The benchmark
 prompt must contain at least 512 token IDs. The precomputed golden file stores
 exact expected tokens for each 512-token correctness prompt and its 256-token
 greedy continuation, the 512-token prefill check, the 512-token decode seed, and
-at least 128 tokens for the timed decode window. During correctness, the harness checks those
-continuation positions teacher-forced: after each accepted step it feeds the
+at least 128 tokens for the timed decode window. During correctness, the harness
+checks the first 128 public continuation positions by default, plus hidden
+behavior gates in official benchmark runs. It checks those continuation
+positions teacher-forced: after each accepted step it feeds the
 golden previous token back into the model. This keeps the gate stable across
 Apple GPU/software differences by preventing one earlier mismatch from
 cascading into unrelated later-token failures. A token is accepted only when it

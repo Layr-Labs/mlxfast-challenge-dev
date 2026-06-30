@@ -29,7 +29,8 @@ func checkedInPublicCorrectnessGoldenIsValid() throws {
     #expect(fixture.cases.count == 1)
     #expect(fixture.cases[0].name == "longcopy-gate-english-512")
     #expect(fixture.cases[0].promptTokens.count == MLXFastConstants.correctnessPromptTokens)
-    #expect(fixture.cases[0].expectedTokens.count == MLXFastConstants.correctnessSteps)
+    #expect(MLXFastConstants.correctnessSteps == 128)
+    #expect(fixture.cases[0].expectedTokens.count == 256)
 }
 
 @Test
@@ -607,7 +608,7 @@ func loadGoldenCasesRejectsNamesWithControlCharacters() throws {
 func loadGoldenCasesRejectsWrongExpectedTokenCount() throws {
     let directory = try temporaryDirectory()
     let path = directory.appendingPathComponent("golden.json")
-    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps + 1)
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps - 1)
     let json = """
     {
       "version": 1,

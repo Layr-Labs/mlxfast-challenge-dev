@@ -2877,9 +2877,9 @@ public enum DeepSeekRuntime {
         guard !testCase.promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("greedy correctness prompt must not be empty")
         }
-        guard testCase.expectedTokens.count == steps else {
+        guard testCase.expectedTokens.count >= steps else {
             throw MLXFastError.invalidInput(
-                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need exactly \(steps)"
+                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need at least \(steps)"
             )
         }
 

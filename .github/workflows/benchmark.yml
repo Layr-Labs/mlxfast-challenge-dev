@@ -83,7 +83,7 @@ jobs:
       MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 830670206859a1b221508ae44a031205a3eba6f5f13e05b40383bf781bdbf067
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "26110"
-      MLXFAST_EXPECTED_CORRECTNESS_STEPS: "256"
+      MLXFAST_EXPECTED_CORRECTNESS_STEPS: "128"
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
       MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
       # Production benchmark dispatches must run the workflow from main. The

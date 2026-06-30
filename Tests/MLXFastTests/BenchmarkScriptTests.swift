@@ -257,6 +257,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("uploaded calibrated GPQA reference cases to private R2"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 830670206859a1b221508ae44a031205a3eba6f5f13e05b40383bf781bdbf067"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: \"26110\""))
+    #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_STEPS: \"128\""))
     #expect(!workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_CASES: \"10\""))
     #expect(workflow.contains("benchmark: using checked-in public correctness golden"))
     #expect(workflow.contains("hidden GPQA behavior gate requires private R2 secrets"))
