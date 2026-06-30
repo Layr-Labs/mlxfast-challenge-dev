@@ -1792,11 +1792,16 @@ public enum DeepSeekRuntime {
                 "prefill \(runLabel) \(runOrdinal)/\(runTotal) start "
                     + "prompt_tokens=\(promptTokens.count)"
             )
+            // The worker contains submitted model code, so do not trust its
+            // reported prefill duration as the score source. The trusted
+            // parent measures the full request/response wall time.
+            let prefillStart = DispatchTime.now().uptimeNanoseconds
             let response = try worker.prefill(promptTokens: promptTokens)
+            let elapsed = secondsSince(prefillStart)
             expertStats = response.expertStats ?? expertStats
             peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
-            guard let token = response.token, let elapsed = response.seconds else {
-                throw MLXFastError.invalidInput("runtime worker prefill response missing token or seconds")
+            guard let token = response.token else {
+                throw MLXFastError.invalidInput("runtime worker prefill response missing token")
             }
             try requireBenchmarkMatch(
                 BenchmarkOutputValidator.comparePrefillToken(
@@ -2664,7 +2669,11 @@ public enum DeepSeekRuntime {
         testCase: GoldenBehaviorCase,
         worker: RuntimeWorkerClient
     ) throws -> WorkerCorrectnessResult {
+        // Hidden GPQA TTFT is a timing gate, so measure it in the trusted parent
+        // instead of trusting the submitted-code worker's reported seconds.
+        let ttftStart = DispatchTime.now().uptimeNanoseconds
         let beginResponse = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
+        let ttftSeconds = secondsSince(ttftStart)
         guard let firstToken = beginResponse.token else {
             throw MLXFastError.invalidInput("runtime worker behavior response missing token")
         }
@@ -2679,7 +2688,7 @@ public enum DeepSeekRuntime {
                 comparison: firstTokenComparison,
                 expertStats: beginResponse.expertStats ?? .zero,
                 peakRamGB: beginResponse.peakRamGB ?? 0,
-                ttftSeconds: beginResponse.seconds,
+                ttftSeconds: ttftSeconds,
                 generatedTokens: [firstToken]
             )
         }
@@ -2717,7 +2726,7 @@ public enum DeepSeekRuntime {
             comparison: comparison,
             expertStats: expertStats,
             peakRamGB: peakRamGB,
-            ttftSeconds: beginResponse.seconds,
+            ttftSeconds: ttftSeconds,
             generatedTokens: generated
         )
     }
