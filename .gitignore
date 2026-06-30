@@ -44,3 +44,6 @@ correctness_prompts/*gpqa_reference_cases*.json
 *.swp
 *.swo
 .DS_Store
+
+# Local-only working docs (not part of the benchmark)
+local-docs/
