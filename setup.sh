@@ -15,7 +15,7 @@ REFERENCE_HASH_VERIFY="${MLXFAST_REFERENCE_HASH_VERIFY:-1}"
 REFERENCE_POST_DOWNLOAD_FULL_VERIFY="${MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY:-1}"
 REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-170}"
 REFERENCE_DOWNLOAD_JOBS="${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-8}"
-SETUP_PARALLEL_BUILD="${MLXFAST_SETUP_PARALLEL_BUILD:-1}"
+SETUP_PARALLEL_METALLIB="${MLXFAST_SETUP_PARALLEL_METALLIB:-${MLXFAST_SETUP_PARALLEL_BUILD:-1}}"
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
 DEFAULT_REFERENCE_DIR="reference_weights/DeepSeek-V4-Flash-4bit"
@@ -32,7 +32,6 @@ fi
 REFERENCE_COMPAT_LINK="${MLXFAST_REFERENCE_COMPAT_LINK:-${DEFAULT_REFERENCE_DIR}}"
 REFERENCE_CACHE_LOCK_PATH="${MLXFAST_REFERENCE_CACHE_LOCK_PATH:-${REFERENCE_DIR}/.mlxfast-reference-cache.lock}"
 SETUP_STARTED_SECONDS="${SECONDS}"
-SWIFT_BUILD_PID=""
 METALLIB_BUILD_PID=""
 REFERENCE_REQUIRED_METADATA_FILES=(
   "config.json"
@@ -77,8 +76,10 @@ Important environment variables:
                                      Skip the second full-checkpoint SHA256 pass
                                      after all downloaded files were already
                                      verified by size and hash. CI-only speedup.
-  MLXFAST_SETUP_PARALLEL_BUILD=0     Disable overlapping the Swift/Metal build
+  MLXFAST_SETUP_PARALLEL_METALLIB=0  Disable overlapping the Metal library build
                                      with reference checkpoint download.
+                                     MLXFAST_SETUP_PARALLEL_BUILD is accepted
+                                     as a deprecated alias.
   MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1    Build tools only; do not download weights.
   MLXFAST_SKIP_MLX_METALLIB=1        Skip mlx.metallib build.
 
@@ -1019,7 +1020,7 @@ download_reference_shards() {
 list_reference_shards() {
   local index_path="$1"
 
-  wait_for_swift_harness_build
+  ensure_swift_harness_ready || return 1
 
   "${SWIFT_BIN}" checkpoint-shards --index "${index_path}"
 }
@@ -1200,8 +1201,8 @@ verify_reference_manifest_sizes() {
   echo "setup.sh: verified ${checked} reference file size(s)"
 }
 
-setup_parallel_build_enabled() {
-  case "${SETUP_PARALLEL_BUILD}" in
+setup_parallel_metallib_enabled() {
+  case "${SETUP_PARALLEL_METALLIB}" in
     0|false|FALSE|no|NO)
       return 1
       ;;
@@ -1209,7 +1210,7 @@ setup_parallel_build_enabled() {
       return 0
       ;;
     *)
-      echo "setup.sh: MLXFAST_SETUP_PARALLEL_BUILD must be 0 or 1" >&2
+      echo "setup.sh: MLXFAST_SETUP_PARALLEL_METALLIB must be 0 or 1" >&2
       return 2
       ;;
   esac
@@ -1218,15 +1219,9 @@ setup_parallel_build_enabled() {
 cleanup_background_builds() {
   local status="$?"
   if [[ "${status}" != "0" ]]; then
-    if [[ -n "${SWIFT_BUILD_PID}" ]] && kill -0 "${SWIFT_BUILD_PID}" >/dev/null 2>&1; then
-      kill "${SWIFT_BUILD_PID}" >/dev/null 2>&1 || true
-    fi
     if [[ -n "${METALLIB_BUILD_PID}" ]] && kill -0 "${METALLIB_BUILD_PID}" >/dev/null 2>&1; then
       kill "${METALLIB_BUILD_PID}" >/dev/null 2>&1 || true
     fi
-  fi
-  if [[ -n "${SWIFT_BUILD_PID}" ]]; then
-    wait "${SWIFT_BUILD_PID}" >/dev/null 2>&1 || true
   fi
   if [[ -n "${METALLIB_BUILD_PID}" ]]; then
     wait "${METALLIB_BUILD_PID}" >/dev/null 2>&1 || true
@@ -1245,25 +1240,7 @@ build_swift_harness() {
   fi
 }
 
-start_swift_harness_build() {
-  if [[ -n "${SWIFT_BUILD_PID}" ]]; then
-    return 0
-  fi
-  build_swift_harness &
-  SWIFT_BUILD_PID="$!"
-  echo "setup.sh: Swift harness build running in background pid=${SWIFT_BUILD_PID}"
-}
-
-wait_for_swift_harness_build() {
-  if [[ -n "${SWIFT_BUILD_PID}" ]]; then
-    echo "setup.sh: waiting for Swift harness build" >&2
-    if ! wait "${SWIFT_BUILD_PID}"; then
-      SWIFT_BUILD_PID=""
-      echo "setup.sh: Swift harness build failed" >&2
-      return 1
-    fi
-    SWIFT_BUILD_PID=""
-  fi
+ensure_swift_harness_ready() {
   if [[ ! -x "${SWIFT_BIN}" ]]; then
     echo "setup.sh: Swift binary missing at ${SWIFT_BIN}; build failed or MLXFAST_SWIFT_BIN is wrong" >&2
     return 1
@@ -1286,7 +1263,7 @@ start_mlx_metallib_build() {
   if [[ "${MLXFAST_SKIP_MLX_METALLIB:-0}" == "1" || -n "${METALLIB_BUILD_PID}" ]]; then
     return 0
   fi
-  if setup_parallel_build_enabled; then
+  if setup_parallel_metallib_enabled; then
     build_mlx_metallib &
     METALLIB_BUILD_PID="$!"
     echo "setup.sh: mlx.metallib build running in background pid=${METALLIB_BUILD_PID}"
@@ -1536,19 +1513,8 @@ if [[ "${MLXFAST_SKIP_WEIGHTS_DOWNLOAD:-0}" == "1" || "${SKIP_MODEL_DOWNLOAD:-0}
   exit 0
 fi
 
-parallel_build_status=0
-if setup_parallel_build_enabled; then
-  start_swift_harness_build
-else
-  parallel_build_status="$?"
-  if [[ "${parallel_build_status}" != "1" ]]; then
-    exit "${parallel_build_status}"
-  fi
-  build_swift_harness
-  start_mlx_metallib_build
-fi
-
+build_swift_harness
+start_mlx_metallib_build
 download_reference_weights "${REFERENCE_DIR}"
-wait_for_swift_harness_build
 wait_for_mlx_metallib_build
 print_setup_summary "ready"
