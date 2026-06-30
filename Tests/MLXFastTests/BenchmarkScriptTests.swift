@@ -51,6 +51,54 @@ func benchmarkWorkflowRunsTransformOfflineAfterSetup() throws {
 }
 
 @Test
+func benchmarkWorkflowProbesAndEnforcesRuntimeWorkerSandbox() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+    let benchmark = try String(
+        contentsOfFile: "benchmark.sh",
+        encoding: .utf8
+    )
+    let probe = try String(
+        contentsOfFile: ".github/scripts/probe-runtime-worker-sandbox.sh",
+        encoding: .utf8
+    )
+    let ci = try String(
+        contentsOfFile: ".github/workflows/ci.yml",
+        encoding: .utf8
+    )
+
+    let probeRange = try #require(workflow.range(of: "- name: Probe runtime worker sandbox"))
+    let goldenSourceRange = try #require(workflow.range(of: "- name: Check correctness golden source"))
+    let setupRange = try #require(workflow.range(of: "- name: Setup Swift harness and reference checkpoint"))
+    #expect(probeRange.lowerBound < goldenSourceRange.lowerBound)
+    #expect(probeRange.lowerBound < setupRange.lowerBound)
+    #expect(workflow.contains("run: .github/scripts/probe-runtime-worker-sandbox.sh"))
+    #expect(workflow.contains("MLXFAST_OFFICIAL_BENCHMARK_RUN: \"1\""))
+
+    #expect(benchmark.contains("enforce_official_sandbox"))
+    #expect(benchmark.contains("MLXFAST_OFFICIAL_BENCHMARK_RUN"))
+    #expect(benchmark.contains("official GitHub benchmark runs must not set MLXFAST_NO_SANDBOX=1"))
+    #expect(benchmark.contains("official GitHub benchmark runs must use the runtime worker sandbox"))
+    #expect(benchmark.contains("enforce_official_sandbox\n\nif [[ \"${MLXFAST_IN_SANDBOX:-0}\" != \"1\" && ! -x \"${SWIFT_BIN}\" ]]; then"))
+
+    #expect(probe.contains("(deny network*)"))
+    #expect(probe.contains("(deny process-fork)"))
+    #expect(probe.contains("(deny process-exec*)"))
+    #expect(probe.contains("(allow process-exec (literal"))
+    #expect(probe.contains("(deny file-write*)"))
+    #expect(probe.contains("(allow file-write* (literal \"/dev/null\"))"))
+    #expect(probe.contains("(deny file-read* (literal"))
+    #expect(probe.contains("(deny file-read* (subpath"))
+    #expect(probe.contains("expect_inet_network_denied()"))
+    #expect(probe.contains("expect_unix_network_denied(argv[5])"))
+    #expect(probe.contains("expect_fork_denied()"))
+    #expect(probe.contains("expect_spawn_denied()"))
+    #expect(ci.contains("bash -n .github/scripts/probe-runtime-worker-sandbox.sh"))
+}
+
+@Test
 func ciSubmissionSmokeTestUsesIsolatedWorkspace() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/ci.yml",

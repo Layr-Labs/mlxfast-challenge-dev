@@ -43,6 +43,20 @@ sandbox_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+enforce_official_sandbox() {
+  if [[ "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" != "1" ]]; then
+    return 0
+  fi
+  if [[ "${MLXFAST_NO_SANDBOX:-0}" == "1" ]]; then
+    echo "benchmark.sh: official GitHub benchmark runs must not set MLXFAST_NO_SANDBOX=1" >&2
+    exit 1
+  fi
+  if [[ "${USE_RUNTIME_WORKER}" != "1" ]]; then
+    echo "benchmark.sh: official GitHub benchmark runs must use the runtime worker sandbox" >&2
+    exit 1
+  fi
+}
+
 write_runtime_worker_sandbox_profile() {
   if [[ "${USE_RUNTIME_WORKER}" != "1" || "${MLXFAST_NO_SANDBOX:-0}" == "1" ]]; then
     return 0
@@ -151,6 +165,8 @@ clear_weights_dir() {
   find "${WEIGHTS_PATH}" -mindepth 1 ! -name .gitkeep -exec rm -rf {} +
 }
 
+enforce_official_sandbox
+
 if [[ "${MLXFAST_IN_SANDBOX:-0}" != "1" && ! -x "${SWIFT_BIN}" ]]; then
   echo "benchmark.sh: Swift release binary missing; building"
   mkdir -p .build/clang-module-cache
@@ -182,6 +198,8 @@ if [[ "${USE_RUNTIME_WORKER}" != "1" && "${MLXFAST_IN_SANDBOX:-0}" != "1" && "${
     HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
     "$0" "$@"
 fi
+
+enforce_official_sandbox
 
 if [[ ! -x "${SWIFT_BIN}" ]]; then
   echo "benchmark.sh: Swift release binary missing at ${SWIFT_BIN}" >&2

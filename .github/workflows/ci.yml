@@ -61,6 +61,7 @@ jobs:
           bash -n .github/scripts/download-r2-object.sh
           bash -n .github/scripts/upload-r2-object.sh
           bash -n .github/scripts/download-reference-cache-scope.sh
+          bash -n .github/scripts/probe-runtime-worker-sandbox.sh
 
       - name: Build release CLI
         run: |
