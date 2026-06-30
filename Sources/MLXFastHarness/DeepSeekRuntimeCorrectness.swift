@@ -56,77 +56,49 @@ extension DeepSeekRuntime {
 
     public static func runCorrectness(
         _ options: CorrectnessOptions,
-        worker: RuntimeWorkerOptions? = nil
+        worker workerOptions: RuntimeWorkerOptions? = nil
     ) throws -> CorrectnessReport {
-        if let worker {
-            return runCorrectnessWithWorker(options, worker: worker)
-        }
-
         var loadedGolden: GoldenFixture?
-        var loader: DeepSeekWeightLoader?
         do {
+            if workerOptions != nil {
+                try requireRegularFile(options.weightsPath + "/config.json", description: "transformed config")
+                try requireRegularFile(options.goldenPath, description: "correctness golden file")
+            }
             let golden = try loadGoldenFixture(from: options.goldenPath)
             loadedGolden = golden
+            if let workerOptions {
+                let worker = try RuntimeWorkerClient(options: workerOptions, weightsPath: options.weightsPath)
+                defer { worker.close() }
+                return runLayeredCorrectness(
+                    golden: golden,
+                    session: worker,
+                    steps: MLXFastConstants.correctnessSteps
+                ).report
+            }
             let config = try DeepSeekConfig.load(from: options.weightsPath)
-            let runtimeLoader = try DeepSeekWeightLoader(
+            let loader = try DeepSeekWeightLoader(
                 weightsPath: options.weightsPath,
                 expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: true)
             )
-            loader = runtimeLoader
-            let weightCache = DeepSeekRuntimeWeightCache(loader: runtimeLoader, config: config)
+            let session = InProcessInferenceSession(
+                weightCache: DeepSeekRuntimeWeightCache(loader: loader, config: config)
+            )
             return runLayeredCorrectness(
                 golden: golden,
-                weightCache: weightCache,
+                session: session,
                 steps: MLXFastConstants.correctnessSteps
-            )
+            ).report
         } catch {
             return failedCorrectnessReport(
                 checkedSteps: 0,
                 caseCount: loadedGolden?.totalCorrectnessCaseCount ?? 0,
                 goldenHash: loadedGolden?.sha256 ?? "",
-                expertStats: expertStats(from: loader),
+                expertStats: .zero,
                 error: "\(error)"
             )
         }
     }
 
-    static func runCorrectnessWithWorker(
-        _ options: CorrectnessOptions,
-        worker workerOptions: RuntimeWorkerOptions
-    ) -> CorrectnessReport {
-        var loadedGolden: GoldenFixture?
-        var lastExpertStats = ExpertStreamingStats.zero
-        var checkedSteps = 0
-        do {
-            try requireRegularFile(options.weightsPath + "/config.json", description: "transformed config")
-            try requireRegularFile(options.goldenPath, description: "correctness golden file")
-            let golden = try loadGoldenFixture(from: options.goldenPath)
-            loadedGolden = golden
-            let worker = try RuntimeWorkerClient(
-                options: workerOptions,
-                weightsPath: options.weightsPath
-            )
-            defer {
-                worker.close()
-            }
-            let result = runLayeredCorrectnessWithWorker(
-                golden: golden,
-                worker: worker,
-                steps: MLXFastConstants.correctnessSteps
-            )
-            checkedSteps = result.report.checkedSteps
-            lastExpertStats = result.expertStats
-            return result.report
-        } catch {
-            return failedCorrectnessReport(
-                checkedSteps: checkedSteps,
-                caseCount: loadedGolden?.totalCorrectnessCaseCount ?? 0,
-                goldenHash: loadedGolden?.sha256 ?? "",
-                expertStats: lastExpertStats,
-                error: "\(error)"
-            )
-        }
-    }
 
     struct WorkerLayeredCorrectnessResult {
         let report: CorrectnessReport
@@ -172,163 +144,7 @@ extension DeepSeekRuntime {
 
     static func runLayeredCorrectness(
         golden: GoldenFixture,
-        weightCache: DeepSeekRuntimeWeightCache,
-        steps: Int = MLXFastConstants.correctnessSteps,
-        progress: ((String) -> Void)? = nil
-    ) -> CorrectnessReport {
-        let caseCount = golden.totalCorrectnessCaseCount
-        var checkedSteps = 0
-        var currentCase: String?
-
-        func failure(
-            caseName: String,
-            comparison: CorrectnessTokenComparison,
-            error: String
-        ) -> CorrectnessReport {
-            let stats = expertStats(from: weightCache)
-            return CorrectnessReport(
-                passed: false,
-                checkedSteps: checkedSteps + comparison.checkedSteps,
-                caseCount: caseCount,
-                expertCacheHits: stats.cacheHits,
-                expertCacheMisses: stats.cacheMisses,
-                expertCacheEvictions: stats.cacheEvictions,
-                expertBytesRead: stats.bytesRead,
-                expertReadSeconds: stats.readSeconds,
-                expertPeakCachedTensors: stats.peakCachedTensors,
-                expertHitRate: stats.hitRate,
-                firstFailingCase: caseName,
-                firstFailingStep: comparison.firstFailingStep,
-                expectedToken: comparison.expectedToken,
-                actualToken: comparison.actualToken,
-                goldenHash: golden.sha256,
-                error: error
-            )
-        }
-
-        do {
-            for (caseIndex, testCase) in golden.cases.enumerated() {
-                currentCase = testCase.name
-                let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
-                progress?("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
-                let comparison = try compareTeacherForcedCached(
-                    testCase: testCase,
-                    weightCache: weightCache,
-                    steps: steps,
-                    progressIntervalSteps: 64,
-                    progress: { step, total in
-                        progress?("correctness case \(caseLabel) checked \(step)/\(total) tokens")
-                    }
-                )
-                if !comparison.passed {
-                    progress?("correctness case \(caseLabel) failed step=\(comparison.firstFailingStep ?? -1)")
-                    return failure(
-                        caseName: testCase.name,
-                        comparison: comparison,
-                        error: "teacher-forced token mismatch"
-                    )
-                }
-                progress?("correctness case \(caseLabel) complete checked_steps=\(comparison.checkedSteps)")
-                checkedSteps += comparison.checkedSteps
-            }
-
-            let gates = golden.correctnessGates
-            for (caseIndex, anchor) in (gates?.anchorCases ?? []).enumerated() {
-                currentCase = anchor.name
-                let caseLabel = "\(caseIndex + 1)/\(gates?.anchorCases.count ?? 0)"
-                progress?("correctness anchor \(caseLabel) start context_tokens=\(anchor.contextTokens.count)")
-                let comparison = try compareAnchorCached(anchor: anchor, weightCache: weightCache)
-                if !comparison.passed {
-                    progress?("correctness anchor \(caseLabel) failed")
-                    return failure(
-                        caseName: anchor.name,
-                        comparison: comparison,
-                        error: "anchor token mismatch"
-                    )
-                }
-                checkedSteps += comparison.checkedSteps
-                progress?("correctness anchor \(caseLabel) complete")
-            }
-
-            for (caseIndex, freeRun) in (gates?.freeRunCases ?? []).enumerated() {
-                currentCase = freeRun.name
-                let caseLabel = "\(caseIndex + 1)/\(gates?.freeRunCases.count ?? 0)"
-                progress?("correctness free-run \(caseLabel) start tokens=\(freeRun.expectedTokens.count)")
-                let comparison = try compareFreeRunCached(
-                    testCase: freeRun,
-                    weightCache: weightCache,
-                    progressIntervalSteps: 64,
-                    progress: { step, total in
-                        progress?("correctness free-run \(caseLabel) generated \(step)/\(total) tokens")
-                    }
-                )
-                if !comparison.passed {
-                    progress?("correctness free-run \(caseLabel) failed step=\(comparison.firstFailingStep ?? -1)")
-                    return failure(
-                        caseName: freeRun.name,
-                        comparison: comparison,
-                        error: "free-run token mismatch"
-                    )
-                }
-                checkedSteps += comparison.checkedSteps
-                progress?("correctness free-run \(caseLabel) complete checked_steps=\(comparison.checkedSteps)")
-            }
-
-            for (caseIndex, behavior) in (gates?.behaviorCases ?? []).enumerated() {
-                currentCase = behavior.name
-                let caseLabel = "\(caseIndex + 1)/\(gates?.behaviorCases.count ?? 0)"
-                progress?("correctness behavior \(caseLabel) start max_new_tokens=\(behavior.maxNewTokens)")
-                let comparison = try compareBehaviorCached(
-                    testCase: behavior,
-                    weightCache: weightCache
-                )
-                if !comparison.passed {
-                    progress?("correctness behavior \(caseLabel) failed step=\(comparison.firstFailingStep ?? -1)")
-                    return failure(
-                        caseName: behavior.name,
-                        comparison: comparison,
-                        error: "behavior answer mismatch"
-                    )
-                }
-                checkedSteps += comparison.checkedSteps
-                progress?("correctness behavior \(caseLabel) complete checked_steps=\(comparison.checkedSteps)")
-            }
-        } catch {
-            progress?("correctness error=\(redactedProgressError("\(error)"))")
-            return failedCorrectnessReport(
-                checkedSteps: checkedSteps,
-                caseCount: caseCount,
-                firstFailingCase: currentCase,
-                goldenHash: golden.sha256,
-                expertStats: expertStats(from: weightCache),
-                error: "\(error)"
-            )
-        }
-
-        let stats = expertStats(from: weightCache)
-        return CorrectnessReport(
-            passed: true,
-            checkedSteps: checkedSteps,
-            caseCount: caseCount,
-            expertCacheHits: stats.cacheHits,
-            expertCacheMisses: stats.cacheMisses,
-            expertCacheEvictions: stats.cacheEvictions,
-            expertBytesRead: stats.bytesRead,
-            expertReadSeconds: stats.readSeconds,
-            expertPeakCachedTensors: stats.peakCachedTensors,
-            expertHitRate: stats.hitRate,
-            firstFailingCase: nil,
-            firstFailingStep: nil,
-            expectedToken: nil,
-            actualToken: nil,
-            goldenHash: golden.sha256,
-            error: ""
-        )
-    }
-
-    static func runLayeredCorrectnessWithWorker(
-        golden: GoldenFixture,
-        worker: RuntimeWorkerClient,
+        session: RuntimeInferenceSession,
         steps: Int = MLXFastConstants.correctnessSteps,
         semanticCapture: SemanticGPQACaptureOptions? = nil,
         progress: ((String) -> Void)? = nil
@@ -389,9 +205,9 @@ extension DeepSeekRuntime {
                 currentCase = testCase.name
                 let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
                 progress?("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
-                let check = try compareTeacherForcedWithWorker(
+                let check = try compareTeacherForced(
                     testCase: testCase,
-                    worker: worker,
+                    session: session,
                     steps: steps,
                     progressIntervalSteps: 64,
                     progress: { step, total in
@@ -417,7 +233,7 @@ extension DeepSeekRuntime {
                 currentCase = anchor.name
                 let caseLabel = "\(caseIndex + 1)/\(gates?.anchorCases.count ?? 0)"
                 progress?("correctness anchor \(caseLabel) start context_tokens=\(anchor.contextTokens.count)")
-                let check = try compareAnchorWithWorker(anchor: anchor, worker: worker)
+                let check = try compareAnchor(anchor: anchor, session: session)
                 lastExpertStats = check.expertStats
                 peakRamGB = max(peakRamGB, check.peakRamGB)
                 if !check.comparison.passed {
@@ -436,7 +252,7 @@ extension DeepSeekRuntime {
                 currentCase = freeRun.name
                 let caseLabel = "\(caseIndex + 1)/\(gates?.freeRunCases.count ?? 0)"
                 progress?("correctness free-run \(caseLabel) start tokens=\(freeRun.expectedTokens.count)")
-                let check = try compareFreeRunWithWorker(testCase: freeRun, worker: worker)
+                let check = try compareFreeRun(testCase: freeRun, session: session)
                 lastExpertStats = check.expertStats
                 peakRamGB = max(peakRamGB, check.peakRamGB)
                 if !check.comparison.passed {
@@ -455,7 +271,7 @@ extension DeepSeekRuntime {
                 currentCase = behavior.name
                 let caseLabel = "\(caseIndex + 1)/\(gates?.behaviorCases.count ?? 0)"
                 progress?("correctness behavior \(caseLabel) start max_new_tokens=\(behavior.maxNewTokens)")
-                let check = try compareBehaviorWithWorker(testCase: behavior, worker: worker)
+                let check = try compareBehavior(testCase: behavior, session: session)
                 lastExpertStats = check.expertStats
                 peakRamGB = max(peakRamGB, check.peakRamGB)
                 if check.ttftSeconds != nil {

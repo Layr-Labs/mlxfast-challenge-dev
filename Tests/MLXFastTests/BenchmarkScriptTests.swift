@@ -351,7 +351,7 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(!cli.contains("print(testCase.prompt)"))
 
     #expect(runtime.contains("compareBehaviorFirstToken"))
-    #expect(runtime.contains("testCase.maxNewTokens == 1"))
+    #expect(runtime.contains("testCase.acceptedTokenSequences.allSatisfy({ $0.count <= 1 })"))
     #expect(runtime.contains("correctnessTokenAccepted("))
     #expect(runtime.contains("correctness_teacher_forced_batch"))
     #expect(runtime.contains("top_logit_rows"))
@@ -459,7 +459,7 @@ func runtimeWorkerBenchmarkDecodeDoesNotReceiveBulkOracle() throws {
 
     #expect(runtime.contains("kind: \"decode_begin\""))
     #expect(runtime.contains("kind: \"decode_step\""))
-    #expect(runtime.contains("worker.decodeStep(inputToken: inputToken)"))
+    #expect(runtime.contains("session.decodeStep(inputToken: inputToken)"))
     #expect(!runtime.contains("expected_seed_token"))
     #expect(!runtime.contains("case decodeSteps = \"decode_steps\""))
     #expect(!runtime.contains("validation_delay_ms"))
@@ -498,7 +498,7 @@ func expertStreamingDiagnosticsUseTrustedCoreCounters() throws {
 @Test
 func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
     let runtime = try harnessRuntimeSource()
-    let workerStart = try #require(runtime.range(of: "private static func benchmarkWithWorker"))
+    let workerStart = try #require(runtime.range(of: "static func benchmarkWithWorker"))
     let workerRuntime = String(runtime[workerStart.lowerBound...])
 
     #expect(workerRuntime.contains("benchmark prefill worker start"))

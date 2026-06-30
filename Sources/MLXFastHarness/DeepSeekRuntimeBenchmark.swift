@@ -110,12 +110,13 @@ extension DeepSeekRuntime {
             let correctnessCache = DeepSeekRuntimeWeightCache(loader: correctnessLoader, config: config)
             let correctnessStart = DispatchTime.now().uptimeNanoseconds
             progress("correctness start cases=\(golden.totalCorrectnessCaseCount)")
+            let correctnessSession = InProcessInferenceSession(weightCache: correctnessCache)
             let correctness = runLayeredCorrectness(
                 golden: golden,
-                weightCache: correctnessCache,
+                session: correctnessSession,
                 steps: options.correctnessSteps,
                 progress: progress
-            )
+            ).report
             correctnessSeconds = secondsSince(correctnessStart)
             correctnessReport = correctness
             progress(
@@ -151,19 +152,26 @@ extension DeepSeekRuntime {
             Memory.peakMemory = 0
             let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
             progress("timed benchmark start")
+            let benchmarkSession = InProcessInferenceSession(weightCache: benchmarkCache)
+            var benchmarkPeakRamGB = 0.0
+            var benchmarkExpertStats = ExpertStreamingStats.zero
             let prefillSecondsPerToken = try measurePrefillSecondsPerToken(
                 promptTokens: promptPlan.prefillTokens,
                 expectedToken: promptPlan.expectedPrefillToken,
-                weightCache: benchmarkCache,
-                progress: progress
+                session: benchmarkSession,
+                progress: progress,
+                peakRamGB: &benchmarkPeakRamGB,
+                expertStats: &benchmarkExpertStats
             )
             let decode = try measureDecode(
                 seedTokens: promptPlan.decodeSeedTokens,
                 expectedSeedToken: promptPlan.expectedDecodeSeedToken,
                 expectedTokens: promptPlan.expectedDecodeTokens,
                 decodeSteps: options.benchmarkDecodeSteps,
-                weightCache: benchmarkCache,
-                progress: progress
+                session: benchmarkSession,
+                progress: progress,
+                peakRamGB: &benchmarkPeakRamGB,
+                expertStats: &benchmarkExpertStats
             )
             timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
             let peakRamGB = Double(Memory.peakMemory) / Double(1 << 30)
@@ -409,10 +417,10 @@ extension DeepSeekRuntime {
                 defer {
                     prefillWorker.close()
                 }
-                prefillSecondsPerToken = try measureWorkerPrefillSecondsPerToken(
+                prefillSecondsPerToken = try measurePrefillSecondsPerToken(
                     promptTokens: promptPlan.prefillTokens,
                     expectedToken: promptPlan.expectedPrefillToken,
-                    worker: prefillWorker,
+                    session: prefillWorker,
                     progress: progress,
                     peakRamGB: &peakRamGB,
                     expertStats: &lastExpertStats
@@ -428,12 +436,12 @@ extension DeepSeekRuntime {
                 defer {
                     decodeWorker.close()
                 }
-                decode = try measureWorkerDecode(
+                decode = try measureDecode(
                     seedTokens: promptPlan.decodeSeedTokens,
                     expectedSeedToken: promptPlan.expectedDecodeSeedToken,
                     expectedTokens: promptPlan.expectedDecodeTokens,
                     decodeSteps: options.benchmarkDecodeSteps,
-                    worker: decodeWorker,
+                    session: decodeWorker,
                     progress: progress,
                     peakRamGB: &peakRamGB,
                     expertStats: &lastExpertStats
@@ -512,9 +520,9 @@ extension DeepSeekRuntime {
                 defer {
                     correctnessWorker.close()
                 }
-                correctnessResult = runLayeredCorrectnessWithWorker(
+                correctnessResult = runLayeredCorrectness(
                     golden: golden,
-                    worker: correctnessWorker,
+                    session: correctnessWorker,
                     steps: options.correctnessSteps,
                     semanticCapture: semanticCapture,
                     progress: progress
@@ -625,71 +633,7 @@ extension DeepSeekRuntime {
     static func measurePrefillSecondsPerToken(
         promptTokens: [Int],
         expectedToken: Int,
-        weightCache: DeepSeekRuntimeWeightCache,
-        progress: ((String) -> Void)? = nil
-    ) throws -> Double {
-        guard !promptTokens.isEmpty else {
-            throw MLXFastError.invalidInput("benchmark prefill prompt must not be empty")
-        }
-
-        let totalRuns = MLXFastConstants.benchmarkPrefillWarmupRuns
-            + MLXFastConstants.benchmarkPrefillTimedRuns
-        var timedElapsed: [Double] = []
-        timedElapsed.reserveCapacity(MLXFastConstants.benchmarkPrefillTimedRuns)
-
-        for runIndex in 0..<totalRuns {
-            let runLabel = runIndex < MLXFastConstants.benchmarkPrefillWarmupRuns ? "warmup" : "timed"
-            let runOrdinal = runIndex < MLXFastConstants.benchmarkPrefillWarmupRuns
-                ? runIndex + 1
-                : runIndex - MLXFastConstants.benchmarkPrefillWarmupRuns + 1
-            let runTotal = runIndex < MLXFastConstants.benchmarkPrefillWarmupRuns
-                ? MLXFastConstants.benchmarkPrefillWarmupRuns
-                : MLXFastConstants.benchmarkPrefillTimedRuns
-            progress?(
-                "prefill \(runLabel) \(runOrdinal)/\(runTotal) start "
-                    + "prompt_tokens=\(promptTokens.count)"
-            )
-            let cache = DeepSeekModelCache(config: weightCache.config)
-            let start = DispatchTime.now().uptimeNanoseconds
-            let logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray(promptTokens),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: 0
-            )
-            eval(logits)
-            let token = try DeepSeekCorrectness.greedyToken(from: logits)
-            try requireBenchmarkMatch(
-                BenchmarkOutputValidator.comparePrefillToken(
-                    expectedToken: expectedToken,
-                    actualToken: token
-                )
-            )
-            let elapsed = secondsSince(start)
-            Memory.clearCache()
-            progress?(
-                "prefill \(runLabel) \(runOrdinal)/\(runTotal) complete "
-                    + "seconds=\(formatSeconds(elapsed))"
-            )
-
-            if runIndex >= MLXFastConstants.benchmarkPrefillWarmupRuns {
-                timedElapsed.append(elapsed)
-            }
-        }
-
-        guard !timedElapsed.isEmpty else {
-            throw MLXFastError.invalidInput("benchmark prefill needs at least one timed run")
-        }
-        let meanElapsed = timedElapsed.reduce(0, +) / Double(timedElapsed.count)
-        let secondsPerToken = meanElapsed / Double(promptTokens.count)
-        progress?("prefill complete seconds_per_token=\(formatDouble(secondsPerToken))")
-        return secondsPerToken
-    }
-
-    static func measureWorkerPrefillSecondsPerToken(
-        promptTokens: [Int],
-        expectedToken: Int,
-        worker: RuntimeWorkerClient,
+        session: RuntimeInferenceSession,
         progress: ((String) -> Void)? = nil,
         peakRamGB: inout Double,
         expertStats: inout ExpertStreamingStats
@@ -715,7 +659,7 @@ extension DeepSeekRuntime {
                 "prefill \(runLabel) \(runOrdinal)/\(runTotal) start "
                     + "prompt_tokens=\(promptTokens.count)"
             )
-            let response = try worker.prefill(promptTokens: promptTokens)
+            let response = try session.prefill(promptTokens: promptTokens)
             expertStats = response.expertStats ?? expertStats
             peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
             guard let token = response.token, let elapsed = response.seconds else {
@@ -751,124 +695,7 @@ extension DeepSeekRuntime {
         expectedSeedToken: Int,
         expectedTokens: [Int],
         decodeSteps: Int = MLXFastConstants.benchmarkDecodeSteps,
-        weightCache: DeepSeekRuntimeWeightCache,
-        progress: ((String) -> Void)? = nil
-    ) throws -> DecodeMeasurement {
-        guard !seedTokens.isEmpty else {
-            throw MLXFastError.invalidInput("benchmark decode seed must not be empty")
-        }
-        guard expectedTokens.count >= decodeSteps else {
-            throw MLXFastError.invalidInput(
-                "benchmark decode oracle has \(expectedTokens.count) tokens; need at least \(decodeSteps)"
-            )
-        }
-        let timingPlan = try DecodeTimingPlan(
-            seedTokenCount: seedTokens.count,
-            decodeSteps: decodeSteps
-        )
-
-        // Start the scored decode phase before prompt-specific warmup and seed
-        // prefill. Otherwise submitted model code can hide speculative work for
-        // future decode steps in setup that is not charged to the score.
-        let decodePhaseStart = DispatchTime.now().uptimeNanoseconds
-        progress?("decode measured start tokens=\(timingPlan.decodeSteps) includes_seed_prefill=true")
-        progress?("decode warmup start seed_tokens=\(seedTokens.count)")
-        let warmupCache = DeepSeekModelCache(config: weightCache.config)
-        let warmupLogits = try DeepSeekModel.logits(
-            inputIDs: inputIDsArray(seedTokens),
-            weightCache: weightCache,
-            cache: warmupCache,
-            positionOffset: 0
-        )
-        _ = try DeepSeekCorrectness.greedyToken(from: warmupLogits)
-        Memory.clearCache()
-        progress?("decode warmup complete")
-
-        progress?("decode seed prefill start seed_tokens=\(seedTokens.count)")
-        let cache = DeepSeekModelCache(config: weightCache.config)
-        var logits = try DeepSeekModel.logits(
-            inputIDs: inputIDsArray(seedTokens),
-            weightCache: weightCache,
-            cache: cache,
-            positionOffset: 0
-        )
-        var token = try DeepSeekCorrectness.greedyToken(from: logits)
-        try requireBenchmarkMatch(
-            BenchmarkOutputValidator.compareDecodeSeedToken(
-                expectedToken: expectedSeedToken,
-                actualToken: token
-            )
-        )
-        cache.materializeCachedState()
-        progress?("decode seed prefill complete")
-
-        var actualTokens: [Int] = []
-        actualTokens.reserveCapacity(timingPlan.decodeSteps)
-        let metricsBeforeDecode = weightCache.loader.expertStreamingMetrics?.snapshot()
-        let validationDelayMS = try submissionValidationDelayMilliseconds()
-        if validationDelayMS > 0 {
-            progress?("decode validation delay enabled milliseconds_per_token=\(validationDelayMS)")
-        }
-        for decodedStep in 0..<timingPlan.decodeSteps {
-            let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
-            logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray([inputToken]),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
-            )
-            token = try DeepSeekCorrectness.greedyToken(from: logits)
-            actualTokens.append(token)
-            let expectedToken = expectedTokens[decodedStep]
-            if token != expectedToken {
-                throw BenchmarkTokenMismatchError(
-                    comparison: BenchmarkTokenComparison(
-                        passed: false,
-                        label: "benchmark decode token",
-                        step: decodedStep,
-                        expectedToken: expectedToken,
-                        actualToken: token
-                    )
-                )
-            }
-            if validationDelayMS > 0 {
-                Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
-            }
-            reportProgress(
-                step: decodedStep + 1,
-                total: timingPlan.decodeSteps,
-                intervalSteps: 64,
-                progress: { step, total in
-                    progress?("decode measured generated \(step)/\(total) tokens")
-                }
-            )
-        }
-
-        let elapsed = secondsSince(decodePhaseStart)
-        let bandwidth = try expertStreamingBandwidthGBPerToken(
-            before: metricsBeforeDecode,
-            after: weightCache.loader.expertStreamingMetrics?.snapshot(),
-            decodedTokens: timingPlan.decodeSteps
-        )
-        progress?(
-            "decode measured complete seconds=\(formatSeconds(elapsed)) "
-                + "seconds_per_token=\(formatDouble(elapsed / Double(timingPlan.decodeSteps))) "
-                + "bandwidth_gb_per_token=\(formatDouble(bandwidth.gbPerToken)) "
-                + "bandwidth_source=\(bandwidth.source)"
-        )
-        return DecodeMeasurement(
-            secondsPerToken: elapsed / Double(timingPlan.decodeSteps),
-            bandwidthGBPerToken: bandwidth.gbPerToken,
-            bandwidthSource: bandwidth.source
-        )
-    }
-
-    static func measureWorkerDecode(
-        seedTokens: [Int],
-        expectedSeedToken: Int,
-        expectedTokens: [Int],
-        decodeSteps: Int = MLXFastConstants.benchmarkDecodeSteps,
-        worker: RuntimeWorkerClient,
+        session: RuntimeInferenceSession,
         progress: ((String) -> Void)? = nil,
         peakRamGB: inout Double,
         expertStats: inout ExpertStreamingStats
@@ -886,7 +713,7 @@ extension DeepSeekRuntime {
         // parent measures decode_begin plus checked decode steps as one phase.
         let decodePhaseStart = DispatchTime.now().uptimeNanoseconds
         progress?("decode measured start tokens=\(decodeSteps) includes_seed_prefill=true")
-        let beginResponse = try worker.beginDecode(seedTokens: seedTokens)
+        let beginResponse = try session.beginDecode(seedTokens: seedTokens)
         let statsBeforeDecode = beginResponse.expertStats
         expertStats = beginResponse.expertStats ?? expertStats
         peakRamGB = max(peakRamGB, beginResponse.peakRamGB ?? 0)
@@ -908,7 +735,7 @@ extension DeepSeekRuntime {
         }
         for decodedStep in 0..<decodeSteps {
             let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
-            let response = try worker.decodeStep(inputToken: inputToken)
+            let response = try session.decodeStep(inputToken: inputToken)
             expertStats = response.expertStats ?? expertStats
             peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
             guard let token = response.token else {
@@ -959,28 +786,6 @@ extension DeepSeekRuntime {
             secondsPerToken: secondsPerToken,
             bandwidthGBPerToken: bandwidth.gbPerToken,
             bandwidthSource: bandwidth.source
-        )
-    }
-
-    static func expertStreamingBandwidthGBPerToken(
-        before: ExpertStreamingMetrics.Snapshot?,
-        after: ExpertStreamingMetrics.Snapshot?,
-        decodedTokens: Int
-    ) throws -> (gbPerToken: Double, source: String) {
-        guard decodedTokens > 0 else {
-            throw MLXFastError.invalidInput("benchmark decode steps must be positive")
-        }
-        guard let after else {
-            throw MLXFastError.invalidInput("expert streaming metrics unavailable for bandwidth diagnostic")
-        }
-        let beforeBytes = before?.bytesRead ?? 0
-        let bytesRead = after.bytesRead >= beforeBytes ? after.bytesRead - beforeBytes : after.bytesRead
-        guard bytesRead > 0 else {
-            throw MLXFastError.invalidInput("expert streaming bandwidth diagnostic observed no decoded expert reads")
-        }
-        return (
-            Double(bytesRead) / Double(1 << 30) / Double(decodedTokens),
-            ExpertStreamingMetrics.bandwidthSource
         )
     }
 
