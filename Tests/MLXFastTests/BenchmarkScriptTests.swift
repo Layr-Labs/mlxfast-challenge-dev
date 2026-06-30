@@ -170,7 +170,7 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
 }
 
 @Test
-func benchmarkWorkflowCanBeDispatchedFromCurrentRefForTesting() throws {
+func benchmarkWorkflowDefaultsToTrustedMainWithExplicitTestingEscapeHatch() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
@@ -180,9 +180,11 @@ func benchmarkWorkflowCanBeDispatchedFromCurrentRefForTesting() throws {
         encoding: .utf8
     )
 
-    #expect(workflow.contains("MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}"))
-    #expect(!workflow.contains("MLXFAST_TRUSTED_BENCHMARK_REF: refs/heads/main"))
-    #expect(guardScript.contains("TRUSTED_REF=\"${MLXFAST_TRUSTED_BENCHMARK_REF:-${GITHUB_REF}}\""))
+    #expect(workflow.contains("allow_untrusted_workflow_testing:"))
+    #expect(workflow.contains("Maintainer-only escape hatch for testing workflow changes from a non-main ref"))
+    #expect(workflow.contains("MLXFAST_TRUSTED_BENCHMARK_REF: ${{ inputs.allow_untrusted_workflow_testing && github.ref || 'refs/heads/main' }}"))
+    #expect(!workflow.contains("MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}"))
+    #expect(guardScript.contains("TRUSTED_REF=\"${MLXFAST_TRUSTED_BENCHMARK_REF:-refs/heads/main}\""))
 }
 
 @Test
@@ -261,14 +263,13 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("[[ \"${MLXFAST_RUN_BENCHMARK}\" == \"1\" ]]"))
     #expect(!workflow.contains("generate_golden_only"))
     #expect(!workflow.contains("MLXFAST_GENERATE_GOLDEN_ONLY"))
-    #expect(workflow.contains("hashFiles('score.json') != ''"))
-    #expect(!workflow.contains("inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success'"))
+    #expect(workflow.contains("steps.validate_benchmark_artifacts.outcome == 'success'"))
+    #expect(!workflow.contains("hashFiles('score.json') != '' && hashFiles('score.json.sha256') != '' && hashFiles('benchmark-integrity.json') != ''"))
     #expect(workflow.contains(".github/scripts/stage-benchmark-artifacts.sh"))
     #expect(workflow.contains("inputs.run_benchmark && !inputs.calibrate_gpqa_reference"))
     #expect(workflow.contains("golden.sha256=\"${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256\""))
     #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results"))
     #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/correctness-results"))
-    #expect(!workflow.contains("inputs.submission_ref == '' || steps.validate_benchmark_artifacts.outcome == 'success'"))
     #expect(workflow.contains("!inputs.run_benchmark && !inputs.calibrate_gpqa_reference && inputs.trace_correctness_step != ''"))
     #expect(!workflow.contains("results.tsv\n          if-no-files-found"))
     #expect(validator.contains("and (.metrics.first_failing_case == null)"))
@@ -313,6 +314,10 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(semanticGate.contains("invalid_judge_response"))
     #expect(semanticGate.contains("diagnostic did not meet threshold"))
     #expect(semanticGate.contains(".metrics.semantic_gpqa_passed = $semantic_passed"))
+    #expect(semanticGate.contains(".passed = false"))
+    #expect(semanticGate.contains(".score = null"))
+    #expect(semanticGate.contains(".metrics.error = \"semantic GPQA gate failed\""))
+    #expect(semanticGate.contains(".metrics.first_failing_case = \"semantic_gpqa\""))
     #expect(semanticGate.contains(".score_sha256 = $score_hash"))
     #expect(!semanticGate.contains("--header \"x-api-key: ${ANTHROPIC_API_KEY}\""))
     #expect(!semanticGate.contains("--arg question \"$(jq"))
@@ -369,9 +374,12 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(runtime.contains("compareBehaviorFirstToken"))
     #expect(runtime.contains("testCase.maxNewTokens == 1"))
     #expect(runtime.contains("correctnessTokenAccepted("))
-    #expect(runtime.contains("correctness_teacher_forced_batch"))
-    #expect(runtime.contains("top_logit_rows"))
-    #expect(runtime.contains("teacherForcedCorrectnessBatch"))
+    #expect(runtime.contains("kind: \"correctness_begin\""))
+    #expect(runtime.contains("kind: \"correctness_step\""))
+    #expect(runtime.contains("worker.teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[step - 1])"))
+    #expect(!runtime.contains("correctness_teacher_forced_batch"))
+    #expect(!runtime.contains("teacherForcedCorrectnessBatch"))
+    #expect(!runtime.contains("let expectedTokens: [Int]?"))
 }
 
 @Test
@@ -487,6 +495,9 @@ func runtimeWorkerBenchmarkDecodeDoesNotReceiveBulkOracle() throws {
     #expect(!runtime.contains("validation_delay_ms"))
     #expect(!runtime.contains("case secondsPerToken = \"seconds_per_token\""))
     #expect(!runtime.contains("case bandwidthGBPerToken = \"bandwidth_gb_per_token\""))
+    #expect(!runtime.contains("message += \": expected"))
+    #expect(!runtime.contains("expectedToken: mismatch.expectedToken"))
+    #expect(!runtime.contains("actualToken: mismatch.actualToken"))
 }
 
 @Test

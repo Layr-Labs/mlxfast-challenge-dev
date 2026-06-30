@@ -269,7 +269,6 @@ private struct BenchmarkTokenMismatchError: Error, CustomStringConvertible {
         if let step {
             message += " at step \(step)"
         }
-        message += ": expected \(expectedToken.map { String($0) } ?? "nil"), actual \(actualToken.map { String($0) } ?? "nil")"
         return message
     }
 }
@@ -523,61 +522,6 @@ public enum DeepSeekRuntime {
                 token: token,
                 topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
                 seconds: elapsed,
-                expertStats: expertStats(from: weightCache),
-                peakRamGB: currentResidentMemoryGB()
-            )
-
-        case "correctness_teacher_forced_batch":
-            guard let promptTokens = request.promptTokens,
-                  let expectedTokens = request.expectedTokens,
-                  let steps = request.steps
-            else {
-                throw MLXFastError.invalidInput(
-                    "runtime worker batched teacher-forced request missing prompt_tokens, expected_tokens, or steps"
-                )
-            }
-            guard !promptTokens.isEmpty else {
-                throw MLXFastError.invalidInput("runtime worker batched teacher-forced prompt_tokens must not be empty")
-            }
-            guard steps > 0 else {
-                throw MLXFastError.invalidInput("runtime worker batched teacher-forced steps must be positive")
-            }
-            guard expectedTokens.count >= steps else {
-                throw MLXFastError.invalidInput(
-                    "runtime worker batched teacher-forced expected_tokens has \(expectedTokens.count) tokens; expected at least \(steps)"
-                )
-            }
-            let teacherForcedInput = promptTokens + Array(expectedTokens.prefix(max(steps - 1, 0)))
-            let cache = DeepSeekModelCache(config: weightCache.config)
-            let logits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray(teacherForcedInput),
-                weightCache: weightCache,
-                cache: cache,
-                positionOffset: 0
-            )
-            var tokens: [Int] = []
-            var topLogitRows: [[CorrectnessTraceLogit]] = []
-            tokens.reserveCapacity(steps)
-            topLogitRows.reserveCapacity(steps)
-            let firstLogitRow = promptTokens.count - 1
-            for step in 0..<steps {
-                let topLogits = try topLogits(
-                    from: logits,
-                    row: firstLogitRow + step,
-                    topK: MLXFastConstants.correctnessTopLogits
-                )
-                guard let token = topLogits.first?.token else {
-                    throw MLXFastError.invalidInput("runtime worker batched teacher-forced top logits missing token")
-                }
-                tokens.append(token)
-                topLogitRows.append(topLogits)
-            }
-            return RuntimeWorkerResponse(
-                id: request.id,
-                nonce: sessionNonce,
-                ok: true,
-                topLogitRows: topLogitRows,
-                tokens: tokens,
                 expertStats: expertStats(from: weightCache),
                 peakRamGB: currentResidentMemoryGB()
             )
@@ -945,8 +889,8 @@ public enum DeepSeekRuntime {
                 expertStats: expertStats(from: benchmarkLoader),
                 firstFailingCase: "benchmark",
                 firstFailingStep: mismatch.step,
-                expectedToken: mismatch.expectedToken,
-                actualToken: mismatch.actualToken,
+                expectedToken: nil,
+                actualToken: nil,
                 weightsDigest: transformedWeightsDigest
             )
         } catch {
@@ -1299,8 +1243,8 @@ public enum DeepSeekRuntime {
                 passedCorrectness: correctnessReport?.passed == true,
                 firstFailingCase: "benchmark",
                 firstFailingStep: mismatch.step,
-                expectedToken: mismatch.expectedToken,
-                actualToken: mismatch.actualToken
+                expectedToken: nil,
+                actualToken: nil
             )
         } catch {
             return makeFailedScore(
@@ -2644,31 +2588,23 @@ public enum DeepSeekRuntime {
                 "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need at least \(steps)"
             )
         }
+        guard steps > 0 else {
+            throw MLXFastError.invalidInput("teacher-forced correctness steps must be positive")
+        }
 
-        let response = try worker.teacherForcedCorrectnessBatch(
-            promptTokens: testCase.promptTokens,
-            expectedTokens: Array(testCase.expectedTokens.prefix(steps)),
-            steps: steps
-        )
-        guard let actualTokens = response.tokens else {
-            throw MLXFastError.invalidInput("runtime worker batched teacher-forced response missing tokens")
-        }
-        guard actualTokens.count == steps else {
-            throw MLXFastError.invalidInput(
-                "runtime worker batched teacher-forced response returned \(actualTokens.count) tokens; expected \(steps)"
-            )
-        }
-        guard let topLogitRows = response.topLogitRows else {
-            throw MLXFastError.invalidInput("runtime worker batched teacher-forced response missing top_logit_rows")
-        }
-        guard topLogitRows.count == steps else {
-            throw MLXFastError.invalidInput(
-                "runtime worker batched teacher-forced response returned \(topLogitRows.count) top_logit_rows; expected \(steps)"
-            )
-        }
+        var response = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
+        var latestExpertStats = response.expertStats ?? .zero
+        var peakRamGB = response.peakRamGB ?? 0
         for step in 0..<steps {
-            let actualToken = actualTokens[step]
-            let topLogits = try validatedWorkerTopLogits(topLogitRows[step], actualToken: actualToken)
+            if step > 0 {
+                response = try worker.teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[step - 1])
+                latestExpertStats = response.expertStats ?? latestExpertStats
+                peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
+            }
+            guard let actualToken = response.token else {
+                throw MLXFastError.invalidInput("runtime worker teacher-forced correctness response missing token")
+            }
+            let topLogits = try validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
             let expectedToken = testCase.expectedTokens[step]
             if !correctnessTokenAccepted(
                 expectedToken: expectedToken,
@@ -2683,8 +2619,8 @@ public enum DeepSeekRuntime {
                         expectedToken: expectedToken,
                         actualToken: actualToken
                     ),
-                    expertStats: response.expertStats ?? .zero,
-                    peakRamGB: response.peakRamGB ?? 0
+                    expertStats: latestExpertStats,
+                    peakRamGB: peakRamGB
                 )
             }
             reportProgress(
@@ -2703,8 +2639,8 @@ public enum DeepSeekRuntime {
                 expectedToken: nil,
                 actualToken: nil
             ),
-            expertStats: response.expertStats ?? .zero,
-            peakRamGB: response.peakRamGB ?? 0
+            expertStats: latestExpertStats,
+            peakRamGB: peakRamGB
         )
     }
 
@@ -3546,7 +3482,6 @@ private struct RuntimeWorkerRequest: Codable {
     let id: Int
     let kind: String
     let promptTokens: [Int]?
-    let expectedTokens: [Int]?
     let token: Int?
     let seedTokens: [Int]?
     let steps: Int?
@@ -3555,7 +3490,6 @@ private struct RuntimeWorkerRequest: Codable {
         case id
         case kind
         case promptTokens = "prompt_tokens"
-        case expectedTokens = "expected_tokens"
         case token
         case seedTokens = "seed_tokens"
         case steps
@@ -3804,19 +3738,6 @@ private final class RuntimeWorkerClient {
         )
     }
 
-    func teacherForcedCorrectnessBatch(
-        promptTokens: [Int],
-        expectedTokens: [Int],
-        steps: Int
-    ) throws -> RuntimeWorkerResponse {
-        try send(
-            kind: "correctness_teacher_forced_batch",
-            promptTokens: promptTokens,
-            expectedTokens: expectedTokens,
-            steps: steps
-        )
-    }
-
     func teacherForcedCorrectnessStep(previousToken: Int) throws -> RuntimeWorkerResponse {
         try send(
             kind: "correctness_step",
@@ -3848,7 +3769,6 @@ private final class RuntimeWorkerClient {
     private func send(
         kind: String,
         promptTokens: [Int]? = nil,
-        expectedTokens: [Int]? = nil,
         token: Int? = nil,
         seedTokens: [Int]? = nil,
         steps: Int? = nil
@@ -3862,7 +3782,6 @@ private final class RuntimeWorkerClient {
             id: id,
             kind: kind,
             promptTokens: promptTokens,
-            expectedTokens: expectedTokens,
             token: token,
             seedTokens: seedTokens,
             steps: steps

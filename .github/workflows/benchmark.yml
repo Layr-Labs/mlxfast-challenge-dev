@@ -61,6 +61,11 @@ on:
         required: false
         default: "16"
         type: string
+      allow_untrusted_workflow_testing:
+        description: "Maintainer-only escape hatch for testing workflow changes from a non-main ref with private benchmark material."
+        required: false
+        default: false
+        type: boolean
 permissions:
   contents: read
 
@@ -104,7 +109,9 @@ jobs:
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "256"
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
       MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
-      MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}
+      # Production benchmark dispatches must run the workflow from main. The
+      # explicit escape hatch exists only for maintainer PR testing.
+      MLXFAST_TRUSTED_BENCHMARK_REF: ${{ inputs.allow_untrusted_workflow_testing && github.ref || 'refs/heads/main' }}
       MLXFAST_VERIFY_TRANSFORM: ${{ inputs.verify_transform && '1' || '0' }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -546,7 +553,7 @@ jobs:
             > correctness-trace.json
 
       - name: Check benchmark artifact paths
-        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference && hashFiles('score.json') != '' && hashFiles('score.json.sha256') != '' && hashFiles('benchmark-integrity.json') != ''
+        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference && steps.validate_benchmark_artifacts.outcome == 'success'
         run: |
           set -euo pipefail
           .github/scripts/deny-private-artifacts.sh \
@@ -558,7 +565,7 @@ jobs:
 
       - name: Stage benchmark artifacts
         id: stage_benchmark_artifacts
-        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference && hashFiles('score.json') != '' && hashFiles('score.json.sha256') != '' && hashFiles('benchmark-integrity.json') != ''
+        if: always() && !inputs.preserve_golden_only && inputs.run_benchmark && !inputs.calibrate_gpqa_reference && steps.validate_benchmark_artifacts.outcome == 'success'
         run: |
           set -euo pipefail
           .github/scripts/stage-benchmark-artifacts.sh \
