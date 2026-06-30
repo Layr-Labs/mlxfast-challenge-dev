@@ -3,6 +3,8 @@ name: ci
 on:
   pull_request:
   push:
+    branches:
+      - main
   workflow_dispatch:
 
 concurrency:
@@ -28,6 +30,19 @@ jobs:
         run: |
           swift --version
           xcodebuild -version
+
+      - name: Restore SwiftPM cache
+        id: restore_swiftpm_cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Enforce contestant modifiable surface
         if: startsWith(github.head_ref, 'submissions/') || startsWith(github.ref_name, 'submissions/')
@@ -67,6 +82,17 @@ jobs:
         run: |
           mkdir -p .build/clang-module-cache
           swift build -c release
+
+      - name: Save SwiftPM cache
+        if: steps.restore_swiftpm_cache.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: ${{ steps.restore_swiftpm_cache.outputs.cache-primary-key }}
 
       - name: Unit tests without Metal runtime
         run: |
