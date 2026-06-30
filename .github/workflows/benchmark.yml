@@ -14,7 +14,7 @@ on:
         required: false
         type: string
       submission_ref:
-        description: "Optional submitted ref/SHA. When set, the workflow keeps trusted harness code and overlays only editablePaths from this ref."
+        description: "Optional submitted commit SHA. Production Yukon runs must pass the exact 40-character SHA from this repository."
         required: false
         type: string
       correctness_golden_url:
@@ -122,6 +122,41 @@ jobs:
       - name: Enforce trusted workflow context
         run: .github/scripts/enforce-trusted-benchmark-workflow.sh
 
+      - name: Validate production dispatch inputs
+        env:
+          ALLOW_UNTRUSTED_WORKFLOW_TESTING: ${{ inputs.allow_untrusted_workflow_testing && '1' || '0' }}
+          TRUSTED_REPOSITORY: ${{ github.repository }}
+          SUBMISSION_REPOSITORY: ${{ inputs.submission_repository || github.repository }}
+          SUBMISSION_REF: ${{ inputs.submission_ref }}
+          REFERENCE_BASE_URL_INPUT: ${{ inputs.reference_base_url }}
+          CORRECTNESS_GOLDEN_URL_INPUT: ${{ inputs.correctness_golden_url }}
+        run: |
+          set -euo pipefail
+          if [[ "${ALLOW_UNTRUSTED_WORKFLOW_TESTING}" == "1" ]]; then
+            echo "benchmark: maintainer workflow testing mode allows mutable refs and custom input URLs"
+            exit 0
+          fi
+
+          if [[ -n "${SUBMISSION_REF}" && ! "${SUBMISSION_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "benchmark: production submission_ref must be the exact 40-character commit SHA provided by Yukon" >&2
+            exit 1
+          fi
+          if [[ "${SUBMISSION_REPOSITORY}" != "${TRUSTED_REPOSITORY}" ]]; then
+            echo "benchmark: production submissions must come from ${TRUSTED_REPOSITORY}, got ${SUBMISSION_REPOSITORY}" >&2
+            exit 1
+          fi
+          if [[ -n "${CORRECTNESS_GOLDEN_URL_INPUT}" ]]; then
+            echo "benchmark: production correctness golden must come from repository secrets or private R2, not workflow input" >&2
+            exit 1
+          fi
+          case "${REFERENCE_BASE_URL_INPUT}" in
+            ""|"https://ds4.darkbloom.ai/deepseek-v4-flash-4bit"|"https://ds4.darkbloom.ai/deepseek-v4-flash-4bit/") ;;
+            *)
+              echo "benchmark: production reference_base_url input must be empty or the approved Darkbloom mirror" >&2
+              exit 1
+              ;;
+          esac
+
       - name: Refuse untrusted submission workflow code
         if: inputs.submission_ref == '' && (startsWith(github.ref_name, 'submissions/') || startsWith(github.ref_name, 'yukon/submissions/'))
         run: |
@@ -137,6 +172,24 @@ jobs:
           path: .mlxfast-submission-src
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Verify submitted commit
+        if: inputs.submission_ref != ''
+        env:
+          ALLOW_UNTRUSTED_WORKFLOW_TESTING: ${{ inputs.allow_untrusted_workflow_testing && '1' || '0' }}
+          SUBMISSION_REF: ${{ inputs.submission_ref }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git -C .mlxfast-submission-src rev-parse HEAD)"
+          if [[ "${SUBMISSION_REF}" =~ ^[0-9a-f]{40}$ && "${actual_sha}" != "${SUBMISSION_REF}" ]]; then
+            echo "benchmark: submitted checkout resolved to ${actual_sha}, expected ${SUBMISSION_REF}" >&2
+            exit 1
+          fi
+          if [[ "${ALLOW_UNTRUSTED_WORKFLOW_TESTING}" != "1" && "${actual_sha}" != "${SUBMISSION_REF}" ]]; then
+            echo "benchmark: production submitted checkout must resolve exactly to submission_ref" >&2
+            exit 1
+          fi
+          echo "benchmark: verified submitted commit ${actual_sha}"
 
       - name: Overlay submitted editable paths
         if: inputs.submission_ref != ''

@@ -184,6 +184,14 @@ func benchmarkWorkflowDefaultsToTrustedMainWithExplicitTestingEscapeHatch() thro
     #expect(workflow.contains("Maintainer-only escape hatch for testing workflow changes from a non-main ref"))
     #expect(workflow.contains("MLXFAST_TRUSTED_BENCHMARK_REF: ${{ inputs.allow_untrusted_workflow_testing && github.ref || 'refs/heads/main' }}"))
     #expect(!workflow.contains("MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}"))
+    #expect(workflow.contains("- name: Validate production dispatch inputs"))
+    #expect(workflow.contains("production submission_ref must be the exact 40-character commit SHA provided by Yukon"))
+    #expect(workflow.contains("production submissions must come from ${TRUSTED_REPOSITORY}"))
+    #expect(workflow.contains("production correctness golden must come from repository secrets or private R2, not workflow input"))
+    #expect(workflow.contains("production reference_base_url input must be empty or the approved Darkbloom mirror"))
+    #expect(workflow.contains("- name: Verify submitted commit"))
+    #expect(workflow.contains("actual_sha=\"$(git -C .mlxfast-submission-src rev-parse HEAD)\""))
+    #expect(workflow.contains("submitted checkout resolved to ${actual_sha}, expected ${SUBMISSION_REF}"))
     #expect(guardScript.contains("TRUSTED_REF=\"${MLXFAST_TRUSTED_BENCHMARK_REF:-refs/heads/main}\""))
 }
 
@@ -426,6 +434,7 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     #expect(benchmark.contains("pwd -P"))
     #expect(benchmark.contains("cd -P"))
     #expect(benchmark.contains("export MLXFAST_RUNTIME_WORKER_EXECUTABLE=\"$(absolute_path \"${SWIFT_BIN}\")\""))
+    #expect(benchmark.contains("export MLXFAST_REFERENCE_DIR=\"${REFERENCE_PATH}\""))
     #expect(benchmark.contains("(deny file-read* (subpath"))
     #expect(benchmark.contains("(deny file-write* (subpath"))
     #expect(benchmark.contains("(deny process-fork)"))
@@ -546,12 +555,15 @@ func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
     #expect(workerRuntime.contains("let decodePhaseStart = DispatchTime.now().uptimeNanoseconds"))
     #expect(workerRuntime.contains("includes_seed_prefill=true"))
     #expect(workerRuntime.contains("let measuredSeconds = secondsSince(decodePhaseStart)"))
+    #expect(workerRuntime.contains("_ = try BenchmarkPreflight.check("))
 
+    let preflightRange = try #require(workerRuntime.range(of: "progress(\"preflight start\")"))
     let timedBenchmarkRange = try #require(workerRuntime.range(of: "progress(\"timed benchmark start\")"))
     let weightsDigestRange = try #require(workerRuntime.range(of: "progress(\"weights digest start\")"))
     let correctnessRange = try #require(workerRuntime.range(of: "progress(\"correctness start cases=\\(golden.totalCorrectnessCaseCount)\")"))
-    #expect(timedBenchmarkRange.lowerBound < weightsDigestRange.lowerBound)
-    #expect(weightsDigestRange.lowerBound < correctnessRange.lowerBound)
+    #expect(preflightRange.lowerBound < weightsDigestRange.lowerBound)
+    #expect(weightsDigestRange.lowerBound < timedBenchmarkRange.lowerBound)
+    #expect(timedBenchmarkRange.lowerBound < correctnessRange.lowerBound)
 }
 
 @Test

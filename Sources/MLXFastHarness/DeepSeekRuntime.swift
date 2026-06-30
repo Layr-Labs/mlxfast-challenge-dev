@@ -1017,12 +1017,25 @@ public enum DeepSeekRuntime {
             try validateBenchmarkOptions(options)
             progress("preflight start")
             let preflightStart = DispatchTime.now().uptimeNanoseconds
-            try checkWorkerBenchmarkInputs(
+            _ = try BenchmarkPreflight.check(
                 weightsPath: options.weightsPath,
                 goldenPath: options.goldenPath
             )
             preflightSeconds = secondsSince(preflightStart)
             progress("preflight complete seconds=\(formatSeconds(preflightSeconds))")
+
+            progress("weights digest start")
+            transformedWeightsDigest = try directoryDigest(
+                rootPath: options.weightsPath,
+                ignoredRelativePaths: [".benchmark-source.sha256", ".gitkeep"]
+            )
+            if let transformedWeightsDigest {
+                try enforceTransformedWeightsByteLimit(transformedWeightsDigest.byteCount)
+                progress(
+                    "weights digest complete files=\(transformedWeightsDigest.fileCount) "
+                        + "bytes=\(transformedWeightsDigest.byteCount)"
+                )
+            }
 
             progress("golden load start")
             let golden = try loadGoldenFixture(from: options.goldenPath)
@@ -1098,19 +1111,6 @@ public enum DeepSeekRuntime {
                 baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken,
                 candidateSecondsPerToken: prefillSecondsPerToken
             )
-
-            progress("weights digest start")
-            transformedWeightsDigest = try directoryDigest(
-                rootPath: options.weightsPath,
-                ignoredRelativePaths: [".benchmark-source.sha256", ".gitkeep"]
-            )
-            if let transformedWeightsDigest {
-                try enforceTransformedWeightsByteLimit(transformedWeightsDigest.byteCount)
-                progress(
-                    "weights digest complete files=\(transformedWeightsDigest.fileCount) "
-                        + "bytes=\(transformedWeightsDigest.byteCount)"
-                )
-            }
 
             guard score.isFinite, score >= 0 else {
                 return makeFailedScore(
@@ -2379,33 +2379,6 @@ public enum DeepSeekRuntime {
         let fileCount: Int
         let byteCount: Int
         let sha256: String
-    }
-
-    private static func checkWorkerBenchmarkInputs(
-        weightsPath: String,
-        goldenPath: String
-    ) throws {
-        try requireDirectory(weightsPath, description: "transformed weights")
-        let requiredFiles = [
-            ("\(weightsPath)/config.json", "transformed config"),
-            ("\(weightsPath)/model.safetensors.index.json", "dense safetensors index"),
-            ("\(weightsPath)/experts/manifest.json", "expert manifest"),
-            (goldenPath, "correctness golden file"),
-        ]
-        for (path, description) in requiredFiles {
-            try requireRegularFile(path, description: description)
-        }
-    }
-
-    private static func requireDirectory(_ path: String, description: String) throws {
-        let url = URL(fileURLWithPath: path).standardizedFileURL
-        let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-        if values.isSymbolicLink == true {
-            throw MLXFastError.invalidInput("\(description) must not be a symlink: \(path)")
-        }
-        guard values.isDirectory == true else {
-            throw MLXFastError.missingFile("\(description) directory missing at \(path)")
-        }
     }
 
     private static func requireRegularFile(_ path: String, description: String) throws {

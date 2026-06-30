@@ -88,7 +88,13 @@ public enum BenchmarkPreflight {
         let denseStore = try DenseTensorStore(weightsPath: weightsPath)
         try denseStore.validateReadableByteRanges()
 
-        let expertBank = try ExpertSlotBank(manifestPath: "\(weightsPath)/experts/manifest.json")
+        let expertBank = try ExpertSlotBank(
+            manifestPath: "\(weightsPath)/experts/manifest.json",
+            allowedReferenceRoots: allowedExpertReferenceRoots(
+                weightsPath: weightsPath,
+                environment: environment
+            )
+        )
         try expertBank.validateReadableByteRanges()
         try DeepSeekWeightLoader(denseStore: denseStore, expertBank: expertBank)
             .validateRequiredMetadata(config: config)
@@ -118,6 +124,18 @@ public enum BenchmarkPreflight {
             )
         }
         return value
+    }
+
+    private static func allowedExpertReferenceRoots(
+        weightsPath: String,
+        environment: [String: String]
+    ) -> [String] {
+        let referencePath = environment["MLXFAST_REFERENCE_DIR"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var roots = [weightsPath]
+        roots.append(referencePath?.isEmpty == false ? referencePath! : MLXFastConstants.defaultReferencePath)
+        var seen = Set<String>()
+        return roots.filter { seen.insert($0).inserted }
     }
 
     private static func transformedWeightsByteCount(
