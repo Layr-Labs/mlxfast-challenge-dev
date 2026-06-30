@@ -19,7 +19,7 @@ SETUP_PARALLEL_METALLIB="${MLXFAST_SETUP_PARALLEL_METALLIB:-${MLXFAST_SETUP_PARA
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
 DEFAULT_REFERENCE_DIR="reference_weights/DeepSeek-V4-Flash-4bit"
-DEFAULT_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${PWD}/.cache/huggingface}}"
+DEFAULT_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}"
 DEFAULT_HF_HUB_CACHE="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${DEFAULT_HF_HOME}/hub}}"
 REFERENCE_CACHE_DIR="${MLXFAST_REFERENCE_CACHE_DIR:-${DEFAULT_HF_HUB_CACHE}/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}}"
 if [[ -n "${MLXFAST_REFERENCE_DIR:-}" ]]; then
@@ -56,8 +56,9 @@ checkpoint when it is not already present.
 Important environment variables:
   MLXFAST_REFERENCE_DIR              Reference checkpoint directory.
                                      Default: ${REFERENCE_DIR}
-  MLXFAST_REFERENCE_CACHE_DIR        Repo-local Hugging Face-style cache path
-                                     used for new downloads when
+  MLXFAST_REFERENCE_CACHE_DIR        Shared Hugging Face-style cache path (under
+                                     $HOME by default, so parallel clones reuse
+                                     one checkpoint) used for new downloads when
                                      MLXFAST_REFERENCE_DIR is not set.
                                      Default: ${REFERENCE_CACHE_DIR}
   MLXFAST_REFERENCE_BASE_URL         HTTP prefix for checkpoint files.
