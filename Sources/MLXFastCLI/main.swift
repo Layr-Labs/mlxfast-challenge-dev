@@ -235,8 +235,13 @@ private enum MLXFastCLI {
     private static func runBenchmark(_ options: ParsedOptions) throws {
         try options.validate(
             valueOptions: ["--weights", "--golden", "--score-path"],
-            flagOptions: ["--quick"]
+            flagOptions: ["--local-submit", "--local-iterate"]
         )
+        let localSubmit = options.hasFlag("--local-submit")
+        let localIterate = options.hasFlag("--local-iterate")
+        guard !(localSubmit && localIterate) else {
+            throw MLXFastError.invalidInput("--local-submit and --local-iterate cannot be used together")
+        }
         let weightsPath = options.value(
             for: "--weights",
             default: environmentValue(
@@ -248,16 +253,40 @@ private enum MLXFastCLI {
             for: "--golden",
             default: environmentValue(
                 "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-                fallback: MLXFastConstants.defaultGoldenPath
+                fallback: localSubmit || localIterate
+                    ? MLXFastConstants.defaultPublicCorrectnessGoldenPath
+                    : MLXFastConstants.defaultGoldenPath
             )
         )
         let scorePath = options.value(
             for: "--score-path",
             default: environmentValue(
                 "MLXFAST_SCORE_PATH",
-                fallback: MLXFastConstants.defaultScorePath
+                fallback: localIterate
+                    ? MLXFastConstants.defaultLocalIterateScorePath
+                    : MLXFastConstants.defaultScorePath
             )
         )
+        if localSubmit || localIterate {
+            let decodeSteps = localSubmit
+                ? MLXFastConstants.localSubmitBenchmarkDecodeSteps
+                : MLXFastConstants.localIterateBenchmarkDecodeSteps
+            let modeName = localSubmit ? "local-submit" : "local-iterate"
+            let runtime = localSubmit ? "swift-local-submit" : "swift-local-iterate"
+            let payload = DeepSeekRuntime.localIterate(
+                LocalIterateOptions(
+                    weightsPath: weightsPath,
+                    goldenPath: goldenPath,
+                    benchmarkDecodeSteps: decodeSteps,
+                    modeName: modeName,
+                    runtime: runtime
+                ),
+                worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
+            )
+            try writeScorePayload(payload, to: scorePath)
+            try printScorePayload(at: scorePath)
+            return
+        }
         let semanticOutputPath = environmentValue("MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH", fallback: "")
         let semanticCaseCount = try parsePositiveInt(
             environmentValue(
@@ -276,13 +305,10 @@ private enum MLXFastCLI {
         if !semanticOutputPath.isEmpty {
             try requirePrivateOutputPath(semanticOutputPath, description: "semantic GPQA answer output")
         }
-        let quick = options.hasFlag("--quick")
         let payload = DeepSeekRuntime.benchmark(
             BenchmarkOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
-                correctnessSteps: quick ? MLXFastConstants.quickCorrectnessSteps : MLXFastConstants.correctnessSteps,
-                benchmarkDecodeSteps: quick ? MLXFastConstants.quickBenchmarkDecodeSteps : MLXFastConstants.benchmarkDecodeSteps,
                 semanticGPQAOutputPath: semanticOutputPath.isEmpty ? nil : semanticOutputPath,
                 semanticGPQATokenizerPath: weightsPath,
                 semanticGPQACaseCount: semanticCaseCount,
@@ -291,7 +317,7 @@ private enum MLXFastCLI {
             worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
         )
         try writeScorePayload(payload, to: scorePath)
-        if quick {
+        if localSubmit {
             try printScorePayload(at: scorePath)
         } else {
             print("wrote \(scorePath)")
@@ -1054,7 +1080,7 @@ private enum MLXFastCLI {
               mlxfast-swift correctness [--weights PATH] [--golden PATH]
               mlxfast-swift correctness-trace [--weights PATH] [--golden PATH] [--case NAME] --step N [--top-k N]
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
-              mlxfast-swift benchmark [--quick] [--weights PATH] [--golden PATH] [--score-path PATH]
+              mlxfast-swift benchmark [--local-submit|--local-iterate] [--weights PATH] [--golden PATH] [--score-path PATH]
               mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
               mlxfast-swift calibrate-gpqa-gates --gpqa PATH [--weights PATH] [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]

@@ -6,6 +6,7 @@ public enum MLXFastConstants {
     public static let defaultPublicCorrectnessPromptPath = "correctness_prompts/public_longcopy_gate_english_512.txt"
     public static let defaultPublicCorrectnessGoldenPath = "correctness_prompts/public_longcopy_gate_english_512_256.json"
     public static let defaultScorePath = "score.json"
+    public static let defaultLocalIterateScorePath = "score.local-iterate.json"
 
     public static let vocabSize = 129_280
     public static let hiddenSize = 4_096
@@ -20,7 +21,6 @@ public enum MLXFastConstants {
     // Keep the public gate long enough to catch broad decode regressions while
     // leaving budget for the hidden GPQA behavior checks in the official job.
     public static let correctnessSteps = 64
-    public static let quickCorrectnessSteps = 64
     public static let correctnessTopLogits = 8
     public static let correctnessLogitTieTolerance = 1e-6
     public static let correctnessMaxAnchorContextTokens = 1_024
@@ -44,7 +44,8 @@ public enum MLXFastConstants {
     // many checked token steps. Charging setup prevents submitted model code
     // from precomputing future decode tokens in an unscored seed-prefill phase.
     public static let benchmarkDecodeSteps = 128
-    public static let quickBenchmarkDecodeSteps = 64
+    public static let localIterateBenchmarkDecodeSteps = 16
+    public static let localSubmitBenchmarkDecodeSteps = 64
     // Seed measured decode with the full prompt. A short instruction-prefix
     // seed can free-run differently across Apple Silicon/MLX versions even
     // when teacher-forced correctness agrees, which makes the timed oracle
