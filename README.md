@@ -35,7 +35,6 @@ MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
 .build/release/mlxfast-swift preflight
 .build/release/mlxfast-swift benchmark --score-path score.json
 .build/release/mlxfast-swift benchmark --quick --score-path score.json
-.build/release/mlxfast-swift submit --dry-run --output mlxfast-submission.zip
 
 # If required model artifacts are missing, the benchmark emits a valid failed
 # score.json instead of a ranked score.
@@ -157,42 +156,31 @@ in scope. Submissions should focus on the Swift targets listed in
 | `Sources/MLXFastTransform/` | Offline weight transform from frozen reference safetensors into benchmark-ready `weights/`. |
 
 The repository is Swift-only: setup, transform, correctness, and benchmark all
-run through the Swift package. Correctness, scoring, timing, provenance, and
-submission packaging are trusted harness code outside `editablePaths`; only
-the model and transform targets are contestant-editable.
+run through the Swift package. Correctness, scoring, timing, and provenance are
+trusted harness code outside `editablePaths`; only the model and transform
+targets are contestant-editable.
 
-`mlxfast-swift submit --dry-run` reads `benchmark.json` and archives only the
-paths listed in `editablePaths`. Generated `weights/`, reference checkpoints,
-golden files, local scores, repository metadata, symlinks, and macOS metadata
-files are not submitted. The default source archive input cap is 256 MiB;
-override it with `MLXFAST_MAX_SUBMISSION_BYTES` or
-`mlxfast-swift submit --max-bytes`. The dry-run report includes the generated
-zip SHA-256 hash. Before packaging or upload, submit also checks the local Git
-diff against the trusted base ref and fails if any committed, staged, unstaged,
-or untracked source changes are outside `editablePaths`. The base ref defaults
-to Yukon metadata from `mlxfast-swift clone`/`link`, then `origin/main`; submit
-fails if no base ref can be resolved, so pass `--base-ref REF` for a manually
-prepared checkout.
-
-For Yukon upload, first store an API key:
+Submissions are made with the **Yukon CLI (`mlxfast`)**, a separate tool that
+manages your account and uploads across all Yukon benchmarks. The
+`mlxfast-swift` binary runs the benchmark domain only (transform, correctness,
+benchmark, preflight, verify-transform) and no longer logs in or uploads.
 
 ```bash
-.build/release/mlxfast-swift login <api-key> --api https://yukon-api.fly.dev
-.build/release/mlxfast-swift link <benchmark-id-or-name>
-.build/release/mlxfast-swift submit <benchmark-id-or-name> \
+mlxfast login <api-key> --api https://yukon-api.fly.dev
+mlxfast clone <benchmark-id-or-name>     # fresh checkout; an existing repo auto-links by its git remote
+mlxfast submit --model "Claude Opus 4.8" \
   --note "Changed expert streaming prefetch policy."
-.build/release/mlxfast-swift submissions <benchmark-id-or-name>
+mlxfast submissions
 ```
 
-The upload path packages the same editable paths as `submission.tar.gz` and
-POSTs it to Yukon with `Authorization: Bearer <api-key>` and an idempotency key.
-`YUKON_API_URL`, `YUKON_API_TOKEN`, `MLXFAST_API_URL`, `MLXFAST_API_KEY`, and
-`MLXFAST_BENCHMARK_REF` can be used in CI or scripted runs. Use `--dry-run` to
-force local packaging even when credentials are configured. `mlxfast-swift clone
-<benchmark>` fetches the benchmark source repository from Yukon metadata and
-writes local `yukon.*` git config; `mlxfast-swift link <benchmark>` writes the
-same config into an existing checkout. Pass `--idempotency-key KEY` to make a
-live submit retry use a stable backend idempotency key.
+`mlxfast submit` reads `benchmark.json` and uploads only the paths listed in
+`editablePaths` as `submission.tar.gz`, POSTed to Yukon with
+`Authorization: Bearer <api-key>` and an idempotency key. Generated `weights/`,
+reference checkpoints, golden files, and local scores live outside
+`editablePaths` and are never uploaded; the backend re-enforces the editable
+surface server-side after upload. `--model` is required and is recorded for the
+leaderboard. `MLXFAST_API_URL` / `MLXFAST_API_TOKEN` (or the `YUKON_*`
+equivalents) configure the endpoint and token for scripted runs.
 
 ## Scoring
 
@@ -246,7 +234,6 @@ Sources/
   MLXFastTransform/          Swift offline weight transform
   MLXFastModel/              editable DeepSeek V4 Flash Swift runtime
   MLXFastHarness/            trusted correctness, golden, and benchmark runner
-  MLXFastSubmission/         trusted Yukon login/submit integration
 weights/                     transformed weights (harness loads from here)
   experts/
     manifest.json            baseline byte ranges for streamed expert tensors

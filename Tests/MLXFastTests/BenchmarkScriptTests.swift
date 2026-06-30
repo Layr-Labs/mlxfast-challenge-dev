@@ -132,19 +132,6 @@ func benchmarkWorkflowProbesAndEnforcesRuntimeWorkerSandbox() throws {
 }
 
 @Test
-func ciSubmissionSmokeTestUsesIsolatedWorkspace() throws {
-    let workflow = try String(
-        contentsOfFile: ".github/workflows/ci.yml",
-        encoding: .utf8
-    )
-
-    #expect(workflow.contains("WORKSPACE=\"${RUNNER_TEMP}/mlxfast-submit-smoke\""))
-    #expect(workflow.contains("git -C \"${WORKSPACE}\" -c user.name=\"CI\" -c user.email=\"ci@example.test\" commit -m \"base\""))
-    #expect(workflow.contains("\"${BIN}\" submit --contract \"${WORKSPACE}/benchmark.json\" --base-ref HEAD --output /tmp/mlxfast-submission.zip"))
-    #expect(!workflow.contains(".build/release/mlxfast-swift submit --output /tmp/mlxfast-submission.zip"))
-}
-
-@Test
 func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/reference-cache-probe.yml",
