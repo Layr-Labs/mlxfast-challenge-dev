@@ -12,6 +12,46 @@ func runtimeWorkerClientSkipsNonJSONStdoutLines() {
 }
 
 @Test
+func runtimeWorkerEnvironmentStripsOfficialRunAndCIIdentity() {
+    let sanitized = sanitizedRuntimeWorkerEnvironment([
+        "ANTHROPIC_API_KEY": "secret",
+        "CI": "true",
+        "GITHUB_ACTIONS": "true",
+        "GITHUB_RUN_ID": "123",
+        "RUNNER_TEMP": "/tmp/runner",
+        "BLACKSMITH_RUNNER": "1",
+        "MLXFAST_OFFICIAL_BENCHMARK_RUN": "1",
+        "MLXFAST_RUN_BENCHMARK": "1",
+        "MLXFAST_REFERENCE_DIR": "/private/reference",
+        "MLXFAST_PRIVATE_DIR": "/private/golden",
+        "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE": "/tmp/profile.sb",
+        "R2_ACCESS_KEY_ID": "key",
+        "MLXFAST_EXPERT_CACHE_TENSORS": "42",
+        "PATH": "/usr/bin",
+    ])
+
+    for key in [
+        "ANTHROPIC_API_KEY",
+        "CI",
+        "GITHUB_ACTIONS",
+        "GITHUB_RUN_ID",
+        "RUNNER_TEMP",
+        "BLACKSMITH_RUNNER",
+        "MLXFAST_OFFICIAL_BENCHMARK_RUN",
+        "MLXFAST_RUN_BENCHMARK",
+        "MLXFAST_REFERENCE_DIR",
+        "MLXFAST_PRIVATE_DIR",
+        "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE",
+        "R2_ACCESS_KEY_ID",
+    ] {
+        #expect(sanitized[key] == nil)
+    }
+    #expect(sanitized["MLXFAST_USE_RUNTIME_WORKER"] == "0")
+    #expect(sanitized["MLXFAST_EXPERT_CACHE_TENSORS"] == "42")
+    #expect(sanitized["PATH"] == "/usr/bin")
+}
+
+@Test
 func correctnessAcceptsOnlyExactTopLogitTies() {
     #expect(correctnessTokenAccepted(
         expectedToken: 30,
