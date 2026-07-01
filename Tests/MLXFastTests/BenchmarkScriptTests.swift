@@ -746,14 +746,18 @@ func benchmarkLocalIterateModeUsesPublicFixtureAndNonOfficialScore() throws {
     #expect(cli.contains("MLXFastConstants.defaultLocalIterateScorePath"))
     #expect(runtime.contains("runLocalIterateCheckedTimingWithWorker("))
     #expect(runtime.contains("includes_seed_prefill=true"))
-    #expect(runtime.contains("try worker.beginDecode(seedTokens: testCase.promptTokens)"))
-    #expect(runtime.contains("try worker.decodeStep(inputToken: testCase.expectedTokens[decodedStep])"))
+    #expect(runtime.contains("\\(modeName) prefill measured start prompt_tokens="))
+    #expect(runtime.contains("let prefillWorker = try RuntimeWorkerClient(options: workerOptions, weightsPath: weightsPath)"))
+    #expect(runtime.contains("let decodeWorker = try RuntimeWorkerClient(options: workerOptions, weightsPath: weightsPath)"))
+    #expect(runtime.contains("try prefillWorker.prefill(promptTokens: testCase.promptTokens)"))
+    #expect(runtime.contains("try decodeWorker.beginDecode(seedTokens: testCase.promptTokens)"))
+    #expect(runtime.contains("try decodeWorker.decodeStep(inputToken: testCase.expectedTokens[decodedStep])"))
     #expect(!runtime.contains("teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[decodedStep])"))
     #expect(runtime.contains("score: nil"))
     #expect(options.contains("runtime: String = \"swift-local-iterate\""))
-    let decodeStartRange = try #require(runtime.range(of: "let decodePhaseStart = DispatchTime.now().uptimeNanoseconds"))
-    let prefillStartRange = try #require(runtime.range(of: "let prefillStart = DispatchTime.now().uptimeNanoseconds"))
-    #expect(decodeStartRange.lowerBound < prefillStartRange.lowerBound)
+    let prefillStartRange = try #require(runtime.range(of: "\\(modeName) prefill measured start prompt_tokens="))
+    let decodeStartRange = try #require(runtime.range(of: "\\(modeName) decode measured start tokens="))
+    #expect(prefillStartRange.lowerBound < decodeStartRange.lowerBound)
 }
 
 @Test

@@ -193,8 +193,8 @@ Use these two benchmark modes for local development:
 
 | Command | Purpose | What it checks | Output |
 |---|---|---|---|
-| `./benchmark.sh --local-iterate` | Fast edit-loop signal, usually under 2 minutes after setup. | Public 512-token prompt, prefill next-token check, and 16 teacher-forced decode checks. | `score.local-iterate.json` with `score: null`. |
-| `./benchmark.sh --local-submit` | Yukon pre-submit gate, intended to be about 10 minutes after setup. | Same public prompt, prefill next-token check, and 1023 teacher-forced decode checks from a longer public fixture. | `score.json` with `score: null`. |
+| `./benchmark.sh --local-iterate` | Fast edit-loop signal, usually under 2 minutes after setup. | Public 512-token prompt, standalone prefill next-token check, decode seed-prefill check, and 16 teacher-forced decode checks. | `score.local-iterate.json` with `score: null`. |
+| `./benchmark.sh --local-submit` | Yukon pre-submit gate, intended to be about 10 minutes after setup. | Same public prompt, standalone prefill next-token check, decode seed-prefill check, and 1023 teacher-forced decode checks from a longer public fixture. | `score.json` with `score: null`. |
 
 Neither local mode produces an official leaderboard score. Official ranking
 still runs the hidden benchmark oracle and hidden correctness gates on the
@@ -239,11 +239,12 @@ cannot warm the measured model path. It then checks 64 public correctness
 positions plus the hidden GPQA behavior checks.
 Public local correctness uses the checked-in correctness fixture. When a local
 edit-loop signal is enough, `--local-iterate` uses that public 512-token prompt,
-checks the prefill next token plus 16 teacher-forced decode tokens, writes
-`score.local-iterate.json`, prints it, and leaves `score` null because it is not
-a ranked benchmark score. The submit hook `--local-submit` uses the same public
-prompt with a longer 1024-token fixture: it checks the prefill next token plus
-1023 teacher-forced decode tokens in one continuous trajectory, writes
+times standalone prefill separately, then times decode including seed prefill
+plus 16 teacher-forced decode tokens, writes `score.local-iterate.json`, prints
+it, and leaves `score` null because it is not a ranked benchmark score. The
+submit hook `--local-submit` uses the same public prompt with a longer 1024-token
+fixture: it times the same standalone prefill and decode-seed phases plus 1023
+teacher-forced decode tokens in one continuous trajectory, writes
 `score.json`, and also leaves `score` null because official ranking still
 requires the hidden benchmark oracle on the trusted runner.
 The score payload includes the official baseline timings, computed speedups,
