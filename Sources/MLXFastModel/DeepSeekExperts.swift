@@ -64,6 +64,46 @@ public enum DeepSeekRoutedExperts {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
         }
 
+        // Decode fast path: a single token routed to topK experts (M == 1). The
+        // per-expert gather and the inverse-permutation reorder of the general
+        // path are identities here, so run each selected expert directly on the
+        // one token row and concatenate outputs in routing order. Each expert
+        // fuses gate+up into one quantizedMM. Both are bit-identical ONLY at
+        // M == 1 and only when the selected experts are all distinct: the general
+        // path batches a duplicated expert (hash-routing layers) into one M == 2
+        // matmul, which uses a different kernel than two M == 1 calls, so fall
+        // through to the general path if any expert repeats.
+        if tokenCount == 1 {
+            var seen = Set<Int>()
+            seen.reserveCapacity(topK)
+            var allDistinct = true
+            for expertIndex in selectedExperts where !seen.insert(expertIndex).inserted {
+                allDistinct = false
+                break
+            }
+            if allDistinct {
+                let token = x.reshaped([1, hiddenSize])
+                var singleTokenOutputs: [MLXArray] = []
+                singleTokenOutputs.reserveCapacity(topK)
+                for expertIndex in selectedExperts {
+                    let expertWeights = try weights(
+                        forExpert: expertIndex,
+                        loader: loader,
+                        spec: spec
+                    )
+                    singleTokenOutputs.append(
+                        DeepSeekMLP.forwardFusedGateUp(
+                            token,
+                            weights: expertWeights,
+                            swigluLimit: spec.swigluLimit
+                        )
+                    )
+                }
+                return concatenated(singleTokenOutputs, axis: 0)
+                    .reshaped([batchSize, sequenceLength, topK, hiddenSize])
+            }
+        }
+
         // Group activation flat-indices by expert so each expert runs one batched
         // matmul over all of its tokens instead of one matmul per token.
         var flatIndicesByExpert: [Int: [Int]] = [:]
