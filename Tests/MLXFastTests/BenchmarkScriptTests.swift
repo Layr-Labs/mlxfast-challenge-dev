@@ -1064,7 +1064,7 @@ func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
         encoding: .utf8
     )
 
-    #expect(!contract.contains("preSubmitCommand"))
+    #expect(contract.contains("\"preSubmitCommand\": [\"bash\", \"-lc\", \"./benchmark.sh --local-submit\"]"))
     #expect(constants.contains("public static let defaultPublicLocalSubmitGoldenPath"))
     #expect(constants.contains("public static let localSubmitBenchmarkDecodeSteps = 1023"))
     #expect(constants.contains("public static let localSubmitBenchmarkRepeats = 1"))
