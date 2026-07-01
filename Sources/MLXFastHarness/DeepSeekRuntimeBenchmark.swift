@@ -241,7 +241,8 @@ extension DeepSeekRuntime {
                 expertStats: expertStats,
                 bandwidthSource: decode.bandwidthSource,
                 weightsDigest: transformedWeightsDigest,
-                gpqaTTFT: .zero
+                gpqaTTFT: .zero,
+                partialResult: !options.checkGates || options.skipTimedBenchmark
             )
         } catch let mismatch as BenchmarkTokenMismatchError {
             return makeFailedScore(
@@ -648,7 +649,8 @@ extension DeepSeekRuntime {
                 expertStats: benchmarkExpertStats,
                 bandwidthSource: decode.bandwidthSource,
                 weightsDigest: transformedWeightsDigest,
-                gpqaTTFT: correctnessResult.gpqaTTFT
+                gpqaTTFT: correctnessResult.gpqaTTFT,
+                partialResult: !options.checkGates || options.skipTimedBenchmark
             )
         } catch let mismatch as BenchmarkTokenMismatchError {
             return makeFailedScore(
@@ -1104,7 +1106,8 @@ extension DeepSeekRuntime {
         expertStats: ExpertStreamingStats,
         bandwidthSource: String,
         weightsDigest: DirectoryDigest?,
-        gpqaTTFT: GPQATTFTSummary
+        gpqaTTFT: GPQATTFTSummary,
+        partialResult: Bool = false
     ) -> ScorePayload {
         ScorePayload(
             score: score,
@@ -1152,7 +1155,8 @@ extension DeepSeekRuntime {
                 weightsHash: weightsDigest?.sha256 ?? "",
                 weightsByteCount: weightsDigest?.byteCount ?? 0,
                 weightsFileCount: weightsDigest?.fileCount ?? 0,
-                runtime: "swift"
+                runtime: "swift",
+                partialResult: partialResult
             )
         )
     }

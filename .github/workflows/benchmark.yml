@@ -49,7 +49,73 @@ on:
 permissions:
   contents: read
 
+# Unlike parallel-correctness-probe.yml/reference-cache-probe.yml (which already
+# have this), a duplicate dispatch on the same ref (retry after a timeout,
+# double-click) used to run all 6 jobs in full parallel twice -- no correctness
+# risk (artifact names are run_id/run_attempt-scoped) but 2x Blacksmith cost.
+# cancel-in-progress: false queues the second run rather than killing the first.
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # Cheap, checkout-free, secret-free sanity check that runs before any of the
+  # three expensive (up to 360min, full checkpoint download+transform) slice
+  # machines start. combine-parallel-correctness.sh's own "Range coverage
+  # check" catches a bad range_1/2/3 too, but only after all three slices (plus
+  # benchmark-timing/benchmark-gates) have already run to completion -- a
+  # manual-dispatch typo would otherwise burn up to 5 full Blacksmith runs
+  # before the mistake is reported.
+  validate-slice-ranges:
+    name: "validate correctness slice ranges"
+    if: ${{ inputs.run_benchmark }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
+    steps:
+      - name: Check range_1/range_2/range_3 partition the full step window
+        env:
+          RANGE_1: ${{ inputs.range_1 }}
+          RANGE_2: ${{ inputs.range_2 }}
+          RANGE_3: ${{ inputs.range_3 }}
+        run: |
+          set -euo pipefail
+          ranges_file="$(mktemp)"
+          trap 'rm -f "${ranges_file}"' EXIT
+          for pair in "range_1=${RANGE_1}" "range_2=${RANGE_2}" "range_3=${RANGE_3}"; do
+            name="${pair%%=*}"
+            range="${pair#*=}"
+            if [[ ! "${range}" =~ ^[0-9]+-[0-9]+$ ]]; then
+              echo "::error::${name} (\"${range}\") is not START-END with non-negative integers" >&2
+              exit 1
+            fi
+            start="${range%-*}"
+            end="${range#*-}"
+            if [[ "${end}" -le "${start}" ]]; then
+              echo "::error::${name} (\"${range}\") must have end > start" >&2
+              exit 1
+            fi
+            jq -n --arg name "${name}" --argjson start "${start}" --argjson end "${end}" \
+              '{name: $name, start: $start, end: $end}' >> "${ranges_file}"
+          done
+
+          coverage_ok="$(jq -s -r --argjson expected "${MLXFAST_EXPECTED_CORRECTNESS_STEPS}" '
+            sort_by(.start) as $sorted
+            | ($sorted | length) as $n
+            | if $n == 0 then "false"
+              elif $sorted[0].start != 0 then "false"
+              elif $sorted[$n - 1].end != $expected then "false"
+              else ([range(0; $n - 1) | ($sorted[.].end == $sorted[. + 1].start)] | all) | tostring
+              end
+          ' "${ranges_file}")"
+          if [[ "${coverage_ok}" != "true" ]]; then
+            echo "::error::range_1/range_2/range_3 do not exactly partition [0, ${MLXFAST_EXPECTED_CORRECTNESS_STEPS}) -- a gap or overlap exists" >&2
+            jq -s -r 'sort_by(.start)[] | "  \(.name): [\(.start), \(.end))"' "${ranges_file}" >&2
+            exit 1
+          fi
+          echo "validate-slice-ranges: range_1/range_2/range_3 exactly partition [0, ${MLXFAST_EXPECTED_CORRECTNESS_STEPS})"
+
   # The base correctness case (64 teacher-forced steps) is checked in parallel,
   # in three slices, on three independent machines -- not serially inside the
   # benchmark job. Teacher-forced checking always feeds the GOLDEN token (never
@@ -65,7 +131,8 @@ jobs:
   # machine "Correctness" step below, unsplit.
   correctness-slice-1:
     name: "correctness slice 1 (${{ inputs.range_1 }})"
-    if: ${{ inputs.run_benchmark }}
+    needs: validate-slice-ranges
+    if: ${{ inputs.run_benchmark && needs.validate-slice-ranges.result == 'success' }}
     uses: ./.github/workflows/benchmark-correctness-slice.yml
     secrets: inherit
     with:
@@ -76,7 +143,8 @@ jobs:
 
   correctness-slice-2:
     name: "correctness slice 2 (${{ inputs.range_2 }})"
-    if: ${{ inputs.run_benchmark }}
+    needs: validate-slice-ranges
+    if: ${{ inputs.run_benchmark && needs.validate-slice-ranges.result == 'success' }}
     uses: ./.github/workflows/benchmark-correctness-slice.yml
     secrets: inherit
     with:
@@ -87,7 +155,8 @@ jobs:
 
   correctness-slice-3:
     name: "correctness slice 3 (${{ inputs.range_3 }})"
-    if: ${{ inputs.run_benchmark }}
+    needs: validate-slice-ranges
+    if: ${{ inputs.run_benchmark && needs.validate-slice-ranges.result == 'success' }}
     uses: ./.github/workflows/benchmark-correctness-slice.yml
     secrets: inherit
     with:
@@ -412,7 +481,7 @@ jobs:
       - name: Download parallel benchmark artifacts
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          pattern: benchmark-parallel-${{ github.run_id }}-*
+          pattern: benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-*
           path: slices
           merge-multiple: false
 
@@ -426,8 +495,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p machine1
-          gates_dir="slices/benchmark-parallel-${{ github.run_id }}-gates"
-          timing_dir="slices/benchmark-parallel-${{ github.run_id }}-timing"
+          gates_dir="slices/benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-gates"
+          timing_dir="slices/benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-timing"
 
           # This is one half of the full 5-way weights-hash guarantee: machine1
           # below is a COPY of gates_hash (see "cp ... machine1/weights.sha256"),
@@ -442,6 +511,28 @@ jobs:
             echo "::error::gates machine weights hash (${gates_hash}) does not match timing machine's (${timing_hash})" >&2
             exit 1
           fi
+
+          # Defense-in-depth, not the primary guard: benchmark-timing-or-gates.yml's
+          # own "Validate intermediate benchmark artifact" step already blocks a
+          # failing gates score.json from ever being uploaded (on submission
+          # branches), and combine's "Check upstream jobs succeeded" step already
+          # fails the whole run if that job's own exit code was nonzero. This is a
+          # second checkpoint in case those two ever disagree (e.g. benchmark.sh's
+          # own pass/fail exit code diverges from the metrics' null-ness) so a
+          # regression there doesn't silently merge hidden-adjacent content into
+          # the published combined score.
+          jq -e '
+            .passed == true
+            and .metrics.error == ""
+            and .metrics.first_failing_case == null
+            and .metrics.first_failing_layer == null
+            and .metrics.first_failing_step == null
+            and .metrics.expected_token == null
+            and .metrics.actual_token == null
+          ' "${gates_dir}/score.json" >/dev/null || {
+            echo "::error::gates machine score.json failed the pre-merge leak-field check" >&2
+            exit 1
+          }
 
           # Base $g (gates) and only overlay the timing-specific fields below --
           # preflight_seconds/correctness_seconds are deliberately left at $g's
@@ -484,6 +575,7 @@ jobs:
               )
             | .metrics.peak_ram_gb = ([.metrics.peak_ram_gb, $t.metrics.peak_ram_gb] | max)
             | .metrics.process_resident_memory_gb = ([.metrics.process_resident_memory_gb, $t.metrics.process_resident_memory_gb] | max)
+            | .metrics.partial_result = false
             ' > machine1/score.json
 
           cp "${gates_dir}/weights.sha256" machine1/weights.sha256
@@ -493,9 +585,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p machine2 machine3 machine4
-          cp "slices/benchmark-parallel-${{ github.run_id }}-machine2/"* machine2/
-          cp "slices/benchmark-parallel-${{ github.run_id }}-machine3/"* machine3/
-          cp "slices/benchmark-parallel-${{ github.run_id }}-machine4/"* machine4/
+          cp "slices/benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-machine2/"* machine2/
+          cp "slices/benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-machine3/"* machine3/
+          cp "slices/benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-machine4/"* machine4/
 
       - name: Combine
         env:
@@ -516,7 +608,7 @@ jobs:
           score_hash="$(shasum -a 256 score.combined.json | awk '{print $1}')"
           printf '%s  %s\n' "${score_hash}" score.combined.json > score.combined.json.sha256
           jq --arg hash "${score_hash}" '.score_sha256 = $hash' \
-            "slices/benchmark-parallel-${{ github.run_id }}-gates/benchmark-integrity.json" \
+            "slices/benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-gates/benchmark-integrity.json" \
             > benchmark-integrity.json
           printf '%s  correctness_golden.json\n' "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}" > correctness_golden.json.sha256
           printf '%s  correctness_golden.json\n' "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES}" > correctness_golden.json.bytes

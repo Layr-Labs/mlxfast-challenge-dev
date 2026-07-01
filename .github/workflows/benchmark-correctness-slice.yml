@@ -250,7 +250,7 @@ jobs:
         if: ${{ always() && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_correctness_slice.outcome == 'success') }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: benchmark-parallel-${{ github.run_id }}-${{ inputs.slice_name }}
+          name: benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.slice_name }}
           path: |
             correctness-report.json
             step-range.json

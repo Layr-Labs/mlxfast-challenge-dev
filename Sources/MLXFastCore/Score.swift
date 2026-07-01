@@ -156,6 +156,15 @@ public struct ScoreMetrics: Codable, Equatable {
     public let weightsByteCount: Int
     public let weightsFileCount: Int
     public let runtime: String
+    // True whenever this metrics payload still contains baseline-placeholder
+    // values for the fields a gates-only or timing-only machine did not itself
+    // measure (see BenchmarkOptions.checkGates/skipTimedBenchmark). The ONLY
+    // thing that clears this to false today is benchmark.yml's "Merge gates and
+    // timing into machine1" step -- a defense-in-depth marker so a future
+    // regression there (or anywhere combine assembles the final score) has a
+    // structural signal to check, instead of relying solely on the YAML wiring
+    // being correct.
+    public let partialResult: Bool
 
     enum CodingKeys: String, CodingKey {
         case peakRamGB = "peak_ram_gb"
@@ -213,6 +222,7 @@ public struct ScoreMetrics: Codable, Equatable {
         case weightsByteCount = "weights_byte_count"
         case weightsFileCount = "weights_file_count"
         case runtime
+        case partialResult = "partial_result"
     }
 
     public init(
@@ -270,7 +280,8 @@ public struct ScoreMetrics: Codable, Equatable {
         weightsHash: String = "",
         weightsByteCount: Int = 0,
         weightsFileCount: Int = 0,
-        runtime: String
+        runtime: String,
+        partialResult: Bool = false
     ) {
         self.peakRamGB = peakRamGB
         self.bandwidthGBPerToken = bandwidthGBPerToken
@@ -333,6 +344,7 @@ public struct ScoreMetrics: Codable, Equatable {
         self.weightsByteCount = weightsByteCount
         self.weightsFileCount = weightsFileCount
         self.runtime = runtime
+        self.partialResult = partialResult
     }
 
     public init(from decoder: Decoder) throws {
@@ -418,6 +430,7 @@ public struct ScoreMetrics: Codable, Equatable {
         self.weightsByteCount = try container.decodeIfPresent(Int.self, forKey: .weightsByteCount) ?? 0
         self.weightsFileCount = try container.decodeIfPresent(Int.self, forKey: .weightsFileCount) ?? 0
         self.runtime = try container.decode(String.self, forKey: .runtime)
+        self.partialResult = try container.decodeIfPresent(Bool.self, forKey: .partialResult) ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -497,6 +510,7 @@ public struct ScoreMetrics: Codable, Equatable {
         try container.encode(weightsByteCount, forKey: .weightsByteCount)
         try container.encode(weightsFileCount, forKey: .weightsFileCount)
         try container.encode(runtime, forKey: .runtime)
+        try container.encode(partialResult, forKey: .partialResult)
     }
 }
 

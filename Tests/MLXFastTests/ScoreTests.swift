@@ -63,6 +63,7 @@ func writeScorePayloadEmitsDarkbloomShape() throws {
     #expect(decoded.metrics.weightsHash == "")
     #expect(decoded.metrics.weightsByteCount == 0)
     #expect(decoded.metrics.weightsFileCount == 0)
+    #expect(decoded.metrics.partialResult == false)
     #expect(decoded.metrics.baselineDecodeSecondsPerToken == MLXFastConstants.officialBaselineDecodeSecondsPerToken)
     #expect(decoded.metrics.baselinePrefillSecondsPerToken == MLXFastConstants.officialBaselinePrefillSecondsPerToken)
     #expect(decoded.metrics.decodeSpeedup == 0)
@@ -153,7 +154,8 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
                 weightsHash: "weights-hash",
                 weightsByteCount: 4096,
                 weightsFileCount: 7,
-                runtime: "swift"
+                runtime: "swift",
+                partialResult: true
             )
         ),
         to: path.path
@@ -181,6 +183,7 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(raw.contains("\"weights_hash\" : \"weights-hash\""))
     #expect(raw.contains("\"weights_byte_count\" : 4096"))
     #expect(raw.contains("\"weights_file_count\" : 7"))
+    #expect(raw.contains("\"partial_result\" : true"))
     #expect(raw.contains("\"baseline_decode_seconds_per_token\" : \(MLXFastConstants.officialBaselineDecodeSecondsPerToken)"))
     #expect(raw.contains("\"baseline_prefill_seconds_per_token\" : \(MLXFastConstants.officialBaselinePrefillSecondsPerToken)"))
     #expect(raw.contains("\"decode_speedup\" : 0"))
@@ -223,6 +226,7 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(decoded.metrics.weightsHash == "weights-hash")
     #expect(decoded.metrics.weightsByteCount == 4096)
     #expect(decoded.metrics.weightsFileCount == 7)
+    #expect(decoded.metrics.partialResult == true)
     #expect(decoded.metrics.baselineDecodeSecondsPerToken == MLXFastConstants.officialBaselineDecodeSecondsPerToken)
     #expect(decoded.metrics.baselinePrefillSecondsPerToken == MLXFastConstants.officialBaselinePrefillSecondsPerToken)
     #expect(decoded.metrics.decodeSpeedup == 0)
@@ -293,6 +297,7 @@ func scoreMetricsDecodeOlderPayloadWithoutWeightsIntegrityFields() throws {
     #expect(decoded.metrics.weightsHash == "")
     #expect(decoded.metrics.weightsByteCount == 0)
     #expect(decoded.metrics.weightsFileCount == 0)
+    #expect(decoded.metrics.partialResult == false)
     #expect(decoded.metrics.baselineDecodeSecondsPerToken == MLXFastConstants.officialBaselineDecodeSecondsPerToken)
     #expect(decoded.metrics.baselinePrefillSecondsPerToken == MLXFastConstants.officialBaselinePrefillSecondsPerToken)
     #expect(decoded.metrics.decodeSpeedup == 0)

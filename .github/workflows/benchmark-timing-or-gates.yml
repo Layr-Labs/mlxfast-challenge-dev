@@ -222,6 +222,97 @@ jobs:
         if: always()
         run: .github/scripts/hash-weights-directory.sh weights weights.sha256
 
+      # Mirrors the "Validate correctness artifacts"/"Validate correctness slice
+      # artifacts" gates elsewhere in this pipeline: on a real gates-mode gate
+      # mismatch, ScoreMetrics.firstFailingCase/firstFailingStep are populated
+      # directly from the hidden golden fixture (case/GPQA-question identifiers).
+      # deny-private-artifacts.sh only checks filenames, not JSON content, so
+      # without this the raw score.json would otherwise reach the unconditional
+      # upload below. Only asserts the security-critical leak fields and overall
+      # pass/fail -- NOT mode-specific business fields (gpqa_ttft_passed,
+      # decode_speedup, etc), which validate-benchmark-artifacts.sh already
+      # checks thoroughly downstream on the merged score.combined.json, and
+      # which are legitimately absent/placeholder on one mode or the other here.
+      - name: Validate intermediate benchmark artifact
+        id: validate_intermediate_benchmark
+        if: always()
+        run: |
+          set -euo pipefail
+          test -s score.json
+          jq -e \
+            '
+            def same_keys($expected):
+              (keys_unsorted | sort) == ($expected | sort);
+
+            same_keys(["metrics", "passed", "score"])
+            and (.metrics | same_keys([
+              "actual_token",
+              "bandwidth_gb_per_token",
+              "bandwidth_source",
+              "baseline_decode_seconds_per_token",
+              "baseline_prefill_seconds_per_token",
+              "benchmark_wall_seconds",
+              "case_count",
+              "checked_steps",
+              "commit",
+              "correctness_seconds",
+              "decode_seconds_per_token",
+              "decode_speedup",
+              "decode_speedup_floor",
+              "error",
+              "expected_token",
+              "expert_bytes_read",
+              "expert_cache_evictions",
+              "expert_cache_hits",
+              "expert_cache_misses",
+              "expert_hit_rate",
+              "expert_peak_cached_tensors",
+              "expert_read_seconds",
+              "first_failing_case",
+              "first_failing_layer",
+              "first_failing_step",
+              "golden_hash",
+              "gpqa_ttft_case_count",
+              "gpqa_ttft_max_seconds",
+              "gpqa_ttft_p50_seconds",
+              "gpqa_ttft_pass_count",
+              "gpqa_ttft_passed",
+              "gpqa_ttft_seconds",
+              "gpqa_ttft_source",
+              "harness_hash",
+              "max_abs_diff",
+              "num_layers",
+              "partial_result",
+              "passed_correctness",
+              "peak_ram_gb",
+              "passed_decode_speedup_floor",
+              "passed_prefill_speedup_floor",
+              "prefill_seconds_per_token",
+              "prefill_speedup",
+              "prefill_speedup_floor",
+              "preflight_seconds",
+              "process_resident_memory_gb",
+              "runtime",
+              "semantic_gpqa_case_count",
+              "semantic_gpqa_model",
+              "semantic_gpqa_pass_count",
+              "semantic_gpqa_passed",
+              "timed_benchmark_seconds",
+              "timestamp",
+              "weights_byte_count",
+              "weights_file_count",
+              "weights_hash"
+            ]))
+            and .passed == true
+            and (.metrics.error == "")
+            and (.metrics.first_failing_case == null)
+            and (.metrics.first_failing_layer == null)
+            and (.metrics.first_failing_step == null)
+            and (.metrics.expected_token == null)
+            and (.metrics.actual_token == null)
+            ' \
+            score.json >/dev/null
+
       - name: Prepare golden expectations for combine
         id: prepare_golden_expectations
         if: always()
@@ -237,7 +328,7 @@ jobs:
           } > golden-expectations.env
 
       - name: Check intermediate benchmark artifact paths
-        if: always() && steps.prepare_golden_expectations.outcome == 'success'
+        if: ${{ always() && steps.prepare_golden_expectations.outcome == 'success' && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_intermediate_benchmark.outcome == 'success') }}
         run: |
           set -euo pipefail
           .github/scripts/deny-private-artifacts.sh \
@@ -247,10 +338,10 @@ jobs:
             golden-expectations.env
 
       - name: Upload intermediate benchmark result
-        if: always()
+        if: ${{ always() && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_intermediate_benchmark.outcome == 'success') }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: benchmark-parallel-${{ github.run_id }}-${{ inputs.mode }}
+          name: benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.mode }}
           path: |
             score.json
             benchmark-integrity.json

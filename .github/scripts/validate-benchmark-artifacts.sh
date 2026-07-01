@@ -106,6 +106,7 @@ jq -e \
     "harness_hash",
     "max_abs_diff",
     "num_layers",
+    "partial_result",
     "passed_correctness",
     "peak_ram_gb",
     "passed_decode_speedup_floor",
@@ -129,6 +130,7 @@ jq -e \
   and .passed == true
   and (.score | type == "number")
   and (.score > 0)
+  and (.metrics.partial_result == false)
   and (.metrics.passed_correctness == true)
   and (.metrics.checked_steps == $checked_steps)
   and (.metrics.case_count == $correctness_cases)

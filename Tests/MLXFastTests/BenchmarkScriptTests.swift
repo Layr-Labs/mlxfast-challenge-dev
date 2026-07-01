@@ -485,8 +485,12 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // `!inputs.run_benchmark` on the wrong job would still satisfy a bare
     // "contains inputs.run_benchmark" check.
     #expect(workflow.contains("    if: ${{ !inputs.run_benchmark }}"))
-    let runBenchmarkGuardCount = workflow.components(separatedBy: "if: ${{ inputs.run_benchmark }}").count - 1
-    #expect(runBenchmarkGuardCount == 5) // correctness-slice-1/2/3, benchmark-timing, benchmark-gates
+    let bareRunBenchmarkGuardCount = workflow.components(separatedBy: "if: ${{ inputs.run_benchmark }}").count - 1
+    #expect(bareRunBenchmarkGuardCount == 3) // validate-slice-ranges, benchmark-timing, benchmark-gates
+    let slicesRequireRangeValidationCount = workflow.components(
+        separatedBy: "if: ${{ inputs.run_benchmark && needs.validate-slice-ranges.result == 'success' }}"
+    ).count - 1
+    #expect(slicesRequireRangeValidationCount == 3) // correctness-slice-1/2/3
     #expect(workflow.contains("if: ${{ always() && inputs.run_benchmark }}"))
     #expect(workflow.contains("golden.sha256=\"${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256\""))
     #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results"))
@@ -1600,6 +1604,123 @@ func combineJobFailsFastOnUpstreamJobFailure() throws {
     }
     #expect(checkStep.contains("!= \"success\""))
     #expect(checkStep.contains("exit \"${status}\""))
+}
+
+@Test
+func timingOrGatesWorkflowGatesUploadOnContentValidation() throws {
+    let timingOrGates = try String(
+        contentsOfFile: ".github/workflows/benchmark-timing-or-gates.yml",
+        encoding: .utf8
+    )
+
+    // Mirrors correctnessSliceWorkflowGatesUploadOnContentValidation: a real
+    // gates-mode gate mismatch populates first_failing_case/first_failing_step
+    // with real hidden GPQA/case identifiers, and deny-private-artifacts.sh
+    // only checks filenames, not content.
+    let validateRange = try #require(timingOrGates.range(of: "- name: Validate intermediate benchmark artifact"))
+    let uploadRange = try #require(timingOrGates.range(of: "- name: Upload intermediate benchmark result"))
+    #expect(validateRange.lowerBound < uploadRange.lowerBound)
+
+    let validateStep = String(timingOrGates[validateRange.lowerBound..<uploadRange.lowerBound])
+    #expect(validateStep.contains("id: validate_intermediate_benchmark"))
+    #expect(validateStep.contains("if: always()"))
+    #expect(validateStep.contains("and .passed == true"))
+    #expect(validateStep.contains("and (.metrics.error == \"\")"))
+    #expect(validateStep.contains("and (.metrics.first_failing_case == null)"))
+    #expect(validateStep.contains("and (.metrics.first_failing_layer == null)"))
+    #expect(validateStep.contains("and (.metrics.first_failing_step == null)"))
+    #expect(validateStep.contains("and (.metrics.expected_token == null)"))
+    #expect(validateStep.contains("and (.metrics.actual_token == null)"))
+    #expect(validateStep.contains("\"partial_result\""))
+
+    let validationClause = "((!(startsWith(github.ref_name, 'submissions/'))) || " +
+        "steps.validate_intermediate_benchmark.outcome == 'success')"
+    #expect(timingOrGates.components(separatedBy: validationClause).count - 1 == 2) // artifact-path check + upload
+    #expect(timingOrGates.contains(
+        "if: ${{ always() && steps.prepare_golden_expectations.outcome == 'success' && \(validationClause) }}"
+    ))
+    #expect(timingOrGates.contains("if: ${{ always() && \(validationClause) }}"))
+}
+
+@Test
+func combineMergeStepChecksGatesScoreBeforeMergingAndClearsPartialResult() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+
+    let mergeRange = try #require(workflow.range(of: "- name: Merge gates and timing into machine1"))
+    let assembleRange = try #require(
+        workflow.range(of: "- name: Assemble machine directories", range: mergeRange.lowerBound..<workflow.endIndex)
+    )
+    let mergeStep = String(workflow[mergeRange.lowerBound..<assembleRange.lowerBound])
+
+    // Defense-in-depth: even though benchmark-timing-or-gates.yml's own
+    // validation should already prevent a failing gates score.json from
+    // reaching this step, check again before merging.
+    #expect(mergeStep.contains(".passed == true"))
+    #expect(mergeStep.contains(".metrics.error == \"\""))
+    #expect(mergeStep.contains(".metrics.first_failing_case == null"))
+    #expect(mergeStep.contains(".metrics.first_failing_layer == null"))
+    #expect(mergeStep.contains(".metrics.first_failing_step == null"))
+    #expect(mergeStep.contains(".metrics.expected_token == null"))
+    #expect(mergeStep.contains(".metrics.actual_token == null"))
+    #expect(mergeStep.contains("gates_dir}/score.json") || mergeStep.contains("gates_dir\"/score.json"))
+    // Once merged, this is the real, final combined result -- clear the marker.
+    #expect(mergeStep.contains(".metrics.partial_result = false"))
+}
+
+@Test
+func validateSliceRangesJobRunsBeforeExpensiveSliceMachinesAndGatesThem() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+
+    let validateRangesRange = try #require(workflow.range(of: "  validate-slice-ranges:\n"))
+    let slice1Range = try #require(
+        workflow.range(of: "  correctness-slice-1:\n", range: validateRangesRange.lowerBound..<workflow.endIndex)
+    )
+    #expect(validateRangesRange.lowerBound < slice1Range.lowerBound)
+
+    let validateRangesJob = String(workflow[validateRangesRange.lowerBound..<slice1Range.lowerBound])
+    // Cheap and checkout-free: no reference checkpoint, no secrets, no environment: gate.
+    #expect(!validateRangesJob.contains("uses: actions/checkout"))
+    #expect(!validateRangesJob.contains("environment:"))
+    #expect(!validateRangesJob.contains("secrets."))
+    #expect(validateRangesJob.contains("runs-on: ubuntu-latest"))
+    #expect(validateRangesJob.contains("range_1"))
+    #expect(validateRangesJob.contains("range_2"))
+    #expect(validateRangesJob.contains("range_3"))
+    #expect(validateRangesJob.contains("sort_by(.start)"))
+
+    for slice in ["correctness-slice-1", "correctness-slice-2", "correctness-slice-3"] {
+        let sliceRange = try #require(workflow.range(of: "  \(slice):\n"))
+        let sliceJob = String(workflow[sliceRange.lowerBound...].prefix(400))
+        #expect(sliceJob.contains("needs: validate-slice-ranges"))
+        #expect(sliceJob.contains("if: ${{ inputs.run_benchmark && needs.validate-slice-ranges.result == 'success' }}"))
+    }
+}
+
+@Test
+func parallelArtifactNamesIncludeRunAttemptToAvoidReRunCollisions() throws {
+    let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
+    let slice = try String(contentsOfFile: ".github/workflows/benchmark-correctness-slice.yml", encoding: .utf8)
+    let timingOrGates = try String(contentsOfFile: ".github/workflows/benchmark-timing-or-gates.yml", encoding: .utf8)
+
+    let runIdAttempt = "${{ github.run_id }}-${{ github.run_attempt }}"
+    #expect(slice.contains("name: benchmark-parallel-\(runIdAttempt)-${{ inputs.slice_name }}"))
+    #expect(timingOrGates.contains("name: benchmark-parallel-\(runIdAttempt)-${{ inputs.mode }}"))
+    #expect(workflow.contains("pattern: benchmark-parallel-\(runIdAttempt)-*"))
+    for dir in ["gates", "timing", "machine2", "machine3", "machine4"] {
+        #expect(workflow.contains("benchmark-parallel-\(runIdAttempt)-\(dir)"))
+    }
+}
+
+@Test
+func benchmarkWorkflowHasConcurrencyGroupMatchingSiblingProbes() throws {
+    let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
+    #expect(workflow.contains("concurrency:\n  group: benchmark-${{ github.ref }}\n  cancel-in-progress: false"))
 }
 
 // DeepSeekRuntime was split across DeepSeekRuntime*.swift; concatenate them so
