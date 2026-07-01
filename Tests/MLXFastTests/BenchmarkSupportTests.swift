@@ -33,7 +33,7 @@ func correctnessAcceptsOnlyExactTopLogitTies() {
 }
 
 @Test
-func failedScorePreservesCorrectnessTokenMismatchAndRuntimeLabel() {
+func failedScoreRedactsCorrectnessTokenMismatchByDefault() {
     let report = CorrectnessReport(
         passed: false,
         checkedSteps: 7,
@@ -57,6 +57,45 @@ func failedScorePreservesCorrectnessTokenMismatchAndRuntimeLabel() {
         error: "token mismatch",
         correctness: report,
         passedCorrectness: false,
+        runtime: "swift-local-iterate"
+    )
+
+    #expect(payload.score == nil)
+    #expect(payload.passed == false)
+    #expect(payload.metrics.runtime == "swift-local-iterate")
+    #expect(payload.metrics.firstFailingCase == "local-iterate")
+    #expect(payload.metrics.firstFailingStep == 6)
+    #expect(payload.metrics.expectedToken == nil)
+    #expect(payload.metrics.actualToken == nil)
+}
+
+@Test
+func failedScorePreservesExplicitPublicMismatchTokensAndRuntimeLabel() {
+    let report = CorrectnessReport(
+        passed: false,
+        checkedSteps: 7,
+        caseCount: 1,
+        expertCacheHits: 0,
+        expertCacheMisses: 0,
+        expertCacheEvictions: 0,
+        expertBytesRead: 0,
+        expertReadSeconds: 0,
+        expertPeakCachedTensors: 0,
+        expertHitRate: 0,
+        firstFailingCase: "local-iterate",
+        firstFailingStep: 6,
+        expectedToken: 123,
+        actualToken: 456,
+        goldenHash: "golden",
+        error: "token mismatch"
+    )
+
+    let payload = DeepSeekRuntime.failedScore(
+        error: "token mismatch",
+        correctness: report,
+        passedCorrectness: false,
+        expectedToken: report.expectedToken,
+        actualToken: report.actualToken,
         runtime: "swift-local-iterate"
     )
 

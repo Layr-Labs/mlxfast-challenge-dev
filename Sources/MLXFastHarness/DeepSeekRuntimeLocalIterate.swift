@@ -41,6 +41,8 @@ extension DeepSeekRuntime {
                 correctness: correctnessReport,
                 passedCorrectness: passedCorrectness,
                 expertStats: expertStats,
+                expectedToken: correctnessReport?.expectedToken,
+                actualToken: correctnessReport?.actualToken,
                 weightsDigest: transformedWeightsDigest,
                 benchmarkWallSeconds: secondsSince(startedAt),
                 preflightSeconds: validationSeconds,
