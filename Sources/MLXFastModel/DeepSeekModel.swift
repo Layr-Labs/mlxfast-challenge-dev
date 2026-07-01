@@ -256,13 +256,13 @@ public enum DeepSeekModel {
         let moeWeights = try weightCache.moeWeights(layerIndex: layerIndex)
         let blockSpec = DeepSeekBlockSpec(config: config)
         let moeSpec = try DeepSeekMoESpec(layerIndex: layerIndex, config: config)
-        let mask = try DeepSeekAttentionMask.causal(
+        let mask = cache == nil ? try DeepSeekAttentionMask.causal(
             queryLength: inputIDs.shape[1],
             keyLength: inputIDs.shape[1],
             queryOffset: positionOffset,
             keyOffset: positionOffset,
             windowSize: config.slidingWindow
-        )
+        ) : nil
 
         return try DeepSeekBlock.forward(
             hidden: hidden,

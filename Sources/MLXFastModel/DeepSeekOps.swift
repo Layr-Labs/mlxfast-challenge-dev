@@ -83,22 +83,29 @@ public enum DeepSeekOps {
             )
         }
         let outputDimensions = weight.logicalShape[1]
-        var outputs: [MLXArray] = []
-        outputs.reserveCapacity(groupCount)
-        for groupIndex in 0..<groupCount {
-            let groupInput = input[0..., groupIndex, 0..., 0...]
-            let rowStart = groupIndex * outputDimensions
-            let rowEnd = rowStart + outputDimensions
-            let groupWeight = weight.rows(
-                rowStart..<rowEnd,
-                logicalShape: [outputDimensions, weight.logicalShape[2]]
-            )
-            outputs.append(
-                linear(input: groupInput, weight: groupWeight)
-                    .expandedDimensions(axis: 1)
-            )
-        }
-        return concatenated(outputs, axis: 1)
+        
+        let batchSize = input.shape[0]
+        let sequenceLength = input.shape[2]
+        let inputDim = input.shape[3]
+        
+        let xGrouped = input.transposed(1, 0, 2, 3).reshaped([groupCount, batchSize * sequenceLength, inputDim])
+        let wGrouped = weight.weight.reshaped([groupCount, outputDimensions, -1])
+        let scalesGrouped = weight.scales!.reshaped([groupCount, outputDimensions, -1])
+        let biasesGrouped = weight.biases?.reshaped([groupCount, outputDimensions, -1])
+        
+        var projected = quantizedMM(
+            xGrouped,
+            wGrouped,
+            scales: scalesGrouped,
+            biases: biasesGrouped,
+            transpose: true,
+            groupSize: weight.groupSize,
+            bits: weight.bits,
+            mode: weight.mode
+        )
+        
+        projected = projected.reshaped([groupCount, batchSize, sequenceLength, outputDimensions])
+        return projected.transposed(1, 0, 2, 3)
     }
 
     public static func rmsNorm(input: MLXArray, weight: MLXArray, eps: Double) -> MLXArray {
