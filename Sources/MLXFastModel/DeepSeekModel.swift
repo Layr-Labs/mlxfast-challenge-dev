@@ -256,13 +256,21 @@ public enum DeepSeekModel {
         let moeWeights = try weightCache.moeWeights(layerIndex: layerIndex)
         let blockSpec = DeepSeekBlockSpec(config: config)
         let moeSpec = try DeepSeekMoESpec(layerIndex: layerIndex, config: config)
-        let mask = try DeepSeekAttentionMask.causal(
-            queryLength: inputIDs.shape[1],
-            keyLength: inputIDs.shape[1],
-            queryOffset: positionOffset,
-            keyOffset: positionOffset,
-            windowSize: config.slidingWindow
-        )
+        // Both attention forwards rebuild the causal mask from KV-cache state
+        // whenever a cache is present (DeepSeekLayerCache.local is non-optional, so
+        // this holds for every scored decode/prefill layer), which makes a mask
+        // built here dead on arrival. Only build it when no cache will overwrite it,
+        // eliminating one discarded causal-mask graph per layer per token. Passing
+        // nil is value-identical: the cache path constructs the same mask itself.
+        let mask: MLXArray? = cache == nil
+            ? try DeepSeekAttentionMask.causal(
+                queryLength: inputIDs.shape[1],
+                keyLength: inputIDs.shape[1],
+                queryOffset: positionOffset,
+                keyOffset: positionOffset,
+                windowSize: config.slidingWindow
+            )
+            : nil
 
         return try DeepSeekBlock.forward(
             hidden: hidden,
