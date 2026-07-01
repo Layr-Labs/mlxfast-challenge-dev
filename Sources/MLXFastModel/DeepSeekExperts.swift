@@ -70,9 +70,8 @@ public enum DeepSeekRoutedExperts {
 
         var outputs = Array<MLXArray?>(repeating: nil, count: outputCount)
         for (expertIndex, flatIndices) in flatIndicesByExpert {
-            let expertWeights = try weights(
-                forExpert: expertIndex,
-                loader: loader,
+            let expertWeights = try loader.routedExpertWeights(
+                expertIndex: expertIndex,
                 spec: spec
             )
             let tokens = concatenated(
