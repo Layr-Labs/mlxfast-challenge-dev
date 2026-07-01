@@ -1176,9 +1176,15 @@ func benchmarkLocalIterateModeUsesPublicFixtureAndNonOfficialScore() throws {
     #expect(cli.contains("DeepSeekRuntime.localIterate("))
     #expect(cli.contains("MLXFastConstants.defaultLocalIterateScorePath"))
     #expect(runtime.contains("runLocalIterateCheckedTimingWithWorker("))
+    #expect(runtime.contains("includes_seed_prefill=true"))
+    #expect(runtime.contains("try worker.beginDecode(seedTokens: testCase.promptTokens)"))
+    #expect(runtime.contains("try worker.decodeStep(inputToken: testCase.expectedTokens[decodedStep])"))
+    #expect(!runtime.contains("teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[decodedStep])"))
     #expect(runtime.contains("score: nil"))
     #expect(options.contains("runtime: String = \"swift-local-iterate\""))
-    #expect(runtime.contains("teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[decodedStep])"))
+    let decodeStartRange = try #require(runtime.range(of: "let decodePhaseStart = DispatchTime.now().uptimeNanoseconds"))
+    let prefillStartRange = try #require(runtime.range(of: "let prefillStart = DispatchTime.now().uptimeNanoseconds"))
+    #expect(decodeStartRange.lowerBound < prefillStartRange.lowerBound)
 }
 
 @Test
