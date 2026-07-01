@@ -83,22 +83,35 @@ public enum DeepSeekOps {
             )
         }
         let outputDimensions = weight.logicalShape[1]
-        var outputs: [MLXArray] = []
-        outputs.reserveCapacity(groupCount)
-        for groupIndex in 0..<groupCount {
-            let groupInput = input[0..., groupIndex, 0..., 0...]
-            let rowStart = groupIndex * outputDimensions
-            let rowEnd = rowStart + outputDimensions
-            let groupWeight = weight.rows(
-                rowStart..<rowEnd,
-                logicalShape: [outputDimensions, weight.logicalShape[2]]
-            )
-            outputs.append(
-                linear(input: groupInput, weight: groupWeight)
-                    .expandedDimensions(axis: 1)
-            )
+        guard let scales = weight.scales else {
+            throw MLXFastError.invalidInput("quantized grouped linear missing scales")
         }
-        return concatenated(outputs, axis: 1)
+
+        // Batch the per-group projections into a single grouped quantizedMM rather
+        // than looping over outputGroups (8 groups x 43 layers ~= 344 quantizedMM /
+        // decode token for woA alone, plus 8 row-slice views + a concat per layer).
+        // The flat quantized weight [groups*out, packed] and its scales/biases
+        // reshape (metadata-only, contiguous) into a [groups, out, ...] batch, and
+        // quantizedMM broadcasts the batch dims: it computes input[b, g] @ w[g].T
+        // per (batch, group) with the SAME per-matmul M/N/K as the loop, so the
+        // kernel selection is unchanged and the result is bit-identical.
+        let packedInput = weight.weight.shape[weight.weight.shape.count - 1]
+        let scaleGroups = scales.shape[scales.shape.count - 1]
+        let groupedWeight = weight.weight.reshaped([groupCount, outputDimensions, packedInput])
+        let groupedScales = scales.reshaped([groupCount, outputDimensions, scaleGroups])
+        let groupedBiases = weight.biases.map {
+            $0.reshaped([groupCount, outputDimensions, scaleGroups])
+        }
+        return quantizedMM(
+            input,
+            groupedWeight,
+            scales: groupedScales,
+            biases: groupedBiases,
+            transpose: true,
+            groupSize: weight.groupSize,
+            bits: weight.bits,
+            mode: weight.mode
+        )
     }
 
     public static func rmsNorm(input: MLXArray, weight: MLXArray, eps: Double) -> MLXArray {
