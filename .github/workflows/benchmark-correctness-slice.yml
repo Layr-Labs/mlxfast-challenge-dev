@@ -181,8 +181,64 @@ jobs:
           fi
           exit "${status}"
 
-      - name: Check correctness slice artifact paths
+      # Mirrors benchmark.yml's "Validate correctness artifacts" gate: on a real
+      # hidden-step mismatch, CorrectnessReport carries the actual golden token,
+      # the model's predicted token, and the failing case name. deny-private-
+      # artifacts.sh only checks filenames/symlinks/size, not JSON content, so
+      # without this the raw report would otherwise reach the unconditional
+      # upload below. For submission branches (untrusted submitted code), a
+      # failed validation blocks the report from ever being staged/uploaded --
+      # the failure still reaches combine's overall pass/fail via this job's own
+      # exit code, just without the sensitive field values leaving the runner.
+      - name: Validate correctness slice artifacts
+        id: validate_correctness_slice
         if: always()
+        env:
+          STEP_RANGE: ${{ inputs.step_range }}
+        run: |
+          set -euo pipefail
+          test -s correctness-report.json
+          range_start="${STEP_RANGE%-*}"
+          range_end="${STEP_RANGE#*-}"
+          expected_checked_steps=$((range_end - range_start))
+          jq -e \
+            --arg golden_hash "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}" \
+            --argjson checked_steps "${expected_checked_steps}" \
+            '
+            def same_keys($expected):
+              (keys_unsorted | sort) == ($expected | sort);
+
+            same_keys([
+              "actual_token",
+              "case_count",
+              "checked_steps",
+              "error",
+              "expected_token",
+              "expert_bytes_read",
+              "expert_cache_evictions",
+              "expert_cache_hits",
+              "expert_cache_misses",
+              "expert_hit_rate",
+              "expert_peak_cached_tensors",
+              "expert_read_seconds",
+              "first_failing_case",
+              "first_failing_step",
+              "golden_hash",
+              "passed"
+            ])
+            and .passed == true
+            and .checked_steps == $checked_steps
+            and .golden_hash == $golden_hash
+            and .error == ""
+            and .first_failing_case == null
+            and .first_failing_step == null
+            and .expected_token == null
+            and .actual_token == null
+            ' \
+            correctness-report.json >/dev/null
+
+      - name: Check correctness slice artifact paths
+        if: ${{ always() && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_correctness_slice.outcome == 'success') }}
         run: |
           set -euo pipefail
           .github/scripts/deny-private-artifacts.sh \
@@ -191,7 +247,7 @@ jobs:
             weights.sha256
 
       - name: Upload slice artifact
-        if: always()
+        if: ${{ always() && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_correctness_slice.outcome == 'success') }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: benchmark-parallel-${{ github.run_id }}-${{ inputs.slice_name }}

@@ -375,6 +375,36 @@ jobs:
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
       MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
+      # combine runs with if: always() so it can report a clear verdict even
+      # when an upstream machine fails, but without this check a failed
+      # upstream job (e.g. a real hidden-correctness failure on a slice) would
+      # only surface once the download/merge steps below hit a missing
+      # artifact directory, as an opaque "No such file or directory".
+      - name: Check upstream jobs succeeded
+        env:
+          SLICE_1_RESULT: ${{ needs.correctness-slice-1.result }}
+          SLICE_2_RESULT: ${{ needs.correctness-slice-2.result }}
+          SLICE_3_RESULT: ${{ needs.correctness-slice-3.result }}
+          TIMING_RESULT: ${{ needs.benchmark-timing.result }}
+          GATES_RESULT: ${{ needs.benchmark-gates.result }}
+        run: |
+          set -euo pipefail
+          status=0
+          for pair in \
+            "correctness-slice-1=${SLICE_1_RESULT}" \
+            "correctness-slice-2=${SLICE_2_RESULT}" \
+            "correctness-slice-3=${SLICE_3_RESULT}" \
+            "benchmark-timing=${TIMING_RESULT}" \
+            "benchmark-gates=${GATES_RESULT}"; do
+            name="${pair%%=*}"
+            result="${pair#*=}"
+            if [[ "${result}" != "success" ]]; then
+              echo "::error::combine: upstream job ${name} did not succeed (result=${result})"
+              status=1
+            fi
+          done
+          exit "${status}"
+
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
@@ -399,6 +429,13 @@ jobs:
           gates_dir="slices/benchmark-parallel-${{ github.run_id }}-gates"
           timing_dir="slices/benchmark-parallel-${{ github.run_id }}-timing"
 
+          # This is one half of the full 5-way weights-hash guarantee: machine1
+          # below is a COPY of gates_hash (see "cp ... machine1/weights.sha256"),
+          # so combine-parallel-correctness.sh's own machine1-vs-machine2/3/4
+          # loop never actually touches timing_hash. This check is what makes
+          # "gates == machine1 == machine2 == machine3 == machine4" transitively
+          # include timing too -- do not remove it without adding a direct
+          # timing-vs-slices comparison elsewhere.
           gates_hash="$(cat "${gates_dir}/weights.sha256")"
           timing_hash="$(cat "${timing_dir}/weights.sha256")"
           if [[ "${gates_hash}" != "${timing_hash}" ]]; then
@@ -406,6 +443,11 @@ jobs:
             exit 1
           fi
 
+          # Base $g (gates) and only overlay the timing-specific fields below --
+          # preflight_seconds/correctness_seconds are deliberately left at $g's
+          # values: the timing machine runs with checkGates=false and skips the
+          # base case (MLXFAST_BENCHMARK_CORRECTNESS_STEPS=0), so it has no
+          # gates-adjacent work of its own to report for either field.
           jq -n \
             --slurpfile gates "${gates_dir}/score.json" \
             --slurpfile timing "${timing_dir}/score.json" \

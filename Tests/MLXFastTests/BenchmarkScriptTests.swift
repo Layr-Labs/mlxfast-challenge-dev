@@ -481,6 +481,13 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(!workflow.contains("hashFiles('score.json') != '' && hashFiles('score.json.sha256') != '' && hashFiles('benchmark-integrity.json') != ''"))
     #expect(workflow.contains(".github/scripts/stage-benchmark-artifacts.sh"))
     #expect(workflow.contains("inputs.run_benchmark"))
+    // Exact per-job guard strings, not just substring presence -- a flipped
+    // `!inputs.run_benchmark` on the wrong job would still satisfy a bare
+    // "contains inputs.run_benchmark" check.
+    #expect(workflow.contains("    if: ${{ !inputs.run_benchmark }}"))
+    let runBenchmarkGuardCount = workflow.components(separatedBy: "if: ${{ inputs.run_benchmark }}").count - 1
+    #expect(runBenchmarkGuardCount == 5) // correctness-slice-1/2/3, benchmark-timing, benchmark-gates
+    #expect(workflow.contains("if: ${{ always() && inputs.run_benchmark }}"))
     #expect(workflow.contains("golden.sha256=\"${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256\""))
     #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results"))
     #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/correctness-results"))
@@ -1533,6 +1540,66 @@ func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
     process.waitUntilExit()
 
     #expect(process.terminationStatus != 0)
+}
+
+@Test
+func correctnessSliceWorkflowGatesUploadOnContentValidation() throws {
+    let slice = try String(
+        contentsOfFile: ".github/workflows/benchmark-correctness-slice.yml",
+        encoding: .utf8
+    )
+
+    // A real hidden-step mismatch populates first_failing_case/expected_token/
+    // actual_token with actual golden-adjacent values -- deny-private-
+    // artifacts.sh only checks filenames, not content, so this jq gate is the
+    // only thing standing between a real failure and a public artifact upload.
+    let validateRange = try #require(slice.range(of: "- name: Validate correctness slice artifacts"))
+    let uploadRange = try #require(slice.range(of: "- name: Upload slice artifact"))
+    #expect(validateRange.lowerBound < uploadRange.lowerBound)
+
+    let validateStep = String(slice[validateRange.lowerBound..<uploadRange.lowerBound])
+    #expect(validateStep.contains("id: validate_correctness_slice"))
+    #expect(validateStep.contains("if: always()"))
+    #expect(validateStep.contains("and .passed == true"))
+    #expect(validateStep.contains("and .checked_steps == $checked_steps"))
+    #expect(validateStep.contains("and .error == \"\""))
+    #expect(validateStep.contains("and .first_failing_case == null"))
+    #expect(validateStep.contains("and .first_failing_step == null"))
+    #expect(validateStep.contains("and .expected_token == null"))
+    #expect(validateStep.contains("and .actual_token == null"))
+
+    let gateCondition = "if: ${{ always() && ((!(startsWith(github.ref_name, 'submissions/'))) || " +
+        "steps.validate_correctness_slice.outcome == 'success') }}"
+    #expect(slice.components(separatedBy: gateCondition).count - 1 == 2) // artifact-path check + upload
+}
+
+@Test
+func combineJobFailsFastOnUpstreamJobFailure() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+
+    // Without this, combine's if: always() would let a failed upstream slice
+    // fall through to the download/merge steps and fail there with a raw
+    // "No such file or directory" instead of a clear diagnosis of which job
+    // actually failed.
+    let combineRange = try #require(workflow.range(of: "  combine:\n"))
+    let checkRange = try #require(
+        workflow.range(of: "- name: Check upstream jobs succeeded", range: combineRange.lowerBound..<workflow.endIndex)
+    )
+    let downloadRange = try #require(
+        workflow.range(of: "- name: Download parallel benchmark artifacts", range: combineRange.lowerBound..<workflow.endIndex)
+    )
+    #expect(combineRange.lowerBound < checkRange.lowerBound)
+    #expect(checkRange.lowerBound < downloadRange.lowerBound)
+
+    let checkStep = String(workflow[checkRange.lowerBound..<downloadRange.lowerBound])
+    for job in ["correctness-slice-1", "correctness-slice-2", "correctness-slice-3", "benchmark-timing", "benchmark-gates"] {
+        #expect(checkStep.contains("needs.\(job).result"))
+    }
+    #expect(checkStep.contains("!= \"success\""))
+    #expect(checkStep.contains("exit \"${status}\""))
 }
 
 // DeepSeekRuntime was split across DeepSeekRuntime*.swift; concatenate them so
