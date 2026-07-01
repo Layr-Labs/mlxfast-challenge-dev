@@ -281,7 +281,7 @@ routed expert tensors from the frozen reference checkpoint named by
 `MLXFAST_REFERENCE_DIR`, falling back to the compatibility symlink when that
 environment variable is not set.
 
-The standard preflight/benchmark path enforces a default 10 GiB cap on the
+The standard preflight/benchmark path enforces a default 25 GiB cap on the
 generated `weights/` tree before correctness or timing runs. Change it with
 `MLXFAST_MAX_WEIGHTS_BYTES`; use `0`, `none`, or `unlimited` only for organizer
 debugging. For stricter organizer-side provenance, set

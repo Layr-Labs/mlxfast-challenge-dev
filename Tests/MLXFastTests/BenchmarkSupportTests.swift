@@ -135,8 +135,8 @@ func benchmarkPromptPlanRejectsMalformedBenchmarkOracle() {
 }
 
 @Test
-func defaultTransformedWeightsLimitIsTenGiB() {
-    #expect(MLXFastConstants.defaultMaxTransformedWeightsBytes == 10 * 1024 * 1024 * 1024)
+func defaultTransformedWeightsLimitIsTwentyFiveGiB() {
+    #expect(MLXFastConstants.defaultMaxTransformedWeightsBytes == 25 * 1024 * 1024 * 1024)
 }
 
 @Test
