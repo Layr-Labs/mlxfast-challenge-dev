@@ -53,11 +53,13 @@ jobs:
       # Benchmark whatever ref is dispatched -- see the matching comment on
       # benchmark.yml's own MLXFAST_TRUSTED_BENCHMARK_REF.
       MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}
-      # enforce-trusted-benchmark-workflow.sh defaults to expecting
-      # .github/workflows/benchmark.yml -- this job's own GITHUB_WORKFLOW_REF is
-      # this file instead, since GitHub reports the reusable callee's own path
-      # for workflow_call jobs, not the caller's.
-      MLXFAST_TRUSTED_BENCHMARK_WORKFLOW: .github/workflows/benchmark-correctness-slice.yml
+      # No MLXFAST_TRUSTED_BENCHMARK_WORKFLOW override needed: GITHUB_WORKFLOW_REF
+      # for a workflow_call-invoked job reports the top-level DISPATCHED
+      # workflow's own path (benchmark.yml), not this reusable callee's path --
+      # confirmed empirically (an earlier version of this file guessed the
+      # opposite and every slice failed with "unexpected workflow ref
+      # .../benchmark.yml ... expected .../benchmark-correctness-slice.yml").
+      # enforce-trusted-benchmark-workflow.sh's own default already matches.
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
