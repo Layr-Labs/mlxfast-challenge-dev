@@ -213,6 +213,22 @@ extension DeepSeekRuntime {
             if timingRepeats > 1 {
                 progress?("\(modeName) checked pass \(repeatIndex + 1)/\(timingRepeats) start")
             }
+            // Match official benchmark decode semantics: charge prompt-specific
+            // setup, seed prefill, cache materialization, and checked token steps
+            // to decode_seconds_per_token so local signals cannot hide work that
+            // the official benchmark charges.
+            let decodePhaseStart = DispatchTime.now().uptimeNanoseconds
+            progress?("\(modeName) decode measured start tokens=\(decodeSteps) includes_seed_prefill=true")
+            let warmupCache = DeepSeekModelCache(config: weightCache.config)
+            let warmupLogits = try DeepSeekModel.logits(
+                inputIDs: inputIDsArray(testCase.promptTokens),
+                weightCache: weightCache,
+                cache: warmupCache,
+                positionOffset: 0
+            )
+            _ = try DeepSeekCorrectness.greedyToken(from: warmupLogits)
+            Memory.clearCache()
+
             let cache = DeepSeekModelCache(config: weightCache.config)
             let prefillStart = DispatchTime.now().uptimeNanoseconds
             var logits = try DeepSeekModel.logits(
@@ -239,7 +255,6 @@ extension DeepSeekRuntime {
             cache.materializeCachedState()
             let metricsBeforeDecode = weightCache.loader.expertStreamingMetrics?.snapshot()
 
-            let decodeStart = DispatchTime.now().uptimeNanoseconds
             for decodedStep in 0..<decodeSteps {
                 let previousToken = testCase.expectedTokens[decodedStep]
                 logits = try DeepSeekModel.logits(
@@ -271,7 +286,7 @@ extension DeepSeekRuntime {
                     }
                 )
             }
-            totalDecodeSeconds += secondsSince(decodeStart)
+            totalDecodeSeconds += secondsSince(decodePhaseStart)
             totalDecodeBytesRead += expertBytesReadDelta(
                 before: metricsBeforeDecode?.stats,
                 after: weightCache.loader.expertStreamingMetrics?.snapshot().stats
@@ -348,36 +363,38 @@ extension DeepSeekRuntime {
             if timingRepeats > 1 {
                 progress?("\(modeName) checked pass \(repeatIndex + 1)/\(timingRepeats) start")
             }
-            let prefillStart = DispatchTime.now().uptimeNanoseconds
-            var response = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
-            totalPrefillSeconds += secondsSince(prefillStart)
+            // Use the same decode protocol as the official benchmark and start
+            // the parent timer before decode_begin so seed prefill/setup is
+            // charged to decode_seconds_per_token.
+            let decodePhaseStart = DispatchTime.now().uptimeNanoseconds
+            progress?("\(modeName) decode measured start tokens=\(decodeSteps) includes_seed_prefill=true")
+            var response = try worker.beginDecode(seedTokens: testCase.promptTokens)
+            totalPrefillSeconds += (response.seconds ?? secondsSince(decodePhaseStart))
             latestStats = response.expertStats ?? latestStats
             peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
-            guard var actualToken = response.token else {
-                throw MLXFastError.invalidInput("runtime worker \(modeName) prefill response missing token")
+            guard let seedToken = response.seedToken else {
+                throw MLXFastError.invalidInput("runtime worker \(modeName) decode_begin response missing seed token")
             }
             let expectedSeedToken = testCase.expectedTokens[0]
-            if failureStep == nil, actualToken != expectedSeedToken {
+            if failureStep == nil, seedToken != expectedSeedToken {
                 failureStep = repeatIndex * checkedStepsPerPass
                 failureExpected = expectedSeedToken
-                failureActual = actualToken
+                failureActual = seedToken
             }
             let statsBeforeDecode = response.expertStats
 
-            let decodeStart = DispatchTime.now().uptimeNanoseconds
             for decodedStep in 0..<decodeSteps {
-                response = try worker.teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[decodedStep])
+                response = try worker.decodeStep(inputToken: testCase.expectedTokens[decodedStep])
                 latestStats = response.expertStats ?? latestStats
                 peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
                 guard let token = response.token else {
                     throw MLXFastError.invalidInput("runtime worker \(modeName) decode response missing token")
                 }
-                actualToken = token
                 let expectedToken = testCase.expectedTokens[decodedStep + 1]
-                if failureStep == nil, actualToken != expectedToken {
+                if failureStep == nil, token != expectedToken {
                     failureStep = repeatIndex * checkedStepsPerPass + decodedStep + 1
                     failureExpected = expectedToken
-                    failureActual = actualToken
+                    failureActual = token
                 }
                 reportProgress(
                     step: repeatIndex * decodeSteps + decodedStep + 1,
@@ -388,7 +405,7 @@ extension DeepSeekRuntime {
                     }
                 )
             }
-            totalDecodeSeconds += secondsSince(decodeStart)
+            totalDecodeSeconds += secondsSince(decodePhaseStart)
             totalDecodeBytesRead += expertBytesReadDelta(before: statsBeforeDecode, after: latestStats)
             if timingRepeats > 1 {
                 progress?("\(modeName) checked pass \(repeatIndex + 1)/\(timingRepeats) complete")
