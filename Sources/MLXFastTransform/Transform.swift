@@ -85,6 +85,18 @@ public enum SwiftTransform {
             index: index
         )
 
+        // Pack U8 expert scale tensors to 2-bit format. The E8M0 scales typically
+        // have only 4 unique values, so each byte maps to a 2-bit index, giving 4x
+        // compression (8.6 GiB → ~2.1 GiB). The packed data is stored alongside
+        // the manifest so the runtime can load it from local disk instead of seeking
+        // into the reference checkpoint shards.
+        try packExpertScales(
+            referenceDirectory: referenceDirectory,
+            expertsDirectory: expertsDirectory,
+            expertKeys: expertKeys,
+            index: index
+        )
+
         return TransformReport(
             referencePath: referenceDirectory.path,
             outputPath: outputDirectory.path,
@@ -216,6 +228,130 @@ public enum SwiftTransform {
         default:
             return name == "tokenizer" || name == "vocab"
         }
+    }
+
+    /// Pack all U8 expert scale tensors from the reference checkpoint into a
+    /// compact 4-bit-per-value (nibble) format. The E8M0 scales have ~9 unique
+    /// values globally, so each byte maps to a 4-bit palette index, giving 2x
+    /// compression (8.6 GiB → ~4.3 GiB).
+    ///
+    /// Format:
+    ///   - 4 bytes: magic "ES4B" (expert scales 4-bit)
+    ///   - 4 bytes: little-endian uint32 tensor count
+    ///   - 4 bytes: little-endian uint32 palette size (<= 16)
+    ///   - palette_size bytes: the unique U8 values
+    ///   - For each tensor:
+    ///     - 256 bytes: null-terminated tensor name (padded)
+    ///     - 4 bytes: little-endian uint32 original byte count
+    ///     - 4 bytes: little-endian uint32 packed byte count
+    ///     - 4 bytes: little-endian uint32 shape dimension count
+    ///     - shape_dims × 4 bytes: shape values
+    ///   - Packed data for all tensors concatenated (2 values per byte, nibble-packed)
+    private static func packExpertScales(
+        referenceDirectory: URL,
+        expertsDirectory: URL,
+        expertKeys: Set<String>,
+        index: CheckpointIndex
+    ) throws {
+        // Find all scale tensor keys (expert keys ending in .scales)
+        let scaleKeys = expertKeys.filter { $0.hasSuffix(".scales") }.sorted()
+        guard !scaleKeys.isEmpty else { return }
+
+        // Read all scale tensor data and find the global palette
+        var tensorEntries: [(name: String, data: Data, shape: [Int])] = []
+        var allValues = Set<UInt8>()
+
+        let scaleKeysByShard = Dictionary(grouping: scaleKeys) { key in
+            index.weightMap[key] ?? ""
+        }
+
+        for shardName in scaleKeysByShard.keys.sorted() {
+            let shardURL = referenceDirectory.appendingPathComponent(shardName)
+            let header = try Safetensors.readHeader(shardURL)
+            let fileHandle = try FileHandle(forReadingFrom: shardURL)
+            defer { fileHandle.closeFile() }
+
+            for key in scaleKeysByShard[shardName, default: []].sorted() {
+                guard let info = header.tensors[key] else { continue }
+                guard info.dtype == "U8" else { continue }
+
+                let absoluteOffset = UInt64(header.dataBaseOffset) + UInt64(info.dataStart)
+                fileHandle.seek(toFileOffset: absoluteOffset)
+                let data = fileHandle.readData(ofLength: info.byteCount)
+                guard data.count == info.byteCount else {
+                    throw MLXFastError.invalidInput("failed to read scale tensor \(key) from \(shardName)")
+                }
+
+                for byte in data { allValues.insert(byte) }
+                tensorEntries.append((name: key, data: data, shape: info.shape))
+            }
+        }
+
+        let palette = allValues.sorted()
+        guard palette.count <= 16 else {
+            throw MLXFastError.invalidInput("expert scales have \(palette.count) unique values; expected <= 16 for nibble packing")
+        }
+
+        // Build reverse lookup: value -> 4-bit index
+        var valueToIndex = [UInt8: UInt8]()
+        for (i, v) in palette.enumerated() {
+            valueToIndex[v] = UInt8(i)
+        }
+
+        // Write the packed file
+        let outputPath = expertsDirectory.appendingPathComponent("packed_scales.bin")
+        var output = Data()
+
+        // Header: magic + tensor count + palette
+        output.append(contentsOf: [0x45, 0x53, 0x34, 0x42]) // "ES4B"
+        appendUInt32(&output, UInt32(tensorEntries.count))
+        appendUInt32(&output, UInt32(palette.count))
+        output.append(contentsOf: palette)
+
+        // Per-tensor metadata
+        for entry in tensorEntries {
+            // Name: 256 bytes, null-padded
+            var nameBytes = Array(entry.name.utf8.prefix(255))
+            nameBytes.append(contentsOf: Array(repeating: UInt8(0), count: 256 - nameBytes.count))
+            output.append(contentsOf: nameBytes)
+            appendUInt32(&output, UInt32(entry.data.count))
+            let packedCount = (entry.data.count + 1) / 2  // ceil(count / 2) for nibble packing
+            appendUInt32(&output, UInt32(packedCount))
+            appendUInt32(&output, UInt32(entry.shape.count))
+            for dim in entry.shape {
+                appendUInt32(&output, UInt32(dim))
+            }
+        }
+
+        // Packed data: 2 values per byte (4 bits / nibble each)
+        for entry in tensorEntries {
+            let raw = entry.data
+            let packedCount = (raw.count + 1) / 2
+            var packed = Data(count: packedCount)
+            packed.withUnsafeMutableBytes { packedBuf in
+                raw.withUnsafeBytes { rawBuf in
+                    let rawPtr = rawBuf.bindMemory(to: UInt8.self)
+                    let packPtr = packedBuf.bindMemory(to: UInt8.self)
+                    for i in 0..<raw.count {
+                        let idx = valueToIndex[rawPtr[i]] ?? 0
+                        let bytePos = i / 2
+                        if i % 2 == 0 {
+                            packPtr[bytePos] = idx          // low nibble
+                        } else {
+                            packPtr[bytePos] |= idx << 4    // high nibble
+                        }
+                    }
+                }
+            }
+            output.append(packed)
+        }
+
+        try output.write(to: outputPath)
+    }
+
+    private static func appendUInt32(_ data: inout Data, _ value: UInt32) {
+        var le = value.littleEndian
+        data.append(Data(bytes: &le, count: 4))
     }
 
     private static func writeExpertManifest(
