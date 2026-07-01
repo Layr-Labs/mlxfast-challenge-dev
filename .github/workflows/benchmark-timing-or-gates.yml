@@ -1,0 +1,257 @@
+name: benchmark-timing-or-gates
+
+# Reusable job body, called twice by benchmark.yml: once with mode=timing (runs
+# ONLY the timed prefill/decode measurement, skipping the base case AND the
+# anchor/free-run/behavior/GPQA gates entirely) and once with mode=gates (runs
+# ONLY those gates, skipping the timed measurement). Splitting these onto
+# separate machines -- on top of the base case already being split across
+# correctness-slice-1/2/3 -- means the anchor/free-run/behavior/GPQA gates no
+# longer sit serially in front of (or behind) the timed measurement on the same
+# machine. combine.yml's "Merge gates and timing into machine1" step
+# reassembles one full score.json from the two before combine-parallel-
+# correctness.sh runs.
+#
+# Not meant to be dispatched on its own -- workflow_call only.
+on:
+  workflow_call:
+    inputs:
+      mode:
+        required: true
+        type: string
+      reference_download_jobs:
+        required: true
+        type: string
+      reference_min_free_gib:
+        required: true
+        type: string
+      verify_transform:
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: blacksmith-12vcpu-macos-26
+    timeout-minutes: 720
+    environment: benchmark-private-prompts
+    env:
+      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.mode }}
+      MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.mode }}/correctness_golden.json
+      MLXFAST_GPQA_REFERENCE_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.mode }}/gpqa_reference_cases.json
+      MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.mode }}/semantic_gpqa_answers.json
+      MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.mode }}/semantic_gpqa_results.json
+      MLXFAST_SUBMISSION_STATIC_REVIEW_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.mode }}/submission_static_review.json
+      MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+      MLXFAST_IS_SUBMISSION_BRANCH: ${{ (startsWith(github.ref_name, 'submissions/')) && '1' || '0' }}
+      MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
+      MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}
+      MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json
+      MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases.json
+      MLXFAST_GPQA_CASE_COUNT: "5"
+      MLXFAST_GPQA_MAX_NEW_TOKENS: "10"
+      MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "5"
+      MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: "10"
+      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "3"
+      MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
+      MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
+      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
+      MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}
+      MLXFAST_VERIFY_TRANSFORM: ${{ inputs.verify_transform && '1' || '0' }}
+      # Both machines skip the base case entirely -- correctness-slice-1/2/3
+      # cover it. mode selects which of the two remaining halves this machine
+      # runs; see the harness-level comment on BenchmarkOptions for why running
+      # neither (or, structurally impossible here, both) is invalid.
+      MLXFAST_BENCHMARK_CORRECTNESS_STEPS: "0"
+      MLXFAST_BENCHMARK_CHECK_GATES: ${{ inputs.mode == 'gates' && '1' || '0' }}
+      MLXFAST_BENCHMARK_SKIP_TIMED: ${{ inputs.mode == 'gates' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Enforce trusted workflow context
+        run: .github/scripts/enforce-trusted-benchmark-workflow.sh
+
+      - name: Review submitted code for benchmark bypasses
+        if: ${{ startsWith(github.ref_name, 'submissions/') }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          .github/scripts/run-submission-static-review.sh
+
+      - name: Enforce modifiable surface
+        if: ${{ startsWith(github.ref_name, 'submissions/') }}
+        env:
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          BASE_SHA="$(git merge-base origin/main "${HEAD_SHA}")" \
+            .github/scripts/enforce-modifiable-surface.sh
+
+      - name: Probe runtime worker sandbox
+        run: .github/scripts/probe-runtime-worker-sandbox.sh
+
+      - name: Check correctness golden source
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "${MLXFAST_CORRECTNESS_GOLDEN_PATH}")"
+          if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
+            echo "benchmark-timing-or-gates: hidden GPQA behavior gate requires private R2 secrets" >&2
+            exit 1
+          fi
+          if [[ "${MLXFAST_ANTHROPIC_PRESENT}" != "1" ]]; then
+            echo "benchmark-timing-or-gates: semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
+            exit 1
+          fi
+
+      - name: Restore SwiftPM cache
+        id: restore_swiftpm_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        env:
+          MLXFAST_REFERENCE_BASE_URL: ${{ secrets.MLXFAST_REFERENCE_BASE_URL || 'https://ds4.darkbloom.ai/deepseek-v4-flash-4bit' }}
+          MLXFAST_REFERENCE_AUTH_HEADER: ${{ secrets.MLXFAST_REFERENCE_AUTH_HEADER }}
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
+          MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+        run: ./setup.sh
+
+      - name: Save SwiftPM cache
+        if: ${{ steps.restore_swiftpm_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: ${{ steps.restore_swiftpm_cache.outputs.cache-primary-key }}
+
+      - name: Transform reference checkpoint
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" \
+            --output weights
+
+      - name: Prepare correctness golden
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" \
+            "${MLXFAST_CORRECTNESS_GOLDEN_PATH}"
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_GPQA_R2_PATH}" \
+            "${MLXFAST_GPQA_REFERENCE_PATH}"
+          .build/release/mlxfast-swift attach-gpqa-gates \
+            --golden "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
+            --gpqa "${MLXFAST_GPQA_REFERENCE_PATH}" \
+            --tokenizer weights \
+            --output "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
+            --case-count "${MLXFAST_GPQA_CASE_COUNT}" \
+            --max-new-tokens "${MLXFAST_GPQA_MAX_NEW_TOKENS}"
+          actual_hash="$(shasum -a 256 "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | awk '{print $1}')"
+          actual_bytes="$(wc -c < "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | tr -d ' ')"
+          {
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"
+          } >> "${GITHUB_ENV}"
+          echo "benchmark-timing-or-gates: using private GPQA-augmented correctness golden ${actual_hash} bytes=${actual_bytes}"
+          .github/scripts/verify-correctness-golden.sh
+
+      - name: Benchmark
+        env:
+          MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }} mode=${{ inputs.mode }}"
+          MLXFAST_SKIP_TRANSFORM: "1"
+        run: |
+          set -euo pipefail
+          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
+            echo "benchmark-timing-or-gates: running submitted benchmark (${{ inputs.mode }}) with private process logs suppressed"
+            started="${SECONDS}"
+            ./benchmark.sh > "${RUNNER_TEMP}/mlxfast-benchmark-private.log" 2>&1 &
+            pid="$!"
+            while kill -0 "${pid}" 2>/dev/null; do
+              sleep 60
+              if kill -0 "${pid}" 2>/dev/null; then
+                echo "benchmark-timing-or-gates: submitted benchmark still running elapsed=$((SECONDS - started))s"
+              fi
+            done
+            wait "${pid}"
+          else
+            ./benchmark.sh
+          fi
+
+      - name: Semantic GPQA gate
+        # Semantic GPQA answers are captured during the behavior-gate pass, so
+        # only the gates machine has anything for this step to judge.
+        if: ${{ inputs.mode == 'gates' }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+            echo "benchmark-timing-or-gates: semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
+            exit 1
+          fi
+          .github/scripts/run-semantic-gpqa-gate.sh
+
+      - name: Hash transformed weights
+        if: always()
+        run: .github/scripts/hash-weights-directory.sh weights weights.sha256
+
+      - name: Prepare golden expectations for combine
+        id: prepare_golden_expectations
+        if: always()
+        run: |
+          set -euo pipefail
+          test -s score.json
+          test -s benchmark-integrity.json
+          {
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}"
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES}"
+            echo "MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS=${MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS}"
+            echo "MLXFAST_EXPECTED_CORRECTNESS_CASES=${MLXFAST_EXPECTED_CORRECTNESS_CASES}"
+          } > golden-expectations.env
+
+      - name: Check intermediate benchmark artifact paths
+        if: always() && steps.prepare_golden_expectations.outcome == 'success'
+        run: |
+          set -euo pipefail
+          .github/scripts/deny-private-artifacts.sh \
+            score.json \
+            benchmark-integrity.json \
+            weights.sha256 \
+            golden-expectations.env
+
+      - name: Upload intermediate benchmark result
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: benchmark-parallel-${{ github.run_id }}-${{ inputs.mode }}
+          path: |
+            score.json
+            benchmark-integrity.json
+            weights.sha256
+            golden-expectations.env
+          if-no-files-found: error
+          retention-days: 7

@@ -244,6 +244,18 @@ public struct BenchmarkOptions: Equatable {
     public let semanticGPQATokenizerPath: String?
     public let semanticGPQACaseCount: Int
     public let semanticGPQAMaxNewTokens: Int
+    // Both default true/false to reproduce the original, single-machine
+    // behavior exactly. Together with correctnessSteps == 0 (skip only the
+    // base case, split elsewhere) these let the base correctness case, the
+    // anchor/free-run/behavior/GPQA gates, and the timed prefill/decode
+    // measurement each run on their own independent machine: checkGates false
+    // skips anchors/free-run/behavior/GPQA entirely (a "timing-only" machine);
+    // skipTimedBenchmark true skips the prefill/decode measurement entirely (a
+    // "gates-only" machine). Never both false and both skip at once -- that
+    // combination is meaningless (nothing left to check or time) and is
+    // rejected by validateBenchmarkOptions.
+    public let checkGates: Bool
+    public let skipTimedBenchmark: Bool
 
     public init(
         weightsPath: String,
@@ -253,7 +265,9 @@ public struct BenchmarkOptions: Equatable {
         semanticGPQAOutputPath: String? = nil,
         semanticGPQATokenizerPath: String? = nil,
         semanticGPQACaseCount: Int = MLXFastConstants.semanticGPQACaseCount,
-        semanticGPQAMaxNewTokens: Int = MLXFastConstants.semanticGPQAMaxNewTokens
+        semanticGPQAMaxNewTokens: Int = MLXFastConstants.semanticGPQAMaxNewTokens,
+        checkGates: Bool = true,
+        skipTimedBenchmark: Bool = false
     ) {
         self.weightsPath = weightsPath
         self.goldenPath = goldenPath
@@ -263,6 +277,8 @@ public struct BenchmarkOptions: Equatable {
         self.semanticGPQATokenizerPath = semanticGPQATokenizerPath
         self.semanticGPQACaseCount = semanticGPQACaseCount
         self.semanticGPQAMaxNewTokens = semanticGPQAMaxNewTokens
+        self.checkGates = checkGates
+        self.skipTimedBenchmark = skipTimedBenchmark
     }
 }
 

@@ -298,6 +298,14 @@ extension DeepSeekRuntime {
                 "semantic GPQA max_new_tokens must be in 1...\(MLXFastConstants.correctnessMaxBehaviorSteps)"
             )
         }
+        // checkGates false skips anchors/free-run/behavior/GPQA; skipTimedBenchmark
+        // true skips the prefill/decode measurement. Both at once would run neither
+        // -- a run that checks and times nothing is never a valid machine role.
+        guard options.checkGates || !options.skipTimedBenchmark else {
+            throw MLXFastError.invalidInput(
+                "benchmark checkGates=false and skipTimedBenchmark=true together check and time nothing"
+            )
+        }
     }
 
     static func benchmarkRequiresRuntimeWorker(golden: GoldenFixture) -> Bool {
@@ -430,49 +438,82 @@ extension DeepSeekRuntime {
             peakRamGB = 0
             lastExpertStats = .zero
 
-            let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
-            progress("timed benchmark start")
-            progress("benchmark prefill worker start")
             let prefillSecondsPerToken: Double
-            do {
-                let prefillWorker = try RuntimeWorkerClient(
-                    options: workerOptions,
-                    weightsPath: options.weightsPath
-                )
-                defer {
-                    prefillWorker.close()
-                }
-                prefillSecondsPerToken = try measureWorkerPrefillSecondsPerToken(
-                    promptTokens: promptPlan.prefillTokens,
-                    expectedToken: promptPlan.expectedPrefillToken,
-                    worker: prefillWorker,
-                    progress: progress,
-                    peakRamGB: &peakRamGB,
-                    expertStats: &lastExpertStats
-                )
-            }
-            progress("benchmark decode worker start")
             let decode: DecodeMeasurement
-            do {
-                let decodeWorker = try RuntimeWorkerClient(
-                    options: workerOptions,
-                    weightsPath: options.weightsPath
+            let benchmarkPeakRamGB: Double
+            let benchmarkExpertStats: ExpertStreamingStats
+            if options.skipTimedBenchmark {
+                // This machine's role is the anchor/free-run/behavior/GPQA gates
+                // only -- a separate "timing-only" machine (checkGates: false)
+                // measures the real prefill/decode numbers. Placeholders here use
+                // the baseline seconds-per-token exactly (speedup == 1.0, always
+                // finite, always clears the floor) rather than 0 or some
+                // arbitrary value: 0 would divide-by-zero into +Infinity in
+                // BenchmarkScore.speedup, and Double.infinity fails JSON
+                // encoding outright. Whatever ships here is overwritten by the
+                // real timing-only machine's values when the two are merged
+                // before combine-parallel-correctness.sh runs.
+                progress("timed benchmark skipped (gates-only machine)")
+                prefillSecondsPerToken = MLXFastConstants.officialBaselinePrefillSecondsPerToken
+                decode = DecodeMeasurement(
+                    secondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+                    bandwidthGBPerToken: 0,
+                    bandwidthSource: "skipped_gates_only_machine"
                 )
-                defer {
-                    decodeWorker.close()
+                timedBenchmarkSeconds = 0
+                benchmarkPeakRamGB = 0
+                benchmarkExpertStats = .zero
+            } else {
+                let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
+                progress("timed benchmark start")
+                progress("benchmark prefill worker start")
+                do {
+                    let prefillWorker = try RuntimeWorkerClient(
+                        options: workerOptions,
+                        weightsPath: options.weightsPath
+                    )
+                    defer {
+                        prefillWorker.close()
+                    }
+                    prefillSecondsPerToken = try measureWorkerPrefillSecondsPerToken(
+                        promptTokens: promptPlan.prefillTokens,
+                        expectedToken: promptPlan.expectedPrefillToken,
+                        worker: prefillWorker,
+                        progress: progress,
+                        peakRamGB: &peakRamGB,
+                        expertStats: &lastExpertStats
+                    )
                 }
-                decode = try measureWorkerDecode(
-                    seedTokens: promptPlan.decodeSeedTokens,
-                    expectedSeedToken: promptPlan.expectedDecodeSeedToken,
-                    expectedTokens: promptPlan.expectedDecodeTokens,
-                    decodeSteps: options.benchmarkDecodeSteps,
-                    worker: decodeWorker,
-                    progress: progress,
-                    peakRamGB: &peakRamGB,
-                    expertStats: &lastExpertStats
-                )
+                progress("benchmark decode worker start")
+                do {
+                    let decodeWorker = try RuntimeWorkerClient(
+                        options: workerOptions,
+                        weightsPath: options.weightsPath
+                    )
+                    defer {
+                        decodeWorker.close()
+                    }
+                    decode = try measureWorkerDecode(
+                        seedTokens: promptPlan.decodeSeedTokens,
+                        expectedSeedToken: promptPlan.expectedDecodeSeedToken,
+                        expectedTokens: promptPlan.expectedDecodeTokens,
+                        decodeSteps: options.benchmarkDecodeSteps,
+                        worker: decodeWorker,
+                        progress: progress,
+                        peakRamGB: &peakRamGB,
+                        expertStats: &lastExpertStats
+                    )
+                }
+                timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
+                benchmarkPeakRamGB = peakRamGB
+                benchmarkExpertStats = lastExpertStats
             }
-            timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
+
+            // Computed unconditionally from whatever `decode`/prefillSecondsPerToken
+            // ended up holding, real or (for a gates-only machine) the baseline
+            // placeholder -- the placeholder yields score/speedups of exactly 1.0,
+            // which trivially clears the floor checks below, so this guard logic
+            // does not need its own skipTimedBenchmark branch.
             let score = BenchmarkScore.score(
                 decodeSecondsPerToken: decode.secondsPerToken,
                 prefillSecondsPerToken: prefillSecondsPerToken
@@ -491,7 +532,7 @@ extension DeepSeekRuntime {
                     error: "computed score was not finite",
                     correctness: correctnessReport,
                     passedCorrectness: false,
-                    peakRamGB: peakRamGB,
+                    peakRamGB: benchmarkPeakRamGB,
                     bandwidthGBPerToken: decode.bandwidthGBPerToken,
                     decodeSecondsPerToken: decode.secondsPerToken,
                     prefillSecondsPerToken: prefillSecondsPerToken,
@@ -509,15 +550,13 @@ extension DeepSeekRuntime {
                     ),
                     correctness: correctnessReport,
                     passedCorrectness: false,
-                    peakRamGB: peakRamGB,
+                    peakRamGB: benchmarkPeakRamGB,
                     bandwidthGBPerToken: decode.bandwidthGBPerToken,
                     decodeSecondsPerToken: decode.secondsPerToken,
                     prefillSecondsPerToken: prefillSecondsPerToken,
                     bandwidthSource: decode.bandwidthSource
                 )
             }
-            let benchmarkPeakRamGB = peakRamGB
-            let benchmarkExpertStats = lastExpertStats
 
             let correctnessStart = DispatchTime.now().uptimeNanoseconds
             progress("correctness start cases=\(golden.totalCorrectnessCaseCount)")
@@ -536,6 +575,7 @@ extension DeepSeekRuntime {
                     golden: golden,
                     worker: correctnessWorker,
                     steps: options.correctnessSteps,
+                    checkGates: options.checkGates,
                     semanticCapture: semanticCapture,
                     progress: progress
                 )

@@ -372,6 +372,12 @@ private enum MLXFastCLI {
             ),
             optionName: "MLXFAST_BENCHMARK_CORRECTNESS_STEPS"
         )
+        // Lets the anchor/free-run/behavior/GPQA gates and the timed prefill/
+        // decode measurement each run on their own machine too, same rationale
+        // as MLXFAST_BENCHMARK_CORRECTNESS_STEPS above. Both default to
+        // reproducing the original, single-machine behavior exactly.
+        let checkGates = environmentValue("MLXFAST_BENCHMARK_CHECK_GATES", fallback: "1") != "0"
+        let skipTimedBenchmark = environmentValue("MLXFAST_BENCHMARK_SKIP_TIMED", fallback: "0") == "1"
         let payload = DeepSeekRuntime.benchmark(
             BenchmarkOptions(
                 weightsPath: weightsPath,
@@ -380,7 +386,9 @@ private enum MLXFastCLI {
                 semanticGPQAOutputPath: semanticOutputPath.isEmpty ? nil : semanticOutputPath,
                 semanticGPQATokenizerPath: weightsPath,
                 semanticGPQACaseCount: semanticCaseCount,
-                semanticGPQAMaxNewTokens: semanticMaxNewTokens
+                semanticGPQAMaxNewTokens: semanticMaxNewTokens,
+                checkGates: checkGates,
+                skipTimedBenchmark: skipTimedBenchmark
             ),
             worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
         )

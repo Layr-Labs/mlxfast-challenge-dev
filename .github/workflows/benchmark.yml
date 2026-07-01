@@ -96,42 +96,30 @@ jobs:
       reference_download_jobs: ${{ inputs.reference_download_jobs }}
       reference_min_free_gib: ${{ inputs.reference_min_free_gib }}
 
-  benchmark:
+  # Only handles run_benchmark=false (correctness-only, no timed benchmark, no
+  # split): a single machine checking the public-or-private golden's base case
+  # unsplit. When run_benchmark=true, benchmark-timing/benchmark-gates below
+  # replace this entirely -- there is no serial single-machine path left for
+  # that mode.
+  correctness-only:
+    if: ${{ !inputs.run_benchmark }}
     runs-on: blacksmith-12vcpu-macos-26
     timeout-minutes: 720
     environment: benchmark-private-prompts
     env:
       MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
-      MLXFAST_GPQA_REFERENCE_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/gpqa_reference_cases.json
-      MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_answers.json
-      MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json
-      MLXFAST_SUBMISSION_STATIC_REVIEW_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/submission_static_review.json
       MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
       # Submission branches run untrusted editable code; gate the modifiable
       # surface + static cheat review on them and suppress submitted-process logs.
       MLXFAST_IS_SUBMISSION_BRANCH: ${{ (startsWith(github.ref_name, 'submissions/')) && '1' || '0' }}
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
-      MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}
-      MLXFAST_RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
       MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 2a747bf797e16d58f5ffedacc0d4bf5ce0d14be00f2421dc04289a2154cb011d
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: "10320"
       MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json
-      MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases.json
-      MLXFAST_GPQA_CASE_COUNT: "5"
-      MLXFAST_GPQA_MAX_NEW_TOKENS: "10"
-      MLXFAST_GPQA_TTFT_CASE_COUNT: "5"
-      MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "5"
-      MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: "10"
-      # Baseline DeepSeek V4 Flash currently passes 3/5 hidden short-answer
-      # semantic GPQA judgments, so the hard gate is calibrated to preserve
-      # baseline behavior rather than demand better-than-baseline GPQA quality.
-      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "3"
-      MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
-      MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 830670206859a1b221508ae44a031205a3eba6f5f13e05b40383bf781bdbf067
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "26110"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
@@ -174,24 +162,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$(dirname "${MLXFAST_CORRECTNESS_GOLDEN_PATH}")"
-          if [[ "${MLXFAST_RUN_BENCHMARK}" != "1" ]]; then
-            test -s "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}"
-            test -s "${MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH}"
-            echo "benchmark: using checked-in public correctness golden"
-          elif [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
-            echo "benchmark: using precomputed R2 private correctness golden"
-          else
-            echo "benchmark: correctness golden requires private R2 secrets" >&2
-            exit 1
-          fi
-          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" && "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
-            echo "benchmark: hidden GPQA behavior gate requires private R2 secrets" >&2
-            exit 1
-          fi
-          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" && "${MLXFAST_ANTHROPIC_PRESENT}" != "1" ]]; then
-            echo "benchmark: semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
-            exit 1
-          fi
+          test -s "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}"
+          test -s "${MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH}"
+          echo "benchmark: using checked-in public correctness golden"
 
       - name: Restore SwiftPM cache
         id: restore_swiftpm_cache
@@ -243,50 +216,17 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
-          if [[ "${MLXFAST_RUN_BENCHMARK}" != "1" ]]; then
-            echo "benchmark: using checked-in public correctness golden"
-            cp "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" "${MLXFAST_CORRECTNESS_GOLDEN_PATH}"
-            export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256="${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256}"
-            export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES="${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES}"
-            {
-              echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256}"
-              echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES}"
-            } >> "${GITHUB_ENV}"
-          elif [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" == "1" ]]; then
-            echo "benchmark: downloading precomputed R2 correctness_golden.json"
-            .github/scripts/download-r2-object.sh \
-              "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" \
-              "${MLXFAST_CORRECTNESS_GOLDEN_PATH}"
-          else
-            echo "benchmark: correctness golden missing; configure private R2 correctness_golden.json" >&2
-            exit 1
-          fi
-          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
-            echo "benchmark: downloading precomputed R2 GPQA behavior cases"
-            .github/scripts/download-r2-object.sh \
-              "${MLXFAST_GPQA_R2_PATH}" \
-              "${MLXFAST_GPQA_REFERENCE_PATH}"
-            .build/release/mlxfast-swift attach-gpqa-gates \
-              --golden "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
-              --gpqa "${MLXFAST_GPQA_REFERENCE_PATH}" \
-              --tokenizer weights \
-              --output "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
-              --case-count "${MLXFAST_GPQA_CASE_COUNT}" \
-              --max-new-tokens "${MLXFAST_GPQA_MAX_NEW_TOKENS}"
-            actual_hash="$(shasum -a 256 "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | awk '{print $1}')"
-            actual_bytes="$(wc -c < "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | tr -d ' ')"
-            export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256="${actual_hash}"
-            export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES="${actual_bytes}"
-            {
-              echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"
-              echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"
-            } >> "${GITHUB_ENV}"
-            echo "benchmark: using private GPQA-augmented correctness golden ${actual_hash} bytes=${actual_bytes}"
-          fi
+          echo "benchmark: using checked-in public correctness golden"
+          cp "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" "${MLXFAST_CORRECTNESS_GOLDEN_PATH}"
+          export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256="${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256}"
+          export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES="${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES}"
+          {
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256}"
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES}"
+          } >> "${GITHUB_ENV}"
           .github/scripts/verify-correctness-golden.sh
 
       - name: Correctness
-        if: ${{ !inputs.run_benchmark }}
         run: |
           set -euo pipefail
           if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
@@ -356,99 +296,8 @@ jobs:
             ' \
             correctness-report.json >/dev/null
 
-      - name: Benchmark
-        if: ${{ inputs.run_benchmark }}
-        env:
-          MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
-          MLXFAST_SKIP_TRANSFORM: "1"
-          # The base correctness case is checked in parallel by correctness-
-          # slice-1/2/3 above instead of here -- 0 means this machine skips only
-          # its own base case; GPQA/free-run/behavior/anchors and the timed
-          # benchmark still run normally. The combine job ANDs this machine's
-          # own passed_correctness (trivially true, since nothing was checked)
-          # with every slice's real verdict before anything is treated as final.
-          MLXFAST_BENCHMARK_CORRECTNESS_STEPS: "0"
-        run: |
-          set -euo pipefail
-          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
-            echo "benchmark: running submitted benchmark with private process logs suppressed"
-            started="${SECONDS}"
-            ./benchmark.sh > "${RUNNER_TEMP}/mlxfast-benchmark-private.log" 2>&1 &
-            pid="$!"
-            while kill -0 "${pid}" 2>/dev/null; do
-              sleep 60
-              if kill -0 "${pid}" 2>/dev/null; then
-                echo "benchmark: submitted benchmark still running elapsed=$((SECONDS - started))s"
-              fi
-            done
-            wait "${pid}"
-          else
-            ./benchmark.sh
-          fi
-
-      - name: Semantic GPQA gate
-        if: ${{ inputs.run_benchmark }}
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-            echo "benchmark: semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
-            exit 1
-          fi
-          .github/scripts/run-semantic-gpqa-gate.sh
-
-      - name: Hash transformed weights
-        if: always() && inputs.run_benchmark
-        run: .github/scripts/hash-weights-directory.sh weights weights.sha256
-
-      - name: Prepare golden expectations for combine
-        id: prepare_golden_expectations
-        if: always() && inputs.run_benchmark
-        run: |
-          set -euo pipefail
-          test -s score.json
-          test -s benchmark-integrity.json
-          {
-            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}"
-            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES}"
-            echo "MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS=${MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS}"
-            echo "MLXFAST_EXPECTED_CORRECTNESS_CASES=${MLXFAST_EXPECTED_CORRECTNESS_CASES}"
-          } > golden-expectations.env
-
-      - name: Check intermediate benchmark artifact paths
-        if: always() && inputs.run_benchmark && steps.prepare_golden_expectations.outcome == 'success'
-        run: |
-          set -euo pipefail
-          .github/scripts/deny-private-artifacts.sh \
-            score.json \
-            benchmark-integrity.json \
-            weights.sha256 \
-            golden-expectations.env
-
-      - name: Upload intermediate benchmark result
-        # This machine's own score.json is NOT the final result: its
-        # passed_correctness is trivially true (MLXFAST_BENCHMARK_CORRECTNESS_
-        # STEPS=0 above means it checked none of the base case itself), and its
-        # checked_steps excludes the ~64 base-case steps the correctness-slice-*
-        # jobs are covering instead. The combine job downloads this alongside
-        # every slice's real report and runs combine-parallel-correctness.sh to
-        # produce the actual, final, validated score -- this upload is an
-        # intermediate input to that job, not a publishable result on its own.
-        if: always() && inputs.run_benchmark
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: benchmark-parallel-${{ github.run_id }}-machine1
-          path: |
-            score.json
-            benchmark-integrity.json
-            weights.sha256
-            golden-expectations.env
-          if-no-files-found: error
-          retention-days: 7
-
       - name: Check correctness artifact paths
-        if: ${{ always() && !inputs.run_benchmark && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_correctness_artifacts.outcome == 'success') }}
+        if: ${{ always() && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_correctness_artifacts.outcome == 'success') }}
         run: |
           set -euo pipefail
           .github/scripts/deny-private-artifacts.sh \
@@ -458,7 +307,7 @@ jobs:
 
       - name: Stage correctness artifacts
         id: stage_correctness_artifacts
-        if: ${{ always() && !inputs.run_benchmark && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_correctness_artifacts.outcome == 'success') }}
+        if: ${{ always() && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_correctness_artifacts.outcome == 'success') }}
         run: |
           set -euo pipefail
           .github/scripts/stage-benchmark-artifacts.sh \
@@ -468,23 +317,58 @@ jobs:
             golden.bytes="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes"
 
       - name: Upload correctness artifacts
-        if: always() && !inputs.run_benchmark && steps.stage_correctness_artifacts.outcome == 'success'
+        if: always() && steps.stage_correctness_artifacts.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: correctness-results-${{ github.run_id }}
           path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/correctness-results
           if-no-files-found: error
 
-  # ANDs the three real correctness-slice verdicts and the benchmark-timing
-  # machine's own (correctness-free) result into the one final, published
-  # score. This job touches no repo credentials -- it only ever reads the
-  # already-computed, already-authenticated outputs the jobs above produced,
-  # so it deliberately has no environment: gate.
+  # Timed benchmark, gates/GPQA, and the base correctness case now each run on
+  # their own independent machine. Splitting the base case alone (correctness-
+  # slice-1/2/3) only saved a fraction of the original serial time: the anchor/
+  # free-run/behavior/GPQA gates turned out to dominate "correctness_seconds",
+  # not the base case, so they needed their own machine too to meaningfully cut
+  # wall-clock time. See BenchmarkOptions.checkGates/skipTimedBenchmark for the
+  # harness-level mechanism.
+  benchmark-timing:
+    name: "benchmark timing (no gates)"
+    if: ${{ inputs.run_benchmark }}
+    uses: ./.github/workflows/benchmark-timing-or-gates.yml
+    secrets: inherit
+    with:
+      mode: timing
+      reference_download_jobs: ${{ inputs.reference_download_jobs }}
+      reference_min_free_gib: ${{ inputs.reference_min_free_gib }}
+      verify_transform: ${{ inputs.verify_transform }}
+
+  benchmark-gates:
+    name: "benchmark gates (no timing)"
+    if: ${{ inputs.run_benchmark }}
+    uses: ./.github/workflows/benchmark-timing-or-gates.yml
+    secrets: inherit
+    with:
+      mode: gates
+      reference_download_jobs: ${{ inputs.reference_download_jobs }}
+      reference_min_free_gib: ${{ inputs.reference_min_free_gib }}
+      verify_transform: ${{ inputs.verify_transform }}
+
+  # ANDs the three real correctness-slice verdicts and the gates machine's own
+  # verdict, and overlays the timing machine's real prefill/decode numbers, into
+  # the one final, published score. This job touches no repo credentials -- it
+  # only ever reads the already-computed, already-authenticated outputs the
+  # jobs above produced, so it deliberately has no environment: gate.
   combine:
     name: combine
     if: ${{ always() && inputs.run_benchmark }}
     needs:
-      [correctness-slice-1, correctness-slice-2, correctness-slice-3, benchmark]
+      [
+        correctness-slice-1,
+        correctness-slice-2,
+        correctness-slice-3,
+        benchmark-timing,
+        benchmark-gates,
+      ]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -502,16 +386,74 @@ jobs:
           path: slices
           merge-multiple: false
 
+      - name: Merge gates and timing into machine1
+        # combine-parallel-correctness.sh expects one "machine1" payload with a
+        # real correctness/gates verdict AND real timing numbers. The gates
+        # machine's own score.json already has the real gates/GPQA verdict (its
+        # timing fields are baseline placeholders -- see BenchmarkOptions'
+        # skipTimedBenchmark comment for why baseline, not zero); overlay the
+        # timing machine's real prefill/decode/speedup numbers on top of it.
+        run: |
+          set -euo pipefail
+          mkdir -p machine1
+          gates_dir="slices/benchmark-parallel-${{ github.run_id }}-gates"
+          timing_dir="slices/benchmark-parallel-${{ github.run_id }}-timing"
+
+          gates_hash="$(cat "${gates_dir}/weights.sha256")"
+          timing_hash="$(cat "${timing_dir}/weights.sha256")"
+          if [[ "${gates_hash}" != "${timing_hash}" ]]; then
+            echo "::error::gates machine weights hash (${gates_hash}) does not match timing machine's (${timing_hash})" >&2
+            exit 1
+          fi
+
+          jq -n \
+            --slurpfile gates "${gates_dir}/score.json" \
+            --slurpfile timing "${timing_dir}/score.json" \
+            '
+            ($gates[0]) as $g | ($timing[0]) as $t
+            | $g
+            | .passed = (.passed and $t.passed)
+            | .score = $t.score
+            | .metrics.decode_seconds_per_token = $t.metrics.decode_seconds_per_token
+            | .metrics.prefill_seconds_per_token = $t.metrics.prefill_seconds_per_token
+            | .metrics.decode_speedup = $t.metrics.decode_speedup
+            | .metrics.prefill_speedup = $t.metrics.prefill_speedup
+            | .metrics.decode_speedup_floor = $t.metrics.decode_speedup_floor
+            | .metrics.prefill_speedup_floor = $t.metrics.prefill_speedup_floor
+            | .metrics.passed_decode_speedup_floor = $t.metrics.passed_decode_speedup_floor
+            | .metrics.passed_prefill_speedup_floor = $t.metrics.passed_prefill_speedup_floor
+            | .metrics.baseline_decode_seconds_per_token = $t.metrics.baseline_decode_seconds_per_token
+            | .metrics.baseline_prefill_seconds_per_token = $t.metrics.baseline_prefill_seconds_per_token
+            | .metrics.timed_benchmark_seconds = $t.metrics.timed_benchmark_seconds
+            | .metrics.bandwidth_gb_per_token = $t.metrics.bandwidth_gb_per_token
+            | .metrics.bandwidth_source = $t.metrics.bandwidth_source
+            | .metrics.benchmark_wall_seconds = ([.metrics.benchmark_wall_seconds, $t.metrics.benchmark_wall_seconds] | max)
+            | .metrics.expert_bytes_read = (.metrics.expert_bytes_read + $t.metrics.expert_bytes_read)
+            | .metrics.expert_cache_hits = (.metrics.expert_cache_hits + $t.metrics.expert_cache_hits)
+            | .metrics.expert_cache_misses = (.metrics.expert_cache_misses + $t.metrics.expert_cache_misses)
+            | .metrics.expert_cache_evictions = (.metrics.expert_cache_evictions + $t.metrics.expert_cache_evictions)
+            | .metrics.expert_read_seconds = (.metrics.expert_read_seconds + $t.metrics.expert_read_seconds)
+            | .metrics.expert_peak_cached_tensors = ([.metrics.expert_peak_cached_tensors, $t.metrics.expert_peak_cached_tensors] | max)
+            | .metrics.expert_hit_rate = (
+                if (.metrics.expert_cache_hits + .metrics.expert_cache_misses) > 0
+                then .metrics.expert_cache_hits / (.metrics.expert_cache_hits + .metrics.expert_cache_misses)
+                else 0
+                end
+              )
+            | .metrics.peak_ram_gb = ([.metrics.peak_ram_gb, $t.metrics.peak_ram_gb] | max)
+            | .metrics.process_resident_memory_gb = ([.metrics.process_resident_memory_gb, $t.metrics.process_resident_memory_gb] | max)
+            ' > machine1/score.json
+
+          cp "${gates_dir}/weights.sha256" machine1/weights.sha256
+          cat "${gates_dir}/golden-expectations.env" >> "${GITHUB_ENV}"
+
       - name: Assemble machine directories
         run: |
           set -euo pipefail
-          mkdir -p machine1 machine2 machine3 machine4
-          cp "slices/benchmark-parallel-${{ github.run_id }}-machine1/score.json" machine1/
-          cp "slices/benchmark-parallel-${{ github.run_id }}-machine1/weights.sha256" machine1/
+          mkdir -p machine2 machine3 machine4
           cp "slices/benchmark-parallel-${{ github.run_id }}-machine2/"* machine2/
           cp "slices/benchmark-parallel-${{ github.run_id }}-machine3/"* machine3/
           cp "slices/benchmark-parallel-${{ github.run_id }}-machine4/"* machine4/
-          cat "slices/benchmark-parallel-${{ github.run_id }}-machine1/golden-expectations.env" >> "${GITHUB_ENV}"
 
       - name: Combine
         env:
@@ -521,17 +463,18 @@ jobs:
 
       - name: Finalize combined score and integrity
         # combine-parallel-correctness.sh only overwrites the correctness
-        # fields inside score.combined.json, so its hash differs from what
-        # machine1's own benchmark-integrity.json recorded -- recompute and
+        # fields inside score.combined.json, and the merge step before it
+        # overlaid timing fields too, so the hash differs from what the gates
+        # machine's own benchmark-integrity.json recorded -- recompute and
         # patch score_sha256 so the integrity cross-check below matches the
-        # artifact that actually gets published, not the pre-combine one.
+        # artifact that actually gets published, not the pre-merge one.
         run: |
           set -euo pipefail
           test -s score.combined.json
           score_hash="$(shasum -a 256 score.combined.json | awk '{print $1}')"
           printf '%s  %s\n' "${score_hash}" score.combined.json > score.combined.json.sha256
           jq --arg hash "${score_hash}" '.score_sha256 = $hash' \
-            "slices/benchmark-parallel-${{ github.run_id }}-machine1/benchmark-integrity.json" \
+            "slices/benchmark-parallel-${{ github.run_id }}-gates/benchmark-integrity.json" \
             > benchmark-integrity.json
           printf '%s  correctness_golden.json\n' "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}" > correctness_golden.json.sha256
           printf '%s  correctness_golden.json\n' "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES}" > correctness_golden.json.bytes
