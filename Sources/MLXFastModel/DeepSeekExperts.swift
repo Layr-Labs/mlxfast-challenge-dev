@@ -55,54 +55,63 @@ public enum DeepSeekRoutedExperts {
         let batchSize = x.shape[0]
         let sequenceLength = x.shape[1]
         let topK = expertIndices.shape[2]
+        let hiddenSize = spec.hiddenSize
         let selectedExperts = expertIndices.asArray(Int32.self).map(Int.init)
 
-        let outputCount = batchSize * sequenceLength * topK
+        let tokenCount = batchSize * sequenceLength
+        let outputCount = tokenCount * topK
         guard outputCount > 0 else {
-            return zeros([batchSize, sequenceLength, topK, spec.hiddenSize], dtype: x.dtype)
+            return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
         }
 
+        // Group activation flat-indices by expert so each expert runs one batched
+        // matmul over all of its tokens instead of one matmul per token.
         var flatIndicesByExpert: [Int: [Int]] = [:]
         flatIndicesByExpert.reserveCapacity(min(outputCount, 256))
         for (flatIndex, expertIndex) in selectedExperts.enumerated() {
             flatIndicesByExpert[expertIndex, default: []].append(flatIndex)
         }
 
-        var outputs = Array<MLXArray?>(repeating: nil, count: outputCount)
+        // Flatten the token axis once. Row (batch * sequenceLength + position)
+        // equals x[batch, position], so an activation flat index maps to token row
+        // flatIndex / topK. Gathering rows with a single `take` replaces the
+        // per-token slice+concat that built each expert batch previously.
+        let xFlat = x.reshaped([tokenCount, hiddenSize])
+
+        var expertOutputs: [MLXArray] = []
+        expertOutputs.reserveCapacity(flatIndicesByExpert.count)
+        var scatterOrder: [Int] = []
+        scatterOrder.reserveCapacity(outputCount)
+
         for (expertIndex, flatIndices) in flatIndicesByExpert {
             let expertWeights = try weights(
                 forExpert: expertIndex,
                 loader: loader,
                 spec: spec
             )
-            let tokens = concatenated(
-                flatIndices.map { flatIndex in
-                    let tokenIndex = flatIndex / topK
-                    let batch = tokenIndex / sequenceLength
-                    let position = tokenIndex % sequenceLength
-                    return x[batch, position].reshaped([1, spec.hiddenSize])
-                },
-                axis: 0
-            )
+            let tokenRows = flatIndices.map { Int32($0 / topK) }
+            let tokens = xFlat.take(MLXArray(tokenRows), axis: 0)
             let expertOutput = DeepSeekMLP.forward(
                 tokens,
                 weights: expertWeights,
                 swigluLimit: spec.swigluLimit
             )
-            for (indexInExpertBatch, flatIndex) in flatIndices.enumerated() {
-                outputs[flatIndex] = expertOutput[indexInExpertBatch].reshaped([1, spec.hiddenSize])
-            }
+            expertOutputs.append(expertOutput)
+            scatterOrder.append(contentsOf: flatIndices)
         }
 
-        let orderedOutputs = try outputs.enumerated().map { flatIndex, output in
-            guard let output else {
-                throw MLXFastError.invalidInput("missing routed expert output at flat index \(flatIndex)")
-            }
-            return output
-        }
+        let combined = concatenated(expertOutputs, axis: 0)
 
-        return concatenated(orderedOutputs, axis: 0)
-            .reshaped([batchSize, sequenceLength, topK, spec.hiddenSize])
+        // scatterOrder[row] is the activation flat index that produced combined
+        // row `row`. Invert it so a single gather places every output back into
+        // activation order, replacing the previous per-row scatter loop.
+        var inverse = [Int32](repeating: 0, count: outputCount)
+        for (row, flatIndex) in scatterOrder.enumerated() {
+            inverse[flatIndex] = Int32(row)
+        }
+        let ordered = combined.take(MLXArray(inverse), axis: 0)
+
+        return ordered.reshaped([batchSize, sequenceLength, topK, hiddenSize])
     }
 
     public static func weights(
