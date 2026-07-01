@@ -259,6 +259,30 @@ func parallelCorrectnessProbeWorkflowIsManualAndSecretFree() throws {
     #expect(slice.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")) // v6.1.0
     #expect(slice.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")) // v6.1.0
     #expect(slice.contains("actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f")) // v6.0.0
+
+    // full-reference-check independently verifies the whole base case, unsplit,
+    // so the combine job can catch a real bug in the split mechanism itself (not
+    // just a range misconfiguration, which combine-parallel-correctness.sh
+    // already catches on its own). It must use the plain `correctness` subcommand
+    // with no --step-range -- not `benchmark --local-iterate`, which only ever
+    // checks a fixed 16 decode steps and would silently under-check here.
+    #expect(workflow.contains("full-reference-check:"))
+    #expect(workflow.contains("mlxfast-swift correctness \\"))
+    #expect(workflow.contains("--base-case-only"))
+    #expect(!workflow.contains("benchmark \\\n            --local-iterate"))
+    // No --step-range anywhere in the parent file: the reusable slice workflow
+    // is the only place that flag is ever passed on a real command line.
+    #expect(!workflow.contains("--step-range \""))
+    #expect(workflow.contains("name: parallel-correctness-probe-${{ github.run_id }}-full-reference"))
+    #expect(workflow.contains("needs: [correctness-slice-1, correctness-slice-2, correctness-slice-3, full-reference-check]"))
+
+    // The combine job must actually cross-check the split verdict against the
+    // full reference, not just download and ignore it.
+    #expect(workflow.contains("Cross-check split result against full reference"))
+    #expect(workflow.contains("full_ref_passed=\"$(jq -r '.passed' \"${full_ref_dir}/correctness-report.json\")\""))
+    #expect(workflow.contains("split_passed=\"$(jq -r '.metrics.passed_correctness' score.combined.json)\""))
+    #expect(workflow.contains("full-reference-check weights hash"))
+    #expect(workflow.contains("disagrees with an independent full-reference check"))
 }
 
 @Test

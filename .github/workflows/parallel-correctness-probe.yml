@@ -87,9 +87,109 @@ jobs:
       reference_download_jobs: ${{ inputs.reference_download_jobs }}
       reference_min_free_gib: ${{ inputs.reference_min_free_gib }}
 
+  full-reference-check:
+    name: "full reference check (no split)"
+    # Independently checks the WHOLE base case on one machine, unsplit -- not
+    # part of the split mechanism at all, and not consumed by
+    # combine-parallel-correctness.sh. Exists purely so the combine job can
+    # assert the split-derived verdict agrees with a genuine, independently-run
+    # full check of the exact same case: if a real bug ever caused the split
+    # ranges to miss part of the window (the class of bug covered by review
+    # finding 2), a real full run over the same case would still check it and
+    # the two verdicts would disagree.
+    runs-on: blacksmith-12vcpu-macos-26
+    timeout-minutes: 360
+    env:
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
+      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Restore SwiftPM cache
+        id: restore_swiftpm_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        env:
+          # This file references no repo secrets by design (see the workflow
+          # header comment; R2/auth-header usage lives only in the reusable
+          # parallel-correctness-probe-slice.yml) -- setup.sh already falls back
+          # to its own public DEFAULT_REFERENCE_BASE_URL and an empty auth header
+          # when these are unset, which is exactly what this job needs.
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
+          MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+        run: ./setup.sh
+
+      - name: Save SwiftPM cache
+        if: ${{ steps.restore_swiftpm_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: ${{ steps.restore_swiftpm_cache.outputs.cache-primary-key }}
+
+      - name: Transform reference checkpoint
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" \
+            --output weights
+
+      - name: Hash transformed weights
+        run: .github/scripts/hash-weights-directory.sh weights weights.sha256
+
+      - name: Run full (unsplit) correctness check
+        run: |
+          set -euo pipefail
+          status=0
+          # Deliberately the plain `correctness` subcommand with no --step-range:
+          # that always covers the full [0, correctnessSteps) window (64 steps) in
+          # one pass, same as every other machine in this probe. --base-case-only
+          # skips anchors/free-run/behavior/GPQA so this is directly comparable to
+          # the slices' own checked_steps -- unlike `benchmark --local-iterate`,
+          # which only ever checks a fixed 16 decode steps regardless of --golden
+          # and would silently under-check (and falsely "disagree" with) here.
+          .build/release/mlxfast-swift correctness \
+            --weights weights \
+            --golden "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" \
+            --base-case-only \
+            > correctness-report.json || status=$?
+          cat correctness-report.json
+          exit "${status}"
+
+      - name: Upload full-reference artifact
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: parallel-correctness-probe-${{ github.run_id }}-full-reference
+          path: |
+            correctness-report.json
+            weights.sha256
+          if-no-files-found: error
+          retention-days: 7
+
   combine:
     name: combine
-    needs: [correctness-slice-1, correctness-slice-2, correctness-slice-3]
+    needs: [correctness-slice-1, correctness-slice-2, correctness-slice-3, full-reference-check]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -140,6 +240,52 @@ jobs:
           MLXFAST_COMBINED_SCORE_PATH: score.combined.json
         run: .github/scripts/combine-parallel-correctness.sh
 
+      # The strongest check in this whole probe: full-reference-check
+      # independently verifies the WHOLE base case, unsplit, on its own machine.
+      # If it disagrees with the split-derived verdict for the exact same case,
+      # that's a real bug in the split mechanism (this is precisely the class of
+      # bug review finding 2 was about, now checked against real infrastructure
+      # instead of a hand-built local repro) -- not a range misconfiguration,
+      # which combine-parallel-correctness.sh already catches on its own.
+      - name: Cross-check split result against full reference
+        if: always()
+        run: |
+          set -euo pipefail
+          full_ref_dir="slices/parallel-correctness-probe-${{ github.run_id }}-full-reference"
+          if [[ ! -s "${full_ref_dir}/correctness-report.json" ]]; then
+            echo "::warning::full-reference-check produced no correctness-report.json; skipping cross-check"
+            exit 0
+          fi
+
+          full_ref_hash="$(cat "${full_ref_dir}/weights.sha256")"
+          split_hash="$(cat machine2/weights.sha256)"
+          if [[ "${full_ref_hash}" != "${split_hash}" ]]; then
+            echo "::error::full-reference-check weights hash (${full_ref_hash}) does not match the split machines' (${split_hash})" >&2
+            exit 1
+          fi
+
+          full_ref_passed="$(jq -r '.passed' "${full_ref_dir}/correctness-report.json")"
+          full_ref_checked_steps="$(jq -r '.checked_steps' "${full_ref_dir}/correctness-report.json")"
+          echo "full-reference passed=${full_ref_passed} checked_steps=${full_ref_checked_steps}"
+
+          if [[ "${full_ref_passed}" == "true" && "${full_ref_checked_steps}" != "${MLXFAST_EXPECTED_CORRECTNESS_STEPS}" ]]; then
+            echo "::error::full-reference-check passed but only checked ${full_ref_checked_steps} of the expected ${MLXFAST_EXPECTED_CORRECTNESS_STEPS} steps" >&2
+            exit 1
+          fi
+
+          if [[ ! -s score.combined.json ]]; then
+            echo "::notice::no combined result to cross-check (combine step already failed separately)"
+            exit 0
+          fi
+          split_passed="$(jq -r '.metrics.passed_correctness' score.combined.json)"
+          echo "split-derived passed_correctness=${split_passed}"
+
+          if [[ "${full_ref_passed}" != "${split_passed}" ]]; then
+            echo "::error::split-derived correctness verdict (${split_passed}) disagrees with an independent full-reference check (${full_ref_passed}) of the exact same base case" >&2
+            exit 1
+          fi
+          echo "cross-check: split-derived verdict agrees with the independent full-reference check"
+
       - name: Probe summary
         if: always()
         run: |
@@ -153,6 +299,11 @@ jobs:
               echo "- first_failing_case: \`$(jq -r '.metrics.first_failing_case // "none"' score.combined.json)\`"
             else
               echo "- combiner did not produce ${MLXFAST_COMBINED_SCORE_PATH:-score.combined.json}"
+            fi
+            full_ref_dir="slices/parallel-correctness-probe-${{ github.run_id }}-full-reference"
+            if [[ -s "${full_ref_dir}/correctness-report.json" ]]; then
+              echo "- full-reference passed: \`$(jq -r '.passed' "${full_ref_dir}/correctness-report.json")\`"
+              echo "- full-reference checked_steps: \`$(jq -r '.checked_steps' "${full_ref_dir}/correctness-report.json")\`"
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
 
