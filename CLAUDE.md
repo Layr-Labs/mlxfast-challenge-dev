@@ -127,6 +127,27 @@ cannot hide future-token work in an unscored seed-prefill phase.
 
 ## Local Workflow
 
+Before optimizing, sync to the latest challenge tip and record a same-machine
+local baseline. Do not compare your changes against a stale branch or an old
+local run:
+
+```bash
+git fetch origin main
+git switch main
+git pull --ff-only
+./setup.sh
+./benchmark.sh --local-iterate
+cp score.local-iterate.json score.local-iterate.baseline.json
+```
+
+Create your working branch from that synced commit, or rebase/merge your
+existing branch onto `origin/main` before trusting local timings. Every
+`./benchmark.sh --local-iterate` result should be interpreted as performance on
+top of the latest synced base commit measured on the same local machine, with
+the same toolchain, model cache, power state, and thermal conditions. If the
+base commit changes, rerun the local baseline before deciding whether an
+optimization is faster.
+
 Start with:
 
 ```bash
@@ -153,6 +174,8 @@ swift build -c release
 ```
 
 `./benchmark.sh --local-iterate` is the fast local edit-loop signal.
+Use it to compare the current working tree against the latest-tip baseline you
+recorded above, not against a result from an older branch.
 `./benchmark.sh --local-submit` is the Yukon pre-submit gate and is intended to
 be longer and closer to the official path while still producing `score: null`.
 `./benchmark.sh` is the full benchmark entrypoint and requires the required
