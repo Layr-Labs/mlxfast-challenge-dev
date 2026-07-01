@@ -9,6 +9,7 @@
     "Sources/MLXFastTransform"
   ],
   "setupCommand": ["bash", "-lc", "./setup.sh"],
+  "preSubmitCommand": ["bash", "-lc", "./benchmark.sh --local-submit"],
   "benchmarkCommand": ["bash", "-lc", "./benchmark.sh"],
   "scorePath": "score.json",
   "runner": {

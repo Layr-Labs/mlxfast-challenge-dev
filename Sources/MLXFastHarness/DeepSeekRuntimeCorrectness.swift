@@ -65,8 +65,13 @@ extension DeepSeekRuntime {
         var loadedGolden: GoldenFixture?
         var loader: DeepSeekWeightLoader?
         do {
+            try requireFile(options.goldenPath, description: "correctness golden file")
             let golden = try loadGoldenFixture(from: options.goldenPath)
             loadedGolden = golden
+            _ = try BenchmarkPreflight.checkCorrectnessArtifacts(
+                weightsPath: options.weightsPath,
+                goldenPath: options.goldenPath
+            )
             let config = try DeepSeekConfig.load(from: options.weightsPath)
             let runtimeLoader = try DeepSeekWeightLoader(
                 weightsPath: options.weightsPath,
@@ -98,10 +103,13 @@ extension DeepSeekRuntime {
         var lastExpertStats = ExpertStreamingStats.zero
         var checkedSteps = 0
         do {
-            try requireRegularFile(options.weightsPath + "/config.json", description: "transformed config")
-            try requireRegularFile(options.goldenPath, description: "correctness golden file")
+            try requireFile(options.goldenPath, description: "correctness golden file")
             let golden = try loadGoldenFixture(from: options.goldenPath)
             loadedGolden = golden
+            _ = try BenchmarkPreflight.checkCorrectnessArtifacts(
+                weightsPath: options.weightsPath,
+                goldenPath: options.goldenPath
+            )
             let worker = try RuntimeWorkerClient(
                 options: workerOptions,
                 weightsPath: options.weightsPath

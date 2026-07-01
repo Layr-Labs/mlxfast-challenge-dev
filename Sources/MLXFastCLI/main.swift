@@ -39,9 +39,6 @@ private enum MLXFastCLI {
             case "attach-gpqa-gates":
                 try runAttachGPQAGates(options)
                 return 0
-            case "calibrate-gpqa-gates":
-                try runCalibrateGPQAGates(options)
-                return 0
             case "generate-gpqa-answers":
                 try runGenerateGPQAAnswers(options)
                 return 0
@@ -235,8 +232,13 @@ private enum MLXFastCLI {
     private static func runBenchmark(_ options: ParsedOptions) throws {
         try options.validate(
             valueOptions: ["--weights", "--golden", "--score-path"],
-            flagOptions: ["--quick"]
+            flagOptions: ["--local-submit", "--local-iterate"]
         )
+        let localSubmit = options.hasFlag("--local-submit")
+        let localIterate = options.hasFlag("--local-iterate")
+        guard !(localSubmit && localIterate) else {
+            throw MLXFastError.invalidInput("--local-submit and --local-iterate cannot be used together")
+        }
         let weightsPath = options.value(
             for: "--weights",
             default: environmentValue(
@@ -248,16 +250,44 @@ private enum MLXFastCLI {
             for: "--golden",
             default: environmentValue(
                 "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-                fallback: MLXFastConstants.defaultGoldenPath
+                fallback: localSubmit
+                    ? MLXFastConstants.defaultPublicLocalSubmitGoldenPath
+                    : localIterate
+                        ? MLXFastConstants.defaultPublicCorrectnessGoldenPath
+                        : MLXFastConstants.defaultGoldenPath
             )
         )
         let scorePath = options.value(
             for: "--score-path",
             default: environmentValue(
                 "MLXFAST_SCORE_PATH",
-                fallback: MLXFastConstants.defaultScorePath
+                fallback: localIterate
+                    ? MLXFastConstants.defaultLocalIterateScorePath
+                    : MLXFastConstants.defaultScorePath
             )
         )
+        if localSubmit || localIterate {
+            let decodeSteps = localSubmit
+                ? MLXFastConstants.localSubmitBenchmarkDecodeSteps
+                : MLXFastConstants.localIterateBenchmarkDecodeSteps
+            let timingRepeats = localSubmit ? MLXFastConstants.localSubmitBenchmarkRepeats : 1
+            let modeName = localSubmit ? "local-submit" : "local-iterate"
+            let runtime = localSubmit ? "swift-local-submit" : "swift-local-iterate"
+            let payload = DeepSeekRuntime.localIterate(
+                LocalIterateOptions(
+                    weightsPath: weightsPath,
+                    goldenPath: goldenPath,
+                    benchmarkDecodeSteps: decodeSteps,
+                    timingRepeats: timingRepeats,
+                    modeName: modeName,
+                    runtime: runtime
+                ),
+                worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
+            )
+            try writeScorePayload(payload, to: scorePath)
+            try printScorePayload(at: scorePath)
+            return
+        }
         let semanticOutputPath = environmentValue("MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH", fallback: "")
         let semanticCaseCount = try parsePositiveInt(
             environmentValue(
@@ -276,13 +306,10 @@ private enum MLXFastCLI {
         if !semanticOutputPath.isEmpty {
             try requirePrivateOutputPath(semanticOutputPath, description: "semantic GPQA answer output")
         }
-        let quick = options.hasFlag("--quick")
         let payload = DeepSeekRuntime.benchmark(
             BenchmarkOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
-                correctnessSteps: quick ? MLXFastConstants.quickCorrectnessSteps : MLXFastConstants.correctnessSteps,
-                benchmarkDecodeSteps: quick ? MLXFastConstants.quickBenchmarkDecodeSteps : MLXFastConstants.benchmarkDecodeSteps,
                 semanticGPQAOutputPath: semanticOutputPath.isEmpty ? nil : semanticOutputPath,
                 semanticGPQATokenizerPath: weightsPath,
                 semanticGPQACaseCount: semanticCaseCount,
@@ -291,7 +318,7 @@ private enum MLXFastCLI {
             worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
         )
         try writeScorePayload(payload, to: scorePath)
-        if quick {
+        if localSubmit {
             try printScorePayload(at: scorePath)
         } else {
             print("wrote \(scorePath)")
@@ -411,143 +438,6 @@ private enum MLXFastCLI {
             "attached GPQA behavior gates cases=\(behaviorCases.count) "
                 + "max_new_tokens=\(maxNewTokens) "
                 + "skipped_over_budget=\(skippedOverBudgetGPQACases) "
-                + "output=\(outputPath)"
-        )
-    }
-
-    private static func runCalibrateGPQAGates(_ options: ParsedOptions) throws {
-        try options.validate(
-            valueOptions: ["--gpqa", "--weights", "--tokenizer", "--output", "--case-count", "--max-new-tokens"]
-        )
-        let gpqaPath = options.value(
-            for: "--gpqa",
-            default: environmentValue("MLXFAST_GPQA_REFERENCE_PATH", fallback: "")
-        )
-        guard !gpqaPath.isEmpty else {
-            throw MLXFastError.invalidInput("calibrate-gpqa-gates requires --gpqa or MLXFAST_GPQA_REFERENCE_PATH")
-        }
-        let weightsPath = options.value(
-            for: "--weights",
-            default: environmentValue("MLXFAST_WEIGHTS_PATH", fallback: MLXFastConstants.defaultWeightsPath)
-        )
-        let tokenizerPath = options.value(
-            for: "--tokenizer",
-            default: environmentValue("MLXFAST_TOKENIZER_PATH", fallback: weightsPath)
-        )
-        let outputPath = options.value(for: "--output", default: gpqaPath)
-        let caseCount = try parsePositiveInt(
-            options.value(for: "--case-count", default: "\(MLXFastConstants.correctnessGPQACaseCount)"),
-            optionName: "--case-count"
-        )
-        let maxNewTokens = try parsePositiveInt(
-            options.value(for: "--max-new-tokens", default: "\(MLXFastConstants.correctnessGPQAMaxNewTokens)"),
-            optionName: "--max-new-tokens"
-        )
-        guard maxNewTokens <= MLXFastConstants.correctnessMaxBehaviorSteps else {
-            throw MLXFastError.invalidInput(
-                "--max-new-tokens must be <= \(MLXFastConstants.correctnessMaxBehaviorSteps)"
-            )
-        }
-
-        try requireFile(gpqaPath, description: "GPQA reference cases file")
-        try requireFile(
-            URL(fileURLWithPath: tokenizerPath).appendingPathComponent("tokenizer.json").path,
-            description: "tokenizer.json"
-        )
-        try requireFile(
-            URL(fileURLWithPath: tokenizerPath).appendingPathComponent("tokenizer_config.json").path,
-            description: "tokenizer_config.json"
-        )
-        try requireFile(
-            URL(fileURLWithPath: weightsPath).appendingPathComponent("config.json").path,
-            description: "weights config.json"
-        )
-
-        let tokenizer = try loadLocalTokenizer(at: tokenizerPath)
-        let gpqaURL = URL(fileURLWithPath: gpqaPath)
-        let data = try Data(contentsOf: gpqaURL)
-        guard var root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              var cases = root["cases"] as? [[String: Any]]
-        else {
-            throw MLXFastError.invalidInput("GPQA reference must be a JSON object with a cases array")
-        }
-
-        let worker = try runtimeWorkerOptions(blockedGoldenPath: gpqaPath)
-        var calibratedCount = 0
-        var skippedOverBudget = 0
-        for index in cases.indices {
-            guard calibratedCount < caseCount else {
-                break
-            }
-            guard let prompt = cases[index]["prompt"] as? String else {
-                throw MLXFastError.invalidInput("gpqa case \(index + 1) missing prompt")
-            }
-            let promptTokens = tokenizer.encode(text: prompt, addSpecialTokens: false)
-            guard !promptTokens.isEmpty else {
-                throw MLXFastError.invalidInput("gpqa case \(index + 1) prompt tokenized to zero tokens")
-            }
-            guard promptTokens.count <= MLXFastConstants.correctnessMaxBehaviorPromptTokens else {
-                skippedOverBudget += 1
-                continue
-            }
-
-            let caseID = (cases[index]["id"] as? String) ?? "gpqa-private-\(index + 1)"
-            let generated = try DeepSeekRuntime.generateGreedyTokens(
-                GreedyGenerationOptions(
-                    weightsPath: weightsPath,
-                    promptTokens: promptTokens,
-                    steps: maxNewTokens
-                ),
-                worker: worker,
-                progress: { step, total in
-                    fputs(
-                        "calibrate-gpqa-gates: generated \(step)/\(total) tokens "
-                            + "for hidden case \(calibratedCount + 1)/\(caseCount)\n",
-                        stderr
-                    )
-                }
-            )
-            let existingSequences = try jsonTokenSequences(
-                from: cases[index]["accepted_token_sequences"],
-                caseName: caseID
-            )
-            let mergedSequences = uniqueSortedTokenSequences(
-                (existingSequences + [generated]).map { Array($0.prefix(maxNewTokens)) }
-            )
-            cases[index]["accepted_token_sequences"] = mergedSequences
-            cases[index]["accepted_responses"] = []
-            cases[index]["needs_reference_output"] = false
-            calibratedCount += 1
-            fputs(
-                "calibrate-gpqa-gates: calibrated hidden case \(calibratedCount)/\(caseCount)\n",
-                stderr
-            )
-        }
-
-        guard calibratedCount == caseCount else {
-            throw MLXFastError.invalidInput(
-                "calibrated \(calibratedCount) token-budget-valid GPQA cases; "
-                    + "need \(caseCount); skipped_over_budget=\(skippedOverBudget)"
-            )
-        }
-
-        root["cases"] = cases
-        root["status"] = "calibrated_reference_outputs"
-        root["needs_reference_output"] = false
-        let outputData = try JSONSerialization.data(
-            withJSONObject: root,
-            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        )
-        let outputURL = URL(fileURLWithPath: outputPath)
-        try FileManager.default.createDirectory(
-            at: outputURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try outputData.write(to: outputURL, options: [.atomic])
-        print(
-            "calibrated GPQA behavior gates cases=\(calibratedCount) "
-                + "max_new_tokens=\(maxNewTokens) "
-                + "skipped_over_budget=\(skippedOverBudget) "
                 + "output=\(outputPath)"
         )
     }
@@ -1054,9 +944,8 @@ private enum MLXFastCLI {
               mlxfast-swift correctness [--weights PATH] [--golden PATH]
               mlxfast-swift correctness-trace [--weights PATH] [--golden PATH] [--case NAME] --step N [--top-k N]
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
-              mlxfast-swift benchmark [--quick] [--weights PATH] [--golden PATH] [--score-path PATH]
+              mlxfast-swift benchmark [--local-submit|--local-iterate] [--weights PATH] [--golden PATH] [--score-path PATH]
               mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
-              mlxfast-swift calibrate-gpqa-gates --gpqa PATH [--weights PATH] [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
 

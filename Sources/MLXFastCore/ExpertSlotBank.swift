@@ -324,7 +324,7 @@ public final class ExpertSlotBank {
         byteLength: Int
     ) throws -> Data {
         let shardPath = try validatedShardURL(shard).path
-        let fd = open(shardPath, O_RDONLY)
+        let fd = open(shardPath, O_RDONLY | O_NOFOLLOW)
         guard fd >= 0 else {
             throw MLXFastError.missingFile(
                 "failed to open expert shard \(shardPath): \(String(cString: strerror(errno)))"
@@ -332,6 +332,21 @@ public final class ExpertSlotBank {
         }
         defer {
             close(fd)
+        }
+        var openedStat = stat()
+        guard fstat(fd, &openedStat) == 0 else {
+            throw MLXFastError.invalidInput(
+                "failed to stat opened expert shard \(shardPath): \(String(cString: strerror(errno)))"
+            )
+        }
+        guard (openedStat.st_mode & S_IFMT) == S_IFREG else {
+            throw MLXFastError.invalidInput("opened expert shard is not a regular file: \(shardPath)")
+        }
+        let end = byteOffset + byteLength
+        guard byteOffset >= 0, byteLength > 0, end <= Int(openedStat.st_size) else {
+            throw MLXFastError.invalidInput(
+                "expert tensor \(name) byte range \(byteOffset)..<\(end) exceeds opened shard size \(openedStat.st_size)"
+            )
         }
 
         var output = Data(count: byteLength)

@@ -1,11 +1,14 @@
 public enum MLXFastConstants {
     public static let referenceModelName = "DeepSeek-V4-Flash-4bit"
     public static let defaultReferencePath = "reference_weights/DeepSeek-V4-Flash-4bit"
+    public static let defaultReferenceCachePath = ".cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main"
     public static let defaultWeightsPath = "weights"
     public static let defaultGoldenPath = "correctness_golden.json"
     public static let defaultPublicCorrectnessPromptPath = "correctness_prompts/public_longcopy_gate_english_512.txt"
     public static let defaultPublicCorrectnessGoldenPath = "correctness_prompts/public_longcopy_gate_english_512_256.json"
+    public static let defaultPublicLocalSubmitGoldenPath = "correctness_prompts/public_longcopy_gate_english_512_1024.json"
     public static let defaultScorePath = "score.json"
+    public static let defaultLocalIterateScorePath = "score.local-iterate.json"
 
     public static let vocabSize = 129_280
     public static let hiddenSize = 4_096
@@ -20,7 +23,6 @@ public enum MLXFastConstants {
     // Keep the public gate long enough to catch broad decode regressions while
     // leaving budget for the hidden GPQA behavior checks in the official job.
     public static let correctnessSteps = 64
-    public static let quickCorrectnessSteps = 64
     public static let correctnessTopLogits = 8
     public static let correctnessLogitTieTolerance = 1e-6
     public static let correctnessMaxAnchorContextTokens = 1_024
@@ -28,9 +30,10 @@ public enum MLXFastConstants {
     public static let correctnessMaxBehaviorPromptTokens = 2_048
     public static let correctnessMaxBehaviorSteps = 64
     public static let correctnessGPQACaseCount = 5
-    // Cross-machine greedy decode can drift after the first answer token even
-    // with pinned Swift/MLX. Exact GPQA behavior accepts the stable first-token
-    // prefix, while the short continuation feeds the private semantic judge.
+    // Cross-machine greedy decode can drift on hidden GPQA even with pinned
+    // Swift/MLX. Semantic GPQA behavior captures a short continuation for the
+    // private judge; exact token enforcement stays on the long copy gate and
+    // non-semantic behavior fixtures.
     public static let correctnessGPQAMaxNewTokens = 10
     // Semantic judging uses short hidden GPQA answers as a baseline-calibrated
     // hard gate for optimizations that preserve the exact prefix but damage
@@ -44,7 +47,12 @@ public enum MLXFastConstants {
     // many checked token steps. Charging setup prevents submitted model code
     // from precomputing future decode tokens in an unscored seed-prefill phase.
     public static let benchmarkDecodeSteps = 128
-    public static let quickBenchmarkDecodeSteps = 64
+    public static let localIterateBenchmarkDecodeSteps = 16
+    // Local submit uses a longer public fixture so the Yukon pre-submit hook
+    // exercises one continuous decode trajectory for about ten minutes instead
+    // of repeating the short local-iterate correctness window.
+    public static let localSubmitBenchmarkDecodeSteps = 1023
+    public static let localSubmitBenchmarkRepeats = 1
     // Seed measured decode with the full prompt. A short instruction-prefix
     // seed can free-run differently across Apple Silicon/MLX versions even
     // when teacher-forced correctness agrees, which makes the timed oracle
@@ -65,6 +73,6 @@ public enum MLXFastConstants {
     public static let scoreDecodeWeight = 0.75
     public static let scorePrefillSpeedupFloor = 0.95
     public static let scoreDecodeSpeedupFloor = 0.95
-    public static let defaultMaxTransformedWeightsBytes = 10 * 1024 * 1024 * 1024
+    public static let defaultMaxTransformedWeightsBytes = 25 * 1024 * 1024 * 1024
     public static let defaultMaxSubmissionSourceBytes = 256 * 1024 * 1024
 }

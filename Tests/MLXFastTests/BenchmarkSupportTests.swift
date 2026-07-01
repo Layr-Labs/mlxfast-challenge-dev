@@ -12,6 +12,75 @@ func runtimeWorkerClientSkipsNonJSONStdoutLines() {
 }
 
 @Test
+func runtimeWorkerEnvironmentStripsOfficialRunAndCIIdentity() {
+    let sanitized = sanitizedRuntimeWorkerEnvironment([
+        "ANTHROPIC_API_KEY": "secret",
+        "CI": "true",
+        "GITHUB_ACTIONS": "true",
+        "GITHUB_RUN_ID": "123",
+        "RUNNER_TEMP": "/tmp/runner",
+        "BLACKSMITH_RUNNER": "1",
+        "MLXFAST_OFFICIAL_BENCHMARK_RUN": "1",
+        "MLXFAST_RUN_BENCHMARK": "1",
+        "MLXFAST_REFERENCE_DIR": "/private/reference",
+        "MLXFAST_PRIVATE_DIR": "/private/golden",
+        "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE": "/tmp/profile.sb",
+        "R2_ACCESS_KEY_ID": "key",
+        "MLXFAST_EXPERT_CACHE_TENSORS": "42",
+        "PATH": "/usr/bin",
+    ])
+
+    for key in [
+        "ANTHROPIC_API_KEY",
+        "CI",
+        "GITHUB_ACTIONS",
+        "GITHUB_RUN_ID",
+        "RUNNER_TEMP",
+        "BLACKSMITH_RUNNER",
+        "MLXFAST_OFFICIAL_BENCHMARK_RUN",
+        "MLXFAST_RUN_BENCHMARK",
+        "MLXFAST_REFERENCE_DIR",
+        "MLXFAST_PRIVATE_DIR",
+        "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE",
+        "R2_ACCESS_KEY_ID",
+    ] {
+        #expect(sanitized[key] == nil)
+    }
+    #expect(sanitized["MLXFAST_USE_RUNTIME_WORKER"] == "0")
+    #expect(sanitized["MLXFAST_EXPERT_CACHE_TENSORS"] == "42")
+    #expect(sanitized["PATH"] == "/usr/bin")
+}
+
+@Test
+func semanticBehaviorGateRequiresPromptAndReferenceAnswer() {
+    let exactOnly = GoldenBehaviorCase(
+        name: "exact-only",
+        promptTokens: [1],
+        acceptedTokenSequences: [[2]],
+        maxNewTokens: 1
+    )
+    let missingReference = GoldenBehaviorCase(
+        name: "missing-reference",
+        promptTokens: [1],
+        acceptedTokenSequences: [[2]],
+        maxNewTokens: 1,
+        semanticPrompt: "question"
+    )
+    let semantic = GoldenBehaviorCase(
+        name: "semantic",
+        promptTokens: [1],
+        acceptedTokenSequences: [[2]],
+        maxNewTokens: 1,
+        semanticPrompt: "question",
+        semanticReferenceAnswer: "answer"
+    )
+
+    #expect(!DeepSeekRuntime.behaviorUsesSemanticJudge(exactOnly))
+    #expect(!DeepSeekRuntime.behaviorUsesSemanticJudge(missingReference))
+    #expect(DeepSeekRuntime.behaviorUsesSemanticJudge(semantic))
+}
+
+@Test
 func correctnessAcceptsOnlyExactTopLogitTies() {
     #expect(correctnessTokenAccepted(
         expectedToken: 30,
@@ -30,6 +99,82 @@ func correctnessAcceptsOnlyExactTopLogitTies() {
         ]
     ))
     #expect(!correctnessTokenAccepted(expectedToken: 30, actualToken: 1, topLogits: nil))
+}
+
+@Test
+func failedScoreRedactsCorrectnessTokenMismatchByDefault() {
+    let report = CorrectnessReport(
+        passed: false,
+        checkedSteps: 7,
+        caseCount: 1,
+        expertCacheHits: 0,
+        expertCacheMisses: 0,
+        expertCacheEvictions: 0,
+        expertBytesRead: 0,
+        expertReadSeconds: 0,
+        expertPeakCachedTensors: 0,
+        expertHitRate: 0,
+        firstFailingCase: "local-iterate",
+        firstFailingStep: 6,
+        expectedToken: 123,
+        actualToken: 456,
+        goldenHash: "golden",
+        error: "token mismatch"
+    )
+
+    let payload = DeepSeekRuntime.failedScore(
+        error: "token mismatch",
+        correctness: report,
+        passedCorrectness: false,
+        runtime: "swift-local-iterate"
+    )
+
+    #expect(payload.score == nil)
+    #expect(payload.passed == false)
+    #expect(payload.metrics.runtime == "swift-local-iterate")
+    #expect(payload.metrics.firstFailingCase == "local-iterate")
+    #expect(payload.metrics.firstFailingStep == 6)
+    #expect(payload.metrics.expectedToken == nil)
+    #expect(payload.metrics.actualToken == nil)
+}
+
+@Test
+func failedScorePreservesExplicitPublicMismatchTokensAndRuntimeLabel() {
+    let report = CorrectnessReport(
+        passed: false,
+        checkedSteps: 7,
+        caseCount: 1,
+        expertCacheHits: 0,
+        expertCacheMisses: 0,
+        expertCacheEvictions: 0,
+        expertBytesRead: 0,
+        expertReadSeconds: 0,
+        expertPeakCachedTensors: 0,
+        expertHitRate: 0,
+        firstFailingCase: "local-iterate",
+        firstFailingStep: 6,
+        expectedToken: 123,
+        actualToken: 456,
+        goldenHash: "golden",
+        error: "token mismatch"
+    )
+
+    let payload = DeepSeekRuntime.failedScore(
+        error: "token mismatch",
+        correctness: report,
+        passedCorrectness: false,
+        expectedToken: report.expectedToken,
+        actualToken: report.actualToken,
+        runtime: "swift-local-iterate"
+    )
+
+    #expect(payload.score == nil)
+    #expect(payload.passed == false)
+    #expect(payload.metrics.runtime == "swift-local-iterate")
+    #expect(payload.metrics.firstFailingCase == "local-iterate")
+    #expect(payload.metrics.firstFailingStep == 6)
+    #expect(payload.metrics.expectedToken == 123)
+    #expect(payload.metrics.actualToken == 456)
 }
 
 @Test
@@ -98,8 +243,8 @@ func benchmarkPromptPlanRejectsMalformedBenchmarkOracle() {
 }
 
 @Test
-func defaultTransformedWeightsLimitIsTenGiB() {
-    #expect(MLXFastConstants.defaultMaxTransformedWeightsBytes == 10 * 1024 * 1024 * 1024)
+func defaultTransformedWeightsLimitIsTwentyFiveGiB() {
+    #expect(MLXFastConstants.defaultMaxTransformedWeightsBytes == 25 * 1024 * 1024 * 1024)
 }
 
 @Test
@@ -203,6 +348,98 @@ func benchmarkPreflightRejectsMissingBenchmarkOracle() throws {
 }
 
 @Test
+func correctnessPreflightAcceptsPublicGoldenWithoutBenchmarkOracle() throws {
+    let fixture = try makePreflightFixture(goldenContents: correctnessOnlyGoldenJSON())
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    let report = try checkCorrectnessPreflight(fixture)
+
+    #expect(report.weightsPath == fixture.weights.path)
+    #expect(report.goldenPath == fixture.golden.path)
+}
+
+@Test
+func correctnessPreflightRejectsExpertManifestOutsideAllowedReferenceRoots() throws {
+    let fixture = try makePreflightFixture(goldenContents: correctnessOnlyGoldenJSON())
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    #expect(throws: MLXFastError.self) {
+        _ = try BenchmarkPreflight.checkCorrectnessArtifacts(
+            weightsPath: fixture.weights.path,
+            goldenPath: fixture.golden.path,
+            environment: [
+                "MLXFAST_REFERENCE_DIR": fixture.root.appendingPathComponent("different-reference").path,
+            ]
+        )
+    }
+}
+
+@Test
+func correctnessPreflightHonorsConfiguredWeightsByteLimit() throws {
+    let fixture = try makePreflightFixture(goldenContents: correctnessOnlyGoldenJSON())
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    #expect(throws: MLXFastError.self) {
+        _ = try checkCorrectnessPreflight(
+            fixture,
+            environment: ["MLXFAST_MAX_WEIGHTS_BYTES": "1"]
+        )
+    }
+}
+
+@Test
+func nonWorkerBenchmarkRejectsBehaviorGatesBecauseTTFTRequiresWorker() throws {
+    let behaviorGate = """
+    {
+      "behavior": [
+        {
+          "name": "gpqa-hidden-ttft",
+          "prompt_tokens": \(arrayJSON(Array(repeating: 1, count: MLXFastConstants.correctnessPromptTokens))),
+          "accepted_token_sequences": [[7]],
+          "max_new_tokens": 1,
+          "semantic_prompt": "Hidden short-answer prompt",
+          "semantic_reference_answer": "Reference answer"
+        }
+      ]
+    }
+    """
+    let fixture = try makePreflightFixture(goldenContents: validGoldenJSON(correctnessGates: behaviorGate))
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    let score = DeepSeekRuntime.benchmark(
+        BenchmarkOptions(
+            weightsPath: fixture.weights.path,
+            goldenPath: fixture.golden.path,
+            correctnessSteps: 1,
+            benchmarkDecodeSteps: 1
+        ),
+        worker: nil
+    )
+
+    #expect(score.passed == false)
+    #expect(score.metrics.passedCorrectness == false)
+    #expect(score.metrics.error == "benchmark behavior and GPQA TTFT gates require runtime worker timing")
+    #expect(score.metrics.gpqaTTFTCaseCount == 0)
+    #expect(score.metrics.preflightSeconds == 0)
+    #expect(score.metrics.weightsByteCount == 0)
+    #expect(score.metrics.weightsFileCount == 0)
+}
+
+@Test
+func runtimeCorrectnessRunsArtifactPreflightBeforeModelExecution() throws {
+    let fixture = try makePreflightFixture(goldenContents: correctnessOnlyGoldenJSON())
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    let report = try DeepSeekRuntime.runCorrectness(
+        CorrectnessOptions(weightsPath: fixture.weights.path, goldenPath: fixture.golden.path)
+    )
+
+    #expect(!report.passed)
+    #expect(report.checkedSteps == 0)
+    #expect(report.error.contains("expert manifest reference_path must be under"))
+}
+
+@Test
 func benchmarkPreflightRejectsMissingSemanticTensor() throws {
     let fixture = try makePreflightFixture(omitDenseTensorName: DeepSeekWeightNames.finalNorm[0])
     defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -275,6 +512,19 @@ private func checkPreflight(
     )
 }
 
+private func checkCorrectnessPreflight(
+    _ fixture: PreflightFixture,
+    environment extraEnvironment: [String: String] = [:]
+) throws -> BenchmarkPreflightReport {
+    var environment = extraEnvironment
+    environment["MLXFAST_REFERENCE_DIR"] = fixture.reference.path
+    return try BenchmarkPreflight.checkCorrectnessArtifacts(
+        weightsPath: fixture.weights.path,
+        goldenPath: fixture.golden.path,
+        environment: environment
+    )
+}
+
 private func makePreflightFixture(
     writeManifest: Bool = true,
     goldenContents: String? = nil,
@@ -340,13 +590,15 @@ private func minimalDeepSeekConfigJSON() -> String {
 
 private func validGoldenJSON(
     correctnessPromptTokens: [Int] = Array(repeating: 1, count: MLXFastConstants.correctnessPromptTokens),
-    benchmarkPromptTokens: [Int] = Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens)
+    benchmarkPromptTokens: [Int] = Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens),
+    correctnessGates: String? = nil
 ) -> String {
     let correctnessPrompt = arrayJSON(correctnessPromptTokens)
     let benchmarkPrompt = arrayJSON(benchmarkPromptTokens)
     let expected = arrayJSON(Array(repeating: 7, count: MLXFastConstants.correctnessSteps))
     let seed = arrayJSON(Array(benchmarkPromptTokens.prefix(MLXFastConstants.benchmarkDecodeSeedTokens)))
     let decode = arrayJSON(Array(repeating: 9, count: MLXFastConstants.benchmarkDecodeSteps))
+    let gates = correctnessGates.map { ",\n  \"correctness_gates\": \($0)" } ?? ""
     return """
     {
       "version": 1,
@@ -363,7 +615,23 @@ private func validGoldenJSON(
         "decode_seed_tokens": \(seed),
         "expected_decode_seed_token": 7,
         "expected_decode_tokens": \(decode)
-      }
+      }\(gates)
+    }
+    """
+}
+
+private func correctnessOnlyGoldenJSON() -> String {
+    let expected = arrayJSON(Array(repeating: 7, count: MLXFastConstants.correctnessSteps))
+    return """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "preflight",
+          "prompt_tokens": \(arrayJSON(Array(repeating: 1, count: MLXFastConstants.correctnessPromptTokens))),
+          "expected_tokens": \(expected)
+        }
+      ]
     }
     """
 }

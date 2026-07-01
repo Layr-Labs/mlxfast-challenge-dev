@@ -21,20 +21,26 @@ MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
 # Run the checked-in public correctness gate.
 .build/release/mlxfast-swift correctness --weights weights
 
+# Fast edit-loop signal: uses the public 512-token correctness prompt, checks
+# the prefill next token plus 16 teacher-forced decode tokens, writes
+# score.local-iterate.json, and prints it to stdout.
+./benchmark.sh --local-iterate
+
 # Run the Darkbloom-compatible benchmark entrypoint.
 # Official benchmark runs use the organizer-supplied hidden correctness_golden.json.
 ./benchmark.sh
 
-# Faster benchmark iteration when a local golden with a benchmark oracle is
-# available: checks 64 correctness tokens, measures 64 decode tokens, writes
-# score.json, and prints score.json to stdout.
-./benchmark.sh --quick
+# Local submit check used by Yukon before upload: runs the public 512-token
+# prompt through a longer checked timing window, writes score.json with
+# score: null, and prints it to stdout.
+./benchmark.sh --local-submit
 
 # Or call the Swift CLI directly
 .build/release/mlxfast-swift correctness --weights weights
 .build/release/mlxfast-swift preflight
+.build/release/mlxfast-swift benchmark --local-iterate
 .build/release/mlxfast-swift benchmark --score-path score.json
-.build/release/mlxfast-swift benchmark --quick --score-path score.json
+.build/release/mlxfast-swift benchmark --local-submit --score-path score.json
 
 # If required model artifacts are missing, the benchmark emits a valid failed
 # score.json instead of a ranked score.
@@ -74,7 +80,10 @@ transform command printed by `setup.sh` or set `MLXFAST_REFERENCE_DIR` before
 running `transform` or `benchmark.sh`. The Swift CLI also honors
 `MLXFAST_REFERENCE_DIR`, `MLXFAST_WEIGHTS_PATH`,
 `MLXFAST_CORRECTNESS_GOLDEN_PATH`, and `MLXFAST_SCORE_PATH` as defaults;
-explicit CLI flags take precedence. Set `MLXFAST_REFERENCE_BASE_URL` to use
+explicit CLI flags take precedence. For `benchmark.sh`, use those `MLXFAST_*`
+environment variables for path overrides; pass `--weights`, `--golden`, and
+`--score-path` only to `.build/release/mlxfast-swift benchmark` directly. Set
+`MLXFAST_REFERENCE_BASE_URL` to use
 another HTTP checkpoint prefix, including Hugging Face. Run `./setup.sh --help`
 for the full local setup knobs.
 
@@ -92,14 +101,11 @@ Full benchmark runs also require the private R2
 `correctness_prompts/gpqa_reference_cases.json` object. The workflow tokenizes
 5 token-budget-valid hidden GPQA multiple-choice prompts locally and attaches
 them as short-answer behavior gates before correctness runs. Each private GPQA
-case must include reference-calibrated `accepted_token_sequences` or
-`accepted_responses`; GPQA answer keys are metadata, not an exact-token oracle.
-Generate those accepted token sequences on the official runner with
-`mlxfast-swift calibrate-gpqa-gates --gpqa PATH --weights weights --tokenizer weights --output PATH`.
-Calibration is cumulative: rerunning it appends and deduplicates the
-runner-observed token sequence instead of replacing older accepted sequences.
+case must include precomputed reference `accepted_token_sequences` or
+`accepted_responses`; GPQA answer keys are metadata, not an exact-token oracle,
+and the benchmark workflow never regenerates this reference object.
 The official workflow checks the first generated GPQA answer token for each
-case, using the stable prefix of any longer calibrated reference sequence.
+case, using the stable prefix of any longer precomputed reference sequence.
 During that hidden behavior correctness pass, it also records TTFT by timing
 prompt prefill through the first greedy answer token. The uploaded score records
 only aggregate TTFT counts and timings; generated first-token IDs, accepted
@@ -112,10 +118,6 @@ candidate answers, and judge text stay in the private runner directory.
 The private workflow treats semantic GPQA as a hard gate with a 3/5 threshold,
 calibrated to the unmodified DeepSeek V4 Flash baseline rather than to
 better-than-baseline GPQA answer quality.
-Because the one-token GPQA behavior gate is exact-token based, calibrate that
-layer on the official Blacksmith runner with the manual
-`calibrate_gpqa_reference` workflow input; M-series local calibration can differ
-from the official runner even at temperature zero.
 If none of those is configured, a full benchmark fails; it will not use a
 committed prompt, committed golden, or Actions cache fallback for ranked
 scoring. Final hidden goldens should come from protected storage. Private
@@ -179,6 +181,24 @@ reference checkpoints, golden files, and local scores live outside
 surface server-side after upload. `--model` is required and is recorded for the
 leaderboard. `MLXFAST_API_URL` / `MLXFAST_API_TOKEN` (or the `YUKON_*`
 equivalents) configure the endpoint and token for scripted runs.
+Before uploading, Yukon runs the contract `preSubmitCommand`, which is
+`./benchmark.sh --local-submit` for this benchmark. That local-submit pass is
+the local submit gate: it uses the public/local oracle, writes and prints
+`score.json`, and stops obviously broken or slower changes before they spend
+official runner time.
+
+## Local Commands
+
+Use these two benchmark modes for local development:
+
+| Command | Purpose | What it checks | Output |
+|---|---|---|---|
+| `./benchmark.sh --local-iterate` | Fast edit-loop signal, usually under 2 minutes after setup. | Public 512-token prompt, prefill next-token check, and 16 teacher-forced decode checks. | `score.local-iterate.json` with `score: null`. |
+| `./benchmark.sh --local-submit` | Yukon pre-submit gate, intended to be about 10 minutes after setup. | Same public prompt, prefill next-token check, and 1023 teacher-forced decode checks from a longer public fixture. | `score.json` with `score: null`. |
+
+Neither local mode produces an official leaderboard score. Official ranking
+still runs the hidden benchmark oracle and hidden correctness gates on the
+trusted runner.
 
 ## Scoring
 
@@ -218,9 +238,14 @@ The official run times the benchmark before correctness so the correctness gate
 cannot warm the measured model path. It then checks 64 public correctness
 positions plus the hidden GPQA behavior checks.
 Public local correctness uses the checked-in correctness fixture. When a local
-golden with a benchmark oracle is available, `--quick` keeps the 64-token public
-correctness window, shortens measured decode to 64 tokens, and prints the
-resulting `score.json`.
+edit-loop signal is enough, `--local-iterate` uses that public 512-token prompt,
+checks the prefill next token plus 16 teacher-forced decode tokens, writes
+`score.local-iterate.json`, prints it, and leaves `score` null because it is not
+a ranked benchmark score. The submit hook `--local-submit` uses the same public
+prompt with a longer 1024-token fixture: it checks the prefill next token plus
+1023 teacher-forced decode tokens in one continuous trajectory, writes
+`score.json`, and also leaves `score` null because official ranking still
+requires the hidden benchmark oracle on the trusted runner.
 The score payload includes the official baseline timings, computed speedups,
 wall-clock phase timings, final process RSS, expert streaming counters, and
 transformed-weights digest.
@@ -249,7 +274,7 @@ routed expert tensors from the frozen reference checkpoint named by
 `MLXFAST_REFERENCE_DIR`, falling back to the compatibility symlink when that
 environment variable is not set.
 
-The standard preflight/benchmark path enforces a default 10 GiB cap on the
+The standard preflight/benchmark path enforces a default 25 GiB cap on the
 generated `weights/` tree before correctness or timing runs. Change it with
 `MLXFAST_MAX_WEIGHTS_BYTES`; use `0`, `none`, or `unlimited` only for organizer
 debugging. For stricter organizer-side provenance, set
@@ -281,10 +306,10 @@ that generator is `bcc9438fabf95a9b371d5749dd64f2f5ccc60fd5`.
 
 Each base correctness prompt must contain exactly 512 token IDs. The benchmark
 prompt must contain at least 512 token IDs. The precomputed golden file stores
-exact expected tokens for each 512-token correctness prompt and its 256-token
-greedy continuation, the 512-token prefill check, the 512-token decode seed, and
-at least 128 tokens for the timed decode window. During correctness, the harness
-checks the first 64 public continuation positions by default, plus hidden
+exact expected tokens for each 512-token correctness prompt continuation, the
+512-token prefill check, the 512-token decode seed, and at least 128 tokens for
+the timed decode window. During correctness, the harness checks the first 64
+public continuation positions by default, plus hidden
 behavior gates in official benchmark runs. It checks those continuation
 positions teacher-forced: after each accepted step it feeds the
 golden previous token back into the model. This keeps the gate stable across

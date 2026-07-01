@@ -437,28 +437,7 @@ final class RuntimeWorkerClient {
                 weightsPath,
             ]
         }
-        var environment = ProcessInfo.processInfo.environment
-        environment["MLXFAST_USE_RUNTIME_WORKER"] = "0"
-        for key in [
-            "ANTHROPIC_API_KEY",
-            "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-            "MLXFAST_CORRECTNESS_GOLDEN_URL",
-            "MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER",
-            "MLXFAST_GPQA_REFERENCE_PATH",
-            "MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH",
-            "MLXFAST_SEMANTIC_GPQA_RESULTS_PATH",
-            "MLXFAST_SEMANTIC_GPQA_MODEL",
-            "MLXFAST_PRIVATE_DIR",
-            "MLXFAST_PRIVATE_PROMPTS_R2_PRESENT",
-            "MLXFAST_ANTHROPIC_PRESENT",
-            "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE",
-            "R2_ACCESS_KEY_ID",
-            "R2_BUCKET_ENDPOINT",
-            "R2_SECRET_ACCESS_KEY",
-        ] {
-            environment.removeValue(forKey: key)
-        }
-        process.environment = environment
+        process.environment = sanitizedRuntimeWorkerEnvironment(ProcessInfo.processInfo.environment)
         process.standardInput = stdin
         process.standardOutput = stdout
         process.standardError = stderr
@@ -623,6 +602,56 @@ final class RuntimeWorkerClient {
         }
         return singleLine
     }
+}
+
+func sanitizedRuntimeWorkerEnvironment(_ environment: [String: String]) -> [String: String] {
+    var sanitized = environment
+    let blockedExactKeys: Set<String> = [
+        "ANTHROPIC_API_KEY",
+        "CI",
+        "MLXFAST_ANTHROPIC_PRESENT",
+        "MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER",
+        "MLXFAST_CORRECTNESS_GOLDEN_PATH",
+        "MLXFAST_CORRECTNESS_GOLDEN_URL",
+        "MLXFAST_FORCE_TRANSFORM",
+        "MLXFAST_GPQA_REFERENCE_PATH",
+        "MLXFAST_IN_SANDBOX",
+        "MLXFAST_NO_SANDBOX",
+        "MLXFAST_OFFICIAL_BENCHMARK_RUN",
+        "MLXFAST_PRIVATE_DIR",
+        "MLXFAST_PRIVATE_PROMPTS_R2_PRESENT",
+        "MLXFAST_REFERENCE_AUTH_HEADER",
+        "MLXFAST_REFERENCE_BASE_URL",
+        "MLXFAST_REFERENCE_DIR",
+        "MLXFAST_RUN_BENCHMARK",
+        "MLXFAST_RUNTIME_WORKER_EXECUTABLE",
+        "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE",
+        "MLXFAST_SEMANTIC_GPQA_MODEL",
+        "MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH",
+        "MLXFAST_SEMANTIC_GPQA_RESULTS_PATH",
+        "MLXFAST_SKIP_TRANSFORM",
+        "MLXFAST_SUBMISSION_REF",
+        "MLXFAST_TRUSTED_BENCHMARK_REF",
+        "MLXFAST_TRUSTED_BENCHMARK_WORKFLOW",
+        "MLXFAST_TRUSTED_REPOSITORY",
+        "MLXFAST_VERIFY_TRANSFORM",
+        "R2_ACCESS_KEY_ID",
+        "R2_BUCKET_ENDPOINT",
+        "R2_SECRET_ACCESS_KEY",
+    ]
+    let blockedPrefixes = [
+        "ACTIONS_",
+        "BLACKSMITH_",
+        "GITHUB_",
+        "RUNNER_",
+    ]
+    for key in sanitized.keys where blockedExactKeys.contains(key)
+        || blockedPrefixes.contains(where: { key.hasPrefix($0) })
+    {
+        sanitized.removeValue(forKey: key)
+    }
+    sanitized["MLXFAST_USE_RUNTIME_WORKER"] = "0"
+    return sanitized
 }
 
 func generateRuntimeWorkerNonce() -> String {

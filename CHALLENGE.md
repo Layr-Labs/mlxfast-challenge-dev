@@ -19,7 +19,7 @@ The benchmark entrypoint:
 3. Runs the correctness gate against `correctness_golden.json`.
 4. Validates the benchmark prefill/decode tokens against the hidden benchmark
    oracle in `correctness_golden.json`.
-5. Measures prefill latency, 256-step greedy decode latency, MLX peak memory, and
+5. Measures prefill latency, 128-token checked decode latency, MLX peak memory, and
    expert-streaming read-byte diagnostics.
 6. Writes `score.json` in the Darkbloom-compatible schema, plus
    `score.json.sha256` and `benchmark-integrity.json` audit sidecars.
@@ -29,10 +29,16 @@ rather than producing a ranked score.
 
 After transform, local users can run the checked-in public correctness gate with
 `.build/release/mlxfast-swift correctness --weights weights`. For benchmark
-iteration, `./benchmark.sh --quick` requires a local golden file that includes
-the benchmark oracle; it checks only the first 64 correctness tokens and times
-only 64 decode tokens. It still writes and prints `score.json`; it is a
-directional local signal, not the official ranking run.
+iteration, `./benchmark.sh --local-iterate` uses that public 512-token prompt,
+checks the prefill next token plus 16 teacher-forced decode tokens, and writes
+the measured 512-token prefill and 16 one-token decode timings to
+`score.local-iterate.json`. It prints that file with `score: null` because it is
+a directional edit-loop signal, not a ranked score.
+For submit-loop iteration, `./benchmark.sh --local-submit` uses the same public
+512-token prompt as a longer pre-submit benchmark. It checks the prefill next
+token plus 1023 teacher-forced decode tokens from a longer public fixture, and
+still writes and prints `score.json` with `score: null`; it is a directional
+local signal, not the official ranking run.
 
 ## Model Artifacts
 
@@ -130,12 +136,16 @@ gzip tar archive with bearer-token auth; the backend applies it to the frozen
 benchmark checkout and re-enforces the editable surface server-side before
 running hidden validation. `--model` is required and is recorded for the
 leaderboard; pass `--note-file PATH` or `--claimed-score N` as needed.
+The benchmark contract also declares a local `preSubmitCommand`:
+`./benchmark.sh --local-submit`. Yukon runs that command before upload so
+participants get a roughly 10-minute local correctness and timing check during
+the submit loop without running the full official hidden benchmark.
 
 `mlxfast-swift verify-transform` is an organizer/debug check for deterministic
 transform output. It re-runs the submitted transform and compares the generated
 `weights/` tree against that fresh run. It is not a baseline-layout requirement.
 The normal preflight/benchmark path also rejects generated `weights/` above the
-default 10 GiB transformed-output cap before correctness or timing runs.
+default 25 GiB transformed-output cap before correctness or timing runs.
 Override it with `MLXFAST_MAX_WEIGHTS_BYTES`; `verify-transform` additionally
 accepts `--max-bytes`.
 
@@ -144,11 +154,11 @@ There is no Python harness path.
 ## Correctness Gate
 
 Correctness is a hard gate. Each base golden case contains exactly 512 prompt
-token IDs and 256 expected continuation token IDs. The harness checks those
-continuation positions teacher-forced with temperature-zero behavior: after each
-accepted step it feeds the golden previous token back into the model. The first
-mismatch records only the case, step, expected token, and actual token in the
-failed report.
+token IDs and at least 64 expected continuation token IDs. The harness checks
+the first 64 continuation positions teacher-forced with temperature-zero
+behavior: after each accepted step it feeds the golden previous token back into
+the model. The first mismatch records only the case, step, expected token, and
+actual token in the failed report.
 
 The gate is intended as a first-stage filter: an implementation that fails it is
 not eligible for the longer benchmark.
@@ -196,7 +206,7 @@ changes to score those paths.
 
 The hidden golden file also includes a benchmark oracle. The benchmark validates
 the greedy token after the fixed 512-token prefill prompt, the greedy token
-after the fixed 512-token decode seed, and all 256 tokens produced inside the
+after the fixed 512-token decode seed, and all 128 tokens produced inside the
 timed decode window before accepting a score.
 
 ## Score
@@ -218,14 +228,15 @@ prefill_speedup >= 0.95
 ```
 
 With the current Blacksmith M4 baseline, those floors allow at most
-`3.177180971604` seconds/token for decode and `0.149183255724` seconds/token for
-prefill. A run below either floor fails eligibility even if the weighted score
-would otherwise be above baseline.
+`4.442638496439145` seconds/token for decode and `0.18242698079358555`
+seconds/token for prefill. A run below either floor fails eligibility even if
+the weighted score would otherwise be above baseline.
 
-`bandwidth_GB_per_token` is derived from measured expert-streaming file bytes
-during the decode window and is reported with
-`bandwidth_source=expert_streaming_reads`. Bandwidth, RAM, and expert-read
-metrics are diagnostics and guardrail candidates, not primary score factors.
+`bandwidth_gb_per_token` is derived from trusted-core expert slot-bank file
+bytes during the decode window and is reported with
+`bandwidth_source=trusted_core_expert_slot_bank_reads`. Bandwidth, RAM, and
+expert-read metrics are diagnostics and guardrail candidates, not primary score
+factors.
 `score.json` also carries audit-only wall-clock phase timings, final process RSS,
 expert streaming counters, and transformed-weights digest fields. These values
 help operators review runs but do not change the score formula.
@@ -239,8 +250,9 @@ swift build -c release
 MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --output weights
 .build/release/mlxfast-swift correctness --weights weights
 .build/release/mlxfast-swift preflight
+.build/release/mlxfast-swift benchmark --local-iterate
 .build/release/mlxfast-swift benchmark --score-path score.json
-.build/release/mlxfast-swift benchmark --quick --score-path score.json
+.build/release/mlxfast-swift benchmark --local-submit --score-path score.json
 .build/release/mlxfast-swift verify-transform
 
 # Submitting is done with the Yukon CLI (mlxfast), not mlxfast-swift:

@@ -62,6 +62,33 @@ public enum BenchmarkPreflight {
         goldenPath: String,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> BenchmarkPreflightReport {
+        try checkArtifacts(
+            weightsPath: weightsPath,
+            goldenPath: goldenPath,
+            requiresBenchmarkOracle: true,
+            environment: environment
+        )
+    }
+
+    public static func checkCorrectnessArtifacts(
+        weightsPath: String,
+        goldenPath: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> BenchmarkPreflightReport {
+        try checkArtifacts(
+            weightsPath: weightsPath,
+            goldenPath: goldenPath,
+            requiresBenchmarkOracle: false,
+            environment: environment
+        )
+    }
+
+    private static func checkArtifacts(
+        weightsPath: String,
+        goldenPath: String,
+        requiresBenchmarkOracle: Bool,
+        environment: [String: String]
+    ) throws -> BenchmarkPreflightReport {
         let requiredFiles = [
             ("\(weightsPath)/config.json", "transformed config"),
             ("\(weightsPath)/model.safetensors.index.json", "dense safetensors index"),
@@ -79,10 +106,12 @@ public enum BenchmarkPreflight {
         )
 
         let golden = try loadGoldenFixture(from: goldenPath)
-        guard let benchmark = golden.benchmark else {
-            throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
+        if requiresBenchmarkOracle {
+            guard let benchmark = golden.benchmark else {
+                throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
+            }
+            _ = try BenchmarkPrompt.plan(from: benchmark)
         }
-        _ = try BenchmarkPrompt.plan(from: benchmark)
         let config = try DeepSeekConfig.load(from: weightsPath)
 
         let denseStore = try DenseTensorStore(weightsPath: weightsPath)
@@ -134,6 +163,7 @@ public enum BenchmarkPreflight {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         var roots = [weightsPath]
         roots.append(referencePath?.isEmpty == false ? referencePath! : MLXFastConstants.defaultReferencePath)
+        roots.append(MLXFastConstants.defaultReferenceCachePath)
         var seen = Set<String>()
         return roots.filter { seen.insert($0).inserted }
     }

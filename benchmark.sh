@@ -2,15 +2,47 @@
 # Run the Swift benchmark and emit the benchmark.json scorePath.
 set -euo pipefail
 
-SCORE_PATH="${MLXFAST_SCORE_PATH:-score.json}"
+LOCAL_ITERATE=0
+LOCAL_SUBMIT=0
+for arg in "$@"; do
+  case "${arg}" in
+    --weights|--weights=*|--golden|--golden=*|--score-path|--score-path=*)
+      echo "benchmark.sh: use MLXFAST_WEIGHTS_PATH, MLXFAST_CORRECTNESS_GOLDEN_PATH, or MLXFAST_SCORE_PATH for shell path overrides" >&2
+      echo "benchmark.sh: pass --weights/--golden/--score-path only to .build/release/mlxfast-swift benchmark" >&2
+      exit 1
+      ;;
+  esac
+  if [[ "${arg}" == "--local-iterate" ]]; then
+    LOCAL_ITERATE=1
+  fi
+  if [[ "${arg}" == "--local-submit" ]]; then
+    LOCAL_SUBMIT=1
+  fi
+done
+
+if [[ "${LOCAL_ITERATE}" == "1" && -z "${MLXFAST_SCORE_PATH:-}" ]]; then
+  SCORE_PATH="score.local-iterate.json"
+else
+  SCORE_PATH="${MLXFAST_SCORE_PATH:-score.json}"
+fi
 WEIGHTS_PATH="${MLXFAST_WEIGHTS_PATH:-weights}"
-GOLDEN_PATH="${MLXFAST_CORRECTNESS_GOLDEN_PATH:-correctness_golden.json}"
+if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" && "${LOCAL_SUBMIT}" == "1" ]]; then
+  GOLDEN_PATH="correctness_prompts/public_longcopy_gate_english_512_1024.json"
+elif [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" && "${LOCAL_ITERATE}" == "1" ]]; then
+  GOLDEN_PATH="correctness_prompts/public_longcopy_gate_english_512_256.json"
+else
+  GOLDEN_PATH="${MLXFAST_CORRECTNESS_GOLDEN_PATH:-correctness_golden.json}"
+fi
 REFERENCE_PATH="${MLXFAST_REFERENCE_DIR:-reference_weights/DeepSeek-V4-Flash-4bit}"
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
 SANDBOX_PROFILE="${MLXFAST_SANDBOX_PROFILE:-tools/deny-network.sb}"
 SOURCE_HASH_PATH="${WEIGHTS_PATH}/.benchmark-source.sha256"
-INTEGRITY_PATH="${MLXFAST_INTEGRITY_PATH:-benchmark-integrity.json}"
+if [[ "${LOCAL_ITERATE}" == "1" && -z "${MLXFAST_INTEGRITY_PATH:-}" ]]; then
+  INTEGRITY_PATH="benchmark-integrity.local-iterate.json"
+else
+  INTEGRITY_PATH="${MLXFAST_INTEGRITY_PATH:-benchmark-integrity.json}"
+fi
 USE_RUNTIME_WORKER="${MLXFAST_USE_RUNTIME_WORKER:-1}"
 
 json_string() {
@@ -128,11 +160,12 @@ score_metric_number() {
 }
 
 source_hash() {
+  # This hash gates regeneration of weights/. Keep it limited to the transform
+  # target and shared core code so runtime/model-only edits stay fast locally.
   local paths=(
     "Package.swift"
     "Package.resolved"
     "Sources/MLXFastCore"
-    "Sources/MLXFastModel"
     "Sources/MLXFastTransform"
   )
 

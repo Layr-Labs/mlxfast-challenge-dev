@@ -76,6 +76,20 @@ extension DeepSeekRuntime {
 
         do {
             try validateBenchmarkOptions(options)
+            progress("golden load start")
+            let golden = try loadGoldenFixture(from: options.goldenPath)
+            progress(
+                "golden load complete cases=\(golden.totalCorrectnessCaseCount) "
+                    + "benchmark_oracle=\(golden.benchmark == nil ? "missing" : "present")"
+            )
+            guard !benchmarkRequiresRuntimeWorker(golden: golden) else {
+                return makeFailedScore(
+                    error: "benchmark behavior and GPQA TTFT gates require runtime worker timing",
+                    correctness: correctnessReport,
+                    passedCorrectness: false,
+                    weightsDigest: transformedWeightsDigest
+                )
+            }
             progress("preflight start")
             let preflightStart = DispatchTime.now().uptimeNanoseconds
             _ = try BenchmarkPreflight.check(
@@ -95,12 +109,6 @@ extension DeepSeekRuntime {
                         + "bytes=\(transformedWeightsDigest.byteCount)"
                 )
             }
-            progress("golden load start")
-            let golden = try loadGoldenFixture(from: options.goldenPath)
-            progress(
-                "golden load complete cases=\(golden.totalCorrectnessCaseCount) "
-                    + "benchmark_oracle=\(golden.benchmark == nil ? "missing" : "present")"
-            )
             let config = try DeepSeekConfig.load(from: options.weightsPath)
             progress("correctness loader start")
             let correctnessLoader = try DeepSeekWeightLoader(
@@ -285,6 +293,13 @@ extension DeepSeekRuntime {
                 "semantic GPQA max_new_tokens must be in 1...\(MLXFastConstants.correctnessMaxBehaviorSteps)"
             )
         }
+    }
+
+    static func benchmarkRequiresRuntimeWorker(golden: GoldenFixture) -> Bool {
+        // Behavior gates include hidden GPQA TTFT. That timing is measured in
+        // the trusted parent around sandboxed worker calls. The in-process path
+        // cannot produce an equivalent trusted TTFT measurement, so fail closed.
+        !(golden.correctnessGates?.behaviorCases.isEmpty ?? true)
     }
 
     static func semanticGPQACaptureOptions(from options: BenchmarkOptions) throws -> SemanticGPQACaptureOptions? {
@@ -1117,7 +1132,8 @@ extension DeepSeekRuntime {
         decodeSecondsPerToken: Double = 0,
         prefillSecondsPerToken: Double = 0,
         bandwidthSource: String = "",
-        gpqaTTFT: GPQATTFTSummary = .zero
+        gpqaTTFT: GPQATTFTSummary = .zero,
+        runtime: String = "swift"
     ) -> ScorePayload {
         let expertStats = explicitExpertStats ?? correctness?.expertStreamingStats ?? .zero
         return ScorePayload(
@@ -1154,8 +1170,8 @@ extension DeepSeekRuntime {
                 firstFailingLayer: nil,
                 firstFailingCase: explicitFirstFailingCase ?? correctness?.firstFailingCase,
                 firstFailingStep: explicitFirstFailingStep ?? correctness?.firstFailingStep,
-                expectedToken: nil,
-                actualToken: nil,
+                expectedToken: explicitExpectedToken,
+                actualToken: explicitActualToken,
                 maxAbsDiff: 0,
                 goldenHash: correctness?.goldenHash ?? "",
                 bandwidthSource: bandwidthSource,
@@ -1166,7 +1182,7 @@ extension DeepSeekRuntime {
                 weightsHash: weightsDigest?.sha256 ?? "",
                 weightsByteCount: weightsDigest?.byteCount ?? 0,
                 weightsFileCount: weightsDigest?.fileCount ?? 0,
-                runtime: "swift"
+                runtime: runtime
             )
         )
     }

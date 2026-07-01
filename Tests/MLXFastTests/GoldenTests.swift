@@ -31,6 +31,27 @@ func checkedInPublicCorrectnessGoldenIsValid() throws {
     #expect(fixture.cases[0].promptTokens.count == MLXFastConstants.correctnessPromptTokens)
     #expect(MLXFastConstants.correctnessSteps == 64)
     #expect(fixture.cases[0].expectedTokens.count == 256)
+
+    let localSubmitPath = MLXFastConstants.defaultPublicLocalSubmitGoldenPath
+    let localSubmitData = try Data(contentsOf: URL(fileURLWithPath: localSubmitPath))
+    let localSubmitDigest = SHA256.hash(data: localSubmitData)
+        .map { String(format: "%02x", $0) }
+        .joined()
+
+    #expect(localSubmitDigest == "9d167d1026dacc69c40fc0de98022def0fedb6aee3a23b714fcbbdf92e3da1f2")
+
+    let localSubmitFixture = try loadGoldenFixture(
+        from: localSubmitPath,
+        requiredSteps: MLXFastConstants.localSubmitBenchmarkDecodeSteps + 1,
+        requiredPromptTokens: MLXFastConstants.correctnessPromptTokens
+    )
+    #expect(localSubmitFixture.sha256 == localSubmitDigest)
+    #expect(localSubmitFixture.benchmark == nil)
+    #expect(localSubmitFixture.correctnessGates == nil)
+    #expect(localSubmitFixture.cases.count == 1)
+    #expect(localSubmitFixture.cases[0].name == fixture.cases[0].name)
+    #expect(localSubmitFixture.cases[0].promptTokens == fixture.cases[0].promptTokens)
+    #expect(localSubmitFixture.cases[0].expectedTokens.count == 1_024)
 }
 
 @Test
