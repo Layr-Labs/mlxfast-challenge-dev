@@ -190,6 +190,11 @@ jobs:
           cat score.local-iterate.json
 
       - name: Write stand-in score.json for the combiner
+        # No `if: always()` here deliberately: if the smoke check step above
+        # failed, `set -euo pipefail` already stopped the job before reaching
+        # this step, so score.json never gets written or uploaded, and the
+        # combiner's `require_file "${MACHINE1_DIR}/score.json"` correctly
+        # fails closed instead of combining a stand-in with a broken machine.
         run: |
           set -euo pipefail
           cat > score.json <<'EOF'
@@ -384,6 +389,11 @@ jobs:
           fi
 
           full_ref_hash="$(cat "${full_ref_dir}/weights.sha256")"
+          # Only compared against machine2 directly, not machine3/4/machine1 --
+          # that's intentional, not a shortcut: the Combine step above already
+          # ran combine-parallel-correctness.sh's own tripwire, which requires
+          # all of machine1-4 to agree with each other before getting this far.
+          # So comparing against any one of them transitively covers all four.
           split_hash="$(cat machine2/weights.sha256)"
           if [[ "${full_ref_hash}" != "${split_hash}" ]]; then
             echo "::error::full-reference-check weights hash (${full_ref_hash}) does not match the split machines' (${split_hash})" >&2
