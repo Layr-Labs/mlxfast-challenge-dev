@@ -52,21 +52,31 @@ public enum DeepSeekCorrectness {
         promptTokens: [Int],
         expectedTokens: [Int],
         steps: Int = MLXFastConstants.correctnessSteps,
+        startStep: Int = 0,
         nextToken: (_ contextTokens: [Int]) throws -> Int
     ) throws -> CorrectnessTokenComparison {
+        // Reference implementation mirroring compareTeacherForcedWithWorker's
+        // startStep/seed behavior in a form that's directly unit-testable without a
+        // live worker. Keep the two in sync: a slice [startStep, startStep + steps)
+        // must produce the same per-position verdicts as running the full range and
+        // looking only at that slice, since teacher forcing seeds every step from the
+        // known golden prefix rather than the model's own prior output.
         guard !promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("teacher-forced correctness prompt must not be empty")
+        }
+        guard startStep >= 0 else {
+            throw MLXFastError.invalidInput("teacher-forced correctness startStep must be >= 0")
         }
         guard steps >= 0 else {
             throw MLXFastError.invalidInput("teacher-forced correctness steps must be non-negative")
         }
 
-        var context = promptTokens
-        for step in 0..<steps {
+        var context = promptTokens + Array(expectedTokens.prefix(startStep))
+        for step in startStep..<(startStep + steps) {
             guard step < expectedTokens.count else {
                 return CorrectnessTokenComparison(
                     passed: false,
-                    checkedSteps: step + 1,
+                    checkedSteps: step - startStep + 1,
                     firstFailingStep: step,
                     expectedToken: nil,
                     actualToken: nil
@@ -77,7 +87,7 @@ public enum DeepSeekCorrectness {
             if actualToken != expectedToken {
                 return CorrectnessTokenComparison(
                     passed: false,
-                    checkedSteps: step + 1,
+                    checkedSteps: step - startStep + 1,
                     firstFailingStep: step,
                     expectedToken: expectedToken,
                     actualToken: actualToken

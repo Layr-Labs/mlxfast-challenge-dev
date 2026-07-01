@@ -643,6 +643,98 @@ func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
 }
 
 @Test
+func compareTeacherForcedWithWorkerSupportsStartStepForParallelCorrectness() throws {
+    let runtime = try harnessRuntimeSource()
+
+    #expect(runtime.contains("static func compareTeacherForcedWithWorker("))
+    #expect(runtime.contains("startStep: Int = 0,"))
+    #expect(runtime.contains("let endStep = startStep + steps"))
+    #expect(runtime.contains("let seedPromptTokens = startStep == 0"))
+    #expect(runtime.contains("? testCase.promptTokens"))
+    #expect(runtime.contains(": testCase.promptTokens + Array(testCase.expectedTokens[0..<startStep])"))
+    #expect(runtime.contains("try worker.beginTeacherForcedCorrectness(promptTokens: seedPromptTokens)"))
+    #expect(runtime.contains("for step in startStep..<endStep {"))
+    #expect(runtime.contains("checkedSteps: step - startStep + 1,"))
+    #expect(runtime.contains("guard startStep >= 0 else {"))
+    #expect(runtime.contains("teacher-forced correctness startStep must be >= 0"))
+
+    // Threaded through the layered-correctness driver, and steps == 0 skips the
+    // base case entirely (still runs anchors/free-run/behavior/GPQA/TTFT) for a
+    // machine that trusts a separate fleet to verify the base case's step range.
+    #expect(runtime.contains("startStep: Int = 0,"))
+    #expect(runtime.contains("startStep: startStep,"))
+    #expect(runtime.contains("progress?(\"correctness case \\(caseLabel) skipped (steps=0)\")"))
+    #expect(runtime.contains("guard steps > 0 else {"))
+
+    // Step ranges (startStep != 0) are worker-only -- calling with a non-zero
+    // start and no worker must fail loudly rather than silently check the wrong
+    // slice on a code path that has no way to honor it.
+    #expect(runtime.contains("guard options.stepStart == 0 else {"))
+    #expect(runtime.contains("correctness step ranges (stepStart != 0) require the runtime worker"))
+
+    // 0 is an explicit, documented allowance for BenchmarkOptions.correctnessSteps
+    // -- the harness never treats a steps=0 run as having verified correctness on
+    // its own; only the external combiner that ANDs every machine's real result
+    // together may do that.
+    #expect(runtime.contains("guard options.correctnessSteps >= 0 else {"))
+    #expect(!runtime.contains("guard options.correctnessSteps > 0 else {"))
+}
+
+@Test
+func benchmarkCliSupportsCorrectnessStepRangeAndSkippableBenchmarkCorrectness() throws {
+    let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
+
+    #expect(cli.contains("\"--step-range\""))
+    #expect(cli.contains("private static func parseCorrectnessStepRange(_ raw: String) throws -> (start: Int, count: Int?) {"))
+    #expect(cli.contains("MLXFAST_CORRECTNESS_STEP_RANGE"))
+    #expect(cli.contains(
+        "CorrectnessOptions(\n                weightsPath: weightsPath,\n                goldenPath: goldenPath,\n                stepStart: stepStart,\n                stepCount: stepCount\n            )"
+    ))
+    #expect(cli.contains("must be START-END with 0 <= START < END"))
+
+    #expect(cli.contains("MLXFAST_BENCHMARK_CORRECTNESS_STEPS"))
+    #expect(cli.contains("private static func parseNonNegativeInt(_ rawValue: String, optionName: String) throws -> Int {"))
+    #expect(cli.contains("correctnessSteps: correctnessSteps,"))
+    #expect(cli.contains("[--step-range START-END]"))
+}
+
+@Test
+func combineParallelCorrectnessScriptEnforcesWeightsHashAndCoverage() throws {
+    let combiner = try String(
+        contentsOfFile: ".github/scripts/combine-parallel-correctness.sh",
+        encoding: .utf8
+    )
+
+    // Every machine's independently-transformed weights/ must hash identically
+    // before any of their results are trusted together.
+    #expect(combiner.contains("weights hash mismatch across machines"))
+    #expect(combiner.contains("exit 1"))
+
+    // Coverage (no gaps/overlaps in the assigned step ranges) is only enforced
+    // when every machine reports its own slice passed -- a real early-stopping
+    // failure must not be misreported as a range misconfiguration.
+    #expect(combiner.contains("if [[ \"${base_case_passed}\" == \"true\" && \"${total_checked_steps}\" -ne \"${MLXFAST_EXPECTED_CORRECTNESS_STEPS}\" ]]; then"))
+    #expect(combiner.contains("base_case_passed=false"))
+
+    // machine1's own checked_steps (anchors/free-run/behavior) must be added to,
+    // not replaced by, the summed base-case step count from the other machines.
+    #expect(combiner.contains(".metrics.checked_steps = (.metrics.checked_steps + $base_case_checked_steps)"))
+    #expect(combiner.contains("if $first_failing_step == \"\" then null else ($first_failing_step | tonumber) end"))
+    #expect(combiner.contains(".score = null"))
+
+    let hashScript = try String(
+        contentsOfFile: ".github/scripts/hash-weights-directory.sh",
+        encoding: .utf8
+    )
+    #expect(hashScript.contains("shasum -a 256"))
+    #expect(hashScript.contains("LC_ALL=C sort -z"))
+
+    let ci = try String(contentsOfFile: ".github/workflows/ci.yml", encoding: .utf8)
+    #expect(ci.contains("bash -n .github/scripts/hash-weights-directory.sh"))
+    #expect(ci.contains("bash -n .github/scripts/combine-parallel-correctness.sh"))
+}
+
+@Test
 func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
     let runtime = try harnessRuntimeSource()
 

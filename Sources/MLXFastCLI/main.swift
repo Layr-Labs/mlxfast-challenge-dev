@@ -131,7 +131,7 @@ private enum MLXFastCLI {
     }
 
     private static func runCorrectness(_ options: ParsedOptions) throws -> Int {
-        try options.validate(valueOptions: ["--weights", "--golden"])
+        try options.validate(valueOptions: ["--weights", "--golden", "--step-range"])
         let weightsPath = options.value(
             for: "--weights",
             default: environmentValue(
@@ -146,8 +146,19 @@ private enum MLXFastCLI {
                 fallback: defaultCorrectnessGoldenPath()
             )
         )
+        let (stepStart, stepCount) = try parseCorrectnessStepRange(
+            options.value(
+                for: "--step-range",
+                default: environmentValue("MLXFAST_CORRECTNESS_STEP_RANGE", fallback: "")
+            )
+        )
         let report = try DeepSeekRuntime.runCorrectness(
-            CorrectnessOptions(weightsPath: weightsPath, goldenPath: goldenPath),
+            CorrectnessOptions(
+                weightsPath: weightsPath,
+                goldenPath: goldenPath,
+                stepStart: stepStart,
+                stepCount: stepCount
+            ),
             worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
         )
 
@@ -157,6 +168,28 @@ private enum MLXFastCLI {
         FileHandle.standardOutput.write(data)
         print("")
         return report.passed ? 0 : 1
+    }
+
+    // Parses "START-END" (e.g. "21-43") into a half-open [start, end) range passed to
+    // CorrectnessOptions as (stepStart, stepCount). Empty input means "full range" --
+    // (0, nil), matching the pre-existing default behavior.
+    private static func parseCorrectnessStepRange(_ raw: String) throws -> (start: Int, count: Int?) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return (0, nil)
+        }
+        let parts = trimmed.split(separator: "-", maxSplits: 1)
+        guard parts.count == 2,
+              let start = Int(parts[0]),
+              let end = Int(parts[1]),
+              start >= 0,
+              end > start
+        else {
+            throw MLXFastError.invalidInput(
+                "--step-range must be START-END with 0 <= START < END, got \"\(raw)\""
+            )
+        }
+        return (start, end - start)
     }
 
     private static func runCorrectnessTrace(_ options: ParsedOptions) throws {
@@ -306,10 +339,25 @@ private enum MLXFastCLI {
         if !semanticOutputPath.isEmpty {
             try requirePrivateOutputPath(semanticOutputPath, description: "semantic GPQA answer output")
         }
+        // Lets a run skip the base teacher-forced case (still runs behavior/GPQA/TTFT/
+        // timing) when a separate fleet of machines verifies that case's step range in
+        // parallel. Defaults to the full official window, unchanged from before this
+        // existed. See the comment on BenchmarkPreflight/validateBenchmarkOptions for why
+        // 0 is accepted: the harness never treats a steps=0 run as self-certifying
+        // correctness, only the combiner that ANDs every machine's real result together
+        // may do that.
+        let correctnessSteps = try parseNonNegativeInt(
+            environmentValue(
+                "MLXFAST_BENCHMARK_CORRECTNESS_STEPS",
+                fallback: "\(MLXFastConstants.correctnessSteps)"
+            ),
+            optionName: "MLXFAST_BENCHMARK_CORRECTNESS_STEPS"
+        )
         let payload = DeepSeekRuntime.benchmark(
             BenchmarkOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
+                correctnessSteps: correctnessSteps,
                 semanticGPQAOutputPath: semanticOutputPath.isEmpty ? nil : semanticOutputPath,
                 semanticGPQATokenizerPath: weightsPath,
                 semanticGPQACaseCount: semanticCaseCount,
@@ -819,6 +867,13 @@ private enum MLXFastCLI {
         return value
     }
 
+    private static func parseNonNegativeInt(_ rawValue: String, optionName: String) throws -> Int {
+        guard let value = Int(rawValue), value >= 0 else {
+            throw MLXFastError.invalidInput("\(optionName) must be a non-negative integer")
+        }
+        return value
+    }
+
     private static func runtimeWorkerOptions(blockedGoldenPath: String? = nil) throws -> RuntimeWorkerOptions? {
         let enabled = environmentValue("MLXFAST_USE_RUNTIME_WORKER", fallback: "1")
         guard enabled != "0" && enabled.lowercased() != "false" else {
@@ -941,7 +996,7 @@ private enum MLXFastCLI {
             Usage:
               mlxfast-swift transform [--reference PATH] [--output PATH]
               mlxfast-swift verify-transform [--reference PATH] [--weights PATH] [--tmp-parent PATH] [--max-bytes N]
-              mlxfast-swift correctness [--weights PATH] [--golden PATH]
+              mlxfast-swift correctness [--weights PATH] [--golden PATH] [--step-range START-END]
               mlxfast-swift correctness-trace [--weights PATH] [--golden PATH] [--case NAME] --step N [--top-k N]
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--local-submit|--local-iterate] [--weights PATH] [--golden PATH] [--score-path PATH]

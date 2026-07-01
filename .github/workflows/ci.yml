@@ -78,6 +78,8 @@ jobs:
           bash -n .github/scripts/upload-r2-object.sh
           bash -n .github/scripts/download-reference-cache-scope.sh
           bash -n .github/scripts/probe-runtime-worker-sandbox.sh
+          bash -n .github/scripts/hash-weights-directory.sh
+          bash -n .github/scripts/combine-parallel-correctness.sh
 
       - name: Build release CLI
         run: |

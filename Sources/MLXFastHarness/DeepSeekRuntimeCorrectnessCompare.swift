@@ -66,27 +66,43 @@ extension DeepSeekRuntime {
         testCase: GoldenCase,
         worker: RuntimeWorkerClient,
         steps: Int = MLXFastConstants.correctnessSteps,
+        startStep: Int = 0,
         progressIntervalSteps: Int = 0,
         progress: ((Int, Int) -> Void)? = nil
     ) throws -> WorkerCorrectnessResult {
+        // `startStep`/`endStep` let a caller check a contiguous slice [startStep, endStep)
+        // of the full teacher-forced window instead of always starting at position 0. This
+        // is safe because teacher forcing always feeds the golden token as input for the
+        // next step (testCase.expectedTokens[...]), never the model's own prediction --
+        // so what the model should see at step N never depends on whether steps before N
+        // were themselves checked or even correct. A caller checking a later slice seeds
+        // the model with the known-golden prefix in one batch call instead of replaying
+        // single-token steps it isn't responsible for verifying.
+        let endStep = startStep + steps
         guard !testCase.promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("teacher-forced correctness prompt must not be empty")
         }
-        guard testCase.expectedTokens.count >= steps else {
-            throw MLXFastError.invalidInput(
-                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; need at least \(steps)"
-            )
+        guard startStep >= 0 else {
+            throw MLXFastError.invalidInput("teacher-forced correctness startStep must be >= 0")
         }
-
         guard steps > 0 else {
             throw MLXFastError.invalidInput("teacher-forced correctness steps must be positive")
         }
+        guard testCase.expectedTokens.count >= endStep else {
+            throw MLXFastError.invalidInput(
+                "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; "
+                    + "need at least \(endStep) for range [\(startStep), \(endStep))"
+            )
+        }
 
-        var response = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
+        let seedPromptTokens = startStep == 0
+            ? testCase.promptTokens
+            : testCase.promptTokens + Array(testCase.expectedTokens[0..<startStep])
+        var response = try worker.beginTeacherForcedCorrectness(promptTokens: seedPromptTokens)
         var latestExpertStats = response.expertStats ?? .zero
         var peakRamGB = response.peakRamGB ?? 0
-        for step in 0..<steps {
-            if step > 0 {
+        for step in startStep..<endStep {
+            if step > startStep {
                 response = try worker.teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[step - 1])
                 latestExpertStats = response.expertStats ?? latestExpertStats
                 peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
@@ -99,7 +115,7 @@ extension DeepSeekRuntime {
                 return WorkerCorrectnessResult(
                     comparison: CorrectnessTokenComparison(
                         passed: false,
-                        checkedSteps: step + 1,
+                        checkedSteps: step - startStep + 1,
                         firstFailingStep: step,
                         expectedToken: expectedToken,
                         actualToken: actualToken
@@ -109,7 +125,7 @@ extension DeepSeekRuntime {
                 )
             }
             reportProgress(
-                step: step + 1,
+                step: step - startStep + 1,
                 total: steps,
                 intervalSteps: progressIntervalSteps,
                 progress: progress

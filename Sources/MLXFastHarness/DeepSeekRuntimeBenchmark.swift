@@ -267,8 +267,13 @@ extension DeepSeekRuntime {
     }
 
     static func validateBenchmarkOptions(_ options: BenchmarkOptions) throws {
-        guard options.correctnessSteps > 0 else {
-            throw MLXFastError.invalidInput("benchmark correctness steps must be positive")
+        // 0 is allowed deliberately: it means "skip the base teacher-forced case on this
+        // run" (still runs anchors/free-run/behavior/GPQA/TTFT/timing), for a machine that
+        // relies on a separate fleet to verify the base case's step range in parallel.
+        // Skipping is a caller decision, not a harness one -- the harness never treats a
+        // steps=0 run as having actually verified correctness by itself.
+        guard options.correctnessSteps >= 0 else {
+            throw MLXFastError.invalidInput("benchmark correctness steps must be >= 0")
         }
         guard options.correctnessSteps <= MLXFastConstants.correctnessSteps else {
             throw MLXFastError.invalidInput(

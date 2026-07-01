@@ -61,6 +61,12 @@ extension DeepSeekRuntime {
         if let worker {
             return runCorrectnessWithWorker(options, worker: worker)
         }
+        guard options.stepStart == 0 else {
+            throw MLXFastError.invalidInput(
+                "correctness step ranges (stepStart != 0) require the runtime worker; "
+                    + "rerun with the worker enabled or omit --step-range"
+            )
+        }
 
         var loadedGolden: GoldenFixture?
         var loader: DeepSeekWeightLoader?
@@ -103,6 +109,15 @@ extension DeepSeekRuntime {
         var lastExpertStats = ExpertStreamingStats.zero
         var checkedSteps = 0
         do {
+            let stepCount = options.stepCount ?? MLXFastConstants.correctnessSteps
+            guard options.stepStart >= 0, stepCount > 0,
+                  options.stepStart + stepCount <= MLXFastConstants.correctnessSteps
+            else {
+                throw MLXFastError.invalidInput(
+                    "correctness step range [\(options.stepStart), \(options.stepStart + stepCount)) "
+                        + "must fall within [0, \(MLXFastConstants.correctnessSteps))"
+                )
+            }
             try requireFile(options.goldenPath, description: "correctness golden file")
             let golden = try loadGoldenFixture(from: options.goldenPath)
             loadedGolden = golden
@@ -120,7 +135,8 @@ extension DeepSeekRuntime {
             let result = runLayeredCorrectnessWithWorker(
                 golden: golden,
                 worker: worker,
-                steps: MLXFastConstants.correctnessSteps
+                steps: options.stepCount ?? MLXFastConstants.correctnessSteps,
+                startStep: options.stepStart
             )
             checkedSteps = result.report.checkedSteps
             lastExpertStats = result.expertStats
@@ -218,6 +234,12 @@ extension DeepSeekRuntime {
             for (caseIndex, testCase) in golden.cases.enumerated() {
                 currentCase = testCase.name
                 let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
+                // See the matching guard in runLayeredCorrectnessWithWorker: steps == 0
+                // intentionally skips the base case for this run.
+                guard steps > 0 else {
+                    progress?("correctness case \(caseLabel) skipped (steps=0)")
+                    continue
+                }
                 progress?("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
                 let comparison = try compareTeacherForcedCached(
                     testCase: testCase,
@@ -338,6 +360,7 @@ extension DeepSeekRuntime {
         golden: GoldenFixture,
         worker: RuntimeWorkerClient,
         steps: Int = MLXFastConstants.correctnessSteps,
+        startStep: Int = 0,
         semanticCapture: SemanticGPQACaptureOptions? = nil,
         progress: ((String) -> Void)? = nil
     ) -> WorkerLayeredCorrectnessResult {
@@ -396,11 +419,22 @@ extension DeepSeekRuntime {
             for (caseIndex, testCase) in golden.cases.enumerated() {
                 currentCase = testCase.name
                 let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
+                // steps == 0 means this run intentionally does not verify the base
+                // teacher-forced case itself -- e.g. a machine that only runs GPQA/TTFT/
+                // timing while a separate fleet of machines verifies the base case in
+                // parallel slices. Skipping here does NOT mean correctness was checked;
+                // callers relying on split verification must independently combine each
+                // slice's real result before trusting an overall pass.
+                guard steps > 0 else {
+                    progress?("correctness case \(caseLabel) skipped (steps=0)")
+                    continue
+                }
                 progress?("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
                 let check = try compareTeacherForcedWithWorker(
                     testCase: testCase,
                     worker: worker,
                     steps: steps,
+                    startStep: startStep,
                     progressIntervalSteps: 64,
                     progress: { step, total in
                         progress?("correctness case \(caseLabel) checked \(step)/\(total) tokens")

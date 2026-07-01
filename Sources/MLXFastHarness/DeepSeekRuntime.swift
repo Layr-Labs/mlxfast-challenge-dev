@@ -9,10 +9,20 @@ import Tokenizers
 public struct CorrectnessOptions: Equatable {
     public let weightsPath: String
     public let goldenPath: String
+    // Check only the [stepStart, stepStart + stepCount) slice of the teacher-forced
+    // window instead of the full [0, correctnessSteps) range. Lets a fleet of machines
+    // each verify a disjoint slice of the same case in parallel; see
+    // compareTeacherForcedWithWorker for why this is sound under teacher forcing.
+    // stepCount defaults to MLXFastConstants.correctnessSteps when nil, matching the
+    // pre-existing full-range behavior. Only honored on the runtime-worker code path.
+    public let stepStart: Int
+    public let stepCount: Int?
 
-    public init(weightsPath: String, goldenPath: String) {
+    public init(weightsPath: String, goldenPath: String, stepStart: Int = 0, stepCount: Int? = nil) {
         self.weightsPath = weightsPath
         self.goldenPath = goldenPath
+        self.stepStart = stepStart
+        self.stepCount = stepCount
     }
 }
 
