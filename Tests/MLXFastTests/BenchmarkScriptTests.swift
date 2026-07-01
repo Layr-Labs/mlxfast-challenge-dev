@@ -745,9 +745,22 @@ func benchmarkLocalIterateModeUsesPublicFixtureAndNonOfficialScore() throws {
     #expect(cli.contains("DeepSeekRuntime.localIterate("))
     #expect(cli.contains("MLXFastConstants.defaultLocalIterateScorePath"))
     #expect(runtime.contains("runLocalIterateCheckedTimingWithWorker("))
+    #expect(runtime.contains("includes_seed_prefill=true"))
+    #expect(runtime.contains("\\(modeName) prefill measured start prompt_tokens="))
+    #expect(runtime.contains("let prefillWorker = try RuntimeWorkerClient(options: workerOptions, weightsPath: weightsPath)"))
+    #expect(runtime.contains("let decodeWorker = try RuntimeWorkerClient(options: workerOptions, weightsPath: weightsPath)"))
+    #expect(runtime.contains("try prefillWorker.prefill(promptTokens: testCase.promptTokens)"))
+    #expect(runtime.contains("try decodeWorker.beginDecode(seedTokens: testCase.promptTokens)"))
+    #expect(runtime.contains("let expectedDecodeTokens = Array(testCase.expectedTokens.dropFirst().prefix(decodeSteps))"))
+    #expect(runtime.contains("let inputToken = decodedStep == 0 ? expectedSeedToken : expectedDecodeTokens[decodedStep - 1]"))
+    #expect(runtime.contains("try decodeWorker.decodeStep(inputToken: inputToken)"))
+    #expect(!runtime.contains("teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[decodedStep])"))
+    #expect(!runtime.contains("topLogits(from:"))
     #expect(runtime.contains("score: nil"))
     #expect(options.contains("runtime: String = \"swift-local-iterate\""))
-    #expect(runtime.contains("teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[decodedStep])"))
+    let prefillStartRange = try #require(runtime.range(of: "\\(modeName) prefill measured start prompt_tokens="))
+    let decodeStartRange = try #require(runtime.range(of: "\\(modeName) decode measured start tokens="))
+    #expect(prefillStartRange.lowerBound < decodeStartRange.lowerBound)
 }
 
 @Test
