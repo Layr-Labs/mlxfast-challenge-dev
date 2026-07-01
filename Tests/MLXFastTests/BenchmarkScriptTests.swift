@@ -44,7 +44,7 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
 @Test
 func rulesDocsQuoteCurrentSpeedupFloorLimits() throws {
     let readme = try String(contentsOfFile: "README.md", encoding: .utf8)
-    let challenge = try String(contentsOfFile: "CHALLENGE.md", encoding: .utf8)
+    let challenge = try String(contentsOfFile: "TASK.md", encoding: .utf8)
     let maxDecodeSeconds = MLXFastConstants.officialBaselineDecodeSecondsPerToken
         / MLXFastConstants.scoreDecodeSpeedupFloor
     let maxPrefillSeconds = MLXFastConstants.officialBaselinePrefillSecondsPerToken
@@ -333,7 +333,7 @@ func parallelCorrectnessProbeWorkflowIsManualAndSecretFree() throws {
 }
 
 @Test
-func benchmarkWorkflowDefaultsToTrustedMainWithExplicitTestingEscapeHatch() throws {
+func benchmarkWorkflowBenchmarksDispatchedRefWithoutSubmissionRef() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
@@ -343,22 +343,37 @@ func benchmarkWorkflowDefaultsToTrustedMainWithExplicitTestingEscapeHatch() thro
         encoding: .utf8
     )
 
-    #expect(workflow.contains("allow_untrusted_workflow_testing:"))
-    #expect(workflow.contains("Maintainer-only escape hatch for testing workflow changes from a non-main ref"))
-    #expect(workflow.contains("MLXFAST_TRUSTED_BENCHMARK_REF: ${{ inputs.allow_untrusted_workflow_testing && github.ref || 'refs/heads/main' }}"))
-    #expect(!workflow.contains("MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}"))
-    #expect(workflow.contains("- name: Validate production dispatch inputs"))
-    #expect(workflow.contains("production submission_ref must be the exact 40-character commit SHA provided by Yukon"))
-    #expect(workflow.contains("production submissions must come from ${TRUSTED_REPOSITORY}"))
+    // The workflow benchmarks whatever ref it is dispatched on: no submission_ref
+    // overlay machinery and no blanket refuse gate. The Yukon eigenbot creates
+    // submission branches that differ from main only in editablePaths.
+    #expect(!workflow.contains("submission_ref"))
+    #expect(!workflow.contains("submission_repository"))
+    #expect(!workflow.contains("allow_untrusted_workflow_testing"))
+    #expect(!workflow.contains("- name: Validate production dispatch inputs"))
+    #expect(!workflow.contains("- name: Refuse untrusted submission workflow code"))
+    #expect(!workflow.contains("- name: Checkout submitted editable paths"))
+    #expect(!workflow.contains("- name: Verify submitted commit"))
+    #expect(!workflow.contains("- name: Overlay submitted editable paths"))
+    #expect(!workflow.contains(".mlxfast-submission-src"))
+
+    // enforce-trusted still pins repo + workflow_dispatch, now accepting the
+    // dispatched ref; the guard script keeps main as its defense-in-depth default.
+    #expect(workflow.contains("MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}"))
+    #expect(guardScript.contains("TRUSTED_REF=\"${MLXFAST_TRUSTED_BENCHMARK_REF:-refs/heads/main}\""))
+
+    // Submission-branch runs still enforce the modifiable surface and the static
+    // cheat review, and suppress submitted-process logs.
+    #expect(workflow.contains("MLXFAST_IS_SUBMISSION_BRANCH: ${{ (startsWith(github.ref_name, 'submissions/')) && '1' || '0' }}"))
+    #expect(workflow.contains("- name: Enforce modifiable surface"))
+    #expect(workflow.contains("- name: Review submitted code for benchmark bypasses"))
+    #expect(workflow.contains("if [[ \"${MLXFAST_IS_SUBMISSION_BRANCH}\" == \"1\" ]]; then"))
+
+    // Dev-only dispatch knobs stay excised.
     #expect(!workflow.contains("reference_base_url:"))
     #expect(!workflow.contains("correctness_golden_url:"))
     #expect(!workflow.contains("preserve_golden_only:"))
     #expect(!workflow.contains("trace_correctness_step:"))
     #expect(!workflow.contains("trace_correctness_top_k:"))
-    #expect(workflow.contains("- name: Verify submitted commit"))
-    #expect(workflow.contains("actual_sha=\"$(git -C .mlxfast-submission-src rev-parse HEAD)\""))
-    #expect(workflow.contains("submitted checkout resolved to ${actual_sha}, expected ${SUBMISSION_REF}"))
-    #expect(guardScript.contains("TRUSTED_REF=\"${MLXFAST_TRUSTED_BENCHMARK_REF:-refs/heads/main}\""))
 }
 
 @Test
@@ -425,12 +440,12 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("benchmark: using checked-in public correctness golden"))
     #expect(workflow.contains("hidden GPQA behavior gate requires private R2 secrets"))
     #expect(workflow.contains("semantic GPQA gate requires ORG_ANTHROPIC_API_KEY"))
-    let overlayRange = try #require(workflow.range(of: "- name: Overlay submitted editable paths"))
     let staticReviewRange = try #require(workflow.range(of: "- name: Review submitted code for benchmark bypasses"))
+    let modifiableSurfaceRange = try #require(workflow.range(of: "- name: Enforce modifiable surface"))
     let goldenSourceRange = try #require(workflow.range(of: "- name: Check correctness golden source"))
-    #expect(overlayRange.lowerBound < staticReviewRange.lowerBound)
-    #expect(staticReviewRange.lowerBound < goldenSourceRange.lowerBound)
-    #expect(workflow.contains("if: inputs.submission_ref != ''"))
+    #expect(staticReviewRange.lowerBound < modifiableSurfaceRange.lowerBound)
+    #expect(modifiableSurfaceRange.lowerBound < goldenSourceRange.lowerBound)
+    #expect(workflow.contains("if: ${{ startsWith(github.ref_name, 'submissions/') }}"))
     #expect(workflow.contains(".github/scripts/run-submission-static-review.sh"))
     #expect(workflow.contains("mlxfast-swift attach-gpqa-gates"))
     #expect(workflow.contains("--case-count \"${MLXFAST_GPQA_CASE_COUNT}\""))
