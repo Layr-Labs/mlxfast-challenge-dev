@@ -9,6 +9,10 @@ public final class DeepSeekRuntimeWeightCache {
     private var cachedLocalAttentionWeights: [Int: DeepSeekLocalAttentionWeights] = [:]
     private var cachedCompressedAttentionWeights: [Int: DeepSeekCompressedAttentionWeights] = [:]
     private var cachedMoEWeights: [Int: DeepSeekMoEWeights] = [:]
+    private var cachedBlockSpec: DeepSeekBlockSpec?
+    private var cachedLocalAttentionSpec: DeepSeekLocalAttentionSpec?
+    private var cachedCompressedAttentionSpecs: [Int: DeepSeekCompressedAttentionSpec] = [:]
+    private var cachedMoESpecs: [Int: DeepSeekMoESpec] = [:]
 
     public init(loader: DeepSeekWeightLoader, config: DeepSeekConfig) {
         self.loader = loader
@@ -58,5 +62,41 @@ public final class DeepSeekRuntimeWeightCache {
         let weights = try loader.moeWeights(layerIndex: layerIndex, config: config)
         cachedMoEWeights[layerIndex] = weights
         return weights
+    }
+
+    public func blockSpec() -> DeepSeekBlockSpec {
+        if let cachedBlockSpec {
+            return cachedBlockSpec
+        }
+        let spec = DeepSeekBlockSpec(config: config)
+        cachedBlockSpec = spec
+        return spec
+    }
+
+    public func localAttentionSpec() -> DeepSeekLocalAttentionSpec {
+        if let cachedLocalAttentionSpec {
+            return cachedLocalAttentionSpec
+        }
+        let spec = DeepSeekLocalAttentionSpec(config: config)
+        cachedLocalAttentionSpec = spec
+        return spec
+    }
+
+    public func compressedAttentionSpec(layerIndex: Int) -> DeepSeekCompressedAttentionSpec {
+        if let spec = cachedCompressedAttentionSpecs[layerIndex] {
+            return spec
+        }
+        let spec = DeepSeekCompressedAttentionSpec(config: config, layerIndex: layerIndex)
+        cachedCompressedAttentionSpecs[layerIndex] = spec
+        return spec
+    }
+
+    public func moeSpec(layerIndex: Int) throws -> DeepSeekMoESpec {
+        if let spec = cachedMoESpecs[layerIndex] {
+            return spec
+        }
+        let spec = try DeepSeekMoESpec(layerIndex: layerIndex, config: config)
+        cachedMoESpecs[layerIndex] = spec
+        return spec
     }
 }

@@ -10,6 +10,40 @@ public final class DeepSeekRoPE {
 
     private let baseFrequencies: [Float]
     private var frequencyCache: [FrequencyCacheKey: MLXArray] = [:]
+    private let frequencyCacheLock = NSLock()
+
+    private static let instanceCacheLock = NSLock()
+    nonisolated(unsafe) private static var instanceCache: [DeepSeekRoPEInstanceCacheKey: DeepSeekRoPE] = [:]
+
+    public static func cached(
+        rotaryDimensions: Int,
+        base: Double,
+        scaling: DeepSeekRopeScaling? = nil,
+        maxPositionEmbeddings: Int,
+        freqScale: Int = 1
+    ) throws -> DeepSeekRoPE {
+        let key = DeepSeekRoPEInstanceCacheKey(
+            rotaryDimensions: rotaryDimensions,
+            base: base,
+            scaling: scaling,
+            maxPositionEmbeddings: maxPositionEmbeddings,
+            freqScale: freqScale
+        )
+        instanceCacheLock.lock()
+        defer { instanceCacheLock.unlock() }
+        if let cached = instanceCache[key] {
+            return cached
+        }
+        let rope = try DeepSeekRoPE(
+            rotaryDimensions: rotaryDimensions,
+            base: base,
+            scaling: scaling,
+            maxPositionEmbeddings: maxPositionEmbeddings,
+            freqScale: freqScale
+        )
+        instanceCache[key] = rope
+        return rope
+    }
 
     public init(
         rotaryDimensions: Int,
@@ -176,6 +210,8 @@ public final class DeepSeekRoPE {
 
     private func frequencyArray(headDimension: Int, inverse: Bool) throws -> MLXArray {
         let key = FrequencyCacheKey(headDimension: headDimension, inverse: inverse)
+        frequencyCacheLock.lock()
+        defer { frequencyCacheLock.unlock() }
         if let cached = frequencyCache[key] {
             return cached
         }
@@ -189,4 +225,36 @@ public final class DeepSeekRoPE {
 private struct FrequencyCacheKey: Hashable {
     let headDimension: Int
     let inverse: Bool
+}
+
+private struct DeepSeekRoPEInstanceCacheKey: Hashable {
+    let rotaryDimensions: Int
+    let base: Double
+    let scalingType: String?
+    let scalingRopeType: String?
+    let scalingFactor: Double?
+    let scalingOriginalMaxPositionEmbeddings: Int?
+    let scalingBetaFast: Double?
+    let scalingBetaSlow: Double?
+    let maxPositionEmbeddings: Int
+    let freqScale: Int
+
+    init(
+        rotaryDimensions: Int,
+        base: Double,
+        scaling: DeepSeekRopeScaling?,
+        maxPositionEmbeddings: Int,
+        freqScale: Int
+    ) {
+        self.rotaryDimensions = rotaryDimensions
+        self.base = base
+        self.scalingType = scaling?.type
+        self.scalingRopeType = scaling?.ropeType
+        self.scalingFactor = scaling?.factor
+        self.scalingOriginalMaxPositionEmbeddings = scaling?.originalMaxPositionEmbeddings
+        self.scalingBetaFast = scaling?.betaFast
+        self.scalingBetaSlow = scaling?.betaSlow
+        self.maxPositionEmbeddings = maxPositionEmbeddings
+        self.freqScale = freqScale
+    }
 }

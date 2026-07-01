@@ -103,6 +103,24 @@ public struct DeepSeekWeightLoader {
     public let expertStreamingMetrics: ExpertStreamingMetrics?
     private let bridge: MLXArrayTensorBridge
 
+    // The core default (768 tensors = 128 experts) is just below a full decode
+    // token's routed working set (43 layers * 6 experts * 3 projections). That
+    // tends to evict entries before adjacent-token reuse. 3072 tensors keeps a
+    // few decode-token working sets resident while staying well below the 48 GB
+    // runner budget; explicit environment/custom settings still win.
+    private static let tunedDefaultTensorCacheCapacity = 3_072
+
+    private static func expertBankCapacity(from config: ExpertStreamingConfig) -> Int {
+        let env = ProcessInfo.processInfo.environment
+        if env["MLXFAST_EXPERT_CACHE_TENSORS"] != nil || env["MLXFAST_EXPERT_CACHE_EXPERTS"] != nil {
+            return config.tensorCacheCapacity
+        }
+        if config.tensorCacheCapacity != ExpertStreamingConfig.defaultTensorCacheCapacity {
+            return config.tensorCacheCapacity
+        }
+        return tunedDefaultTensorCacheCapacity
+    }
+
     public init(
         weightsPath: String,
         expertStreamingConfig: ExpertStreamingConfig = .fromEnvironment(),
@@ -116,7 +134,7 @@ public struct DeepSeekWeightLoader {
         self.expertStreamingMetrics = metrics
         self.expertBank = try ExpertSlotBank(
             manifestPath: "\(weightsPath)/experts/manifest.json",
-            capacity: expertStreamingConfig.tensorCacheCapacity,
+            capacity: Self.expertBankCapacity(from: expertStreamingConfig),
             metrics: metrics
         )
         self.bridge = bridge

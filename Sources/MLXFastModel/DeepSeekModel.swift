@@ -254,15 +254,15 @@ public enum DeepSeekModel {
         let compressRatio = config.compressRatios[layerIndex]
         let blockWeights = try weightCache.blockWeights(layerIndex: layerIndex)
         let moeWeights = try weightCache.moeWeights(layerIndex: layerIndex)
-        let blockSpec = DeepSeekBlockSpec(config: config)
-        let moeSpec = try DeepSeekMoESpec(layerIndex: layerIndex, config: config)
-        let mask = try DeepSeekAttentionMask.causal(
+        let blockSpec = weightCache.blockSpec()
+        let moeSpec = try weightCache.moeSpec(layerIndex: layerIndex)
+        let mask = cache == nil ? try DeepSeekAttentionMask.causal(
             queryLength: inputIDs.shape[1],
             keyLength: inputIDs.shape[1],
             queryOffset: positionOffset,
             keyOffset: positionOffset,
             windowSize: config.slidingWindow
-        )
+        ) : nil
 
         return try DeepSeekBlock.forward(
             hidden: hidden,
@@ -274,7 +274,7 @@ public enum DeepSeekModel {
                     return try DeepSeekLocalAttention.forward(
                         normalized,
                         weights: weightCache.localAttentionWeights(layerIndex: layerIndex),
-                        spec: DeepSeekLocalAttentionSpec(config: config),
+                        spec: weightCache.localAttentionSpec(),
                         mask: mask,
                         cache: cache?.local,
                         windowSize: config.slidingWindow,
@@ -284,7 +284,7 @@ public enum DeepSeekModel {
                     return try DeepSeekCompressedAttention.forward(
                         normalized,
                         weights: weightCache.compressedAttentionWeights(layerIndex: layerIndex),
-                        spec: DeepSeekCompressedAttentionSpec(config: config, layerIndex: layerIndex),
+                        spec: weightCache.compressedAttentionSpec(layerIndex: layerIndex),
                         mask: mask,
                         cache: cache,
                         windowSize: config.slidingWindow,

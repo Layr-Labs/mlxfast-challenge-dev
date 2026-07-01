@@ -438,7 +438,7 @@ public enum DeepSeekKVCompressor {
             ? overlapCompress(kv: kvWindows, gate: gateWindows, ape: weights.ape)
             : simpleCompress(kv: kvWindows, gate: gateWindows, ape: weights.ape)
         let normalized = DeepSeekOps.rmsNorm(input: pooled, weight: weights.norm, eps: spec.rmsNormEps)
-        let rope = try DeepSeekRoPE(
+        let rope = try DeepSeekRoPE.cached(
             rotaryDimensions: spec.ropeHeadDim,
             base: spec.ropeTheta,
             scaling: spec.ropeScaling,
@@ -491,7 +491,7 @@ public enum DeepSeekLocalAttention {
         try validateInput(x, spec: spec)
         let batchSize = x.shape[0]
         let sequenceLength = x.shape[1]
-        let rope = try DeepSeekRoPE(
+        let rope = try DeepSeekRoPE.cached(
             rotaryDimensions: spec.qkRopeHeadDim,
             base: spec.ropeTheta,
             scaling: nil,
@@ -566,7 +566,7 @@ public enum DeepSeekCompressedAttention {
         try validateInput(x, spec: spec)
         let batchSize = x.shape[0]
         let sequenceLength = x.shape[1]
-        let rope = try DeepSeekRoPE(
+        let rope = try DeepSeekRoPE.cached(
             rotaryDimensions: spec.qkRopeHeadDim,
             base: spec.ropeTheta,
             scaling: spec.ropeScaling,
@@ -905,7 +905,7 @@ public enum DeepSeekIndexer {
             throw MLXFastError.invalidInput("indexer requires at least one pooled KV token")
         }
 
-        let rope = try DeepSeekRoPE(
+        let rope = try DeepSeekRoPE.cached(
             rotaryDimensions: spec.qkRopeHeadDim,
             base: spec.ropeTheta,
             scaling: spec.ropeScaling,
