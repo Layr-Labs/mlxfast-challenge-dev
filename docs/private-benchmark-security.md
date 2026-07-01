@@ -72,6 +72,32 @@ boundary is the combination of:
 The `benchmark-private-prompts` Environment deployment-branch policy and required
 reviewers remain the gate on private-secret access.
 
+## Parallel job topology
+
+When dispatched with `run_benchmark=true`, the trust boundary above applies
+independently to 5 privileged jobs instead of one. Each of the following
+separately declares `environment: benchmark-private-prompts` and separately
+re-runs the trusted-workflow check, the submission-branch static review, the
+modifiable-surface enforcement, and the sandbox probe: `correctness-slice-1`,
+`correctness-slice-2`, `correctness-slice-3` (each running the reusable
+`benchmark-correctness-slice.yml`), and `benchmark-timing`, `benchmark-gates`
+(both running the reusable `benchmark-timing-or-gates.yml`). A sixth job,
+`combine`, has no `environment:` gate and no private-secret access — it only
+downloads the already-computed, already-authenticated outputs the 5 privileged
+jobs uploaded (after each independently validated its own content, see
+`benchmark-correctness-slice.yml`'s "Validate correctness slice artifacts" and
+`benchmark-timing-or-gates.yml`'s "Validate intermediate benchmark artifact"),
+merges them, and re-verifies the combined result before it may be staged or
+uploaded. A `validate-slice-ranges` job runs before the three correctness-slice
+jobs with no checkout and no secrets at all — it only validates the numeric
+range inputs. Dispatching with the default `run_benchmark=false` instead runs
+everything on the single `correctness-only` job described elsewhere in this
+document. Any future change to this topology that drops the environment gate,
+the trusted-workflow check, the static/modifiable-surface guards, or the
+per-job content-validation gate from one of the 5 privileged jobs — without an
+equivalent guard elsewhere — reopens the exact channels this document
+describes.
+
 ## Submission flow
 
 The benchmark orchestrator (Yukon eigenbot) creates a `submissions/*` branch that

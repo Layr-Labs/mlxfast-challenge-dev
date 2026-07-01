@@ -140,6 +140,7 @@ extract_review_json() {
         type == "object"
         and (.passed | type == "boolean")
         and (.severity | type == "string")
+        and (.severity | IN("none", "low", "medium", "high", "critical"))
         and (.findings | type == "array")
       );
     [
@@ -188,6 +189,17 @@ summary="$(jq -r '.summary // ""' "${RESULTS_PATH}")"
 finding_count="$(jq '.findings | length' "${RESULTS_PATH}")"
 
 echo "submission-review: passed=${passed} severity=${severity} findings=${finding_count} summary=${summary}"
+# The judge is instructed (system prompt above) to set passed=false for high/
+# critical evidence of cheating, but that is a policy sent to the LLM, not
+# something this script enforces -- a schema-valid but self-contradictory
+# verdict (e.g. passed=true with severity=critical, from a partially-successful
+# prompt injection in the reviewed code) would otherwise satisfy extract_review_
+# json's schema check and sail through the passed-only gate below. Fail closed
+# on that specific contradiction regardless of the reported passed value.
+if [[ "${passed}" == "true" ]] && { [[ "${severity}" == "high" ]] || [[ "${severity}" == "critical" ]]; }; then
+  echo "::error::submission static review reported passed=true but severity=${severity}; treating as failed" >&2
+  passed="false"
+fi
 if [[ "${passed}" != "true" ]]; then
   jq -r '.findings[]? | "submission-review: finding category=\(.category // "unknown") path=\(.path // "unknown") reason=\(.reason // "")"' "${RESULTS_PATH}" >&2
   echo "::error::submission static review failed; likely benchmark bypass behavior detected" >&2

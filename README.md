@@ -3,7 +3,7 @@
 A benchmark arena for memory-bandwidth-optimal LLM inference on Apple Silicon.
 Run DeepSeek V4 Flash without loading all 256 experts into RAM — and beat the baseline score.
 
-See [CHALLENGE.md](CHALLENGE.md) for the full problem statement, scoring formula, and approach space.
+See [TASK.md](TASK.md) for the full problem statement, scoring formula, and approach space.
 
 ## Quickstart
 
@@ -118,6 +118,17 @@ candidate answers, and judge text stay in the private runner directory.
 The private workflow treats semantic GPQA as a hard gate with a 3/5 threshold,
 calibrated to the unmodified DeepSeek V4 Flash baseline rather than to
 better-than-baseline GPQA answer quality.
+When dispatched with `run_benchmark=true`, the workflow fans out across 5
+independent machines instead of running everything on one: three
+`correctness-slice-N` jobs each check one `range_N`-defined slice of the
+hidden base correctness case, `benchmark-timing` runs only the timed
+prefill/decode measurement, and `benchmark-gates` runs only the anchor/
+free-run/behavior/GPQA gates. A cheap `validate-slice-ranges` job checks the
+three ranges before any of those machines start. A `combine` job (no
+checkpoint download, no private secrets) then downloads all 5 results and ANDs
+every machine's real verdict into the final score. Dispatching with the
+default `run_benchmark=false` instead runs the same checks serially on one
+machine.
 If none of those is configured, a full benchmark fails; it will not use a
 committed prompt, committed golden, or Actions cache fallback for ranked
 scoring. Final hidden goldens should come from protected storage. Private
@@ -233,7 +244,7 @@ The harness records `bandwidth_source=trusted_core_expert_slot_bank_reads` and
 derives `bandwidth_gb_per_token` from trusted-core expert slot-bank file bytes
 during the decode window. Bandwidth, RAM, and expert-read metrics are reported
 for operator review and future guardrails; they are not primary score factors.
-Correctness is a hard gate. See CHALLENGE.md for the full correctness specification.
+Correctness is a hard gate. See TASK.md for the full correctness specification.
 The official run times the benchmark before correctness so the correctness gate
 cannot warm the measured model path. It then checks 64 public correctness
 positions plus the hidden GPQA behavior checks.

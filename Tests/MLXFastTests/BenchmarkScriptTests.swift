@@ -1723,6 +1723,33 @@ func benchmarkWorkflowHasConcurrencyGroupMatchingSiblingProbes() throws {
     #expect(workflow.contains("concurrency:\n  group: benchmark-${{ github.ref }}\n  cancel-in-progress: false"))
 }
 
+@Test
+func staticReviewFailsClosedOnSelfContradictoryPassedTrueWithHighSeverity() throws {
+    let staticReview = try String(
+        contentsOfFile: ".github/scripts/run-submission-static-review.sh",
+        encoding: .utf8
+    )
+
+    // The judge's own system prompt instructs it to set passed=false for high/
+    // critical severity, but that's policy text sent to the LLM, not something
+    // the schema check enforced -- a prompt-injection-influenced response could
+    // return a schema-valid but self-contradictory {passed:true, severity:
+    // critical, findings:[...]} and previously sailed through the passed-only
+    // gate. Confirm both the tightened schema (severity must be one of the five
+    // enumerated values, not just typed as a string) and the explicit fail-
+    // closed cross-check are present.
+    #expect(staticReview.contains("and (.severity | IN(\"none\", \"low\", \"medium\", \"high\", \"critical\"))"))
+    let crossCheckRange = try #require(staticReview.range(
+        of: "if [[ \"${passed}\" == \"true\" ]] && { [[ \"${severity}\" == \"high\" ]] || [[ \"${severity}\" == \"critical\" ]]; }; then"
+    ))
+    let finalGateRange = try #require(
+        staticReview.range(of: "if [[ \"${passed}\" != \"true\" ]]; then", range: crossCheckRange.lowerBound..<staticReview.endIndex)
+    )
+    #expect(crossCheckRange.lowerBound < finalGateRange.lowerBound)
+    let crossCheckBlock = String(staticReview[crossCheckRange.lowerBound..<finalGateRange.lowerBound])
+    #expect(crossCheckBlock.contains("passed=\"false\""))
+}
+
 // DeepSeekRuntime was split across DeepSeekRuntime*.swift; concatenate them so
 // source-level assertions stay agnostic to which split file the code lives in.
 private func harnessRuntimeSource() throws -> String {
