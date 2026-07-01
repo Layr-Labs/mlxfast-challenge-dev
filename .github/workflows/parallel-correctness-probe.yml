@@ -170,17 +170,23 @@ jobs:
         run: .github/scripts/hash-weights-directory.sh weights weights.sha256
 
       - name: Run real smoke check (public fixture only)
+        env:
+          # Deliberately ./benchmark.sh, not the raw binary: the raw binary's
+          # `benchmark` subcommand always exits 0 and just writes a failing
+          # payload (`"passed": false`) to score-path -- it's benchmark.sh's own
+          # `grep -Eq '"passed"...false'` check (line ~350) that turns that into
+          # a nonzero exit. Calling the raw binary directly here would silently
+          # report success even if this machine's transform/worker/decode path
+          # were actually broken. benchmark.sh also rejects --weights/--golden/
+          # --score-path as direct arguments (it wants the env vars below), and
+          # gets the established sandbox/network-isolation handling for free.
+          MLXFAST_SKIP_TRANSFORM: "1"
+          MLXFAST_WEIGHTS_PATH: weights
+          MLXFAST_CORRECTNESS_GOLDEN_PATH: ${{ env.MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH }}
+          MLXFAST_SCORE_PATH: score.local-iterate.json
         run: |
           set -euo pipefail
-          # Fails the job (fail-closed) if this machine's own independent
-          # transform + worker + decode path is broken -- but its output is
-          # diagnostic only. score.json below is a separate, deliberately
-          # documented stand-in; see the job header comment for why.
-          .build/release/mlxfast-swift benchmark \
-            --local-iterate \
-            --weights weights \
-            --golden "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" \
-            --score-path score.local-iterate.json
+          ./benchmark.sh --local-iterate
           cat score.local-iterate.json
 
       - name: Write stand-in score.json for the combiner
@@ -408,11 +414,22 @@ jobs:
 
       - name: Probe summary
         if: always()
+        env:
+          # Routed through env: rather than interpolated directly into the run:
+          # body, matching the established convention in benchmark.yml -- see the
+          # comment on parallel-correctness-probe-slice.yml's "Check correctness
+          # slice" step for why ${{ inputs.* }} must never be inlined into a
+          # run: script directly. (${{ github.run_id }} below is left as direct
+          # interpolation: it's GitHub-assigned and always a plain integer, never
+          # attacker-influenced text.)
+          RANGE_1: ${{ inputs.range_1 }}
+          RANGE_2: ${{ inputs.range_2 }}
+          RANGE_3: ${{ inputs.range_3 }}
         run: |
           {
             echo "## Parallel Correctness Probe"
             echo ""
-            echo "- ranges: \`${{ inputs.range_1 }}\`, \`${{ inputs.range_2 }}\`, \`${{ inputs.range_3 }}\`"
+            echo "- ranges: \`${RANGE_1}\`, \`${RANGE_2}\`, \`${RANGE_3}\`"
             if [[ -s score.combined.json ]]; then
               echo "- combined passed: \`$(jq -r '.passed' score.combined.json)\`"
               echo "- combined checked_steps: \`$(jq -r '.metrics.checked_steps' score.combined.json)\`"

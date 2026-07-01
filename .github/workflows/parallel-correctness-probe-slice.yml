@@ -86,6 +86,14 @@ jobs:
 
       - name: Check correctness slice
         id: correctness
+        env:
+          # Routed through env: rather than interpolated directly into the run:
+          # body -- ${{ inputs.* }} substitutes as a literal string before bash
+          # ever sees it, so inlining an untrusted/malformed value here would be
+          # a script-injection vector. Matches the established convention in
+          # benchmark.yml (see e.g. MLXFAST_SUBMISSION_REF), which never
+          # interpolates ${{ inputs.* }} directly inside a run: script.
+          STEP_RANGE: ${{ inputs.step_range }}
         run: |
           set -euo pipefail
           status=0
@@ -93,7 +101,7 @@ jobs:
             --weights weights \
             --golden "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" \
             --base-case-only \
-            --step-range "${{ inputs.step_range }}" \
+            --step-range "${STEP_RANGE}" \
             --step-range-output step-range.json \
             > correctness-report.json || status=$?
           cat correctness-report.json

@@ -250,9 +250,18 @@ func parallelCorrectnessProbeWorkflowIsManualAndSecretFree() throws {
     // The slice job actually exercises the fixes from the review: base-case-only
     // (no gate pollution) and the range sidecar (real coverage verification).
     #expect(slice.contains("--base-case-only"))
-    #expect(slice.contains("--step-range \"${{ inputs.step_range }}\""))
+    #expect(slice.contains("--step-range \"${STEP_RANGE}\""))
     #expect(slice.contains("--step-range-output step-range.json"))
     #expect(slice.contains(".github/scripts/hash-weights-directory.sh weights weights.sha256"))
+
+    // ${{ inputs.* }} must never be interpolated directly into a run: script body
+    // (classic GitHub Actions script-injection vector -- it substitutes as a
+    // literal string before bash ever sees it). Both files must route dispatch
+    // inputs through env: first, matching benchmark.yml's own convention.
+    #expect(slice.contains("STEP_RANGE: ${{ inputs.step_range }}"))
+    #expect(!slice.contains("--step-range \"${{ inputs.step_range }}\""))
+    #expect(workflow.contains("RANGE_1: ${{ inputs.range_1 }}"))
+    #expect(!workflow.contains("echo \"- ranges: \\`${{ inputs.range_1 }}\\`"))
 
     // Action pins must be independently verified against the upstream repo, not
     // guessed -- this repo pins by commit SHA specifically to prevent a mutated
@@ -293,8 +302,17 @@ func parallelCorrectnessProbeWorkflowIsManualAndSecretFree() throws {
     // if this machine's own transform/worker/decode path is broken), but its
     // score.json for the combiner stays a deliberate stand-in for GPQA/TTFT/
     // timing, which require the hidden golden this workflow must never touch.
+    //
+    // It must call ./benchmark.sh, not the raw binary directly: the raw
+    // `mlxfast-swift benchmark` subcommand always returns exit code 0 and just
+    // writes a failing payload ("passed": false) to score-path -- only
+    // benchmark.sh's own post-hoc grep for "passed": false turns that into a
+    // nonzero exit. Calling the raw binary here would silently report success
+    // even if this machine's transform/worker/decode path were actually broken.
     #expect(workflow.contains("machine1-check:"))
-    #expect(workflow.contains("mlxfast-swift benchmark \\\n            --local-iterate \\"))
+    #expect(workflow.contains("./benchmark.sh --local-iterate"))
+    #expect(!workflow.contains(".build/release/mlxfast-swift benchmark \\\n            --local-iterate"))
+    #expect(workflow.contains("MLXFAST_SKIP_TRANSFORM: \"1\""))
     #expect(workflow.contains("\"passed_correctness\": true,\n              \"checked_steps\": 0,"))
 
     // The combine job must actually cross-check the split verdict against the
