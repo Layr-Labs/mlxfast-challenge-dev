@@ -357,13 +357,7 @@ extension DeepSeekRuntime {
                 throw MLXFastError.invalidInput("runtime worker \(modeName) prefill response missing token")
             }
             let expectedSeedToken = testCase.expectedTokens[0]
-            if failureStep == nil,
-               !correctnessTokenAccepted(
-                   expectedToken: expectedSeedToken,
-                   actualToken: actualToken,
-                   topLogits: try validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
-               )
-            {
+            if failureStep == nil, actualToken != expectedSeedToken {
                 failureStep = repeatIndex * checkedStepsPerPass
                 failureExpected = expectedSeedToken
                 failureActual = actualToken
@@ -380,13 +374,7 @@ extension DeepSeekRuntime {
                 }
                 actualToken = token
                 let expectedToken = testCase.expectedTokens[decodedStep + 1]
-                if failureStep == nil,
-                   !correctnessTokenAccepted(
-                       expectedToken: expectedToken,
-                       actualToken: actualToken,
-                       topLogits: try validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
-                   )
-                {
+                if failureStep == nil, actualToken != expectedToken {
                     failureStep = repeatIndex * checkedStepsPerPass + decodedStep + 1
                     failureExpected = expectedToken
                     failureActual = actualToken

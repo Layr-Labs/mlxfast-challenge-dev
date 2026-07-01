@@ -377,6 +377,8 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(staticReview.contains("hardcoded GPQA/public-dataset question or answer lookup tables"))
     #expect(staticReview.contains("if/else, switch, dictionary, trie, hash, token-sequence, or text matching"))
     #expect(staticReview.contains("score.json or benchmark-integrity.json tampering"))
+    #expect(staticReview.contains("request-shape, call-count, phase, process-lifetime, prompt-length, or cache-state special-casing"))
+    #expect(staticReview.contains("only for timed benchmark workers"))
     #expect(staticReview.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES"))
     #expect(staticReview.contains("oversized source that could hide lookup tables"))
     #expect(staticReview.contains("find \"${editable_path}\" -type f -print0"))
@@ -435,6 +437,18 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(!runtime.contains("correctness_teacher_forced_batch"))
     #expect(!runtime.contains("teacherForcedCorrectnessBatch"))
     #expect(!runtime.contains("let expectedTokens: [Int]?"))
+
+    let workerTeacherForcedStart = try #require(runtime.range(of: "static func compareTeacherForcedWithWorker"))
+    let workerAnchorStart = try #require(runtime.range(of: "static func compareAnchorWithWorker"))
+    let workerBehaviorStart = try #require(runtime.range(of: "static func compareBehaviorWithWorker"))
+    let workerValidationStart = try #require(runtime.range(of: "static func validatedWorkerTopLogits"))
+    let workerTeacherForced = String(runtime[workerTeacherForcedStart.lowerBound..<workerAnchorStart.lowerBound])
+    let workerAnchor = String(runtime[workerAnchorStart.lowerBound..<workerBehaviorStart.lowerBound])
+    let workerBehavior = String(runtime[workerBehaviorStart.lowerBound..<workerValidationStart.lowerBound])
+    #expect(workerTeacherForced.contains("actualToken != expectedToken"))
+    #expect(!workerTeacherForced.contains("correctnessTokenAccepted("))
+    #expect(workerAnchor.contains("topLogits: nil"))
+    #expect(workerBehavior.contains("topLogits: nil"))
 }
 
 @Test
@@ -503,6 +517,19 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     #expect(cli.contains("(deny file-read* (subpath"))
     #expect(cli.contains("absolutePath(privateDir)"))
     #expect(!cli.contains("(allow network* (remote ip \\\"localhost:*\\\"))"))
+}
+
+@Test
+func expertSlotBankUsesNoFollowPostOpenShardValidation() throws {
+    let source = try String(
+        contentsOfFile: "Sources/MLXFastCore/ExpertSlotBank.swift",
+        encoding: .utf8
+    )
+
+    #expect(source.contains("open(shardPath, O_RDONLY | O_NOFOLLOW)"))
+    #expect(source.contains("fstat(fd, &openedStat)"))
+    #expect(source.contains("(openedStat.st_mode & S_IFMT) == S_IFREG"))
+    #expect(source.contains("end <= Int(openedStat.st_size)"))
 }
 
 @Test

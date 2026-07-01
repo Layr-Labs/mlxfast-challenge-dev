@@ -94,13 +94,8 @@ extension DeepSeekRuntime {
             guard let actualToken = response.token else {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness response missing token")
             }
-            let topLogits = try validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
             let expectedToken = testCase.expectedTokens[step]
-            if !correctnessTokenAccepted(
-                expectedToken: expectedToken,
-                actualToken: actualToken,
-                topLogits: topLogits
-            ) {
+            if actualToken != expectedToken {
                 return WorkerCorrectnessResult(
                     comparison: CorrectnessTokenComparison(
                         passed: false,
@@ -142,12 +137,11 @@ extension DeepSeekRuntime {
         guard let actualToken = response.token else {
             throw MLXFastError.invalidInput("runtime worker anchor response missing token")
         }
-        let topLogits = try validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
         return WorkerCorrectnessResult(
             comparison: compareAnchorToken(
                 anchor: anchor,
                 actualToken: actualToken,
-                topLogits: topLogits
+                topLogits: nil
             ),
             expertStats: response.expertStats ?? .zero,
             peakRamGB: response.peakRamGB ?? 0
@@ -189,11 +183,10 @@ extension DeepSeekRuntime {
         guard let firstToken = beginResponse.token else {
             throw MLXFastError.invalidInput("runtime worker behavior response missing token")
         }
-        let topLogits = try validatedWorkerTopLogits(beginResponse.topLogits, actualToken: firstToken)
         let firstTokenComparison = compareBehaviorFirstToken(
             testCase: testCase,
             actualToken: firstToken,
-            topLogits: topLogits
+            topLogits: nil
         )
         if !firstTokenComparison.passed {
             return WorkerCorrectnessResult(
