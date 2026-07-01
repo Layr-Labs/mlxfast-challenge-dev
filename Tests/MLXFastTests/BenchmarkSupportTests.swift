@@ -52,6 +52,35 @@ func runtimeWorkerEnvironmentStripsOfficialRunAndCIIdentity() {
 }
 
 @Test
+func semanticBehaviorGateRequiresPromptAndReferenceAnswer() {
+    let exactOnly = GoldenBehaviorCase(
+        name: "exact-only",
+        promptTokens: [1],
+        acceptedTokenSequences: [[2]],
+        maxNewTokens: 1
+    )
+    let missingReference = GoldenBehaviorCase(
+        name: "missing-reference",
+        promptTokens: [1],
+        acceptedTokenSequences: [[2]],
+        maxNewTokens: 1,
+        semanticPrompt: "question"
+    )
+    let semantic = GoldenBehaviorCase(
+        name: "semantic",
+        promptTokens: [1],
+        acceptedTokenSequences: [[2]],
+        maxNewTokens: 1,
+        semanticPrompt: "question",
+        semanticReferenceAnswer: "answer"
+    )
+
+    #expect(!DeepSeekRuntime.behaviorUsesSemanticJudge(exactOnly))
+    #expect(!DeepSeekRuntime.behaviorUsesSemanticJudge(missingReference))
+    #expect(DeepSeekRuntime.behaviorUsesSemanticJudge(semantic))
+}
+
+@Test
 func correctnessAcceptsOnlyExactTopLogitTies() {
     #expect(correctnessTokenAccepted(
         expectedToken: 30,

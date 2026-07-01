@@ -30,9 +30,10 @@ public enum MLXFastConstants {
     public static let correctnessMaxBehaviorPromptTokens = 2_048
     public static let correctnessMaxBehaviorSteps = 64
     public static let correctnessGPQACaseCount = 5
-    // Cross-machine greedy decode can drift after the first answer token even
-    // with pinned Swift/MLX. Exact GPQA behavior accepts the stable first-token
-    // prefix, while the short continuation feeds the private semantic judge.
+    // Cross-machine greedy decode can drift on hidden GPQA even with pinned
+    // Swift/MLX. Semantic GPQA behavior captures a short continuation for the
+    // private judge; exact token enforcement stays on the long copy gate and
+    // non-semantic behavior fixtures.
     public static let correctnessGPQAMaxNewTokens = 10
     // Semantic judging uses short hidden GPQA answers as a baseline-calibrated
     // hard gate for optimizations that preserve the exact prefix but damage

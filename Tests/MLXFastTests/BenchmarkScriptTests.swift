@@ -451,6 +451,9 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(!workerTeacherForced.contains("correctnessTokenAccepted("))
     #expect(workerAnchor.contains("topLogits: nil"))
     #expect(workerBehavior.contains("topLogits: nil"))
+    #expect(workerBehavior.contains("let usesSemanticJudge = behaviorUsesSemanticJudge(testCase)"))
+    #expect(workerBehavior.contains("if !usesSemanticJudge"))
+    #expect(workerBehavior.contains("if usesSemanticJudge ||"))
 }
 
 @Test
