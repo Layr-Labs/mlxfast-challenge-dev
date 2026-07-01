@@ -64,6 +64,113 @@ public enum DeepSeekRoutedExperts {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
         }
 
+        // Decode fast path: a single token routed to topK experts (M == 1). The
+        // per-expert gather and the inverse-permutation reorder of the general
+        // path are identities here, so run each selected expert directly on the
+        // one token row and concatenate outputs in routing order. Each expert
+        // fuses gate+up into one quantizedMM. Both are bit-identical ONLY at
+        // M == 1 and only when the selected experts are all distinct: the general
+        // path batches a duplicated expert (hash-routing layers) into one M == 2
+        // matmul, which uses a different kernel than two M == 1 calls, so fall
+        // through to the general path if any expert repeats.
+        if tokenCount == 1 {
+            var seen = Set<Int>()
+            seen.reserveCapacity(topK)
+            var allDistinct = true
+            for expertIndex in selectedExperts where !seen.insert(expertIndex).inserted {
+                allDistinct = false
+                break
+            }
+            if allDistinct {
+                let token = x.reshaped([1, hiddenSize])
+                var expertWeightsList: [DeepSeekMLPWeights] = []
+                expertWeightsList.reserveCapacity(topK)
+                var allQuantized = true
+                for expertIndex in selectedExperts {
+                    let expertWeights = try weights(
+                        forExpert: expertIndex,
+                        loader: loader,
+                        spec: spec
+                    )
+                    if expertWeights.gate.scales == nil
+                        || expertWeights.up.scales == nil
+                        || expertWeights.down.scales == nil
+                        || expertWeights.gate.biases != nil
+                        || expertWeights.up.biases != nil
+                        || expertWeights.down.biases != nil
+                    {
+                        allQuantized = false
+                    }
+                    expertWeightsList.append(expertWeights)
+                }
+
+                if allQuantized {
+                    // Batch the topK distinct experts: stack their fused gate|up and
+                    // down mxfp4 weights into [topK, ...] and run TWO batched
+                    // quantizedMM (broadcasting the single token across the expert
+                    // batch) instead of 2*topK per-expert matmuls. Same
+                    // QuantizedMatmul primitive as the per-expert path — at M == 1
+                    // each batch element dispatches the identical qmv kernel — so it
+                    // is bit-identical while cutting matmul dispatches per layer.
+                    let intermediate = spec.intermediateSize
+                    var gateUpWeights: [MLXArray] = []
+                    var gateUpScales: [MLXArray] = []
+                    var downWeights: [MLXArray] = []
+                    var downScales: [MLXArray] = []
+                    gateUpWeights.reserveCapacity(topK)
+                    gateUpScales.reserveCapacity(topK)
+                    downWeights.reserveCapacity(topK)
+                    downScales.reserveCapacity(topK)
+                    for w in expertWeightsList {
+                        gateUpWeights.append(concatenated([w.gate.weight, w.up.weight], axis: 0))
+                        gateUpScales.append(concatenated([w.gate.scales!, w.up.scales!], axis: 0))
+                        downWeights.append(w.down.weight)
+                        downScales.append(w.down.scales!)
+                    }
+                    let first = expertWeightsList[0]
+                    let gateUp = quantizedMM(
+                        token.reshaped([1, 1, hiddenSize]),
+                        stacked(gateUpWeights, axis: 0),
+                        scales: stacked(gateUpScales, axis: 0),
+                        biases: nil,
+                        transpose: true,
+                        groupSize: first.gate.groupSize,
+                        bits: first.gate.bits,
+                        mode: first.gate.mode
+                    )
+                    let gate = gateUp[.ellipsis, 0 ..< intermediate]
+                    let up = gateUp[.ellipsis, intermediate ..< (2 * intermediate)]
+                    let hidden = DeepSeekOps.limitedSwiGLU(gate: gate, up: up, limit: spec.swigluLimit)
+                    let down = quantizedMM(
+                        hidden,
+                        stacked(downWeights, axis: 0),
+                        scales: stacked(downScales, axis: 0),
+                        biases: nil,
+                        transpose: true,
+                        groupSize: first.down.groupSize,
+                        bits: first.down.bits,
+                        mode: first.down.mode
+                    )
+                    return down.reshaped([batchSize, sequenceLength, topK, hiddenSize])
+                }
+
+                // Non-quantized fallback (e.g. F32 test weights): fused per-expert.
+                var singleTokenOutputs: [MLXArray] = []
+                singleTokenOutputs.reserveCapacity(topK)
+                for expertWeights in expertWeightsList {
+                    singleTokenOutputs.append(
+                        DeepSeekMLP.forwardFusedGateUp(
+                            token,
+                            weights: expertWeights,
+                            swigluLimit: spec.swigluLimit
+                        )
+                    )
+                }
+                return concatenated(singleTokenOutputs, axis: 0)
+                    .reshaped([batchSize, sequenceLength, topK, hiddenSize])
+            }
+        }
+
         // Group activation flat-indices by expert so each expert runs one batched
         // matmul over all of its tokens instead of one matmul per token.
         var flatIndicesByExpert: [Int: [Int]] = [:]
