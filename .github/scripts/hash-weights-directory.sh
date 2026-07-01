@@ -17,8 +17,13 @@ hash="$(
   find "${WEIGHTS_PATH}" -type f ! -name '.benchmark-source.sha256' ! -name '.gitkeep' -print0 \
     | LC_ALL=C sort -z \
     | while IFS= read -r -d '' path; do
-        printf '%s\0' "${path#"${WEIGHTS_PATH}"/}"
-        shasum -a 256 "${path}"
+        # shasum's own output line embeds the exact path it was given
+        # ("<hash>  <path>"), which includes WEIGHTS_PATH -- that varies between
+        # machines even for byte-identical trees, so extract just the hash and
+        # pair it with our own path made relative to WEIGHTS_PATH instead of
+        # feeding shasum's raw output (path and all) into the outer hash.
+        file_hash="$(shasum -a 256 "${path}" | awk '{print $1}')"
+        printf '%s  %s\n' "${file_hash}" "${path#"${WEIGHTS_PATH}"/}"
       done \
     | shasum -a 256 \
     | awk '{print $1}'

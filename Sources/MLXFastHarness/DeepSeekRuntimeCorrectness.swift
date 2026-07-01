@@ -61,9 +61,13 @@ extension DeepSeekRuntime {
         if let worker {
             return runCorrectnessWithWorker(options, worker: worker)
         }
-        guard options.stepStart == 0 else {
+        // Both stepStart and stepCount are worker-only: the non-worker path below
+        // always checks the full [0, correctnessSteps) window and has no way to honor
+        // either an explicit start or an explicit count, so any explicit request for
+        // either must fail loudly rather than silently run the full window.
+        guard options.stepStart == 0, options.stepCount == nil else {
             throw MLXFastError.invalidInput(
-                "correctness step ranges (stepStart != 0) require the runtime worker; "
+                "correctness step ranges (--step-range) require the runtime worker; "
                     + "rerun with the worker enabled or omit --step-range"
             )
         }
@@ -88,7 +92,8 @@ extension DeepSeekRuntime {
             return runLayeredCorrectness(
                 golden: golden,
                 weightCache: weightCache,
-                steps: MLXFastConstants.correctnessSteps
+                steps: MLXFastConstants.correctnessSteps,
+                checkGates: !options.baseCaseOnly
             )
         } catch {
             return failedCorrectnessReport(
@@ -136,7 +141,8 @@ extension DeepSeekRuntime {
                 golden: golden,
                 worker: worker,
                 steps: options.stepCount ?? MLXFastConstants.correctnessSteps,
-                startStep: options.stepStart
+                startStep: options.stepStart,
+                checkGates: !options.baseCaseOnly
             )
             checkedSteps = result.report.checkedSteps
             lastExpertStats = result.expertStats
@@ -198,9 +204,15 @@ extension DeepSeekRuntime {
         golden: GoldenFixture,
         weightCache: DeepSeekRuntimeWeightCache,
         steps: Int = MLXFastConstants.correctnessSteps,
+        checkGates: Bool = true,
         progress: ((String) -> Void)? = nil
     ) -> CorrectnessReport {
-        let caseCount = golden.totalCorrectnessCaseCount
+        // checkGates: false skips anchors/free-run/behavior entirely and reports
+        // caseCount/checkedSteps for golden.cases alone -- for a machine assigned only
+        // a slice of the base case, so its checked_steps total is comparable across
+        // machines instead of being inflated by however many gates the golden happens
+        // to carry (which a step-range coverage check would otherwise miscount).
+        let caseCount = checkGates ? golden.totalCorrectnessCaseCount : golden.cases.count
         var checkedSteps = 0
         var currentCase: String?
 
@@ -262,7 +274,7 @@ extension DeepSeekRuntime {
                 checkedSteps += comparison.checkedSteps
             }
 
-            let gates = golden.correctnessGates
+            let gates = checkGates ? golden.correctnessGates : nil
             for (caseIndex, anchor) in (gates?.anchorCases ?? []).enumerated() {
                 currentCase = anchor.name
                 let caseLabel = "\(caseIndex + 1)/\(gates?.anchorCases.count ?? 0)"
@@ -361,10 +373,13 @@ extension DeepSeekRuntime {
         worker: RuntimeWorkerClient,
         steps: Int = MLXFastConstants.correctnessSteps,
         startStep: Int = 0,
+        checkGates: Bool = true,
         semanticCapture: SemanticGPQACaptureOptions? = nil,
         progress: ((String) -> Void)? = nil
     ) -> WorkerLayeredCorrectnessResult {
-        let caseCount = golden.totalCorrectnessCaseCount
+        // checkGates: false skips anchors/free-run/behavior/GPQA entirely -- see the
+        // matching comment on runLayeredCorrectness.
+        let caseCount = checkGates ? golden.totalCorrectnessCaseCount : golden.cases.count
         var checkedSteps = 0
         var currentCase: String?
         var lastExpertStats = ExpertStreamingStats.zero
@@ -454,7 +469,7 @@ extension DeepSeekRuntime {
                 progress?("correctness case \(caseLabel) complete checked_steps=\(check.comparison.checkedSteps)")
             }
 
-            let gates = golden.correctnessGates
+            let gates = checkGates ? golden.correctnessGates : nil
             for (caseIndex, anchor) in (gates?.anchorCases ?? []).enumerated() {
                 currentCase = anchor.name
                 let caseLabel = "\(caseIndex + 1)/\(gates?.anchorCases.count ?? 0)"

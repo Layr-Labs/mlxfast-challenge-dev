@@ -17,12 +17,27 @@ public struct CorrectnessOptions: Equatable {
     // pre-existing full-range behavior. Only honored on the runtime-worker code path.
     public let stepStart: Int
     public let stepCount: Int?
+    // When true, skip anchors/free-run/behavior/GPQA gates entirely and check only
+    // golden.cases (the base case). Without this, a machine checking a step-range
+    // slice of the base case still runs every gate in the golden file, and its
+    // checked_steps total becomes base-slice-length + gate-step-counts -- not
+    // comparable across machines and not what a range-coverage check expects. Use
+    // this on every machine that's assigned a base-case slice; leave it off on
+    // whichever machine (if any) is responsible for the gates.
+    public let baseCaseOnly: Bool
 
-    public init(weightsPath: String, goldenPath: String, stepStart: Int = 0, stepCount: Int? = nil) {
+    public init(
+        weightsPath: String,
+        goldenPath: String,
+        stepStart: Int = 0,
+        stepCount: Int? = nil,
+        baseCaseOnly: Bool = false
+    ) {
         self.weightsPath = weightsPath
         self.goldenPath = goldenPath
         self.stepStart = stepStart
         self.stepCount = stepCount
+        self.baseCaseOnly = baseCaseOnly
     }
 }
 

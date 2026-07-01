@@ -131,7 +131,10 @@ private enum MLXFastCLI {
     }
 
     private static func runCorrectness(_ options: ParsedOptions) throws -> Int {
-        try options.validate(valueOptions: ["--weights", "--golden", "--step-range"])
+        try options.validate(
+            valueOptions: ["--weights", "--golden", "--step-range", "--step-range-output"],
+            flagOptions: ["--base-case-only"]
+        )
         let weightsPath = options.value(
             for: "--weights",
             default: environmentValue(
@@ -152,12 +155,28 @@ private enum MLXFastCLI {
                 default: environmentValue("MLXFAST_CORRECTNESS_STEP_RANGE", fallback: "")
             )
         )
+        let baseCaseOnly = options.hasFlag("--base-case-only")
+            || environmentValue("MLXFAST_CORRECTNESS_BASE_CASE_ONLY", fallback: "0") == "1"
+        // Recorded independent of pass/fail and before the check even runs: a
+        // combiner verifying range coverage across machines needs to know what was
+        // actually ASSIGNED, not derive it from checked_steps, which is truncated on
+        // a real failure and must not be confused with an unassigned/uncovered range.
+        let stepRangeOutputPath = options.value(for: "--step-range-output", default: "")
+        if !stepRangeOutputPath.isEmpty {
+            guard let stepCount else {
+                throw MLXFastError.invalidInput("--step-range-output requires --step-range")
+            }
+            try requirePrivateOutputPath(stepRangeOutputPath, description: "step-range report")
+            let sidecar = "{\"step_range_start\":\(stepStart),\"step_range_end\":\(stepStart + stepCount)}\n"
+            try sidecar.write(toFile: stepRangeOutputPath, atomically: true, encoding: .utf8)
+        }
         let report = try DeepSeekRuntime.runCorrectness(
             CorrectnessOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
                 stepStart: stepStart,
-                stepCount: stepCount
+                stepCount: stepCount,
+                baseCaseOnly: baseCaseOnly
             ),
             worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
         )
@@ -996,7 +1015,7 @@ private enum MLXFastCLI {
             Usage:
               mlxfast-swift transform [--reference PATH] [--output PATH]
               mlxfast-swift verify-transform [--reference PATH] [--weights PATH] [--tmp-parent PATH] [--max-bytes N]
-              mlxfast-swift correctness [--weights PATH] [--golden PATH] [--step-range START-END]
+              mlxfast-swift correctness [--weights PATH] [--golden PATH] [--step-range START-END] [--step-range-output PATH] [--base-case-only]
               mlxfast-swift correctness-trace [--weights PATH] [--golden PATH] [--case NAME] --step N [--top-k N]
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--local-submit|--local-iterate] [--weights PATH] [--golden PATH] [--score-path PATH]

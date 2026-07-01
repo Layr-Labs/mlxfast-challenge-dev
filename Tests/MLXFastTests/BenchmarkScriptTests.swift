@@ -11,7 +11,7 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
 
     #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://ds4.darkbloom.ai/deepseek-v4-flash-4bit\""))
     #expect(setup.contains("REFERENCE_BASE_URL=\"${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}\""))
-    #expect(setup.contains("DEFAULT_HF_HOME=\"${MLXFAST_HF_HOME:-${HF_HOME:-${PWD}/.cache/huggingface}}\""))
+    #expect(setup.contains("DEFAULT_HF_HOME=\"${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}\""))
     #expect(setup.contains("REFERENCE_CACHE_DIR=\"${MLXFAST_REFERENCE_CACHE_DIR:-${DEFAULT_HF_HUB_CACHE}/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}}\""))
     #expect(setup.contains("REFERENCE_CACHE_LOCK_PATH=\"${MLXFAST_REFERENCE_CACHE_LOCK_PATH:-${REFERENCE_DIR}/.mlxfast-reference-cache.lock}\""))
     #expect(setup.contains("REFERENCE_POST_DOWNLOAD_FULL_VERIFY=\"${MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY:-1}\""))
@@ -666,11 +666,14 @@ func compareTeacherForcedWithWorkerSupportsStartStepForParallelCorrectness() thr
     #expect(runtime.contains("progress?(\"correctness case \\(caseLabel) skipped (steps=0)\")"))
     #expect(runtime.contains("guard steps > 0 else {"))
 
-    // Step ranges (startStep != 0) are worker-only -- calling with a non-zero
-    // start and no worker must fail loudly rather than silently check the wrong
-    // slice on a code path that has no way to honor it.
-    #expect(runtime.contains("guard options.stepStart == 0 else {"))
-    #expect(runtime.contains("correctness step ranges (stepStart != 0) require the runtime worker"))
+    // Step ranges (stepStart != 0 OR an explicit stepCount) are worker-only --
+    // calling with either on a code path with no worker must fail loudly rather
+    // than silently run the full window and claim to have honored the request.
+    // (Regression test for a review finding: the guard originally checked only
+    // stepStart, so `--step-range 0-10` without a worker silently ran all 64
+    // steps instead of the requested 10.)
+    #expect(runtime.contains("guard options.stepStart == 0, options.stepCount == nil else {"))
+    #expect(runtime.contains("correctness step ranges (--step-range) require the runtime worker"))
 
     // 0 is an explicit, documented allowance for BenchmarkOptions.correctnessSteps
     // -- the harness never treats a steps=0 run as having verified correctness on
@@ -678,6 +681,60 @@ func compareTeacherForcedWithWorkerSupportsStartStepForParallelCorrectness() thr
     // together may do that.
     #expect(runtime.contains("guard options.correctnessSteps >= 0 else {"))
     #expect(!runtime.contains("guard options.correctnessSteps > 0 else {"))
+}
+
+// Regression test for a review finding: a machine checking a step-range slice of
+// the base case still ran every gate in the golden (anchors/free-run/behavior/
+// GPQA) by default, so its checked_steps became base-slice-length + gate-step-
+// counts instead of just the slice -- not comparable across machines, and wrong
+// for a range-coverage check. --base-case-only / checkGates: false must skip all
+// three gate loops and report caseCount as golden.cases.count alone.
+@Test
+func correctnessBaseCaseOnlySkipsGatesAndReportsBaseCaseCountAlone() throws {
+    let runtime = try harnessRuntimeSource()
+
+    #expect(runtime.contains("public let baseCaseOnly: Bool"))
+    #expect(runtime.contains("baseCaseOnly: Bool = false"))
+
+    #expect(runtime.contains("checkGates: Bool = true,"))
+    #expect(runtime.contains("let caseCount = checkGates ? golden.totalCorrectnessCaseCount : golden.cases.count"))
+    #expect(runtime.contains("let gates = checkGates ? golden.correctnessGates : nil"))
+    #expect(runtime.contains("checkGates: !options.baseCaseOnly"))
+
+    let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
+    #expect(cli.contains("\"--base-case-only\""))
+    #expect(cli.contains("options.hasFlag(\"--base-case-only\")"))
+    #expect(cli.contains("MLXFAST_CORRECTNESS_BASE_CASE_ONLY"))
+    #expect(cli.contains("baseCaseOnly: baseCaseOnly"))
+    #expect(cli.contains("[--base-case-only]"))
+}
+
+// Regression test for a review finding: the combiner needs to know which
+// ABSOLUTE range each machine actually checked, not just how many steps it
+// checked, to detect overlapping/gapped range assignments. --step-range-output
+// writes that range unconditionally (before the check even runs, so it's
+// present even on a failing run) to a sidecar file separate from
+// correctness-report.json -- deliberately not added as a new field on
+// CorrectnessReport, since correctness-report.json's exact key set is enforced
+// by a strict same_keys check in the official "Validate correctness artifacts"
+// workflow step, and adding a key there would break that gate.
+@Test
+func correctnessStepRangeOutputWritesSidecarSeparateFromReport() throws {
+    let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
+
+    #expect(cli.contains("\"--step-range-output\""))
+    #expect(cli.contains("--step-range-output requires --step-range"))
+    #expect(cli.contains("\"{\\\"step_range_start\\\":\\(stepStart),\\\"step_range_end\\\":\\(stepStart + stepCount)}\\n\""))
+    #expect(cli.contains("try requirePrivateOutputPath(stepRangeOutputPath, description: \"step-range report\")"))
+    #expect(cli.contains("[--step-range-output PATH]"))
+
+    // correctness-report.json's schema must stay untouched by this feature --
+    // confirm the official validator's exact key list still has 16 entries and
+    // no step-range-specific key was added to it.
+    let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
+    #expect(workflow.contains("\"golden_hash\","))
+    #expect(!workflow.contains("step_range_start"))
+    #expect(!workflow.contains("step_range_end"))
 }
 
 @Test
@@ -688,7 +745,8 @@ func benchmarkCliSupportsCorrectnessStepRangeAndSkippableBenchmarkCorrectness() 
     #expect(cli.contains("private static func parseCorrectnessStepRange(_ raw: String) throws -> (start: Int, count: Int?) {"))
     #expect(cli.contains("MLXFAST_CORRECTNESS_STEP_RANGE"))
     #expect(cli.contains(
-        "CorrectnessOptions(\n                weightsPath: weightsPath,\n                goldenPath: goldenPath,\n                stepStart: stepStart,\n                stepCount: stepCount\n            )"
+        "CorrectnessOptions(\n                weightsPath: weightsPath,\n                goldenPath: goldenPath,\n"
+            + "                stepStart: stepStart,\n                stepCount: stepCount,\n                baseCaseOnly: baseCaseOnly\n            )"
     ))
     #expect(cli.contains("must be START-END with 0 <= START < END"))
 
@@ -710,11 +768,30 @@ func combineParallelCorrectnessScriptEnforcesWeightsHashAndCoverage() throws {
     #expect(combiner.contains("weights hash mismatch across machines"))
     #expect(combiner.contains("exit 1"))
 
-    // Coverage (no gaps/overlaps in the assigned step ranges) is only enforced
-    // when every machine reports its own slice passed -- a real early-stopping
-    // failure must not be misreported as a range misconfiguration.
-    #expect(combiner.contains("if [[ \"${base_case_passed}\" == \"true\" && \"${total_checked_steps}\" -ne \"${MLXFAST_EXPECTED_CORRECTNESS_STEPS}\" ]]; then"))
+    // Regression test for a review finding: summing checked_steps across machines
+    // cannot detect an overlapping/gapped range assignment (two machines both
+    // reporting checked_steps=32 sums to 64 -- the expected total -- even if both
+    // covered [0,32) and [32,64) was never assigned to anyone). The combiner must
+    // read each machine's ASSIGNED range from step-range.json and verify those
+    // ranges -- sorted -- actually partition [0, EXPECTED) with no gaps or overlaps,
+    // not just that the counts add up.
+    #expect(combiner.contains("require_file \"${dir}/step-range.json\""))
+    #expect(combiner.contains("range_start=\"$(jq -r '.step_range_start' \"${dir}/step-range.json\")\""))
+    #expect(combiner.contains("range_end=\"$(jq -r '.step_range_end' \"${dir}/step-range.json\")\""))
+    #expect(combiner.contains("sort_by(.start) as $sorted"))
+    #expect(combiner.contains("elif $sorted[0].start != 0 then \"false\""))
+    #expect(combiner.contains("elif $sorted[$n - 1].end != $expected then \"false\""))
+    #expect(combiner.contains("([range(0; $n - 1) | ($sorted[.].end == $sorted[. + 1].start)] | all) | tostring"))
+    #expect(combiner.contains("if [[ \"${base_case_passed}\" == \"true\" ]]; then"))
     #expect(combiner.contains("base_case_passed=false"))
+
+    // Regression test for a review finding: this is the fix for a machine that
+    // ran gates alongside its base-case slice (forgot --base-case-only), which
+    // would silently inflate checked_steps -- catch it directly by requiring a
+    // passing machine's checked_steps to equal its own assigned range width.
+    #expect(combiner.contains("assigned_width=$((range_end - range_start))"))
+    #expect(combiner.contains("if [[ \"${checked_steps}\" -ne \"${assigned_width}\" ]]; then"))
+    #expect(combiner.contains("--base-case-only was omitted"))
 
     // machine1's own checked_steps (anchors/free-run/behavior) must be added to,
     // not replaced by, the summed base-case step count from the other machines.
@@ -732,6 +809,126 @@ func combineParallelCorrectnessScriptEnforcesWeightsHashAndCoverage() throws {
     let ci = try String(contentsOfFile: ".github/workflows/ci.yml", encoding: .utf8)
     #expect(ci.contains("bash -n .github/scripts/hash-weights-directory.sh"))
     #expect(ci.contains("bash -n .github/scripts/combine-parallel-correctness.sh"))
+}
+
+// Regression test for a review finding: shasum's own printed output line embeds
+// the exact path it was given ("<hash>  <path>"), so hashing "shasum -a 256
+// ${WEIGHTS_PATH}/file" output directly makes the final digest depend on
+// WEIGHTS_PATH itself -- two machines with byte-identical weights/ under
+// different root paths (an unavoidable difference between independent
+// machines/temp dirs) would then hash differently, making the combiner's
+// weights-hash tripwire reject every legitimate multi-machine run. Runs the
+// actual script against real byte-identical fixture trees under different
+// roots to prove the fix, not just check the source for a keyword.
+@Test
+func hashWeightsDirectoryIsIndependentOfWeightsPathButSensitiveToContent() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    func makeWeights(named name: String, content: String, filename: String = "config.json") throws -> URL {
+        let dir = root.appendingPathComponent(name).appendingPathComponent("weights")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try content.write(to: dir.appendingPathComponent(filename), atomically: true, encoding: .utf8)
+        return dir
+    }
+
+    func hash(_ weightsDir: URL) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [".github/scripts/hash-weights-directory.sh", weightsDir.path]
+        process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        try process.run()
+        process.waitUntilExit()
+        #expect(process.terminationStatus == 0)
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    let rootA = try makeWeights(named: "rootA-\(UUID().uuidString)", content: "identical content")
+    let rootB = try makeWeights(named: "rootB-\(UUID().uuidString)", content: "identical content")
+    let hashA = try hash(rootA)
+    let hashB = try hash(rootB)
+    #expect(!hashA.isEmpty)
+    #expect(hashA == hashB)
+
+    let differentContent = try makeWeights(named: "different-\(UUID().uuidString)", content: "not the same")
+    #expect(try hash(differentContent) != hashA)
+
+    let renamedFile = try makeWeights(named: "renamed-\(UUID().uuidString)", content: "identical content", filename: "renamed.json")
+    #expect(try hash(renamedFile) != hashA)
+}
+
+// Regression test for a review finding, run against the real script: two
+// machines both assigned/reporting range [0, 32) with expected=64 must NOT
+// combine to passed=true just because their checked_steps happen to sum to 64.
+// This is the exact false-pass the review reported reproducing.
+@Test
+func combineParallelCorrectnessRejectsOverlappingRangesDespiteMatchingSum() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    func writeMachine(_ name: String, weightsHash: String, rangeStart: Int, rangeEnd: Int, checkedSteps: Int, passed: Bool = true) throws {
+        let dir = root.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try weightsHash.write(to: dir.appendingPathComponent("weights.sha256"), atomically: true, encoding: .utf8)
+        try """
+        {"step_range_start": \(rangeStart), "step_range_end": \(rangeEnd)}
+        """.write(to: dir.appendingPathComponent("step-range.json"), atomically: true, encoding: .utf8)
+        try """
+        {"passed": \(passed), "checked_steps": \(checkedSteps), "first_failing_step": null}
+        """.write(to: dir.appendingPathComponent("correctness-report.json"), atomically: true, encoding: .utf8)
+    }
+
+    try FileManager.default.createDirectory(
+        at: root.appendingPathComponent("machine1"),
+        withIntermediateDirectories: true
+    )
+    try "sharedhash".write(
+        to: root.appendingPathComponent("machine1/weights.sha256"),
+        atomically: true,
+        encoding: .utf8
+    )
+    try """
+    {"score": 1.1, "passed": true, "metrics": {"passed_correctness": true, "checked_steps": 0, "case_count": 6, "first_failing_case": null, "first_failing_step": null}}
+    """.write(to: root.appendingPathComponent("machine1/score.json"), atomically: true, encoding: .utf8)
+
+    let scriptPath = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent(".github/scripts/combine-parallel-correctness.sh")
+        .path
+
+    func runCombiner(machineDirs: String, expectedSteps: Int) throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [scriptPath]
+        process.currentDirectoryURL = root
+        process.environment = [
+            "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
+            "MLXFAST_MACHINE1_DIR": "machine1",
+            "MLXFAST_CORRECTNESS_MACHINE_DIRS": machineDirs,
+            "MLXFAST_EXPECTED_CORRECTNESS_STEPS": "\(expectedSteps)",
+            "MLXFAST_COMBINED_SCORE_PATH": root.appendingPathComponent("score.combined.json").path,
+        ]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
+    // The exact reported repro: machine2 and machine3 both cover [0, 32), nobody
+    // covers [32, 64) -- checked_steps sums to the expected 64 by coincidence.
+    try writeMachine("machine2", weightsHash: "sharedhash", rangeStart: 0, rangeEnd: 32, checkedSteps: 32)
+    try writeMachine("machine3", weightsHash: "sharedhash", rangeStart: 0, rangeEnd: 32, checkedSteps: 32)
+    let overlappingStatus = try runCombiner(machineDirs: "machine2 machine3", expectedSteps: 64)
+    #expect(overlappingStatus != 0)
+
+    // A genuinely contiguous, non-overlapping split of the same total must pass.
+    try writeMachine("machine4", weightsHash: "sharedhash", rangeStart: 0, rangeEnd: 32, checkedSteps: 32)
+    try writeMachine("machine5", weightsHash: "sharedhash", rangeStart: 32, rangeEnd: 64, checkedSteps: 32)
+    let contiguousStatus = try runCombiner(machineDirs: "machine4 machine5", expectedSteps: 64)
+    #expect(contiguousStatus == 0)
 }
 
 @Test
@@ -772,7 +969,7 @@ func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
         encoding: .utf8
     )
 
-    #expect(contract.contains("\"preSubmitCommand\": [\"bash\", \"-lc\", \"./benchmark.sh --local-submit\"]"))
+    #expect(!contract.contains("preSubmitCommand"))
     #expect(constants.contains("public static let defaultPublicLocalSubmitGoldenPath"))
     #expect(constants.contains("public static let localSubmitBenchmarkDecodeSteps = 1023"))
     #expect(constants.contains("public static let localSubmitBenchmarkRepeats = 1"))

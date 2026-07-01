@@ -3,8 +3,12 @@
 #   machine1/ - ran `mlxfast-swift benchmark` with MLXFAST_BENCHMARK_CORRECTNESS_STEPS=0
 #               (GPQA cases + GPQA TTFT + timed prefill/decode; skips its own base
 #               teacher-forced correctness case)
-#   machine2/ .. machineN/ - each ran `mlxfast-swift correctness --step-range START-END`
-#               covering a disjoint slice of the base correctness case's step window
+#   machine2/ .. machineN/ - each ran `mlxfast-swift correctness --base-case-only
+#               --step-range START-END --step-range-output step-range.json`, covering a
+#               disjoint slice of the base correctness case's step window. --base-case-only
+#               is required: without it, checked_steps also includes anchors/free-run/
+#               behavior/GPQA from the golden file, which is not comparable across
+#               machines and would corrupt the coverage check below.
 #
 # This script is the only place the real, combined correctness verdict is asserted.
 # Machine 1's own score.json reports passed_correctness based on nothing but GPQA/TTFT/
@@ -47,19 +51,32 @@ for dir in "${MACHINE1_DIR}" "${CORRECTNESS_MACHINE_DIRS[@]}"; do
 done
 echo "combine-parallel-correctness: weights hash agrees across all machines: ${expected_weights_hash}"
 
-# --- Combine the base correctness case's step-range slices.
+# --- Combine the base correctness case's step-range slices. Each machine reports its
+# ASSIGNED range (step-range.json, written unconditionally before the check runs) plus
+# its own pass/fail/checked_steps (correctness-report.json). The assigned range is what
+# coverage is checked against, not checked_steps -- a real failure legitimately stops
+# early and reports fewer checked_steps than its assigned slice, and that must not be
+# confused with a range that was never assigned to anyone.
 total_checked_steps=0
 base_case_passed=true
 first_failing_step=""
 first_failing_dir=""
+ranges_file="$(mktemp)"
+trap 'rm -f "${ranges_file}"' EXIT
 
 for dir in "${CORRECTNESS_MACHINE_DIRS[@]}"; do
   require_file "${dir}/correctness-report.json"
+  require_file "${dir}/step-range.json"
   report="${dir}/correctness-report.json"
 
   passed="$(jq -r '.passed' "${report}")"
   checked_steps="$(jq -r '.checked_steps' "${report}")"
   failing_step="$(jq -r '.first_failing_step // empty' "${report}")"
+  range_start="$(jq -r '.step_range_start' "${dir}/step-range.json")"
+  range_end="$(jq -r '.step_range_end' "${dir}/step-range.json")"
+
+  jq -n --arg dir "${dir}" --argjson start "${range_start}" --argjson end "${range_end}" \
+    '{dir: $dir, start: $start, end: $end}' >> "${ranges_file}"
 
   total_checked_steps=$((total_checked_steps + checked_steps))
 
@@ -70,24 +87,47 @@ for dir in "${CORRECTNESS_MACHINE_DIRS[@]}"; do
       first_failing_step="${failing_step}"
       first_failing_dir="${dir}"
     fi
-    echo "combine-parallel-correctness: ${dir} FAILED at step ${failing_step:-unknown}" >&2
+    echo "combine-parallel-correctness: ${dir} FAILED at step ${failing_step:-unknown} (assigned [${range_start}, ${range_end}))" >&2
   else
-    echo "combine-parallel-correctness: ${dir} passed, checked_steps=${checked_steps}"
+    # A passing slice that didn't actually cover its whole assigned range is a real
+    # bug (e.g. --base-case-only omitted so checked_steps includes gate steps, or a
+    # mismatched --step-range/--step-range-output pairing) -- catch it here rather
+    # than let it silently corrupt the coverage check below.
+    assigned_width=$((range_end - range_start))
+    if [[ "${checked_steps}" -ne "${assigned_width}" ]]; then
+      echo "::error file=${report}::${dir} passed but checked_steps=${checked_steps} does not match its assigned range width ${assigned_width} ([${range_start}, ${range_end}))" >&2
+      echo "this usually means --base-case-only was omitted (checked_steps includes gate steps) or --step-range/--step-range-output disagree" >&2
+      base_case_passed=false
+      first_failing_dir="${dir} (checked_steps/range mismatch)"
+    else
+      echo "combine-parallel-correctness: ${dir} passed, range=[${range_start}, ${range_end}) checked_steps=${checked_steps}"
+    fi
   fi
 done
 
-# --- Coverage check: when every machine reports its own slice passed, those slices
-# must still partition [0, EXPECTED) with no gaps or overlaps -- otherwise a
-# misconfigured range assignment (e.g. a 9-step gap nobody was assigned to check) would
-# report "all passed" despite part of the window never having been verified at all.
-# Only enforced on the all-passed path: a real failure legitimately stops early and
-# reports fewer checked_steps than its assigned slice, which is expected, not a
-# misconfiguration, and must not be confused with a coverage gap.
-if [[ "${base_case_passed}" == "true" && "${total_checked_steps}" -ne "${MLXFAST_EXPECTED_CORRECTNESS_STEPS}" ]]; then
-  echo "::error::all machines reported passed, but combined checked_steps=${total_checked_steps} does not equal expected ${MLXFAST_EXPECTED_CORRECTNESS_STEPS}" >&2
-  echo "this means the per-machine --step-range assignments overlap or leave a gap; fix the range assignment, do not adjust this check" >&2
-  base_case_passed=false
-  first_failing_dir="range-coverage-check"
+# --- Range coverage check: the ASSIGNED ranges (not checked_steps) must partition
+# [0, EXPECTED) with no gaps or overlaps. Summing checked_steps alone cannot catch
+# this -- two machines both covering [0, 32) and nobody covering [32, 64) still sums
+# to 64 and would otherwise report passed=true despite half the window never having
+# been assigned to anyone. Only enforced when every machine's own slice passed; a
+# real failure already fails the run regardless of coverage.
+if [[ "${base_case_passed}" == "true" ]]; then
+  coverage_ok="$(jq -s -r --argjson expected "${MLXFAST_EXPECTED_CORRECTNESS_STEPS}" '
+    sort_by(.start) as $sorted
+    | ($sorted | length) as $n
+    | if $n == 0 then "false"
+      elif $sorted[0].start != 0 then "false"
+      elif $sorted[$n - 1].end != $expected then "false"
+      else ([range(0; $n - 1) | ($sorted[.].end == $sorted[. + 1].start)] | all) | tostring
+      end
+  ' "${ranges_file}")"
+  if [[ "${coverage_ok}" != "true" ]]; then
+    echo "::error::assigned step ranges do not exactly partition [0, ${MLXFAST_EXPECTED_CORRECTNESS_STEPS}) -- a gap or overlap exists" >&2
+    jq -s -r 'sort_by(.start)[] | "  \(.dir): [\(.start), \(.end))"' "${ranges_file}" >&2
+    echo "fix the per-machine --step-range assignment; do not adjust this check" >&2
+    base_case_passed=false
+    first_failing_dir="range-coverage-check"
+  fi
 fi
 
 # --- Assemble the final score.json: take machine1's payload (score, GPQA, TTFT, speedup
