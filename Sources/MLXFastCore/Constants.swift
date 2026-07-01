@@ -58,9 +58,11 @@ public enum MLXFastConstants {
     // when teacher-forced correctness agrees, which makes the timed oracle
     // fragile for reasons unrelated to kernel performance.
     public static let benchmarkDecodeSeedTokens = 512
-    // Correctness and hidden GPQA already run substantial prefills before the
-    // timed benchmark. Avoid a separate prefill warmup so the full GitHub job
-    // stays within the 30-minute target while keeping one measured prefill run.
+    // The timed benchmark runs FIRST, before correctness/GPQA, specifically so
+    // the measured model path is cold (the correctness gate must not be able to
+    // warm it). The official baselines below were measured the same way, so a
+    // warmup run here would both diverge from how the baseline was calibrated
+    // and add minutes to the job -- keep zero warmup and one measured run.
     public static let benchmarkPrefillWarmupRuns = 0
     public static let benchmarkPrefillTimedRuns = 1
     // Official baseline measured on the Blacksmith runner for this model. After

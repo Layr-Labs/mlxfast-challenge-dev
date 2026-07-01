@@ -39,6 +39,10 @@ jobs:
     env:
       MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
       MLXFAST_IS_SUBMISSION_BRANCH: ${{ (startsWith(github.ref_name, 'submissions/')) && '1' || '0' }}
+      # Deny the whole private subtree (not just the golden literal) to the
+      # sandboxed worker, matching the benchmark/gates/timing machines. The CLI's
+      # writeRuntimeWorkerSandboxProfile adds a subpath deny for this dir.
+      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.slice_name }}
       MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.slice_name }}/correctness_golden.json
       MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json
       # The RAW (pre-GPQA-augmentation) hidden golden's expected hash/bytes --
@@ -156,9 +160,9 @@ jobs:
         run: |
           set -euo pipefail
           status=0
+          started="${SECONDS}"
           if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
             echo "benchmark-correctness-slice: running submitted correctness slice with private process logs suppressed"
-            started="${SECONDS}"
             .build/release/mlxfast-swift correctness \
               --weights weights \
               --golden "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
@@ -179,6 +183,15 @@ jobs:
               --step-range-output step-range.json \
               > correctness-report.json || status=$?
           fi
+          # The serial run's published correctness_seconds covered base case +
+          # gates together; the gates machine now only reports its own gates
+          # time, so without this sidecar the three slices' base-case duration
+          # would appear in no published artifact at all (CorrectnessReport has
+          # no seconds field) and a base-case slowdown would be invisible.
+          # combine-parallel-correctness.sh sums these back into
+          # metrics.correctness_seconds. Wall-clock seconds only -- carries no
+          # token or prompt content.
+          printf '{"slice_seconds":%d}\n' "$((SECONDS - started))" > slice-timing.json
           exit "${status}"
 
       # Mirrors benchmark.yml's "Validate correctness artifacts" gate: on a real
@@ -244,6 +257,7 @@ jobs:
           .github/scripts/deny-private-artifacts.sh \
             correctness-report.json \
             step-range.json \
+            slice-timing.json \
             weights.sha256
 
       - name: Upload slice artifact
@@ -254,6 +268,7 @@ jobs:
           path: |
             correctness-report.json
             step-range.json
+            slice-timing.json
             weights.sha256
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 90

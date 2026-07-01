@@ -662,6 +662,30 @@ func offlineRunnerProvesNetworkIsBlockedBeforeRunningCommand() throws {
     #expect(runner.contains("export HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9"))
 }
 
+// The three correctness-slice machines invoke `mlxfast-swift correctness`
+// directly, not through benchmark.sh, so benchmark.sh's enforce_official_sandbox
+// (which refuses to run an official benchmark with the worker or its sandbox
+// disabled) does not cover them. The CLI's runtimeWorkerOptions must fail closed
+// itself when MLXFAST_OFFICIAL_BENCHMARK_RUN=1, and the slice job must set
+// MLXFAST_PRIVATE_DIR so the worker profile denies the whole private subtree,
+// matching the benchmark/gates/timing machines.
+@Test
+func sliceCorrectnessRunEnforcesOfficialSandboxLikeBenchmarkScript() throws {
+    let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
+
+    #expect(cli.contains("let officialRun = environmentValue(\"MLXFAST_OFFICIAL_BENCHMARK_RUN\", fallback: \"0\") == \"1\""))
+    #expect(cli.contains("official benchmark runs require the runtime worker; unset MLXFAST_USE_RUNTIME_WORKER"))
+    #expect(cli.contains("official benchmark runs require the runtime worker sandbox; unset MLXFAST_NO_SANDBOX"))
+    #expect(cli.contains("official benchmark runs require a runtime worker sandbox profile; none was configured or derivable"))
+
+    let slice = try String(
+        contentsOfFile: ".github/workflows/benchmark-correctness-slice.yml",
+        encoding: .utf8
+    )
+    #expect(slice.contains("MLXFAST_OFFICIAL_BENCHMARK_RUN: \"1\""))
+    #expect(slice.contains("MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.slice_name }}"))
+}
+
 @Test
 func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     let benchmark = try String(
@@ -830,10 +854,17 @@ func compareTeacherForcedWithWorkerSupportsStartStepForParallelCorrectness() thr
     #expect(runtime.contains("static func compareTeacherForcedWithWorker("))
     #expect(runtime.contains("startStep: Int = 0,"))
     #expect(runtime.contains("let endStep = startStep + steps"))
-    #expect(runtime.contains("let seedPromptTokens = startStep == 0"))
-    #expect(runtime.contains("? testCase.promptTokens"))
-    #expect(runtime.contains(": testCase.promptTokens + Array(testCase.expectedTokens[0..<startStep])"))
-    #expect(runtime.contains("try worker.beginTeacherForcedCorrectness(promptTokens: seedPromptTokens)"))
+    // Seeding must replay [0, startStep) as single-token teacher-forced steps from
+    // the bare prompt -- NOT one batched prefill over prompt+prefix -- so every
+    // checked step's KV state has bit-identical floating-point provenance to a
+    // serial run. A batched seed goes through different kernel dispatch/reduction
+    // orders, and under strict argmax equality a near-tie logit could flip a
+    // checked token in either direction relative to what serial would have found.
+    #expect(runtime.contains("try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)"))
+    #expect(runtime.contains("for seedStep in 0..<startStep {"))
+    #expect(runtime.contains("previousToken: testCase.expectedTokens[seedStep]"))
+    #expect(!runtime.contains("let seedPromptTokens"))
+    #expect(!runtime.contains("testCase.promptTokens + Array(testCase.expectedTokens[0..<startStep])"))
     #expect(runtime.contains("for step in startStep..<endStep {"))
     #expect(runtime.contains("checkedSteps: step - startStep + 1,"))
     #expect(runtime.contains("guard startStep >= 0 else {"))
@@ -1149,6 +1180,87 @@ func combineParallelCorrectnessRejectsOverlappingRangesDespiteMatchingSum() thro
     try writeMachine("machine5", weightsHash: "sharedhash", rangeStart: 32, rangeEnd: 64, checkedSteps: 32)
     let contiguousStatus = try runCombiner(machineDirs: "machine4 machine5", expectedSteps: 64)
     #expect(contiguousStatus == 0)
+}
+
+// The serial run's published correctness_seconds covered base case + gates in
+// one number; machine1's own value now covers gates only. Each slice reports
+// its base-case wall seconds in slice-timing.json and the combiner must fold
+// the sum back into metrics.correctness_seconds -- and must fail loudly on a
+// malformed sidecar rather than silently zeroing it. Runs the real script.
+@Test
+func combineParallelCorrectnessSumsSliceTimingIntoCorrectnessSeconds() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    func writeMachine(_ name: String, rangeStart: Int, rangeEnd: Int, sliceTiming: String?) throws {
+        let dir = root.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try "sharedhash".write(to: dir.appendingPathComponent("weights.sha256"), atomically: true, encoding: .utf8)
+        try """
+        {"step_range_start": \(rangeStart), "step_range_end": \(rangeEnd)}
+        """.write(to: dir.appendingPathComponent("step-range.json"), atomically: true, encoding: .utf8)
+        try """
+        {"passed": true, "checked_steps": \(rangeEnd - rangeStart), "first_failing_step": null}
+        """.write(to: dir.appendingPathComponent("correctness-report.json"), atomically: true, encoding: .utf8)
+        if let sliceTiming {
+            try sliceTiming.write(to: dir.appendingPathComponent("slice-timing.json"), atomically: true, encoding: .utf8)
+        }
+    }
+
+    try FileManager.default.createDirectory(at: root.appendingPathComponent("machine1"), withIntermediateDirectories: true)
+    try "sharedhash".write(to: root.appendingPathComponent("machine1/weights.sha256"), atomically: true, encoding: .utf8)
+    try """
+    {"score": 1.1, "passed": true, "metrics": {"passed_correctness": true, "checked_steps": 50, "correctness_seconds": 400.5, "case_count": 6, "first_failing_case": null, "first_failing_step": null}}
+    """.write(to: root.appendingPathComponent("machine1/score.json"), atomically: true, encoding: .utf8)
+
+    let scriptPath = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent(".github/scripts/combine-parallel-correctness.sh")
+        .path
+    let combinedPath = root.appendingPathComponent("score.combined.json")
+
+    func runCombiner(machineDirs: String) throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [scriptPath]
+        process.currentDirectoryURL = root
+        process.environment = [
+            "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
+            "MLXFAST_MACHINE1_DIR": "machine1",
+            "MLXFAST_CORRECTNESS_MACHINE_DIRS": machineDirs,
+            "MLXFAST_EXPECTED_CORRECTNESS_STEPS": "64",
+            "MLXFAST_COMBINED_SCORE_PATH": combinedPath.path,
+        ]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
+    func combinedMetric(_ key: String) throws -> Double {
+        let object = try JSONSerialization.jsonObject(with: Data(contentsOf: combinedPath))
+        let payload = try #require(object as? [String: Any])
+        let metrics = try #require(payload["metrics"] as? [String: Any])
+        return try #require(metrics[key] as? Double)
+    }
+
+    // Sidecars present: 120 + 95 must be added on top of machine1's gates-only 400.5.
+    try writeMachine("machine2", rangeStart: 0, rangeEnd: 32, sliceTiming: "{\"slice_seconds\":120}")
+    try writeMachine("machine3", rangeStart: 32, rangeEnd: 64, sliceTiming: "{\"slice_seconds\":95}")
+    #expect(try runCombiner(machineDirs: "machine2 machine3") == 0)
+    #expect(try combinedMetric("correctness_seconds") == 400.5 + 120 + 95)
+    #expect(try combinedMetric("checked_steps") == Double(50 + 64))
+
+    // Absent sidecars (the public probe workflow predates them) must still combine.
+    try writeMachine("machine4", rangeStart: 0, rangeEnd: 32, sliceTiming: nil)
+    try writeMachine("machine5", rangeStart: 32, rangeEnd: 64, sliceTiming: nil)
+    #expect(try runCombiner(machineDirs: "machine4 machine5") == 0)
+    #expect(try combinedMetric("correctness_seconds") == 400.5)
+
+    // A malformed sidecar is a real bug and must fail closed, not silently zero.
+    try writeMachine("machine6", rangeStart: 0, rangeEnd: 32, sliceTiming: "{\"slice_seconds\":\"soon\"}")
+    try writeMachine("machine7", rangeStart: 32, rangeEnd: 64, sliceTiming: "{\"slice_seconds\":95}")
+    #expect(try runCombiner(machineDirs: "machine6 machine7") != 0)
 }
 
 @Test

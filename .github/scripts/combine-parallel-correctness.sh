@@ -60,6 +60,7 @@ echo "combine-parallel-correctness: weights hash agrees across all machines: ${e
 # early and reports fewer checked_steps than its assigned slice, and that must not be
 # confused with a range that was never assigned to anyone.
 total_checked_steps=0
+total_base_case_seconds=0
 base_case_passed=true
 first_failing_step=""
 first_failing_dir=""
@@ -76,6 +77,21 @@ for dir in "${CORRECTNESS_MACHINE_DIRS[@]}"; do
   failing_step="$(jq -r '.first_failing_step // empty' "${report}")"
   range_start="$(jq -r '.step_range_start' "${dir}/step-range.json")"
   range_end="$(jq -r '.step_range_end' "${dir}/step-range.json")"
+
+  # The serial run's correctness_seconds covered base case + gates together;
+  # machine1's own value now only covers gates, so each slice reports its
+  # base-case wall seconds in a sidecar and the total is folded back into
+  # metrics.correctness_seconds below. Optional (the public probe workflow
+  # predates it), but when present it must be a non-negative integer -- a
+  # malformed sidecar is a real bug, not something to silently zero.
+  if [[ -s "${dir}/slice-timing.json" ]]; then
+    slice_seconds="$(jq -r '.slice_seconds' "${dir}/slice-timing.json")"
+    if ! [[ "${slice_seconds}" =~ ^[0-9]+$ ]]; then
+      echo "::error file=${dir}/slice-timing.json::slice_seconds must be a non-negative integer, got \"${slice_seconds}\"" >&2
+      exit 1
+    fi
+    total_base_case_seconds=$((total_base_case_seconds + slice_seconds))
+  fi
 
   jq -n --arg dir "${dir}" --argjson start "${range_start}" --argjson end "${range_end}" \
     '{dir: $dir, start: $start, end: $end}' >> "${ranges_file}"
@@ -136,10 +152,13 @@ fi
 # floors) and override the correctness fields with the real, combined verdict.
 # machine1's own metrics.checked_steps only covers what it actually checked itself
 # (anchors/free-run/behavior -- it skipped the base case), so the combined total adds
-# the base-case step count on top of that rather than replacing it.
+# the base-case step count on top of that rather than replacing it. correctness_seconds
+# gets the same treatment: machine1's value covers gates only, and adding the slices'
+# base-case wall seconds restores the serial run's semantics (base case + gates total).
 jq -e \
   --argjson base_case_passed "${base_case_passed}" \
   --argjson base_case_checked_steps "${total_checked_steps}" \
+  --argjson base_case_seconds "${total_base_case_seconds}" \
   --arg first_failing_step "${first_failing_step}" \
   --arg first_failing_dir "${first_failing_dir}" \
   '
@@ -147,6 +166,7 @@ jq -e \
   | (.metrics.passed_correctness and $base_case_passed) as $combined_passed_correctness
   | .metrics.passed_correctness = $combined_passed_correctness
   | .metrics.checked_steps = (.metrics.checked_steps + $base_case_checked_steps)
+  | .metrics.correctness_seconds = (.metrics.correctness_seconds + $base_case_seconds)
   | .metrics.first_failing_case = (if $base_case_passed then .metrics.first_failing_case else "base_correctness_case (\($first_failing_dir))" end)
   | .metrics.first_failing_step = (if $base_case_passed then .metrics.first_failing_step else $ffs end)
   | .passed = (.passed and $combined_passed_correctness)

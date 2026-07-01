@@ -75,9 +75,7 @@ extension DeepSeekRuntime {
         // is safe because teacher forcing always feeds the golden token as input for the
         // next step (testCase.expectedTokens[...]), never the model's own prediction --
         // so what the model should see at step N never depends on whether steps before N
-        // were themselves checked or even correct. A caller checking a later slice seeds
-        // the model with the known-golden prefix in one batch call instead of replaying
-        // single-token steps it isn't responsible for verifying.
+        // were themselves checked or even correct.
         let endStep = startStep + steps
         guard !testCase.promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("teacher-forced correctness prompt must not be empty")
@@ -95,12 +93,27 @@ extension DeepSeekRuntime {
             )
         }
 
-        let seedPromptTokens = startStep == 0
-            ? testCase.promptTokens
-            : testCase.promptTokens + Array(testCase.expectedTokens[0..<startStep])
-        var response = try worker.beginTeacherForcedCorrectness(promptTokens: seedPromptTokens)
+        // Seed with the bare prompt and then advance through [0, startStep) using the
+        // same single-token teacher-forced steps a full serial run would have used --
+        // feeding the GOLDEN token each time and ignoring the model's own predictions,
+        // which are earlier slices' responsibility to check. This costs startStep
+        // unchecked decode steps (well inside the slice machines' wall-clock headroom
+        // against the timing machine's critical path) but makes the KV-cache state at
+        // every CHECKED step bit-identical in floating-point provenance to the serial
+        // run: one batched prefill over prompt+prefix goes through different kernel
+        // dispatch and reduction orders than incremental single-token decode, and
+        // under strict argmax equality a near-tie logit could otherwise flip a checked
+        // token in either direction relative to what serial would have found.
+        var response = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
         var latestExpertStats = response.expertStats ?? .zero
         var peakRamGB = response.peakRamGB ?? 0
+        for seedStep in 0..<startStep {
+            response = try worker.teacherForcedCorrectnessStep(
+                previousToken: testCase.expectedTokens[seedStep]
+            )
+            latestExpertStats = response.expertStats ?? latestExpertStats
+            peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
+        }
         for step in startStep..<endStep {
             if step > startStep {
                 response = try worker.teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[step - 1])

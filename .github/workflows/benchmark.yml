@@ -400,6 +400,14 @@ jobs:
   # not the base case, so they needed their own machine too to meaningfully cut
   # wall-clock time. See BenchmarkOptions.checkGates/skipTimedBenchmark for the
   # harness-level mechanism.
+  #
+  # Parity note: in the serial run the gates/GPQA/semantic-judge checks ran
+  # AFTER the timed benchmark and were short-circuited if the speedup floors
+  # already failed. Here they run on their own machine unconditionally (there
+  # is no timing result to short-circuit on), so gates always execute even when
+  # timing fails. The final verdict is identical -- combine ANDs both machines'
+  # pass/fail -- this only removes an ordering side channel and costs one extra
+  # gates run on an already-failing submission.
   benchmark-timing:
     name: "benchmark timing (no gates)"
     if: ${{ inputs.run_benchmark }}
@@ -504,7 +512,11 @@ jobs:
           # loop never actually touches timing_hash. This check is what makes
           # "gates == machine1 == machine2 == machine3 == machine4" transitively
           # include timing too -- do not remove it without adding a direct
-          # timing-vs-slices comparison elsewhere.
+          # timing-vs-slices comparison elsewhere. This 5-way byte-equality is
+          # ALSO the substitute for verify_transform on the slice machines: the
+          # slices never re-run mlxfast-swift verify-transform (only timing/gates
+          # do, via benchmark.sh), but a verified timing/gates tree plus this
+          # hash equality proves the slice trees are byte-identical to it.
           gates_hash="$(cat "${gates_dir}/weights.sha256")"
           timing_hash="$(cat "${timing_dir}/weights.sha256")"
           if [[ "${gates_hash}" != "${timing_hash}" ]]; then
@@ -534,11 +546,38 @@ jobs:
             exit 1
           }
 
-          # Base $g (gates) and only overlay the timing-specific fields below --
-          # preflight_seconds/correctness_seconds are deliberately left at $g's
-          # values: the timing machine runs with checkGates=false and skips the
-          # base case (MLXFAST_BENCHMARK_CORRECTNESS_STEPS=0), so it has no
-          # gates-adjacent work of its own to report for either field.
+          # The expert_* sums below reproduce the serial run's timed-phase-only
+          # semantics ONLY because the gates machine (skipTimedBenchmark) reports
+          # structural zeros for all of them. If the gates machine ever starts
+          # reporting nonzero expert stats (e.g. a future change folds its
+          # correctness-phase reads into the published score), summing would
+          # silently double-count relative to serial -- fail loudly instead.
+          jq -e '
+            .metrics.expert_bytes_read == 0
+            and .metrics.expert_cache_hits == 0
+            and .metrics.expert_cache_misses == 0
+            and .metrics.expert_cache_evictions == 0
+            and .metrics.expert_read_seconds == 0
+            and .metrics.expert_peak_cached_tensors == 0
+          ' "${gates_dir}/score.json" >/dev/null || {
+            echo "::error::gates machine score.json reports nonzero expert stats; the merge sums gates+timing and would double-count -- update the merge semantics before allowing this" >&2
+            exit 1
+          }
+
+          # Base $g (gates) and only overlay the timing-specific fields below.
+          # Provenance of the fields NOT overlaid from $t, versus the serial run:
+          #  - preflight_seconds, timestamp: gates-machine only (both machines
+          #    run an equivalent cheap preflight; the difference is diagnostic).
+          #  - correctness_seconds: starts as $g's gates-only value here and is
+          #    COMPLETED downstream -- combine-parallel-correctness.sh adds the
+          #    three slices' base-case seconds back in, restoring the serial
+          #    "base case + gates" total.
+          #  - benchmark_wall_seconds, peak_ram_gb, process_resident_memory_gb,
+          #    expert_peak_cached_tensors: max() across the two machines (a
+          #    single serial process reported one number; the cross-machine max
+          #    is the closest faithful aggregate and is diagnostic, not scored).
+          #  - expert_* counters: summed (gates contributes structural zeros,
+          #    asserted above), reproducing the serial timed-phase totals.
           jq -n \
             --slurpfile gates "${gates_dir}/score.json" \
             --slurpfile timing "${timing_dir}/score.json" \

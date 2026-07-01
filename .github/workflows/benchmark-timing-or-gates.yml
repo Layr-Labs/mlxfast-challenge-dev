@@ -158,6 +158,16 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
+          # PARITY CONTRACT: attach-gpqa-gates augments the raw golden with GPQA
+          # behavior gates but MUST NOT mutate its .cases (the base teacher-forced
+          # case). The three correctness-slice machines verify the base case
+          # against the RAW golden (pinned by MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_
+          # SHA256 = 8306..bdbf067); this machine verifies gates against the
+          # augmented golden. Both must agree on .cases or the split would check
+          # the base case against a different fixture than it reports. That
+          # agreement is backstopped by checked_steps/case_count equality in
+          # combine-parallel-correctness.sh -- if attach-gpqa-gates ever starts
+          # touching .cases, that coverage check is what catches it.
           .github/scripts/download-r2-object.sh \
             "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" \
             "${MLXFAST_CORRECTNESS_GOLDEN_PATH}"
@@ -348,4 +358,8 @@ jobs:
             weights.sha256
             golden-expectations.env
           if-no-files-found: error
-          retention-days: 7
+          # These per-machine intermediates are the only place each machine's
+          # own timing/gates/RAM/expert provenance survives -- combine collapses
+          # them into one score.json. Keep them as long as the final result so a
+          # score dispute can still be traced to the contributing machine.
+          retention-days: 90

@@ -902,9 +902,27 @@ private enum MLXFastCLI {
     }
 
     private static func runtimeWorkerOptions(blockedGoldenPath: String? = nil) throws -> RuntimeWorkerOptions? {
+        // benchmark.sh's enforce_official_sandbox refuses to run the timed benchmark
+        // with the worker or its sandbox disabled on an official run, but the slice
+        // machines invoke `mlxfast-swift correctness` directly, so the same policy
+        // must fail closed here too rather than silently falling back to an
+        // unsandboxed (or worker-less) path. MLXFAST_OFFICIAL_BENCHMARK_RUN is set
+        // by trusted workflow env and stripped from the worker's own environment by
+        // sanitizedRuntimeWorkerEnvironment, so submitted code cannot observe it.
+        let officialRun = environmentValue("MLXFAST_OFFICIAL_BENCHMARK_RUN", fallback: "0") == "1"
         let enabled = environmentValue("MLXFAST_USE_RUNTIME_WORKER", fallback: "1")
         guard enabled != "0" && enabled.lowercased() != "false" else {
+            if officialRun {
+                throw MLXFastError.invalidInput(
+                    "official benchmark runs require the runtime worker; unset MLXFAST_USE_RUNTIME_WORKER"
+                )
+            }
             return nil
+        }
+        if officialRun, environmentValue("MLXFAST_NO_SANDBOX", fallback: "0") == "1" {
+            throw MLXFastError.invalidInput(
+                "official benchmark runs require the runtime worker sandbox; unset MLXFAST_NO_SANDBOX"
+            )
         }
         let executable = environmentValue(
             "MLXFAST_RUNTIME_WORKER_EXECUTABLE",
@@ -931,6 +949,11 @@ private enum MLXFastCLI {
             sandboxProfile = try writeRuntimeWorkerSandboxProfile(
                 blockedGoldenPath: blockedGoldenPath,
                 allowedExecutablePath: executablePath
+            )
+        }
+        if officialRun, sandboxProfile.isEmpty {
+            throw MLXFastError.invalidInput(
+                "official benchmark runs require a runtime worker sandbox profile; none was configured or derivable"
             )
         }
         return RuntimeWorkerOptions(
