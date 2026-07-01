@@ -12,9 +12,9 @@ repository-wide or organization-wide secrets.
 
 Configure the `benchmark-private-prompts` Environment with:
 
-- Deployment branches restricted to `main`.
+- Deployment branches limited to `main` and `submissions/*` (the refs the
+  benchmark orchestrator dispatches). Do not grant fork access.
 - Required reviewers for private benchmark runs.
-- No fork or submission branch access to the environment.
 - R2 prompt manifest credentials:
   - `R2_ACCESS_KEY_ID`
   - `R2_BUCKET_ENDPOINT`
@@ -55,29 +55,44 @@ model name are patched into `score.json`; prompts, references, candidate
 answers, and judge transcripts remain private and are covered by artifact
 deny-list checks.
 
-The benchmark workflow also verifies at runtime that it is executing from the
-configured trusted workflow ref. In production, that trusted ref should be:
+The benchmark workflow verifies at runtime (see
+`enforce-trusted-benchmark-workflow.sh`) that it runs in this repository via a
+`workflow_dispatch` event. It benchmarks whatever ref it is dispatched on.
 
-```text
-Layr-Labs/mlxfast-challenge-dev/.github/workflows/benchmark.yml@refs/heads/main
-```
+Because the workflow runs the dispatched ref's own workflow file, the real
+boundary is the combination of:
 
-This runtime check is defense in depth. The GitHub Environment branch
-restriction is the real boundary that prevents a changed workflow file from
-printing private secrets before the guard can run.
+- the benchmark orchestrator (Yukon eigenbot) being the only creator of
+  `submissions/*` branches, built from remotely validated `editablePaths` so
+  their non-`editablePaths` files match `main`;
+- the `Enforce modifiable surface` step re-verifying at runtime that a
+  `submissions/*` branch changes only `editablePaths` relative to `main`; and
+- restricting who can push `submissions/*` branches and dispatch the workflow.
+
+The `benchmark-private-prompts` Environment deployment-branch policy and required
+reviewers remain the gate on private-secret access.
 
 ## Submission flow
 
-Run private benchmarks by dispatching the trusted `benchmark.yml` workflow on
-`main` and passing the contestant commit or branch as `submission_ref`.
+The benchmark orchestrator (Yukon eigenbot) creates a `submissions/*` branch that
+differs from `main` only in `benchmark.json` `editablePaths`, then dispatches
+`benchmark.yml` on that branch. The workflow benchmarks the checked-out branch
+directly.
 
-The workflow checks out trusted `main`, then overlays only the `editablePaths`
-from `benchmark.json` out of the submitted ref. Submitted workflow files,
-scripts, tests, and harness code are not used.
+On `submissions/*` branches the workflow additionally:
+
+- runs the static cheat review over the editable code
+  (`run-submission-static-review.sh`),
+- enforces the modifiable surface against `main` (`enforce-modifiable-surface.sh`),
+- suppresses submitted correctness/benchmark process logs, and
+- uploads correctness artifacts only after validation succeeds.
+
+Maintainers can also dispatch the workflow on `main` (baseline) or a dev branch;
+those runs skip the submission-only guards.
 
 ## Output policy
 
-For `submission_ref` runs:
+For `submissions/*` runs:
 
 - Correctness and benchmark process logs are redirected to private runner temp
   files and are not uploaded.

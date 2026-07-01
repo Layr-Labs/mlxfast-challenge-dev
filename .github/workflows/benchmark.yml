@@ -2,17 +2,15 @@ name: benchmark
 
 # Dispatch-only: maintainers or the benchmark orchestrator start the expensive
 # Apple Silicon run explicitly. No PR/push triggers should burn macOS minutes.
+#
+# The workflow benchmarks whatever ref it is dispatched on. The Yukon eigenbot
+# creates submission branches (submissions/*) that differ from main only in
+# benchmark.json editablePaths, so running them directly is safe: submission-branch
+# runs still enforce the modifiable surface and the static cheat review, and
+# suppress submitted-process logs.
 on:
   workflow_dispatch:
     inputs:
-      submission_repository:
-        description: "Optional repository containing submitted editable paths. Defaults to this repository."
-        required: false
-        type: string
-      submission_ref:
-        description: "Optional submitted commit SHA. Production Yukon runs must pass the exact 40-character SHA from this repository."
-        required: false
-        type: string
       reference_download_jobs:
         description: "Parallel shard downloads for setup.sh."
         required: false
@@ -33,11 +31,6 @@ on:
         required: false
         default: true
         type: boolean
-      allow_untrusted_workflow_testing:
-        description: "Maintainer-only escape hatch for testing workflow changes from a non-main ref with private benchmark material."
-        required: false
-        default: false
-        type: boolean
 permissions:
   contents: read
 
@@ -55,6 +48,9 @@ jobs:
       MLXFAST_SUBMISSION_STATIC_REVIEW_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/submission_static_review.json
       MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+      # Submission branches run untrusted editable code; gate the modifiable
+      # surface + static cheat review on them and suppress submitted-process logs.
+      MLXFAST_IS_SUBMISSION_BRANCH: ${{ (startsWith(github.ref_name, 'submissions/')) && '1' || '0' }}
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
       MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}
       MLXFAST_RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
@@ -80,9 +76,10 @@ jobs:
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
       MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
-      # Production benchmark dispatches must run the workflow from main. The
-      # explicit escape hatch exists only for maintainer PR testing.
-      MLXFAST_TRUSTED_BENCHMARK_REF: ${{ inputs.allow_untrusted_workflow_testing && github.ref || 'refs/heads/main' }}
+      # Benchmark whatever ref is dispatched; enforce-trusted still pins repo +
+      # workflow_dispatch. Submission branches are bot-created and differ from
+      # main only in editablePaths (re-verified by the modifiable-surface step).
+      MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}
       MLXFAST_VERIFY_TRANSFORM: ${{ inputs.verify_transform && '1' || '0' }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -93,70 +90,8 @@ jobs:
       - name: Enforce trusted workflow context
         run: .github/scripts/enforce-trusted-benchmark-workflow.sh
 
-      - name: Validate production dispatch inputs
-        env:
-          ALLOW_UNTRUSTED_WORKFLOW_TESTING: ${{ inputs.allow_untrusted_workflow_testing && '1' || '0' }}
-          TRUSTED_REPOSITORY: ${{ github.repository }}
-          SUBMISSION_REPOSITORY: ${{ inputs.submission_repository || github.repository }}
-          SUBMISSION_REF: ${{ inputs.submission_ref }}
-        run: |
-          set -euo pipefail
-          if [[ "${ALLOW_UNTRUSTED_WORKFLOW_TESTING}" == "1" ]]; then
-            echo "benchmark: maintainer workflow testing mode allows mutable refs"
-            exit 0
-          fi
-
-          if [[ -n "${SUBMISSION_REF}" && ! "${SUBMISSION_REF}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "benchmark: production submission_ref must be the exact 40-character commit SHA provided by Yukon" >&2
-            exit 1
-          fi
-          if [[ "${SUBMISSION_REPOSITORY}" != "${TRUSTED_REPOSITORY}" ]]; then
-            echo "benchmark: production submissions must come from ${TRUSTED_REPOSITORY}, got ${SUBMISSION_REPOSITORY}" >&2
-            exit 1
-          fi
-
-      - name: Refuse untrusted submission workflow code
-        if: inputs.submission_ref == '' && (startsWith(github.ref_name, 'submissions/') || startsWith(github.ref_name, 'yukon/submissions/'))
-        run: |
-          echo "benchmark: submission branches must be benchmarked by dispatching trusted main with submission_ref" >&2
-          exit 1
-
-      - name: Checkout submitted editable paths
-        if: inputs.submission_ref != ''
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          repository: ${{ inputs.submission_repository || github.repository }}
-          ref: ${{ inputs.submission_ref }}
-          path: .mlxfast-submission-src
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Verify submitted commit
-        if: inputs.submission_ref != ''
-        env:
-          ALLOW_UNTRUSTED_WORKFLOW_TESTING: ${{ inputs.allow_untrusted_workflow_testing && '1' || '0' }}
-          SUBMISSION_REF: ${{ inputs.submission_ref }}
-        run: |
-          set -euo pipefail
-          actual_sha="$(git -C .mlxfast-submission-src rev-parse HEAD)"
-          if [[ "${SUBMISSION_REF}" =~ ^[0-9a-f]{40}$ && "${actual_sha}" != "${SUBMISSION_REF}" ]]; then
-            echo "benchmark: submitted checkout resolved to ${actual_sha}, expected ${SUBMISSION_REF}" >&2
-            exit 1
-          fi
-          if [[ "${ALLOW_UNTRUSTED_WORKFLOW_TESTING}" != "1" && "${actual_sha}" != "${SUBMISSION_REF}" ]]; then
-            echo "benchmark: production submitted checkout must resolve exactly to submission_ref" >&2
-            exit 1
-          fi
-          echo "benchmark: verified submitted commit ${actual_sha}"
-
-      - name: Overlay submitted editable paths
-        if: inputs.submission_ref != ''
-        env:
-          SUBMISSION_WORKTREE: .mlxfast-submission-src
-        run: .github/scripts/overlay-editable-paths.sh
-
       - name: Review submitted code for benchmark bypasses
-        if: inputs.submission_ref != ''
+        if: ${{ startsWith(github.ref_name, 'submissions/') }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
         run: |
@@ -164,7 +99,7 @@ jobs:
           .github/scripts/run-submission-static-review.sh
 
       - name: Enforce modifiable surface
-        if: inputs.submission_ref == '' && (startsWith(github.ref_name, 'submissions/') || startsWith(github.ref_name, 'yukon/submissions/'))
+        if: ${{ startsWith(github.ref_name, 'submissions/') }}
         env:
           HEAD_SHA: ${{ github.sha }}
         run: |
@@ -291,11 +226,9 @@ jobs:
 
       - name: Correctness
         if: ${{ !inputs.run_benchmark }}
-        env:
-          MLXFAST_SUBMISSION_REF: ${{ inputs.submission_ref }}
         run: |
           set -euo pipefail
-          if [[ -n "${MLXFAST_SUBMISSION_REF}" ]]; then
+          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
             echo "benchmark: running submitted correctness with private process logs suppressed"
             started="${SECONDS}"
             .build/release/mlxfast-swift correctness \
@@ -367,10 +300,9 @@ jobs:
         env:
           MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
           MLXFAST_SKIP_TRANSFORM: "1"
-          MLXFAST_SUBMISSION_REF: ${{ inputs.submission_ref }}
         run: |
           set -euo pipefail
-          if [[ -n "${MLXFAST_SUBMISSION_REF}" ]]; then
+          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
             echo "benchmark: running submitted benchmark with private process logs suppressed"
             started="${SECONDS}"
             ./benchmark.sh > "${RUNNER_TEMP}/mlxfast-benchmark-private.log" 2>&1 &
@@ -436,7 +368,7 @@ jobs:
           if-no-files-found: error
 
       - name: Check correctness artifact paths
-        if: always() && !inputs.run_benchmark && (inputs.submission_ref == '' || steps.validate_correctness_artifacts.outcome == 'success')
+        if: ${{ always() && !inputs.run_benchmark && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_correctness_artifacts.outcome == 'success') }}
         run: |
           set -euo pipefail
           .github/scripts/deny-private-artifacts.sh \
@@ -446,7 +378,7 @@ jobs:
 
       - name: Stage correctness artifacts
         id: stage_correctness_artifacts
-        if: always() && !inputs.run_benchmark && (inputs.submission_ref == '' || steps.validate_correctness_artifacts.outcome == 'success')
+        if: ${{ always() && !inputs.run_benchmark && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_correctness_artifacts.outcome == 'success') }}
         run: |
           set -euo pipefail
           .github/scripts/stage-benchmark-artifacts.sh \
