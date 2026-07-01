@@ -31,10 +31,71 @@ on:
         required: false
         default: true
         type: boolean
+      range_1:
+        description: "Base-case step range for correctness slice 1, as START-END (half-open). Only used when run_benchmark is true."
+        required: false
+        default: "0-21"
+        type: string
+      range_2:
+        description: "Base-case step range for correctness slice 2, as START-END (half-open). Only used when run_benchmark is true."
+        required: false
+        default: "21-42"
+        type: string
+      range_3:
+        description: "Base-case step range for correctness slice 3, as START-END (half-open). Only used when run_benchmark is true."
+        required: false
+        default: "42-64"
+        type: string
 permissions:
   contents: read
 
 jobs:
+  # The base correctness case (64 teacher-forced steps) is checked in parallel,
+  # in three slices, on three independent machines -- not serially inside the
+  # benchmark job. Teacher-forced checking always feeds the GOLDEN token (never
+  # the model's own prediction) as input to the next step, so a slice's verdict
+  # is independent of what happens outside its range as long as it seeds its
+  # context with the golden prefix up to its start step, which
+  # compareTeacherForcedWithWorker already does. This is why splitting is sound,
+  # not just fast: each slice's real, hidden-golden verdict is exactly what a
+  # full serial run would have found for those same steps.
+  #
+  # These only matter when run_benchmark is true -- the run_benchmark=false
+  # (correctness-only, no timed benchmark) path keeps its original single-
+  # machine "Correctness" step below, unsplit.
+  correctness-slice-1:
+    name: "correctness slice 1 (${{ inputs.range_1 }})"
+    if: ${{ inputs.run_benchmark }}
+    uses: ./.github/workflows/benchmark-correctness-slice.yml
+    secrets: inherit
+    with:
+      slice_name: machine2
+      step_range: ${{ inputs.range_1 }}
+      reference_download_jobs: ${{ inputs.reference_download_jobs }}
+      reference_min_free_gib: ${{ inputs.reference_min_free_gib }}
+
+  correctness-slice-2:
+    name: "correctness slice 2 (${{ inputs.range_2 }})"
+    if: ${{ inputs.run_benchmark }}
+    uses: ./.github/workflows/benchmark-correctness-slice.yml
+    secrets: inherit
+    with:
+      slice_name: machine3
+      step_range: ${{ inputs.range_2 }}
+      reference_download_jobs: ${{ inputs.reference_download_jobs }}
+      reference_min_free_gib: ${{ inputs.reference_min_free_gib }}
+
+  correctness-slice-3:
+    name: "correctness slice 3 (${{ inputs.range_3 }})"
+    if: ${{ inputs.run_benchmark }}
+    uses: ./.github/workflows/benchmark-correctness-slice.yml
+    secrets: inherit
+    with:
+      slice_name: machine4
+      step_range: ${{ inputs.range_3 }}
+      reference_download_jobs: ${{ inputs.reference_download_jobs }}
+      reference_min_free_gib: ${{ inputs.reference_min_free_gib }}
+
   benchmark:
     runs-on: blacksmith-12vcpu-macos-26
     timeout-minutes: 720
@@ -300,6 +361,13 @@ jobs:
         env:
           MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }}"
           MLXFAST_SKIP_TRANSFORM: "1"
+          # The base correctness case is checked in parallel by correctness-
+          # slice-1/2/3 above instead of here -- 0 means this machine skips only
+          # its own base case; GPQA/free-run/behavior/anchors and the timed
+          # benchmark still run normally. The combine job ANDs this machine's
+          # own passed_correctness (trivially true, since nothing was checked)
+          # with every slice's real verdict before anything is treated as final.
+          MLXFAST_BENCHMARK_CORRECTNESS_STEPS: "0"
         run: |
           set -euo pipefail
           if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
@@ -330,42 +398,54 @@ jobs:
           fi
           .github/scripts/run-semantic-gpqa-gate.sh
 
-      - name: Validate benchmark artifacts
-        id: validate_benchmark_artifacts
+      - name: Hash transformed weights
         if: always() && inputs.run_benchmark
-        run: .github/scripts/validate-benchmark-artifacts.sh
+        run: .github/scripts/hash-weights-directory.sh weights weights.sha256
 
-      - name: Check benchmark artifact paths
-        if: always() && inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success'
+      - name: Prepare golden expectations for combine
+        id: prepare_golden_expectations
+        if: always() && inputs.run_benchmark
+        run: |
+          set -euo pipefail
+          test -s score.json
+          test -s benchmark-integrity.json
+          {
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}"
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES}"
+            echo "MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS=${MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS}"
+            echo "MLXFAST_EXPECTED_CORRECTNESS_CASES=${MLXFAST_EXPECTED_CORRECTNESS_CASES}"
+          } > golden-expectations.env
+
+      - name: Check intermediate benchmark artifact paths
+        if: always() && inputs.run_benchmark && steps.prepare_golden_expectations.outcome == 'success'
         run: |
           set -euo pipefail
           .github/scripts/deny-private-artifacts.sh \
-            "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
-            "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes" \
             score.json \
-            score.json.sha256 \
-            benchmark-integrity.json
+            benchmark-integrity.json \
+            weights.sha256 \
+            golden-expectations.env
 
-      - name: Stage benchmark artifacts
-        id: stage_benchmark_artifacts
-        if: always() && inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success'
-        run: |
-          set -euo pipefail
-          .github/scripts/stage-benchmark-artifacts.sh \
-            "${MLXFAST_ARTIFACT_ROOT}/benchmark-results" \
-            golden.sha256="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
-            golden.bytes="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes" \
-            score.json=score.json \
-            score.sha256=score.json.sha256 \
-            benchmark-integrity.json=benchmark-integrity.json
-
-      - name: Upload benchmark artifacts
-        if: always() && inputs.run_benchmark && steps.stage_benchmark_artifacts.outcome == 'success'
+      - name: Upload intermediate benchmark result
+        # This machine's own score.json is NOT the final result: its
+        # passed_correctness is trivially true (MLXFAST_BENCHMARK_CORRECTNESS_
+        # STEPS=0 above means it checked none of the base case itself), and its
+        # checked_steps excludes the ~64 base-case steps the correctness-slice-*
+        # jobs are covering instead. The combine job downloads this alongside
+        # every slice's real report and runs combine-parallel-correctness.sh to
+        # produce the actual, final, validated score -- this upload is an
+        # intermediate input to that job, not a publishable result on its own.
+        if: always() && inputs.run_benchmark
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: benchmark-results-${{ github.run_id }}
-          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results
+          name: benchmark-parallel-${{ github.run_id }}-machine1
+          path: |
+            score.json
+            benchmark-integrity.json
+            weights.sha256
+            golden-expectations.env
           if-no-files-found: error
+          retention-days: 7
 
       - name: Check correctness artifact paths
         if: ${{ always() && !inputs.run_benchmark && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_correctness_artifacts.outcome == 'success') }}
@@ -393,4 +473,108 @@ jobs:
         with:
           name: correctness-results-${{ github.run_id }}
           path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/correctness-results
+          if-no-files-found: error
+
+  # ANDs the three real correctness-slice verdicts and the benchmark-timing
+  # machine's own (correctness-free) result into the one final, published
+  # score. This job touches no repo credentials -- it only ever reads the
+  # already-computed, already-authenticated outputs the jobs above produced,
+  # so it deliberately has no environment: gate.
+  combine:
+    name: combine
+    if: ${{ always() && inputs.run_benchmark }}
+    needs:
+      [correctness-slice-1, correctness-slice-2, correctness-slice-3, benchmark]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
+      MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Download parallel benchmark artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: benchmark-parallel-${{ github.run_id }}-*
+          path: slices
+          merge-multiple: false
+
+      - name: Assemble machine directories
+        run: |
+          set -euo pipefail
+          mkdir -p machine1 machine2 machine3 machine4
+          cp "slices/benchmark-parallel-${{ github.run_id }}-machine1/score.json" machine1/
+          cp "slices/benchmark-parallel-${{ github.run_id }}-machine1/weights.sha256" machine1/
+          cp "slices/benchmark-parallel-${{ github.run_id }}-machine2/"* machine2/
+          cp "slices/benchmark-parallel-${{ github.run_id }}-machine3/"* machine3/
+          cp "slices/benchmark-parallel-${{ github.run_id }}-machine4/"* machine4/
+          cat "slices/benchmark-parallel-${{ github.run_id }}-machine1/golden-expectations.env" >> "${GITHUB_ENV}"
+
+      - name: Combine
+        env:
+          MLXFAST_CORRECTNESS_MACHINE_DIRS: "machine2 machine3 machine4"
+          MLXFAST_COMBINED_SCORE_PATH: score.combined.json
+        run: .github/scripts/combine-parallel-correctness.sh
+
+      - name: Finalize combined score and integrity
+        # combine-parallel-correctness.sh only overwrites the correctness
+        # fields inside score.combined.json, so its hash differs from what
+        # machine1's own benchmark-integrity.json recorded -- recompute and
+        # patch score_sha256 so the integrity cross-check below matches the
+        # artifact that actually gets published, not the pre-combine one.
+        run: |
+          set -euo pipefail
+          test -s score.combined.json
+          score_hash="$(shasum -a 256 score.combined.json | awk '{print $1}')"
+          printf '%s  %s\n' "${score_hash}" score.combined.json > score.combined.json.sha256
+          jq --arg hash "${score_hash}" '.score_sha256 = $hash' \
+            "slices/benchmark-parallel-${{ github.run_id }}-machine1/benchmark-integrity.json" \
+            > benchmark-integrity.json
+          printf '%s  correctness_golden.json\n' "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}" > correctness_golden.json.sha256
+          printf '%s  correctness_golden.json\n' "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES}" > correctness_golden.json.bytes
+
+      - name: Validate combined benchmark artifacts
+        id: validate_benchmark_artifacts
+        env:
+          MLXFAST_SCORE_PATH: score.combined.json
+          MLXFAST_CORRECTNESS_GOLDEN_PATH: correctness_golden.json
+          MLXFAST_GPQA_TTFT_CASE_COUNT: "5"
+          MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "5"
+          MLXFAST_SEMANTIC_GPQA_MIN_PASS: "3"
+          MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
+        run: .github/scripts/validate-benchmark-artifacts.sh
+
+      - name: Check combined benchmark artifact paths
+        if: steps.validate_benchmark_artifacts.outcome == 'success'
+        run: |
+          set -euo pipefail
+          .github/scripts/deny-private-artifacts.sh \
+            correctness_golden.json.sha256 \
+            correctness_golden.json.bytes \
+            score.combined.json \
+            score.combined.json.sha256 \
+            benchmark-integrity.json
+
+      - name: Stage combined benchmark artifacts
+        id: stage_benchmark_artifacts
+        if: steps.validate_benchmark_artifacts.outcome == 'success'
+        run: |
+          set -euo pipefail
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/benchmark-results" \
+            golden.sha256=correctness_golden.json.sha256 \
+            golden.bytes=correctness_golden.json.bytes \
+            score.json=score.combined.json \
+            score.sha256=score.combined.json.sha256 \
+            benchmark-integrity.json=benchmark-integrity.json
+
+      - name: Upload benchmark artifacts
+        if: steps.stage_benchmark_artifacts.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results
           if-no-files-found: error
