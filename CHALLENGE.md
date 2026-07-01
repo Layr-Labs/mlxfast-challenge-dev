@@ -145,7 +145,7 @@ the submit loop without running the full official hidden benchmark.
 transform output. It re-runs the submitted transform and compares the generated
 `weights/` tree against that fresh run. It is not a baseline-layout requirement.
 The normal preflight/benchmark path also rejects generated `weights/` above the
-default 10 GiB transformed-output cap before correctness or timing runs.
+default 25 GiB transformed-output cap before correctness or timing runs.
 Override it with `MLXFAST_MAX_WEIGHTS_BYTES`; `verify-transform` additionally
 accepts `--max-bytes`.
 
