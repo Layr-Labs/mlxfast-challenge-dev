@@ -10,13 +10,17 @@ name: parallel-correctness-probe
 # section on why that's a throughput lever, not a per-run latency one), so this
 # is expensive and deliberately dispatch-only.
 #
-# Scope: this validates ONLY the correctness-split mechanism (the part that's
-# actually built and tested), not the full multi-runner topology discussed
-# separately (GPQA/TTFT/timing on a dedicated machine). There is no real
-# "machine 1" here -- the combine job manufactures a trivial stand-in payload so
-# combine-parallel-correctness.sh has something to attach the real, combined
-# base-case verdict to. Uses the checked-in public correctness fixture only; no
-# private secrets, no hidden golden, no environment protection needed.
+# Scope: this validates the correctness-split mechanism (the part that's
+# actually built and tested) plus a real, independent 4th machine (machine1-
+# check below). It deliberately does NOT attempt real GPQA/TTFT/timing checks:
+# those require the hidden golden fixture and R2 credentials, which must never
+# be reachable from a manual, unprotected, dispatch-only workflow like this one
+# (its logs and artifacts are visible to anyone who can trigger it). That real
+# checking already happens, under secrets and environment protection, on every
+# ranked run of the official benchmark.yml -- this probe only needed to prove
+# out the NEW split mechanism, not duplicate what benchmark.yml already covers.
+# Uses the checked-in public correctness fixture only; no private secrets, no
+# hidden golden, no environment protection needed.
 on:
   workflow_dispatch:
     inputs:
@@ -86,6 +90,127 @@ jobs:
       step_range: ${{ inputs.range_3 }}
       reference_download_jobs: ${{ inputs.reference_download_jobs }}
       reference_min_free_gib: ${{ inputs.reference_min_free_gib }}
+
+  machine1-check:
+    name: "machine1 (real transform + smoke check, stand-in score)"
+    # A real 4th machine, not a fabrication: independently downloads and
+    # transforms the reference checkpoint (so the combiner's weights-hash
+    # tripwire genuinely cross-checks all 4 machines instead of 3 real ones plus
+    # a copy of machine2's hash) and runs a real --local-iterate smoke check of
+    # the public fixture (so a broken transform/worker/decode path on this
+    # specific machine fails the job instead of going unnoticed).
+    #
+    # Its score.json payload is still a documented stand-in for the fields that
+    # would come from real GPQA/TTFT/timing on the official benchmark.yml: the
+    # public fixture has no GPQA cases and no benchmark oracle (by design -- see
+    # the workflow header), so there is no safe, secret-free way to compute real
+    # values for those fields here. checked_steps stays 0 deliberately: this
+    # machine's role is to skip the base case (MLXFAST_BENCHMARK_CORRECTNESS_
+    # STEPS=0 in the real topology) and let machine2-4 cover it in slices, so
+    # combine-parallel-correctness.sh's `own checked_steps + base-case total`
+    # arithmetic must not be polluted by the unrelated --local-iterate smoke
+    # check's own step count.
+    runs-on: blacksmith-12vcpu-macos-26
+    timeout-minutes: 360
+    env:
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
+      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Restore SwiftPM cache
+        id: restore_swiftpm_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        env:
+          # This file references no repo secrets by design -- see the workflow
+          # header comment. setup.sh falls back to its own public
+          # DEFAULT_REFERENCE_BASE_URL and an empty auth header when these are
+          # unset, which is exactly what this job needs.
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
+          MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+        run: ./setup.sh
+
+      - name: Save SwiftPM cache
+        if: ${{ steps.restore_swiftpm_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: ${{ steps.restore_swiftpm_cache.outputs.cache-primary-key }}
+
+      - name: Transform reference checkpoint
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" \
+            --output weights
+
+      - name: Hash transformed weights
+        run: .github/scripts/hash-weights-directory.sh weights weights.sha256
+
+      - name: Run real smoke check (public fixture only)
+        run: |
+          set -euo pipefail
+          # Fails the job (fail-closed) if this machine's own independent
+          # transform + worker + decode path is broken -- but its output is
+          # diagnostic only. score.json below is a separate, deliberately
+          # documented stand-in; see the job header comment for why.
+          .build/release/mlxfast-swift benchmark \
+            --local-iterate \
+            --weights weights \
+            --golden "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" \
+            --score-path score.local-iterate.json
+          cat score.local-iterate.json
+
+      - name: Write stand-in score.json for the combiner
+        run: |
+          set -euo pipefail
+          cat > score.json <<'EOF'
+          {
+            "score": null,
+            "passed": true,
+            "metrics": {
+              "passed_correctness": true,
+              "checked_steps": 0,
+              "case_count": 1,
+              "first_failing_case": null,
+              "first_failing_step": null
+            }
+          }
+          EOF
+
+      - name: Upload machine1 artifact
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: parallel-correctness-probe-${{ github.run_id }}-machine1
+          path: |
+            score.json
+            score.local-iterate.json
+            weights.sha256
+          if-no-files-found: error
+          retention-days: 7
 
   full-reference-check:
     name: "full reference check (no split)"
@@ -189,7 +314,14 @@ jobs:
 
   combine:
     name: combine
-    needs: [correctness-slice-1, correctness-slice-2, correctness-slice-3, full-reference-check]
+    needs:
+      [
+        correctness-slice-1,
+        correctness-slice-2,
+        correctness-slice-3,
+        full-reference-check,
+        machine1-check,
+      ]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -205,32 +337,20 @@ jobs:
           path: slices
           merge-multiple: false
 
-      - name: Assemble machine directories and stand-in machine1
+      - name: Assemble machine directories
         run: |
           set -euo pipefail
           mkdir -p machine1 machine2 machine3 machine4
+          # machine1's score.json is still a documented stand-in for GPQA/TTFT/
+          # timing (see machine1-check's job comment for why), but its
+          # weights.sha256 is now real and independently computed on its own
+          # machine -- the combiner's determinism tripwire genuinely cross-checks
+          # all 4 machines instead of 3 real ones plus a borrowed hash.
+          cp "slices/parallel-correctness-probe-${{ github.run_id }}-machine1/score.json" machine1/
+          cp "slices/parallel-correctness-probe-${{ github.run_id }}-machine1/weights.sha256" machine1/
           cp "slices/parallel-correctness-probe-${{ github.run_id }}-machine2/"* machine2/
           cp "slices/parallel-correctness-probe-${{ github.run_id }}-machine3/"* machine3/
           cp "slices/parallel-correctness-probe-${{ github.run_id }}-machine4/"* machine4/
-
-          # No real "machine 1" in this probe -- see the workflow header comment.
-          # Its weights hash must match the real slices' (they all transformed the
-          # same reference checkpoint) so the combiner's determinism tripwire
-          # passes; borrow slice 1's since it's a real, independently-computed hash.
-          cp machine2/weights.sha256 machine1/weights.sha256
-          cat > machine1/score.json <<'EOF'
-          {
-            "score": null,
-            "passed": true,
-            "metrics": {
-              "passed_correctness": true,
-              "checked_steps": 0,
-              "case_count": 1,
-              "first_failing_case": null,
-              "first_failing_step": null
-            }
-          }
-          EOF
 
       - name: Combine
         env:
@@ -304,6 +424,10 @@ jobs:
             if [[ -s "${full_ref_dir}/correctness-report.json" ]]; then
               echo "- full-reference passed: \`$(jq -r '.passed' "${full_ref_dir}/correctness-report.json")\`"
               echo "- full-reference checked_steps: \`$(jq -r '.checked_steps' "${full_ref_dir}/correctness-report.json")\`"
+            fi
+            machine1_dir="slices/parallel-correctness-probe-${{ github.run_id }}-machine1"
+            if [[ -s "${machine1_dir}/score.local-iterate.json" ]]; then
+              echo "- machine1 real smoke check passed: \`$(jq -r '.passed' "${machine1_dir}/score.local-iterate.json")\` (public fixture only; not a GPQA/TTFT check -- see machine1-check's job comment)"
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
 

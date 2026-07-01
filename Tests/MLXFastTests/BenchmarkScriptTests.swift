@@ -220,12 +220,18 @@ func parallelCorrectnessProbeWorkflowIsManualAndSecretFree() throws {
     #expect(workflow.contains("default: \"21-42\""))
     #expect(workflow.contains("default: \"42-64\""))
 
-    // No real "machine 1" in this probe -- see the combine job's stand-in payload.
-    // Its weights hash must match a real slice's for the combiner's determinism
-    // tripwire to pass rather than being fabricated independently.
-    #expect(workflow.contains("cp machine2/weights.sha256 machine1/weights.sha256"))
+    // machine1-check is a real 4th machine: independently transforms the
+    // checkpoint (so the combiner's weights-hash tripwire genuinely cross-checks
+    // all 4 machines, not 3 real ones plus a copy of machine2's hash) and runs a
+    // real --local-iterate smoke check. Its score.json for the combiner remains a
+    // documented stand-in -- GPQA/TTFT/timing require the hidden golden and R2
+    // credentials, which must never be reachable from this secret-free workflow.
+    #expect(workflow.contains("machine1-check:"))
+    #expect(!workflow.contains("cp machine2/weights.sha256 machine1/weights.sha256"))
+    #expect(workflow.contains("cp \"slices/parallel-correctness-probe-${{ github.run_id }}-machine1/weights.sha256\" machine1/"))
     #expect(workflow.contains(".github/scripts/combine-parallel-correctness.sh"))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_MACHINE_DIRS: \"machine2 machine3 machine4\""))
+    #expect(workflow.contains("name: parallel-correctness-probe-${{ github.run_id }}-machine1"))
 
     // Secret-free by design: no `environment:` gate, no R2/Anthropic secrets
     // referenced anywhere in either file.
@@ -265,16 +271,31 @@ func parallelCorrectnessProbeWorkflowIsManualAndSecretFree() throws {
     // just a range misconfiguration, which combine-parallel-correctness.sh
     // already catches on its own). It must use the plain `correctness` subcommand
     // with no --step-range -- not `benchmark --local-iterate`, which only ever
-    // checks a fixed 16 decode steps and would silently under-check here.
-    #expect(workflow.contains("full-reference-check:"))
-    #expect(workflow.contains("mlxfast-swift correctness \\"))
-    #expect(workflow.contains("--base-case-only"))
-    #expect(!workflow.contains("benchmark \\\n            --local-iterate"))
-    // No --step-range anywhere in the parent file: the reusable slice workflow
-    // is the only place that flag is ever passed on a real command line.
-    #expect(!workflow.contains("--step-range \""))
+    // checks a fixed 16 decode steps and would silently under-check here. (The
+    // separate machine1-check job legitimately uses --local-iterate for its own,
+    // different purpose -- a real infra smoke check, not a correctness cross-
+    // check -- so the assertion below is scoped to full-reference-check's own
+    // job body, not a blanket ban on --local-iterate anywhere in the file.)
+    let fullReferenceCheckStart = try #require(workflow.range(of: "full-reference-check:"))
+    let fullReferenceCheckEnd = try #require(workflow.range(of: "combine:", range: fullReferenceCheckStart.upperBound..<workflow.endIndex))
+    let fullReferenceCheckJob = workflow[fullReferenceCheckStart.lowerBound..<fullReferenceCheckEnd.lowerBound]
+    #expect(fullReferenceCheckJob.contains("mlxfast-swift correctness \\"))
+    #expect(fullReferenceCheckJob.contains("--base-case-only"))
+    // The job's own explanatory comment mentions `benchmark --local-iterate` by
+    // name as the thing NOT to use here, so check for the actual invocation
+    // pattern rather than banning the substring outright.
+    #expect(!fullReferenceCheckJob.contains("benchmark \\\n            --local-iterate \\"))
+    #expect(!fullReferenceCheckJob.contains("--step-range \""))
     #expect(workflow.contains("name: parallel-correctness-probe-${{ github.run_id }}-full-reference"))
-    #expect(workflow.contains("needs: [correctness-slice-1, correctness-slice-2, correctness-slice-3, full-reference-check]"))
+    #expect(workflow.contains("    needs:\n      [\n        correctness-slice-1,\n        correctness-slice-2,\n        correctness-slice-3,\n        full-reference-check,\n        machine1-check,\n      ]"))
+
+    // machine1-check runs a real smoke check on the public fixture (fail-closed
+    // if this machine's own transform/worker/decode path is broken), but its
+    // score.json for the combiner stays a deliberate stand-in for GPQA/TTFT/
+    // timing, which require the hidden golden this workflow must never touch.
+    #expect(workflow.contains("machine1-check:"))
+    #expect(workflow.contains("mlxfast-swift benchmark \\\n            --local-iterate \\"))
+    #expect(workflow.contains("\"passed_correctness\": true,\n              \"checked_steps\": 0,"))
 
     // The combine job must actually cross-check the split verdict against the
     // full reference, not just download and ignore it.
