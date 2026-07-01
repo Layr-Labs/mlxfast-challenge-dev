@@ -161,6 +161,14 @@ jobs:
           set -euo pipefail
           status=0
           started="${SECONDS}"
+          # --step-range-output passes through the CLI's requirePrivateOutputPath,
+          # which (now that this job sets MLXFAST_PRIVATE_DIR for the worker
+          # subtree-deny) requires the target to live UNDER the private dir. The
+          # sidecar itself is non-private assigned-range metadata that combine
+          # needs as a public artifact, so write it into the private dir here and
+          # copy it out to the workspace below -- the private dir denies the
+          # sandboxed WORKER, not these unsandboxed parent steps.
+          step_range_private="${MLXFAST_PRIVATE_DIR}/step-range.json"
           if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
             echo "benchmark-correctness-slice: running submitted correctness slice with private process logs suppressed"
             .build/release/mlxfast-swift correctness \
@@ -168,7 +176,7 @@ jobs:
               --golden "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
               --base-case-only \
               --step-range "${STEP_RANGE}" \
-              --step-range-output step-range.json \
+              --step-range-output "${step_range_private}" \
               > correctness-report.json \
               2> "${RUNNER_TEMP}/mlxfast-correctness-slice-private.log" || status=$?
             if [[ "${status}" -ne 0 ]]; then
@@ -180,8 +188,14 @@ jobs:
               --golden "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
               --base-case-only \
               --step-range "${STEP_RANGE}" \
-              --step-range-output step-range.json \
+              --step-range-output "${step_range_private}" \
               > correctness-report.json || status=$?
+          fi
+          # Copy the assigned-range sidecar out for the combine artifact. It is
+          # written before the model runs, so it exists on any failure past
+          # argument validation; a pre-write throw fails the step anyway.
+          if [[ -s "${step_range_private}" ]]; then
+            cp "${step_range_private}" step-range.json
           fi
           # The serial run's published correctness_seconds covered base case +
           # gates together; the gates machine now only reports its own gates

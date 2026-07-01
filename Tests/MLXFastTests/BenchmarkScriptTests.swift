@@ -259,6 +259,9 @@ func parallelCorrectnessProbeWorkflowIsManualAndSecretFree() throws {
     // (no gate pollution) and the range sidecar (real coverage verification).
     #expect(slice.contains("--base-case-only"))
     #expect(slice.contains("--step-range \"${STEP_RANGE}\""))
+    // The public-fixture probe slice sets no MLXFAST_PRIVATE_DIR, so its
+    // --step-range-output writes straight to the workspace (unlike the hidden
+    // benchmark-correctness-slice.yml, which routes it through the private dir).
     #expect(slice.contains("--step-range-output step-range.json"))
     #expect(slice.contains(".github/scripts/hash-weights-directory.sh weights weights.sha256"))
 
@@ -684,6 +687,18 @@ func sliceCorrectnessRunEnforcesOfficialSandboxLikeBenchmarkScript() throws {
     )
     #expect(slice.contains("MLXFAST_OFFICIAL_BENCHMARK_RUN: \"1\""))
     #expect(slice.contains("MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.slice_name }}"))
+
+    // Because this job sets MLXFAST_PRIVATE_DIR (for the worker subtree-deny),
+    // the CLI's requirePrivateOutputPath forces --step-range-output under it.
+    // The sidecar is non-private assigned-range metadata that combine needs as
+    // a public artifact, so it is written into the private dir and copied out.
+    // Regression guard for the run 28554064321 failure, where setting
+    // MLXFAST_PRIVATE_DIR while still writing --step-range-output to the
+    // workspace made every slice throw before any model work.
+    #expect(slice.contains("step_range_private=\"${MLXFAST_PRIVATE_DIR}/step-range.json\""))
+    #expect(slice.contains("--step-range-output \"${step_range_private}\""))
+    #expect(slice.contains("cp \"${step_range_private}\" step-range.json"))
+    #expect(!slice.contains("--step-range-output step-range.json"))
 }
 
 @Test
