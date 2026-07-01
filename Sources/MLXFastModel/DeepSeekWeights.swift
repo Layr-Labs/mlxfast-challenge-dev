@@ -96,12 +96,191 @@ public enum DeepSeekExpertProjection: String, Equatable, Hashable {
     }
 }
 
+/// Pre-loaded expert scale tensors from 2-bit packed format. During transform,
+/// U8 E8M0 scales (only ~4 unique values) are packed to 2 bits per value and
+/// stored in `weights/experts/packed_scales.bin`. At runtime this class loads
+/// the ~2 GiB packed file and unpacks per-expert slices on demand, eliminating
+/// all scale SSD reads during decode.
+///
+/// Reference type so it is shared across value-type WeightLoader copies.
+public final class PreloadedExpertScales {
+    private struct Entry {
+        let shape: [Int]
+        let originalByteCount: Int
+        let packedData: Data       // 2-bit packed bytes for the full stacked tensor
+        let perExpertOriginal: Int // bytes per expert in the original U8 format
+        let perExpertPacked: Int   // bytes per expert in the packed format
+    }
+
+    private var store: [String: Entry] = [:]
+    private var palette: [UInt8] = []
+
+    public var count: Int { store.count }
+    public var totalBytes: Int { store.values.reduce(0) { $0 + $1.packedData.count } }
+
+    /// Load from the packed_scales.bin written by the transform.
+    public init(packedScalesPath: String) throws {
+        let url = URL(fileURLWithPath: packedScalesPath)
+        guard FileManager.default.fileExists(atPath: packedScalesPath) else {
+            // No packed scales file -- fall through to ExpertSlotBank reads.
+            return
+        }
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        try parse(data)
+    }
+
+    /// Empty init (no pre-loading).
+    public init() {}
+
+    private func parse(_ data: Data) throws {
+        guard data.count >= 12 else { return }
+        // Magic: "ES4B" (4-bit nibble packed) or legacy "ES2B"
+        guard data[0] == 0x45, data[1] == 0x53, (data[2] == 0x34 || data[2] == 0x32), data[3] == 0x42 else {
+            return
+        }
+        let tensorCount = Int(readUInt32(data, offset: 4))
+        let paletteSize = Int(readUInt32(data, offset: 8))
+        guard paletteSize <= 256 else { return }
+
+        var offset = 12
+        palette = Array(data[offset..<(offset + paletteSize)])
+        offset += paletteSize
+
+        // Read per-tensor metadata
+        struct TensorMeta {
+            let name: String
+            let originalByteCount: Int
+            let packedByteCount: Int
+            let shape: [Int]
+        }
+        var metas: [TensorMeta] = []
+        for _ in 0..<tensorCount {
+            guard offset + 256 + 12 <= data.count else { return }
+            let nameBytes = data[offset..<(offset + 256)]
+            let name = String(bytes: nameBytes.prefix { $0 != 0 }, encoding: .utf8) ?? ""
+            offset += 256
+            let origCount = Int(readUInt32(data, offset: offset)); offset += 4
+            let packCount = Int(readUInt32(data, offset: offset)); offset += 4
+            let shapeDims = Int(readUInt32(data, offset: offset)); offset += 4
+            var shape: [Int] = []
+            for _ in 0..<shapeDims {
+                guard offset + 4 <= data.count else { return }
+                shape.append(Int(readUInt32(data, offset: offset))); offset += 4
+            }
+            metas.append(TensorMeta(name: name, originalByteCount: origCount, packedByteCount: packCount, shape: shape))
+        }
+
+        // Read packed data
+        for meta in metas {
+            guard offset + meta.packedByteCount <= data.count else { return }
+            let packed = data.subdata(in: offset..<(offset + meta.packedByteCount))
+            offset += meta.packedByteCount
+            let firstDim = meta.shape.first ?? 1
+            store[meta.name] = Entry(
+                shape: meta.shape,
+                originalByteCount: meta.originalByteCount,
+                packedData: packed,
+                perExpertOriginal: firstDim > 0 ? meta.originalByteCount / firstDim : meta.originalByteCount,
+                perExpertPacked: firstDim > 0 ? meta.packedByteCount / firstDim : meta.packedByteCount
+            )
+        }
+    }
+
+    private func readUInt32(_ data: Data, offset: Int) -> UInt32 {
+        data.withUnsafeBytes { buf in
+            buf.load(fromByteOffset: offset, as: UInt32.self).littleEndian
+        }
+    }
+
+    /// Unpack a per-expert slice from the 4-bit nibble-packed data back to U8.
+    public func scaleTensor(named name: String, firstAxisIndex: Int) throws -> MaterializedTensor? {
+        guard let entry = store[name], !palette.isEmpty else { return nil }
+        guard entry.shape.count > 1, let firstDim = entry.shape.first, firstAxisIndex < firstDim else {
+            return nil
+        }
+        let packedOffset = firstAxisIndex * entry.perExpertPacked
+        let packedEnd = packedOffset + entry.perExpertPacked
+        guard packedEnd <= entry.packedData.count else { return nil }
+
+        let unpackedCount = entry.perExpertOriginal
+        var unpacked = Data(count: unpackedCount)
+        unpacked.withUnsafeMutableBytes { outBuf in
+            entry.packedData.withUnsafeBytes { inBuf in
+                let inPtr = inBuf.baseAddress!.advanced(by: packedOffset)
+                    .assumingMemoryBound(to: UInt8.self)
+                let outPtr = outBuf.bindMemory(to: UInt8.self).baseAddress!
+                for i in 0..<unpackedCount {
+                    let bytePos = i / 2
+                    let idx: Int
+                    if i % 2 == 0 {
+                        idx = Int(inPtr[bytePos] & 0x0F)        // low nibble
+                    } else {
+                        idx = Int((inPtr[bytePos] >> 4) & 0x0F) // high nibble
+                    }
+                    outPtr[i] = idx < palette.count ? palette[idx] : 0
+                }
+            }
+        }
+        let slicedShape = Array(entry.shape.dropFirst())
+        return try MaterializedTensor(name: name, dtype: .u8, shape: slicedShape, bytes: unpacked)
+    }
+
+    /// Unpack a full stacked tensor.
+    public func scaleTensor(named name: String) throws -> MaterializedTensor? {
+        guard let entry = store[name], !palette.isEmpty else { return nil }
+        var unpacked = Data(count: entry.originalByteCount)
+        unpacked.withUnsafeMutableBytes { outBuf in
+            entry.packedData.withUnsafeBytes { inBuf in
+                let inPtr = inBuf.bindMemory(to: UInt8.self).baseAddress!
+                let outPtr = outBuf.bindMemory(to: UInt8.self).baseAddress!
+                for i in 0..<entry.originalByteCount {
+                    let bytePos = i / 2
+                    let idx: Int
+                    if i % 2 == 0 {
+                        idx = Int(inPtr[bytePos] & 0x0F)
+                    } else {
+                        idx = Int((inPtr[bytePos] >> 4) & 0x0F)
+                    }
+                    outPtr[i] = idx < palette.count ? palette[idx] : 0
+                }
+            }
+        }
+        return try MaterializedTensor(name: name, dtype: .u8, shape: entry.shape, bytes: unpacked)
+    }
+}
+
 public struct DeepSeekWeightLoader {
     public let denseStore: DenseTensorStore
     public let expertBank: ExpertSlotBank
+    // L2: caches the fully built routed-expert weights (MLXArrays) per
+    // (layer, expert) so reuse skips pread + makeArray. This is the primary
+    // routed-expert cache; the ExpertSlotBank byte cache is disabled (capacity 0)
+    // to avoid holding the same bytes twice.
+    public let expertWeightCache: ExpertWeightCache
+    // Pre-loaded expert scale tensors. Scale reads are eliminated from the
+    // SSD I/O path: all U8 E8M0 scales are loaded into RAM at init time
+    // (~8.6 GiB) and served from memory during decode.
+    public let preloadedScales: PreloadedExpertScales
     public let expertStreamingConfig: ExpertStreamingConfig
     public let expertStreamingMetrics: ExpertStreamingMetrics?
     private let bridge: MLXArrayTensorBridge
+
+    /// Default L2 expert cache capacity in experts. Sized conservatively for 48 GB
+    /// machines: 128 experts × ~12 MiB (weights only) ≈ 1.5 GiB. The O(1)
+    /// doubly-linked-list LRU and MLXArray-level caching eliminate the
+    /// Data->MLXArray rebuild cost on hits. Override with MLXFAST_EXPERT_CACHE_EXPERTS.
+    private static let defaultL2CacheCapacity = 128
+
+    private static func l2CacheCapacity(from config: ExpertStreamingConfig) -> Int {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["MLXFAST_EXPERT_CACHE_EXPERTS"], let parsed = Int(raw), parsed >= 0 {
+            return parsed
+        }
+        if let raw = env["MLXFAST_EXPERT_CACHE_TENSORS"], let parsed = Int(raw), parsed >= 0 {
+            return parsed / ExpertStreamingConfig.tensorsPerExpertRecord
+        }
+        return defaultL2CacheCapacity
+    }
 
     public init(
         weightsPath: String,
@@ -114,10 +293,22 @@ public struct DeepSeekWeightLoader {
         self.denseStore = try DenseTensorStore(weightsPath: weightsPath)
         self.expertStreamingConfig = expertStreamingConfig
         self.expertStreamingMetrics = metrics
+        // Disable byte-level LRU in ExpertSlotBank (capacity 0); all caching is
+        // done at the MLXArray level in expertWeightCache to avoid double-caching
+        // and the ~12.75 MiB/expert Data->MLXArray copy on every reuse.
         self.expertBank = try ExpertSlotBank(
             manifestPath: "\(weightsPath)/experts/manifest.json",
-            capacity: expertStreamingConfig.tensorCacheCapacity,
+            capacity: 0,
             metrics: metrics
+        )
+        self.expertWeightCache = ExpertWeightCache(
+            capacity: Self.l2CacheCapacity(from: expertStreamingConfig)
+        )
+        // Load 2-bit packed expert scales from weights/experts/packed_scales.bin
+        // (~2 GiB). Scale reads are eliminated from SSD during decode; each
+        // expert activation unpacks its scales from the compact in-memory buffer.
+        self.preloadedScales = try PreloadedExpertScales(
+            packedScalesPath: "\(weightsPath)/experts/packed_scales.bin"
         )
         self.bridge = bridge
     }
@@ -133,7 +324,34 @@ public struct DeepSeekWeightLoader {
         self.expertBank = expertBank
         self.expertStreamingConfig = expertStreamingConfig
         self.expertStreamingMetrics = expertStreamingMetrics ?? expertBank.metrics
+        self.expertWeightCache = ExpertWeightCache(
+            capacity: Self.l2CacheCapacity(from: expertStreamingConfig)
+        )
+        // No pre-loading in the test/harness init path.
+        self.preloadedScales = PreloadedExpertScales()
         self.bridge = bridge
+    }
+
+    /// Routed-expert weights for (spec.layerIndex, expertIndex), served from the
+    /// L2 cache when resident. On a miss the weights are built once (pread +
+    /// makeArray via expertLinearWeight) and inserted, so subsequent reuse across
+    /// decode steps is a pointer return with no host->device copy and no recorded
+    /// streaming bytes.
+    public func routedExpertWeights(
+        expertIndex: Int,
+        spec: DeepSeekRoutedExpertSpec
+    ) throws -> DeepSeekMLPWeights {
+        let key = ExpertWeightCache.Key(layer: spec.layerIndex, expert: expertIndex)
+        if let cached = expertWeightCache.value(for: key) {
+            return cached
+        }
+        let weights = try DeepSeekRoutedExperts.weights(
+            forExpert: expertIndex,
+            loader: self,
+            spec: spec
+        )
+        expertWeightCache.insert(weights, for: key)
+        return weights
     }
 
     public func resolveDenseName(_ candidates: [String]) throws -> String {
@@ -251,6 +469,14 @@ public struct DeepSeekWeightLoader {
                 expectedShape: expectedShape,
                 tensor: tensor,
                 companionTensor: { companionName, shouldSlice in
+                    // Serve pre-loaded scales from RAM (zero SSD I/O).
+                    if shouldSlice, let preloaded = try preloadedScales.scaleTensor(named: companionName, firstAxisIndex: expertIndex) {
+                        return preloaded
+                    }
+                    if !shouldSlice, let preloaded = try preloadedScales.scaleTensor(named: companionName) {
+                        return preloaded
+                    }
+                    // Fall through to SSD for non-preloaded companions.
                     guard expertBank.record(named: companionName) != nil else {
                         return nil
                     }
