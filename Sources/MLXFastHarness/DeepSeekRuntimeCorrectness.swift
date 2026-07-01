@@ -546,7 +546,13 @@ extension DeepSeekRuntime {
                 checkedSteps += check.comparison.checkedSteps
                 progress?("correctness behavior \(caseLabel) complete checked_steps=\(check.comparison.checkedSteps)")
             }
-            if let semanticCapture {
+            // checkGates false means the behavior loop above never ran (a
+            // "timing-only" machine, correctness/gates split elsewhere), so
+            // semanticAnswers is always empty here regardless of caseCount --
+            // that is not a capture failure, there was simply nothing to
+            // capture on this machine, and enforcing the count would turn a
+            // valid timing-only run into a spurious hard failure.
+            if checkGates, let semanticCapture {
                 guard semanticAnswers.count == semanticCapture.caseCount else {
                     throw MLXFastError.invalidInput(
                         "captured \(semanticAnswers.count) semantic GPQA answers; expected \(semanticCapture.caseCount)"
