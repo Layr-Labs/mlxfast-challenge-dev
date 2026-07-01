@@ -45,6 +45,39 @@ else
 fi
 USE_RUNTIME_WORKER="${MLXFAST_USE_RUNTIME_WORKER:-1}"
 
+report_local_iterate_git_base() {
+  if [[ "${LOCAL_ITERATE}" != "1" ]]; then
+    return 0
+  fi
+  if ! command -v git >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local head_sha
+  local origin_main_sha
+  head_sha="$(git rev-parse --short=12 HEAD 2>/dev/null || true)"
+  origin_main_sha="$(git rev-parse --short=12 --verify origin/main 2>/dev/null || true)"
+
+  if [[ -n "${head_sha}" && -n "${origin_main_sha}" ]]; then
+    echo "benchmark.sh: local-iterate git_head=${head_sha} origin_main=${origin_main_sha}"
+    if ! git merge-base --is-ancestor origin/main HEAD >/dev/null 2>&1; then
+      cat >&2 <<EOF
+benchmark.sh: warning: HEAD does not contain the currently fetched origin/main.
+benchmark.sh: run 'git fetch origin main', rebase or branch from the latest tip,
+benchmark.sh: then rerun './benchmark.sh --local-iterate' before trusting local speedups.
+EOF
+    fi
+  else
+    cat >&2 <<EOF
+benchmark.sh: warning: could not find origin/main for local-iterate baseline context.
+benchmark.sh: run 'git fetch origin main' and measure the latest tip locally before comparing changes.
+EOF
+  fi
+}
+
 json_string() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
@@ -233,6 +266,7 @@ if [[ "${USE_RUNTIME_WORKER}" != "1" && "${MLXFAST_IN_SANDBOX:-0}" != "1" && "${
 fi
 
 enforce_official_sandbox
+report_local_iterate_git_base
 
 if [[ ! -x "${SWIFT_BIN}" ]]; then
   echo "benchmark.sh: Swift release binary missing at ${SWIFT_BIN}" >&2
