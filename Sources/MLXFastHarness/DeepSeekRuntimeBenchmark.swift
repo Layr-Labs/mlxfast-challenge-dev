@@ -1117,7 +1117,8 @@ extension DeepSeekRuntime {
         decodeSecondsPerToken: Double = 0,
         prefillSecondsPerToken: Double = 0,
         bandwidthSource: String = "",
-        gpqaTTFT: GPQATTFTSummary = .zero
+        gpqaTTFT: GPQATTFTSummary = .zero,
+        runtime: String = "swift"
     ) -> ScorePayload {
         let expertStats = explicitExpertStats ?? correctness?.expertStreamingStats ?? .zero
         return ScorePayload(
@@ -1154,8 +1155,8 @@ extension DeepSeekRuntime {
                 firstFailingLayer: nil,
                 firstFailingCase: explicitFirstFailingCase ?? correctness?.firstFailingCase,
                 firstFailingStep: explicitFirstFailingStep ?? correctness?.firstFailingStep,
-                expectedToken: nil,
-                actualToken: nil,
+                expectedToken: explicitExpectedToken ?? correctness?.expectedToken,
+                actualToken: explicitActualToken ?? correctness?.actualToken,
                 maxAbsDiff: 0,
                 goldenHash: correctness?.goldenHash ?? "",
                 bandwidthSource: bandwidthSource,
@@ -1166,7 +1167,7 @@ extension DeepSeekRuntime {
                 weightsHash: weightsDigest?.sha256 ?? "",
                 weightsByteCount: weightsDigest?.byteCount ?? 0,
                 weightsFileCount: weightsDigest?.fileCount ?? 0,
-                runtime: "swift"
+                runtime: runtime
             )
         )
     }

@@ -241,6 +241,31 @@ public struct BenchmarkOptions: Equatable {
     }
 }
 
+public struct LocalIterateOptions: Equatable {
+    public let weightsPath: String
+    public let goldenPath: String
+    public let benchmarkDecodeSteps: Int
+    public let timingRepeats: Int
+    public let modeName: String
+    public let runtime: String
+
+    public init(
+        weightsPath: String,
+        goldenPath: String = MLXFastConstants.defaultPublicCorrectnessGoldenPath,
+        benchmarkDecodeSteps: Int = MLXFastConstants.localIterateBenchmarkDecodeSteps,
+        timingRepeats: Int = 1,
+        modeName: String = "local-iterate",
+        runtime: String = "swift-local-iterate"
+    ) {
+        self.weightsPath = weightsPath
+        self.goldenPath = goldenPath
+        self.benchmarkDecodeSteps = benchmarkDecodeSteps
+        self.timingRepeats = timingRepeats
+        self.modeName = modeName
+        self.runtime = runtime
+    }
+}
+
 public struct RuntimeWorkerOptions: Equatable {
     public let executablePath: String
     public let sandboxProfilePath: String?

@@ -595,7 +595,11 @@ func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
 }
 
 @Test
-func benchmarkQuickModeUsesShortLocalPrefixAndPrintsScore() throws {
+func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
+    let contract = try String(
+        contentsOfFile: "benchmark.json",
+        encoding: .utf8
+    )
     let constants = try String(
         contentsOfFile: "Sources/MLXFastCore/Constants.swift",
         encoding: .utf8
@@ -605,11 +609,27 @@ func benchmarkQuickModeUsesShortLocalPrefixAndPrintsScore() throws {
         encoding: .utf8
     )
     let runtime = try harnessRuntimeSource()
+    let localRuntime = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntimeLocalIterate.swift",
+        encoding: .utf8
+    )
 
-    #expect(constants.contains("public static let quickCorrectnessSteps = 64"))
-    #expect(constants.contains("public static let quickBenchmarkDecodeSteps = 64"))
-    #expect(cli.contains("flagOptions: [\"--quick\"]"))
+    #expect(contract.contains("\"preSubmitCommand\": [\"bash\", \"-lc\", \"./benchmark.sh --local-submit\"]"))
+    #expect(constants.contains("public static let defaultPublicLocalSubmitGoldenPath"))
+    #expect(constants.contains("public static let localSubmitBenchmarkDecodeSteps = 1023"))
+    #expect(constants.contains("public static let localSubmitBenchmarkRepeats = 1"))
+    #expect(cli.contains("flagOptions: [\"--local-submit\", \"--local-iterate\"]"))
+    #expect(cli.contains("? MLXFastConstants.defaultPublicLocalSubmitGoldenPath"))
+    #expect(cli.contains("? MLXFastConstants.defaultPublicCorrectnessGoldenPath"))
+    #expect(cli.contains("let decodeSteps = localSubmit"))
+    #expect(cli.contains("? MLXFastConstants.localSubmitBenchmarkDecodeSteps"))
+    #expect(cli.contains("let timingRepeats = localSubmit ? MLXFastConstants.localSubmitBenchmarkRepeats : 1"))
+    #expect(cli.contains("timingRepeats: timingRepeats"))
+    #expect(cli.contains("let runtime = localSubmit ? \"swift-local-submit\" : \"swift-local-iterate\""))
+    #expect(cli.contains("DeepSeekRuntime.localIterate("))
     #expect(cli.contains("printScorePayload(at: scorePath)"))
+    #expect(localRuntime.contains("runtime: runtime"))
+    #expect(localRuntime.contains("modeName: String"))
     #expect(runtime.contains("correctness_steps=\\(options.correctnessSteps)"))
     #expect(runtime.contains("benchmark_decode_steps=\\(options.benchmarkDecodeSteps)"))
     #expect(!runtime.contains("Array(expectedTokens.prefix(timingPlan.decodeSteps))"))
@@ -617,7 +637,50 @@ func benchmarkQuickModeUsesShortLocalPrefixAndPrintsScore() throws {
 }
 
 @Test
-func benchmarkScriptForwardsQuickFlagToSwiftBenchmark() throws {
+func benchmarkLocalIterateModeUsesPublicFixtureAndNonOfficialScore() throws {
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    let constants = try String(
+        contentsOfFile: "Sources/MLXFastCore/Constants.swift",
+        encoding: .utf8
+    )
+    let cli = try String(
+        contentsOfFile: "Sources/MLXFastCLI/main.swift",
+        encoding: .utf8
+    )
+    let runtime = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntimeLocalIterate.swift",
+        encoding: .utf8
+    )
+    let options = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
+        encoding: .utf8
+    )
+
+    #expect(script.contains("if [[ \"${arg}\" == \"--local-iterate\" ]]; then"))
+    #expect(script.contains("SCORE_PATH=\"score.local-iterate.json\""))
+    #expect(script.contains("GOLDEN_PATH=\"correctness_prompts/public_longcopy_gate_english_512_256.json\""))
+    #expect(constants.contains("public static let localIterateBenchmarkDecodeSteps = 16"))
+    #expect(cli.contains("flagOptions: [\"--local-submit\", \"--local-iterate\"]"))
+    #expect(cli.contains("DeepSeekRuntime.localIterate("))
+    #expect(cli.contains("MLXFastConstants.defaultLocalIterateScorePath"))
+    #expect(runtime.contains("runLocalIterateCheckedTimingWithWorker("))
+    #expect(runtime.contains("score: nil"))
+    #expect(options.contains("runtime: String = \"swift-local-iterate\""))
+    #expect(runtime.contains("teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[decodedStep])"))
+}
+
+@Test
+func benchmarkTransformCacheKeyIgnoresRuntimeModelSources() throws {
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+
+    #expect(script.contains("This hash gates regeneration of weights/"))
+    #expect(script.contains("\"Sources/MLXFastCore\""))
+    #expect(script.contains("\"Sources/MLXFastTransform\""))
+    #expect(!script.contains("\"Sources/MLXFastModel\""))
+}
+
+@Test
+func benchmarkScriptForwardsLocalSubmitFlagToSwiftBenchmark() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
 
@@ -628,9 +691,6 @@ func benchmarkScriptForwardsQuickFlagToSwiftBenchmark() throws {
         atomically: true,
         encoding: .utf8
     )
-
-    let golden = root.appendingPathComponent("correctness_golden.json")
-    try "{}".write(to: golden, atomically: true, encoding: .utf8)
 
     let argLog = root.appendingPathComponent("args.txt")
     let fakeSwift = root.appendingPathComponent("mlxfast-swift")
@@ -666,14 +726,13 @@ func benchmarkScriptForwardsQuickFlagToSwiftBenchmark() throws {
     let integrity = root.appendingPathComponent("benchmark-integrity.json")
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/bin/bash")
-    process.arguments = ["benchmark.sh", "--quick"]
+    process.arguments = ["benchmark.sh", "--local-submit"]
     process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     process.environment = ProcessInfo.processInfo.environment.merging([
         "MLXFAST_NO_SANDBOX": "1",
         "MLXFAST_SKIP_TRANSFORM": "1",
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
         "MLXFAST_WEIGHTS_PATH": weights.path,
-        "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
         "MLXFAST_SCORE_PATH": score.path,
         "MLXFAST_INTEGRITY_PATH": integrity.path,
     ]) { _, new in new }
@@ -684,7 +743,114 @@ func benchmarkScriptForwardsQuickFlagToSwiftBenchmark() throws {
     let args = try String(contentsOf: argLog, encoding: .utf8)
     #expect(process.terminationStatus == 0)
     #expect(args.contains("benchmark\n"))
-    #expect(args.contains("--quick\n"))
+    #expect(args.contains("--golden\n"))
+    #expect(args.contains("correctness_prompts/public_longcopy_gate_english_512_1024.json\n"))
+    #expect(args.contains("--local-submit\n"))
+}
+
+@Test
+func benchmarkScriptForwardsLocalIterateDefaultsToSwiftBenchmark() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let argLog = root.appendingPathComponent("args.txt")
+    let score = root.appendingPathComponent("score.local-iterate.json")
+    let integrity = root.appendingPathComponent("benchmark-integrity.local-iterate.json")
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    printf '%s\\n' "$@" > "\(argLog.path)"
+    score_path="score.json"
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--score-path" ]; then
+        shift
+        score_path="$1"
+      fi
+      shift || exit 1
+    done
+    cat > "$score_path" <<'JSON'
+    {
+      "score": null,
+      "passed": true,
+      "metrics": {
+        "weights_hash": "fake-weights",
+        "weights_file_count": 1,
+        "weights_byte_count": 2
+      }
+    }
+    JSON
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = ["benchmark.sh", "--local-iterate"]
+    process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = ProcessInfo.processInfo.environment.merging([
+        "MLXFAST_NO_SANDBOX": "1",
+        "MLXFAST_SKIP_TRANSFORM": "1",
+        "MLXFAST_SWIFT_BIN": fakeSwift.path,
+        "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_SCORE_PATH": score.path,
+        "MLXFAST_INTEGRITY_PATH": integrity.path,
+    ]) { _, new in new }
+
+    try process.run()
+    process.waitUntilExit()
+
+    let args = try String(contentsOf: argLog, encoding: .utf8)
+    #expect(process.terminationStatus == 0)
+    #expect(args.contains("benchmark\n"))
+    #expect(args.contains("--golden\n"))
+    #expect(args.contains("correctness_prompts/public_longcopy_gate_english_512_256.json\n"))
+    #expect(args.contains("--score-path\n"))
+    #expect(args.contains("\(score.path)\n"))
+    #expect(args.contains("--local-iterate\n"))
+}
+
+@Test
+func benchmarkScriptRejectsPathFlagsBeforeForwardingToSwiftBenchmark() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    exit 99
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = ["benchmark.sh", "--local-iterate", "--score-path", "custom.json"]
+    process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = ProcessInfo.processInfo.environment.merging([
+        "MLXFAST_NO_SANDBOX": "1",
+        "MLXFAST_SWIFT_BIN": fakeSwift.path,
+    ]) { _, new in new }
+
+    let stderr = Pipe()
+    process.standardError = stderr
+    try process.run()
+    process.waitUntilExit()
+
+    let error = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    #expect(process.terminationStatus == 1)
+    #expect(error.contains("use MLXFAST_WEIGHTS_PATH, MLXFAST_CORRECTNESS_GOLDEN_PATH, or MLXFAST_SCORE_PATH"))
 }
 
 @Test
