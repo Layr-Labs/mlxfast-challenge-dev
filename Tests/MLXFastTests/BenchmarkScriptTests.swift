@@ -233,13 +233,21 @@ func parallelCorrectnessProbeWorkflowIsManualAndSecretFree() throws {
     #expect(workflow.contains("MLXFAST_CORRECTNESS_MACHINE_DIRS: \"machine2 machine3 machine4\""))
     #expect(workflow.contains("name: parallel-correctness-probe-${{ github.run_id }}-machine1"))
 
-    // Secret-free by design: no `environment:` gate, no R2/Anthropic secrets
-    // referenced anywhere in either file.
+    // Secret-free by design: no `environment:` gate, no secrets of any kind
+    // referenced anywhere in either file. This must be a blanket `secrets.`
+    // ban on BOTH files, not just a check for specific secret names -- a
+    // narrower check here previously let `secrets.MLXFAST_REFERENCE_BASE_URL`/
+    // `secrets.MLXFAST_REFERENCE_AUTH_HEADER` slip into the slice workflow
+    // undetected (a real credential-exposure bug: this workflow_call target has
+    // no `environment:` gate, so those secrets -- configured for benchmark.yml's
+    // environment-gated job -- would have been injected into a job reachable by
+    // anyone who can dispatch the parent probe workflow).
     #expect(!workflow.contains("environment:"))
     #expect(!workflow.contains("secrets."))
     #expect(!workflow.contains("secrets: inherit"))
-    #expect(!slice.contains("R2_ACCESS_KEY_ID"))
-    #expect(!slice.contains("ORG_ANTHROPIC_API_KEY"))
+    #expect(!slice.contains("environment:"))
+    #expect(!slice.contains("secrets."))
+    #expect(!slice.contains("secrets: inherit"))
 
     // Uses the checked-in public correctness fixture only, never a hidden golden.
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))

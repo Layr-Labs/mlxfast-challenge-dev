@@ -54,8 +54,19 @@ jobs:
 
       - name: Setup Swift harness and reference checkpoint
         env:
-          MLXFAST_REFERENCE_BASE_URL: ${{ secrets.MLXFAST_REFERENCE_BASE_URL || 'https://ds4.darkbloom.ai/deepseek-v4-flash-4bit' }}
-          MLXFAST_REFERENCE_AUTH_HEADER: ${{ secrets.MLXFAST_REFERENCE_AUTH_HEADER }}
+          # This workflow reaches no repo credentials by design -- it's a
+          # workflow_call target with no approval gate, dispatchable (via the
+          # parent probe workflow) by anyone with write access, so it must never
+          # be handed anything that authenticates as more than "the public
+          # checkpoint mirror". setup.sh already falls back to its own public
+          # DEFAULT_REFERENCE_BASE_URL and an empty auth header when these are
+          # unset (matching machine1-check/full-reference-check in the parent
+          # workflow, which never pulled in real credentials to begin with). A
+          # prior version of this step pulled the base-URL/auth-header repo
+          # credentials in here with a public fallback -- that meant a real
+          # credential WOULD have been injected into this unprotected job
+          # whenever those repo credentials happen to be configured (they exist
+          # for the official benchmark workflow's approval-gated job). Removed.
           MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
           MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
           MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
