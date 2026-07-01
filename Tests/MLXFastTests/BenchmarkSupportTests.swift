@@ -28,6 +28,16 @@ func runtimeWorkerEnvironmentStripsOfficialRunAndCIIdentity() {
         "R2_ACCESS_KEY_ID": "key",
         "MLXFAST_EXPERT_CACHE_TENSORS": "42",
         "PATH": "/usr/bin",
+        // A gates-only or timing-only parallel-split machine sets these to
+        // tell the trusted CLI which half of the original single-machine run
+        // this process covers -- on one machine, decode/prefill was always
+        // timed at the same time gates were checked, so submitted code could
+        // never previously tell "my speed doesn't count right now" from "my
+        // correctness doesn't count right now." These must not reach the
+        // sandboxed worker submitted code executes in.
+        "MLXFAST_BENCHMARK_CHECK_GATES": "0",
+        "MLXFAST_BENCHMARK_CORRECTNESS_STEPS": "0",
+        "MLXFAST_BENCHMARK_SKIP_TIMED": "1",
     ])
 
     for key in [
@@ -43,6 +53,9 @@ func runtimeWorkerEnvironmentStripsOfficialRunAndCIIdentity() {
         "MLXFAST_PRIVATE_DIR",
         "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE",
         "R2_ACCESS_KEY_ID",
+        "MLXFAST_BENCHMARK_CHECK_GATES",
+        "MLXFAST_BENCHMARK_CORRECTNESS_STEPS",
+        "MLXFAST_BENCHMARK_SKIP_TIMED",
     ] {
         #expect(sanitized[key] == nil)
     }
