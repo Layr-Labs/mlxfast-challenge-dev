@@ -208,6 +208,8 @@ extension DeepSeekRuntime {
         var failureActual: Int?
         let checkedStepsPerPass = decodeSteps + 2
         let totalDecodeSteps = decodeSteps * timingRepeats
+        let expectedSeedToken = testCase.expectedTokens[0]
+        let expectedDecodeTokens = Array(testCase.expectedTokens.dropFirst().prefix(decodeSteps))
 
         for repeatIndex in 0..<timingRepeats {
             if timingRepeats > 1 {
@@ -227,15 +229,8 @@ extension DeepSeekRuntime {
             let prefillElapsed = secondsSince(prefillStart)
             totalPrefillSeconds += prefillElapsed
             Memory.clearCache()
-            let expectedSeedToken = testCase.expectedTokens[0]
             latestStats = DeepSeekRuntime.expertStats(from: weightCache)
-            if failureStep == nil,
-               !correctnessTokenAccepted(
-                   expectedToken: expectedSeedToken,
-                   actualToken: prefillToken,
-                   topLogits: try topLogits(from: prefillLogits, topK: MLXFastConstants.correctnessTopLogits)
-               )
-            {
+            if failureStep == nil, prefillToken != expectedSeedToken {
                 failureStep = repeatIndex * checkedStepsPerPass
                 failureExpected = expectedSeedToken
                 failureActual = prefillToken
@@ -269,13 +264,7 @@ extension DeepSeekRuntime {
             )
             var actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
             latestStats = DeepSeekRuntime.expertStats(from: weightCache)
-            if failureStep == nil,
-               !correctnessTokenAccepted(
-                   expectedToken: expectedSeedToken,
-                   actualToken: actualToken,
-                   topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits)
-               )
-            {
+            if failureStep == nil, actualToken != expectedSeedToken {
                 failureStep = repeatIndex * checkedStepsPerPass + 1
                 failureExpected = expectedSeedToken
                 failureActual = actualToken
@@ -288,7 +277,7 @@ extension DeepSeekRuntime {
             }
 
             for decodedStep in 0..<decodeSteps {
-                let previousToken = testCase.expectedTokens[decodedStep]
+                let previousToken = decodedStep == 0 ? expectedSeedToken : expectedDecodeTokens[decodedStep - 1]
                 logits = try DeepSeekModel.logits(
                     inputIDs: inputIDsArray([previousToken]),
                     weightCache: weightCache,
@@ -296,14 +285,8 @@ extension DeepSeekRuntime {
                     positionOffset: testCase.promptTokens.count + decodedStep
                 )
                 actualToken = try DeepSeekCorrectness.greedyToken(from: logits)
-                let expectedToken = testCase.expectedTokens[decodedStep + 1]
-                if failureStep == nil,
-                   !correctnessTokenAccepted(
-                       expectedToken: expectedToken,
-                       actualToken: actualToken,
-                       topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits)
-                   )
-                {
+                let expectedToken = expectedDecodeTokens[decodedStep]
+                if failureStep == nil, actualToken != expectedToken {
                     failureStep = repeatIndex * checkedStepsPerPass + decodedStep + 2
                     failureExpected = expectedToken
                     failureActual = actualToken
@@ -388,12 +371,13 @@ extension DeepSeekRuntime {
         var failureActual: Int?
         let checkedStepsPerPass = decodeSteps + 2
         let totalDecodeSteps = decodeSteps * timingRepeats
+        let expectedSeedToken = testCase.expectedTokens[0]
+        let expectedDecodeTokens = Array(testCase.expectedTokens.dropFirst().prefix(decodeSteps))
 
         for repeatIndex in 0..<timingRepeats {
             if timingRepeats > 1 {
                 progress?("\(modeName) checked pass \(repeatIndex + 1)/\(timingRepeats) start")
             }
-            let expectedSeedToken = testCase.expectedTokens[0]
             do {
                 let prefillWorker = try RuntimeWorkerClient(options: workerOptions, weightsPath: weightsPath)
                 defer {
@@ -442,13 +426,14 @@ extension DeepSeekRuntime {
             let statsBeforeDecode = response.expertStats
 
             for decodedStep in 0..<decodeSteps {
-                response = try decodeWorker.decodeStep(inputToken: testCase.expectedTokens[decodedStep])
+                let inputToken = decodedStep == 0 ? expectedSeedToken : expectedDecodeTokens[decodedStep - 1]
+                response = try decodeWorker.decodeStep(inputToken: inputToken)
                 latestStats = response.expertStats ?? latestStats
                 peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
                 guard let token = response.token else {
                     throw MLXFastError.invalidInput("runtime worker \(modeName) decode response missing token")
                 }
-                let expectedToken = testCase.expectedTokens[decodedStep + 1]
+                let expectedToken = expectedDecodeTokens[decodedStep]
                 if failureStep == nil, token != expectedToken {
                     failureStep = repeatIndex * checkedStepsPerPass + decodedStep + 2
                     failureExpected = expectedToken
