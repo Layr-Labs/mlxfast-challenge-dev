@@ -191,6 +191,77 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
 }
 
 @Test
+func parallelCorrectnessProbeWorkflowIsManualAndSecretFree() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/parallel-correctness-probe.yml",
+        encoding: .utf8
+    )
+    let slice = try String(
+        contentsOfFile: ".github/workflows/parallel-correctness-probe-slice.yml",
+        encoding: .utf8
+    )
+
+    #expect(workflow.contains("name: parallel-correctness-probe"))
+    #expect(workflow.contains("workflow_dispatch:"))
+    #expect(!workflow.contains("pull_request:"))
+    #expect(!workflow.contains("push:"))
+
+    // Three slice jobs, each calling the reusable slice workflow with a distinct
+    // machine name and step range, feeding combine-parallel-correctness.sh's
+    // machine2/machine3/machine4 convention.
+    #expect(workflow.contains("uses: ./.github/workflows/parallel-correctness-probe-slice.yml"))
+    #expect(workflow.contains("slice_name: machine2"))
+    #expect(workflow.contains("slice_name: machine3"))
+    #expect(workflow.contains("slice_name: machine4"))
+    #expect(workflow.contains("step_range: ${{ inputs.range_1 }}"))
+    #expect(workflow.contains("step_range: ${{ inputs.range_2 }}"))
+    #expect(workflow.contains("step_range: ${{ inputs.range_3 }}"))
+    #expect(workflow.contains("default: \"0-21\""))
+    #expect(workflow.contains("default: \"21-42\""))
+    #expect(workflow.contains("default: \"42-64\""))
+
+    // No real "machine 1" in this probe -- see the combine job's stand-in payload.
+    // Its weights hash must match a real slice's for the combiner's determinism
+    // tripwire to pass rather than being fabricated independently.
+    #expect(workflow.contains("cp machine2/weights.sha256 machine1/weights.sha256"))
+    #expect(workflow.contains(".github/scripts/combine-parallel-correctness.sh"))
+    #expect(workflow.contains("MLXFAST_CORRECTNESS_MACHINE_DIRS: \"machine2 machine3 machine4\""))
+
+    // Secret-free by design: no `environment:` gate, no R2/Anthropic secrets
+    // referenced anywhere in either file.
+    #expect(!workflow.contains("environment:"))
+    #expect(!workflow.contains("secrets."))
+    #expect(!workflow.contains("secrets: inherit"))
+    #expect(!slice.contains("R2_ACCESS_KEY_ID"))
+    #expect(!slice.contains("ORG_ANTHROPIC_API_KEY"))
+
+    // Uses the checked-in public correctness fixture only, never a hidden golden.
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
+    #expect(slice.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
+    #expect(!workflow.contains("correctness_golden.json"))
+    #expect(!slice.contains("correctness_golden.json"))
+
+    // The slice job actually exercises the fixes from the review: base-case-only
+    // (no gate pollution) and the range sidecar (real coverage verification).
+    #expect(slice.contains("--base-case-only"))
+    #expect(slice.contains("--step-range \"${{ inputs.step_range }}\""))
+    #expect(slice.contains("--step-range-output step-range.json"))
+    #expect(slice.contains(".github/scripts/hash-weights-directory.sh weights weights.sha256"))
+
+    // Action pins must be independently verified against the upstream repo, not
+    // guessed -- this repo pins by commit SHA specifically to prevent a mutated
+    // tag from silently changing what runs. Reuses the exact upload-artifact pin
+    // already vetted in benchmark.yml.
+    #expect(workflow.contains("actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd")) // v5
+    #expect(workflow.contains("actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53")) // v6.0.0
+    #expect(workflow.contains("actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f")) // v6.0.0
+    #expect(slice.contains("actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd")) // v5
+    #expect(slice.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")) // v6.1.0
+    #expect(slice.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")) // v6.1.0
+    #expect(slice.contains("actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f")) // v6.0.0
+}
+
+@Test
 func benchmarkWorkflowDefaultsToTrustedMainWithExplicitTestingEscapeHatch() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/benchmark.yml",

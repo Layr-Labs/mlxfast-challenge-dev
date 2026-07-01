@@ -1,0 +1,166 @@
+name: parallel-correctness-probe
+
+# Manual experiment for splitting the base teacher-forced correctness case across
+# multiple Blacksmith machines. This workflow is not part of CI or scoring; it
+# exists to validate --base-case-only / --step-range / --step-range-output /
+# combine-parallel-correctness.sh end to end on real infrastructure, not just the
+# local bash/xctest simulation. Each of the three slice jobs independently
+# downloads and transforms the full ~141 GiB reference checkpoint (no shared
+# cache between them yet -- see the parallelization plan's honest wall-clock
+# section on why that's a throughput lever, not a per-run latency one), so this
+# is expensive and deliberately dispatch-only.
+#
+# Scope: this validates ONLY the correctness-split mechanism (the part that's
+# actually built and tested), not the full multi-runner topology discussed
+# separately (GPQA/TTFT/timing on a dedicated machine). There is no real
+# "machine 1" here -- the combine job manufactures a trivial stand-in payload so
+# combine-parallel-correctness.sh has something to attach the real, combined
+# base-case verdict to. Uses the checked-in public correctness fixture only; no
+# private secrets, no hidden golden, no environment protection needed.
+on:
+  workflow_dispatch:
+    inputs:
+      range_1:
+        description: "Base-case step range for slice 1, as START-END (half-open)."
+        required: false
+        default: "0-21"
+        type: string
+      range_2:
+        description: "Base-case step range for slice 2, as START-END (half-open)."
+        required: false
+        default: "21-42"
+        type: string
+      range_3:
+        description: "Base-case step range for slice 3, as START-END (half-open)."
+        required: false
+        default: "42-64"
+        type: string
+      reference_download_jobs:
+        description: "Parallel shard downloads for setup.sh, per machine."
+        required: false
+        default: "12"
+        type: string
+      reference_min_free_gib:
+        description: "Minimum free GiB required before reference checkpoint download."
+        required: false
+        default: "170"
+        type: string
+
+concurrency:
+  group: parallel-correctness-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+  MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
+  MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
+  MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
+
+jobs:
+  correctness-slice-1:
+    name: "slice 1 (${{ inputs.range_1 }})"
+    uses: ./.github/workflows/parallel-correctness-probe-slice.yml
+    with:
+      slice_name: machine2
+      step_range: ${{ inputs.range_1 }}
+      reference_download_jobs: ${{ inputs.reference_download_jobs }}
+      reference_min_free_gib: ${{ inputs.reference_min_free_gib }}
+
+  correctness-slice-2:
+    name: "slice 2 (${{ inputs.range_2 }})"
+    uses: ./.github/workflows/parallel-correctness-probe-slice.yml
+    with:
+      slice_name: machine3
+      step_range: ${{ inputs.range_2 }}
+      reference_download_jobs: ${{ inputs.reference_download_jobs }}
+      reference_min_free_gib: ${{ inputs.reference_min_free_gib }}
+
+  correctness-slice-3:
+    name: "slice 3 (${{ inputs.range_3 }})"
+    uses: ./.github/workflows/parallel-correctness-probe-slice.yml
+    with:
+      slice_name: machine4
+      step_range: ${{ inputs.range_3 }}
+      reference_download_jobs: ${{ inputs.reference_download_jobs }}
+      reference_min_free_gib: ${{ inputs.reference_min_free_gib }}
+
+  combine:
+    name: combine
+    needs: [correctness-slice-1, correctness-slice-2, correctness-slice-3]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Download slice artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: parallel-correctness-probe-${{ github.run_id }}-*
+          path: slices
+          merge-multiple: false
+
+      - name: Assemble machine directories and stand-in machine1
+        run: |
+          set -euo pipefail
+          mkdir -p machine1 machine2 machine3 machine4
+          cp "slices/parallel-correctness-probe-${{ github.run_id }}-machine2/"* machine2/
+          cp "slices/parallel-correctness-probe-${{ github.run_id }}-machine3/"* machine3/
+          cp "slices/parallel-correctness-probe-${{ github.run_id }}-machine4/"* machine4/
+
+          # No real "machine 1" in this probe -- see the workflow header comment.
+          # Its weights hash must match the real slices' (they all transformed the
+          # same reference checkpoint) so the combiner's determinism tripwire
+          # passes; borrow slice 1's since it's a real, independently-computed hash.
+          cp machine2/weights.sha256 machine1/weights.sha256
+          cat > machine1/score.json <<'EOF'
+          {
+            "score": null,
+            "passed": true,
+            "metrics": {
+              "passed_correctness": true,
+              "checked_steps": 0,
+              "case_count": 1,
+              "first_failing_case": null,
+              "first_failing_step": null
+            }
+          }
+          EOF
+
+      - name: Combine
+        env:
+          # MLXFAST_EXPECTED_CORRECTNESS_STEPS is inherited from the workflow-level
+          # env: block above.
+          MLXFAST_CORRECTNESS_MACHINE_DIRS: "machine2 machine3 machine4"
+          MLXFAST_COMBINED_SCORE_PATH: score.combined.json
+        run: .github/scripts/combine-parallel-correctness.sh
+
+      - name: Probe summary
+        if: always()
+        run: |
+          {
+            echo "## Parallel Correctness Probe"
+            echo ""
+            echo "- ranges: \`${{ inputs.range_1 }}\`, \`${{ inputs.range_2 }}\`, \`${{ inputs.range_3 }}\`"
+            if [[ -s score.combined.json ]]; then
+              echo "- combined passed: \`$(jq -r '.passed' score.combined.json)\`"
+              echo "- combined checked_steps: \`$(jq -r '.metrics.checked_steps' score.combined.json)\`"
+              echo "- first_failing_case: \`$(jq -r '.metrics.first_failing_case // "none"' score.combined.json)\`"
+            else
+              echo "- combiner did not produce ${MLXFAST_COMBINED_SCORE_PATH:-score.combined.json}"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload combined result
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: parallel-correctness-probe-${{ github.run_id }}-combined
+          path: score.combined.json
+          if-no-files-found: warn
+          retention-days: 7

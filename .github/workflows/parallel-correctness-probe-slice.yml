@@ -1,0 +1,113 @@
+name: parallel-correctness-probe-slice
+
+# Reusable job body for parallel-correctness-probe.yml: one machine independently
+# downloads and transforms the reference checkpoint, then checks a single
+# --step-range slice of the checked-in public correctness case with
+# --base-case-only, and uploads its report + assigned range + weights hash for
+# the probe's combine job to verify and merge. Not meant to be dispatched on its
+# own.
+on:
+  workflow_call:
+    inputs:
+      slice_name:
+        required: true
+        type: string
+      step_range:
+        required: true
+        type: string
+      reference_download_jobs:
+        required: true
+        type: string
+      reference_min_free_gib:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  slice:
+    runs-on: blacksmith-12vcpu-macos-26
+    timeout-minutes: 360
+    env:
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
+      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Restore SwiftPM cache
+        id: restore_swiftpm_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        env:
+          MLXFAST_REFERENCE_BASE_URL: ${{ secrets.MLXFAST_REFERENCE_BASE_URL || 'https://ds4.darkbloom.ai/deepseek-v4-flash-4bit' }}
+          MLXFAST_REFERENCE_AUTH_HEADER: ${{ secrets.MLXFAST_REFERENCE_AUTH_HEADER }}
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
+          MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+        run: ./setup.sh
+
+      - name: Save SwiftPM cache
+        if: ${{ steps.restore_swiftpm_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: ${{ steps.restore_swiftpm_cache.outputs.cache-primary-key }}
+
+      - name: Transform reference checkpoint
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" \
+            --output weights
+
+      - name: Hash transformed weights
+        run: .github/scripts/hash-weights-directory.sh weights weights.sha256
+
+      - name: Check correctness slice
+        id: correctness
+        run: |
+          set -euo pipefail
+          status=0
+          .build/release/mlxfast-swift correctness \
+            --weights weights \
+            --golden "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" \
+            --base-case-only \
+            --step-range "${{ inputs.step_range }}" \
+            --step-range-output step-range.json \
+            > correctness-report.json || status=$?
+          cat correctness-report.json
+          cat step-range.json
+          exit "${status}"
+
+      - name: Upload slice artifact
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: parallel-correctness-probe-${{ github.run_id }}-${{ inputs.slice_name }}
+          path: |
+            correctness-report.json
+            step-range.json
+            weights.sha256
+          if-no-files-found: error
+          retention-days: 7

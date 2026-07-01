@@ -20,7 +20,9 @@ set -euo pipefail
 : "${MLXFAST_COMBINED_SCORE_PATH:=score.combined.json}"
 
 MACHINE1_DIR="${MLXFAST_MACHINE1_DIR:-machine1}"
-CORRECTNESS_MACHINE_DIRS=(${MLXFAST_CORRECTNESS_MACHINE_DIRS:-machine2 machine3 machine4})
+# read -a splits on whitespace without also glob-expanding the result, unlike an
+# unquoted array assignment.
+read -ra CORRECTNESS_MACHINE_DIRS <<< "${MLXFAST_CORRECTNESS_MACHINE_DIRS:-machine2 machine3 machine4}"
 
 require_file() {
   local path="$1"
