@@ -1,6 +1,7 @@
 public enum MLXFastConstants {
     public static let referenceModelName = "DeepSeek-V4-Flash-4bit"
     public static let defaultReferencePath = "reference_weights/DeepSeek-V4-Flash-4bit"
+    public static let defaultReferenceCachePath = ".cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main"
     public static let defaultWeightsPath = "weights"
     public static let defaultGoldenPath = "correctness_golden.json"
     public static let defaultPublicCorrectnessPromptPath = "correctness_prompts/public_longcopy_gate_english_512.txt"

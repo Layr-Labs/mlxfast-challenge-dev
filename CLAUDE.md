@@ -73,7 +73,6 @@ They are trusted harness/operator code and are not packaged by submit:
 - `Sources/MLXFastCore/`
 - `Sources/MLXFastHarness/`
 - `Sources/MLXFastCLI/`
-- `Sources/MLXFastSubmission/`
 - `.github/`, scripts, tests, docs, `benchmark.json`
 - `weights/`, reference checkpoints, scores, golden files, local caches
 
@@ -83,8 +82,9 @@ official runner uses private artifacts, sandboxed runtime workers, artifact
 validation, trusted workflow code, and static review gates. Hidden prompts and
 goldens are not part of the public repo or submission payload.
 
-Python is not part of the challenge runtime. Setup, transform, correctness,
-benchmark, and submit all go through the Swift package.
+Python is not part of the challenge runtime. Setup, transform, correctness, and
+benchmark run through the Swift package. Account login, clone, and submission
+use the Yukon CLI (`mlxfast`).
 
 ## Correctness Gates
 
@@ -99,7 +99,7 @@ The official correctness stack includes:
 
 - Teacher-forced token checks on 512-token prompt cases.
 - Hidden behavior checks, including GPQA-style prompts.
-- Short exact-token GPQA prefix checks calibrated on the official runner.
+- Short exact-token GPQA prefix checks from the private reference fixture.
 - Semantic GPQA judging through a private judge path.
 - TTFT guardrails for hidden GPQA first-token behavior.
 - Benchmark oracle checks for the timed prefill/decode prompt.
@@ -183,13 +183,13 @@ change touches MLX runtime behavior and the machine can run those tests.
 
 ## Submission Workflow
 
-Use Yukon/Darkbloom submit commands through the Swift CLI:
+Use Yukon/Darkbloom submit commands through the Yukon CLI:
 
 ```bash
-.build/release/mlxfast-swift login <api-key> --api <url>
-.build/release/mlxfast-swift link <benchmark-id-or-name>
-.build/release/mlxfast-swift submit --dry-run --output mlxfast-submission.zip
-.build/release/mlxfast-swift submit <benchmark-id-or-name> --note "describe optimization"
+mlxfast login <api-key> --api <url>
+mlxfast clone <benchmark-id-or-name>
+mlxfast submit --model "<model name>" --note "describe optimization"
+mlxfast submissions
 ```
 
 Submit packages only `editablePaths`. It rejects generated artifacts, symlinks,
@@ -261,7 +261,6 @@ swift test
 ./setup.sh
 .build/release/mlxfast-swift correctness --weights weights
 ./benchmark.sh --local-submit
-.build/release/mlxfast-swift submit --dry-run --output mlxfast-submission.zip
 ```
 
 If the local correctness gate fails, the official benchmark will not rank the

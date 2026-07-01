@@ -101,14 +101,11 @@ Full benchmark runs also require the private R2
 `correctness_prompts/gpqa_reference_cases.json` object. The workflow tokenizes
 5 token-budget-valid hidden GPQA multiple-choice prompts locally and attaches
 them as short-answer behavior gates before correctness runs. Each private GPQA
-case must include reference-calibrated `accepted_token_sequences` or
-`accepted_responses`; GPQA answer keys are metadata, not an exact-token oracle.
-Generate those accepted token sequences on the official runner with
-`mlxfast-swift calibrate-gpqa-gates --gpqa PATH --weights weights --tokenizer weights --output PATH`.
-Calibration is cumulative: rerunning it appends and deduplicates the
-runner-observed token sequence instead of replacing older accepted sequences.
+case must include precomputed reference `accepted_token_sequences` or
+`accepted_responses`; GPQA answer keys are metadata, not an exact-token oracle,
+and the benchmark workflow never regenerates this reference object.
 The official workflow checks the first generated GPQA answer token for each
-case, using the stable prefix of any longer calibrated reference sequence.
+case, using the stable prefix of any longer precomputed reference sequence.
 During that hidden behavior correctness pass, it also records TTFT by timing
 prompt prefill through the first greedy answer token. The uploaded score records
 only aggregate TTFT counts and timings; generated first-token IDs, accepted
@@ -121,10 +118,6 @@ candidate answers, and judge text stay in the private runner directory.
 The private workflow treats semantic GPQA as a hard gate with a 3/5 threshold,
 calibrated to the unmodified DeepSeek V4 Flash baseline rather than to
 better-than-baseline GPQA answer quality.
-Because the one-token GPQA behavior gate is exact-token based, calibrate that
-layer on the official Blacksmith runner with the manual
-`calibrate_gpqa_reference` workflow input; M-series local calibration can differ
-from the official runner even at temperature zero.
 If none of those is configured, a full benchmark fails; it will not use a
 committed prompt, committed golden, or Actions cache fallback for ranked
 scoring. Final hidden goldens should come from protected storage. Private
@@ -313,10 +306,10 @@ that generator is `bcc9438fabf95a9b371d5749dd64f2f5ccc60fd5`.
 
 Each base correctness prompt must contain exactly 512 token IDs. The benchmark
 prompt must contain at least 512 token IDs. The precomputed golden file stores
-exact expected tokens for each 512-token correctness prompt and its 256-token
-greedy continuation, the 512-token prefill check, the 512-token decode seed, and
-at least 128 tokens for the timed decode window. During correctness, the harness
-checks the first 64 public continuation positions by default, plus hidden
+exact expected tokens for each 512-token correctness prompt continuation, the
+512-token prefill check, the 512-token decode seed, and at least 128 tokens for
+the timed decode window. During correctness, the harness checks the first 64
+public continuation positions by default, plus hidden
 behavior gates in official benchmark runs. It checks those continuation
 positions teacher-forced: after each accepted step it feeds the
 golden previous token back into the model. This keeps the gate stable across

@@ -19,7 +19,7 @@ The benchmark entrypoint:
 3. Runs the correctness gate against `correctness_golden.json`.
 4. Validates the benchmark prefill/decode tokens against the hidden benchmark
    oracle in `correctness_golden.json`.
-5. Measures prefill latency, 128-step greedy decode latency, MLX peak memory, and
+5. Measures prefill latency, 128-token checked decode latency, MLX peak memory, and
    expert-streaming read-byte diagnostics.
 6. Writes `score.json` in the Darkbloom-compatible schema, plus
    `score.json.sha256` and `benchmark-integrity.json` audit sidecars.
@@ -154,11 +154,11 @@ There is no Python harness path.
 ## Correctness Gate
 
 Correctness is a hard gate. Each base golden case contains exactly 512 prompt
-token IDs and 256 expected continuation token IDs. The harness checks those
-continuation positions teacher-forced with temperature-zero behavior: after each
-accepted step it feeds the golden previous token back into the model. The first
-mismatch records only the case, step, expected token, and actual token in the
-failed report.
+token IDs and at least 64 expected continuation token IDs. The harness checks
+the first 64 continuation positions teacher-forced with temperature-zero
+behavior: after each accepted step it feeds the golden previous token back into
+the model. The first mismatch records only the case, step, expected token, and
+actual token in the failed report.
 
 The gate is intended as a first-stage filter: an implementation that fails it is
 not eligible for the longer benchmark.
@@ -206,7 +206,7 @@ changes to score those paths.
 
 The hidden golden file also includes a benchmark oracle. The benchmark validates
 the greedy token after the fixed 512-token prefill prompt, the greedy token
-after the fixed 512-token decode seed, and all 256 tokens produced inside the
+after the fixed 512-token decode seed, and all 128 tokens produced inside the
 timed decode window before accepting a score.
 
 ## Score
@@ -228,14 +228,15 @@ prefill_speedup >= 0.95
 ```
 
 With the current Blacksmith M4 baseline, those floors allow at most
-`3.177180971604` seconds/token for decode and `0.149183255724` seconds/token for
-prefill. A run below either floor fails eligibility even if the weighted score
-would otherwise be above baseline.
+`4.442638496439145` seconds/token for decode and `0.18242698079358555`
+seconds/token for prefill. A run below either floor fails eligibility even if
+the weighted score would otherwise be above baseline.
 
-`bandwidth_GB_per_token` is derived from measured expert-streaming file bytes
-during the decode window and is reported with
-`bandwidth_source=expert_streaming_reads`. Bandwidth, RAM, and expert-read
-metrics are diagnostics and guardrail candidates, not primary score factors.
+`bandwidth_gb_per_token` is derived from trusted-core expert slot-bank file
+bytes during the decode window and is reported with
+`bandwidth_source=trusted_core_expert_slot_bank_reads`. Bandwidth, RAM, and
+expert-read metrics are diagnostics and guardrail candidates, not primary score
+factors.
 `score.json` also carries audit-only wall-clock phase timings, final process RSS,
 expert streaming counters, and transformed-weights digest fields. These values
 help operators review runs but do not change the score formula.

@@ -1,4 +1,5 @@
 import Foundation
+@testable import MLXFastCore
 import Testing
 
 @Test
@@ -38,6 +39,39 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("setup.sh: setup complete elapsed="))
     #expect(setup.contains("MLXFAST_OFFLINE_WRITABLE_PATHS=\"${PWD}/weights\" .github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference \"${REFERENCE_DIR}\" --output weights"))
     #expect(setup.contains("${SWIFT_BIN} correctness --weights weights"))
+}
+
+@Test
+func rulesDocsQuoteCurrentSpeedupFloorLimits() throws {
+    let readme = try String(contentsOfFile: "README.md", encoding: .utf8)
+    let challenge = try String(contentsOfFile: "CHALLENGE.md", encoding: .utf8)
+    let maxDecodeSeconds = MLXFastConstants.officialBaselineDecodeSecondsPerToken
+        / MLXFastConstants.scoreDecodeSpeedupFloor
+    let maxPrefillSeconds = MLXFastConstants.officialBaselinePrefillSecondsPerToken
+        / MLXFastConstants.scorePrefillSpeedupFloor
+    let decodeText = "\(maxDecodeSeconds)"
+    let prefillText = "\(maxPrefillSeconds)"
+
+    for document in [readme, challenge] {
+        #expect(document.contains("decode_speedup >= \(MLXFastConstants.scoreDecodeSpeedupFloor)"))
+        #expect(document.contains("prefill_speedup >= \(MLXFastConstants.scorePrefillSpeedupFloor)"))
+        #expect(document.contains(decodeText))
+        #expect(document.contains(prefillText))
+        #expect(document.contains("\(MLXFastConstants.correctnessSteps)"))
+        #expect(document.contains("\(MLXFastConstants.benchmarkDecodeSteps)"))
+        #expect(!document.contains("3.177180971604"))
+        #expect(!document.contains("0.149183255724"))
+        #expect(!document.contains("256-step greedy decode latency"))
+        #expect(!document.contains("256 expected continuation token IDs"))
+        #expect(!document.contains("all 256 tokens produced"))
+        #expect(!document.contains("256-token greedy continuation"))
+    }
+    #expect(readme.contains("bandwidth_source=trusted_core_expert_slot_bank_reads"))
+    #expect(readme.contains("bandwidth_gb_per_token"))
+    #expect(challenge.contains("bandwidth_source=trusted_core_expert_slot_bank_reads"))
+    #expect(challenge.contains("bandwidth_gb_per_token"))
+    #expect(!challenge.contains("bandwidth_source=expert_streaming_reads"))
+    #expect(!challenge.contains("bandwidth_GB_per_token"))
 }
 
 @Test
@@ -236,12 +270,12 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MIN_PASS: \"3\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_REQUIRED: \"1\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929"))
-    #expect(workflow.contains("calibrate_gpqa_reference:"))
-    #expect(workflow.contains("MLXFAST_CALIBRATE_GPQA_REFERENCE: ${{ inputs.calibrate_gpqa_reference && '1' || '0' }}"))
-    #expect(workflow.contains("mlxfast-swift calibrate-gpqa-gates"))
-    #expect(workflow.contains("mlxfast-gpqa-calibration-private.log"))
-    #expect(workflow.contains(".github/scripts/upload-r2-object.sh"))
-    #expect(workflow.contains("uploaded calibrated GPQA reference cases to private R2"))
+    #expect(!workflow.contains("calibrate_gpqa_reference"))
+    #expect(!workflow.contains("MLXFAST_CALIBRATE_GPQA_REFERENCE"))
+    #expect(!workflow.contains("mlxfast-swift calibrate-gpqa-gates"))
+    #expect(!workflow.contains("mlxfast-gpqa-calibration-private.log"))
+    #expect(!workflow.contains(".github/scripts/upload-r2-object.sh"))
+    #expect(!workflow.contains("uploaded calibrated GPQA reference cases to private R2"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 830670206859a1b221508ae44a031205a3eba6f5f13e05b40383bf781bdbf067"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: \"26110\""))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_STEPS: \"64\""))
@@ -254,7 +288,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     let goldenSourceRange = try #require(workflow.range(of: "- name: Check correctness golden source"))
     #expect(overlayRange.lowerBound < staticReviewRange.lowerBound)
     #expect(staticReviewRange.lowerBound < goldenSourceRange.lowerBound)
-    #expect(workflow.contains("if: inputs.submission_ref != '' && !inputs.calibrate_gpqa_reference"))
+    #expect(workflow.contains("if: inputs.submission_ref != ''"))
     #expect(workflow.contains(".github/scripts/run-submission-static-review.sh"))
     #expect(workflow.contains("mlxfast-swift attach-gpqa-gates"))
     #expect(workflow.contains("--case-count \"${MLXFAST_GPQA_CASE_COUNT}\""))
@@ -276,7 +310,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("steps.validate_benchmark_artifacts.outcome == 'success'"))
     #expect(!workflow.contains("hashFiles('score.json') != '' && hashFiles('score.json.sha256') != '' && hashFiles('benchmark-integrity.json') != ''"))
     #expect(workflow.contains(".github/scripts/stage-benchmark-artifacts.sh"))
-    #expect(workflow.contains("inputs.run_benchmark && !inputs.calibrate_gpqa_reference"))
+    #expect(workflow.contains("inputs.run_benchmark"))
     #expect(workflow.contains("golden.sha256=\"${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256\""))
     #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results"))
     #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/correctness-results"))
@@ -362,14 +396,14 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
 
     #expect(package.contains(".product(name: \"Tokenizers\", package: \"swift-transformers\")"))
     #expect(cli.contains("case \"attach-gpqa-gates\""))
-    #expect(cli.contains("case \"calibrate-gpqa-gates\""))
+    #expect(!cli.contains("case \"calibrate-gpqa-gates\""))
     #expect(cli.contains("case \"generate-gpqa-answers\""))
     #expect(!cli.contains("case \"measure-gpqa-ttft\""))
     #expect(cli.contains("AutoTokenizer.from(modelFolder: modelFolder, strict: false)"))
     #expect(cli.contains("acceptedReferenceTokenSequences"))
     #expect(cli.contains("DeepSeekRuntime.generateGreedyTokens"))
     #expect(cli.contains("runtimeWorkerOptions(blockedGoldenPath: gpqaPath)"))
-    #expect(cli.contains("calibrated_reference_outputs"))
+    #expect(!cli.contains("calibrated_reference_outputs"))
     #expect(cli.contains("SemanticGPQAAnswerDocument"))
     #expect(cli.contains("referenceAnswer(for: testCase)"))
     #expect(cli.contains("generate-gpqa-answers requires --output or MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH"))
@@ -378,7 +412,7 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(!cli.contains("FirstTokenTimingOptions(weightsPath: weightsPath, promptTokenSets: selectedPrompts)"))
     #expect(cli.contains("[\"\\(normalizedKey).\", \"\\(normalizedKey):\", \"\\(normalizedKey))\"]"))
     #expect(!cli.contains("[\"\\(normalizedKey).\", \"\\(normalizedKey):\", \"\\(normalizedKey))\", \"\\(normalizedKey)\"]"))
-    #expect(cli.contains("existingSequences + [generated]"))
+    #expect(!cli.contains("existingSequences + [generated]"))
     #expect(!cli.contains("accepted_sequences="))
     #expect(cli.contains("accepted_token_sequences or accepted_responses generated from the reference model"))
     #expect(cli.contains("sequence.prefix(maxNewTokens)"))

@@ -276,5 +276,5 @@ public struct RuntimeWorkerOptions: Equatable {
     }
 }
 
-// Implementation lives in DeepSeekRuntime+*.swift and DeepSeekRuntime{Worker,Support}.swift.
+// Implementation lives in the DeepSeekRuntime*.swift split files.
 public enum DeepSeekRuntime {}
