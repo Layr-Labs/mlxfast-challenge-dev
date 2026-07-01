@@ -879,6 +879,45 @@ func correctnessBaseCaseOnlySkipsGatesAndReportsBaseCaseCountAlone() throws {
     #expect(cli.contains("[--base-case-only]"))
 }
 
+// Regression test for a bug caught only by a real dispatch (not reproducible
+// locally without a live worker + real weights, hence a source-text check
+// rather than a behavioral one -- see BenchmarkOptions.checkGates/
+// skipTimedBenchmark for the harness-level design these fields support):
+// a "timing-only" machine (checkGates: false, so the behavior-gate loop that
+// captures semantic GPQA answers never runs) still built a non-nil
+// SemanticGPQACaptureOptions whenever MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH was
+// set, and then unconditionally required semanticAnswers.count to equal
+// caseCount -- turning a correct, nothing-to-capture timing-only run into a
+// hard failure ("captured 0 semantic GPQA answers; expected 5").
+@Test
+func benchmarkSplitsGatesAndTimingOntoSeparateMachinesWithoutSpuriousSemanticCaptureFailure() throws {
+    let runtime = try harnessRuntimeSource()
+
+    #expect(runtime.contains("public let checkGates: Bool"))
+    #expect(runtime.contains("public let skipTimedBenchmark: Bool"))
+    #expect(runtime.contains("checkGates: Bool = true,"))
+    #expect(runtime.contains("skipTimedBenchmark: Bool = false"))
+    #expect(runtime.contains("guard options.checkGates || !options.skipTimedBenchmark else {"))
+
+    // The fix: the semantic-capture count guard must not fire when checkGates
+    // is false, since nothing was ever captured to check.
+    #expect(runtime.contains("if checkGates, let semanticCapture {"))
+    #expect(!runtime.contains("if let semanticCapture {\n                guard semanticAnswers.count == semanticCapture.caseCount else {"))
+
+    // Placeholder timing values for a gates-only machine must be the official
+    // baseline exactly (speedup == 1.0, always finite) -- 0 would divide-by-
+    // zero into +Infinity in BenchmarkScore.speedup, and Double.infinity fails
+    // JSON encoding outright.
+    #expect(runtime.contains("prefillSecondsPerToken = MLXFastConstants.officialBaselinePrefillSecondsPerToken"))
+    #expect(runtime.contains("secondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,"))
+
+    let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
+    #expect(cli.contains("MLXFAST_BENCHMARK_CHECK_GATES"))
+    #expect(cli.contains("MLXFAST_BENCHMARK_SKIP_TIMED"))
+    #expect(cli.contains("checkGates: checkGates,"))
+    #expect(cli.contains("skipTimedBenchmark: skipTimedBenchmark"))
+}
+
 // Regression test for a review finding: the combiner needs to know which
 // ABSOLUTE range each machine actually checked, not just how many steps it
 // checked, to detect overlapping/gapped range assignments. --step-range-output
