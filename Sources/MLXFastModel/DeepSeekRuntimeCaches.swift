@@ -33,6 +33,33 @@ final class LockedCache<Key: Hashable, Value>: @unchecked Sendable {
         lock.unlock()
         return value
     }
+
+    func peek(_ key: Key) -> Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage[key]
+    }
+}
+
+/// Hardware kernel-parity verdicts, computed once per process in untimed
+/// init: a candidate kernel path (gatherQuantizedMM expert slabs) is enabled
+/// only after producing bit-identical outputs to the incumbent per-expert
+/// path on REAL weights and deterministic inputs at the exact runtime
+/// shapes, ON THIS MACHINE. Kernel dispatch depends on shapes/dtypes, not
+/// values, so bitwise equality at the runtime shapes proves the kernel pair
+/// identical for all inputs; hardware where selection differs keeps the
+/// incumbent path. This makes kernel-family optimizations safe under the
+/// benchmark's hard-equality decode window.
+public enum DeepSeekKernelParity {
+    private static let verdicts = LockedCache<String, Bool>()
+
+    public static func verifyGatherSlabs(key: String, probe: () -> Bool) -> Bool {
+        verdicts.value(for: "gather-slabs|\(key)", make: probe)
+    }
+
+    public static func gatherSlabsVerified(key: String) -> Bool {
+        verdicts.peek("gather-slabs|\(key)") == true
+    }
 }
 
 /// Process-wide cache for causal attention masks.
@@ -75,6 +102,25 @@ public enum DeepSeekMaskCache {
                 keyOffset: keyOffset,
                 windowSize: windowSize
             )
+        }
+    }
+}
+
+/// Cached index arrays for expert-slab gather matmuls: decode reuses the same
+/// zeros(k)/0..<k selectors every layer every token, so upload them once.
+public enum DeepSeekGatherIndexCache {
+    private static let zerosCache = LockedCache<Int, MLXArray>()
+    private static let sequenceCache = LockedCache<Int, MLXArray>()
+
+    public static func zeros(_ count: Int) -> MLXArray {
+        zerosCache.value(for: count) {
+            MLXArray([Int32](repeating: 0, count: count))
+        }
+    }
+
+    public static func sequence(_ count: Int) -> MLXArray {
+        sequenceCache.value(for: count) {
+            MLXArray((0..<count).map(Int32.init))
         }
     }
 }

@@ -23,12 +23,29 @@ public final class ExpertPrefetcher {
     private let expertBank: ExpertSlotBank
     private let referenceBaseURL: URL
     private let enabled: Bool
+    private let isRecordResident: ((String) -> Bool)?
     private let queue = DispatchQueue(label: "mlxfast.expert.prefetch", qos: .userInitiated)
     private var fdsByShard: [String: Int32] = [:]  // accessed only on `queue`
+    // Warming pool: advisories alone depend on the kernel honoring
+    // F_RDADVISE, which virtualized runners may not. Four bounded reader
+    // threads issue real preads of the advised ranges into throwaway
+    // buffers, forcing the pages into the unified buffer cache at queue
+    // depth >1 so the trusted bank's subsequent demand preads hit RAM. The
+    // bank stays the sole reader-of-record; metrics are untouched.
+    private let warmQueue = DispatchQueue(
+        label: "mlxfast.expert.prefetch.warm",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+    private let warmSlots = DispatchSemaphore(value: 4)
+    private let warmFDLock = NSLock()
+    private var warmFDsByShard: [String: Int32] = [:]  // guarded by warmFDLock
+    private static let maxWarmBytes = 16 << 20
 
     public init(
         expertBank: ExpertSlotBank,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        isRecordResident: ((String) -> Bool)? = nil
     ) {
         self.expertBank = expertBank
         // Mirrors ExpertSlotBank's referenceBaseURL construction so advisories
@@ -39,6 +56,7 @@ public final class ExpertPrefetcher {
         self.enabled = environment["MLXFAST_EXPERT_PREFETCH"].map {
             !["0", "false", "no", "off"].contains($0.lowercased())
         } ?? true
+        self.isRecordResident = isRecordResident
     }
 
     deinit {
@@ -48,6 +66,12 @@ public final class ExpertPrefetcher {
                 close(fd)
             }
         }
+        warmFDLock.lock()
+        for fd in warmFDsByShard.values {
+            close(fd)
+        }
+        warmFDsByShard.removeAll()
+        warmFDLock.unlock()
     }
 
     /// Call on the model thread right after routing indices materialize.
@@ -79,6 +103,7 @@ public final class ExpertPrefetcher {
         queue.async { [weak self] in
             self?.advise(ranges)
         }
+        warm(ranges)
     }
 
     // MARK: - Range resolution (model thread)
@@ -106,12 +131,17 @@ public final class ExpertPrefetcher {
             }
             let isStacked = record.shape.count == projection.expectedRank + 1
                 && record.shape.first.map { expertIndex < $0 } == true
-            append(record: record, expertIndex: expertIndex, sliced: isStacked, into: &ranges)
+            // RAM-resident tensors (pinned codes, resident scales) are never
+            // read from disk, so advising or warming their ranges is waste.
+            if isRecordResident?(candidate) != true {
+                append(record: record, expertIndex: expertIndex, sliced: isStacked, into: &ranges)
+            }
             // Companion tensors are read only for quantized (U32) weights.
             if record.dtype == "U32" {
                 for suffix in ["scales", "biases"] {
                     let companion = companionName(for: candidate, suffix: suffix)
-                    if let companionRecord = expertBank.record(named: companion) {
+                    if isRecordResident?(companion) != true,
+                       let companionRecord = expertBank.record(named: companion) {
                         append(
                             record: companionRecord,
                             expertIndex: expertIndex,
@@ -164,6 +194,47 @@ public final class ExpertPrefetcher {
             return String(weightName.dropLast(".weight".count)) + ".\(suffix)"
         }
         return "\(weightName).\(suffix)"
+    }
+
+    // MARK: - Warming preads (bounded concurrent pool)
+
+    private func warm(_ ranges: [ByteRange]) {
+        for range in ranges where range.length > 0 && range.length <= Self.maxWarmBytes {
+            warmQueue.async { [weak self] in
+                guard let self else { return }
+                self.warmSlots.wait()
+                defer { self.warmSlots.signal() }
+                guard let fd = self.warmDescriptor(forShard: range.shard) else { return }
+                let buffer = UnsafeMutableRawPointer.allocate(
+                    byteCount: range.length,
+                    alignment: 16384
+                )
+                defer { buffer.deallocate() }
+                _ = pread(fd, buffer, range.length, off_t(range.offset))  // best effort
+            }
+        }
+    }
+
+    private func warmDescriptor(forShard shard: String) -> Int32? {
+        warmFDLock.lock()
+        defer { warmFDLock.unlock() }
+        if let fd = warmFDsByShard[shard] {
+            return fd
+        }
+        let shardURL = referenceBaseURL
+            .appendingPathComponent(shard)
+            .standardizedFileURL
+        let fd = open(shardURL.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else {
+            return nil
+        }
+        var status = stat()
+        guard fstat(fd, &status) == 0, (status.st_mode & S_IFMT) == S_IFREG else {
+            close(fd)
+            return nil
+        }
+        warmFDsByShard[shard] = fd
+        return fd
     }
 
     // MARK: - Advisory syscalls (serial queue only)

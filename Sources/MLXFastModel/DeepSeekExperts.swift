@@ -94,6 +94,29 @@ public enum DeepSeekRoutedExperts {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
         }
 
+        // Decode fast path: batch the token's routed experts into slabs and
+        // run one gatherQuantizedMM per projection (3 dispatches instead of
+        // 18). Slab rows follow routing order, so the output layout matches
+        // the grouped path's inverse-gather result exactly. The path is
+        // enabled ONLY on hardware where untimed init proved the gather
+        // kernel bit-identical to per-expert quantizedMM at these exact
+        // shapes (see DeepSeekKernelParity) — everywhere else the loop path
+        // below runs unchanged.
+        if tokenCount == 1,
+           DeepSeekKernelParity.gatherSlabsVerified(
+               key: loader.expertBank.manifest.referencePath
+           ),
+           let slabOutput = try slabForward(
+               x: x,
+               selectedExperts: selectedExperts,
+               loader: loader,
+               spec: spec,
+               topK: topK
+           )
+        {
+            return slabOutput
+        }
+
         // Group activation flat-indices by expert so each expert runs one batched
         // matmul over all of its tokens instead of one matmul per token.
         var flatIndicesByExpert: [Int: [Int]] = [:]
@@ -143,6 +166,117 @@ public enum DeepSeekRoutedExperts {
         let ordered = combined.take(MLXArray(inverse), axis: 0)
 
         return ordered.reshaped([batchSize, sequenceLength, topK, hiddenSize])
+    }
+
+    /// Untimed-init parity probe: computes one synthetic decode token through
+    /// BOTH the slab gather path and the per-expert loop with real weights at
+    /// the exact runtime shapes, and demands bitwise-equal outputs. Kernel
+    /// dispatch depends on shapes/dtypes, not values, so equality here proves
+    /// the kernel pair identical for every input on this machine. Returns
+    /// false — keeping the loop path — when slabs are unavailable or any bit
+    /// differs.
+    public static func gatherSlabParityHolds(
+        loader: DeepSeekWeightLoader,
+        spec: DeepSeekRoutedExpertSpec,
+        topK: Int
+    ) -> Bool {
+        guard topK > 0, spec.hiddenSize > 0 else {
+            return false
+        }
+        let values = (0..<spec.hiddenSize).map { Float(sin(Double($0) * 0.37 + 1.0)) }
+        let x = MLXArray(values).asType(.bfloat16).reshaped([1, 1, spec.hiddenSize])
+        let xFlat = x.reshaped([1, spec.hiddenSize])
+
+        var expertSets = [Array(0..<topK)]
+        if topK >= 3 {
+            expertSets.append(Array((0..<topK).reversed()))
+        }
+        for experts in expertSets {
+            guard let slab = try? slabForward(
+                x: x,
+                selectedExperts: experts,
+                loader: loader,
+                spec: spec,
+                topK: topK
+            ) else {
+                return false
+            }
+            var rows: [MLXArray] = []
+            rows.reserveCapacity(experts.count)
+            for expertIndex in experts {
+                guard let expertWeights = try? weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec
+                ) else {
+                    return false
+                }
+                rows.append(DeepSeekMLP.forward(
+                    xFlat,
+                    weights: expertWeights,
+                    swigluLimit: spec.swigluLimit
+                ))
+            }
+            let loop = concatenated(rows, axis: 0).reshaped([1, 1, topK, spec.hiddenSize])
+            guard arrayEqual(slab, loop).all().item(Bool.self) else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func slabForward(
+        x: MLXArray,
+        selectedExperts: [Int],
+        loader: DeepSeekWeightLoader,
+        spec: DeepSeekRoutedExpertSpec,
+        topK: Int
+    ) throws -> MLXArray? {
+        guard selectedExperts.count == topK else {
+            return nil
+        }
+        guard
+            let gateSlab = try loader.expertSlab(
+                layerIndex: spec.layerIndex,
+                expertIndices: selectedExperts,
+                projection: .gate,
+                expectedShape: [spec.intermediateSize, spec.hiddenSize]
+            ),
+            let upSlab = try loader.expertSlab(
+                layerIndex: spec.layerIndex,
+                expertIndices: selectedExperts,
+                projection: .up,
+                expectedShape: [spec.intermediateSize, spec.hiddenSize]
+            ),
+            let downSlab = try loader.expertSlab(
+                layerIndex: spec.layerIndex,
+                expertIndices: selectedExperts,
+                projection: .down,
+                expectedShape: [spec.hiddenSize, spec.intermediateSize]
+            )
+        else {
+            return nil
+        }
+
+        let sharedInput = DeepSeekGatherIndexCache.zeros(topK)
+        let perExpert = DeepSeekGatherIndexCache.sequence(topK)
+        let tokenRow = x.reshaped([1, 1, spec.hiddenSize])
+
+        let gate = DeepSeekOps.gatherLinear(
+            input: tokenRow, slab: gateSlab,
+            lhsIndices: sharedInput, rhsIndices: perExpert
+        )
+        let up = DeepSeekOps.gatherLinear(
+            input: tokenRow, slab: upSlab,
+            lhsIndices: sharedInput, rhsIndices: perExpert
+        )
+        let hidden = DeepSeekOps.limitedSwiGLU(gate: gate, up: up, limit: spec.swigluLimit)
+        let output = DeepSeekOps.gatherLinear(
+            input: hidden, slab: downSlab,
+            lhsIndices: perExpert, rhsIndices: perExpert
+        )
+        // [topK, 1, hidden] is row-contiguous, so this is a metadata reshape.
+        return output.reshaped([1, 1, topK, spec.hiddenSize])
     }
 
     public static func weights(

@@ -19,7 +19,27 @@ enum DeepSeekWarmup {
         let config = weightCache.config
         evalDerivedWeights(weightCache: weightCache)
         warmKernels(config: config)
+        verifyKernelParity(weightCache: weightCache)
         runThrowawayDecodeForward(weightCache: weightCache)
+    }
+
+    /// Decides, on this machine with real weights, whether the slab gather
+    /// path is bit-identical to the per-expert loop; the decode fast path is
+    /// enabled only on a positive verdict. Layer 0 is RAM-pinned on runner-
+    /// class machines, so the probe costs milliseconds of untimed init.
+    private static func verifyKernelParity(weightCache: DeepSeekRuntimeWeightCache) {
+        guard let moeSpec = try? weightCache.moeSpec(layerIndex: 0) else {
+            return
+        }
+        _ = DeepSeekKernelParity.verifyGatherSlabs(
+            key: weightCache.loader.expertBank.manifest.referencePath
+        ) {
+            DeepSeekRoutedExperts.gatherSlabParityHolds(
+                loader: weightCache.loader,
+                spec: moeSpec.routedExperts,
+                topK: weightCache.config.expertsPerToken
+            )
+        }
     }
 
     private static func evalDerivedWeights(weightCache: DeepSeekRuntimeWeightCache) {
