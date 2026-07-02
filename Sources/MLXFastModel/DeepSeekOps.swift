@@ -115,12 +115,26 @@ public enum DeepSeekOps {
         input * sigmoid(input)
     }
 
+    private static let compiledLimitedSwiGLUCache =
+        LockedCache<UInt32, @Sendable (MLXArray, MLXArray) -> MLXArray>()
+
     public static func limitedSwiGLU(gate: MLXArray, up: MLXArray, limit: Double) -> MLXArray {
         guard limit > 0 else {
             return silu(gate) * up
         }
-        let cappedGate = minimum(gate, Float(limit))
-        let clippedUp = clip(up, min: Float(-limit), max: Float(limit))
-        return silu(cappedGate) * clippedUp
+        // Fuse the SwiGLU elementwise chain (minimum, clip, sigmoid, muls) into
+        // one compiled kernel. Called ~once per active expert per layer
+        // (~300x/token), each otherwise ~5 tiny dispatches — a large per-token
+        // dispatch cut. Pure elementwise (no matmul/reshape) so shapeless
+        // compile is safe and value-identical; gated on the token signature.
+        let cappedLimit = Float(limit)
+        let fn = compiledLimitedSwiGLUCache.value(for: cappedLimit.bitPattern) {
+            compile(shapeless: true) { (gate: MLXArray, up: MLXArray) in
+                let cappedGate = minimum(gate, cappedLimit)
+                let clippedUp = clip(up, min: -cappedLimit, max: cappedLimit)
+                return (cappedGate * sigmoid(cappedGate)) * clippedUp
+            }
+        }
+        return fn(gate, up)
     }
 }
