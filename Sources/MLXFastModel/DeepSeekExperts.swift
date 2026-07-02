@@ -94,6 +94,41 @@ public enum DeepSeekRoutedExperts {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
         }
 
+        // Flatten the token axis once. Row (batch * sequenceLength + position)
+        // equals x[batch, position], so an activation flat index maps to token row
+        // flatIndex / topK. Gathering rows with a single `take` replaces the
+        // per-token slice+concat that built each expert batch previously.
+        let xFlat = x.reshaped([tokenCount, hiddenSize])
+
+        // Decode fast path: exactly one activation row shared across all
+        // topK slots. `argPartition` returns distinct expert indices so each
+        // top-k slot gets exactly one expert; the per-expert gather of a
+        // 1-row source is byte-identical to `xFlat`, the concatenated output
+        // is already in top-k slot order, and the final inverse take() is a
+        // no-op permutation. Bypassing all of that saves ~2*topK+1 Metal
+        // kernel launches per MoE layer per decode token without touching
+        // any tensor values or quantizedMM inputs.
+        if tokenCount == 1 {
+            var expertOutputs: [MLXArray] = []
+            expertOutputs.reserveCapacity(topK)
+            for expertIndex in selectedExperts {
+                let expertWeights = try weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec,
+                    preferStaged: useStaged
+                )
+                let expertOutput = DeepSeekMLP.forward(
+                    xFlat,
+                    weights: expertWeights,
+                    swigluLimit: spec.swigluLimit
+                )
+                expertOutputs.append(expertOutput)
+            }
+            let combined = concatenated(expertOutputs, axis: 0)
+            return combined.reshaped([batchSize, sequenceLength, topK, hiddenSize])
+        }
+
         // Group activation flat-indices by expert so each expert runs one batched
         // matmul over all of its tokens instead of one matmul per token.
         var flatIndicesByExpert: [Int: [Int]] = [:]
@@ -101,12 +136,6 @@ public enum DeepSeekRoutedExperts {
         for (flatIndex, expertIndex) in selectedExperts.enumerated() {
             flatIndicesByExpert[expertIndex, default: []].append(flatIndex)
         }
-
-        // Flatten the token axis once. Row (batch * sequenceLength + position)
-        // equals x[batch, position], so an activation flat index maps to token row
-        // flatIndex / topK. Gathering rows with a single `take` replaces the
-        // per-token slice+concat that built each expert batch previously.
-        let xFlat = x.reshaped([tokenCount, hiddenSize])
 
         var expertOutputs: [MLXArray] = []
         expertOutputs.reserveCapacity(flatIndicesByExpert.count)
