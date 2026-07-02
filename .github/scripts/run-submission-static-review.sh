@@ -38,7 +38,8 @@ escaped_api_key="${escaped_api_key//\"/\\\"}"
 
 validate_contract_path() {
   local path="$1"
-  if [[ -z "${path}" || "${path}" == /* || "${path}" == *\\* ]]; then
+  # A leading ':' would be git pathspec magic in the diff below, not a path.
+  if [[ -z "${path}" || "${path}" == /* || "${path}" == :* || "${path}" == *\\* ]]; then
     echo "::error::invalid editable path '${path}' in ${CONTRACT_PATH}" >&2
     exit 1
   fi
@@ -87,32 +88,81 @@ collect_file() {
 review_base="${MLXFAST_SUBMISSION_REVIEW_BASE_SHA:-}"
 review_head="${HEAD_SHA:-HEAD}"
 
+# Set-but-empty means the caller intended diff-only mode but its base
+# computation failed silently (a command substitution in a prefix assignment
+# is invisible to set -e). Never degrade to whole-surface review over that.
+if [[ -n "${MLXFAST_SUBMISSION_REVIEW_BASE_SHA+set}" && -z "${MLXFAST_SUBMISSION_REVIEW_BASE_SHA}" ]]; then
+  echo "::error::MLXFAST_SUBMISSION_REVIEW_BASE_SHA is set but empty (did git merge-base fail?); refusing to fall back to whole-surface review" >&2
+  exit 1
+fi
+
+editable_paths=()
 if [[ -n "${review_base}" ]]; then
   if ! command -v git >/dev/null 2>&1 || ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "::error::MLXFAST_SUBMISSION_REVIEW_BASE_SHA is set but this is not a git work tree" >&2
     exit 1
   fi
-  if ! git rev-parse --verify --quiet "${review_base}^{commit}" >/dev/null; then
-    echo "::error::submission review base '${review_base}' is not a resolvable commit" >&2
+  if ! review_base="$(git rev-parse --verify --quiet "${review_base}^{commit}")"; then
+    echo "::error::submission review base '${MLXFAST_SUBMISSION_REVIEW_BASE_SHA}' is not a resolvable commit" >&2
+    exit 1
+  fi
+  if ! review_head="$(git rev-parse --verify --quiet "${review_head}^{commit}")"; then
+    echo "::error::submission review head '${HEAD_SHA:-HEAD}' is not a resolvable commit" >&2
+    exit 1
+  fi
+  # The diff selects paths from commits but collect_file reads the work tree;
+  # those only agree when the work tree is the checkout of the review head.
+  if [[ "$(git rev-parse HEAD)" != "${review_head}" ]]; then
+    echo "::error::review head ${review_head} is not the checked-out HEAD; work-tree content would not match the reviewed diff" >&2
+    exit 1
+  fi
+  # Like enforce-modifiable-surface.sh, read the allowlist from the BASE commit
+  # so nothing in the submitted work tree can steer which files the judge sees.
+  if ! contract_source="$(git show "${review_base}:${CONTRACT_PATH}")"; then
+    echo "::error::cannot read ${CONTRACT_PATH} from review base ${review_base}" >&2
     exit 1
   fi
   while IFS= read -r editable_path; do
+    editable_paths+=("${editable_path}")
+  done < <(jq -r '.editablePaths[]' <<<"${contract_source}")
+else
+  while IFS= read -r editable_path; do
+    editable_paths+=("${editable_path}")
+  done < <(jq -r '.editablePaths[]' "${CONTRACT_PATH}")
+fi
+
+# A jq failure inside a process substitution is also invisible to set -e; an
+# empty allowlist must be an error, never an accidental clean pass.
+if (( ${#editable_paths[@]} == 0 )); then
+  echo "::error::${CONTRACT_PATH} lists no editablePaths for static review" >&2
+  exit 1
+fi
+
+if [[ -n "${review_base}" ]]; then
+  for editable_path in "${editable_paths[@]}"; do
     validate_contract_path "${editable_path}"
     # --diff-filter=d keeps every changed-and-still-present file (excludes only
     # deletions -- a removed file has nothing to review). Paths are repo-relative
     # and pathspec-scoped to the editable surface, matching the fallback below.
     while IFS= read -r -d '' file_path; do
+      # Every path the diff lists exists in the review head commit; a missing
+      # or non-regular work-tree file is divergence (or a symlink) and must
+      # fail the review, not silently shrink what the judge sees.
+      if [[ -h "${file_path}" || ! -f "${file_path}" ]]; then
+        echo "::error file=${file_path}::changed editable path is missing or not a regular file in the checkout" >&2
+        exit 1
+      fi
       collect_file "${file_path}"
     done < <(git diff --name-only -z --diff-filter=d "${review_base}" "${review_head}" -- "${editable_path}")
-  done < <(jq -r '.editablePaths[]' "${CONTRACT_PATH}")
+  done
 
   if (( file_count == 0 )); then
     echo "submission-review: no editable files changed versus ${review_base}; nothing to review"
-    printf '%s' '{"passed":true,"severity":"none","summary":"no editable files changed versus base","findings":[]}' > "${RESULTS_PATH}"
+    printf '{"passed":true,"severity":"none","summary":"no editable files changed versus base %s","findings":[]}' "${review_base}" > "${RESULTS_PATH}"
     exit 0
   fi
 else
-  while IFS= read -r editable_path; do
+  for editable_path in "${editable_paths[@]}"; do
     validate_contract_path "${editable_path}"
     if [[ ! -e "${editable_path}" ]]; then
       echo "::error file=${editable_path}::editable path missing after overlay" >&2
@@ -121,7 +171,7 @@ else
     while IFS= read -r -d '' file_path; do
       collect_file "${file_path}"
     done < <(find "${editable_path}" -type f -print0)
-  done < <(jq -r '.editablePaths[]' "${CONTRACT_PATH}")
+  done
 
   if (( file_count == 0 )); then
     echo "::error::editable paths selected no files for static review" >&2
