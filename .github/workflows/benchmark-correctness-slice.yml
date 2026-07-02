@@ -78,9 +78,13 @@ jobs:
         if: ${{ startsWith(github.ref_name, 'submissions/') }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          .github/scripts/run-submission-static-review.sh
+          # Review only the editable files changed vs the merge-base -- see the
+          # diff-only-mode comment in run-submission-static-review.sh.
+          MLXFAST_SUBMISSION_REVIEW_BASE_SHA="$(git merge-base origin/main "${HEAD_SHA}")" \
+            .github/scripts/run-submission-static-review.sh
 
       - name: Enforce modifiable surface
         if: ${{ startsWith(github.ref_name, 'submissions/') }}

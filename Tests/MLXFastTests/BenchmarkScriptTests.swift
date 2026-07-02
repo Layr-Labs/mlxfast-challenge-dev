@@ -571,6 +571,32 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(staticReview.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES"))
     #expect(staticReview.contains("oversized source that could hide lookup tables"))
     #expect(staticReview.contains("find \"${editable_path}\" -type f -print0"))
+
+    // Diff-only mode: when a base commit is provided the review must send only
+    // the editable files CHANGED vs that base, not the whole editable surface.
+    // This is the fix for the false positive where an unchanged baseline file
+    // (DeepSeekSubmissionControls.swift's validation hook, comment mentions
+    // benchmark timing) failed a submission that never touched it.
+    #expect(staticReview.contains("review_base=\"${MLXFAST_SUBMISSION_REVIEW_BASE_SHA:-}\""))
+    #expect(staticReview.contains("git diff --name-only -z --diff-filter=d \"${review_base}\" \"${review_head}\" -- \"${editable_path}\""))
+    // A resolvable base is mandatory once provided (fail closed, never silently
+    // fall back to whole-surface which would resurrect the false positive).
+    #expect(staticReview.contains("is not a resolvable commit"))
+    // An empty diff (nothing changed in the editable surface) is a clean pass,
+    // not the whole-surface "selected no files" error.
+    #expect(staticReview.contains("no editable files changed versus"))
+    #expect(staticReview.contains("\"passed\":true,\"severity\":\"none\""))
+
+    // All three privileged workflows pass the merge-base so the review runs in
+    // diff-only mode on every machine that executes submitted code.
+    for wf in [
+        ".github/workflows/benchmark.yml",
+        ".github/workflows/benchmark-timing-or-gates.yml",
+        ".github/workflows/benchmark-correctness-slice.yml",
+    ] {
+        let content = try String(contentsOfFile: wf, encoding: .utf8)
+        #expect(content.contains("MLXFAST_SUBMISSION_REVIEW_BASE_SHA=\"$(git merge-base origin/main \"${HEAD_SHA}\")\""))
+    }
 }
 
 @Test
