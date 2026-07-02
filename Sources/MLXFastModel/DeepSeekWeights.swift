@@ -105,6 +105,10 @@ public struct DeepSeekWeightLoader {
     public let residentExpertScales: ResidentExpertTensors?
     public let pinnedExpertCodes: ResidentExpertTensors?
     public let expertLayerStager: ExpertLayerStager?
+    // Dedicated capacity-0 side bank for concurrent decode-step slice reads.
+    // Capacity 0 => no cache/LRU mutation, so concurrent preads are race-free
+    // and read byte-identical ranges through the trusted metered path.
+    private let decodeSideBank: ExpertSlotBank?
     private let bridge: MLXArrayTensorBridge
 
     /// Sized for the official 48 GB runner: pin only where at least that
@@ -157,6 +161,11 @@ public struct DeepSeekWeightLoader {
             manifestPath: manifestPath,
             metrics: metrics
         )
+        self.decodeSideBank = try? ExpertSlotBank(
+            manifestPath: manifestPath,
+            capacity: 0,
+            metrics: metrics
+        )
         self.bridge = bridge
     }
 
@@ -175,6 +184,7 @@ public struct DeepSeekWeightLoader {
         self.residentExpertScales = nil
         self.pinnedExpertCodes = nil
         self.expertLayerStager = nil
+        self.decodeSideBank = nil
         self.bridge = bridge
     }
 
@@ -274,11 +284,94 @@ public struct DeepSeekWeightLoader {
         )
     }
 
+    static func decodePrefetchKey(_ name: String, _ index: Int) -> String {
+        "\(name)#\(index)"
+    }
+
+    /// Concurrently pre-reads the routed-expert code slices a 1-token decode
+    /// step is about to consume, through the capacity-0 side bank, returning a
+    /// map keyed by `decodePrefetchKey`. Returns nil when the fast path does
+    /// not apply (no side bank, main byte-cache disabled, or nothing to fetch);
+    /// callers then use the normal serial per-expert bank reads. Only reads
+    /// slices that would otherwise be serial bank preads — pinned codes come
+    /// from RAM and are skipped. Byte-identical to the serial path.
+    public func prefetchDecodeExpertCodes(
+        layerIndex: Int,
+        expertIndices: [Int],
+        hiddenSize: Int,
+        intermediateSize: Int
+    ) -> [String: MaterializedTensor]? {
+        guard let sideBank = decodeSideBank, expertBank.capacity > 0, !expertIndices.isEmpty else {
+            return nil
+        }
+        let projections: [(DeepSeekExpertProjection, [Int])] = [
+            (.gate, [intermediateSize, hiddenSize]),
+            (.up, [intermediateSize, hiddenSize]),
+            (.down, [hiddenSize, intermediateSize]),
+        ]
+        var keys: [String] = []
+        var names: [String] = []
+        var indices: [Int] = []
+        var seen = Set<String>()
+        for expertIndex in expertIndices {
+            for (projection, expectedShape) in projections {
+                let candidates = DeepSeekWeightNames.routedExpert(
+                    layerIndex: layerIndex,
+                    expertIndex: expertIndex,
+                    projection: projection
+                )
+                for candidate in candidates {
+                    guard let record = expertBank.record(named: candidate) else {
+                        continue
+                    }
+                    let isStacked = record.shape.count == expectedShape.count + 1
+                        && record.shape.first.map { expertIndex < $0 } == true
+                    // Match expertLinearWeight: first matching candidate wins.
+                    guard isStacked else {
+                        break
+                    }
+                    if pinnedExpertCodes?.isResident(name: candidate) == true {
+                        break
+                    }
+                    let key = Self.decodePrefetchKey(candidate, expertIndex)
+                    if seen.insert(key).inserted {
+                        keys.append(key)
+                        names.append(candidate)
+                        indices.append(expertIndex)
+                    }
+                    break
+                }
+            }
+        }
+        guard !keys.isEmpty else {
+            return nil
+        }
+        var results = [MaterializedTensor?](repeating: nil, count: keys.count)
+        results.withUnsafeMutableBufferPointer { buffer in
+            let sink = DecodePrefetchSink(buffer: buffer)
+            DispatchQueue.concurrentPerform(iterations: keys.count) { index in
+                sink.buffer[index] = try? sideBank.materializedTensor(
+                    named: names[index],
+                    firstAxisIndex: indices[index]
+                )
+            }
+        }
+        var map: [String: MaterializedTensor] = [:]
+        map.reserveCapacity(keys.count)
+        for (index, key) in keys.enumerated() {
+            if let tensor = results[index] {
+                map[key] = tensor
+            }
+        }
+        return map.isEmpty ? nil : map
+    }
+
     public func expertLinearWeight(
         candidates: [String],
         expectedShape: [Int],
         expertIndex: Int,
-        preferStaged: Bool = false
+        preferStaged: Bool = false,
+        decodePrefetch: [String: MaterializedTensor]? = nil
     ) throws -> DeepSeekLinearWeight {
         for candidate in candidates {
             guard let record = expertBank.record(named: candidate) else {
@@ -296,6 +389,10 @@ public struct DeepSeekWeightLoader {
             } else if preferStaged, isStacked,
                let staged = stagedSliceTensor(recordName: candidate, expertIndex: expertIndex) {
                 tensor = staged
+            } else if isStacked,
+               let prefetched = decodePrefetch?[Self.decodePrefetchKey(candidate, expertIndex)] {
+                // Concurrently pre-read slice (byte-identical to the bank read below).
+                tensor = prefetched
             } else if isStacked {
                 tensor = try expertBank.materializedTensor(named: candidate, firstAxisIndex: expertIndex)
             } else {
@@ -1280,4 +1377,11 @@ public struct DeepSeekWeightLoader {
         }
         return "\(weightName).\(suffix)"
     }
+}
+
+// Lets concurrentPerform write results into distinct buffer slots from worker
+// threads. Each index is written by exactly one iteration, so the aliasing is
+// disjoint and the unchecked Sendable conformance is sound.
+private struct DecodePrefetchSink: @unchecked Sendable {
+    let buffer: UnsafeMutableBufferPointer<MaterializedTensor?>
 }
