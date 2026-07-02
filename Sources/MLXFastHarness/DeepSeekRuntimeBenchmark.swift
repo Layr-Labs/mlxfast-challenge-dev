@@ -834,23 +834,21 @@ extension DeepSeekRuntime {
             decodeSteps: decodeSteps
         )
 
-        // Start the scored decode phase before prompt-specific warmup and seed
-        // prefill. Otherwise submitted model code can hide speculative work for
-        // future decode steps in setup that is not charged to the score.
+        // Start the scored decode phase before the seed prefill. Otherwise
+        // submitted model code can hide speculative work for future decode steps
+        // in setup that is not charged to the score.
+        //
+        // Exactly one whole-prompt (seed) forward runs in this phase, with NO
+        // preceding warmup pass. A second identical whole-prompt forward (the
+        // warmup this used to run) let submitted model code memoize one pass and
+        // serve the other from that memo, collapsing two charged forwards into
+        // one and inflating decode_speedup. The trusted harness cannot force
+        // editable code to recompute a forward it issues, so the defense is to
+        // never issue two identical forwards in the timed window. (Mirrors the
+        // runtime worker's decode_begin; this in-process path is only used when
+        // the worker is disabled, which official runs forbid.)
         let decodePhaseStart = DispatchTime.now().uptimeNanoseconds
         progress?("decode measured start tokens=\(timingPlan.decodeSteps) includes_seed_prefill=true")
-        progress?("decode warmup start seed_tokens=\(seedTokens.count)")
-        let warmupCache = DeepSeekModelCache(config: weightCache.config)
-        let warmupLogits = try DeepSeekModel.logits(
-            inputIDs: inputIDsArray(seedTokens),
-            weightCache: weightCache,
-            cache: warmupCache,
-            positionOffset: 0
-        )
-        _ = try DeepSeekCorrectness.greedyToken(from: warmupLogits)
-        Memory.clearCache()
-        progress?("decode warmup complete")
-
         progress?("decode seed prefill start seed_tokens=\(seedTokens.count)")
         let cache = DeepSeekModelCache(config: weightCache.config)
         var logits = try DeepSeekModel.logits(
