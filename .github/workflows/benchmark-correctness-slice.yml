@@ -39,6 +39,7 @@ jobs:
     env:
       MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
       MLXFAST_IS_SUBMISSION_BRANCH: ${{ (startsWith(github.ref_name, 'submissions/')) && '1' || '0' }}
+      MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
       # Deny the whole private subtree (not just the golden literal) to the
       # sandboxed worker, matching the benchmark/gates/timing machines. The CLI's
       # writeRuntimeWorkerSandboxProfile adds a subpath deny for this dir.
@@ -91,6 +92,18 @@ jobs:
 
       - name: Probe runtime worker sandbox
         run: .github/scripts/probe-runtime-worker-sandbox.sh
+
+      # Mirrors benchmark-timing-or-gates.yml's early check: without it, a run
+      # missing the R2 secrets would only fail at "Download and verify hidden
+      # correctness golden" -- after the full ~141 GiB checkpoint download and
+      # transform, times three slice machines.
+      - name: Check correctness golden source
+        run: |
+          set -euo pipefail
+          if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
+            echo "benchmark-correctness-slice: hidden correctness golden requires private R2 secrets" >&2
+            exit 1
+          fi
 
       - name: Restore SwiftPM cache
         id: restore_swiftpm_cache
@@ -265,6 +278,7 @@ jobs:
             correctness-report.json >/dev/null
 
       - name: Check correctness slice artifact paths
+        id: deny_slice_paths
         if: ${{ always() && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_correctness_slice.outcome == 'success') }}
         run: |
           set -euo pipefail
@@ -275,7 +289,10 @@ jobs:
             weights.sha256
 
       - name: Upload slice artifact
-        if: ${{ always() && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_correctness_slice.outcome == 'success') }}
+        # Requires the deny-path check to have PASSED (not just run), matching
+        # main's deny-before-upload ordering where staging (and therefore the
+        # upload gate) ran deny-private-artifacts.sh itself.
+        if: ${{ always() && steps.deny_slice_paths.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.slice_name }}

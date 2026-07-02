@@ -1702,9 +1702,15 @@ func correctnessSliceWorkflowGatesUploadOnContentValidation() throws {
     #expect(validateStep.contains("and .expected_token == null"))
     #expect(validateStep.contains("and .actual_token == null"))
 
+    // The deny-path check runs only when (non-submission || validation
+    // passed); the upload then requires the deny check to have PASSED, which
+    // transitively enforces the validation gate on submission branches AND
+    // restores main's deny-before-upload ordering.
     let gateCondition = "if: ${{ always() && ((!(startsWith(github.ref_name, 'submissions/'))) || " +
         "steps.validate_correctness_slice.outcome == 'success') }}"
-    #expect(slice.components(separatedBy: gateCondition).count - 1 == 2) // artifact-path check + upload
+    #expect(slice.components(separatedBy: gateCondition).count - 1 == 1) // deny-path check
+    #expect(slice.contains("id: deny_slice_paths"))
+    #expect(slice.contains("if: ${{ always() && steps.deny_slice_paths.outcome == 'success' }}"))
 }
 
 @Test
@@ -1763,13 +1769,18 @@ func timingOrGatesWorkflowGatesUploadOnContentValidation() throws {
     #expect(validateStep.contains("and (.metrics.actual_token == null)"))
     #expect(validateStep.contains("\"partial_result\""))
 
+    // Deny-path check keeps the validation clause; the upload requires the
+    // deny check to have PASSED, which transitively enforces both the
+    // prepare_golden_expectations and (on submission branches) validation
+    // gates while restoring main's deny-before-upload ordering.
     let validationClause = "((!(startsWith(github.ref_name, 'submissions/'))) || " +
         "steps.validate_intermediate_benchmark.outcome == 'success')"
-    #expect(timingOrGates.components(separatedBy: validationClause).count - 1 == 2) // artifact-path check + upload
+    #expect(timingOrGates.components(separatedBy: validationClause).count - 1 == 1) // deny-path check
     #expect(timingOrGates.contains(
         "if: ${{ always() && steps.prepare_golden_expectations.outcome == 'success' && \(validationClause) }}"
     ))
-    #expect(timingOrGates.contains("if: ${{ always() && \(validationClause) }}"))
+    #expect(timingOrGates.contains("id: deny_intermediate_paths"))
+    #expect(timingOrGates.contains("if: ${{ always() && steps.deny_intermediate_paths.outcome == 'success' }}"))
 }
 
 @Test
@@ -1848,16 +1859,38 @@ func parallelArtifactNamesIncludeRunAttemptToAvoidReRunCollisions() throws {
     let runIdAttempt = "${{ github.run_id }}-${{ github.run_attempt }}"
     #expect(slice.contains("name: benchmark-parallel-\(runIdAttempt)-${{ inputs.slice_name }}"))
     #expect(timingOrGates.contains("name: benchmark-parallel-\(runIdAttempt)-${{ inputs.mode }}"))
-    #expect(workflow.contains("pattern: benchmark-parallel-\(runIdAttempt)-*"))
+    // Uploads embed run_attempt (immutable names within a run), but combine's
+    // DOWNLOAD must be attempt-agnostic: on "Re-run failed jobs" only the
+    // re-run jobs execute under the new attempt -- jobs that succeeded earlier
+    // keep old-attempt artifact names, so a current-attempt-only pattern would
+    // make every partial re-run uncombinable. A resolve step then picks the
+    // highest-attempt artifact per machine role.
+    #expect(workflow.contains("pattern: benchmark-parallel-${{ github.run_id }}-*"))
+    #expect(!workflow.contains("pattern: benchmark-parallel-\(runIdAttempt)-*"))
+    #expect(workflow.contains("- name: Resolve newest artifact per machine role"))
+    #expect(workflow.contains("for role in gates timing machine2 machine3 machine4; do"))
+    #expect(workflow.contains("(( attempt > best_attempt ))"))
+    #expect(workflow.contains("no benchmark-parallel artifact found for role"))
     for dir in ["gates", "timing", "machine2", "machine3", "machine4"] {
-        #expect(workflow.contains("benchmark-parallel-\(runIdAttempt)-\(dir)"))
+        #expect(workflow.contains("benchmark-parallel-${{ github.run_id }}-resolved-\(dir)"))
+        #expect(!workflow.contains("slices/benchmark-parallel-\(runIdAttempt)-\(dir)"))
     }
+    // The final artifacts keep run_id-only names (the orchestrator's lookup
+    // contract) so a re-run reaching the upload again must overwrite, not 409.
+    let benchmarkUploadRange = try #require(workflow.range(of: "name: benchmark-results-${{ github.run_id }}"))
+    let benchmarkUploadBlock = String(workflow[benchmarkUploadRange.lowerBound...].prefix(900))
+    #expect(benchmarkUploadBlock.contains("overwrite: true"))
+    let correctnessUploadRange = try #require(workflow.range(of: "name: correctness-results-${{ github.run_id }}"))
+    let correctnessUploadBlock = String(workflow[correctnessUploadRange.lowerBound...].prefix(400))
+    #expect(correctnessUploadBlock.contains("overwrite: true"))
 }
 
 @Test
 func benchmarkWorkflowHasConcurrencyGroupMatchingSiblingProbes() throws {
     let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
-    #expect(workflow.contains("concurrency:\n  group: benchmark-${{ github.ref }}\n  cancel-in-progress: false"))
+    // Keyed on run_benchmark so correctness-only dispatches keep main's
+    // concurrent behavior instead of queueing behind a full benchmark run.
+    #expect(workflow.contains("concurrency:\n  group: benchmark-${{ github.ref }}-${{ inputs.run_benchmark }}\n  cancel-in-progress: false"))
 }
 
 @Test

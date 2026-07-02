@@ -54,8 +54,11 @@ permissions:
 # double-click) used to run all 6 jobs in full parallel twice -- no correctness
 # risk (artifact names are run_id/run_attempt-scoped) but 2x Blacksmith cost.
 # cancel-in-progress: false queues the second run rather than killing the first.
+# The group is keyed on run_benchmark so a correctness-only dispatch keeps
+# main's behavior of running concurrently with (not queued behind) a full
+# benchmark run on the same ref; only same-mode duplicates queue.
 concurrency:
-  group: benchmark-${{ github.ref }}
+  group: benchmark-${{ github.ref }}-${{ inputs.run_benchmark }}
   cancel-in-progress: false
 
 jobs:
@@ -392,6 +395,9 @@ jobs:
           name: correctness-results-${{ github.run_id }}
           path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/correctness-results
           if-no-files-found: error
+          # run_id-only name is the orchestrator's lookup contract; without
+          # overwrite a re-run that reached this step again would 409.
+          overwrite: true
 
   # Timed benchmark, gates/GPQA, and the base correctness case now each run on
   # their own independent machine. Splitting the base case alone (correctness-
@@ -497,9 +503,47 @@ jobs:
       - name: Download parallel benchmark artifacts
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          pattern: benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-*
+          # Deliberately attempt-agnostic: on "Re-run failed jobs" only the
+          # re-run jobs execute under the new run_attempt -- jobs that succeeded
+          # in an earlier attempt are NOT re-executed and their artifacts keep
+          # the old attempt's name. Downloading only the current attempt's
+          # artifacts would make every partial re-run uncombinable (and a
+          # combine-only retry would match nothing at all). The resolve step
+          # below picks the highest-attempt artifact per machine role instead.
+          pattern: benchmark-parallel-${{ github.run_id }}-*
           path: slices
           merge-multiple: false
+
+      - name: Resolve newest artifact per machine role
+        # Upload names embed run_attempt (uploads are immutable within a run,
+        # so a re-run job must upload under a fresh name). For each of the five
+        # roles pick the highest-attempt directory: attempt-1 results for jobs
+        # that were not re-run, the newest re-run results for jobs that were.
+        run: |
+          set -euo pipefail
+          prefix="slices/benchmark-parallel-${{ github.run_id }}"
+          status=0
+          for role in gates timing machine2 machine3 machine4; do
+            best_dir=""
+            best_attempt=-1
+            for dir in "${prefix}"-*-"${role}"; do
+              [[ -d "${dir}" ]] || continue
+              attempt="${dir#"${prefix}"-}"
+              attempt="${attempt%-"${role}"}"
+              if [[ "${attempt}" =~ ^[0-9]+$ ]] && (( attempt > best_attempt )); then
+                best_attempt="${attempt}"
+                best_dir="${dir}"
+              fi
+            done
+            if [[ -z "${best_dir}" ]]; then
+              echo "::error::combine: no benchmark-parallel artifact found for role ${role} in any attempt" >&2
+              status=1
+              continue
+            fi
+            echo "combine: role ${role} resolved to ${best_dir} (attempt ${best_attempt})"
+            ln -s "$(basename "${best_dir}")" "${prefix}-resolved-${role}"
+          done
+          exit "${status}"
 
       - name: Merge gates and timing into machine1
         # combine-parallel-correctness.sh expects one "machine1" payload with a
@@ -511,8 +555,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p machine1
-          gates_dir="slices/benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-gates"
-          timing_dir="slices/benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-timing"
+          gates_dir="slices/benchmark-parallel-${{ github.run_id }}-resolved-gates"
+          timing_dir="slices/benchmark-parallel-${{ github.run_id }}-resolved-timing"
 
           # This is one half of the full 5-way weights-hash guarantee: machine1
           # below is a COPY of gates_hash (see "cp ... machine1/weights.sha256"),
@@ -626,15 +670,25 @@ jobs:
             ' > machine1/score.json
 
           cp "${gates_dir}/weights.sha256" machine1/weights.sha256
+          # Validate the artifact-derived env file's exact shape before letting
+          # it into GITHUB_ENV: a malformed/truncated file would otherwise only
+          # surface two steps later as an opaque unbound-variable or --argjson
+          # parse error, and arbitrary lines must never enter this job's env.
+          expected_shape='^MLXFAST_EXPECTED_CORRECTNESS_(GOLDEN_SHA256=[0-9a-f]{64}|GOLDEN_BYTES=[0-9]+|CHECKED_STEPS=[0-9]+|CASES=[0-9]+)$'
+          line_count="$(wc -l < "${gates_dir}/golden-expectations.env" | tr -d ' ')"
+          if [[ "${line_count}" != "4" ]] || grep -qvE "${expected_shape}" "${gates_dir}/golden-expectations.env"; then
+            echo "::error::gates machine golden-expectations.env is malformed (expected exactly 4 MLXFAST_EXPECTED_CORRECTNESS_* lines)" >&2
+            exit 1
+          fi
           cat "${gates_dir}/golden-expectations.env" >> "${GITHUB_ENV}"
 
       - name: Assemble machine directories
         run: |
           set -euo pipefail
           mkdir -p machine2 machine3 machine4
-          cp "slices/benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-machine2/"* machine2/
-          cp "slices/benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-machine3/"* machine3/
-          cp "slices/benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-machine4/"* machine4/
+          cp "slices/benchmark-parallel-${{ github.run_id }}-resolved-machine2/"* machine2/
+          cp "slices/benchmark-parallel-${{ github.run_id }}-resolved-machine3/"* machine3/
+          cp "slices/benchmark-parallel-${{ github.run_id }}-resolved-machine4/"* machine4/
 
       - name: Combine
         env:
@@ -654,8 +708,15 @@ jobs:
           test -s score.combined.json
           score_hash="$(shasum -a 256 score.combined.json | awk '{print $1}')"
           printf '%s  %s\n' "${score_hash}" score.combined.json > score.combined.json.sha256
+          # The staged artifact renames score.combined.json to score.json, so
+          # the sidecar shipped inside benchmark-results-<run_id> must name
+          # score.json too or `shasum -c score.sha256` fails on the published
+          # artifact -- main's serial pipeline shipped a matching pair, and
+          # downstream consumers may rely on that contract. The .combined.
+          # sidecar above stays for the in-workspace validate step's own check.
+          printf '%s  score.json\n' "${score_hash}" > score.artifact.sha256
           jq --arg hash "${score_hash}" '.score_sha256 = $hash' \
-            "slices/benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-gates/benchmark-integrity.json" \
+            "slices/benchmark-parallel-${{ github.run_id }}-resolved-gates/benchmark-integrity.json" \
             > benchmark-integrity.json
           printf '%s  correctness_golden.json\n' "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}" > correctness_golden.json.sha256
           printf '%s  correctness_golden.json\n' "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES}" > correctness_golden.json.bytes
@@ -680,6 +741,7 @@ jobs:
             correctness_golden.json.bytes \
             score.combined.json \
             score.combined.json.sha256 \
+            score.artifact.sha256 \
             benchmark-integrity.json
 
       - name: Stage combined benchmark artifacts
@@ -692,7 +754,7 @@ jobs:
             golden.sha256=correctness_golden.json.sha256 \
             golden.bytes=correctness_golden.json.bytes \
             score.json=score.combined.json \
-            score.sha256=score.combined.json.sha256 \
+            score.sha256=score.artifact.sha256 \
             benchmark-integrity.json=benchmark-integrity.json
 
       - name: Upload benchmark artifacts
@@ -702,3 +764,9 @@ jobs:
           name: benchmark-results-${{ github.run_id }}
           path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results
           if-no-files-found: error
+          # Artifact names are immutable within a run across ALL attempts; the
+          # per-machine intermediates dodge that with run_attempt in the name,
+          # but this run_id-only name is the orchestrator's lookup contract, so
+          # a re-run-all that reached this step would otherwise 409 and strand
+          # the fresh result at the final upload.
+          overwrite: true

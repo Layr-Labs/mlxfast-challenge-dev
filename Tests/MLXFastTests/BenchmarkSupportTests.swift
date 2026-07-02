@@ -38,6 +38,10 @@ func runtimeWorkerEnvironmentStripsOfficialRunAndCIIdentity() {
         "MLXFAST_BENCHMARK_CHECK_GATES": "0",
         "MLXFAST_BENCHMARK_CORRECTNESS_STEPS": "0",
         "MLXFAST_BENCHMARK_SKIP_TIMED": "1",
+        // Env-var forms of --base-case-only/--step-range: the slice machines'
+        // equivalents of the split-phase vars above.
+        "MLXFAST_CORRECTNESS_BASE_CASE_ONLY": "1",
+        "MLXFAST_CORRECTNESS_STEP_RANGE": "21-42",
     ])
 
     for key in [
@@ -56,6 +60,8 @@ func runtimeWorkerEnvironmentStripsOfficialRunAndCIIdentity() {
         "MLXFAST_BENCHMARK_CHECK_GATES",
         "MLXFAST_BENCHMARK_CORRECTNESS_STEPS",
         "MLXFAST_BENCHMARK_SKIP_TIMED",
+        "MLXFAST_CORRECTNESS_BASE_CASE_ONLY",
+        "MLXFAST_CORRECTNESS_STEP_RANGE",
     ] {
         #expect(sanitized[key] == nil)
     }

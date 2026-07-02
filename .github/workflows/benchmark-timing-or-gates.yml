@@ -338,6 +338,7 @@ jobs:
           } > golden-expectations.env
 
       - name: Check intermediate benchmark artifact paths
+        id: deny_intermediate_paths
         if: ${{ always() && steps.prepare_golden_expectations.outcome == 'success' && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_intermediate_benchmark.outcome == 'success') }}
         run: |
           set -euo pipefail
@@ -348,7 +349,11 @@ jobs:
             golden-expectations.env
 
       - name: Upload intermediate benchmark result
-        if: ${{ always() && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_intermediate_benchmark.outcome == 'success') }}
+        # Requires the deny-path check to have PASSED (not just run), matching
+        # main's deny-before-upload ordering; deny success also transitively
+        # implies prepare_golden_expectations succeeded and, on submission
+        # branches, that the content validation passed.
+        if: ${{ always() && steps.deny_intermediate_paths.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.mode }}

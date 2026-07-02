@@ -620,6 +620,14 @@ func sanitizedRuntimeWorkerEnvironment(_ environment: [String: String]) -> [Stri
         "MLXFAST_BENCHMARK_CHECK_GATES",
         "MLXFAST_BENCHMARK_CORRECTNESS_STEPS",
         "MLXFAST_BENCHMARK_SKIP_TIMED",
+        // The env-var forms of --base-case-only/--step-range are the slice
+        // machines' equivalents of the three split-phase vars above: they let
+        // submitted code detect "I am an unscored correctness slice checking
+        // exactly steps N-M". Latent today (the slice workflow passes flags,
+        // not env), but an operator using the documented env form must not
+        // reopen the side channel.
+        "MLXFAST_CORRECTNESS_BASE_CASE_ONLY",
+        "MLXFAST_CORRECTNESS_STEP_RANGE",
         "MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER",
         "MLXFAST_CORRECTNESS_GOLDEN_PATH",
         "MLXFAST_CORRECTNESS_GOLDEN_URL",

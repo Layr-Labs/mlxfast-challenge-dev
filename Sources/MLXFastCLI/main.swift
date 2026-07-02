@@ -929,6 +929,14 @@ private enum MLXFastCLI {
             fallback: CommandLine.arguments.first ?? ""
         )
         guard !executable.isEmpty else {
+            // Every no-worker exit must be fail-closed on an official run, not
+            // just the explicit-disable ones above -- returning nil here means
+            // "run the model in-process, no worker, no sandbox".
+            if officialRun {
+                throw MLXFastError.invalidInput(
+                    "official benchmark runs require a runtime worker executable; none was configured or derivable"
+                )
+            }
             return nil
         }
         let executablePath: String
