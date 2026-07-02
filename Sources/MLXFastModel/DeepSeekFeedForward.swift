@@ -6,11 +6,18 @@ public struct DeepSeekMLPWeights {
     public let gate: DeepSeekLinearWeight
     public let up: DeepSeekLinearWeight
     public let down: DeepSeekLinearWeight
+    public let gateUp: DeepSeekLinearWeight?
 
-    public init(gate: DeepSeekLinearWeight, up: DeepSeekLinearWeight, down: DeepSeekLinearWeight) {
+    public init(
+        gate: DeepSeekLinearWeight,
+        up: DeepSeekLinearWeight,
+        down: DeepSeekLinearWeight,
+        gateUp: DeepSeekLinearWeight? = nil
+    ) {
         self.gate = gate
         self.up = up
         self.down = down
+        self.gateUp = gateUp
     }
 
     public init(gate: MLXArray, up: MLXArray, down: MLXArray) {
@@ -84,8 +91,17 @@ public enum DeepSeekMLP {
         weights: DeepSeekMLPWeights,
         swigluLimit: Double
     ) -> MLXArray {
-        let gate = DeepSeekOps.linear(input: x, weight: weights.gate)
-        let up = DeepSeekOps.linear(input: x, weight: weights.up)
+        let gate: MLXArray
+        let up: MLXArray
+        if let gateUp = weights.gateUp {
+            let projected = DeepSeekOps.linear(input: x, weight: gateUp)
+            let parts = projected.split(parts: 2, axis: -1)
+            gate = parts[0]
+            up = parts[1]
+        } else {
+            gate = DeepSeekOps.linear(input: x, weight: weights.gate)
+            up = DeepSeekOps.linear(input: x, weight: weights.up)
+        }
         let hidden = DeepSeekOps.limitedSwiGLU(gate: gate, up: up, limit: swigluLimit)
         return DeepSeekOps.linear(input: hidden, weight: weights.down)
     }

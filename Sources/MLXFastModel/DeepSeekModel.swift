@@ -117,8 +117,7 @@ public enum DeepSeekModel {
         cache: DeepSeekModelCache? = nil,
         positionOffset: Int = 0
     ) throws -> MLXArray {
-        let config = weightCache.config
-        let spec = DeepSeekModelSpec(config: config)
+        let spec = weightCache.modelSpec
         let weights = try weightCache.modelWeights()
         return try logits(
             inputIDs: inputIDs,
@@ -254,15 +253,20 @@ public enum DeepSeekModel {
         let compressRatio = config.compressRatios[layerIndex]
         let blockWeights = try weightCache.blockWeights(layerIndex: layerIndex)
         let moeWeights = try weightCache.moeWeights(layerIndex: layerIndex)
-        let blockSpec = DeepSeekBlockSpec(config: config)
-        let moeSpec = try DeepSeekMoESpec(layerIndex: layerIndex, config: config)
-        let mask = try DeepSeekAttentionMask.causal(
-            queryLength: inputIDs.shape[1],
-            keyLength: inputIDs.shape[1],
-            queryOffset: positionOffset,
-            keyOffset: positionOffset,
-            windowSize: config.slidingWindow
-        )
+        let blockSpec = weightCache.blockSpec
+        let moeSpec = try weightCache.moeSpec(layerIndex: layerIndex)
+        let mask: MLXArray?
+        if cache == nil {
+            mask = try DeepSeekAttentionMask.causal(
+                queryLength: inputIDs.shape[1],
+                keyLength: inputIDs.shape[1],
+                queryOffset: positionOffset,
+                keyOffset: positionOffset,
+                windowSize: config.slidingWindow
+            )
+        } else {
+            mask = nil
+        }
 
         return try DeepSeekBlock.forward(
             hidden: hidden,
@@ -274,7 +278,7 @@ public enum DeepSeekModel {
                     return try DeepSeekLocalAttention.forward(
                         normalized,
                         weights: weightCache.localAttentionWeights(layerIndex: layerIndex),
-                        spec: DeepSeekLocalAttentionSpec(config: config),
+                        spec: weightCache.localAttentionSpec(layerIndex: layerIndex),
                         mask: mask,
                         cache: cache?.local,
                         windowSize: config.slidingWindow,
@@ -284,7 +288,7 @@ public enum DeepSeekModel {
                     return try DeepSeekCompressedAttention.forward(
                         normalized,
                         weights: weightCache.compressedAttentionWeights(layerIndex: layerIndex),
-                        spec: DeepSeekCompressedAttentionSpec(config: config, layerIndex: layerIndex),
+                        spec: weightCache.compressedAttentionSpec(layerIndex: layerIndex),
                         mask: mask,
                         cache: cache,
                         windowSize: config.slidingWindow,

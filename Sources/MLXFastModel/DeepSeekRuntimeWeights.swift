@@ -3,16 +3,30 @@ import Foundation
 public final class DeepSeekRuntimeWeightCache {
     public let loader: DeepSeekWeightLoader
     public let config: DeepSeekConfig
+    public let modelSpec: DeepSeekModelSpec
+    public let blockSpec: DeepSeekBlockSpec
 
     private var cachedModelWeights: DeepSeekModelWeights?
-    private var cachedBlockWeights: [Int: DeepSeekBlockWeights] = [:]
-    private var cachedLocalAttentionWeights: [Int: DeepSeekLocalAttentionWeights] = [:]
-    private var cachedCompressedAttentionWeights: [Int: DeepSeekCompressedAttentionWeights] = [:]
-    private var cachedMoEWeights: [Int: DeepSeekMoEWeights] = [:]
+    private var cachedBlockWeights: [DeepSeekBlockWeights?]
+    private var cachedLocalAttentionWeights: [DeepSeekLocalAttentionWeights?]
+    private var cachedCompressedAttentionWeights: [DeepSeekCompressedAttentionWeights?]
+    private var cachedMoEWeights: [DeepSeekMoEWeights?]
+    private var cachedMoESpecs: [DeepSeekMoESpec?]
+    private var cachedLocalAttentionSpecs: [DeepSeekLocalAttentionSpec?]
+    private var cachedCompressedAttentionSpecs: [DeepSeekCompressedAttentionSpec?]
 
     public init(loader: DeepSeekWeightLoader, config: DeepSeekConfig) {
         self.loader = loader
         self.config = config
+        self.modelSpec = DeepSeekModelSpec(config: config)
+        self.blockSpec = DeepSeekBlockSpec(config: config)
+        self.cachedBlockWeights = Array(repeating: nil, count: config.numHiddenLayers)
+        self.cachedLocalAttentionWeights = Array(repeating: nil, count: config.numHiddenLayers)
+        self.cachedCompressedAttentionWeights = Array(repeating: nil, count: config.numHiddenLayers)
+        self.cachedMoEWeights = Array(repeating: nil, count: config.numHiddenLayers)
+        self.cachedMoESpecs = Array(repeating: nil, count: config.numHiddenLayers)
+        self.cachedLocalAttentionSpecs = Array(repeating: nil, count: config.numHiddenLayers)
+        self.cachedCompressedAttentionSpecs = Array(repeating: nil, count: config.numHiddenLayers)
     }
 
     public func modelWeights() throws -> DeepSeekModelWeights {
@@ -58,5 +72,34 @@ public final class DeepSeekRuntimeWeightCache {
         let weights = try loader.moeWeights(layerIndex: layerIndex, config: config)
         cachedMoEWeights[layerIndex] = weights
         return weights
+    }
+
+    public func moeSpec(layerIndex: Int) throws -> DeepSeekMoESpec {
+        if let spec = cachedMoESpecs[layerIndex] {
+            return spec
+        }
+        let spec = try DeepSeekMoESpec(layerIndex: layerIndex, config: config)
+        cachedMoESpecs[layerIndex] = spec
+        return spec
+    }
+
+    public func localAttentionSpec(layerIndex: Int) -> DeepSeekLocalAttentionSpec {
+        precondition(cachedLocalAttentionSpecs.indices.contains(layerIndex), "DeepSeek layer index out of range")
+        if let spec = cachedLocalAttentionSpecs[layerIndex] {
+            return spec
+        }
+        let spec = DeepSeekLocalAttentionSpec(config: config)
+        cachedLocalAttentionSpecs[layerIndex] = spec
+        return spec
+    }
+
+    public func compressedAttentionSpec(layerIndex: Int) -> DeepSeekCompressedAttentionSpec {
+        precondition(cachedCompressedAttentionSpecs.indices.contains(layerIndex), "DeepSeek layer index out of range")
+        if let spec = cachedCompressedAttentionSpecs[layerIndex] {
+            return spec
+        }
+        let spec = DeepSeekCompressedAttentionSpec(config: config, layerIndex: layerIndex)
+        cachedCompressedAttentionSpecs[layerIndex] = spec
+        return spec
     }
 }

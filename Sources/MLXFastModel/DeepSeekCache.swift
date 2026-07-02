@@ -157,21 +157,122 @@ public final class DeepSeekPoolingCache {
     }
 }
 
+public struct DeepSeekDeferredInputChunk {
+    public let x: MLXArray
+    public let offset: Int
+}
+
+public final class DeepSeekDeferredInputCache {
+    private var chunks: [DeepSeekDeferredInputChunk] = []
+    private var nextOffset: Int?
+    private var batchSize: Int?
+    private var hiddenSize: Int?
+    private var dtype: DType?
+
+    public init() {}
+
+    public var isEmpty: Bool {
+        chunks.isEmpty
+    }
+
+    public func append(_ x: MLXArray, offset: Int) throws {
+        guard x.shape.count == 3 else {
+            throw MLXFastError.invalidInput("deferred input cache expects shape [batch, length, hidden]")
+        }
+        let length = x.shape[1]
+        guard length > 0 else {
+            return
+        }
+        if let batchSize {
+            guard x.shape[0] == batchSize else {
+                throw MLXFastError.invalidInput(
+                    "deferred input cache received batch \(x.shape[0]); expected \(batchSize)"
+                )
+            }
+        } else {
+            batchSize = x.shape[0]
+        }
+        if let hiddenSize {
+            guard x.shape[2] == hiddenSize else {
+                throw MLXFastError.invalidInput(
+                    "deferred input cache received hidden \(x.shape[2]); expected \(hiddenSize)"
+                )
+            }
+        } else {
+            hiddenSize = x.shape[2]
+        }
+        if let dtype {
+            guard x.dtype == dtype else {
+                throw MLXFastError.invalidInput(
+                    "deferred input cache received dtype \(x.dtype); expected \(dtype)"
+                )
+            }
+        } else {
+            dtype = x.dtype
+        }
+        if let nextOffset {
+            guard offset == nextOffset else {
+                throw MLXFastError.invalidInput(
+                    "deferred input cache received offset \(offset); expected \(nextOffset)"
+                )
+            }
+        }
+        chunks.append(DeepSeekDeferredInputChunk(x: x, offset: offset))
+        nextOffset = offset + length
+    }
+
+    public func drain() -> [DeepSeekDeferredInputChunk] {
+        let pending = chunks
+        chunks.removeAll(keepingCapacity: true)
+        nextOffset = nil
+        batchSize = nil
+        hiddenSize = nil
+        dtype = nil
+        return pending
+    }
+
+    public func drainMerged() -> DeepSeekDeferredInputChunk? {
+        let pending = drain()
+        guard let first = pending.first else {
+            return nil
+        }
+        guard pending.count > 1 else {
+            return first
+        }
+        return DeepSeekDeferredInputChunk(
+            x: concatenated(pending.map(\.x), axis: 1),
+            offset: first.offset
+        )
+    }
+
+    func arraysForMaterialization() -> [MLXArray] {
+        chunks.map(\.x)
+    }
+}
+
 public final class DeepSeekLayerCache {
     public let local: DeepSeekLocalKVCache
     public let pooled: DeepSeekPoolingCache?
     public let indexPooled: DeepSeekPoolingCache?
+    public let deferredIndexInput: DeepSeekDeferredInputCache?
 
-    public init(local: DeepSeekLocalKVCache, pooled: DeepSeekPoolingCache?, indexPooled: DeepSeekPoolingCache?) {
+    public init(
+        local: DeepSeekLocalKVCache,
+        pooled: DeepSeekPoolingCache?,
+        indexPooled: DeepSeekPoolingCache?,
+        deferredIndexInput: DeepSeekDeferredInputCache? = nil
+    ) {
         self.local = local
         self.pooled = pooled
         self.indexPooled = indexPooled
+        self.deferredIndexInput = deferredIndexInput
     }
 
     func arraysForMaterialization() -> [MLXArray] {
         local.arraysForMaterialization()
             + (pooled?.arraysForMaterialization() ?? [])
             + (indexPooled?.arraysForMaterialization() ?? [])
+            + (deferredIndexInput?.arraysForMaterialization() ?? [])
     }
 }
 
@@ -183,7 +284,8 @@ public final class DeepSeekModelCache {
             DeepSeekLayerCache(
                 local: DeepSeekLocalKVCache(maxSize: config.slidingWindow),
                 pooled: ratio == 0 ? nil : DeepSeekPoolingCache(ratio: ratio),
-                indexPooled: ratio == 4 ? DeepSeekPoolingCache(ratio: ratio) : nil
+                indexPooled: ratio == 4 ? DeepSeekPoolingCache(ratio: ratio) : nil,
+                deferredIndexInput: ratio == 4 ? DeepSeekDeferredInputCache() : nil
             )
         }
     }
