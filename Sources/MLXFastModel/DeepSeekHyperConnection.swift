@@ -15,6 +15,13 @@ public struct DeepSeekHyperConnectionOutput {
 }
 
 public enum DeepSeekHyperConnection {
+    // NOTE: MLX `compile` was evaluated for these graphs and rejected: its
+    // fused elementwise kernels contract multiply-add chains into FMAs, so
+    // sigmoid/softmax inputs differ from the eager kernels at the ULP level
+    // and the divergence is measurable after 43 layers. The correctness gate
+    // is a hard token-match with only a 1e-6 tie tolerance, so every graph
+    // here must stay on the eager kernels that produced the golden fixtures.
+
     public static func collapse(
         _ x: MLXArray,
         fn: MLXArray,
@@ -28,27 +35,55 @@ public enum DeepSeekHyperConnection {
     ) throws -> DeepSeekHyperConnectionOutput {
         try validateInput(x, hcMult: hcMult)
 
-        let y = DeepSeekOps.cast(x, to: .float32)
-        let normalized = weightlessRMSNorm(y.flattened(start: -2), eps: normEps)
-        let mixes = matmul(normalized, fnTransposed ?? fn.T)
-        let mix = try splitSinkhorn(
-            mixes: mixes,
-            scale: scale,
-            base: base,
-            hcMult: hcMult,
-            sinkhornIters: sinkhornIters,
-            eps: eps
-        )
-
-        let collapsed = DeepSeekOps.cast(
-            (mix.pre.expandedDimensions(axis: -1) * y).sum(axis: 2),
-            to: x.dtype
+        let outputs = collapseBody(
+            x: x, fnTransposed: fnTransposed ?? fn.T, base: base, scale: scale,
+            hcMult: hcMult, sinkhornIters: sinkhornIters, eps: eps, normEps: normEps
         )
         return DeepSeekHyperConnectionOutput(
-            collapsed: collapsed,
-            post: mix.post,
-            combination: mix.combination
+            collapsed: outputs[0],
+            post: outputs[1],
+            combination: outputs[2]
         )
+    }
+
+    /// The exact op sequence of the original collapse + splitSinkhorn pair.
+    private static func collapseBody(
+        x: MLXArray,
+        fnTransposed: MLXArray,
+        base: MLXArray,
+        scale: MLXArray,
+        hcMult: Int,
+        sinkhornIters: Int,
+        eps: Double,
+        normEps: Double
+    ) -> [MLXArray] {
+        let y = DeepSeekOps.cast(x, to: .float32)
+        let normalized = weightlessRMSNorm(y.flattened(start: -2), eps: normEps)
+        let mixes = DeepSeekOps.cast(matmul(normalized, fnTransposed), to: .float32)
+        let scale = DeepSeekOps.cast(scale, to: .float32)
+        let base = DeepSeekOps.cast(base, to: .float32)
+        let epsF = Float(eps)
+
+        let pre = sigmoid(mixes[.ellipsis, 0..<hcMult] * scale[0] + base[0..<hcMult]) + epsF
+        let post = 2.0 * sigmoid(
+            mixes[.ellipsis, hcMult..<(2 * hcMult)] * scale[1] + base[hcMult..<(2 * hcMult)]
+        )
+
+        let combFlat = mixes[.ellipsis, (2 * hcMult)...] * scale[2] + base[(2 * hcMult)...]
+        let combShape = Array(mixes.shape.dropLast()) + [hcMult, hcMult]
+        var combination = combFlat.reshaped(combShape)
+        combination = softmax(combination, axis: -1, precise: true) + epsF
+        combination = combination / (combination.sum(axis: -2, keepDims: true) + epsF)
+        for _ in 0..<max(sinkhornIters - 1, 0) {
+            combination = combination / (combination.sum(axis: -1, keepDims: true) + epsF)
+            combination = combination / (combination.sum(axis: -2, keepDims: true) + epsF)
+        }
+
+        let collapsed = DeepSeekOps.cast(
+            (pre.expandedDimensions(axis: -1) * y).sum(axis: 2),
+            to: x.dtype
+        )
+        return [collapsed, post, combination]
     }
 
     public static func splitSinkhorn(
@@ -124,9 +159,23 @@ public enum DeepSeekHyperConnection {
     ) throws -> MLXArray {
         try validateInput(x, hcMult: hcMult)
 
+        return headBody(
+            x: x, fnTransposed: fnTransposed ?? fn.T, base: base, scale: scale,
+            eps: eps, normEps: normEps
+        )
+    }
+
+    private static func headBody(
+        x: MLXArray,
+        fnTransposed: MLXArray,
+        base: MLXArray,
+        scale: MLXArray,
+        eps: Double,
+        normEps: Double
+    ) -> MLXArray {
         let y = DeepSeekOps.cast(x, to: .float32)
         let normalized = weightlessRMSNorm(y.flattened(start: -2), eps: normEps)
-        let mixes = matmul(normalized, fnTransposed ?? fn.T)
+        let mixes = matmul(normalized, fnTransposed)
         let pre = sigmoid(mixes * scale[0] + base) + Float(eps)
         return DeepSeekOps.cast(
             (pre.expandedDimensions(axis: -1) * y).sum(axis: 2),

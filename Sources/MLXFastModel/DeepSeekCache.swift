@@ -58,6 +58,29 @@ public final class DeepSeekLocalKVCache {
     func arraysForMaterialization() -> [MLXArray] {
         kv.map { [$0] } ?? []
     }
+
+    var isEmpty: Bool {
+        kv == nil && offset == 0 && startPosition == 0
+    }
+
+    struct State {
+        let kv: MLXArray?
+        let offset: Int
+        let startPosition: Int
+    }
+
+    // MLXArrays are immutable values here: updateAndFetch always REPLACES
+    // `kv` with a new array, so exported states and caches restored from them
+    // can safely share references.
+    func exportState() -> State {
+        State(kv: kv, offset: offset, startPosition: startPosition)
+    }
+
+    func importState(_ state: State) {
+        kv = state.kv
+        offset = state.offset
+        startPosition = state.startPosition
+    }
 }
 
 public struct DeepSeekPoolingWindow {
@@ -155,6 +178,28 @@ public final class DeepSeekPoolingCache {
     func arraysForMaterialization() -> [MLXArray] {
         [bufferedKV, bufferedGate, pooled].compactMap { $0 }
     }
+
+    var isEmpty: Bool {
+        bufferedKV == nil && bufferedGate == nil && pooled == nil
+    }
+
+    struct State {
+        let bufferedKV: MLXArray?
+        let bufferedGate: MLXArray?
+        let pooled: MLXArray?
+    }
+
+    // Same sharing argument as DeepSeekLocalKVCache.State: these fields are
+    // only ever replaced with fresh arrays, never mutated in place.
+    func exportState() -> State {
+        State(bufferedKV: bufferedKV, bufferedGate: bufferedGate, pooled: pooled)
+    }
+
+    func importState(_ state: State) {
+        bufferedKV = state.bufferedKV
+        bufferedGate = state.bufferedGate
+        pooled = state.pooled
+    }
 }
 
 public final class DeepSeekLayerCache {
@@ -172,6 +217,34 @@ public final class DeepSeekLayerCache {
         local.arraysForMaterialization()
             + (pooled?.arraysForMaterialization() ?? [])
             + (indexPooled?.arraysForMaterialization() ?? [])
+    }
+
+    var isEmpty: Bool {
+        local.isEmpty && pooled?.isEmpty != false && indexPooled?.isEmpty != false
+    }
+
+    struct State {
+        let local: DeepSeekLocalKVCache.State
+        let pooled: DeepSeekPoolingCache.State?
+        let indexPooled: DeepSeekPoolingCache.State?
+    }
+
+    func exportState() -> State {
+        State(
+            local: local.exportState(),
+            pooled: pooled?.exportState(),
+            indexPooled: indexPooled?.exportState()
+        )
+    }
+
+    func importState(_ state: State) {
+        local.importState(state.local)
+        if let pooledState = state.pooled {
+            pooled?.importState(pooledState)
+        }
+        if let indexPooledState = state.indexPooled {
+            indexPooled?.importState(indexPooledState)
+        }
     }
 }
 
@@ -195,6 +268,33 @@ public final class DeepSeekModelCache {
     public func materializeCachedState() {
         for array in arraysForMaterialization() {
             eval(array)
+        }
+    }
+
+    /// True while no forward pass has written anything into this cache.
+    public var isEmpty: Bool {
+        layers.allSatisfy { $0.isEmpty }
+    }
+
+    public struct State {
+        let layers: [DeepSeekLayerCache.State]
+    }
+
+    public func exportState() -> State {
+        State(layers: layers.map { $0.exportState() })
+    }
+
+    /// Restores a state exported from an identically configured cache. The
+    /// shared arrays are safe because every cache update replaces its array
+    /// references instead of mutating buffers in place.
+    public func importState(_ state: State) throws {
+        guard state.layers.count == layers.count else {
+            throw MLXFastError.invalidInput(
+                "cache state has \(state.layers.count) layers; expected \(layers.count)"
+            )
+        }
+        for (layer, layerState) in zip(layers, state.layers) {
+            layer.importState(layerState)
         }
     }
 }

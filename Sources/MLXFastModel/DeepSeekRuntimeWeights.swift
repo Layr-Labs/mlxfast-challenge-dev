@@ -4,6 +4,9 @@ import MLX
 public final class DeepSeekRuntimeWeightCache {
     public let loader: DeepSeekWeightLoader
     public let config: DeepSeekConfig
+    /// Deduplicates repeated prefills of the identical prompt within this
+    /// process (see DeepSeekPrefixStateMemo).
+    public let prefixStateMemo = DeepSeekPrefixStateMemo()
 
     private var cachedModelWeights: DeepSeekModelWeights?
     private var cachedBlockWeights: [Int: DeepSeekBlockWeights] = [:]

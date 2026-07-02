@@ -33,8 +33,20 @@ public final class ExpertLayerStager {
         }
     }
 
-    private let sideBank: ExpertSlotBank
+    /// One capacity-0 bank per concurrent record read. A layer plan stages at
+    /// most 9 records (3 projections x codes/scales/biases), and the large
+    /// code tensors dominate, so a handful of parallel sequential streams is
+    /// enough to move a layer at aggregate SSD bandwidth instead of one
+    /// stream's worth. Each bank is confined to a single in-flight read task.
+    private static let readerCount = 6
+
+    private let sideBanks: [ExpertSlotBank]
     private let queue = DispatchQueue(label: "mlxfast.expert.stager", qos: .userInitiated)
+    private let readQueue = DispatchQueue(
+        label: "mlxfast.expert.stager.reads",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
     private let condition = NSCondition()
     // All three guarded by `condition`.
     private var stagedBytesByRecordName: [String: Data] = [:]
@@ -43,14 +55,19 @@ public final class ExpertLayerStager {
     private var failedLayers: Set<Int> = []
 
     public init?(manifestPath: String, metrics: ExpertStreamingMetrics?) {
-        guard let bank = try? ExpertSlotBank(
-            manifestPath: manifestPath,
-            capacity: 0,
-            metrics: metrics
-        ) else {
-            return nil
+        var banks: [ExpertSlotBank] = []
+        banks.reserveCapacity(Self.readerCount)
+        for _ in 0..<Self.readerCount {
+            guard let bank = try? ExpertSlotBank(
+                manifestPath: manifestPath,
+                capacity: 0,
+                metrics: metrics
+            ) else {
+                return nil
+            }
+            banks.append(bank)
         }
-        self.sideBank = bank
+        self.sideBanks = banks
     }
 
     /// Enqueues background staging for a layer. Non-blocking, so callers can
@@ -108,15 +125,36 @@ public final class ExpertLayerStager {
         }
         pendingLayers.insert(plan.layerIndex)
         queue.async { [self] in
+            // Fan the layer's whole-tensor reads out across the reader banks
+            // so the ~1 GiB code tensors stream concurrently. The serial
+            // outer queue stages one layer at a time, so bank `i` is only
+            // ever used by one read task here.
+            let mergeLock = NSLock()
             var loaded: [String: Data] = [:]
             var succeeded = true
-            for name in plan.recordNames {
-                guard let tensor = try? sideBank.materializedTensor(named: name) else {
-                    succeeded = false
-                    break
+            let group = DispatchGroup()
+            let readerCount = min(sideBanks.count, plan.recordNames.count)
+            for readerIndex in 0..<readerCount {
+                group.enter()
+                let bank = sideBanks[readerIndex]
+                readQueue.async {
+                    defer { group.leave() }
+                    var recordIndex = readerIndex
+                    while recordIndex < plan.recordNames.count {
+                        let name = plan.recordNames[recordIndex]
+                        recordIndex += readerCount
+                        let bytes = (try? bank.materializedTensor(named: name))?.bytes
+                        mergeLock.lock()
+                        if let bytes {
+                            loaded[name] = bytes
+                        } else {
+                            succeeded = false
+                        }
+                        mergeLock.unlock()
+                    }
                 }
-                loaded[name] = tensor.bytes
             }
+            group.wait()
             condition.lock()
             pendingLayers.remove(plan.layerIndex)
             if succeeded {

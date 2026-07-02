@@ -105,6 +105,12 @@ public struct DeepSeekWeightLoader {
     public let residentExpertScales: ResidentExpertTensors?
     public let pinnedExpertCodes: ResidentExpertTensors?
     public let expertLayerStager: ExpertLayerStager?
+    public let expertReadPool: ExpertReadPool?
+    // Cross-step tensor LRU in front of the parallel pool; model-thread only.
+    // It reproduces the single-bank LRU's policy (same keys, same default
+    // capacity) that the parallel read path would otherwise lose. See
+    // ExpertTensorLRUCache for the accounting story.
+    let expertTensorCache: ExpertTensorLRUCache
     private let bridge: MLXArrayTensorBridge
 
     /// Sized for the official 48 GB runner: pin only where at least that
@@ -157,6 +163,13 @@ public struct DeepSeekWeightLoader {
             manifestPath: manifestPath,
             metrics: metrics
         )
+        self.expertReadPool = ExpertReadPool(
+            manifestPath: manifestPath,
+            metrics: metrics
+        )
+        self.expertTensorCache = ExpertTensorLRUCache(
+            capacity: expertStreamingConfig.tensorCacheCapacity
+        )
         self.bridge = bridge
     }
 
@@ -175,6 +188,8 @@ public struct DeepSeekWeightLoader {
         self.residentExpertScales = nil
         self.pinnedExpertCodes = nil
         self.expertLayerStager = nil
+        self.expertReadPool = nil
+        self.expertTensorCache = ExpertTensorLRUCache(capacity: 0)
         self.bridge = bridge
     }
 
@@ -278,7 +293,8 @@ public struct DeepSeekWeightLoader {
         candidates: [String],
         expectedShape: [Int],
         expertIndex: Int,
-        preferStaged: Bool = false
+        preferStaged: Bool = false,
+        prefetched: [String: MaterializedTensor] = [:]
     ) throws -> DeepSeekLinearWeight {
         for candidate in candidates {
             guard let record = expertBank.record(named: candidate) else {
@@ -296,6 +312,12 @@ public struct DeepSeekWeightLoader {
             } else if preferStaged, isStacked,
                let staged = stagedSliceTensor(recordName: candidate, expertIndex: expertIndex) {
                 tensor = staged
+            } else if let fetched = prefetched[
+                isStacked ? "\(candidate)[\(expertIndex)]" : candidate
+            ] {
+                // Produced by ExpertReadPool through its own metric-sharing
+                // banks; byte-identical to the bank reads below.
+                tensor = fetched
             } else if isStacked {
                 tensor = try expertBank.materializedTensor(named: candidate, firstAxisIndex: expertIndex)
             } else {
@@ -319,6 +341,11 @@ public struct DeepSeekWeightLoader {
                        ) {
                         return staged
                     }
+                    if let fetched = prefetched[
+                        shouldSlice ? "\(companionName)[\(expertIndex)]" : companionName
+                    ] {
+                        return fetched
+                    }
                     guard expertBank.record(named: companionName) != nil else {
                         return nil
                     }
@@ -332,6 +359,86 @@ public struct DeepSeekWeightLoader {
         throw MLXFastError.invalidInput(
             "expert tensor not found; tried \(candidates.joined(separator: ", "))"
         )
+    }
+
+    /// Resolves every streamed byte range the per-expert weight builds below
+    /// would read for `expertIndices` and fetches them concurrently through
+    /// the read pool. RAM-resident tensors (pinned hash-layer codes, resident
+    /// scales) are skipped exactly as `expertLinearWeight` skips them. The
+    /// result feeds `expertLinearWeight(prefetched:)`; any request the pool
+    /// failed to read is simply absent and falls back to the main-bank path.
+    public func parallelExpertTensors(
+        layerIndex: Int,
+        expertIndices: [Int]
+    ) -> [String: MaterializedTensor] {
+        guard let pool = expertReadPool else {
+            return [:]
+        }
+        var seen = Set<Int>()
+        var requests: [ExpertReadPool.Request] = []
+        requests.reserveCapacity(expertIndices.count * 6)
+        for expertIndex in expertIndices where seen.insert(expertIndex).inserted {
+            for projection in [DeepSeekExpertProjection.gate, .up, .down] {
+                let candidates = DeepSeekWeightNames.routedExpert(
+                    layerIndex: layerIndex,
+                    expertIndex: expertIndex,
+                    projection: projection
+                )
+                // First matching candidate wins, mirroring expertLinearWeight.
+                guard let candidate = candidates.first(
+                    where: { expertBank.record(named: $0) != nil }
+                ), let record = expertBank.record(named: candidate) else {
+                    continue
+                }
+                let isStacked = record.shape.count == 3
+                    && record.shape.first.map { expertIndex < $0 } == true
+                let sliceIndex = isStacked ? expertIndex : nil
+                if pinnedExpertCodes?.isResident(name: candidate) != true {
+                    requests.append(
+                        ExpertReadPool.Request(recordName: candidate, expertIndex: sliceIndex)
+                    )
+                }
+                guard record.dtype == "U32" else {
+                    continue
+                }
+                for suffix in ["scales", "biases"] {
+                    let companion = companionName(for: candidate, suffix: suffix)
+                    guard expertBank.record(named: companion) != nil else {
+                        continue
+                    }
+                    if residentExpertScales?.isResident(name: companion) == true {
+                        continue
+                    }
+                    requests.append(
+                        ExpertReadPool.Request(recordName: companion, expertIndex: sliceIndex)
+                    )
+                }
+            }
+        }
+
+        // Serve repeats from the cross-step LRU first (same keys and policy
+        // the single-bank cache used), then fetch only true misses in
+        // parallel and remember them for future steps.
+        var results: [String: MaterializedTensor] = [:]
+        results.reserveCapacity(requests.count)
+        var misses: [ExpertReadPool.Request] = []
+        misses.reserveCapacity(requests.count)
+        for request in requests {
+            if let cached = expertTensorCache.lookup(request.cacheKey) {
+                results[request.cacheKey] = cached
+            } else {
+                misses.append(request)
+            }
+        }
+        guard !misses.isEmpty else {
+            return results
+        }
+        let fetched = pool.materializedTensors(misses)
+        for (key, tensor) in fetched {
+            results[key] = tensor
+            expertTensorCache.insert(key, tensor)
+        }
+        return results
     }
 
     /// Stacked expert record names for one layer, for whole-tensor staging:

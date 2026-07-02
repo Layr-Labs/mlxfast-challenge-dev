@@ -83,15 +83,50 @@ public enum DeepSeekRoutedExperts {
                 loader.expertLayerStager?.releaseLayer(spec.layerIndex)
             }
         }
+        // On the streaming path, read every selected expert's tensors through
+        // the concurrent pool before the per-expert loop: the SSD then serves
+        // the layer's byte ranges at high queue depth instead of one blocking
+        // pread at a time on this thread. Weights built below consult this
+        // dictionary first; anything missing falls back to the original
+        // single-threaded bank read.
+        var prefetchedTensors: [String: MaterializedTensor] = [:]
         if !useStaged {
-            // Kernel read-ahead for every byte range this layer is about to
-            // pread, so SSD I/O overlaps the per-expert GPU compute below.
-            loader.expertPrefetcher.prefetch(layerIndex: spec.layerIndex, expertIndices: selectedExperts)
+            prefetchedTensors = loader.parallelExpertTensors(
+                layerIndex: spec.layerIndex,
+                expertIndices: selectedExperts
+            )
+            if prefetchedTensors.isEmpty {
+                // Pool unavailable: keep the kernel read-ahead advisories so
+                // SSD I/O still overlaps the per-expert GPU compute below.
+                loader.expertPrefetcher.prefetch(
+                    layerIndex: spec.layerIndex,
+                    expertIndices: selectedExperts
+                )
+            }
         }
 
         let outputCount = tokenCount * topK
         guard outputCount > 0 else {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
+        }
+
+        // Decode fast path: one token, topK activations. Stack each
+        // projection's per-activation expert weights and run ONE gather-
+        // quantized matmul per projection instead of topK separate quantized
+        // matmuls plus per-expert gather/scatter. gatherQuantizedMM computes
+        // the identical per-row quantized dot products as quantizedMM, so
+        // this only removes kernel-launch and graph overhead. Any shape or
+        // quantization irregularity falls back to the general path below.
+        if tokenCount == 1, !useStaged,
+           let output = try batchedSingleTokenForward(
+               x: x,
+               selectedExperts: selectedExperts,
+               loader: loader,
+               spec: spec,
+               prefetched: prefetchedTensors
+           )
+        {
+            return output.reshaped([batchSize, sequenceLength, topK, hiddenSize])
         }
 
         // Group activation flat-indices by expert so each expert runs one batched
@@ -118,7 +153,8 @@ public enum DeepSeekRoutedExperts {
                 forExpert: expertIndex,
                 loader: loader,
                 spec: spec,
-                preferStaged: useStaged
+                preferStaged: useStaged,
+                prefetched: prefetchedTensors
             )
             let tokenRows = flatIndices.map { Int32($0 / topK) }
             let tokens = xFlat.take(MLXArray(tokenRows), axis: 0)
@@ -145,11 +181,119 @@ public enum DeepSeekRoutedExperts {
         return ordered.reshaped([batchSize, sequenceLength, topK, hiddenSize])
     }
 
+    /// Single-token routed MoE with one gatherQuantizedMM per projection.
+    /// Returns nil when the per-activation weights are not uniformly
+    /// quantized (mode/groupSize/bits/shape), in which case the caller keeps
+    /// the per-expert loop.
+    private static func batchedSingleTokenForward(
+        x: MLXArray,
+        selectedExperts: [Int],
+        loader: DeepSeekWeightLoader,
+        spec: DeepSeekRoutedExpertSpec,
+        prefetched: [String: MaterializedTensor]
+    ) throws -> MLXArray? {
+        var gateWeights: [DeepSeekLinearWeight] = []
+        var upWeights: [DeepSeekLinearWeight] = []
+        var downWeights: [DeepSeekLinearWeight] = []
+        gateWeights.reserveCapacity(selectedExperts.count)
+        upWeights.reserveCapacity(selectedExperts.count)
+        downWeights.reserveCapacity(selectedExperts.count)
+        for expertIndex in selectedExperts {
+            let expertWeights = try weights(
+                forExpert: expertIndex,
+                loader: loader,
+                spec: spec,
+                prefetched: prefetched
+            )
+            gateWeights.append(expertWeights.gate)
+            upWeights.append(expertWeights.up)
+            downWeights.append(expertWeights.down)
+        }
+
+        guard
+            let gate = stackedQuantizedWeight(gateWeights),
+            let up = stackedQuantizedWeight(upWeights),
+            let down = stackedQuantizedWeight(downWeights)
+        else {
+            return nil
+        }
+
+        // x is [1, 1, hidden]; per-activation rows come out as
+        // [topK, 1, intermediate].
+        let xIn = x.reshaped([1, 1, spec.hiddenSize])
+        let rhsIndices = MLXArray((0..<Int32(selectedExperts.count)).map { $0 })
+        let gateOut = gatherQuantizedMM(
+            xIn, gate.weight, scales: gate.scales, biases: gate.biases,
+            rhsIndices: rhsIndices,
+            transpose: true, groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode,
+            sortedIndices: true
+        )
+        let upOut = gatherQuantizedMM(
+            xIn, up.weight, scales: up.scales, biases: up.biases,
+            rhsIndices: rhsIndices,
+            transpose: true, groupSize: up.groupSize, bits: up.bits, mode: up.mode,
+            sortedIndices: true
+        )
+        let hidden = DeepSeekOps.limitedSwiGLU(
+            gate: gateOut,
+            up: upOut,
+            limit: spec.swigluLimit
+        )
+        // Row i of `hidden` multiplies activation i's own down matrix.
+        let downOut = gatherQuantizedMM(
+            hidden, down.weight, scales: down.scales, biases: down.biases,
+            rhsIndices: rhsIndices,
+            transpose: true, groupSize: down.groupSize, bits: down.bits, mode: down.mode,
+            sortedIndices: true
+        )
+        return downOut
+    }
+
+    private struct StackedQuantizedWeight {
+        let weight: MLXArray
+        let scales: MLXArray
+        let biases: MLXArray?
+        let groupSize: Int
+        let bits: Int
+        let mode: QuantizationMode
+    }
+
+    private static func stackedQuantizedWeight(
+        _ weights: [DeepSeekLinearWeight]
+    ) -> StackedQuantizedWeight? {
+        guard let first = weights.first, first.isQuantized, let firstScales = first.scales else {
+            return nil
+        }
+        let hasBiases = first.biases != nil
+        for weight in weights {
+            guard
+                weight.isQuantized,
+                weight.groupSize == first.groupSize,
+                weight.bits == first.bits,
+                weight.mode == first.mode,
+                weight.weight.shape == first.weight.shape,
+                weight.scales?.shape == firstScales.shape,
+                (weight.biases != nil) == hasBiases
+            else {
+                return nil
+            }
+        }
+        return StackedQuantizedWeight(
+            weight: stacked(weights.map { $0.weight }, axis: 0),
+            scales: stacked(weights.compactMap { $0.scales }, axis: 0),
+            biases: hasBiases ? stacked(weights.compactMap { $0.biases }, axis: 0) : nil,
+            groupSize: first.groupSize,
+            bits: first.bits,
+            mode: first.mode
+        )
+    }
+
     public static func weights(
         forExpert expertIndex: Int,
         loader: DeepSeekWeightLoader,
         spec: DeepSeekRoutedExpertSpec,
-        preferStaged: Bool = false
+        preferStaged: Bool = false,
+        prefetched: [String: MaterializedTensor] = [:]
     ) throws -> DeepSeekMLPWeights {
         try DeepSeekMLPWeights(
             gate: loader.expertLinearWeight(
@@ -160,7 +304,8 @@ public enum DeepSeekRoutedExperts {
                 ),
                 expectedShape: [spec.intermediateSize, spec.hiddenSize],
                 expertIndex: expertIndex,
-                preferStaged: preferStaged
+                preferStaged: preferStaged,
+                prefetched: prefetched
             ),
             up: loader.expertLinearWeight(
                 candidates: DeepSeekWeightNames.routedExpert(
@@ -170,7 +315,8 @@ public enum DeepSeekRoutedExperts {
                 ),
                 expectedShape: [spec.intermediateSize, spec.hiddenSize],
                 expertIndex: expertIndex,
-                preferStaged: preferStaged
+                preferStaged: preferStaged,
+                prefetched: prefetched
             ),
             down: loader.expertLinearWeight(
                 candidates: DeepSeekWeightNames.routedExpert(
@@ -180,7 +326,8 @@ public enum DeepSeekRoutedExperts {
                 ),
                 expectedShape: [spec.hiddenSize, spec.intermediateSize],
                 expertIndex: expertIndex,
-                preferStaged: preferStaged
+                preferStaged: preferStaged,
+                prefetched: prefetched
             )
         )
     }

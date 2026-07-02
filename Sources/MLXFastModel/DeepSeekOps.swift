@@ -89,6 +89,33 @@ public enum DeepSeekOps {
             )
         }
         let outputDimensions = weight.logicalShape[1]
+
+        // Batch-1 fast path: all groups in ONE gatherQuantizedMM against the
+        // weight reshaped to [groups, outputDim, packed] (a contiguous view,
+        // no copy). gatherQuantizedMM computes the identical per-row
+        // quantized dot products as the per-group quantizedMM loop below at
+        // both decode (M=1) and prefill (M=512) shapes, so this only removes
+        // per-group kernel launches, slices, and the concat.
+        if input.shape[0] == 1, let scales = weight.scales {
+            let packedInput = weight.weight.shape[weight.weight.shape.count - 1]
+            let scaleGroups = scales.shape[scales.shape.count - 1]
+            let grouped = gatherQuantizedMM(
+                input.squeezed(axis: 0),
+                weight.weight.reshaped([groupCount, outputDimensions, packedInput]),
+                scales: scales.reshaped([groupCount, outputDimensions, scaleGroups]),
+                biases: weight.biases.map {
+                    $0.reshaped([groupCount, outputDimensions, scaleGroups])
+                },
+                rhsIndices: MLXArray((0..<Int32(groupCount)).map { $0 }),
+                transpose: true,
+                groupSize: weight.groupSize,
+                bits: weight.bits,
+                mode: weight.mode,
+                sortedIndices: true
+            )
+            return grouped.expandedDimensions(axis: 0)
+        }
+
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(groupCount)
         for groupIndex in 0..<groupCount {
