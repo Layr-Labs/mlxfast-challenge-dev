@@ -610,6 +610,24 @@ func sanitizedRuntimeWorkerEnvironment(_ environment: [String: String]) -> [Stri
         "ANTHROPIC_API_KEY",
         "CI",
         "MLXFAST_ANTHROPIC_PRESENT",
+        // The gates/timing parallel split reads these three to decide which
+        // half of the original single-machine run this process covers. On one
+        // machine, decode/prefill was ALWAYS timed at the same time gates were
+        // checked, so there was no way for submitted code to tell "my speed
+        // doesn't count right now" from "my correctness doesn't count right
+        // now" -- these vars make exactly that distinction newly observable,
+        // so they must be blocked the same way MLXFAST_RUN_BENCHMARK already is.
+        "MLXFAST_BENCHMARK_CHECK_GATES",
+        "MLXFAST_BENCHMARK_CORRECTNESS_STEPS",
+        "MLXFAST_BENCHMARK_SKIP_TIMED",
+        // The env-var forms of --base-case-only/--step-range are the slice
+        // machines' equivalents of the three split-phase vars above: they let
+        // submitted code detect "I am an unscored correctness slice checking
+        // exactly steps N-M". Latent today (the slice workflow passes flags,
+        // not env), but an operator using the documented env form must not
+        // reopen the side channel.
+        "MLXFAST_CORRECTNESS_BASE_CASE_ONLY",
+        "MLXFAST_CORRECTNESS_STEP_RANGE",
         "MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER",
         "MLXFAST_CORRECTNESS_GOLDEN_PATH",
         "MLXFAST_CORRECTNESS_GOLDEN_URL",

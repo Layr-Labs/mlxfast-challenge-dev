@@ -24,7 +24,7 @@ extension DeepSeekRuntime {
             "setup.sh",
             "tools",
             "README.md",
-            "CHALLENGE.md",
+            "TASK.md",
         ]
         var files: [String] = []
         for root in roots {

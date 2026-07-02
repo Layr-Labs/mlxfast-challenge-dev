@@ -61,6 +61,16 @@ extension DeepSeekRuntime {
         if let worker {
             return runCorrectnessWithWorker(options, worker: worker)
         }
+        // Both stepStart and stepCount are worker-only: the non-worker path below
+        // always checks the full [0, correctnessSteps) window and has no way to honor
+        // either an explicit start or an explicit count, so any explicit request for
+        // either must fail loudly rather than silently run the full window.
+        guard options.stepStart == 0, options.stepCount == nil else {
+            throw MLXFastError.invalidInput(
+                "correctness step ranges (--step-range) require the runtime worker; "
+                    + "rerun with the worker enabled or omit --step-range"
+            )
+        }
 
         var loadedGolden: GoldenFixture?
         var loader: DeepSeekWeightLoader?
@@ -82,7 +92,8 @@ extension DeepSeekRuntime {
             return runLayeredCorrectness(
                 golden: golden,
                 weightCache: weightCache,
-                steps: MLXFastConstants.correctnessSteps
+                steps: MLXFastConstants.correctnessSteps,
+                checkGates: !options.baseCaseOnly
             )
         } catch {
             return failedCorrectnessReport(
@@ -103,6 +114,15 @@ extension DeepSeekRuntime {
         var lastExpertStats = ExpertStreamingStats.zero
         var checkedSteps = 0
         do {
+            let stepCount = options.stepCount ?? MLXFastConstants.correctnessSteps
+            guard options.stepStart >= 0, stepCount > 0,
+                  options.stepStart + stepCount <= MLXFastConstants.correctnessSteps
+            else {
+                throw MLXFastError.invalidInput(
+                    "correctness step range [\(options.stepStart), \(options.stepStart + stepCount)) "
+                        + "must fall within [0, \(MLXFastConstants.correctnessSteps))"
+                )
+            }
             try requireFile(options.goldenPath, description: "correctness golden file")
             let golden = try loadGoldenFixture(from: options.goldenPath)
             loadedGolden = golden
@@ -120,7 +140,9 @@ extension DeepSeekRuntime {
             let result = runLayeredCorrectnessWithWorker(
                 golden: golden,
                 worker: worker,
-                steps: MLXFastConstants.correctnessSteps
+                steps: options.stepCount ?? MLXFastConstants.correctnessSteps,
+                startStep: options.stepStart,
+                checkGates: !options.baseCaseOnly
             )
             checkedSteps = result.report.checkedSteps
             lastExpertStats = result.expertStats
@@ -182,9 +204,15 @@ extension DeepSeekRuntime {
         golden: GoldenFixture,
         weightCache: DeepSeekRuntimeWeightCache,
         steps: Int = MLXFastConstants.correctnessSteps,
+        checkGates: Bool = true,
         progress: ((String) -> Void)? = nil
     ) -> CorrectnessReport {
-        let caseCount = golden.totalCorrectnessCaseCount
+        // checkGates: false skips anchors/free-run/behavior entirely and reports
+        // caseCount/checkedSteps for golden.cases alone -- for a machine assigned only
+        // a slice of the base case, so its checked_steps total is comparable across
+        // machines instead of being inflated by however many gates the golden happens
+        // to carry (which a step-range coverage check would otherwise miscount).
+        let caseCount = checkGates ? golden.totalCorrectnessCaseCount : golden.cases.count
         var checkedSteps = 0
         var currentCase: String?
 
@@ -218,6 +246,12 @@ extension DeepSeekRuntime {
             for (caseIndex, testCase) in golden.cases.enumerated() {
                 currentCase = testCase.name
                 let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
+                // See the matching guard in runLayeredCorrectnessWithWorker: steps == 0
+                // intentionally skips the base case for this run.
+                guard steps > 0 else {
+                    progress?("correctness case \(caseLabel) skipped (steps=0)")
+                    continue
+                }
                 progress?("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
                 let comparison = try compareTeacherForcedCached(
                     testCase: testCase,
@@ -240,7 +274,7 @@ extension DeepSeekRuntime {
                 checkedSteps += comparison.checkedSteps
             }
 
-            let gates = golden.correctnessGates
+            let gates = checkGates ? golden.correctnessGates : nil
             for (caseIndex, anchor) in (gates?.anchorCases ?? []).enumerated() {
                 currentCase = anchor.name
                 let caseLabel = "\(caseIndex + 1)/\(gates?.anchorCases.count ?? 0)"
@@ -338,10 +372,14 @@ extension DeepSeekRuntime {
         golden: GoldenFixture,
         worker: RuntimeWorkerClient,
         steps: Int = MLXFastConstants.correctnessSteps,
+        startStep: Int = 0,
+        checkGates: Bool = true,
         semanticCapture: SemanticGPQACaptureOptions? = nil,
         progress: ((String) -> Void)? = nil
     ) -> WorkerLayeredCorrectnessResult {
-        let caseCount = golden.totalCorrectnessCaseCount
+        // checkGates: false skips anchors/free-run/behavior/GPQA entirely -- see the
+        // matching comment on runLayeredCorrectness.
+        let caseCount = checkGates ? golden.totalCorrectnessCaseCount : golden.cases.count
         var checkedSteps = 0
         var currentCase: String?
         var lastExpertStats = ExpertStreamingStats.zero
@@ -396,11 +434,22 @@ extension DeepSeekRuntime {
             for (caseIndex, testCase) in golden.cases.enumerated() {
                 currentCase = testCase.name
                 let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
+                // steps == 0 means this run intentionally does not verify the base
+                // teacher-forced case itself -- e.g. a machine that only runs GPQA/TTFT/
+                // timing while a separate fleet of machines verifies the base case in
+                // parallel slices. Skipping here does NOT mean correctness was checked;
+                // callers relying on split verification must independently combine each
+                // slice's real result before trusting an overall pass.
+                guard steps > 0 else {
+                    progress?("correctness case \(caseLabel) skipped (steps=0)")
+                    continue
+                }
                 progress?("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
                 let check = try compareTeacherForcedWithWorker(
                     testCase: testCase,
                     worker: worker,
                     steps: steps,
+                    startStep: startStep,
                     progressIntervalSteps: 64,
                     progress: { step, total in
                         progress?("correctness case \(caseLabel) checked \(step)/\(total) tokens")
@@ -420,7 +469,7 @@ extension DeepSeekRuntime {
                 progress?("correctness case \(caseLabel) complete checked_steps=\(check.comparison.checkedSteps)")
             }
 
-            let gates = golden.correctnessGates
+            let gates = checkGates ? golden.correctnessGates : nil
             for (caseIndex, anchor) in (gates?.anchorCases ?? []).enumerated() {
                 currentCase = anchor.name
                 let caseLabel = "\(caseIndex + 1)/\(gates?.anchorCases.count ?? 0)"
@@ -497,7 +546,13 @@ extension DeepSeekRuntime {
                 checkedSteps += check.comparison.checkedSteps
                 progress?("correctness behavior \(caseLabel) complete checked_steps=\(check.comparison.checkedSteps)")
             }
-            if let semanticCapture {
+            // checkGates false means the behavior loop above never ran (a
+            // "timing-only" machine, correctness/gates split elsewhere), so
+            // semanticAnswers is always empty here regardless of caseCount --
+            // that is not a capture failure, there was simply nothing to
+            // capture on this machine, and enforcing the count would turn a
+            // valid timing-only run into a spurious hard failure.
+            if checkGates, let semanticCapture {
                 guard semanticAnswers.count == semanticCapture.caseCount else {
                     throw MLXFastError.invalidInput(
                         "captured \(semanticAnswers.count) semantic GPQA answers; expected \(semanticCapture.caseCount)"
