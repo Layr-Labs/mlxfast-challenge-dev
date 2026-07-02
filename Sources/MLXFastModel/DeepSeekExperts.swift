@@ -114,7 +114,7 @@ public enum DeepSeekRoutedExperts {
         // ranges), so the per-expert loop below builds its MLXArrays from
         // already-fetched bytes instead of serializing on each pread. Anything
         // not prefetched falls back to the normal per-expert bank read.
-        var decodePrefetch: [String: MaterializedTensor]?
+        var decodePrefetch: [String: StagedExpertCode]?
         if tokenCount == 1, !useStaged {
             decodePrefetch = loader.prefetchDecodeExpertCodes(
                 layerIndex: spec.layerIndex,
@@ -167,7 +167,7 @@ public enum DeepSeekRoutedExperts {
         loader: DeepSeekWeightLoader,
         spec: DeepSeekRoutedExpertSpec,
         preferStaged: Bool = false,
-        decodePrefetch: [String: MaterializedTensor]? = nil
+        decodePrefetch: [String: StagedExpertCode]? = nil
     ) throws -> DeepSeekMLPWeights {
         try DeepSeekMLPWeights(
             gate: loader.expertLinearWeight(
