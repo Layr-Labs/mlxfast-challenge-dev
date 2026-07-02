@@ -104,6 +104,8 @@ public struct DeepSeekModelSpec: Equatable {
 }
 
 public enum DeepSeekModel {
+    // Value-identical to the promoted frontier; used to distinguish a runner
+    // infrastructure failure from a submission-specific one.
     public static func logits(
         inputIDs: MLXArray,
         loader: DeepSeekWeightLoader,
