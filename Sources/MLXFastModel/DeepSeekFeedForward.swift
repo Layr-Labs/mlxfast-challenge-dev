@@ -115,16 +115,25 @@ public enum DeepSeekMoE {
             normTopKProb: spec.normTopKProb,
             scoring: spec.scoring
         )
-        let routed = try DeepSeekRoutedExperts.forward(
-            x,
-            expertIndices: routing.indices,
-            loader: loader,
-            spec: spec.routedExperts
-        )
+        // Build the shared-expert graph up front. It depends only on x and the
+        // RAM-resident shared weights (no SSD read), so at decode it is the one
+        // piece of GPU work that can fill the GPU-idle window while the routed
+        // experts' codes stream in from SSD. The routed forward evals it (via
+        // asyncEval) right after its routing sync, so it overlaps those reads.
         let shared = DeepSeekMLP.forward(
             x,
             weights: weights.sharedExperts,
             swigluLimit: spec.routedExperts.swigluLimit
+        )
+        let overlapShared = (x.shape[0] * x.shape[1]) == 1
+            ? { asyncEval(shared) }
+            : nil
+        let routed = try DeepSeekRoutedExperts.forward(
+            x,
+            expertIndices: routing.indices,
+            loader: loader,
+            spec: spec.routedExperts,
+            onRoutingSynced: overlapShared
         )
         return combine(
             routedExpertOutput: routed,

@@ -35,7 +35,8 @@ public enum DeepSeekRoutedExperts {
         _ x: MLXArray,
         expertIndices: MLXArray,
         loader: DeepSeekWeightLoader,
-        spec: DeepSeekRoutedExpertSpec
+        spec: DeepSeekRoutedExpertSpec,
+        onRoutingSynced: (() -> Void)? = nil
     ) throws -> MLXArray {
         guard x.shape.count == 3 else {
             throw MLXFastError.invalidInput("routed expert input must have shape [batch, length, hidden]")
@@ -76,6 +77,12 @@ public enum DeepSeekRoutedExperts {
         }
 
         let selectedExperts = expertIndices.asArray(Int32.self).map(Int.init)
+        // Routing is now materialized on the host; the GPU would otherwise sit
+        // idle while the compute thread blocks on the expert SSD reads below.
+        // Kick off any independent GPU work (the shared expert) now so it
+        // overlaps those reads instead of running after them. Value-identical:
+        // same graph, only the eval timing changes.
+        onRoutingSynced?()
         let useStaged = stagingScheduled
             && loader.expertLayerStager?.waitForLayer(spec.layerIndex) == true
         defer {
