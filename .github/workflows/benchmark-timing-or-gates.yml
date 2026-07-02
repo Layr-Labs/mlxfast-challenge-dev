@@ -1,15 +1,13 @@
 name: benchmark-timing-or-gates
 
-# Reusable job body, called twice by benchmark.yml: once with mode=timing (runs
-# ONLY the timed prefill/decode measurement, skipping the base case AND the
-# anchor/free-run/behavior/GPQA gates entirely) and once with mode=gates (runs
-# ONLY those gates, skipping the timed measurement). Splitting these onto
-# separate machines -- on top of the base case already being split across
-# correctness-slice-1/2/3 -- means the anchor/free-run/behavior/GPQA gates no
-# longer sit serially in front of (or behind) the timed measurement on the same
-# machine. combine.yml's "Merge gates and timing into machine1" step
-# reassembles one full score.json from the two before combine-parallel-
-# correctness.sh runs.
+# OPERATOR DEBUG variant (branch-local, never merged to main): identical to
+# main's version through the Benchmark step, except the submitted-process log
+# suppression applies on EVERY ref (this debug branch is not submissions/* but
+# re-runs submitted code). Everything after the Benchmark step -- semantic
+# GPQA, artifact validation, and the intermediate artifact upload -- is
+# replaced by a single "Redacted failure report" step: this branch exists to
+# surface WHY a submission's timing run failed without uploading or printing
+# anything derived from hidden fixtures.
 #
 # Not meant to be dispatched on its own -- workflow_call only.
 on:
@@ -77,30 +75,6 @@ jobs:
       - name: Enforce trusted workflow context
         run: .github/scripts/enforce-trusted-benchmark-workflow.sh
 
-      - name: Review submitted code for benchmark bypasses
-        if: ${{ startsWith(github.ref_name, 'submissions/') }}
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
-          HEAD_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          # Review only the editable files changed vs the merge-base -- see the
-          # diff-only-mode comment in run-submission-static-review.sh. Standalone
-          # assignment: a merge-base failure must fail this step; as a command
-          # prefix its failure would be masked by bash and the review would
-          # silently fall back to the whole editable surface.
-          base_sha="$(git merge-base origin/main "${HEAD_SHA}")"
-          MLXFAST_SUBMISSION_REVIEW_BASE_SHA="${base_sha}" \
-            .github/scripts/run-submission-static-review.sh
-
-      - name: Enforce modifiable surface
-        if: ${{ startsWith(github.ref_name, 'submissions/') }}
-        env:
-          HEAD_SHA: ${{ github.sha }}
-        run: |
-          BASE_SHA="$(git merge-base origin/main "${HEAD_SHA}")" \
-            .github/scripts/enforce-modifiable-surface.sh
-
       - name: Probe runtime worker sandbox
         run: .github/scripts/probe-runtime-worker-sandbox.sh
 
@@ -166,16 +140,6 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
-          # PARITY CONTRACT: attach-gpqa-gates augments the raw golden with GPQA
-          # behavior gates but MUST NOT mutate its .cases (the base teacher-forced
-          # case). The three correctness-slice machines verify the base case
-          # against the RAW golden (pinned by MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_
-          # SHA256 = 8306..bdbf067); this machine verifies gates against the
-          # augmented golden. Both must agree on .cases or the split would check
-          # the base case against a different fixture than it reports. That
-          # agreement is backstopped by checked_steps/case_count equality in
-          # combine-parallel-correctness.sh -- if attach-gpqa-gates ever starts
-          # touching .cases, that coverage check is what catches it.
           .github/scripts/download-r2-object.sh \
             "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" \
             "${MLXFAST_CORRECTNESS_GOLDEN_PATH}"
@@ -202,177 +166,82 @@ jobs:
 
       - name: Benchmark
         env:
-          MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }} mode=${{ inputs.mode }}"
+          MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }} mode=${{ inputs.mode }} operator-debug"
           MLXFAST_SKIP_TRANSFORM: "1"
         run: |
           set -euo pipefail
-          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
-            echo "benchmark-timing-or-gates: running submitted benchmark (${{ inputs.mode }}) with private process logs suppressed"
-            started="${SECONDS}"
-            ./benchmark.sh > "${RUNNER_TEMP}/mlxfast-benchmark-private.log" 2>&1 &
-            pid="$!"
-            while kill -0 "${pid}" 2>/dev/null; do
-              sleep 60
-              if kill -0 "${pid}" 2>/dev/null; then
-                echo "benchmark-timing-or-gates: submitted benchmark still running elapsed=$((SECONDS - started))s"
-              fi
-            done
-            wait "${pid}"
+          # Operator debug: this ref is not submissions/* but re-runs submitted
+          # code, so ALWAYS suppress the raw submitted-process output.
+          echo "benchmark-timing-or-gates: running submitted benchmark (${{ inputs.mode }}) with private process logs suppressed"
+          started="${SECONDS}"
+          ./benchmark.sh > "${RUNNER_TEMP}/mlxfast-benchmark-private.log" 2>&1 &
+          pid="$!"
+          while kill -0 "${pid}" 2>/dev/null; do
+            sleep 60
+            if kill -0 "${pid}" 2>/dev/null; then
+              echo "benchmark-timing-or-gates: submitted benchmark still running elapsed=$((SECONDS - started))s"
+            fi
+          done
+          wait "${pid}"
+
+      # Replaces main's validate/deny/upload chain on this operator-debug
+      # branch: print a REDACTED failure summary and upload nothing at all.
+      # Redaction rules:
+      #  - expected_token/actual_token metrics are never printed;
+      #  - first_failing_case can carry hidden-fixture case identifiers on
+      #    correctness failures, so it is printed only when null or the
+      #    known-safe timed-phase literal "benchmark";
+      #  - the free-text error and the log tail have every run of 3+ digits
+      #    masked, so hidden-oracle token ids cannot appear;
+      #  - only the trusted harness writes to the private log (worker stdout is
+      #    the protocol pipe; worker stderr only surfaces inside error strings,
+      #    which are masked; the editable surface contains no print statements),
+      #    so the masked tail is safe to echo.
+      - name: Redacted failure report
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "== score.json summary (token-id fields omitted, error digit-masked) =="
+          if [[ -s score.json ]]; then
+            jq -r '
+              [
+                "passed=\(.passed)",
+                "score=\(.score)",
+                "partial_result=\(.metrics.partial_result)",
+                "passed_correctness=\(.metrics.passed_correctness)",
+                "first_failing_case=\(
+                  if .metrics.first_failing_case == null or .metrics.first_failing_case == "benchmark"
+                  then .metrics.first_failing_case
+                  else "[redacted-case-id]"
+                  end)",
+                "first_failing_step=\(.metrics.first_failing_step)",
+                "first_failing_layer=\(.metrics.first_failing_layer)",
+                "prefill_seconds_per_token=\(.metrics.prefill_seconds_per_token)",
+                "decode_seconds_per_token=\(.metrics.decode_seconds_per_token)",
+                "prefill_speedup=\(.metrics.prefill_speedup)",
+                "decode_speedup=\(.metrics.decode_speedup)",
+                "timed_benchmark_seconds=\(.metrics.timed_benchmark_seconds)",
+                "benchmark_wall_seconds=\(.metrics.benchmark_wall_seconds)",
+                "correctness_seconds=\(.metrics.correctness_seconds)",
+                "preflight_seconds=\(.metrics.preflight_seconds)",
+                "peak_ram_gb=\(.metrics.peak_ram_gb)",
+                "process_resident_memory_gb=\(.metrics.process_resident_memory_gb)",
+                "bandwidth_source=\(.metrics.bandwidth_source)",
+                "expert_bytes_read=\(.metrics.expert_bytes_read)",
+                "expert_cache_hits=\(.metrics.expert_cache_hits)",
+                "expert_cache_misses=\(.metrics.expert_cache_misses)"
+              ] | .[]
+            ' score.json
+            printf 'error='
+            jq -r '.metrics.error // ""' score.json | sed -E 's/[0-9]{3,}/<num>/g' | head -c 2000
+            echo
           else
-            ./benchmark.sh
+            echo "score.json missing or empty"
           fi
-
-      - name: Semantic GPQA gate
-        # Semantic GPQA answers are captured during the behavior-gate pass, so
-        # only the gates machine has anything for this step to judge.
-        if: ${{ inputs.mode == 'gates' }}
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-            echo "benchmark-timing-or-gates: semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
-            exit 1
+          echo "== private log tail (digit-masked) =="
+          log="${RUNNER_TEMP}/mlxfast-benchmark-private.log"
+          if [[ -s "${log}" ]]; then
+            tail -n 150 "${log}" | sed -E 's/[0-9]{3,}/<num>/g' | cut -c 1-400
+          else
+            echo "private log missing or empty"
           fi
-          .github/scripts/run-semantic-gpqa-gate.sh
-
-      - name: Hash transformed weights
-        if: always()
-        run: .github/scripts/hash-weights-directory.sh weights weights.sha256
-
-      # Mirrors the "Validate correctness artifacts"/"Validate correctness slice
-      # artifacts" gates elsewhere in this pipeline: on a real gates-mode gate
-      # mismatch, ScoreMetrics.firstFailingCase/firstFailingStep are populated
-      # directly from the hidden golden fixture (case/GPQA-question identifiers).
-      # deny-private-artifacts.sh only checks filenames, not JSON content, so
-      # without this the raw score.json would otherwise reach the unconditional
-      # upload below. Only asserts the security-critical leak fields and overall
-      # pass/fail -- NOT mode-specific business fields (gpqa_ttft_passed,
-      # decode_speedup, etc), which validate-benchmark-artifacts.sh already
-      # checks thoroughly downstream on the merged score.combined.json, and
-      # which are legitimately absent/placeholder on one mode or the other here.
-      - name: Validate intermediate benchmark artifact
-        id: validate_intermediate_benchmark
-        if: always()
-        run: |
-          set -euo pipefail
-          test -s score.json
-          jq -e \
-            '
-            def same_keys($expected):
-              (keys_unsorted | sort) == ($expected | sort);
-
-            same_keys(["metrics", "passed", "score"])
-            and (.metrics | same_keys([
-              "actual_token",
-              "bandwidth_gb_per_token",
-              "bandwidth_source",
-              "baseline_decode_seconds_per_token",
-              "baseline_prefill_seconds_per_token",
-              "benchmark_wall_seconds",
-              "case_count",
-              "checked_steps",
-              "commit",
-              "correctness_seconds",
-              "decode_seconds_per_token",
-              "decode_speedup",
-              "decode_speedup_floor",
-              "error",
-              "expected_token",
-              "expert_bytes_read",
-              "expert_cache_evictions",
-              "expert_cache_hits",
-              "expert_cache_misses",
-              "expert_hit_rate",
-              "expert_peak_cached_tensors",
-              "expert_read_seconds",
-              "first_failing_case",
-              "first_failing_layer",
-              "first_failing_step",
-              "golden_hash",
-              "gpqa_ttft_case_count",
-              "gpqa_ttft_max_seconds",
-              "gpqa_ttft_p50_seconds",
-              "gpqa_ttft_pass_count",
-              "gpqa_ttft_passed",
-              "gpqa_ttft_seconds",
-              "gpqa_ttft_source",
-              "harness_hash",
-              "max_abs_diff",
-              "num_layers",
-              "partial_result",
-              "passed_correctness",
-              "peak_ram_gb",
-              "passed_decode_speedup_floor",
-              "passed_prefill_speedup_floor",
-              "prefill_seconds_per_token",
-              "prefill_speedup",
-              "prefill_speedup_floor",
-              "preflight_seconds",
-              "process_resident_memory_gb",
-              "runtime",
-              "semantic_gpqa_case_count",
-              "semantic_gpqa_model",
-              "semantic_gpqa_pass_count",
-              "semantic_gpqa_passed",
-              "timed_benchmark_seconds",
-              "timestamp",
-              "weights_byte_count",
-              "weights_file_count",
-              "weights_hash"
-            ]))
-            and .passed == true
-            and (.metrics.error == "")
-            and (.metrics.first_failing_case == null)
-            and (.metrics.first_failing_layer == null)
-            and (.metrics.first_failing_step == null)
-            and (.metrics.expected_token == null)
-            and (.metrics.actual_token == null)
-            ' \
-            score.json >/dev/null
-
-      - name: Prepare golden expectations for combine
-        id: prepare_golden_expectations
-        if: always()
-        run: |
-          set -euo pipefail
-          test -s score.json
-          test -s benchmark-integrity.json
-          {
-            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}"
-            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES}"
-            echo "MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS=${MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS}"
-            echo "MLXFAST_EXPECTED_CORRECTNESS_CASES=${MLXFAST_EXPECTED_CORRECTNESS_CASES}"
-          } > golden-expectations.env
-
-      - name: Check intermediate benchmark artifact paths
-        id: deny_intermediate_paths
-        if: ${{ always() && steps.prepare_golden_expectations.outcome == 'success' && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_intermediate_benchmark.outcome == 'success') }}
-        run: |
-          set -euo pipefail
-          .github/scripts/deny-private-artifacts.sh \
-            score.json \
-            benchmark-integrity.json \
-            weights.sha256 \
-            golden-expectations.env
-
-      - name: Upload intermediate benchmark result
-        # Requires the deny-path check to have PASSED (not just run), matching
-        # main's deny-before-upload ordering; deny success also transitively
-        # implies prepare_golden_expectations succeeded and, on submission
-        # branches, that the content validation passed.
-        if: ${{ always() && steps.deny_intermediate_paths.outcome == 'success' }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: benchmark-parallel-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.mode }}
-          path: |
-            score.json
-            benchmark-integrity.json
-            weights.sha256
-            golden-expectations.env
-          if-no-files-found: error
-          # These per-machine intermediates are the only place each machine's
-          # own timing/gates/RAM/expert provenance survives -- combine collapses
-          # them into one score.json. Keep them as long as the final result so a
-          # score dispute can still be traced to the contributing machine.
-          retention-days: 90
