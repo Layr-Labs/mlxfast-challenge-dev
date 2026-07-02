@@ -288,6 +288,32 @@ public struct DeepSeekWeightLoader {
         "\(name)#\(index)"
     }
 
+    /// Builds the base scales MLXArray for a code tensor off the compute
+    /// thread, but only when the scales are RAM-resident (the common frontier
+    /// path). Thread-safe: the resident store is immutable and makeArray is a
+    /// per-buffer copy. Returns nil to leave scales construction on the compute
+    /// thread (byte-identical either way).
+    static func residentScalesArray(
+        residentScales: ResidentExpertTensors?,
+        bridge: MLXArrayTensorBridge,
+        codeName: String,
+        expertIndex: Int
+    ) -> MLXArray? {
+        guard let residentScales else {
+            return nil
+        }
+        let scalesName = codeName.hasSuffix(".weight")
+            ? String(codeName.dropLast(".weight".count)) + ".scales"
+            : codeName + ".scales"
+        guard let scalesTensor = residentScales.materializedTensor(
+            named: scalesName,
+            firstAxisIndex: expertIndex
+        ) else {
+            return nil
+        }
+        return try? bridge.makeArray(from: scalesTensor)
+    }
+
     /// Concurrently pre-reads the routed-expert code slices a 1-token decode
     /// step is about to consume, through the capacity-0 side bank, returning a
     /// map keyed by `decodePrefetchKey`. Returns nil when the fast path does
@@ -347,6 +373,7 @@ public struct DeepSeekWeightLoader {
             return nil
         }
         let bridge = self.bridge
+        let residentScales = self.residentExpertScales
         var results = [StagedExpertCode?](repeating: nil, count: keys.count)
         results.withUnsafeMutableBufferPointer { buffer in
             let sink = DecodePrefetchSink(buffer: buffer)
@@ -365,7 +392,18 @@ public struct DeepSeekWeightLoader {
                 else {
                     return
                 }
-                sink.buffer[index] = StagedExpertCode(tensor: tensor, array: array)
+                // Also build the resident scales' base array off-thread.
+                let scalesArray = Self.residentScalesArray(
+                    residentScales: residentScales,
+                    bridge: bridge,
+                    codeName: names[index],
+                    expertIndex: indices[index]
+                )
+                sink.buffer[index] = StagedExpertCode(
+                    tensor: tensor,
+                    array: array,
+                    scalesArray: scalesArray
+                )
             }
         }
         var map: [String: StagedExpertCode] = [:]
@@ -435,6 +473,7 @@ public struct DeepSeekWeightLoader {
             return nil
         }
         let bridge = self.bridge
+        let residentScales = self.residentExpertScales
         var results = [StagedExpertCode?](repeating: nil, count: keys.count)
         results.withUnsafeMutableBufferPointer { buffer in
             let sink = DecodePrefetchSink(buffer: buffer)
@@ -451,7 +490,17 @@ public struct DeepSeekWeightLoader {
                 else {
                     return
                 }
-                sink.buffer[index] = StagedExpertCode(tensor: tensor, array: array)
+                let scalesArray = Self.residentScalesArray(
+                    residentScales: residentScales,
+                    bridge: bridge,
+                    codeName: names[index],
+                    expertIndex: indices[index]
+                )
+                sink.buffer[index] = StagedExpertCode(
+                    tensor: tensor,
+                    array: array,
+                    scalesArray: scalesArray
+                )
             }
         }
         var map: [String: StagedExpertCode] = [:]
@@ -483,6 +532,7 @@ public struct DeepSeekWeightLoader {
             // bridge.makeArray(from: tensor)); using it skips the eager
             // Data->Metal copy here on the compute thread.
             var prebuiltWeightArray: MLXArray?
+            var prebuiltScalesArray: MLXArray?
             if isStacked,
                let pinned = pinnedExpertCodes?.materializedTensor(
                    named: candidate,
@@ -491,11 +541,12 @@ public struct DeepSeekWeightLoader {
                 tensor = pinned
             } else if isStacked,
                let prefetched = decodePrefetch?[Self.decodePrefetchKey(candidate, expertIndex)] {
-                // Concurrently pre-read slice + pre-built base array (decode
+                // Concurrently pre-read slice + pre-built base arrays (decode
                 // side-bank OR prefill staged-buffer). Checked before the
-                // serial staged path so the prebuilt copy is used when present.
+                // serial staged path so the prebuilt copies are used when present.
                 tensor = prefetched.tensor
                 prebuiltWeightArray = prefetched.array
+                prebuiltScalesArray = prefetched.scalesArray
             } else if preferStaged, isStacked,
                let staged = stagedSliceTensor(recordName: candidate, expertIndex: expertIndex) {
                 tensor = staged
@@ -509,6 +560,7 @@ public struct DeepSeekWeightLoader {
                 expectedShape: expectedShape,
                 tensor: tensor,
                 prebuiltWeightArray: prebuiltWeightArray,
+                prebuiltScalesArray: prebuiltScalesArray,
                 companionTensor: { companionName, shouldSlice in
                     if let resident = residentExpertScales?.materializedTensor(
                         named: companionName,
@@ -1406,6 +1458,7 @@ public struct DeepSeekWeightLoader {
         expectedShape: [Int],
         tensor: MaterializedTensor,
         prebuiltWeightArray: MLXArray? = nil,
+        prebuiltScalesArray: MLXArray? = nil,
         companionTensor: (_ companionName: String, _ shouldSlice: Bool) throws -> MaterializedTensor?,
         shouldSliceCompanions: Bool = false
     ) throws -> DeepSeekLinearWeight {
@@ -1467,7 +1520,8 @@ public struct DeepSeekWeightLoader {
         let mode: QuantizationMode = biasesTensor == nil && scalesTensor.dtype == .u8 ? .mxfp4 : .affine
         let weightArray = try (prebuiltWeightArray ?? bridge.makeArray(from: tensor))
             .reshaped([expectedRows, packedInput])
-        let scalesArray = try bridge.makeArray(from: scalesTensor).reshaped([expectedRows, scaleGroups])
+        let scalesArray = try (prebuiltScalesArray ?? bridge.makeArray(from: scalesTensor))
+            .reshaped([expectedRows, scaleGroups])
         let biasesArray = try biasesTensor.map { try bridge.makeArray(from: $0).reshaped([expectedRows, scaleGroups]) }
         return DeepSeekLinearWeight(
             weight: weightArray,
@@ -1495,9 +1549,14 @@ public struct DeepSeekWeightLoader {
 public struct StagedExpertCode {
     public let tensor: MaterializedTensor
     public let array: MLXArray
-    public init(tensor: MaterializedTensor, array: MLXArray) {
+    // Base scales MLXArray built off the compute thread when the scales are
+    // RAM-resident, so linearWeight skips that eager copy too. nil => build on
+    // the compute thread as before.
+    public let scalesArray: MLXArray?
+    public init(tensor: MaterializedTensor, array: MLXArray, scalesArray: MLXArray? = nil) {
         self.tensor = tensor
         self.array = array
+        self.scalesArray = scalesArray
     }
 }
 
