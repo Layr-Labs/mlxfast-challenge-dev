@@ -47,6 +47,59 @@ public struct DeepSeekLinearWeight {
         logicalShape
     }
 
+    public func concatenatingRows(with other: DeepSeekLinearWeight) -> DeepSeekLinearWeight? {
+        guard logicalShape.count == 2,
+              other.logicalShape.count == 2,
+              logicalShape[1] == other.logicalShape[1],
+              weight.shape.count == 2,
+              other.weight.shape.count == 2,
+              weight.shape[1] == other.weight.shape[1],
+              groupSize == other.groupSize,
+              bits == other.bits,
+              mode == other.mode
+        else {
+            return nil
+        }
+
+        switch (scales, other.scales) {
+        case (nil, nil):
+            break
+        case let (lhs?, rhs?):
+            guard lhs.shape.count == 2,
+                  rhs.shape.count == 2,
+                  lhs.shape[1] == rhs.shape[1]
+            else {
+                return nil
+            }
+        default:
+            return nil
+        }
+
+        switch (biases, other.biases) {
+        case (nil, nil):
+            break
+        case let (lhs?, rhs?):
+            guard lhs.shape.count == 2,
+                  rhs.shape.count == 2,
+                  lhs.shape[1] == rhs.shape[1]
+            else {
+                return nil
+            }
+        default:
+            return nil
+        }
+
+        return DeepSeekLinearWeight(
+            weight: concatenated([weight, other.weight], axis: 0),
+            scales: zipOptional(scales, other.scales).map { concatenated([$0, $1], axis: 0) },
+            biases: zipOptional(biases, other.biases).map { concatenated([$0, $1], axis: 0) },
+            logicalShape: [logicalShape[0] + other.logicalShape[0], logicalShape[1]],
+            groupSize: groupSize,
+            bits: bits,
+            mode: mode
+        )
+    }
+
     public func rows(_ rowRange: Range<Int>, logicalShape: [Int]? = nil) -> DeepSeekLinearWeight {
         if let scales {
             return DeepSeekLinearWeight(
@@ -69,4 +122,11 @@ public struct DeepSeekLinearWeight {
             mode: .affine
         )
     }
+}
+
+private func zipOptional<T>(_ lhs: T?, _ rhs: T?) -> (T, T)? {
+    guard let lhs, let rhs else {
+        return nil
+    }
+    return (lhs, rhs)
 }

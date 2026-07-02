@@ -5,6 +5,7 @@ import MLXFastCore
 public struct DeepSeekLocalAttentionSpec {
     public let numAttentionHeads: Int
     public let headDim: Int
+    public let attentionScale: Float
     public let outputGroups: Int
     public let qkRopeHeadDim: Int
     public let ropeTheta: Double
@@ -22,6 +23,7 @@ public struct DeepSeekLocalAttentionSpec {
     ) {
         self.numAttentionHeads = numAttentionHeads
         self.headDim = headDim
+        self.attentionScale = Float(pow(Double(headDim), -0.5))
         self.outputGroups = outputGroups
         self.qkRopeHeadDim = qkRopeHeadDim
         self.ropeTheta = ropeTheta
@@ -45,6 +47,7 @@ public struct DeepSeekLocalAttentionSpec {
 public struct DeepSeekCompressedAttentionSpec {
     public let numAttentionHeads: Int
     public let headDim: Int
+    public let attentionScale: Float
     public let outputGroups: Int
     public let qkRopeHeadDim: Int
     public let ropeTheta: Double
@@ -55,6 +58,8 @@ public struct DeepSeekCompressedAttentionSpec {
     public let indexHeads: Int
     public let indexHeadDim: Int
     public let indexTopK: Int
+    public let compressorSpec: DeepSeekCompressorSpec
+    public let indexerSpec: DeepSeekIndexerSpec
 
     public init(
         numAttentionHeads: Int,
@@ -72,6 +77,7 @@ public struct DeepSeekCompressedAttentionSpec {
     ) {
         self.numAttentionHeads = numAttentionHeads
         self.headDim = headDim
+        self.attentionScale = Float(pow(Double(headDim), -0.5))
         self.outputGroups = outputGroups
         self.qkRopeHeadDim = qkRopeHeadDim
         self.ropeTheta = ropeTheta
@@ -82,6 +88,26 @@ public struct DeepSeekCompressedAttentionSpec {
         self.indexHeads = indexHeads
         self.indexHeadDim = indexHeadDim
         self.indexTopK = indexTopK
+        self.compressorSpec = DeepSeekCompressorSpec(
+            compressRatio: compressRatio,
+            headDim: headDim,
+            ropeHeadDim: qkRopeHeadDim,
+            ropeTheta: ropeTheta,
+            ropeScaling: ropeScaling,
+            maxPositionEmbeddings: maxPositionEmbeddings,
+            rmsNormEps: rmsNormEps
+        )
+        self.indexerSpec = DeepSeekIndexerSpec(
+            indexHeads: indexHeads,
+            indexHeadDim: indexHeadDim,
+            indexTopK: indexTopK,
+            qkRopeHeadDim: qkRopeHeadDim,
+            ropeTheta: ropeTheta,
+            ropeScaling: ropeScaling,
+            maxPositionEmbeddings: maxPositionEmbeddings,
+            rmsNormEps: rmsNormEps,
+            compressRatio: compressRatio
+        )
     }
 
     public init(config: DeepSeekConfig, layerIndex: Int) {
@@ -105,6 +131,8 @@ public struct DeepSeekCompressedAttentionSpec {
 public struct DeepSeekIndexerSpec {
     public let indexHeads: Int
     public let indexHeadDim: Int
+    public let indexHeadScale: Float
+    public let indexHeadsScale: Float
     public let indexTopK: Int
     public let qkRopeHeadDim: Int
     public let ropeTheta: Double
@@ -112,6 +140,7 @@ public struct DeepSeekIndexerSpec {
     public let maxPositionEmbeddings: Int
     public let rmsNormEps: Double
     public let compressRatio: Int
+    public let compressorSpec: DeepSeekCompressorSpec
 
     public init(
         indexHeads: Int,
@@ -126,6 +155,8 @@ public struct DeepSeekIndexerSpec {
     ) {
         self.indexHeads = indexHeads
         self.indexHeadDim = indexHeadDim
+        self.indexHeadScale = Float(pow(Double(indexHeadDim), -0.5))
+        self.indexHeadsScale = Float(pow(Double(indexHeads), -0.5))
         self.indexTopK = indexTopK
         self.qkRopeHeadDim = qkRopeHeadDim
         self.ropeTheta = ropeTheta
@@ -133,6 +164,15 @@ public struct DeepSeekIndexerSpec {
         self.maxPositionEmbeddings = maxPositionEmbeddings
         self.rmsNormEps = rmsNormEps
         self.compressRatio = compressRatio
+        self.compressorSpec = DeepSeekCompressorSpec(
+            compressRatio: compressRatio,
+            headDim: indexHeadDim,
+            ropeHeadDim: qkRopeHeadDim,
+            ropeTheta: ropeTheta,
+            ropeScaling: ropeScaling,
+            maxPositionEmbeddings: maxPositionEmbeddings,
+            rmsNormEps: rmsNormEps
+        )
     }
 
     public init(config: DeepSeekConfig, layerIndex: Int) {
@@ -249,6 +289,8 @@ public struct DeepSeekIndexerWeights {
 }
 
 public enum DeepSeekAttentionMask {
+    private static let causalCache = CausalMaskCache()
+
     public static func causal(
         queryLength: Int,
         keyLength: Int? = nil,
@@ -268,6 +310,15 @@ public enum DeepSeekAttentionMask {
                 throw MLXFastError.invalidInput("causal mask window size must be positive")
             }
         }
+        let cacheKey = CausalMaskCacheKey(
+            queryLength: queryLength,
+            keyLength: keyLength,
+            relativeOffset: queryOffset - keyOffset,
+            windowSize: windowSize
+        )
+        if let cached = causalCache.value(for: cacheKey) {
+            return cached
+        }
 
         let queryPositions = arange(
             queryOffset,
@@ -284,7 +335,45 @@ public enum DeepSeekAttentionMask {
         if let windowSize {
             allowed = allowed .&& (queryPositions .< (keyPositions + windowSize))
         }
+        causalCache.insert(allowed, for: cacheKey)
         return allowed
+    }
+}
+
+private struct CausalMaskCacheKey: Hashable {
+    let queryLength: Int
+    let keyLength: Int
+    let relativeOffset: Int
+    let windowSize: Int?
+}
+
+private final class CausalMaskCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var masks: [CausalMaskCacheKey: MLXArray] = [:]
+    private var order: [CausalMaskCacheKey] = []
+    private let capacity = 4096
+
+    func value(for key: CausalMaskCacheKey) -> MLXArray? {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return masks[key]
+    }
+
+    func insert(_ mask: MLXArray, for key: CausalMaskCacheKey) {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        if masks[key] == nil {
+            order.append(key)
+        }
+        masks[key] = mask
+        while order.count > capacity {
+            let oldest = order.removeFirst()
+            masks.removeValue(forKey: oldest)
+        }
     }
 }
 
@@ -398,16 +487,9 @@ public enum DeepSeekKVCompressor {
             return zeros([batchSize, 0, spec.headDim], dtype: x.dtype)
         }
 
-        let kv = DeepSeekOps.linear(input: x, weight: weights.wkv)[
-            0...,
-            0..<usable,
-            0...
-        ]
-        let gate = DeepSeekOps.linear(input: x, weight: weights.wgate)[
-            0...,
-            0..<usable,
-            0...
-        ]
+        let xUsable = x[0..., 0..<usable, 0...]
+        let kv = DeepSeekOps.linear(input: xUsable, weight: weights.wkv)
+        let gate = DeepSeekOps.linear(input: xUsable, weight: weights.wgate)
         return try compressReadyWindows(
             kv: kv,
             gate: gate,
@@ -527,7 +609,7 @@ public enum DeepSeekLocalAttention {
             queries: q,
             keys: kv,
             values: kv,
-            scale: Float(pow(Double(spec.headDim), -0.5)),
+            scale: spec.attentionScale,
             mask: attentionMask,
             sinks: weights.attentionSink.map { $0.asType(q.dtype) }
         )
@@ -604,15 +686,7 @@ public enum DeepSeekCompressedAttention {
         let pooled = try DeepSeekKVCompressor.forward(
             x,
             weights: weights.compressor,
-            spec: DeepSeekCompressorSpec(
-                compressRatio: spec.compressRatio,
-                headDim: spec.headDim,
-                ropeHeadDim: spec.qkRopeHeadDim,
-                ropeTheta: spec.ropeTheta,
-                ropeScaling: spec.ropeScaling,
-                maxPositionEmbeddings: spec.maxPositionEmbeddings,
-                rmsNormEps: spec.rmsNormEps
-            ),
+            spec: spec.compressorSpec,
             poolingCache: cache?.pooled,
             positionOffset: positionOffset
         )
@@ -627,24 +701,27 @@ public enum DeepSeekCompressedAttention {
                     "Swift DeepSeek sparse compressed attention requires indexer weights"
                 )
             }
+            try flushDeferredIndexInput(
+                cache?.deferredIndexInput,
+                into: cache?.indexPooled,
+                weights: indexer.compressor,
+                spec: spec.indexerSpec.compressorSpec
+            )
             let topK = try DeepSeekIndexer.topKNoCache(
                 x: x,
                 qResidual: qResidual,
                 weights: indexer,
-                spec: DeepSeekIndexerSpec(
-                    indexHeads: spec.indexHeads,
-                    indexHeadDim: spec.indexHeadDim,
-                    indexTopK: spec.indexTopK,
-                    qkRopeHeadDim: spec.qkRopeHeadDim,
-                    ropeTheta: spec.ropeTheta,
-                    ropeScaling: spec.ropeScaling,
-                    maxPositionEmbeddings: spec.maxPositionEmbeddings,
-                    rmsNormEps: spec.rmsNormEps,
-                    compressRatio: spec.compressRatio
-                ),
+                spec: spec.indexerSpec,
                 poolingCache: cache?.indexPooled,
                 positionOffset: positionOffset
             )
+            if let indexPooled = cache?.indexPooled {
+                guard indexPooled.pooledLength == pooledLength else {
+                    throw MLXFastError.invalidInput(
+                        "indexer pooled length \(indexPooled.pooledLength); expected \(pooledLength)"
+                    )
+                }
+            }
             out = try sparsePooledAttention(
                 q: q,
                 localKV: kv,
@@ -652,7 +729,7 @@ public enum DeepSeekCompressedAttention {
                 topK: topK,
                 localMask: localMask,
                 pooledMask: pooledMask,
-                scale: Float(pow(Double(spec.headDim), -0.5)),
+                scale: spec.attentionScale,
                 sinks: sinks
             )
         } else {
@@ -660,21 +737,17 @@ public enum DeepSeekCompressedAttention {
                let indexer = weights.indexer,
                let indexPooled = cache?.indexPooled
             {
-                _ = try DeepSeekKVCompressor.forward(
-                    x,
-                    weights: indexer.compressor,
-                    spec: DeepSeekCompressorSpec(
-                        compressRatio: spec.compressRatio,
-                        headDim: spec.indexHeadDim,
-                        ropeHeadDim: spec.qkRopeHeadDim,
-                        ropeTheta: spec.ropeTheta,
-                        ropeScaling: spec.ropeScaling,
-                        maxPositionEmbeddings: spec.maxPositionEmbeddings,
-                        rmsNormEps: spec.rmsNormEps
-                    ),
-                    poolingCache: indexPooled,
-                    positionOffset: positionOffset
-                )
+                if let deferredIndexInput = cache?.deferredIndexInput {
+                    try deferredIndexInput.append(x, offset: positionOffset)
+                } else {
+                    _ = try DeepSeekKVCompressor.forward(
+                        x,
+                        weights: indexer.compressor,
+                        spec: spec.indexerSpec.compressorSpec,
+                        poolingCache: indexPooled,
+                        positionOffset: positionOffset
+                    )
+                }
             }
             let attentionMask = try extendMask(
                 localMask,
@@ -689,7 +762,7 @@ public enum DeepSeekCompressedAttention {
                 queries: q,
                 keys: kv,
                 values: kv,
-                scale: Float(pow(Double(spec.headDim), -0.5)),
+                scale: spec.attentionScale,
                 mask: attentionMask,
                 sinks: sinks
             )
@@ -705,6 +778,29 @@ public enum DeepSeekCompressedAttention {
             weight: weights.attention.woB,
             bias: weights.attention.woBBias
         )
+    }
+
+    private static func flushDeferredIndexInput(
+        _ deferred: DeepSeekDeferredInputCache?,
+        into poolingCache: DeepSeekPoolingCache?,
+        weights: DeepSeekCompressorWeights,
+        spec: DeepSeekCompressorSpec
+    ) throws {
+        guard let deferred, !deferred.isEmpty else {
+            return
+        }
+        guard let poolingCache else {
+            throw MLXFastError.invalidInput("deferred indexer inputs require an index pooling cache")
+        }
+        if let chunk = deferred.drainMerged() {
+            _ = try DeepSeekKVCompressor.forward(
+                chunk.x,
+                weights: weights,
+                spec: spec,
+                poolingCache: poolingCache,
+                positionOffset: chunk.offset
+            )
+        }
     }
 
     private static func validateInput(_ x: MLXArray, spec: DeepSeekCompressedAttentionSpec) throws {
@@ -783,22 +879,19 @@ public enum DeepSeekCompressedAttention {
         let selectedCount = topK.shape[2]
         let pooledLength = pooled.shape[1]
 
-        let pooledForGather = broadcast(
-            pooled.expandedDimensions(axis: 1).expandedDimensions(axis: 2),
-            to: [batchSize, 1, sequenceLength, pooledLength, headDim]
-        )
-        let gatherIndex = broadcast(
-            topK.expandedDimensions(axis: 1).expandedDimensions(axis: -1),
-            to: [batchSize, 1, sequenceLength, selectedCount, headDim]
-        )
-        let selectedPooled = takeAlong(pooledForGather, gatherIndex, axis: 3)
+        let batchOffsets = (arange(batchSize, dtype: .int32) * Int32(pooledLength))
+            .reshaped([batchSize, 1, 1])
+        let flatIndex = (topK + batchOffsets).reshaped([-1])
+        let selectedPooled = pooled.reshaped([batchSize * pooledLength, headDim])
+            .take(flatIndex, axis: 0)
+            .reshaped([batchSize, sequenceLength, selectedCount, headDim])
 
         let qScaled = q * scale
         var localScores = matmul(qScaled, localKV.swappedAxes(-1, -2))
         localScores = applyScoreMask(localScores, mask: localMask)
         var normalizer = localScores.logSumExp(axis: -1, keepDims: true)
 
-        let pooledSQ = selectedPooled.squeezed(axis: 1)
+        let pooledSQ = selectedPooled
         let qBL = qScaled.transposed(0, 2, 1, 3)
         var pooledScores = matmul(qBL, pooledSQ.swappedAxes(-1, -2))
             .transposed(0, 2, 1, 3)
@@ -888,15 +981,7 @@ public enum DeepSeekIndexer {
         let pooled = try DeepSeekKVCompressor.forward(
             x,
             weights: weights.compressor,
-            spec: DeepSeekCompressorSpec(
-                compressRatio: spec.compressRatio,
-                headDim: spec.indexHeadDim,
-                ropeHeadDim: spec.qkRopeHeadDim,
-                ropeTheta: spec.ropeTheta,
-                ropeScaling: spec.ropeScaling,
-                maxPositionEmbeddings: spec.maxPositionEmbeddings,
-                rmsNormEps: spec.rmsNormEps
-            ),
+            spec: spec.compressorSpec,
             poolingCache: poolingCache,
             positionOffset: positionOffset
         )
@@ -920,10 +1005,10 @@ public enum DeepSeekIndexer {
             q.asType(.float32),
             pooled.expandedDimensions(axis: 1).swappedAxes(-1, -2).asType(.float32)
         )
-        scores = maximum(scores, 0) * Float(pow(Double(spec.indexHeadDim), -0.5))
+        scores = maximum(scores, 0) * spec.indexHeadScale
         let weightsByHead = DeepSeekOps.linear(input: x, weight: weights.weightsProj)
             .asType(.float32)
-            * Float(pow(Double(spec.indexHeads), -0.5))
+            * spec.indexHeadsScale
         scores = (
             scores * weightsByHead.swappedAxes(-1, -2).expandedDimensions(axis: -1)
         ).sum(axis: 1)

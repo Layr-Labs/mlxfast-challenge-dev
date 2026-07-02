@@ -26,21 +26,27 @@ public enum DeepSeekMoEGate {
         scoring: DeepSeekGateScoring
     ) throws -> DeepSeekMoEGateResult {
         let logits = matmul(hidden, weight.T).asType(.float32)
-        let scores = score(logits, scoring: scoring)
-
-        let indices: MLXArray
         if let tokenToExpert {
             guard let inputIDs else {
                 throw MLXFastError.invalidInput("hash routing requires input ids")
             }
-            indices = tokenToExpert[inputIDs].asType(.int32)
-        } else {
-            let biased = correctionBias.map { scores + $0 } ?? scores
-            indices = argPartition(-biased, kth: topK - 1, axis: -1)[
+            let indices = tokenToExpert[inputIDs].asType(.int32)
+            var selectedWeights = scoring == .softmax
+                ? takeAlong(score(logits, scoring: scoring), indices, axis: -1)
+                : score(takeAlong(logits, indices, axis: -1), scoring: scoring)
+            if scoring != .softmax && normTopKProb {
+                selectedWeights = selectedWeights / (selectedWeights.sum(axis: -1, keepDims: true) + 1e-20)
+            }
+            selectedWeights = selectedWeights * Float(routedScalingFactor)
+            return DeepSeekMoEGateResult(indices: indices, weights: selectedWeights)
+        }
+
+        let scores = score(logits, scoring: scoring)
+        let biased = correctionBias.map { scores + $0 } ?? scores
+        let indices = argPartition(-biased, kth: topK - 1, axis: -1)[
                 .ellipsis,
                 0..<topK
             ].asType(.int32)
-        }
 
         var selectedWeights = takeAlong(scores, indices, axis: -1)
         if scoring != .softmax && normTopKProb {

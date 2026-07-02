@@ -7,17 +7,20 @@ public struct DeepSeekRoutedExpertSpec: Equatable {
     public let hiddenSize: Int
     public let intermediateSize: Int
     public let swigluLimit: Double
+    public let expertCount: Int
 
     public init(
         layerIndex: Int,
         hiddenSize: Int,
         intermediateSize: Int,
-        swigluLimit: Double
+        swigluLimit: Double,
+        expertCount: Int = MLXFastConstants.routedExperts
     ) {
         self.layerIndex = layerIndex
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
         self.swigluLimit = swigluLimit
+        self.expertCount = expertCount
     }
 
     public init(layerIndex: Int, config: DeepSeekConfig) {
@@ -25,7 +28,8 @@ public struct DeepSeekRoutedExpertSpec: Equatable {
             layerIndex: layerIndex,
             hiddenSize: config.hiddenSize,
             intermediateSize: config.moeIntermediateSize,
-            swigluLimit: config.swigluLimit
+            swigluLimit: config.swigluLimit,
+            expertCount: config.routedExperts
         )
     }
 }
@@ -51,25 +55,48 @@ public enum DeepSeekRoutedExperts {
                 "routed expert input hidden size \(x.shape[2]) expected \(spec.hiddenSize)"
             )
         }
+        guard spec.expertCount > 0 else {
+            throw MLXFastError.invalidInput("routed expert count must be positive")
+        }
 
         let batchSize = x.shape[0]
         let sequenceLength = x.shape[1]
         let topK = expertIndices.shape[2]
         let hiddenSize = spec.hiddenSize
-        let selectedExperts = expertIndices.asArray(Int32.self).map(Int.init)
 
         let tokenCount = batchSize * sequenceLength
         let outputCount = tokenCount * topK
         guard outputCount > 0 else {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
         }
+        let selectedExperts = expertIndices.asArray(Int32.self).map(Int.init)
 
         // Group activation flat-indices by expert so each expert runs one batched
         // matmul over all of its tokens instead of one matmul per token.
-        var flatIndicesByExpert: [Int: [Int]] = [:]
-        flatIndicesByExpert.reserveCapacity(min(outputCount, 256))
+        var countsByExpert = Array(repeating: 0, count: spec.expertCount)
+        var activeSlotByExpert = Array(repeating: -1, count: spec.expertCount)
+        var activeExperts: [Int] = []
+        activeExperts.reserveCapacity(min(outputCount, spec.expertCount))
+        for expertIndex in selectedExperts {
+            guard expertIndex >= 0, expertIndex < spec.expertCount else {
+                throw MLXFastError.invalidInput(
+                    "routed expert index \(expertIndex) outside 0..<\(spec.expertCount)"
+                )
+            }
+            if countsByExpert[expertIndex] == 0 {
+                activeSlotByExpert[expertIndex] = activeExperts.count
+                activeExperts.append(expertIndex)
+            }
+            countsByExpert[expertIndex] += 1
+        }
+
+        var flatIndicesByActiveExpert = activeExperts.map { expertIndex -> [Int] in
+            var bucket: [Int] = []
+            bucket.reserveCapacity(countsByExpert[expertIndex])
+            return bucket
+        }
         for (flatIndex, expertIndex) in selectedExperts.enumerated() {
-            flatIndicesByExpert[expertIndex, default: []].append(flatIndex)
+            flatIndicesByActiveExpert[activeSlotByExpert[expertIndex]].append(flatIndex)
         }
 
         // Flatten the token axis once. Row (batch * sequenceLength + position)
@@ -79,17 +106,22 @@ public enum DeepSeekRoutedExperts {
         let xFlat = x.reshaped([tokenCount, hiddenSize])
 
         var expertOutputs: [MLXArray] = []
-        expertOutputs.reserveCapacity(flatIndicesByExpert.count)
+        expertOutputs.reserveCapacity(activeExperts.count)
         var scatterOrder: [Int] = []
         scatterOrder.reserveCapacity(outputCount)
 
-        for (expertIndex, flatIndices) in flatIndicesByExpert {
+        for (slot, expertIndex) in activeExperts.enumerated() {
+            let flatIndices = flatIndicesByActiveExpert[slot]
             let expertWeights = try weights(
                 forExpert: expertIndex,
                 loader: loader,
                 spec: spec
             )
-            let tokenRows = flatIndices.map { Int32($0 / topK) }
+            var tokenRows: [Int32] = []
+            tokenRows.reserveCapacity(flatIndices.count)
+            for flatIndex in flatIndices {
+                tokenRows.append(Int32(flatIndex / topK))
+            }
             let tokens = xFlat.take(MLXArray(tokenRows), axis: 0)
             let expertOutput = DeepSeekMLP.forward(
                 tokens,
@@ -119,34 +151,11 @@ public enum DeepSeekRoutedExperts {
         loader: DeepSeekWeightLoader,
         spec: DeepSeekRoutedExpertSpec
     ) throws -> DeepSeekMLPWeights {
-        try DeepSeekMLPWeights(
-            gate: loader.expertLinearWeight(
-                candidates: DeepSeekWeightNames.routedExpert(
-                    layerIndex: spec.layerIndex,
-                    expertIndex: expertIndex,
-                    projection: .gate
-                ),
-                expectedShape: [spec.intermediateSize, spec.hiddenSize],
-                expertIndex: expertIndex
-            ),
-            up: loader.expertLinearWeight(
-                candidates: DeepSeekWeightNames.routedExpert(
-                    layerIndex: spec.layerIndex,
-                    expertIndex: expertIndex,
-                    projection: .up
-                ),
-                expectedShape: [spec.intermediateSize, spec.hiddenSize],
-                expertIndex: expertIndex
-            ),
-            down: loader.expertLinearWeight(
-                candidates: DeepSeekWeightNames.routedExpert(
-                    layerIndex: spec.layerIndex,
-                    expertIndex: expertIndex,
-                    projection: .down
-                ),
-                expectedShape: [spec.hiddenSize, spec.intermediateSize],
-                expertIndex: expertIndex
-            )
+        try loader.routedExpertMLPWeights(
+            layerIndex: spec.layerIndex,
+            expertIndex: expertIndex,
+            hiddenSize: spec.hiddenSize,
+            intermediateSize: spec.intermediateSize
         )
     }
 }

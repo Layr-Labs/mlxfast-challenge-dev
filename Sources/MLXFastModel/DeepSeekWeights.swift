@@ -102,6 +102,7 @@ public struct DeepSeekWeightLoader {
     public let expertStreamingConfig: ExpertStreamingConfig
     public let expertStreamingMetrics: ExpertStreamingMetrics?
     private let bridge: MLXArrayTensorBridge
+    private let expertLinearResolutionCache: ExpertLinearResolutionCache
 
     public init(
         weightsPath: String,
@@ -116,10 +117,11 @@ public struct DeepSeekWeightLoader {
         self.expertStreamingMetrics = metrics
         self.expertBank = try ExpertSlotBank(
             manifestPath: "\(weightsPath)/experts/manifest.json",
-            capacity: expertStreamingConfig.tensorCacheCapacity,
+            capacity: Self.effectiveExpertTensorCacheCapacity(expertStreamingConfig),
             metrics: metrics
         )
         self.bridge = bridge
+        self.expertLinearResolutionCache = ExpertLinearResolutionCache()
     }
 
     public init(
@@ -134,6 +136,7 @@ public struct DeepSeekWeightLoader {
         self.expertStreamingConfig = expertStreamingConfig
         self.expertStreamingMetrics = expertStreamingMetrics ?? expertBank.metrics
         self.bridge = bridge
+        self.expertLinearResolutionCache = ExpertLinearResolutionCache()
     }
 
     public func resolveDenseName(_ candidates: [String]) throws -> String {
@@ -263,6 +266,272 @@ public struct DeepSeekWeightLoader {
         }
         throw MLXFastError.invalidInput(
             "expert tensor not found; tried \(candidates.joined(separator: ", "))"
+        )
+    }
+
+    public func routedExpertLinearWeight(
+        layerIndex: Int,
+        expertIndex: Int,
+        projection: DeepSeekExpertProjection,
+        expectedShape: [Int]
+    ) throws -> DeepSeekLinearWeight {
+        if let layout = try stackedRoutedExpertLinearLayout(
+            layerIndex: layerIndex,
+            projection: projection,
+            expectedShape: expectedShape
+        ) {
+            return try expertLinearWeight(layout: layout, expertIndex: expertIndex)
+        }
+        return try expertLinearWeight(
+            candidates: DeepSeekWeightNames.routedExpert(
+                layerIndex: layerIndex,
+                expertIndex: expertIndex,
+                projection: projection
+            ),
+            expectedShape: expectedShape,
+            expertIndex: expertIndex
+        )
+    }
+
+    public func routedExpertMLPWeights(
+        layerIndex: Int,
+        expertIndex: Int,
+        hiddenSize: Int,
+        intermediateSize: Int
+    ) throws -> DeepSeekMLPWeights {
+        return try DeepSeekMLPWeights(
+            gate: routedExpertLinearWeight(
+                layerIndex: layerIndex,
+                expertIndex: expertIndex,
+                projection: .gate,
+                expectedShape: [intermediateSize, hiddenSize]
+            ),
+            up: routedExpertLinearWeight(
+                layerIndex: layerIndex,
+                expertIndex: expertIndex,
+                projection: .up,
+                expectedShape: [intermediateSize, hiddenSize]
+            ),
+            down: routedExpertLinearWeight(
+                layerIndex: layerIndex,
+                expertIndex: expertIndex,
+                projection: .down,
+                expectedShape: [hiddenSize, intermediateSize]
+            )
+        )
+    }
+
+    private func stackedRoutedExpertLinearLayout(
+        layerIndex: Int,
+        projection: DeepSeekExpertProjection,
+        expectedShape: [Int]
+    ) throws -> ResolvedStackedExpertLinear? {
+        let key = RoutedExpertLinearLayoutKey(
+            layerIndex: layerIndex,
+            projection: projection,
+            expectedShape: expectedShape
+        )
+        return try expertLinearResolutionCache.layout(for: key) {
+            try resolveStackedRoutedExpertLinearLayout(
+                layerIndex: layerIndex,
+                projection: projection,
+                expectedShape: expectedShape
+            )
+        }
+    }
+
+    private func resolveStackedRoutedExpertLinearLayout(
+        layerIndex: Int,
+        projection: DeepSeekExpertProjection,
+        expectedShape: [Int]
+    ) throws -> ResolvedStackedExpertLinear? {
+        for candidate in DeepSeekWeightNames.routedExpert(
+            layerIndex: layerIndex,
+            expertIndex: 0,
+            projection: projection
+        ) {
+            guard let record = expertBank.record(named: candidate),
+                  record.shape.count == expectedShape.count + 1
+            else {
+                continue
+            }
+            guard let expertCount = record.shape.first, expertCount > 0 else {
+                throw MLXFastError.invalidInput("stacked expert tensor \(candidate) has invalid first dimension")
+            }
+            let tensorShape = Array(record.shape.dropFirst())
+            let dtype = try TensorDType.parse(record.dtype)
+            let scalesName = companionName(for: candidate, suffix: "scales")
+            guard dtype == .u32, let scales = expertBank.record(named: scalesName) else {
+                try validateShape(tensorShape, expectedShape: expectedShape, tensorName: candidate)
+                return ResolvedStackedExpertLinear(
+                    baseName: candidate,
+                    expertCount: expertCount,
+                    expectedShape: expectedShape,
+                    expectedRows: expectedShape.dropLast().reduce(1, *),
+                    packedInput: tensorShape.last ?? 0,
+                    scaleGroups: 0,
+                    groupSize: 0,
+                    bits: 0,
+                    mode: .affine,
+                    scalesName: nil,
+                    biasesName: nil
+                )
+            }
+
+            let scalesShape = try slicedShape(
+                of: scales,
+                expertCount: expertCount,
+                tensorName: scalesName
+            )
+            let biasesName = companionName(for: candidate, suffix: "biases")
+            let biases = expertBank.record(named: biasesName)
+            let biasesShape = try biases.map {
+                try slicedShape(of: $0, expertCount: expertCount, tensorName: biasesName)
+            }
+            return try resolvedQuantizedStackedExpertLinear(
+                baseName: candidate,
+                expertCount: expertCount,
+                expectedShape: expectedShape,
+                tensorShape: tensorShape,
+                scalesName: scalesName,
+                scales: scales,
+                scalesShape: scalesShape,
+                biasesName: biases == nil ? nil : biasesName,
+                biases: biases,
+                biasesShape: biasesShape
+            )
+        }
+        return nil
+    }
+
+    private func resolvedQuantizedStackedExpertLinear(
+        baseName: String,
+        expertCount: Int,
+        expectedShape: [Int],
+        tensorShape: [Int],
+        scalesName: String,
+        scales: ExpertTensorRecord,
+        scalesShape: [Int],
+        biasesName: String?,
+        biases: ExpertTensorRecord?,
+        biasesShape: [Int]?
+    ) throws -> ResolvedStackedExpertLinear {
+        let expectedRows = expectedShape.dropLast().reduce(1, *)
+        guard
+            let expectedInput = expectedShape.last,
+            let packedInput = tensorShape.last,
+            expectedInput > 0,
+            packedInput > 0
+        else {
+            throw MLXFastError.invalidInput("linear tensor \(baseName) has invalid expected shape \(expectedShape)")
+        }
+        let actualRows = tensorShape.dropLast().reduce(1, *)
+        guard actualRows == expectedRows else {
+            throw MLXFastError.invalidInput(
+                "quantized tensor \(baseName) has \(actualRows) output rows; expected \(expectedRows) from \(expectedShape)"
+            )
+        }
+        let packedBits = packedInput * 32
+        guard packedBits % expectedInput == 0 else {
+            throw MLXFastError.invalidInput(
+                "quantized tensor \(baseName) packed input \(packedInput) is incompatible with logical input \(expectedInput)"
+            )
+        }
+        let bits = packedBits / expectedInput
+        guard [2, 4, 8].contains(bits) else {
+            throw MLXFastError.invalidInput("quantized tensor \(baseName) inferred unsupported bits=\(bits)")
+        }
+        guard let scaleGroups = scalesShape.last, scaleGroups > 0, expectedInput % scaleGroups == 0 else {
+            throw MLXFastError.invalidInput(
+                "quantized tensor \(baseName) scales shape \(scalesShape) is incompatible with logical input \(expectedInput)"
+            )
+        }
+        let scaleRows = scalesShape.dropLast().reduce(1, *)
+        guard scaleRows == expectedRows else {
+            throw MLXFastError.invalidInput(
+                "quantized tensor \(baseName) scales have \(scaleRows) rows; expected \(expectedRows)"
+            )
+        }
+        if let biasesShape {
+            let biasRows = biasesShape.dropLast().reduce(1, *)
+            guard biasRows == expectedRows, biasesShape.last == scaleGroups else {
+                throw MLXFastError.invalidInput(
+                    "quantized tensor \(baseName) biases shape \(biasesShape) does not match scales shape \(scalesShape)"
+                )
+            }
+        }
+
+        let groupSize = expectedInput / scaleGroups
+        let scalesDType = try TensorDType.parse(scales.dtype)
+        if biases == nil && scalesDType == .u8 && groupSize != 32 {
+            throw MLXFastError.invalidInput(
+                "mxfp4 tensor \(baseName) has group size \(groupSize); MLX requires group size 32"
+            )
+        }
+        let mode: QuantizationMode = biases == nil && scalesDType == .u8 ? .mxfp4 : .affine
+        return ResolvedStackedExpertLinear(
+            baseName: baseName,
+            expertCount: expertCount,
+            expectedShape: expectedShape,
+            expectedRows: expectedRows,
+            packedInput: packedInput,
+            scaleGroups: scaleGroups,
+            groupSize: groupSize,
+            bits: bits,
+            mode: mode,
+            scalesName: scalesName,
+            biasesName: biasesName
+        )
+    }
+
+    private func slicedShape(
+        of record: ExpertTensorRecord,
+        expertCount: Int,
+        tensorName: String
+    ) throws -> [Int] {
+        guard let firstDimension = record.shape.first,
+              record.shape.count >= 2,
+              firstDimension >= expertCount
+        else {
+            throw MLXFastError.invalidInput("expert tensor \(tensorName) cannot be sliced across \(expertCount) experts")
+        }
+        return Array(record.shape.dropFirst())
+    }
+
+    private func expertLinearWeight(
+        layout: ResolvedStackedExpertLinear,
+        expertIndex: Int
+    ) throws -> DeepSeekLinearWeight {
+        guard expertIndex >= 0, expertIndex < layout.expertCount else {
+            throw MLXFastError.invalidInput(
+                "expert tensor \(layout.baseName) slice index \(expertIndex) is outside 0..<\(layout.expertCount)"
+            )
+        }
+        let tensor = try expertBank.materializedTensor(
+            named: layout.baseName,
+            firstAxisIndex: expertIndex
+        )
+        guard let scalesName = layout.scalesName else {
+            return DeepSeekLinearWeight(try bridge.makeArray(from: tensor))
+        }
+
+        let scalesTensor = try expertBank.materializedTensor(
+            named: scalesName,
+            firstAxisIndex: expertIndex
+        )
+        let biasesTensor = try layout.biasesName.map {
+            try expertBank.materializedTensor(named: $0, firstAxisIndex: expertIndex)
+        }
+        return DeepSeekLinearWeight(
+            weight: try bridge.makeArray(from: tensor).reshaped([layout.expectedRows, layout.packedInput]),
+            scales: try bridge.makeArray(from: scalesTensor).reshaped([layout.expectedRows, layout.scaleGroups]),
+            biases: try biasesTensor.map {
+                try bridge.makeArray(from: $0).reshaped([layout.expectedRows, layout.scaleGroups])
+            },
+            logicalShape: layout.expectedShape,
+            groupSize: layout.groupSize,
+            bits: layout.bits,
+            mode: layout.mode
         )
     }
 
@@ -565,19 +834,23 @@ public struct DeepSeekWeightLoader {
         hiddenSize: Int,
         intermediateSize: Int
     ) throws -> DeepSeekMLPWeights {
-        try DeepSeekMLPWeights(
-            gate: denseLinearWeight(
-                candidates: DeepSeekWeightNames.feedForward(layerIndex, "shared_experts.gate_proj.weight"),
-                expectedShape: [intermediateSize, hiddenSize]
-            ),
-            up: denseLinearWeight(
-                candidates: DeepSeekWeightNames.feedForward(layerIndex, "shared_experts.up_proj.weight"),
-                expectedShape: [intermediateSize, hiddenSize]
-            ),
-            down: denseLinearWeight(
-                candidates: DeepSeekWeightNames.feedForward(layerIndex, "shared_experts.down_proj.weight"),
-                expectedShape: [hiddenSize, intermediateSize]
-            )
+        let gate = try denseLinearWeight(
+            candidates: DeepSeekWeightNames.feedForward(layerIndex, "shared_experts.gate_proj.weight"),
+            expectedShape: [intermediateSize, hiddenSize]
+        )
+        let up = try denseLinearWeight(
+            candidates: DeepSeekWeightNames.feedForward(layerIndex, "shared_experts.up_proj.weight"),
+            expectedShape: [intermediateSize, hiddenSize]
+        )
+        let down = try denseLinearWeight(
+            candidates: DeepSeekWeightNames.feedForward(layerIndex, "shared_experts.down_proj.weight"),
+            expectedShape: [hiddenSize, intermediateSize]
+        )
+        return DeepSeekMLPWeights(
+            gate: gate,
+            up: up,
+            down: down,
+            gateUp: gate.concatenatingRows(with: up)
         )
     }
 
@@ -1132,5 +1405,64 @@ public struct DeepSeekWeightLoader {
             return String(weightName.dropLast(".weight".count)) + ".\(suffix)"
         }
         return "\(weightName).\(suffix)"
+    }
+
+    private static func effectiveExpertTensorCacheCapacity(
+        _ config: ExpertStreamingConfig,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Int {
+        if environment["MLXFAST_EXPERT_CACHE_TENSORS"] != nil
+            || environment["MLXFAST_EXPERT_CACHE_EXPERTS"] != nil
+        {
+            return config.tensorCacheCapacity
+        }
+        return 0
+    }
+}
+
+private struct RoutedExpertLinearLayoutKey: Hashable {
+    let layerIndex: Int
+    let projection: DeepSeekExpertProjection
+    let expectedShape: [Int]
+}
+
+private struct ResolvedStackedExpertLinear {
+    let baseName: String
+    let expertCount: Int
+    let expectedShape: [Int]
+    let expectedRows: Int
+    let packedInput: Int
+    let scaleGroups: Int
+    let groupSize: Int
+    let bits: Int
+    let mode: QuantizationMode
+    let scalesName: String?
+    let biasesName: String?
+}
+
+private enum ExpertLinearResolution {
+    case stacked(ResolvedStackedExpertLinear)
+    case missing
+}
+
+private final class ExpertLinearResolutionCache {
+    private var layouts: [RoutedExpertLinearLayoutKey: ExpertLinearResolution] = [:]
+
+    func layout(
+        for key: RoutedExpertLinearLayoutKey,
+        build: () throws -> ResolvedStackedExpertLinear?
+    ) throws -> ResolvedStackedExpertLinear? {
+        if let cached = layouts[key] {
+            switch cached {
+            case .stacked(let layout):
+                return layout
+            case .missing:
+                return nil
+            }
+        }
+
+        let resolved = try build()
+        layouts[key] = resolved.map(ExpertLinearResolution.stacked) ?? .missing
+        return resolved
     }
 }
