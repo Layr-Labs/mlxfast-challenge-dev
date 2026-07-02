@@ -122,6 +122,16 @@ public enum DeepSeekRoutedExperts {
                 hiddenSize: spec.hiddenSize,
                 intermediateSize: spec.intermediateSize
             )
+        } else if useStaged {
+            // Prefill/warmup staged path: build the active experts' base
+            // MLXArrays from the staged layer buffer concurrently so the loop
+            // below skips the serial Data->Metal copy (same win as decode).
+            decodePrefetch = loader.prefetchStagedExpertCodes(
+                layerIndex: spec.layerIndex,
+                expertIndices: Array(flatIndicesByExpert.keys),
+                hiddenSize: spec.hiddenSize,
+                intermediateSize: spec.intermediateSize
+            )
         }
 
         var expertOutputs: [MLXArray] = []

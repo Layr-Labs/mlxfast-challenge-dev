@@ -378,6 +378,92 @@ public struct DeepSeekWeightLoader {
         return map.isEmpty ? nil : map
     }
 
+    /// Prefill/warmup analogue of prefetchDecodeExpertCodes for the staged
+    /// (whole-layer) path: builds each active expert's base MLXArray from the
+    /// already-staged layer buffer concurrently, so the per-expert compute
+    /// loop skips the serial Data->Metal copy. Byte-identical to the serial
+    /// stagedSliceTensor + bridge.makeArray it replaces. Returns nil when the
+    /// layer is not staged; callers then use the serial staged path.
+    public func prefetchStagedExpertCodes(
+        layerIndex: Int,
+        expertIndices: [Int],
+        hiddenSize: Int,
+        intermediateSize: Int
+    ) -> [String: StagedExpertCode]? {
+        guard expertLayerStager != nil, !expertIndices.isEmpty else {
+            return nil
+        }
+        let projections: [(DeepSeekExpertProjection, [Int])] = [
+            (.gate, [intermediateSize, hiddenSize]),
+            (.up, [intermediateSize, hiddenSize]),
+            (.down, [hiddenSize, intermediateSize]),
+        ]
+        var keys: [String] = []
+        var names: [String] = []
+        var indices: [Int] = []
+        var seen = Set<String>()
+        for expertIndex in expertIndices {
+            for (projection, expectedShape) in projections {
+                let candidates = DeepSeekWeightNames.routedExpert(
+                    layerIndex: layerIndex,
+                    expertIndex: expertIndex,
+                    projection: projection
+                )
+                for candidate in candidates {
+                    guard let record = expertBank.record(named: candidate) else {
+                        continue
+                    }
+                    let isStacked = record.shape.count == expectedShape.count + 1
+                        && record.shape.first.map { expertIndex < $0 } == true
+                    guard isStacked else {
+                        break
+                    }
+                    if pinnedExpertCodes?.isResident(name: candidate) == true {
+                        break
+                    }
+                    let key = Self.decodePrefetchKey(candidate, expertIndex)
+                    if seen.insert(key).inserted {
+                        keys.append(key)
+                        names.append(candidate)
+                        indices.append(expertIndex)
+                    }
+                    break
+                }
+            }
+        }
+        guard !keys.isEmpty else {
+            return nil
+        }
+        let bridge = self.bridge
+        var results = [StagedExpertCode?](repeating: nil, count: keys.count)
+        results.withUnsafeMutableBufferPointer { buffer in
+            let sink = DecodePrefetchSink(buffer: buffer)
+            DispatchQueue.concurrentPerform(iterations: keys.count) { index in
+                // Cut the slice from the staged layer buffer AND build its base
+                // MLXArray concurrently; the compute thread then only wires the
+                // lazy reshape/quant assembly. Byte-identical to the serial path.
+                guard
+                    let tensor = self.stagedSliceTensor(
+                        recordName: names[index],
+                        expertIndex: indices[index]
+                    ),
+                    let array = try? bridge.makeArray(from: tensor)
+                else {
+                    return
+                }
+                sink.buffer[index] = StagedExpertCode(tensor: tensor, array: array)
+            }
+        }
+        var map: [String: StagedExpertCode] = [:]
+        map.reserveCapacity(keys.count)
+        for (index, key) in keys.enumerated() {
+            if let staged = results[index] {
+                map[key] = staged
+            }
+        }
+        return map.isEmpty ? nil : map
+    }
+
     public func expertLinearWeight(
         candidates: [String],
         expectedShape: [Int],
@@ -403,14 +489,16 @@ public struct DeepSeekWeightLoader {
                    firstAxisIndex: expertIndex
                ) {
                 tensor = pinned
+            } else if isStacked,
+               let prefetched = decodePrefetch?[Self.decodePrefetchKey(candidate, expertIndex)] {
+                // Concurrently pre-read slice + pre-built base array (decode
+                // side-bank OR prefill staged-buffer). Checked before the
+                // serial staged path so the prebuilt copy is used when present.
+                tensor = prefetched.tensor
+                prebuiltWeightArray = prefetched.array
             } else if preferStaged, isStacked,
                let staged = stagedSliceTensor(recordName: candidate, expertIndex: expertIndex) {
                 tensor = staged
-            } else if isStacked,
-               let prefetched = decodePrefetch?[Self.decodePrefetchKey(candidate, expertIndex)] {
-                // Concurrently pre-read slice + pre-built base array.
-                tensor = prefetched.tensor
-                prebuiltWeightArray = prefetched.array
             } else if isStacked {
                 tensor = try expertBank.materializedTensor(named: candidate, firstAxisIndex: expertIndex)
             } else {
