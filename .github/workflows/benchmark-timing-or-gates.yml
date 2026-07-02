@@ -201,6 +201,9 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          echo "== safe failure reason (fixture-free, participant-shareable) =="
+          .github/scripts/summarize-failure-safe.sh score.json || echo "summarizer unavailable"
+          echo
           echo "== score.json summary (token-id fields omitted, error digit-masked) =="
           if [[ -s score.json ]]; then
             jq -r '
