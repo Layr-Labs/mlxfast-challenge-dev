@@ -571,6 +571,218 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(staticReview.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES"))
     #expect(staticReview.contains("oversized source that could hide lookup tables"))
     #expect(staticReview.contains("find \"${editable_path}\" -type f -print0"))
+
+    // Diff-only mode: when a base commit is provided the review must send only
+    // the editable files CHANGED vs that base, not the whole editable surface.
+    // This is the fix for the false positive where an unchanged baseline file
+    // (DeepSeekSubmissionControls.swift's validation hook, comment mentions
+    // benchmark timing) failed a submission that never touched it.
+    #expect(staticReview.contains("review_base=\"${MLXFAST_SUBMISSION_REVIEW_BASE_SHA:-}\""))
+    #expect(staticReview.contains("git diff --name-only -z --diff-filter=d \"${review_base}\" \"${review_head}\" -- \"${editable_path}\""))
+    // A resolvable base is mandatory once provided (fail closed, never silently
+    // fall back to whole-surface which would resurrect the false positive).
+    #expect(staticReview.contains("is not a resolvable commit"))
+    // An empty diff (nothing changed in the editable surface) is a clean pass,
+    // not the whole-surface "selected no files" error.
+    #expect(staticReview.contains("no editable files changed versus"))
+    #expect(staticReview.contains("\"passed\":true,\"severity\":\"none\""))
+    // Set-but-empty base (a masked merge-base failure inside a prefix
+    // assignment, invisible to set -e) must fail closed, never silently
+    // review the whole surface.
+    #expect(staticReview.contains("is set but empty"))
+    // The allowlist comes from the BASE commit (like enforce-modifiable-
+    // surface.sh), and an empty allowlist is an error, not a clean pass.
+    #expect(staticReview.contains("git show \"${review_base}:${CONTRACT_PATH}\""))
+    #expect(staticReview.contains("lists no editablePaths"))
+    // A changed path that is missing or not a regular file in the work tree
+    // (checkout divergence or a symlink) fails the review instead of silently
+    // shrinking what the judge sees.
+    #expect(staticReview.contains("missing or not a regular file"))
+    #expect(staticReview.contains("not the checked-out HEAD"))
+
+    // All three privileged workflows pass the merge-base so the review runs in
+    // diff-only mode on every machine that executes submitted code. The base is
+    // computed in a standalone assignment: as a command prefix a merge-base
+    // failure would be masked and the script would fall back to whole-surface.
+    for wf in [
+        ".github/workflows/benchmark.yml",
+        ".github/workflows/benchmark-timing-or-gates.yml",
+        ".github/workflows/benchmark-correctness-slice.yml",
+    ] {
+        let content = try String(contentsOfFile: wf, encoding: .utf8)
+        #expect(content.contains("base_sha=\"$(git merge-base origin/main \"${HEAD_SHA}\")\""))
+        #expect(content.contains("MLXFAST_SUBMISSION_REVIEW_BASE_SHA=\"${base_sha}\""))
+        #expect(!content.contains("MLXFAST_SUBMISSION_REVIEW_BASE_SHA=\"$(git merge-base"))
+    }
+}
+
+// Behavioral pin for run-submission-static-review.sh's diff-only mode, run
+// against a throwaway git repo. Every guard case exits before any network
+// call (a real curl attempt with the dummy key would fail the script); the
+// happy path shims curl on PATH and asserts the judge request contains only
+// the changed editable file, never the unchanged suspicious baseline file.
+@Test
+func submissionStaticReviewDiffModeFailsClosedAndSendsOnlyChangedFiles() throws {
+    let fm = FileManager.default
+    let scriptPath = URL(fileURLWithPath: fm.currentDirectoryPath)
+        .appendingPathComponent(".github/scripts/run-submission-static-review.sh").path
+
+    let root = fm.temporaryDirectory
+        .appendingPathComponent("static-review-\(UUID().uuidString)")
+    try fm.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: root) }
+    let repo = root.appendingPathComponent("repo").path
+    let privatePath = root.appendingPathComponent("private").path
+    try fm.createDirectory(atPath: repo, withIntermediateDirectories: true)
+
+    func run(
+        _ argv: [String], env extra: [String: String] = [:]
+    ) throws -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = argv
+        process.currentDirectoryURL = URL(fileURLWithPath: repo)
+        var env = ProcessInfo.processInfo.environment
+        let strayKeys = env.keys.filter {
+            $0.hasPrefix("MLXFAST_") || $0.hasPrefix("ANTHROPIC_")
+        }
+        for key in strayKeys { env.removeValue(forKey: key) }
+        env.merge(extra) { _, override in override }
+        process.environment = env
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    @discardableResult
+    func git(_ args: [String]) throws -> String {
+        let result = try run(
+            ["git", "-c", "user.email=test@test", "-c", "user.name=test",
+             "-c", "commit.gpgsign=false"] + args)
+        #expect(result.status == 0, "git \(args.joined(separator: " ")): \(result.output)")
+        return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func review(
+        base: String?, head: String, env extra: [String: String] = [:]
+    ) throws -> (status: Int32, output: String) {
+        var env: [String: String] = [
+            "ANTHROPIC_API_KEY": "test-key-never-sent",
+            "MLXFAST_PRIVATE_DIR": privatePath,
+            "HEAD_SHA": head,
+        ]
+        if let base { env["MLXFAST_SUBMISSION_REVIEW_BASE_SHA"] = base }
+        env.merge(extra) { _, override in override }
+        return try run(["bash", scriptPath], env: env)
+    }
+
+    // The script's own runtime dependencies; skip quietly where they are absent.
+    for tool in ["git", "jq", "bash"] {
+        guard try run(["sh", "-c", "command -v \(tool)"]).status == 0 else { return }
+    }
+
+    try git(["init", "-q"])
+    try #"{"editablePaths":["Sources/MLXFastModel"]}"#
+        .write(toFile: repo + "/benchmark.json", atomically: true, encoding: .utf8)
+    try fm.createDirectory(
+        atPath: repo + "/Sources/MLXFastModel", withIntermediateDirectories: true)
+    try "let changed = 1\n".write(
+        toFile: repo + "/Sources/MLXFastModel/Changed.swift", atomically: true, encoding: .utf8)
+    // Unchanged baseline file that LOOKS suspicious -- must never reach the judge.
+    try "// prove the benchmark detects slower measured decode\nlet hook = 0\n".write(
+        toFile: repo + "/Sources/MLXFastModel/Baseline.swift", atomically: true, encoding: .utf8)
+    try git(["add", "."])
+    try git(["commit", "-q", "-m", "base"])
+    let baseSha = try git(["rev-parse", "HEAD"])
+    try "let changed = 2\n".write(
+        toFile: repo + "/Sources/MLXFastModel/Changed.swift", atomically: true, encoding: .utf8)
+    try git(["commit", "-q", "-am", "change"])
+    let headSha = try git(["rev-parse", "HEAD"])
+
+    // Set-but-empty base (the masked merge-base failure) fails closed.
+    let emptyBase = try review(base: "", head: headSha)
+    #expect(emptyBase.status != 0)
+    #expect(emptyBase.output.contains("is set but empty"))
+
+    // An unresolvable base fails closed.
+    let badBase = try review(base: String(repeating: "0", count: 40), head: headSha)
+    #expect(badBase.status != 0)
+    #expect(badBase.output.contains("is not a resolvable commit"))
+
+    // A head that is not the checked-out HEAD fails closed (the diff would not
+    // describe the work-tree content the judge reads).
+    let staleHead = try review(base: baseSha, head: baseSha)
+    #expect(staleHead.status != 0)
+    #expect(staleHead.output.contains("not the checked-out HEAD"))
+
+    // Nothing changed (base == head) is a clean pass without any API call.
+    let emptyDiff = try review(base: headSha, head: headSha)
+    #expect(emptyDiff.status == 0, emptyDiff.output.isEmpty ? "no output" : "\(emptyDiff.output)")
+    #expect(emptyDiff.output.contains("no editable files changed versus"))
+    let emptyDiffResults = try String(
+        contentsOfFile: privatePath + "/submission_static_review.json", encoding: .utf8)
+    #expect(emptyDiffResults.contains("\"passed\":true"))
+    #expect(emptyDiffResults.contains(headSha))
+
+    // A changed path that is not a regular file in the work tree fails closed.
+    try fm.removeItem(atPath: repo + "/Sources/MLXFastModel/Changed.swift")
+    try fm.createSymbolicLink(
+        atPath: repo + "/Sources/MLXFastModel/Changed.swift",
+        withDestinationPath: "../../benchmark.json")
+    let symlinked = try review(base: baseSha, head: headSha)
+    #expect(symlinked.status != 0)
+    #expect(symlinked.output.contains("missing or not a regular file"))
+    try git(["checkout", "--", "Sources/MLXFastModel/Changed.swift"])
+
+    // A base contract with no editablePaths is an error, not a clean pass
+    // (jq failures inside process substitutions are invisible to set -e).
+    try #"{"schemaVersion":1}"#
+        .write(toFile: repo + "/benchmark.json", atomically: true, encoding: .utf8)
+    try "let changed = 3\n".write(
+        toFile: repo + "/Sources/MLXFastModel/Changed.swift", atomically: true, encoding: .utf8)
+    try git(["commit", "-q", "-am", "contract without editablePaths"])
+    let contractlessHead = try git(["rev-parse", "HEAD"])
+    let noPaths = try review(base: contractlessHead, head: contractlessHead)
+    #expect(noPaths.status != 0)
+    #expect(noPaths.output.contains("lists no editablePaths"))
+
+    // Happy path via a curl shim: the request must carry only the changed
+    // editable file (the good contract comes from the BASE commit even though
+    // the work-tree copy now lacks editablePaths).
+    let shimDir = root.appendingPathComponent("bin").path
+    try fm.createDirectory(atPath: shimDir, withIntermediateDirectories: true)
+    let capturePath = root.appendingPathComponent("request-capture.json").path
+    let shim = """
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=""
+    data=""
+    prev=""
+    for arg in "$@"; do
+      case "${prev}" in
+        --output) out="${arg}" ;;
+        --data) data="${arg}" ;;
+      esac
+      prev="${arg}"
+    done
+    cp "${data#@}" "${CURL_SHIM_CAPTURE}"
+    printf '%s' '{"content":[{"type":"text","text":"{\\"passed\\":true,\\"severity\\":\\"none\\",\\"summary\\":\\"ok\\",\\"findings\\":[]}"}]}' > "${out}"
+    """
+    try shim.write(toFile: shimDir + "/curl", atomically: true, encoding: .utf8)
+    try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shimDir + "/curl")
+    let inheritedPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
+    let happy = try review(
+        base: baseSha, head: contractlessHead,
+        env: ["PATH": shimDir + ":" + inheritedPath, "CURL_SHIM_CAPTURE": capturePath])
+    #expect(happy.status == 0, happy.output.isEmpty ? "no output" : "\(happy.output)")
+    let request = try String(contentsOfFile: capturePath, encoding: .utf8)
+    #expect(request.contains("Sources/MLXFastModel/Changed.swift"))
+    #expect(!request.contains("Baseline.swift"))
+    #expect(!request.contains("prove the benchmark detects slower measured decode"))
 }
 
 @Test

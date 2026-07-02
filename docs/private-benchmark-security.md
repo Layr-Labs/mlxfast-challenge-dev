@@ -107,8 +107,11 @@ directly.
 
 On `submissions/*` branches the workflow additionally:
 
-- runs the static cheat review over the editable code
-  (`run-submission-static-review.sh`),
+- runs the static cheat review over the editable files the submission changed
+  versus its merge-base with `main` (`run-submission-static-review.sh`;
+  unchanged editable files are byte-identical to trusted `main` content and are
+  not sent to the judge — only a no-base local/manual run reviews the whole
+  editable surface),
 - enforces the modifiable surface against `main` (`enforce-modifiable-surface.sh`),
 - suppresses submitted correctness/benchmark process logs, and
 - uploads correctness artifacts only after validation succeeds.
