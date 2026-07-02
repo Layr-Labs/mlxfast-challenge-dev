@@ -408,9 +408,16 @@ jobs:
   # timing fails. The final verdict is identical -- combine ANDs both machines'
   # pass/fail -- this only removes an ordering side channel and costs one extra
   # gates run on an already-failing submission.
+  # Gate timing/gates on validate-slice-ranges too, not just the slices: a bad
+  # range_1/2/3 dooms the whole run (combine's coverage check fails), so failing
+  # the cheap validator in ~3s must stop ALL five expensive machines, not only
+  # the three slices -- otherwise a typo still burns these two Blacksmith jobs.
+  # (timing/gates don't consume the ranges themselves, but there is no point
+  # running them for a run that cannot combine.)
   benchmark-timing:
     name: "benchmark timing (no gates)"
-    if: ${{ inputs.run_benchmark }}
+    needs: validate-slice-ranges
+    if: ${{ inputs.run_benchmark && needs.validate-slice-ranges.result == 'success' }}
     uses: ./.github/workflows/benchmark-timing-or-gates.yml
     secrets: inherit
     with:
@@ -421,7 +428,8 @@ jobs:
 
   benchmark-gates:
     name: "benchmark gates (no timing)"
-    if: ${{ inputs.run_benchmark }}
+    needs: validate-slice-ranges
+    if: ${{ inputs.run_benchmark && needs.validate-slice-ranges.result == 'success' }}
     uses: ./.github/workflows/benchmark-timing-or-gates.yml
     secrets: inherit
     with:

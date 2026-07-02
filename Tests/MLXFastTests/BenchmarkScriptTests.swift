@@ -488,12 +488,15 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // `!inputs.run_benchmark` on the wrong job would still satisfy a bare
     // "contains inputs.run_benchmark" check.
     #expect(workflow.contains("    if: ${{ !inputs.run_benchmark }}"))
+    // Only validate-slice-ranges itself uses the bare run_benchmark guard now;
+    // all five expensive machines gate on the validator's success so a bad
+    // range_1/2/3 fails the whole run in ~3s instead of burning any machine.
     let bareRunBenchmarkGuardCount = workflow.components(separatedBy: "if: ${{ inputs.run_benchmark }}").count - 1
-    #expect(bareRunBenchmarkGuardCount == 3) // validate-slice-ranges, benchmark-timing, benchmark-gates
-    let slicesRequireRangeValidationCount = workflow.components(
+    #expect(bareRunBenchmarkGuardCount == 1) // validate-slice-ranges
+    let requireRangeValidationCount = workflow.components(
         separatedBy: "if: ${{ inputs.run_benchmark && needs.validate-slice-ranges.result == 'success' }}"
     ).count - 1
-    #expect(slicesRequireRangeValidationCount == 3) // correctness-slice-1/2/3
+    #expect(requireRangeValidationCount == 5) // correctness-slice-1/2/3 + benchmark-timing + benchmark-gates
     #expect(workflow.contains("if: ${{ always() && inputs.run_benchmark }}"))
     #expect(workflow.contains("golden.sha256=\"${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256\""))
     #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results"))
@@ -1821,11 +1824,18 @@ func validateSliceRangesJobRunsBeforeExpensiveSliceMachinesAndGatesThem() throws
     #expect(validateRangesJob.contains("range_3"))
     #expect(validateRangesJob.contains("sort_by(.start)"))
 
-    for slice in ["correctness-slice-1", "correctness-slice-2", "correctness-slice-3"] {
-        let sliceRange = try #require(workflow.range(of: "  \(slice):\n"))
-        let sliceJob = String(workflow[sliceRange.lowerBound...].prefix(400))
-        #expect(sliceJob.contains("needs: validate-slice-ranges"))
-        #expect(sliceJob.contains("if: ${{ inputs.run_benchmark && needs.validate-slice-ranges.result == 'success' }}"))
+    // All five expensive machines gate on the validator, not just the slices:
+    // timing/gates don't consume the ranges but a bad range dooms the run, so
+    // failing the validator must stop them too (else a typo still burns two
+    // Blacksmith jobs before combine reports the coverage failure).
+    for job in [
+        "correctness-slice-1", "correctness-slice-2", "correctness-slice-3",
+        "benchmark-timing", "benchmark-gates",
+    ] {
+        let jobRange = try #require(workflow.range(of: "  \(job):\n"))
+        let jobBody = String(workflow[jobRange.lowerBound...].prefix(400))
+        #expect(jobBody.contains("needs: validate-slice-ranges"))
+        #expect(jobBody.contains("if: ${{ inputs.run_benchmark && needs.validate-slice-ranges.result == 'success' }}"))
     }
 }
 
