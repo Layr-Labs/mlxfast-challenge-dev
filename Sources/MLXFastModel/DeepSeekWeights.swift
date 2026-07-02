@@ -108,9 +108,31 @@ public struct DeepSeekWeightLoader {
     private let bridge: MLXArrayTensorBridge
 
     /// Sized for the official 48 GB runner: pin only where at least that
-    /// budget exists, and never more than two layers of codes (~6.4 GiB).
+    /// budget exists, and never more than four layers of codes (~12.8 GiB).
+    /// The official run measured 19.5 GB peak with two pinned layers and the
+    /// 768-entry byte cache, leaving room for two more layers plus the larger
+    /// cache below while staying under ~30 GB.
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
-    private static let pinnedHashLayerCap = 2
+    private static let pinnedLayerCap = 4
+
+    /// With scales RAM-resident and leading layers pinned, byte-cache entries
+    /// are ~4.2 MB code slices and a decode token touches ~240 of them, so
+    /// 1536 entries (~6.4 GiB) hold about six tokens of history. The official
+    /// run showed 17% adjacent-token hits at just three tokens of depth.
+    /// Explicit environment settings still win.
+    private static let tunedExpertCodeCacheEntries = 1536
+
+    private static func expertBankCapacity(from config: ExpertStreamingConfig) -> Int {
+        let environment = ProcessInfo.processInfo.environment
+        if environment["MLXFAST_EXPERT_CACHE_TENSORS"] != nil
+            || environment["MLXFAST_EXPERT_CACHE_EXPERTS"] != nil {
+            return config.tensorCacheCapacity
+        }
+        if config.tensorCacheCapacity != ExpertStreamingConfig.defaultTensorCacheCapacity {
+            return config.tensorCacheCapacity
+        }
+        return tunedExpertCodeCacheEntries
+    }
 
     public init(
         weightsPath: String,
@@ -125,7 +147,7 @@ public struct DeepSeekWeightLoader {
         self.expertStreamingMetrics = metrics
         let expertBank = try ExpertSlotBank(
             manifestPath: "\(weightsPath)/experts/manifest.json",
-            capacity: expertStreamingConfig.tensorCacheCapacity,
+            capacity: Self.expertBankCapacity(from: expertStreamingConfig),
             metrics: metrics
         )
         self.expertBank = expertBank
@@ -139,17 +161,19 @@ public struct DeepSeekWeightLoader {
             manifestPath: manifestPath,
             metrics: metrics
         )
-        // Pinning trades RAM for guaranteed hits on the token-id-routed
-        // layers; only worthwhile at the official 48 GB budget or above,
-        // and capped so the pinned codes (~3.2 GiB per layer) leave headroom
-        // for the resident scales, staging buffers, and page cache inside
-        // that budget. Both constants encode the OFFICIAL runner's memory
-        // math — do not raise them because a larger local machine has room.
-        let hashLayerCount = (try? DeepSeekConfig.load(from: weightsPath))?.numHashLayers ?? 0
+        // Pinning trades RAM for guaranteed hits: the decode working set
+        // cycles through far more bytes than any cache and cyclic scans
+        // defeat LRU, so each pinned layer (~3.2 GiB of codes) removes its
+        // share of BOTH prefill and decode reads deterministically. Only
+        // worthwhile at the official 48 GB budget or above, and capped to
+        // leave headroom for the resident scales, byte cache, staging
+        // buffers, and page cache inside that budget. These constants encode
+        // the OFFICIAL runner's memory math — do not raise them because a
+        // larger local machine has room.
         self.pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
-            ? ResidentExpertStoreRegistry.pinnedHashLayerCodes(
+            ? ResidentExpertStoreRegistry.pinnedLeadingLayerCodes(
                 manifestPath: manifestPath,
-                hashLayerCount: min(hashLayerCount, Self.pinnedHashLayerCap),
+                layerCount: Self.pinnedLayerCap,
                 metrics: metrics
             )
             : nil

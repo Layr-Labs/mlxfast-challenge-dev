@@ -34,12 +34,21 @@ public final class ExpertLayerStager {
     }
 
     private let sideBank: ExpertSlotBank
-    private let queue = DispatchQueue(label: "mlxfast.expert.stager", qos: .userInitiated)
+    // Concurrent readers: the official runner's cold disk serves ~2 GB/s at
+    // queue depth 1 regardless of read pattern, but scales with parallel
+    // requests. Four in-flight whole-tensor preads bound both the queue depth
+    // and the transient buffer footprint (~4 GiB).
+    private let queue = DispatchQueue(
+        label: "mlxfast.expert.stager",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+    private let readSlots = DispatchSemaphore(value: 4)
     private let condition = NSCondition()
-    // All three guarded by `condition`.
+    // All four guarded by `condition`.
     private var stagedBytesByRecordName: [String: Data] = [:]
     private var recordNamesByLayer: [Int: [String]] = [:]
-    private var pendingLayers: Set<Int> = []
+    private var pendingRecordCountByLayer: [Int: Int] = [:]
     private var failedLayers: Set<Int> = []
 
     public init?(manifestPath: String, metrics: ExpertStreamingMetrics?) {
@@ -72,7 +81,7 @@ public final class ExpertLayerStager {
     /// per-slice streaming path, which reproduces today's behavior exactly.
     public func waitForLayer(_ layerIndex: Int) -> Bool {
         condition.lock()
-        while pendingLayers.contains(layerIndex) {
+        while pendingRecordCountByLayer[layerIndex] != nil {
             condition.wait()
         }
         let isStaged = recordNamesByLayer[layerIndex] != nil
@@ -102,33 +111,42 @@ public final class ExpertLayerStager {
     private func scheduleLocked(_ plan: LayerPlan) {
         guard
             recordNamesByLayer[plan.layerIndex] == nil,
-            !pendingLayers.contains(plan.layerIndex)
+            pendingRecordCountByLayer[plan.layerIndex] == nil
         else {
             return
         }
-        pendingLayers.insert(plan.layerIndex)
-        queue.async { [self] in
-            var loaded: [String: Data] = [:]
-            var succeeded = true
-            for name in plan.recordNames {
-                guard let tensor = try? sideBank.materializedTensor(named: name) else {
-                    succeeded = false
-                    break
-                }
-                loaded[name] = tensor.bytes
-            }
-            condition.lock()
-            pendingLayers.remove(plan.layerIndex)
-            if succeeded {
-                recordNamesByLayer[plan.layerIndex] = plan.recordNames
-                for (name, bytes) in loaded {
+        pendingRecordCountByLayer[plan.layerIndex] = plan.recordNames.count
+        // One job per record so the current layer's tensors read in parallel;
+        // jobs start FIFO, so a layer scheduled first fills the read slots
+        // before its successor's jobs begin. The capacity-0 side bank mutates
+        // no shared state, making concurrent materializedTensor calls safe.
+        for name in plan.recordNames {
+            queue.async { [self] in
+                readSlots.wait()
+                let bytes = (try? sideBank.materializedTensor(named: name))?.bytes
+                readSlots.signal()
+                condition.lock()
+                if let bytes {
                     stagedBytesByRecordName[name] = bytes
+                } else {
+                    failedLayers.insert(plan.layerIndex)
                 }
-            } else {
-                failedLayers.insert(plan.layerIndex)
+                let remaining = (pendingRecordCountByLayer[plan.layerIndex] ?? 1) - 1
+                if remaining > 0 {
+                    pendingRecordCountByLayer[plan.layerIndex] = remaining
+                } else {
+                    pendingRecordCountByLayer.removeValue(forKey: plan.layerIndex)
+                    if failedLayers.contains(plan.layerIndex) {
+                        for staged in plan.recordNames {
+                            stagedBytesByRecordName.removeValue(forKey: staged)
+                        }
+                    } else {
+                        recordNamesByLayer[plan.layerIndex] = plan.recordNames
+                    }
+                    condition.broadcast()
+                }
+                condition.unlock()
             }
-            condition.broadcast()
-            condition.unlock()
         }
     }
 }

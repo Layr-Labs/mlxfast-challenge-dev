@@ -11,7 +11,7 @@ import MLXFastCore
 ///   expert bytes but half of all bank round-trips — every expert
 ///   materialization pays a second open/fstat/pread/close for its small
 ///   scales slice.
-/// - **Hash-layer codes** (layers routed by token id, ~9.6 GiB, only on
+/// - **Leading-layer codes** (~3.2 GiB per pinned layer, only on
 ///   machines with the official 48 GB or more): the expert working set
 ///   cycles through far more bytes than any cache, and cyclic scans defeat
 ///   LRU — pinning converts those layers' reads into guaranteed RAM hits
@@ -124,18 +124,18 @@ extension ResidentExpertTensors {
         }
     }
 
-    /// The packed U32 code tensors of the first `hashLayerCount` layers.
+    /// The packed U32 code tensors of the first `layerCount` layers.
     public convenience init?(
-        hashLayerCodesFromManifest manifestPath: String,
-        hashLayerCount: Int,
+        leadingLayerCodesFromManifest manifestPath: String,
+        layerCount: Int,
         metrics: ExpertStreamingMetrics?
     ) {
-        guard hashLayerCount > 0 else {
+        guard layerCount > 0 else {
             return nil
         }
         self.init(manifestPath: manifestPath, metrics: metrics) { record in
             record.dtype == "U32"
-                && Self.layerIndex(fromRecordName: record.name).map { $0 < hashLayerCount } == true
+                && Self.layerIndex(fromRecordName: record.name).map { $0 < layerCount } == true
         }
     }
 
@@ -171,15 +171,15 @@ public enum ResidentExpertStoreRegistry {
         }
     }
 
-    public static func pinnedHashLayerCodes(
+    public static func pinnedLeadingLayerCodes(
         manifestPath: String,
-        hashLayerCount: Int,
+        layerCount: Int,
         metrics: ExpertStreamingMetrics?
     ) -> ResidentExpertTensors? {
-        pinnedCodesCache.value(for: "\(hashLayerCount)|\(manifestPath)") {
+        pinnedCodesCache.value(for: "\(layerCount)|\(manifestPath)") {
             ResidentExpertTensors(
-                hashLayerCodesFromManifest: manifestPath,
-                hashLayerCount: hashLayerCount,
+                leadingLayerCodesFromManifest: manifestPath,
+                layerCount: layerCount,
                 metrics: metrics
             )
         }
