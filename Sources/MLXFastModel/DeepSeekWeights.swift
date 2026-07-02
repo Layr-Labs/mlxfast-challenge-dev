@@ -129,7 +129,6 @@ public struct DeepSeekWeightLoader {
             metrics: metrics
         )
         self.expertBank = expertBank
-        self.expertPrefetcher = ExpertPrefetcher(expertBank: expertBank)
         // Resident stores come from a process-wide registry: the trusted
         // benchmark harness keeps two loaders alive at once, and duplicating
         // ~14 GiB of resident data per loader would threaten the 48 GB
@@ -153,6 +152,15 @@ public struct DeepSeekWeightLoader {
                 metrics: metrics
             )
             : nil
+        let residentScales = self.residentExpertScales
+        let pinnedCodes = self.pinnedExpertCodes
+        self.expertPrefetcher = ExpertPrefetcher(
+            expertBank: expertBank,
+            isRecordResident: { name in
+                residentScales?.isResident(name: name) == true
+                    || pinnedCodes?.isResident(name: name) == true
+            }
+        )
         self.expertLayerStager = ExpertLayerStager(
             manifestPath: manifestPath,
             metrics: metrics
@@ -286,6 +294,20 @@ public struct DeepSeekWeightLoader {
             }
             let isStacked = record.shape.count == expectedShape.count + 1
                 && record.shape.first.map { expertIndex < $0 } == true
+            // Array fast path: when the scales are RAM-resident (and codes
+            // possibly pinned), build the weight from contiguous MLXArray
+            // slices instead of copying bytes through the bridge — the same
+            // bytes reach the same kernels with zero host memcpy.
+            if isStacked,
+               let fast = fastStackedExpertLinearWeight(
+                   record: record,
+                   candidate: candidate,
+                   expertIndex: expertIndex,
+                   expectedShape: expectedShape,
+                   preferStaged: preferStaged
+               ) {
+                return fast
+            }
             let tensor: MaterializedTensor
             if isStacked,
                let pinned = pinnedExpertCodes?.materializedTensor(
@@ -331,6 +353,92 @@ public struct DeepSeekWeightLoader {
         }
         throw MLXFastError.invalidInput(
             "expert tensor not found; tried \(candidates.joined(separator: ", "))"
+        )
+    }
+
+    /// Builds a quantized expert weight from resident MLXArray slices,
+    /// mirroring linearWeight's shape/bits/group inference and expertSlab's
+    /// guards. Engages only for stacked U32 records whose scales are
+    /// RAM-resident and that have no biases companion (the mxfp4 layout this
+    /// checkpoint uses); anything else returns nil and the byte path runs
+    /// unchanged. Codes come from the pinned store when present, otherwise
+    /// from the same bank slice read as today (one copy — identical to the
+    /// legacy path); scales always come as views, removing their per-use
+    /// host memcpy on every layer of every token.
+    private func fastStackedExpertLinearWeight(
+        record: ExpertTensorRecord,
+        candidate: String,
+        expertIndex: Int,
+        expectedShape: [Int],
+        preferStaged: Bool
+    ) -> DeepSeekLinearWeight? {
+        guard
+            record.dtype == "U32",
+            expectedShape.count == 2,
+            record.shape.count == 3,
+            record.shape[1] == expectedShape[0]
+        else {
+            return nil
+        }
+        let rows = expectedShape[0]
+        let inputColumns = expectedShape[1]
+        let packedColumns = record.shape[2]
+        guard
+            packedColumns > 0,
+            inputColumns > 0,
+            (packedColumns * 32) % inputColumns == 0,
+            [2, 4, 8].contains(packedColumns * 32 / inputColumns)
+        else {
+            return nil
+        }
+        let bits = packedColumns * 32 / inputColumns
+
+        let scalesName = companionName(for: candidate, suffix: "scales")
+        guard
+            expertBank.record(named: companionName(for: candidate, suffix: "biases")) == nil,
+            let scalesRecord = expertBank.record(named: scalesName),
+            scalesRecord.dtype == "U8",
+            scalesRecord.shape.count == 3,
+            scalesRecord.shape[1] == rows,
+            let scaleGroups = scalesRecord.shape.last,
+            scaleGroups > 0,
+            inputColumns % scaleGroups == 0,
+            inputColumns / scaleGroups == 32,
+            let scalesSlice = residentExpertScales?.arraySlice(
+                named: scalesName,
+                firstAxisIndex: expertIndex
+            )
+        else {
+            return nil
+        }
+
+        let weightArray: MLXArray
+        if let pinnedSlice = pinnedExpertCodes?.arraySlice(
+            named: candidate,
+            firstAxisIndex: expertIndex
+        ) {
+            weightArray = pinnedSlice
+        } else if preferStaged,
+                  let staged = stagedSliceTensor(recordName: candidate, expertIndex: expertIndex),
+                  let array = try? bridge.makeArray(from: staged) {
+            weightArray = array
+        } else if let tensor = try? expertBank.materializedTensor(
+            named: candidate,
+            firstAxisIndex: expertIndex
+        ), let array = try? bridge.makeArray(from: tensor) {
+            weightArray = array
+        } else {
+            return nil
+        }
+
+        return DeepSeekLinearWeight(
+            weight: weightArray.reshaped([rows, packedColumns]),
+            scales: scalesSlice.reshaped([rows, scaleGroups]),
+            biases: nil,
+            logicalShape: expectedShape,
+            groupSize: inputColumns / scaleGroups,
+            bits: bits,
+            mode: .mxfp4
         )
     }
 

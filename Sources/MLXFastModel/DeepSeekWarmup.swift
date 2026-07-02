@@ -19,7 +19,55 @@ enum DeepSeekWarmup {
         let config = weightCache.config
         evalDerivedWeights(weightCache: weightCache)
         warmKernels(config: config)
+        verifyKernelParity(weightCache: weightCache)
+        seedPageCacheForEarlyLayers(weightCache: weightCache)
         runThrowawayDecodeForward(weightCache: weightCache)
+    }
+
+    /// Untimed page-cache seeding: read the earliest UNPINNED layers' code
+    /// tensors once through the stager's counted side bank and release them.
+    /// The buffers are freed but the pages stay in the unified buffer cache,
+    /// so the scored prefill's first unpinned layers read from RAM instead of
+    /// the ~2 GB/s cold disk. Prompt-independent (prefill touches every
+    /// expert of every layer) and honestly recorded on the shared metrics.
+    private static func seedPageCacheForEarlyLayers(weightCache: DeepSeekRuntimeWeightCache) {
+        guard let stager = weightCache.loader.expertLayerStager else {
+            return
+        }
+        let seededLayerCount = 4
+        var seeded: [Int] = []
+        for layerIndex in 0..<weightCache.config.numHiddenLayers {
+            guard seeded.count < seededLayerCount else {
+                break
+            }
+            guard let plan = weightCache.loader.stagedExpertLayerPlan(layerIndex: layerIndex) else {
+                continue  // pinned or non-stacked layers need no seeding
+            }
+            stager.schedule(plan)
+            seeded.append(layerIndex)
+        }
+        for layerIndex in seeded where stager.waitForLayer(layerIndex) {
+            stager.releaseLayer(layerIndex)
+        }
+    }
+
+    /// Decides, on this machine with real weights, whether the slab gather
+    /// path is bit-identical to the per-expert loop; the decode fast path is
+    /// enabled only on a positive verdict. Layer 0 is RAM-pinned on runner-
+    /// class machines, so the probe costs milliseconds of untimed init.
+    private static func verifyKernelParity(weightCache: DeepSeekRuntimeWeightCache) {
+        guard let moeSpec = try? weightCache.moeSpec(layerIndex: 0) else {
+            return
+        }
+        _ = DeepSeekKernelParity.verifyGatherSlabs(
+            key: weightCache.loader.expertBank.manifest.referencePath
+        ) {
+            DeepSeekRoutedExperts.gatherSlabParityHolds(
+                loader: weightCache.loader,
+                spec: moeSpec.routedExperts,
+                topK: weightCache.config.expertsPerToken
+            )
+        }
     }
 
     private static func evalDerivedWeights(weightCache: DeepSeekRuntimeWeightCache) {

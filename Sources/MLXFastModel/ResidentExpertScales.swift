@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 import MLXFastCore
 
 /// RAM-resident copies of selected routed-expert tensors, serving
@@ -33,6 +34,13 @@ public final class ResidentExpertTensors {
     }
 
     private let entries: [String: Entry]
+    // Whole-tensor MLXArray wraps, built lazily once per record. When the
+    // store's Data is page-aligned with page-multiple length, the wrap is
+    // zero-copy over unified memory; otherwise a one-time copy. Either way,
+    // per-expert consumers get contiguous row SLICES of the whole array —
+    // same bytes, same kernels, and no per-use host memcpy.
+    private let wrapLock = NSLock()
+    private var wrappedArrays: [String: MLXArray] = [:]
 
     public var residentTensorCount: Int {
         entries.count
@@ -81,6 +89,53 @@ public final class ResidentExpertTensors {
 
     public func isResident(name: String) -> Bool {
         entries[name] != nil
+    }
+
+    /// Contiguous [rows, cols] MLXArray view of one expert's slice within the
+    /// resident stacked tensor. First-axis slices of a row-major array are
+    /// fully contiguous, so downstream quantized matmuls read the identical
+    /// bytes through the identical kernels as a freshly copied compact array.
+    public func arraySlice(named name: String, firstAxisIndex: Int) -> MLXArray? {
+        guard
+            let entry = entries[name],
+            let firstDimension = entry.shape.first,
+            firstAxisIndex >= 0,
+            firstAxisIndex < firstDimension,
+            let whole = wholeArray(named: name, entry: entry)
+        else {
+            return nil
+        }
+        return whole[firstAxisIndex]
+    }
+
+    private func wholeArray(named name: String, entry: Entry) -> MLXArray? {
+        wrapLock.lock()
+        if let cached = wrappedArrays[name] {
+            wrapLock.unlock()
+            return cached
+        }
+        wrapLock.unlock()
+
+        let dtype = MLXArrayTensorBridge.mlxDType(for: entry.dtype)
+        let bytes = entry.bytes
+        let array: MLXArray
+        let base = bytes.withUnsafeBytes { UnsafeMutableRawPointer(mutating: $0.baseAddress!) }
+        if UInt(bitPattern: base) % 16384 == 0, bytes.count % 16384 == 0 {
+            // Zero-copy wrap over unified memory; the finalizer keeps the
+            // store's Data alive for the array's lifetime (it is class-held
+            // anyway, but the retain makes the ownership explicit).
+            array = MLXArray(rawPointer: base, entry.shape, dtype: dtype) {
+                _ = bytes
+            }
+        } else {
+            array = MLXArray(bytes, entry.shape, dtype: dtype)
+        }
+
+        wrapLock.lock()
+        let winner = wrappedArrays[name] ?? array
+        wrappedArrays[name] = winner
+        wrapLock.unlock()
+        return winner
     }
 
     /// Byte-identical stand-in for the slot bank's materializedTensor calls.
