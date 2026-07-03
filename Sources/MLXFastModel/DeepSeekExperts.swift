@@ -36,7 +36,8 @@ public enum DeepSeekRoutedExperts {
         expertIndices: MLXArray,
         loader: DeepSeekWeightLoader,
         spec: DeepSeekRoutedExpertSpec,
-        onRoutingSynced: (() -> Void)? = nil
+        onRoutingSynced: (() -> Void)? = nil,
+        earlyDecodePrefetch: [String: StagedExpertCode]? = nil
     ) throws -> MLXArray {
         guard x.shape.count == 3 else {
             throw MLXFastError.invalidInput("routed expert input must have shape [batch, length, hidden]")
@@ -127,7 +128,7 @@ public enum DeepSeekRoutedExperts {
         // not prefetched falls back to the normal per-expert bank read.
         var decodePrefetch: [String: StagedExpertCode]?
         if tokenCount == 1, !useStaged {
-            decodePrefetch = loader.prefetchDecodeExpertCodes(
+            decodePrefetch = earlyDecodePrefetch ?? loader.prefetchDecodeExpertCodes(
                 layerIndex: spec.layerIndex,
                 expertIndices: Array(flatIndicesByExpert.keys),
                 hiddenSize: spec.hiddenSize,
