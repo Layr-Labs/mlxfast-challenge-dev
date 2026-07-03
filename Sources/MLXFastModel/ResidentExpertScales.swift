@@ -139,6 +139,26 @@ extension ResidentExpertTensors {
         }
     }
 
+    /// The packed U32 code tensors of the first `layerCount` layers (not
+    /// limited to hash-routed layers). This extends the hash-layer pinning
+    /// to non-hash layers: every decode step visits all 43 layers, so
+    /// pinning any layer's full expert code set eliminates all SSD reads
+    /// for that layer's routed experts. Input-independent weight pinning
+    /// — all 256 experts are resident regardless of which 6 are selected.
+    public convenience init?(
+        layerCodesFromManifest manifestPath: String,
+        layerCount: Int,
+        metrics: ExpertStreamingMetrics?
+    ) {
+        guard layerCount > 0 else {
+            return nil
+        }
+        self.init(manifestPath: manifestPath, metrics: metrics) { record in
+            record.dtype == "U32"
+                && Self.layerIndex(fromRecordName: record.name).map { $0 < layerCount } == true
+        }
+    }
+
     static func layerIndex(fromRecordName name: String) -> Int? {
         let components = name.split(separator: ".")
         guard
@@ -180,6 +200,20 @@ public enum ResidentExpertStoreRegistry {
             ResidentExpertTensors(
                 hashLayerCodesFromManifest: manifestPath,
                 hashLayerCount: hashLayerCount,
+                metrics: metrics
+            )
+        }
+    }
+
+    public static func pinnedLayerCodes(
+        manifestPath: String,
+        layerCount: Int,
+        metrics: ExpertStreamingMetrics?
+    ) -> ResidentExpertTensors? {
+        pinnedCodesCache.value(for: "layer\(layerCount)|\(manifestPath)") {
+            ResidentExpertTensors(
+                layerCodesFromManifest: manifestPath,
+                layerCount: layerCount,
                 metrics: metrics
             )
         }
