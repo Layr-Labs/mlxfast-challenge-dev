@@ -105,6 +105,7 @@ public struct DeepSeekWeightLoader {
     public let residentExpertScales: ResidentExpertTensors?
     public let pinnedExpertCodes: ResidentExpertTensors?
     public let expertLayerStager: ExpertLayerStager?
+    private let pinnedExpertCodeLayerCount: Int
     // Dedicated capacity-0 side bank for concurrent decode-step slice reads.
     // Capacity 0 => no cache/LRU mutation, so concurrent preads are race-free
     // and read byte-identical ranges through the trusted metered path.
@@ -134,7 +135,6 @@ public struct DeepSeekWeightLoader {
             metrics: metrics
         )
         self.expertBank = expertBank
-        self.expertPrefetcher = ExpertPrefetcher(expertBank: expertBank)
         // Resident stores come from a process-wide registry: the trusted
         // benchmark harness keeps two loaders alive at once, and duplicating
         // ~14 GiB of resident data per loader would threaten the 48 GB
@@ -144,6 +144,7 @@ public struct DeepSeekWeightLoader {
             manifestPath: manifestPath,
             metrics: metrics
         )
+        self.expertPrefetcher = ExpertPrefetcher(expertBank: expertBank)
         // Pinning trades RAM for guaranteed hits on the token-id-routed
         // layers; only worthwhile at the official 48 GB budget or above,
         // and capped so the pinned codes (~3.2 GiB per layer) leave headroom
@@ -151,13 +152,16 @@ public struct DeepSeekWeightLoader {
         // that budget. Both constants encode the OFFICIAL runner's memory
         // math — do not raise them because a larger local machine has room.
         let hashLayerCount = (try? DeepSeekConfig.load(from: weightsPath))?.numHashLayers ?? 0
-        self.pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
+        let pinnedHashLayerCount = min(hashLayerCount, Self.pinnedHashLayerCap)
+        let pinnedCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
             ? ResidentExpertStoreRegistry.pinnedHashLayerCodes(
                 manifestPath: manifestPath,
-                hashLayerCount: min(hashLayerCount, Self.pinnedHashLayerCap),
+                hashLayerCount: pinnedHashLayerCount,
                 metrics: metrics
             )
             : nil
+        self.pinnedExpertCodes = pinnedCodes
+        self.pinnedExpertCodeLayerCount = pinnedCodes == nil ? 0 : pinnedHashLayerCount
         self.expertLayerStager = ExpertLayerStager(
             manifestPath: manifestPath,
             metrics: metrics
@@ -184,9 +188,14 @@ public struct DeepSeekWeightLoader {
         self.expertPrefetcher = ExpertPrefetcher(expertBank: expertBank)
         self.residentExpertScales = nil
         self.pinnedExpertCodes = nil
+        self.pinnedExpertCodeLayerCount = 0
         self.expertLayerStager = nil
         self.decodeSideBank = nil
         self.bridge = bridge
+    }
+
+    public func hasPinnedDecodeExpertCodes(layerIndex: Int) -> Bool {
+        layerIndex >= 0 && layerIndex < pinnedExpertCodeLayerCount
     }
 
     public func resolveDenseName(_ candidates: [String]) throws -> String {

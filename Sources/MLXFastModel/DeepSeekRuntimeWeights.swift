@@ -39,17 +39,19 @@ public final class DeepSeekRuntimeWeightCache {
             guard base + entry.topK <= entry.table.count else {
                 continue
             }
-            let experts = entry.table[base..<(base + entry.topK)].map(Int.init)
-            if entry.layerIndex == 0, loader.pinnedExpertCodes != nil {
+            let hasPinnedCodes = loader.hasPinnedDecodeExpertCodes(layerIndex: entry.layerIndex)
+            if entry.layerIndex == 0, hasPinnedCodes {
                 continue
             }
-            let fullyPinned = loader.schedulePinnedDecodeExpertCodes(
-                layerIndex: entry.layerIndex,
-                expertIndices: experts,
-                hiddenSize: config.hiddenSize,
-                intermediateSize: config.moeIntermediateSize
-            )
-            if !fullyPinned {
+            let experts = entry.table[base..<(base + entry.topK)].map(Int.init)
+            if hasPinnedCodes {
+                _ = loader.schedulePinnedDecodeExpertCodes(
+                    layerIndex: entry.layerIndex,
+                    expertIndices: experts,
+                    hiddenSize: config.hiddenSize,
+                    intermediateSize: config.moeIntermediateSize
+                )
+            } else {
                 loader.expertPrefetcher.prefetch(
                     layerIndex: entry.layerIndex,
                     expertIndices: experts
@@ -95,6 +97,9 @@ public final class DeepSeekRuntimeWeightCache {
                tokenToExpert.shape.count == 2,
                tokenToExpert.shape[1] > 0
             {
+                if layerIndex == 0, loader.hasPinnedDecodeExpertCodes(layerIndex: layerIndex) {
+                    continue
+                }
                 // asArray on this untimed init path is the table's only host
                 // materialization; ~6 MB per hash layer. The decode entry path
                 // uses it for exact disk read-ahead on unpinned hash layers,
