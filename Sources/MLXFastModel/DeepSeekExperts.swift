@@ -84,7 +84,9 @@ public enum DeepSeekRoutedExperts {
                 loader.expertLayerStager?.releaseLayer(spec.layerIndex)
             }
         }
-        if !useStaged {
+        let hasScheduledPinnedDecodePrefetch = tokenCount == 1
+            && loader.hasScheduledPinnedDecodeExpertCodes(layerIndex: spec.layerIndex)
+        if !useStaged, !hasScheduledPinnedDecodePrefetch {
             // Kernel read-ahead for every byte range this layer is about to
             // pread, so SSD I/O overlaps the per-expert GPU compute below.
             loader.expertPrefetcher.prefetch(layerIndex: spec.layerIndex, expertIndices: selectedExperts)
@@ -127,7 +129,9 @@ public enum DeepSeekRoutedExperts {
         // not prefetched falls back to the normal per-expert bank read.
         var decodePrefetch: [String: StagedExpertCode]?
         if tokenCount == 1, !useStaged {
-            decodePrefetch = loader.prefetchDecodeExpertCodes(
+            decodePrefetch = loader.consumeScheduledPinnedDecodeExpertCodes(
+                layerIndex: spec.layerIndex
+            ) ?? loader.prefetchDecodeExpertCodes(
                 layerIndex: spec.layerIndex,
                 expertIndices: Array(flatIndicesByExpert.keys),
                 hiddenSize: spec.hiddenSize,
