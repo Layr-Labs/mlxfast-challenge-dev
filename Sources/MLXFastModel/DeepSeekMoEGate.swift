@@ -30,23 +30,29 @@ public enum DeepSeekMoEGate {
             matmul(hidden, weightTransposed ?? weight.T),
             to: .float32
         )
-        let scores = score(logits, scoring: scoring)
 
         let indices: MLXArray
+        var selectedWeights: MLXArray
         if let tokenToExpert {
             guard let inputIDs else {
                 throw MLXFastError.invalidInput("hash routing requires input ids")
             }
             indices = tokenToExpert[inputIDs].asType(.int32)
+            if scoring == .softmax {
+                selectedWeights = takeAlong(score(logits, scoring: scoring), indices, axis: -1)
+            } else {
+                selectedWeights = score(takeAlong(logits, indices, axis: -1), scoring: scoring)
+            }
         } else {
+            let scores = score(logits, scoring: scoring)
             let biased = correctionBias.map { scores + $0 } ?? scores
             indices = argPartition(-biased, kth: topK - 1, axis: -1)[
                 .ellipsis,
                 0..<topK
             ].asType(.int32)
+            selectedWeights = takeAlong(scores, indices, axis: -1)
         }
 
-        var selectedWeights = takeAlong(scores, indices, axis: -1)
         if scoring != .softmax && normTopKProb {
             selectedWeights = selectedWeights / (selectedWeights.sum(axis: -1, keepDims: true) + 1e-20)
         }
