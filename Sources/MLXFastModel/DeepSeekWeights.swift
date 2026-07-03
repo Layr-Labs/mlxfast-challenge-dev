@@ -110,6 +110,7 @@ public struct DeepSeekWeightLoader {
     // and read byte-identical ranges through the trusted metered path.
     private let decodeSideBank: ExpertSlotBank?
     private let bridge: MLXArrayTensorBridge
+    private let scheduledPinnedDecodePrefetches = ScheduledDecodePrefetches()
 
     /// Sized for the official 48 GB runner: pin only where at least that
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
@@ -397,6 +398,145 @@ public struct DeepSeekWeightLoader {
                     return
                 }
                 // Also build the resident scales' base array off-thread.
+                let scalesArray = Self.residentScalesArray(
+                    residentScales: residentScales,
+                    bridge: bridge,
+                    codeName: name,
+                    expertIndex: expertIndex
+                )
+                sink.buffer[index] = StagedExpertCode(
+                    tensor: tensor,
+                    array: array,
+                    scalesArray: scalesArray
+                )
+            }
+        }
+        var map: [String: StagedExpertCode] = [:]
+        map.reserveCapacity(keys.count)
+        for (index, key) in keys.enumerated() {
+            if let staged = results[index] {
+                map[key] = staged
+            }
+        }
+        return map.isEmpty ? nil : map
+    }
+
+    /// Starts building resident pinned-code decode slices for a hash-routed
+    /// layer before that layer reaches MoE. Only the first two hash layers are
+    /// pinned on the official runner; unpinned layers return false so callers
+    /// still issue the normal disk read-ahead.
+    @discardableResult
+    public func schedulePinnedDecodeExpertCodes(
+        layerIndex: Int,
+        expertIndices: [Int],
+        hiddenSize: Int,
+        intermediateSize: Int
+    ) -> Bool {
+        guard let pinnedCodes = self.pinnedExpertCodes, !expertIndices.isEmpty else {
+            scheduledPinnedDecodePrefetches.remove(layerIndex: layerIndex)
+            return false
+        }
+        let plan = pinnedDecodeExpertCodePlan(
+            pinnedCodes: pinnedCodes,
+            layerIndex: layerIndex,
+            expertIndices: expertIndices,
+            hiddenSize: hiddenSize,
+            intermediateSize: intermediateSize
+        )
+        guard !plan.keys.isEmpty else {
+            scheduledPinnedDecodePrefetches.remove(layerIndex: layerIndex)
+            return false
+        }
+        let bridge = self.bridge
+        let residentScales = self.residentExpertScales
+        scheduledPinnedDecodePrefetches.schedule(layerIndex: layerIndex) {
+            Self.buildPinnedDecodeExpertCodes(
+                keys: plan.keys,
+                names: plan.names,
+                indices: plan.indices,
+                pinnedCodes: pinnedCodes,
+                residentScales: residentScales,
+                bridge: bridge
+            )
+        }
+        return plan.keys.count == Set(expertIndices).count * 3
+    }
+
+    public func consumeScheduledPinnedDecodeExpertCodes(layerIndex: Int) -> [String: StagedExpertCode]? {
+        scheduledPinnedDecodePrefetches.consume(layerIndex: layerIndex)
+    }
+
+    private func pinnedDecodeExpertCodePlan(
+        pinnedCodes: ResidentExpertTensors,
+        layerIndex: Int,
+        expertIndices: [Int],
+        hiddenSize: Int,
+        intermediateSize: Int
+    ) -> (keys: [String], names: [String], indices: [Int]) {
+        let projections: [(DeepSeekExpertProjection, [Int])] = [
+            (.gate, [intermediateSize, hiddenSize]),
+            (.up, [intermediateSize, hiddenSize]),
+            (.down, [hiddenSize, intermediateSize]),
+        ]
+        var keys: [String] = []
+        var names: [String] = []
+        var indices: [Int] = []
+        var seen = Set<String>()
+        for expertIndex in expertIndices {
+            for (projection, expectedShape) in projections {
+                let candidates = DeepSeekWeightNames.routedExpert(
+                    layerIndex: layerIndex,
+                    expertIndex: expertIndex,
+                    projection: projection
+                )
+                for candidate in candidates {
+                    guard let record = expertBank.record(named: candidate) else {
+                        continue
+                    }
+                    let isStacked = record.shape.count == expectedShape.count + 1
+                        && record.shape.first.map { expertIndex < $0 } == true
+                    guard isStacked else {
+                        break
+                    }
+                    guard pinnedCodes.isResident(name: candidate) else {
+                        break
+                    }
+                    let key = Self.decodePrefetchKey(candidate, expertIndex)
+                    if seen.insert(key).inserted {
+                        keys.append(key)
+                        names.append(candidate)
+                        indices.append(expertIndex)
+                    }
+                    break
+                }
+            }
+        }
+        return (keys, names, indices)
+    }
+
+    private static func buildPinnedDecodeExpertCodes(
+        keys: [String],
+        names: [String],
+        indices: [Int],
+        pinnedCodes: ResidentExpertTensors,
+        residentScales: ResidentExpertTensors?,
+        bridge: MLXArrayTensorBridge
+    ) -> [String: StagedExpertCode]? {
+        var results = [StagedExpertCode?](repeating: nil, count: keys.count)
+        results.withUnsafeMutableBufferPointer { buffer in
+            let sink = DecodePrefetchSink(buffer: buffer)
+            DispatchQueue.concurrentPerform(iterations: keys.count) { index in
+                let name = names[index]
+                let expertIndex = indices[index]
+                guard
+                    let tensor = pinnedCodes.materializedTensor(
+                        named: name,
+                        firstAxisIndex: expertIndex
+                    ),
+                    let array = try? bridge.makeArray(from: tensor)
+                else {
+                    return
+                }
                 let scalesArray = Self.residentScalesArray(
                     residentScales: residentScales,
                     bridge: bridge,
@@ -1569,4 +1709,55 @@ public struct StagedExpertCode {
 // disjoint and the unchecked Sendable conformance is sound.
 private struct DecodePrefetchSink: @unchecked Sendable {
     let buffer: UnsafeMutableBufferPointer<StagedExpertCode?>
+}
+
+private final class ScheduledDecodePrefetches {
+    private final class Entry {
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var result: [String: StagedExpertCode]?
+    }
+
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "mlxfast.decode.pinned-prefetch", qos: .userInitiated)
+    private var entries: [Int: Entry] = [:]
+
+    func schedule(
+        layerIndex: Int,
+        build: @escaping () -> [String: StagedExpertCode]?
+    ) {
+        let entry = Entry()
+        entry.group.enter()
+        lock.lock()
+        entries[layerIndex] = entry
+        lock.unlock()
+
+        queue.async {
+            let result = build()
+            entry.lock.lock()
+            entry.result = result
+            entry.lock.unlock()
+            entry.group.leave()
+        }
+    }
+
+    func consume(layerIndex: Int) -> [String: StagedExpertCode]? {
+        lock.lock()
+        let entry = entries.removeValue(forKey: layerIndex)
+        lock.unlock()
+        guard let entry else {
+            return nil
+        }
+        entry.group.wait()
+        entry.lock.lock()
+        let result = entry.result
+        entry.lock.unlock()
+        return result?.isEmpty == true ? nil : result
+    }
+
+    func remove(layerIndex: Int) {
+        lock.lock()
+        entries.removeValue(forKey: layerIndex)
+        lock.unlock()
+    }
 }
