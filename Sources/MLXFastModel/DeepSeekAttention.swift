@@ -799,9 +799,20 @@ public enum DeepSeekCompressedAttention {
         var normalizer = localScores.logSumExp(axis: -1, keepDims: true)
 
         let pooledSQ = selectedPooled.squeezed(axis: 1)
-        let qBL = qScaled.transposed(0, 2, 1, 3)
+        let qBL: MLXArray
+        if sequenceLength == 1 {
+            // [B, H, 1, D] -> [B, 1, H, D]
+            qBL = qScaled.reshaped([batchSize, 1, heads, headDim])
+        } else {
+            qBL = qScaled.transposed(0, 2, 1, 3)
+        }
         var pooledScores = matmul(qBL, pooledSQ.swappedAxes(-1, -2))
-            .transposed(0, 2, 1, 3)
+        if sequenceLength == 1 {
+            // [B, 1, H, K] -> [B, H, 1, K]
+            pooledScores = pooledScores.reshaped([batchSize, heads, 1, selectedCount])
+        } else {
+            pooledScores = pooledScores.transposed(0, 2, 1, 3)
+        }
         let sparseMask = try sparsePooledMask(
             pooledMask,
             topK: topK,
@@ -824,10 +835,20 @@ public enum DeepSeekCompressedAttention {
         let localWeights = (localScores - normalizer).exp()
         let pooledWeights = (pooledScores - normalizer).exp()
         var out = matmul(localWeights, localKV)
-        let pooledOut = matmul(
-            pooledWeights.transposed(0, 2, 1, 3),
-            pooledSQ
-        ).transposed(0, 2, 1, 3)
+        let pooledWeightsBL: MLXArray
+        if sequenceLength == 1 {
+            // [B, H, 1, K] -> [B, 1, H, K]
+            pooledWeightsBL = pooledWeights.reshaped([batchSize, 1, heads, selectedCount])
+        } else {
+            pooledWeightsBL = pooledWeights.transposed(0, 2, 1, 3)
+        }
+        var pooledOut = matmul(pooledWeightsBL, pooledSQ)
+        if sequenceLength == 1 {
+            // [B, 1, H, D] -> [B, H, 1, D]
+            pooledOut = pooledOut.reshaped([batchSize, heads, 1, headDim])
+        } else {
+            pooledOut = pooledOut.transposed(0, 2, 1, 3)
+        }
         out = out + pooledOut
         return out.asType(q.dtype)
     }
@@ -913,7 +934,12 @@ public enum DeepSeekIndexer {
         )
         var q = DeepSeekOps.linear(input: qResidual, weight: weights.wqB)
         q = q.reshaped([batchSize, sequenceLength, spec.indexHeads, spec.indexHeadDim])
-        q = q.transposed(0, 2, 1, 3)
+        if sequenceLength == 1 {
+            // [B, 1, H, D] -> [B, H, 1, D]; moving only a size-1 axis, so reshape is element-order identical.
+            q = q.reshaped([batchSize, spec.indexHeads, 1, spec.indexHeadDim])
+        } else {
+            q = q.transposed(0, 2, 1, 3)
+        }
         q = try rope.applied(to: q, offset: positionOffset)
 
         var scores = matmul(
