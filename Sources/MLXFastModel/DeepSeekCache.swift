@@ -17,6 +17,7 @@ public final class DeepSeekLocalKVCache {
     public private(set) var offset: Int
     public private(set) var startPosition: Int
     private var kv: MLXArray?
+    private var deferredKeyOffset: Int?
 
     public init(maxSize: Int, offset: Int = 0, startPosition: Int = 0) {
         self.maxSize = maxSize
@@ -34,21 +35,45 @@ public final class DeepSeekLocalKVCache {
         let incoming = newKV.shape[2]
         guard incoming > 0 else {
             if let kv {
-                return DeepSeekCachedKV(kv: kv, keyOffset: startPosition)
+                return DeepSeekCachedKV(kv: kv, keyOffset: deferredKeyOffset ?? startPosition)
             }
             return DeepSeekCachedKV(kv: newKV, keyOffset: offset)
         }
 
-        let combinedStart = startPosition
-        let combined = kv.map { concatenated([$0, newKV], axis: 2) } ?? newKV
+        let baseKV: MLXArray?
+        let baseStart: Int
+        if let existing = kv, let deferred = deferredKeyOffset {
+            // The previous decode step stored [maxSize + 1] keys. Drop exactly
+            // the overflow key now, before appending the new decode token.
+            baseKV = existing[0..., 0..., 1..., 0...]
+            baseStart = deferred + 1
+            deferredKeyOffset = nil
+        } else {
+            baseKV = kv
+            baseStart = startPosition
+        }
+
+        let combinedStart = baseStart
+        let combined = baseKV.map { concatenated([$0, newKV], axis: 2) } ?? newKV
         offset += incoming
 
         if combined.shape[2] > maxSize {
             let drop = combined.shape[2] - maxSize
-            kv = combined[0..., 0..., drop..., 0...]
-            startPosition = combinedStart + drop
+            if incoming == 1 && drop == 1 {
+                // Decode steady state. Attention must see `combined` including the
+                // overflow key; the mask removes it. Store the same tensor and delay
+                // the tail view until the next append.
+                kv = combined
+                deferredKeyOffset = combinedStart
+                startPosition = combinedStart + drop
+            } else {
+                kv = combined[0..., 0..., drop..., 0...]
+                deferredKeyOffset = nil
+                startPosition = combinedStart + drop
+            }
         } else {
             kv = combined
+            deferredKeyOffset = nil
             startPosition = combinedStart
         }
 
