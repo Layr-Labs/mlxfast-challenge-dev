@@ -1,0 +1,370 @@
+name: blacksmith-baseline-variance-probe
+
+# Manual experiment: run the UNMODIFIED baseline (this branch is origin/main plus
+# only this workflow file -- the editable model surface is untouched) timing
+# benchmark on N Blacksmith machines concurrently, and compare what each machine
+# reports. It exists to test the hypothesis that Blacksmith runtime performance
+# is variable/contended -- e.g. the expert-read (disk / network-backed storage)
+# path is shared with noisy neighbours -- which would make the same code score
+# far worse here than on a local M4 Pro, and would make the calibrated baseline
+# denominators (decode 4.2205 s/tok, prefill 0.17331 s/tok in Constants.swift)
+# unreproducible on a bad day.
+#
+# NOT part of CI or scoring. Secret-free by design (same posture as
+# parallel-correctness-probe.yml): checked-in public fixture only, a locally
+# synthesized benchmark oracle, no hidden goldens, no R2/Anthropic secrets, no
+# environment protection. Its logs and artifacts are visible to anyone who can
+# trigger it, so it must never touch private material.
+#
+# What each machine measures (full official 128-step timing path, so the numbers
+# are directly comparable to the ranked benchmark's own):
+#   - decode_seconds_per_token / prefill_seconds_per_token (+ speedup vs baseline)
+#   - bandwidth_gb_per_token, expert_read_seconds, expert_bytes_read (the read path)
+#   - a raw sequential-read microbench over the on-disk checkpoint (model-independent)
+#   - reference-checkpoint download throughput during setup (the other "network")
+#   - host identity (so two matrix entries landing on the same physical host are visible)
+on:
+  workflow_dispatch:
+    inputs:
+      machines:
+        description: 'JSON array of machine indices to run concurrently, e.g. "[1]" for an isolated baseline or "[1,2,3,4,5,6]" to stress shared resources.'
+        required: false
+        default: "[1,2,3,4,5,6]"
+        type: string
+      reference_download_jobs:
+        description: "Parallel shard downloads for setup.sh, per machine."
+        required: false
+        default: "12"
+        type: string
+      reference_min_free_gib:
+        description: "Minimum free GiB required before reference checkpoint download."
+        required: false
+        default: "170"
+        type: string
+      raw_read_gib:
+        description: "GiB to sequentially read from the on-disk checkpoint for the model-independent read-bandwidth microbench."
+        required: false
+        default: "8"
+        type: string
+      label:
+        description: "Free-text label to distinguish repeated dispatches in the summary."
+        required: false
+        default: "baseline"
+        type: string
+
+concurrency:
+  group: blacksmith-baseline-variance-probe-${{ github.ref }}-${{ inputs.label }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  timing:
+    name: "timing machine ${{ matrix.machine }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(inputs.machines) }}
+    runs-on: blacksmith-12vcpu-macos-26
+    timeout-minutes: 360
+    env:
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
+      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Capture host identity
+        # A shared physical host is the whole question: if two matrix entries
+        # report the same hostname / MAC / boot time, they are contending with
+        # each other, not just with unknown neighbours.
+        run: |
+          set -uo pipefail
+          {
+            echo "machine_index=${{ matrix.machine }}"
+            echo "hostname=$(hostname 2>/dev/null || true)"
+            echo "cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)"
+            echo "ncpu=$(sysctl -n hw.ncpu 2>/dev/null || true)"
+            echo "memsize_bytes=$(sysctl -n hw.memsize 2>/dev/null || true)"
+            echo "model=$(sysctl -n hw.model 2>/dev/null || true)"
+            echo "boottime=$(sysctl -n kern.boottime 2>/dev/null || true)"
+            echo "os=$(sw_vers -productVersion 2>/dev/null || true) build=$(sw_vers -buildVersion 2>/dev/null || true)"
+            echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            # Any Blacksmith-provided identifiers, without dumping secrets.
+            env | grep -iE '^BLACKSMITH' | sort || true
+          } | tee host.txt
+
+      - name: Restore SwiftPM cache
+        id: restore_swiftpm_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        # No repo secrets by design (see header). setup.sh falls back to its own
+        # public DEFAULT_REFERENCE_BASE_URL and an empty auth header when these
+        # are unset -- exactly what a secret-free probe needs. We time the whole
+        # setup (dominated by the ~141 GiB checkpoint download) so download
+        # throughput -- the other "network bandwidth" in the hypothesis -- is
+        # itself a recorded, comparable-across-machines number.
+        env:
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
+          MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+        run: |
+          set -euo pipefail
+          started="${SECONDS}"
+          ./setup.sh
+          echo "setup_seconds=$((SECONDS - started))" | tee -a host.txt
+
+      - name: Save SwiftPM cache
+        if: ${{ steps.restore_swiftpm_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: ${{ steps.restore_swiftpm_cache.outputs.cache-primary-key }}
+
+      - name: Measure on-disk checkpoint size and raw read bandwidth
+        # Model-independent read-bandwidth probe: sequentially read the largest
+        # checkpoint shards to /dev/null and record GiB/s. This isolates the
+        # storage/read path from all model, transform, and MLX behaviour -- if
+        # THIS number is low or varies across concurrent machines, the read path
+        # is the bottleneck, regardless of what the model does. Cold-cache read
+        # is what the benchmark's expert streaming actually pays.
+        env:
+          RAW_READ_GIB: ${{ inputs.raw_read_gib }}
+        run: |
+          set -uo pipefail
+          ref="${MLXFAST_REFERENCE_DIR}"
+          echo "checkpoint_du_bytes=$(du -sk "${ref}" 2>/dev/null | awk '{print $1*1024}')" | tee -a host.txt
+          # Pick the single largest shard and read up to RAW_READ_GIB of it.
+          big="$(find "${ref}" -type f -name '*.safetensors' -exec stat -f '%z %N' {} + 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+          if [[ -z "${big}" ]]; then
+            echo "raw_read_status=no_shard_found" | tee -a host.txt
+          else
+            # Try to drop this file from the unified buffer cache so we measure a
+            # real (cold) read, not RAM. Best-effort; ignore failure.
+            /usr/bin/purge >/dev/null 2>&1 || true
+            gib="${RAW_READ_GIB:-8}"
+            count=$(( gib * 1024 ))   # 1 MiB blocks
+            start_ns=$(python3 -c 'import time;print(time.monotonic_ns())')
+            bytes="$(dd if="${big}" of=/dev/null bs=1048576 count="${count}" 2>/dev/null; stat -f '%z' "${big}")"
+            # dd read min(count MiB, filesize); recompute actual bytes read.
+            fsize="$(stat -f '%z' "${big}")"
+            want=$(( count * 1048576 ))
+            read_bytes=$(( want < fsize ? want : fsize ))
+            end_ns=$(python3 -c 'import time;print(time.monotonic_ns())')
+            secs=$(python3 -c "print(($end_ns-$start_ns)/1e9)")
+            gbps=$(python3 -c "print($read_bytes/1e9/max($secs,1e-9))")
+            {
+              echo "raw_read_file=$(basename "${big}")"
+              echo "raw_read_bytes=${read_bytes}"
+              echo "raw_read_seconds=${secs}"
+              echo "raw_read_gbps=${gbps}"
+            } | tee -a host.txt
+          fi
+
+      - name: Transform reference checkpoint
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" \
+            --output weights
+
+      - name: Synthesize a benchmark oracle from the public fixture
+        # The public golden is {version, cases}; the timing path requires a
+        # `benchmark` oracle. Baseline main reproduces the reference's
+        # teacher-forced trajectory (the correctness contract), so an oracle
+        # built from the public case's own tokens passes on baseline and lets us
+        # run the real 128-step timing path with no hidden material.
+        run: |
+          set -euo pipefail
+          python3 - "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" golden_with_oracle.json <<'PY'
+          import json, sys
+          src, dst = sys.argv[1], sys.argv[2]
+          d = json.load(open(src))
+          case = d["cases"][0]
+          prompt = case["prompt_tokens"]
+          expected = case["expected_tokens"]
+          assert len(expected) >= 129, f"need >=129 expected tokens, got {len(expected)}"
+          d["benchmark"] = {
+              "prefill_prompt_tokens": prompt,
+              "expected_prefill_token": expected[0],
+              "decode_seed_tokens": prompt,
+              "expected_decode_seed_token": expected[0],
+              "expected_decode_tokens": expected[1:],
+          }
+          json.dump(d, open(dst, "w"))
+          print(f"oracle: prefill_tokens={len(prompt)} decode_oracle={len(expected[1:])}")
+          PY
+
+      - name: Run baseline timing benchmark (full 128-step official path)
+        # Timing only: no gates, no base correctness steps. Same sandbox + worker
+        # posture as a ranked run (MLXFAST_OFFICIAL_BENCHMARK_RUN=1) so the
+        # measurement environment matches official; only the hidden goldens/gates
+        # are omitted (irrelevant to timing). Baseline main passes the synthesized
+        # oracle, so this produces a real, passing score.json with full timing +
+        # bandwidth diagnostics.
+        env:
+          MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+          MLXFAST_SKIP_TRANSFORM: "1"
+          MLXFAST_WEIGHTS_PATH: weights
+          MLXFAST_CORRECTNESS_GOLDEN_PATH: golden_with_oracle.json
+          MLXFAST_SCORE_PATH: score.json
+          MLXFAST_BENCHMARK_CORRECTNESS_STEPS: "0"
+          MLXFAST_BENCHMARK_CHECK_GATES: "0"
+          MLXFAST_BENCHMARK_SKIP_TIMED: "0"
+          MLXFAST_NOTE: "blacksmith-baseline-variance-probe machine=${{ matrix.machine }} label=${{ inputs.label }}"
+        run: |
+          set -euo pipefail
+          echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a host.txt
+          ./benchmark.sh
+          echo "== score.json =="
+          cat score.json
+
+      - name: Upload machine artifact
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: blacksmith-baseline-variance-probe-${{ github.run_id }}-machine-${{ matrix.machine }}
+          path: |
+            score.json
+            host.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  combine:
+    name: combine
+    needs: [timing]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download machine artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: blacksmith-baseline-variance-probe-${{ github.run_id }}-machine-*
+          path: machines
+          merge-multiple: false
+
+      - name: Tabulate variance
+        env:
+          LABEL: ${{ inputs.label }}
+          MACHINES: ${{ inputs.machines }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
+          import glob, json, os, re, statistics
+
+          BASE_DECODE = 4.220506571617188
+          BASE_PREFILL = 0.17330563175390626
+
+          def host_field(path, key):
+              try:
+                  for line in open(path):
+                      if line.startswith(key + "="):
+                          return line.split("=", 1)[1].strip()
+              except FileNotFoundError:
+                  return None
+              return None
+
+          rows = []
+          for d in sorted(glob.glob("machines/*")):
+              sp, hp = os.path.join(d, "score.json"), os.path.join(d, "host.txt")
+              idx = host_field(hp, "machine_index") or re.sub(r".*machine-", "", d)
+              row = {"machine": idx,
+                     "host": (host_field(hp, "hostname") or "?"),
+                     "setup_s": host_field(hp, "setup_seconds"),
+                     "raw_gbps": host_field(hp, "raw_read_gbps")}
+              try:
+                  m = json.load(open(sp))["metrics"]
+                  row.update(
+                      decode=m.get("decode_seconds_per_token"),
+                      prefill=m.get("prefill_seconds_per_token"),
+                      bw=m.get("bandwidth_gb_per_token"),
+                      eread=m.get("expert_read_seconds"),
+                      ebytes=m.get("expert_bytes_read"),
+                      ram=m.get("peak_ram_gb"),
+                      timed=m.get("timed_benchmark_seconds"),
+                  )
+              except (FileNotFoundError, KeyError, json.JSONDecodeError):
+                  row["decode"] = None
+              rows.append(row)
+
+          def f(x, nd=4):
+              return "n/a" if x is None else (f"{x:.{nd}f}" if isinstance(x, float) else str(x))
+
+          def spd(base, v):
+              return None if not v else base / v
+
+          print(f"## Blacksmith baseline variance probe — `{os.environ.get('LABEL','')}`")
+          print()
+          print(f"- machines requested: `{os.environ.get('MACHINES','')}`  ·  reported: {len(rows)}")
+          print(f"- baseline denominators: decode `{BASE_DECODE:.4f}` s/tok, prefill `{BASE_PREFILL:.5f}` s/tok")
+          print()
+          print("| m | host | decode s/tok | decode×base | prefill s/tok | prefill×base | bw GB/tok | expert_read s | peak RAM GB | raw read GB/s | setup s | timed s |")
+          print("|---|------|-------------|-------------|---------------|--------------|-----------|---------------|-------------|---------------|---------|---------|")
+          for r in rows:
+              print("| {m} | {h} | {dc} | {dcs} | {pf} | {pfs} | {bw} | {er} | {ram} | {raw} | {su} | {ti} |".format(
+                  m=r["machine"], h=(r.get("host") or "?")[-12:],
+                  dc=f(r.get("decode")), dcs=f(spd(BASE_DECODE, r.get("decode")), 3),
+                  pf=f(r.get("prefill"), 5), pfs=f(spd(BASE_PREFILL, r.get("prefill")), 3),
+                  bw=f(r.get("bw"), 3), er=f(r.get("eread"), 2), ram=f(r.get("ram"), 2),
+                  raw=f(float(r["raw_gbps"]), 3) if r.get("raw_gbps") else "n/a",
+                  su=r.get("setup_s") or "n/a", ti=f(r.get("timed"), 1)))
+
+          def stats(key, conv=lambda r: r.get(key)):
+              vals = [conv(r) for r in rows]
+              vals = [v for v in vals if isinstance(v, (int, float))]
+              if len(vals) < 2:
+                  return None
+              mean = statistics.mean(vals)
+              sd = statistics.pstdev(vals)
+              return mean, sd, (sd / mean * 100 if mean else 0), min(vals), max(vals), (max(vals)/min(vals) if min(vals) else 0)
+
+          print()
+          print("| metric | mean | stdev | CV% | min | max | max/min |")
+          print("|--------|------|-------|-----|-----|-----|---------|")
+          for name, key, conv in [
+              ("decode s/tok", "decode", lambda r: r.get("decode")),
+              ("prefill s/tok", "prefill", lambda r: r.get("prefill")),
+              ("bandwidth GB/tok", "bw", lambda r: r.get("bw")),
+              ("expert_read s", "eread", lambda r: r.get("eread")),
+              ("raw read GB/s", "raw", lambda r: float(r["raw_gbps"]) if r.get("raw_gbps") else None),
+              ("setup s", "setup", lambda r: int(r["setup_s"]) if r.get("setup_s") else None),
+          ]:
+              s = stats(key, conv)
+              if s:
+                  mean, sd, cv, lo, hi, ratio = s
+                  print(f"| {name} | {mean:.4f} | {sd:.4f} | {cv:.1f}% | {lo:.4f} | {hi:.4f} | {ratio:.2f}× |")
+          print()
+          print("**Read as:** high CV% / max÷min ≫ 1 on decode & bandwidth across concurrent machines ⇒ contention on the read path. "
+                "`decode×base` well below 1.0 ⇒ baseline main no longer reproduces the calibrated 4.2205 s/tok on Blacksmith today. "
+                "raw read GB/s tracking decode ⇒ the storage/read path (not compute) is the variable.")
+          PY
+
+      - name: Upload combined summary
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: blacksmith-baseline-variance-probe-${{ github.run_id }}-combined
+          path: machines
+          if-no-files-found: warn
+          retention-days: 14
