@@ -150,6 +150,7 @@ jobs:
           key: ${{ steps.restore_swiftpm_cache.outputs.cache-primary-key }}
 
       - name: Measure on-disk checkpoint size and raw read bandwidth
+        continue-on-error: true
         # Model-independent read-bandwidth probe: sequentially read the largest
         # checkpoint shards to /dev/null and record GiB/s. This isolates the
         # storage/read path from all model, transform, and MLX behaviour -- if
@@ -190,6 +191,7 @@ jobs:
           fi
 
       - name: CPU compute microbench (I/O-free)
+        continue-on-error: true
         # Fixed single-thread arithmetic work, zero I/O -- isolates per-host CPU /
         # scheduling availability from storage. If cpu_mops varies across
         # concurrent machines in step with decode while cold_read stays flat, the
@@ -212,20 +214,19 @@ jobs:
         # measures sustained COLD storage throughput, unlike the warm sequential
         # raw-read above (which the sticky-disk-resident checkpoint served from
         # cache, hence its flat ~3.25 GB/s). Under co-located concurrent machines
-        # this is the direct shared-storage-contention probe.
+        # this is the direct shared-storage-contention probe. Python globs the
+        # shards itself (macOS ships bash 3.2 -- no `mapfile`).
+        continue-on-error: true
         env:
           COLD_READ_GIB: "56"
         run: |
-          set -uo pipefail
-          ref="${MLXFAST_REFERENCE_DIR}"
-          mapfile -t shards < <(find "${ref}" -type f -name '*.safetensors' | sort)
-          if [[ "${#shards[@]}" -eq 0 ]]; then
-            echo "cold_read_status=no_shards" | tee -a host.txt
-          else
-            python3 - "${COLD_READ_GIB}" "${shards[@]}" <<'PY' | tee -a host.txt
-          import fcntl, sys, time
-          target = int(sys.argv[1]) * (1024**3)
-          shards = sys.argv[2:]
+          python3 - "${MLXFAST_REFERENCE_DIR}" "${COLD_READ_GIB}" <<'PY' | tee -a host.txt
+          import fcntl, glob, os, sys, time
+          ref, gib = sys.argv[1], int(sys.argv[2])
+          target = gib * (1024**3)
+          shards = sorted(glob.glob(os.path.join(ref, "*.safetensors")))
+          if not shards:
+              print("cold_read_status=no_shards"); sys.exit(0)
           buf = bytearray(8 * 1024 * 1024)
           read = 0
           t = time.monotonic()
@@ -247,7 +248,6 @@ jobs:
           print(f"cold_read_seconds={dt:.3f}")
           print(f"cold_read_gbps={read/1e9/max(dt,1e-9):.3f}")
           PY
-          fi
 
       - name: Transform reference checkpoint
         run: |
