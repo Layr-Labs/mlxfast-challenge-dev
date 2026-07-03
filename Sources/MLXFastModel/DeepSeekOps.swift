@@ -140,8 +140,53 @@ public enum DeepSeekOps {
         guard limit > 0 else {
             return silu(gate) * up
         }
+        // Compile fusion pays off only when the input has enough elements
+        // for the fused kernel to amortize the compile-invocation
+        // overhead. Empirically (from submission 098c5a9's 1.673 result vs
+        // frontier 1.726) that overhead dominates on the tiny 1-row
+        // decode expert MLPs. Prefill and the full-sequence shared MLP
+        // hand this function multi-hundred-row activations where the
+        // fusion savings actually win. Threshold on element count to
+        // keep decode on the direct dispatch path and let large
+        // activations take the fused path.
+        let elementCount = gate.size
+        if elementCount >= compiledLimitedSwiGLUThreshold {
+            let cache = Self.compiledLimitedSwiGLU(limit: Float(limit), dtype: gate.dtype)
+            return cache(gate, up)
+        }
         let cappedGate = minimum(gate, Float(limit))
         let clippedUp = clip(up, min: Float(-limit), max: Float(limit))
         return silu(cappedGate) * clippedUp
+    }
+
+    /// Element-count above which the compiled limitedSwiGLU is worth its
+    /// invocation overhead. Below this, direct dispatch wins.
+    private static let compiledLimitedSwiGLUThreshold = 32_768
+
+    private struct LimitedSwiGLUKey: Hashable {
+        let limitBits: UInt32
+        let dtype: DType
+    }
+
+    private static let compiledLimitedSwiGLUCache =
+        LockedCache<LimitedSwiGLUKey, @Sendable (MLXArray, MLXArray) -> MLXArray>()
+
+    private static func compiledLimitedSwiGLU(
+        limit: Float,
+        dtype: DType
+    ) -> @Sendable (MLXArray, MLXArray) -> MLXArray {
+        let key = LimitedSwiGLUKey(limitBits: limit.bitPattern, dtype: dtype)
+        return compiledLimitedSwiGLUCache.value(for: key) {
+            compile { (gate: MLXArray, up: MLXArray) -> MLXArray in
+                // Preserve the exact op order of the un-compiled path:
+                //   silu(cappedGate) * clippedUp
+                // where silu(x) = x * sigmoid(x). Splitting into the silu
+                // intermediate keeps operand pairing identical.
+                let cappedGate = minimum(gate, limit)
+                let clippedUp = clip(up, min: -limit, max: limit)
+                let siluGate = cappedGate * sigmoid(cappedGate)
+                return siluGate * clippedUp
+            }
+        }
     }
 }
