@@ -136,6 +136,35 @@ public enum DeepSeekModel {
             weightCache.prefetchHashLayerExperts(
                 token: Int(DeepSeekOps.cast(inputIDs, to: .int32).asArray(Int32.self)[0])
             )
+            // Whole-token lookahead: run a cheap approximate forward (attention
+            // + shared MLP, no routed experts — all RAM-resident) to predict
+            // all 43 layers' expert choices, then issue ALL ~720 expert reads
+            // concurrently at high queue depth before the real forward starts.
+            // This converts the decode critical path from 40 sequential
+            // read-compute barriers to one sustained parallel read batch.
+            // Mispredicted experts fall back to serial bank reads in the real
+            // forward. The approximate forward uses a shadow cache so the real
+            // KV state is not polluted. Value-identical: the real forward
+            // re-runs every layer on the exact hidden state.
+            if let cache,
+               let predictions = try? predictAllLayerExperts(
+                   inputIDs: inputIDs,
+                   weightCache: weightCache,
+                   cache: cache,
+                   positionOffset: positionOffset
+               )
+            {
+                weightCache.loader.prefetchAllDecodeExperts(
+                    predictedLayerExperts: predictions,
+                    hiddenSize: config.hiddenSize,
+                    intermediateSize: config.moeIntermediateSize
+                )
+            }
+        }
+        defer {
+            if inputIDs.shape == [1, 1] {
+                weightCache.loader.clearLookaheadPrefetch()
+            }
         }
         return try logits(
             inputIDs: inputIDs,
@@ -152,6 +181,54 @@ public enum DeepSeekModel {
                 positionOffset: positionOffset
             )
         }
+    }
+
+    /// Approximate forward for speculative expert prefetch: runs attention +
+    /// shared MLP for all layers (no routed experts — all RAM-resident, no
+    /// SSD reads) using a shadow KV cache, and records the gate's predicted
+    /// expert indices at each layer. The prediction is used to issue all
+    /// expert reads concurrently before the real forward starts. The real
+    /// forward re-runs every layer on the exact hidden state, so this is
+    /// purely a prefetch hint — mispredictions fall back to serial reads.
+    private static func predictAllLayerExperts(
+        inputIDs: MLXArray,
+        weightCache: DeepSeekRuntimeWeightCache,
+        cache: DeepSeekModelCache,
+        positionOffset: Int
+    ) throws -> [(layerIndex: Int, expertIndices: [Int])] {
+        let spec = DeepSeekModelSpec(config: weightCache.config)
+        let shadowCache = cache.shallowCopy()
+        var hidden = try initialHidden(
+            inputIDs: inputIDs,
+            embedding: weightCache.modelWeights().embedTokens,
+            spec: spec
+        )
+        var predictions: [(layerIndex: Int, expertIndices: [Int])] = []
+        predictions.reserveCapacity(spec.numHiddenLayers)
+        for layerIndex in 0..<spec.numHiddenLayers {
+            var predictedExperts: [Int] = []
+            hidden = try layer(
+                index: layerIndex,
+                hidden: hidden,
+                inputIDs: inputIDs,
+                weightCache: weightCache,
+                cache: shadowCache.layers[layerIndex],
+                positionOffset: positionOffset,
+                feedForwardOverride: { normalized in
+                    let moeWeights = try weightCache.moeWeights(layerIndex: layerIndex)
+                    let moeSpec = try weightCache.moeSpec(layerIndex: layerIndex)
+                    return try DeepSeekMoE.forwardApproximate(
+                        normalized,
+                        inputIDs: inputIDs,
+                        weights: moeWeights,
+                        spec: moeSpec,
+                        recordExperts: { experts in predictedExperts = experts }
+                    )
+                }
+            )
+            predictions.append((layerIndex: layerIndex, expertIndices: predictedExperts))
+        }
+        return predictions
     }
 
     public static func logits(
@@ -266,7 +343,8 @@ public enum DeepSeekModel {
         inputIDs: MLXArray,
         weightCache: DeepSeekRuntimeWeightCache,
         cache: DeepSeekLayerCache? = nil,
-        positionOffset: Int = 0
+        positionOffset: Int = 0,
+        feedForwardOverride: ((MLXArray) throws -> MLXArray)? = nil
     ) throws -> MLXArray {
         let config = weightCache.config
         let compressRatio = config.compressRatios[layerIndex]
@@ -320,7 +398,10 @@ public enum DeepSeekModel {
                 }
             },
             feedForward: { normalized in
-                try DeepSeekMoE.forward(
+                if let override = feedForwardOverride {
+                    return try override(normalized)
+                }
+                return try DeepSeekMoE.forward(
                     normalized,
                     inputIDs: inputIDs,
                     weights: moeWeights,

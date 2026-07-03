@@ -150,6 +150,43 @@ public enum DeepSeekMoE {
         return weightedRouted + sharedExpertOutput
     }
 
+    /// Approximate MoE forward for speculative expert prefetch: runs the
+    /// gate to predict expert indices and the shared expert only (no routed
+    /// expert SSD reads). The returned hidden is an approximation (missing
+    /// the routed contribution), but the gate's top-K selection at the next
+    /// layer is often preserved. The predicted expert indices are recorded
+    /// via `recordExperts` for the prefetch caller. Value-identical gate
+    /// routing — the real forward re-runs the gate on the exact hidden.
+    public static func forwardApproximate(
+        _ x: MLXArray,
+        inputIDs: MLXArray?,
+        weights: DeepSeekMoEWeights,
+        spec: DeepSeekMoESpec,
+        recordExperts: (([Int]) -> Void)? = nil
+    ) throws -> MLXArray {
+        let routing = try DeepSeekMoEGate.route(
+            hidden: x,
+            inputIDs: inputIDs,
+            weight: weights.gate,
+            weightTransposed: weights.gateTransposed,
+            correctionBias: weights.correctionBias,
+            tokenToExpert: weights.tokenToExpert,
+            topK: spec.expertsPerToken,
+            routedScalingFactor: spec.routedScalingFactor,
+            normTopKProb: spec.normTopKProb,
+            scoring: spec.scoring
+        )
+        if let recordExperts {
+            let expertIndices = routing.indices.asArray(Int32.self).map(Int.init)
+            recordExperts(expertIndices)
+        }
+        return DeepSeekMLP.forward(
+            x,
+            weights: weights.sharedExperts,
+            swigluLimit: spec.routedExperts.swigluLimit
+        )
+    }
+
     public static func forward(
         _ x: MLXArray,
         routeWeights: MLXArray,

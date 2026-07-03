@@ -127,12 +127,18 @@ public enum DeepSeekRoutedExperts {
         // not prefetched falls back to the normal per-expert bank read.
         var decodePrefetch: [String: StagedExpertCode]?
         if tokenCount == 1, !useStaged {
-            decodePrefetch = loader.prefetchDecodeExpertCodes(
-                layerIndex: spec.layerIndex,
-                expertIndices: Array(flatIndicesByExpert.keys),
-                hiddenSize: spec.hiddenSize,
-                intermediateSize: spec.intermediateSize
-            )
+            if !loader.lookaheadPrefetchActive() {
+                decodePrefetch = loader.prefetchDecodeExpertCodes(
+                    layerIndex: spec.layerIndex,
+                    expertIndices: Array(flatIndicesByExpert.keys),
+                    hiddenSize: spec.hiddenSize,
+                    intermediateSize: spec.intermediateSize
+                )
+            }
+            // When the whole-token lookahead prefetch is active, the
+            // prefetched codes are in the loader's lookahead storage.
+            // expertLinearWeight checks it as a fallback. Mispredicted
+            // experts fall back to serial bank reads.
         } else if useStaged {
             // Prefill/warmup staged path: build the active experts' base
             // MLXArrays from the staged layer buffer concurrently so the loop

@@ -58,6 +58,16 @@ public final class DeepSeekLocalKVCache {
     func arraysForMaterialization() -> [MLXArray] {
         kv.map { [$0] } ?? []
     }
+
+    /// Shallow copy for speculative prefetch: shares the COW MLXArray
+    /// reference (concatenation creates a new array, leaving the original
+    /// intact) but copies the mutable offset/startPosition. The approximate
+    /// forward can update this copy without polluting the real cache.
+    func shallowCopy() -> DeepSeekLocalKVCache {
+        let copy = DeepSeekLocalKVCache(maxSize: maxSize, offset: offset, startPosition: startPosition)
+        copy.kv = kv
+        return copy
+    }
 }
 
 public struct DeepSeekPoolingWindow {
@@ -155,6 +165,15 @@ public final class DeepSeekPoolingCache {
     func arraysForMaterialization() -> [MLXArray] {
         [bufferedKV, bufferedGate, pooled].compactMap { $0 }
     }
+
+    /// Shallow copy for speculative prefetch (see DeepSeekLocalKVCache).
+    func shallowCopy() -> DeepSeekPoolingCache {
+        let copy = DeepSeekPoolingCache(ratio: ratio)
+        copy.bufferedKV = bufferedKV
+        copy.bufferedGate = bufferedGate
+        copy.pooled = pooled
+        return copy
+    }
 }
 
 public final class DeepSeekLayerCache {
@@ -172,6 +191,14 @@ public final class DeepSeekLayerCache {
         local.arraysForMaterialization()
             + (pooled?.arraysForMaterialization() ?? [])
             + (indexPooled?.arraysForMaterialization() ?? [])
+    }
+
+    func shallowCopy() -> DeepSeekLayerCache {
+        DeepSeekLayerCache(
+            local: local.shallowCopy(),
+            pooled: pooled?.shallowCopy(),
+            indexPooled: indexPooled?.shallowCopy()
+        )
     }
 }
 
@@ -196,5 +223,17 @@ public final class DeepSeekModelCache {
         for array in arraysForMaterialization() {
             eval(array)
         }
+    }
+
+    /// Shallow copy of all layer caches for speculative prefetch. The
+    /// approximate forward uses this to run attention without polluting the
+    /// real cache's KV state.
+    public func shallowCopy() -> DeepSeekModelCache {
+        DeepSeekModelCache(layers: layers.map { $0.shallowCopy() })
+    }
+
+    /// Init from pre-built layer caches (used by shallowCopy).
+    public init(layers: [DeepSeekLayerCache]) {
+        self.layers = layers
     }
 }

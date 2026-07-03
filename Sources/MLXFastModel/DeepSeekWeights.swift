@@ -110,6 +110,10 @@ public struct DeepSeekWeightLoader {
     // and read byte-identical ranges through the trusted metered path.
     private let decodeSideBank: ExpertSlotBank?
     private let bridge: MLXArrayTensorBridge
+    // Shared storage for the whole-token lookahead prefetch (see
+    // prefetchAllDecodeExperts). Reference type so it is shared across
+    // struct copies of the loader.
+    private let lookaheadStorage: LookaheadPrefetchStorage
 
     /// Sized for the official 48 GB runner: pin only where at least that
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
@@ -166,6 +170,7 @@ public struct DeepSeekWeightLoader {
             capacity: 0,
             metrics: metrics
         )
+        self.lookaheadStorage = LookaheadPrefetchStorage()
         self.bridge = bridge
     }
 
@@ -185,6 +190,7 @@ public struct DeepSeekWeightLoader {
         self.pinnedExpertCodes = nil
         self.expertLayerStager = nil
         self.decodeSideBank = nil
+        self.lookaheadStorage = LookaheadPrefetchStorage()
         self.bridge = bridge
     }
 
@@ -513,6 +519,117 @@ public struct DeepSeekWeightLoader {
         return map.isEmpty ? nil : map
     }
 
+    /// Whole-token lookahead prefetch: issues ALL decode expert code reads
+    /// for ALL layers concurrently in one `concurrentPerform` batch, so the
+    /// SSD sustains high queue depth for the entire read volume (~2.88 GB)
+    /// instead of reading layer-by-layer with idle gaps between compute.
+    /// The predicted expert indices come from an approximate forward (gate
+    /// + shared MLP only). Mispredictions are simply absent from the map;
+    /// `DeepSeekRoutedExperts.forward` falls back to the serial side-bank
+    /// read for any expert not found here. Byte-identical to the serial path.
+    public func prefetchAllDecodeExperts(
+        predictedLayerExperts: [(layerIndex: Int, expertIndices: [Int])],
+        hiddenSize: Int,
+        intermediateSize: Int
+    ) {
+        guard let sideBank = decodeSideBank, expertBank.capacity > 0 else {
+            return
+        }
+        let projections: [(DeepSeekExpertProjection, [Int])] = [
+            (.gate, [intermediateSize, hiddenSize]),
+            (.up, [intermediateSize, hiddenSize]),
+            (.down, [hiddenSize, intermediateSize]),
+        ]
+        var keys: [String] = []
+        var names: [String] = []
+        var indices: [Int] = []
+        var seen = Set<String>()
+        for entry in predictedLayerExperts {
+            for expertIndex in entry.expertIndices {
+                for (projection, expectedShape) in projections {
+                    let candidates = DeepSeekWeightNames.routedExpert(
+                        layerIndex: entry.layerIndex,
+                        expertIndex: expertIndex,
+                        projection: projection
+                    )
+                    for candidate in candidates {
+                        guard let record = expertBank.record(named: candidate) else {
+                            continue
+                        }
+                        let isStacked = record.shape.count == expectedShape.count + 1
+                            && record.shape.first.map { expertIndex < $0 } == true
+                        guard isStacked else { break }
+                        if pinnedExpertCodes?.isResident(name: candidate) == true { break }
+                        let key = Self.decodePrefetchKey(candidate, expertIndex)
+                        if seen.insert(key).inserted {
+                            keys.append(key)
+                            names.append(candidate)
+                            indices.append(expertIndex)
+                        }
+                        break
+                    }
+                }
+            }
+        }
+        guard !keys.isEmpty else {
+            lookaheadStorage.allLayerCodes = [:]
+            return
+        }
+        let bridge = self.bridge
+        let residentScales = self.residentExpertScales
+        var results = [StagedExpertCode?](repeating: nil, count: keys.count)
+        results.withUnsafeMutableBufferPointer { buffer in
+            let sink = DecodePrefetchSink(buffer: buffer)
+            DispatchQueue.concurrentPerform(iterations: keys.count) { index in
+                guard
+                    let tensor = try? sideBank.materializedTensor(
+                        named: names[index],
+                        firstAxisIndex: indices[index]
+                    ),
+                    let array = try? bridge.makeArray(from: tensor)
+                else {
+                    return
+                }
+                let scalesArray = Self.residentScalesArray(
+                    residentScales: residentScales,
+                    bridge: bridge,
+                    codeName: names[index],
+                    expertIndex: indices[index]
+                )
+                sink.buffer[index] = StagedExpertCode(
+                    tensor: tensor,
+                    array: array,
+                    scalesArray: scalesArray
+                )
+            }
+        }
+        var map: [String: StagedExpertCode] = [:]
+        map.reserveCapacity(keys.count)
+        for (index, key) in keys.enumerated() {
+            if let staged = results[index] {
+                map[key] = staged
+            }
+        }
+        lookaheadStorage.allLayerCodes = map
+    }
+
+    /// Look up a prefetched code from the whole-token lookahead. Returns nil
+    /// if lookahead prefetch is not active or this expert was not prefetched
+    /// (misprediction — caller falls back to the serial side-bank read).
+    func lookaheadPrefetch(_ key: String) -> StagedExpertCode? {
+        lookaheadStorage.allLayerCodes?[key]
+    }
+
+    /// Whether the whole-token lookahead prefetch is active for this step.
+    func lookaheadPrefetchActive() -> Bool {
+        lookaheadStorage.allLayerCodes != nil
+    }
+
+    /// Clear the lookahead prefetch storage (between decode steps).
+    func clearLookaheadPrefetch() {
+        lookaheadStorage.allLayerCodes = nil
+    }
+
     public func expertLinearWeight(
         candidates: [String],
         expectedShape: [Int],
@@ -540,10 +657,12 @@ public struct DeepSeekWeightLoader {
                ) {
                 tensor = pinned
             } else if isStacked,
-               let prefetched = decodePrefetch?[Self.decodePrefetchKey(candidate, expertIndex)] {
+               let prefetched = decodePrefetch?[Self.decodePrefetchKey(candidate, expertIndex)]
+               ?? lookaheadPrefetch(Self.decodePrefetchKey(candidate, expertIndex)) {
                 // Concurrently pre-read slice + pre-built base arrays (decode
-                // side-bank OR prefill staged-buffer). Checked before the
-                // serial staged path so the prebuilt copies are used when present.
+                // side-bank, prefill staged-buffer, OR whole-token lookahead).
+                // Checked before the serial staged path so the prebuilt copies
+                // are used when present.
                 tensor = prefetched.tensor
                 prebuiltWeightArray = prefetched.array
                 prebuiltScalesArray = prefetched.scalesArray
@@ -1565,4 +1684,11 @@ public struct StagedExpertCode {
 // disjoint and the unchecked Sendable conformance is sound.
 private struct DecodePrefetchSink: @unchecked Sendable {
     let buffer: UnsafeMutableBufferPointer<StagedExpertCode?>
+}
+
+/// Shared mutable storage for the whole-token lookahead prefetch. Reference
+/// type so it is shared across struct copies of DeepSeekWeightLoader.
+final class LookaheadPrefetchStorage {
+    var allLayerCodes: [String: StagedExpertCode]?
+    init() {}
 }
