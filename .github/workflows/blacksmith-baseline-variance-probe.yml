@@ -24,6 +24,16 @@ name: blacksmith-baseline-variance-probe
 #   - reference-checkpoint download throughput during setup (the other "network")
 #   - host identity (so two matrix entries landing on the same physical host are visible)
 on:
+  # push runs the branch's OWN copy of this workflow (no default-branch
+  # requirement, unlike workflow_dispatch) -- this is how the probe runs straight
+  # from its PR branch without merging to main. push events carry no dispatch
+  # inputs, so every `${{ inputs.* }}` below falls back to a literal default. The
+  # concurrent machine count for the push path is the fallback in the matrix's
+  # `machine:` line (jobs.<id>.strategy cannot read the env context). Edit that
+  # fallback and push again to change scale ("[1]" solo -> "[1,2,3,4,5,6]" stress).
+  push:
+    branches:
+      - probe/blacksmith-baseline-variance
   workflow_dispatch:
     inputs:
       machines:
@@ -53,7 +63,7 @@ on:
         type: string
 
 concurrency:
-  group: blacksmith-baseline-variance-probe-${{ github.ref }}-${{ inputs.label }}
+  group: blacksmith-baseline-variance-probe-${{ github.ref }}-${{ inputs.label || 'push' }}
   cancel-in-progress: false
 
 permissions:
@@ -65,7 +75,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        machine: ${{ fromJSON(inputs.machines) }}
+        machine: ${{ fromJSON(inputs.machines || '[1]') }}
     runs-on: blacksmith-12vcpu-macos-26
     timeout-minutes: 360
     env:
@@ -119,8 +129,8 @@ jobs:
         # throughput -- the other "network bandwidth" in the hypothesis -- is
         # itself a recorded, comparable-across-machines number.
         env:
-          MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
-          MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs || '12' }}
+          MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib || '170' }}
           MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
         run: |
           set -euo pipefail
@@ -147,7 +157,7 @@ jobs:
         # is the bottleneck, regardless of what the model does. Cold-cache read
         # is what the benchmark's expert streaming actually pays.
         env:
-          RAW_READ_GIB: ${{ inputs.raw_read_gib }}
+          RAW_READ_GIB: ${{ inputs.raw_read_gib || '8' }}
         run: |
           set -uo pipefail
           ref="${MLXFAST_REFERENCE_DIR}"
@@ -231,7 +241,7 @@ jobs:
           MLXFAST_BENCHMARK_CORRECTNESS_STEPS: "0"
           MLXFAST_BENCHMARK_CHECK_GATES: "0"
           MLXFAST_BENCHMARK_SKIP_TIMED: "0"
-          MLXFAST_NOTE: "blacksmith-baseline-variance-probe machine=${{ matrix.machine }} label=${{ inputs.label }}"
+          MLXFAST_NOTE: "blacksmith-baseline-variance-probe machine=${{ matrix.machine }} label=${{ inputs.label || 'push' }}"
         run: |
           set -euo pipefail
           echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a host.txt
@@ -266,7 +276,7 @@ jobs:
 
       - name: Tabulate variance
         env:
-          LABEL: ${{ inputs.label }}
+          LABEL: ${{ inputs.label || 'push' }}
           MACHINES: ${{ inputs.machines }}
         run: |
           set -euo pipefail
