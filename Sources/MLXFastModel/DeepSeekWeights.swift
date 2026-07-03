@@ -1754,7 +1754,7 @@ private final class ScheduledDecodePrefetches {
         guard let entry else {
             return nil
         }
-        guard entry.group.wait(timeout: .now() + .milliseconds(2)) == .success else {
+        guard entry.group.wait(timeout: .now() + .milliseconds(0)) == .success else {
             return nil
         }
         entry.lock.lock()
