@@ -155,7 +155,12 @@ public enum SwiftTransform {
         }
     }
 
-    private static func findReferenceDirectory(_ base: URL) throws -> URL {
+    private static func findReferenceDirectory(_ rawBase: URL) throws -> URL {
+        // Resolve symlinks so directory enumeration works when the reference
+        // path is a symlink into an external cache (e.g. ~/.cache/huggingface).
+        // FileManager.contentsOfDirectory(at:) / enumerator(at:) do not traverse
+        // a top-level symlink-to-directory and fail with ENOTDIR otherwise.
+        let base = rawBase.resolvingSymlinksInPath()
         if FileManager.default.fileExists(
             atPath: base.appendingPathComponent("config.json").path
         ) {
