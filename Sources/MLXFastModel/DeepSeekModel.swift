@@ -325,7 +325,11 @@ public enum DeepSeekModel {
                     inputIDs: inputIDs,
                     weights: moeWeights,
                     loader: weightCache.loader,
-                    spec: moeSpec
+                    spec: moeSpec,
+                    earlyDecodePrefetch: inputIDs.shape == [1, 1]
+                        && layerIndex < config.numHashLayers
+                        ? weightCache.takeEarlyDecodePrefetch(layerIndex: layerIndex)
+                        : nil
                 )
             }
         )
