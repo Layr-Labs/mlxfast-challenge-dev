@@ -203,10 +203,13 @@ public enum DeepSeekHyperConnection {
         let normalized = weightlessRMSNorm(y.flattened(start: -2), eps: normEps)
         let mixes = matmul(normalized, fnTransposed ?? fn.T)
         let pre = sigmoid(mixes * scale[0] + base) + Float(eps)
-        return DeepSeekOps.cast(
-            (pre.expandedDimensions(axis: -1) * y).sum(axis: 2),
-            to: x.dtype
-        )
+        // Reuse the already-compiled block-level collapse-tail closure:
+        // the head's tail (pre.expandedDimensions(-1) * y).sum(axis: 2).asType(x.dtype)
+        // is the same op signature the block collapse compiles ~86x per
+        // decode step, so hitting that shared cache adds one more call
+        // site with zero new compile invocations. Value-identical: the
+        // closure's math is the same sequence of ops that ran here inline.
+        return compiledCollapseTail(hcMult: hcMult, outputDType: x.dtype)(pre, y)
     }
 
     public static func weightlessRMSNorm(_ x: MLXArray, eps: Double) -> MLXArray {
