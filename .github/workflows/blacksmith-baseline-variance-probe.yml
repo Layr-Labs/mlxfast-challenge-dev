@@ -75,7 +75,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        machine: ${{ fromJSON(inputs.machines || '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]') }}
+        machine: ${{ fromJSON(inputs.machines || '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24]') }}
     runs-on: blacksmith-12vcpu-macos-26
     timeout-minutes: 360
     env:
@@ -249,6 +249,64 @@ jobs:
           print(f"cold_read_gbps={read/1e9/max(dt,1e-9):.3f}")
           PY
 
+      - name: Latency probes (scheduling jitter, multi-core burn, random read)
+        continue-on-error: true
+        # Target the LATENCY dimensions that throughput probes miss and that
+        # decode (many tiny per-token ops + small random expert reads) is bound
+        # by. If one of these correlates with decode across machines, it names
+        # the cause:
+        #   cpu_busy_seconds (all-core burn) -> thermal throttling / vCPU steal
+        #   sched_jitter_p99_ms (sleep overshoot) -> hypervisor descheduling
+        #   rand_read_p99_us (random 16 KiB reads) -> storage IOPS latency, not bandwidth
+        run: |
+          set -uo pipefail
+          # (1) sustained all-core burn (bash-launched procs; macOS python
+          # multiprocessing over a stdin script is unsafe under spawn).
+          cat > /tmp/burn.py <<'BURN'
+          import sys
+          n = int(sys.argv[1]); s = 0.0
+          for i in range(n):
+              s += (i * 1.0000001) % 7.0
+          BURN
+          ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 12)
+          start=$(python3 -c 'import time; print(time.monotonic())')
+          for _ in $(seq 1 "${ncpu}"); do python3 /tmp/burn.py 20000000 & done
+          wait
+          end=$(python3 -c 'import time; print(time.monotonic())')
+          python3 -c "print(f'cpu_busy_seconds={$end-$start:.3f}')" | tee -a host.txt
+          python3 -c "print(f'cpu_busy_mops={$ncpu*20000000/($end-$start)/1e6:.2f}')" | tee -a host.txt
+          # (2) scheduling jitter: how much longer a 10 ms sleep actually takes.
+          python3 - <<'JIT' | tee -a host.txt
+          import time
+          N = 400; iv = 0.01; ov = []
+          for _ in range(N):
+              t0 = time.monotonic(); time.sleep(iv); ov.append((time.monotonic() - t0 - iv) * 1000)
+          ov.sort()
+          print(f"sched_jitter_p50_ms={ov[len(ov)//2]:.3f}")
+          print(f"sched_jitter_p99_ms={ov[int(len(ov)*0.99)]:.3f}")
+          JIT
+          # (3) random small-read latency (IOPS), F_NOCACHE best-effort.
+          python3 - "${MLXFAST_REFERENCE_DIR}" <<'RND' | tee -a host.txt
+          import fcntl, glob, os, random, sys, time
+          shards = sorted(glob.glob(os.path.join(sys.argv[1], "*.safetensors")))
+          if not shards:
+              print("rand_read_status=no_shards"); sys.exit(0)
+          path = max(shards, key=os.path.getsize); size = os.path.getsize(path)
+          fd = os.open(path, os.O_RDONLY)
+          try:
+              fcntl.fcntl(fd, 48, 1)
+          except OSError:
+              pass
+          blk = 16384; N = 3000; rng = random.Random(1234); lat = []
+          for _ in range(N):
+              off = rng.randrange(0, max(1, size - blk))
+              t0 = time.monotonic(); os.pread(fd, blk, off); lat.append((time.monotonic() - t0) * 1e6)
+          os.close(fd); lat.sort()
+          print(f"rand_read_p50_us={lat[len(lat)//2]:.1f}")
+          print(f"rand_read_p99_us={lat[int(len(lat)*0.99)]:.1f}")
+          print(f"rand_read_iops={N/(sum(lat)/1e6):.0f}")
+          RND
+
       - name: Transform reference checkpoint
         run: |
           set -euo pipefail
@@ -334,7 +392,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
-          import glob, json, os, re, statistics
+          import glob, json, math, os, re, statistics
 
           def host_field(path, key):
               try:
@@ -359,7 +417,11 @@ jobs:
                      "setup_s": host_field(hp, "setup_seconds"),
                      "raw_gbps": host_field(hp, "raw_read_gbps"),
                      "cold_gbps": host_field(hp, "cold_read_gbps"),
-                     "cpu_mops": host_field(hp, "cpu_mops")}
+                     "cpu_mops": host_field(hp, "cpu_mops"),
+                     "busy_s": host_field(hp, "cpu_busy_seconds"),
+                     "jitter_p99": host_field(hp, "sched_jitter_p99_ms"),
+                     "rand_p50": host_field(hp, "rand_read_p50_us"),
+                     "rand_p99": host_field(hp, "rand_read_p99_us")}
               try:
                   m = json.load(open(sp))["metrics"]
                   row.update(
@@ -409,22 +471,66 @@ jobs:
           print()
           print("| metric | mean | stdev | CV% | min | max | max/min |")
           print("|--------|------|-------|-----|-----|-----|---------|")
-          for name, conv in [
-              ("decode s/tok", lambda r: r.get("decode")),
-              ("prefill s/tok", lambda r: r.get("prefill")),
-              ("cpu Mops (I/O-free)", lambda r: float(r["cpu_mops"]) if r.get("cpu_mops") else None),
-              ("cold read GB/s", lambda r: float(r["cold_gbps"]) if r.get("cold_gbps") else None),
-              ("warm read GB/s", lambda r: float(r["raw_gbps"]) if r.get("raw_gbps") else None),
-              ("setup s", lambda r: int(r["setup_s"]) if r.get("setup_s") else None),
-          ]:
+          def num(r, key):
+              v = r.get(key)
+              try:
+                  return float(v)
+              except (TypeError, ValueError):
+                  return None
+          candidates = [
+              ("decode s/tok", lambda r: num(r, "decode")),
+              ("prefill s/tok", lambda r: num(r, "prefill")),
+              ("cpu_busy_seconds (all-core)", lambda r: num(r, "busy_s")),
+              ("cpu Mops (1 core)", lambda r: num(r, "cpu_mops")),
+              ("sched_jitter_p99_ms", lambda r: num(r, "jitter_p99")),
+              ("rand_read_p99_us", lambda r: num(r, "rand_p99")),
+              ("rand_read_p50_us", lambda r: num(r, "rand_p50")),
+              ("cold read GB/s", lambda r: num(r, "cold_gbps")),
+              ("warm read GB/s", lambda r: num(r, "raw_gbps")),
+              ("setup s", lambda r: num(r, "setup_s")),
+          ]
+          for name, conv in candidates:
               s = stats(conv)
               if s:
                   mean, sd, cv, lo, hi, ratio = s
                   print(f"| {name} | {mean:.4f} | {sd:.4f} | {cv:.1f}% | {lo:.4f} | {hi:.4f} | {ratio:.2f}× |")
+
+          # Correlation of each candidate with decode s/tok. A strong signed
+          # correlation NAMES the mechanism; ~0 across the board = none of these.
+          def corr(cx, cy):
+              pairs = [(cx(r), cy(r)) for r in rows]
+              pairs = [(x, y) for x, y in pairs if isinstance(x, (int, float)) and isinstance(y, (int, float))]
+              n = len(pairs)
+              if n < 3:
+                  return None, n
+              mx = sum(x for x, _ in pairs) / n
+              my = sum(y for _, y in pairs) / n
+              cov = sum((x - mx) * (y - my) for x, y in pairs)
+              sx = math.sqrt(sum((x - mx) ** 2 for x, _ in pairs))
+              sy = math.sqrt(sum((y - my) ** 2 for _, y in pairs))
+              return (cov / (sx * sy) if sx and sy else None), n
+          dec = lambda r: num(r, "decode")
           print()
-          print("**Read as (mechanism isolation):** decode varies but cpu Mops + cold read GB/s stay flat ⇒ latency/scheduling jitter, not throughput. "
-                "cpu Mops tracks decode ⇒ neighbour-CPU contention. cold read GB/s tracks decode ⇒ shared-storage contention (the real test, esp. when host IPs repeat = co-located). "
-                "warm read GB/s is cache-served and expected flat. Compare decode s/tok to a local M4 `--local-iterate` run for the Blacksmith-vs-local delta. One run is one moment — repeat over time for external contention.")
+          print("| candidate | corr with decode | n | reading |")
+          print("|-----------|------------------|---|---------|")
+          hints = {
+              "cpu_busy_seconds (all-core)": "+ ⇒ throttle/steal under load",
+              "cpu Mops (1 core)": "− ⇒ neighbour-CPU",
+              "sched_jitter_p99_ms": "+ ⇒ hypervisor descheduling",
+              "rand_read_p99_us": "+ ⇒ storage IOPS latency",
+              "rand_read_p50_us": "+ ⇒ storage IOPS latency",
+              "cold read GB/s": "− ⇒ storage bandwidth",
+              "warm read GB/s": "− ⇒ storage bandwidth",
+          }
+          for name, conv in candidates:
+              if name in ("decode s/tok", "prefill s/tok", "setup s"):
+                  continue
+              c, n = corr(dec, conv)
+              print(f"| {name} | {('%+.2f' % c) if c is not None else 'n/a'} | {n} | {hints.get(name,'')} |")
+          print()
+          print("**Read as:** whichever candidate shows a strong signed correlation (|r| ≳ 0.6, right sign) is the mechanism. "
+                "All ~0 ⇒ none of CPU / storage-bandwidth / storage-IOPS / scheduling explains it — leaving GPU/memory-latency (needs a Metal probe). "
+                "Compare decode s/tok to a local M4 `--local-iterate` run for the Blacksmith-vs-local delta. One run is one moment — repeat over time for external contention.")
           PY
 
       - name: Upload combined summary
