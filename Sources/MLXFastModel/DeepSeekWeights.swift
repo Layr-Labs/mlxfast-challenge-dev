@@ -284,8 +284,8 @@ public struct DeepSeekWeightLoader {
         )
     }
 
-    static func decodePrefetchKey(_ name: String, _ index: Int) -> String {
-        "\(name)#\(index)"
+    static func decodePrefetchKey(_ name: String, _ index: Int) -> DeepSeekDecodePrefetchKey {
+        DeepSeekDecodePrefetchKey(name: name, expertIndex: index)
     }
 
     /// Builds the base scales MLXArray for a code tensor off the compute
@@ -319,14 +319,15 @@ public struct DeepSeekWeightLoader {
     /// map keyed by `decodePrefetchKey`. Returns nil when the fast path does
     /// not apply (no side bank, main byte-cache disabled, or nothing to fetch);
     /// callers then use the normal serial per-expert bank reads. Only reads
-    /// slices that would otherwise be serial bank preads — pinned codes come
-    /// from RAM and are skipped. Byte-identical to the serial path.
+    /// slices that would otherwise be serial bank preads, and also builds
+    /// pinned-code arrays off-thread when a hash layer is RAM-resident.
+    /// Byte-identical to the serial path.
     public func prefetchDecodeExpertCodes(
         layerIndex: Int,
         expertIndices: [Int],
         hiddenSize: Int,
         intermediateSize: Int
-    ) -> [String: StagedExpertCode]? {
+    ) -> [DeepSeekDecodePrefetchKey: StagedExpertCode]? {
         guard let sideBank = decodeSideBank, expertBank.capacity > 0, !expertIndices.isEmpty else {
             return nil
         }
@@ -335,10 +336,8 @@ public struct DeepSeekWeightLoader {
             (.up, [intermediateSize, hiddenSize]),
             (.down, [hiddenSize, intermediateSize]),
         ]
-        var keys: [String] = []
-        var names: [String] = []
-        var indices: [Int] = []
-        var seen = Set<String>()
+        var requests: [DecodePrefetchRequest] = []
+        var seen = Set<DeepSeekDecodePrefetchKey>()
         for expertIndex in expertIndices {
             for (projection, expectedShape) in projections {
                 let candidates = DeepSeekWeightNames.routedExpert(
@@ -356,38 +355,39 @@ public struct DeepSeekWeightLoader {
                     guard isStacked else {
                         break
                     }
-                    if pinnedExpertCodes?.isResident(name: candidate) == true {
-                        break
-                    }
                     let key = Self.decodePrefetchKey(candidate, expertIndex)
                     if seen.insert(key).inserted {
-                        keys.append(key)
-                        names.append(candidate)
-                        indices.append(expertIndex)
+                        requests.append(
+                            DecodePrefetchRequest(key: key, name: candidate, expertIndex: expertIndex)
+                        )
                     }
                     break
                 }
             }
         }
-        guard !keys.isEmpty else {
+        guard !requests.isEmpty else {
             return nil
         }
         let bridge = self.bridge
         let residentScales = self.residentExpertScales
-        var results = [StagedExpertCode?](repeating: nil, count: keys.count)
+        var results = [StagedExpertCode?](repeating: nil, count: requests.count)
         results.withUnsafeMutableBufferPointer { buffer in
             let sink = DecodePrefetchSink(buffer: buffer)
-            DispatchQueue.concurrentPerform(iterations: keys.count) { index in
+            DispatchQueue.concurrentPerform(iterations: requests.count) { index in
+                let request = requests[index]
                 // Read the slice AND build its base MLXArray (the eager
                 // Data->Metal copy) here on the worker thread. The compute
                 // thread's per-expert loop then skips that memcpy and only
                 // wires the lazy reshape/quant assembly into the graph.
                 // Byte-identical: same bytes, same array constructor.
                 guard
-                    let tensor = try? sideBank.materializedTensor(
-                        named: names[index],
-                        firstAxisIndex: indices[index]
-                    ),
+                    let tensor = pinnedExpertCodes?.materializedTensor(
+                        named: request.name,
+                        firstAxisIndex: request.expertIndex
+                    ) ?? (try? sideBank.materializedTensor(
+                        named: request.name,
+                        firstAxisIndex: request.expertIndex
+                    )),
                     let array = try? bridge.makeArray(from: tensor)
                 else {
                     return
@@ -396,8 +396,8 @@ public struct DeepSeekWeightLoader {
                 let scalesArray = Self.residentScalesArray(
                     residentScales: residentScales,
                     bridge: bridge,
-                    codeName: names[index],
-                    expertIndex: indices[index]
+                    codeName: request.name,
+                    expertIndex: request.expertIndex
                 )
                 sink.buffer[index] = StagedExpertCode(
                     tensor: tensor,
@@ -406,11 +406,11 @@ public struct DeepSeekWeightLoader {
                 )
             }
         }
-        var map: [String: StagedExpertCode] = [:]
-        map.reserveCapacity(keys.count)
-        for (index, key) in keys.enumerated() {
+        var map: [DeepSeekDecodePrefetchKey: StagedExpertCode] = [:]
+        map.reserveCapacity(requests.count)
+        for (index, request) in requests.enumerated() {
             if let staged = results[index] {
-                map[key] = staged
+                map[request.key] = staged
             }
         }
         return map.isEmpty ? nil : map
@@ -427,7 +427,7 @@ public struct DeepSeekWeightLoader {
         expertIndices: [Int],
         hiddenSize: Int,
         intermediateSize: Int
-    ) -> [String: StagedExpertCode]? {
+    ) -> [DeepSeekDecodePrefetchKey: StagedExpertCode]? {
         guard expertLayerStager != nil, !expertIndices.isEmpty else {
             return nil
         }
@@ -436,10 +436,8 @@ public struct DeepSeekWeightLoader {
             (.up, [intermediateSize, hiddenSize]),
             (.down, [hiddenSize, intermediateSize]),
         ]
-        var keys: [String] = []
-        var names: [String] = []
-        var indices: [Int] = []
-        var seen = Set<String>()
+        var requests: [DecodePrefetchRequest] = []
+        var seen = Set<DeepSeekDecodePrefetchKey>()
         for expertIndex in expertIndices {
             for (projection, expectedShape) in projections {
                 let candidates = DeepSeekWeightNames.routedExpert(
@@ -461,30 +459,31 @@ public struct DeepSeekWeightLoader {
                     }
                     let key = Self.decodePrefetchKey(candidate, expertIndex)
                     if seen.insert(key).inserted {
-                        keys.append(key)
-                        names.append(candidate)
-                        indices.append(expertIndex)
+                        requests.append(
+                            DecodePrefetchRequest(key: key, name: candidate, expertIndex: expertIndex)
+                        )
                     }
                     break
                 }
             }
         }
-        guard !keys.isEmpty else {
+        guard !requests.isEmpty else {
             return nil
         }
         let bridge = self.bridge
         let residentScales = self.residentExpertScales
-        var results = [StagedExpertCode?](repeating: nil, count: keys.count)
+        var results = [StagedExpertCode?](repeating: nil, count: requests.count)
         results.withUnsafeMutableBufferPointer { buffer in
             let sink = DecodePrefetchSink(buffer: buffer)
-            DispatchQueue.concurrentPerform(iterations: keys.count) { index in
+            DispatchQueue.concurrentPerform(iterations: requests.count) { index in
+                let request = requests[index]
                 // Cut the slice from the staged layer buffer AND build its base
                 // MLXArray concurrently; the compute thread then only wires the
                 // lazy reshape/quant assembly. Byte-identical to the serial path.
                 guard
                     let tensor = self.stagedSliceTensor(
-                        recordName: names[index],
-                        expertIndex: indices[index]
+                        recordName: request.name,
+                        expertIndex: request.expertIndex
                     ),
                     let array = try? bridge.makeArray(from: tensor)
                 else {
@@ -493,8 +492,8 @@ public struct DeepSeekWeightLoader {
                 let scalesArray = Self.residentScalesArray(
                     residentScales: residentScales,
                     bridge: bridge,
-                    codeName: names[index],
-                    expertIndex: indices[index]
+                    codeName: request.name,
+                    expertIndex: request.expertIndex
                 )
                 sink.buffer[index] = StagedExpertCode(
                     tensor: tensor,
@@ -503,11 +502,11 @@ public struct DeepSeekWeightLoader {
                 )
             }
         }
-        var map: [String: StagedExpertCode] = [:]
-        map.reserveCapacity(keys.count)
-        for (index, key) in keys.enumerated() {
+        var map: [DeepSeekDecodePrefetchKey: StagedExpertCode] = [:]
+        map.reserveCapacity(requests.count)
+        for (index, request) in requests.enumerated() {
             if let staged = results[index] {
-                map[key] = staged
+                map[request.key] = staged
             }
         }
         return map.isEmpty ? nil : map
@@ -518,7 +517,7 @@ public struct DeepSeekWeightLoader {
         expectedShape: [Int],
         expertIndex: Int,
         preferStaged: Bool = false,
-        decodePrefetch: [String: StagedExpertCode]? = nil
+        decodePrefetch: [DeepSeekDecodePrefetchKey: StagedExpertCode]? = nil
     ) throws -> DeepSeekLinearWeight {
         for candidate in candidates {
             guard let record = expertBank.record(named: candidate) else {
@@ -534,19 +533,20 @@ public struct DeepSeekWeightLoader {
             var prebuiltWeightArray: MLXArray?
             var prebuiltScalesArray: MLXArray?
             if isStacked,
+               let prefetched = decodePrefetch?[Self.decodePrefetchKey(candidate, expertIndex)] {
+                // Concurrently pre-read slice + pre-built base arrays (decode
+                // side-bank OR prefill staged-buffer). Checked before the
+                // serial pinned/staged paths so the prebuilt copies are used
+                // when present.
+                tensor = prefetched.tensor
+                prebuiltWeightArray = prefetched.array
+                prebuiltScalesArray = prefetched.scalesArray
+            } else if isStacked,
                let pinned = pinnedExpertCodes?.materializedTensor(
                    named: candidate,
                    firstAxisIndex: expertIndex
                ) {
                 tensor = pinned
-            } else if isStacked,
-               let prefetched = decodePrefetch?[Self.decodePrefetchKey(candidate, expertIndex)] {
-                // Concurrently pre-read slice + pre-built base arrays (decode
-                // side-bank OR prefill staged-buffer). Checked before the
-                // serial staged path so the prebuilt copies are used when present.
-                tensor = prefetched.tensor
-                prebuiltWeightArray = prefetched.array
-                prebuiltScalesArray = prefetched.scalesArray
             } else if preferStaged, isStacked,
                let staged = stagedSliceTensor(recordName: candidate, expertIndex: expertIndex) {
                 tensor = staged
@@ -1540,6 +1540,22 @@ public struct DeepSeekWeightLoader {
         }
         return "\(weightName).\(suffix)"
     }
+}
+
+public struct DeepSeekDecodePrefetchKey: Hashable, Sendable {
+    public let name: String
+    public let expertIndex: Int
+
+    public init(name: String, expertIndex: Int) {
+        self.name = name
+        self.expertIndex = expertIndex
+    }
+}
+
+private struct DecodePrefetchRequest: Sendable {
+    let key: DeepSeekDecodePrefetchKey
+    let name: String
+    let expertIndex: Int
 }
 
 // A routed-expert code slice read off the compute thread: the raw tensor
