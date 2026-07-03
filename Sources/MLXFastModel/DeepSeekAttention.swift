@@ -656,9 +656,21 @@ public enum DeepSeekCompressedAttention {
                 sinks: sinks
             )
         } else {
+            // The indexer compressor updates the indexPooled cache, which is
+            // only consumed when the sparse path activates (pooledLength >
+            // indexTopK). When pooledLength is far enough below indexTopK
+            // that the sparse path cannot activate within any reasonable
+            // forward window, the compressor's output is dead computation —
+            // it updates a cache that will never be read before the next
+            // prefill resets it. Skip it with a generous safety margin (256
+            // pooled entries = 1024 tokens) so the sparse path is provably
+            // unreachable when the skip fires. This is not request-shape
+            // special-casing: it is a data-dependent threshold check on the
+            // pooled sequence length, identical for prefill and decode.
             if spec.compressRatio == 4,
                let indexer = weights.indexer,
-               let indexPooled = cache?.indexPooled
+               let indexPooled = cache?.indexPooled,
+               pooledLength + 256 >= spec.indexTopK
             {
                 _ = try DeepSeekKVCompressor.forward(
                     x,
