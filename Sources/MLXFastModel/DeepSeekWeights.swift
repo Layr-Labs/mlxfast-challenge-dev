@@ -130,33 +130,22 @@ public struct DeepSeekWeightLoader {
         )
         self.expertBank = expertBank
         self.expertPrefetcher = ExpertPrefetcher(expertBank: expertBank)
-        // Resident stores come from a process-wide registry: the trusted
-        // benchmark harness keeps two loaders alive at once, and duplicating
-        // ~14 GiB of resident data per loader would threaten the 48 GB
-        // runner budget.
-        let manifestPath = "\(weightsPath)/experts/manifest.json"
-        self.residentExpertScales = ResidentExpertStoreRegistry.scales(
-            manifestPath: manifestPath,
-            metrics: metrics
-        )
-        // Pinning trades RAM for guaranteed hits on the token-id-routed
-        // layers; only worthwhile at the official 48 GB budget or above,
-        // and capped so the pinned codes (~3.2 GiB per layer) leave headroom
-        // for the resident scales, staging buffers, and page cache inside
-        // that budget. Both constants encode the OFFICIAL runner's memory
-        // math — do not raise them because a larger local machine has room.
-        let hashLayerCount = (try? DeepSeekConfig.load(from: weightsPath))?.numHashLayers ?? 0
-        self.pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
-            ? ResidentExpertStoreRegistry.pinnedHashLayerCodes(
-                manifestPath: manifestPath,
-                hashLayerCount: min(hashLayerCount, Self.pinnedHashLayerCap),
-                metrics: metrics
-            )
-            : nil
-        self.expertLayerStager = ExpertLayerStager(
-            manifestPath: manifestPath,
-            metrics: metrics
-        )
+        // QUARANTINED pending issue #83 root-cause isolation: the resident-
+        // scales, pinned-hash-layer-codes, and whole-layer staging paths serve
+        // expert bytes through hand-rolled slice arithmetic instead of the
+        // trusted ExpertSlotBank reads. Unmodified main deterministically
+        // diverges from the public correctness golden at
+        // longcopy-gate-english-512 step 5 (expected 1718, actual 671) on the
+        // official runner, and these are the only code paths in the promoted
+        // frontier whose served bytes are not the bank's own -- the pinned-
+        // codes path is additionally RAM-gated (>= 40 GiB), matching the
+        // observed pass-locally/fail-on-runner split. Disabling them falls
+        // every read back to the trusted bank; the advisory ExpertPrefetcher
+        // stays enabled because F_RDADVISE hints cannot alter served bytes.
+        // Re-enable only through a submission that passes the public gate.
+        self.residentExpertScales = nil
+        self.pinnedExpertCodes = nil
+        self.expertLayerStager = nil
         self.bridge = bridge
     }
 
