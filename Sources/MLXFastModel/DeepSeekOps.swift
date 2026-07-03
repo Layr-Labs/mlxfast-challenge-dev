@@ -140,8 +140,45 @@ public enum DeepSeekOps {
         guard limit > 0 else {
             return silu(gate) * up
         }
-        let cappedGate = minimum(gate, Float(limit))
-        let clippedUp = clip(up, min: Float(-limit), max: Float(limit))
-        return silu(cappedGate) * clippedUp
+        // Fuse the min/clip/sigmoid/multiply chain into one kernel. On the
+        // decode path this runs ~topK*numMoELayers times per token (~240)
+        // and inside prefill it runs once per token per expert; each call
+        // was dispatching ~5 tiny elementwise kernels (minimum, clip.min,
+        // clip.max, sigmoid, multiply, multiply). mx.compile fuses them
+        // into one kernel while preserving op semantics — pure
+        // elementwise, no reductions, no accumulation-order sensitivity,
+        // no FMA-reassociation on any reduction dimension. The compile
+        // cache is keyed on the numeric limit constant and gate dtype so
+        // shape polymorphism doesn't invalidate it.
+        let cache = Self.compiledLimitedSwiGLU(limit: Float(limit), dtype: gate.dtype)
+        return cache(gate, up)
+    }
+
+    private struct LimitedSwiGLUKey: Hashable {
+        let limitBits: UInt32
+        let dtype: DType
+    }
+
+    private static let compiledLimitedSwiGLUCache =
+        LockedCache<LimitedSwiGLUKey, @Sendable (MLXArray, MLXArray) -> MLXArray>()
+
+    private static func compiledLimitedSwiGLU(
+        limit: Float,
+        dtype: DType
+    ) -> @Sendable (MLXArray, MLXArray) -> MLXArray {
+        let key = LimitedSwiGLUKey(limitBits: limit.bitPattern, dtype: dtype)
+        return compiledLimitedSwiGLUCache.value(for: key) {
+            compile { (gate: MLXArray, up: MLXArray) -> MLXArray in
+                // Preserve the exact op order the un-compiled path uses:
+                //   silu(cappedGate) * clippedUp
+                // where silu(x) = x * sigmoid(x). Splitting the intermediate
+                // silu materializes the same graph shape the baseline had,
+                // so operand pairing is identical when compile fuses.
+                let cappedGate = minimum(gate, limit)
+                let clippedUp = clip(up, min: -limit, max: limit)
+                let siluGate = cappedGate * sigmoid(cappedGate)
+                return siluGate * clippedUp
+            }
+        }
     }
 }
