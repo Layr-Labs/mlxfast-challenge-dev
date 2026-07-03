@@ -76,8 +76,9 @@ public final class ExpertPrefetcher {
         // reference: if it did, deinit would run ON this serial queue and its
         // queue.sync fd cleanup would self-deadlock. Once deinit is reachable,
         // pending advisories see nil and no-op before the fds close.
+        let advisoryRanges = ranges
         queue.async { [weak self] in
-            self?.advise(ranges)
+            self?.advise(advisoryRanges)
         }
     }
 

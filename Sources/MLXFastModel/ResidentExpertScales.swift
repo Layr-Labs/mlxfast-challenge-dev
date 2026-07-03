@@ -108,7 +108,7 @@ public final class ResidentExpertTensors {
         let start = entry.bytes.startIndex + firstAxisIndex * entry.sliceByteLength
         let slice = entry.bytes[start..<(start + entry.sliceByteLength)]
         return try? MaterializedTensor(
-            name: "\(name)[\(firstAxisIndex)]",
+            name: name,
             dtype: entry.dtype,
             shape: Array(entry.shape.dropFirst()),
             bytes: slice
