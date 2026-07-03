@@ -3,6 +3,34 @@ import MLX
 import MLXFastCore
 
 public enum DeepSeekOps {
+    private struct SwiGLUKey: Hashable {
+        let limitBits: UInt32
+        let hasLimit: Bool
+    }
+
+    private static let compiledSwiGLUCache =
+        LockedCache<SwiGLUKey, @Sendable (MLXArray, MLXArray) -> MLXArray>()
+
+    /// Cached compiled limitedSwiGLU: fuses minimum/clip/sigmoid/multiply into
+    /// one kernel instead of ~5-6 separate elementwise dispatches. Called
+    /// ~280x per decode step (7 MLPs × 40 layers). Pure elementwise with no
+    /// accumulation-order sensitivity. Shape-stable on decode ([1, intermediate]).
+    private static func compiledLimitedSwiGLU(limit: Double) -> @Sendable (MLXArray, MLXArray) -> MLXArray {
+        let hasLimit = limit > 0
+        let key = SwiGLUKey(limitBits: Float(limit).bitPattern, hasLimit: hasLimit)
+        return compiledSwiGLUCache.value(for: key) {
+            compile { (gate: MLXArray, up: MLXArray) -> MLXArray in
+                if hasLimit {
+                    let cappedGate = minimum(gate, Float(limit))
+                    let clippedUp = clip(up, min: Float(-limit), max: Float(limit))
+                    return (cappedGate * sigmoid(cappedGate)) * clippedUp
+                } else {
+                    return (gate * sigmoid(gate)) * up
+                }
+            }
+        }
+    }
+
     /// Cast that skips the graph node when the array is already in the target
     /// dtype (MLXArray.asType emits a node even for a no-op cast).
     public static func cast(_ input: MLXArray, to dtype: DType) -> MLXArray {
@@ -137,11 +165,6 @@ public enum DeepSeekOps {
     }
 
     public static func limitedSwiGLU(gate: MLXArray, up: MLXArray, limit: Double) -> MLXArray {
-        guard limit > 0 else {
-            return silu(gate) * up
-        }
-        let cappedGate = minimum(gate, Float(limit))
-        let clippedUp = clip(up, min: Float(-limit), max: Float(limit))
-        return silu(cappedGate) * clippedUp
+        compiledLimitedSwiGLU(limit: limit)(gate, up)
     }
 }
