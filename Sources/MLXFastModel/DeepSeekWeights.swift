@@ -109,6 +109,12 @@ public struct DeepSeekWeightLoader {
     // Capacity 0 => no cache/LRU mutation, so concurrent preads are race-free
     // and read byte-identical ranges through the trusted metered path.
     private let decodeSideBank: ExpertSlotBank?
+    // Cross-step LRU of decode expert code slices (tensor + prebuilt array),
+    // keyed by expert index + layer + projection. Input-independent: a hit
+    // skips the SSD read and Data->Metal copy for an expert weight that was
+    // recently used in any prompt. Same weight-caching pattern as the
+    // RAM-resident scales and pinned hash-layer codes.
+    private let decodeCodeCache: ExpertCodeLRUCache
     private let bridge: MLXArrayTensorBridge
 
     /// Sized for the official 48 GB runner: pin only where at least that
@@ -166,6 +172,9 @@ public struct DeepSeekWeightLoader {
             capacity: 0,
             metrics: metrics
         )
+        self.decodeCodeCache = ExpertCodeLRUCache(
+            capacity: expertStreamingConfig.tensorCacheCapacity
+        )
         self.bridge = bridge
     }
 
@@ -185,6 +194,9 @@ public struct DeepSeekWeightLoader {
         self.pinnedExpertCodes = nil
         self.expertLayerStager = nil
         self.decodeSideBank = nil
+        self.decodeCodeCache = ExpertCodeLRUCache(
+            capacity: expertStreamingConfig.tensorCacheCapacity
+        )
         self.bridge = bridge
     }
 
@@ -372,44 +384,67 @@ public struct DeepSeekWeightLoader {
         guard !keys.isEmpty else {
             return nil
         }
+        // Cross-step LRU: experts that recur across decode steps (same
+        // expert index in the same layer) hit here and skip both the SSD
+        // read and the Data->Metal copy. The cache is keyed by expert
+        // index + layer + projection — never by prompt content — so this
+        // is input-independent weight caching. Misses fall through to the
+        // concurrent side-bank reads below and are inserted for future
+        // steps. Pinned (RAM-resident) experts never reach this point
+        // (they broke out above), so every key here is a genuine SSD read
+        // on a miss.
+        var map: [String: StagedExpertCode] = [:]
+        map.reserveCapacity(keys.count)
+        var missKeys: [String] = []
+        var missNames: [String] = []
+        var missIndices: [Int] = []
+        var missSlots: [Int] = []
+        for (index, key) in keys.enumerated() {
+            if let cached = decodeCodeCache.lookup(key) {
+                map[key] = cached
+            } else {
+                missKeys.append(key)
+                missNames.append(names[index])
+                missIndices.append(indices[index])
+                missSlots.append(index)
+            }
+        }
+        guard !missKeys.isEmpty else {
+            return map
+        }
         let bridge = self.bridge
         let residentScales = self.residentExpertScales
-        var results = [StagedExpertCode?](repeating: nil, count: keys.count)
+        let cache = self.decodeCodeCache
+        var results = [StagedExpertCode?](repeating: nil, count: missKeys.count)
         results.withUnsafeMutableBufferPointer { buffer in
             let sink = DecodePrefetchSink(buffer: buffer)
-            DispatchQueue.concurrentPerform(iterations: keys.count) { index in
-                // Read the slice AND build its base MLXArray (the eager
-                // Data->Metal copy) here on the worker thread. The compute
-                // thread's per-expert loop then skips that memcpy and only
-                // wires the lazy reshape/quant assembly into the graph.
-                // Byte-identical: same bytes, same array constructor.
+            DispatchQueue.concurrentPerform(iterations: missKeys.count) { missIndex in
                 guard
                     let tensor = try? sideBank.materializedTensor(
-                        named: names[index],
-                        firstAxisIndex: indices[index]
+                        named: missNames[missIndex],
+                        firstAxisIndex: missIndices[missIndex]
                     ),
                     let array = try? bridge.makeArray(from: tensor)
                 else {
                     return
                 }
-                // Also build the resident scales' base array off-thread.
                 let scalesArray = Self.residentScalesArray(
                     residentScales: residentScales,
                     bridge: bridge,
-                    codeName: names[index],
-                    expertIndex: indices[index]
+                    codeName: missNames[missIndex],
+                    expertIndex: missIndices[missIndex]
                 )
-                sink.buffer[index] = StagedExpertCode(
+                let code = StagedExpertCode(
                     tensor: tensor,
                     array: array,
                     scalesArray: scalesArray
                 )
+                sink.buffer[missIndex] = code
+                cache.insert(missKeys[missIndex], code)
             }
         }
-        var map: [String: StagedExpertCode] = [:]
-        map.reserveCapacity(keys.count)
-        for (index, key) in keys.enumerated() {
-            if let staged = results[index] {
+        for (missIndex, key) in missKeys.enumerated() {
+            if let staged = results[missIndex] {
                 map[key] = staged
             }
         }
@@ -1565,4 +1600,57 @@ public struct StagedExpertCode {
 // disjoint and the unchecked Sendable conformance is sound.
 private struct DecodePrefetchSink: @unchecked Sendable {
     let buffer: UnsafeMutableBufferPointer<StagedExpertCode?>
+}
+
+/// Cross-step LRU cache of decode expert code slices (StagedExpertCode:
+/// tensor bytes + prebuilt base MLXArray + scales array). Keyed by
+/// `decodePrefetchKey(name, expertIndex)` — a function of the layer index,
+/// expert index, and projection only, never of prompt content or request
+/// shape. A hit skips the SSD read AND the Data->Metal copy: the cached
+/// MLXArray's underlying Metal buffer is reused (same bytes, same
+/// constructor), and linearWeight's lazy reshape/quant assembly runs as
+/// usual on the compute thread. This is input-independent weight caching,
+/// the same pattern as the RAM-resident scales and pinned hash-layer codes.
+final class ExpertCodeLRUCache {
+    private struct Entry {
+        let code: StagedExpertCode
+        var lastUse: UInt64
+    }
+
+    private let capacity: Int
+    private var entries: [String: Entry] = [:]
+    private var clock: UInt64 = 0
+    private let lock = NSLock()
+
+    init(capacity: Int) {
+        self.capacity = max(0, capacity)
+    }
+
+    func lookup(_ key: String) -> StagedExpertCode? {
+        guard capacity > 0 else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        guard var entry = entries[key] else { return nil }
+        clock += 1
+        entry.lastUse = clock
+        entries[key] = entry
+        return entry.code
+    }
+
+    func insert(_ key: String, _ code: StagedExpertCode) {
+        guard capacity > 0 else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        clock += 1
+        entries[key] = Entry(code: code, lastUse: clock)
+        while entries.count > capacity {
+            var oldestKey: String?
+            var oldestUse = UInt64.max
+            for (k, e) in entries where e.lastUse < oldestUse {
+                oldestUse = e.lastUse
+                oldestKey = k
+            }
+            if let oldestKey { entries.removeValue(forKey: oldestKey) } else { break }
+        }
+    }
 }
