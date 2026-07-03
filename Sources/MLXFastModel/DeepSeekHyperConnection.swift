@@ -202,11 +202,33 @@ public enum DeepSeekHyperConnection {
         let y = DeepSeekOps.cast(x, to: .float32)
         let normalized = weightlessRMSNorm(y.flattened(start: -2), eps: normEps)
         let mixes = matmul(normalized, fnTransposed ?? fn.T)
-        let pre = sigmoid(mixes * scale[0] + base) + Float(eps)
-        return DeepSeekOps.cast(
-            (pre.expandedDimensions(axis: -1) * y).sum(axis: 2),
-            to: x.dtype
-        )
+        // Compile the head tail (sigmoid + scale + base + eps + multiply +
+        // reduce + cast) into one fused kernel. Pure elementwise — no
+        // RMSNorm/square/mean/rsqrt chain in the closure, so no FMA-
+        // reassociation risk. Same pattern as the compiled collapse-tail.
+        let tail = compiledHeadTail(outputDType: x.dtype, eps: Float(eps))
+        return tail(mixes, scale[0], base, y)
+    }
+
+    private struct HeadTailKey: Hashable {
+        let outputDType: DType
+        let epsBits: UInt32
+    }
+
+    private static let compiledHeadTailCache =
+        LockedCache<HeadTailKey, @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray>()
+
+    private static func compiledHeadTail(
+        outputDType: DType,
+        eps: Float
+    ) -> @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray {
+        let key = HeadTailKey(outputDType: outputDType, epsBits: eps.bitPattern)
+        return compiledHeadTailCache.value(for: key) {
+            compile { (mixes: MLXArray, scale: MLXArray, base: MLXArray, y: MLXArray) -> MLXArray in
+                let pre = sigmoid(mixes * scale + base) + eps
+                return (pre.expandedDimensions(axis: -1) * y).sum(axis: 2).asType(outputDType)
+            }
+        }
     }
 
     public static func weightlessRMSNorm(_ x: MLXArray, eps: Double) -> MLXArray {
