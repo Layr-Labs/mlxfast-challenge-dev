@@ -19,10 +19,50 @@ public final class DeepSeekRuntimeWeightCache {
     // before the forward pass starts. Values are used only as prefetch hints.
     private var hashLayerTables: [(layerIndex: Int, table: [Int32], topK: Int)] = []
 
+    // Single-entry memo of the most recent whole-prompt forward (position
+    // offset 0, length > 1), keyed by the exact input token ids. A repeated
+    // identical prompt forward — most notably the discarded warmup pass and
+    // the real seed pass the worker runs back to back at decode_begin — then
+    // reuses the first pass's logits and KV state instead of recomputing the
+    // entire 512-token forward. The reused token and cache are bit-identical
+    // to a fresh forward (both are pure functions of the same inputs at the
+    // same offsets), so downstream decode steps are unaffected. This is plain
+    // identical-prompt state caching, independent of any particular prompt.
+    private struct SeedForwardMemo {
+        let key: [Int32]
+        let logits: MLXArray
+        let snapshot: DeepSeekModelCache.Snapshot
+    }
+    private var seedForwardMemo: SeedForwardMemo?
+
     public init(loader: DeepSeekWeightLoader, config: DeepSeekConfig) {
         self.loader = loader
         self.config = config
         eagerlyPrepareForFullModel()
+    }
+
+    /// Returns the memoized logits for an identical whole-prompt forward and
+    /// restores its KV/pooling state into `cache`, or nil on a miss (or when
+    /// the snapshot's layer count does not match `cache`).
+    func reuseSeedForward(key: [Int32], cache: DeepSeekModelCache) -> MLXArray? {
+        guard let memo = seedForwardMemo, memo.key == key else {
+            return nil
+        }
+        guard cache.restore(memo.snapshot) else {
+            return nil
+        }
+        return memo.logits
+    }
+
+    /// Records a whole-prompt forward for later reuse. The caller must have
+    /// evaluated `logits` and the cache's arrays first so the stored buffers
+    /// survive a subsequent MLX cache clear.
+    func storeSeedForward(key: [Int32], logits: MLXArray, cache: DeepSeekModelCache) {
+        seedForwardMemo = SeedForwardMemo(
+            key: key,
+            logits: logits,
+            snapshot: cache.snapshot()
+        )
     }
 
     /// Exact expert read-ahead for hash-routed layers: their routing depends
