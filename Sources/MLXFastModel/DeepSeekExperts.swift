@@ -84,12 +84,6 @@ public enum DeepSeekRoutedExperts {
                 loader.expertLayerStager?.releaseLayer(spec.layerIndex)
             }
         }
-        if !useStaged {
-            // Kernel read-ahead for every byte range this layer is about to
-            // pread, so SSD I/O overlaps the per-expert GPU compute below.
-            loader.expertPrefetcher.prefetch(layerIndex: spec.layerIndex, expertIndices: selectedExperts)
-        }
-
         let outputCount = tokenCount * topK
         guard outputCount > 0 else {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
@@ -101,6 +95,33 @@ public enum DeepSeekRoutedExperts {
         flatIndicesByExpert.reserveCapacity(min(outputCount, 256))
         for (flatIndex, expertIndex) in selectedExperts.enumerated() {
             flatIndicesByExpert[expertIndex, default: []].append(flatIndex)
+        }
+
+        // Cross-step cache: experts this token reuses from recent steps skip
+        // both the SSD read and the array rebuild. Only the decode path -- a
+        // prefill touches essentially every expert and would thrash it. The
+        // lookup runs before the kernel read-ahead below so hits do not waste
+        // advisory bandwidth on byte ranges nothing will read.
+        var cachedWeightsByExpert: [Int: DeepSeekMLPWeights] = [:]
+        let weightCache = tokenCount == 1 && !useStaged ? loader.decodeExpertWeightCache : nil
+        if let weightCache {
+            for expertIndex in flatIndicesByExpert.keys {
+                if let cached = weightCache.cachedWeights(
+                    layerIndex: spec.layerIndex,
+                    expertIndex: expertIndex
+                ) {
+                    cachedWeightsByExpert[expertIndex] = cached
+                }
+            }
+        }
+        let missingExperts = flatIndicesByExpert.keys.filter {
+            cachedWeightsByExpert[$0] == nil
+        }
+
+        if !useStaged {
+            // Kernel read-ahead for every byte range this layer is about to
+            // pread, so SSD I/O overlaps the per-expert GPU compute below.
+            loader.expertPrefetcher.prefetch(layerIndex: spec.layerIndex, expertIndices: missingExperts)
         }
 
         // Flatten the token axis once. Row (batch * sequenceLength + position)
@@ -127,9 +148,9 @@ public enum DeepSeekRoutedExperts {
         // not prefetched falls back to the normal per-expert bank read.
         var decodePrefetch: [String: StagedExpertCode]?
         if tokenCount == 1, !useStaged {
-            decodePrefetch = loader.prefetchDecodeExpertCodes(
+            decodePrefetch = missingExperts.isEmpty ? nil : loader.prefetchDecodeExpertCodes(
                 layerIndex: spec.layerIndex,
-                expertIndices: Array(flatIndicesByExpert.keys),
+                expertIndices: missingExperts,
                 hiddenSize: spec.hiddenSize,
                 intermediateSize: spec.intermediateSize
             )
@@ -151,13 +172,26 @@ public enum DeepSeekRoutedExperts {
         scatterOrder.reserveCapacity(outputCount)
 
         for (expertIndex, flatIndices) in flatIndicesByExpert {
-            let expertWeights = try weights(
-                forExpert: expertIndex,
-                loader: loader,
-                spec: spec,
-                preferStaged: useStaged,
-                decodePrefetch: decodePrefetch
-            )
+            let expertWeights: DeepSeekMLPWeights
+            if let cached = cachedWeightsByExpert[expertIndex] {
+                expertWeights = cached
+            } else {
+                expertWeights = try weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec,
+                    preferStaged: useStaged,
+                    decodePrefetch: decodePrefetch
+                )
+                if let weightCache {
+                    weightCache.insert(
+                        layerIndex: spec.layerIndex,
+                        expertIndex: expertIndex,
+                        weights: expertWeights,
+                        byteCount: DecodeExpertWeightCache.residentByteCount(for: expertWeights)
+                    )
+                }
+            }
             let tokenRows = flatIndices.map { Int32($0 / topK) }
             let tokens = xFlat.take(MLXArray(tokenRows), axis: 0)
             let expertOutput = DeepSeekMLP.forward(

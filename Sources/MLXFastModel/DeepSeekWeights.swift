@@ -109,6 +109,9 @@ public struct DeepSeekWeightLoader {
     // Capacity 0 => no cache/LRU mutation, so concurrent preads are race-free
     // and read byte-identical ranges through the trusted metered path.
     private let decodeSideBank: ExpertSlotBank?
+    // Cross-step assembled-weight cache for the 1-token decode path. Weight
+    // data is immutable, so hits are value-identical to a fresh streamed read.
+    public let decodeExpertWeightCache: DecodeExpertWeightCache?
     private let bridge: MLXArrayTensorBridge
 
     /// Sized for the official 48 GB runner: pin only where at least that
@@ -166,6 +169,12 @@ public struct DeepSeekWeightLoader {
             capacity: 0,
             metrics: metrics
         )
+        // Shared process-wide for the same reason as the resident stores: the
+        // harness keeps two loaders alive at once, and two full-budget caches
+        // would double the accounted memory.
+        self.decodeExpertWeightCache = DecodeExpertWeightCacheRegistry.cache(
+            manifestPath: manifestPath
+        )
         self.bridge = bridge
     }
 
@@ -185,6 +194,7 @@ public struct DeepSeekWeightLoader {
         self.pinnedExpertCodes = nil
         self.expertLayerStager = nil
         self.decodeSideBank = nil
+        self.decodeExpertWeightCache = nil
         self.bridge = bridge
     }
 
