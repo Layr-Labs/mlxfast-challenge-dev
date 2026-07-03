@@ -88,6 +88,16 @@ public enum DeepSeekRoutedExperts {
             // Kernel read-ahead for every byte range this layer is about to
             // pread, so SSD I/O overlaps the per-expert GPU compute below.
             loader.expertPrefetcher.prefetch(layerIndex: spec.layerIndex, expertIndices: selectedExperts)
+            // Speculative next-layer prefetch: issue F_RDADVISE for the next
+            // layer's likely experts (same indices — intra-layer expert
+            // recurrence is high) during this layer's compute. The advisory
+            // is async and costs no memory; wrong guesses just get evicted.
+            // This fills otherwise-idle SSD time during GPU compute, so the
+            // next layer's pread hits page cache instead of disk.
+            loader.expertPrefetcher.prefetch(
+                layerIndex: spec.layerIndex + 1,
+                expertIndices: selectedExperts
+            )
         }
 
         let outputCount = tokenCount * topK
