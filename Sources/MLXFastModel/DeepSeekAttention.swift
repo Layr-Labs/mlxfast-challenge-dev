@@ -658,7 +658,8 @@ public enum DeepSeekCompressedAttention {
         } else {
             if spec.compressRatio == 4,
                let indexer = weights.indexer,
-               let indexPooled = cache?.indexPooled
+               let indexPooled = cache?.indexPooled,
+               sequenceLength > 1
             {
                 _ = try DeepSeekKVCompressor.forward(
                     x,
