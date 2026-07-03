@@ -75,7 +75,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        machine: ${{ fromJSON(inputs.machines || '[1]') }}
+        machine: ${{ fromJSON(inputs.machines || '[1,2,3,4,5,6]') }}
     runs-on: blacksmith-12vcpu-macos-26
     timeout-minutes: 360
     env:
@@ -236,6 +236,11 @@ jobs:
               sys.exit(1)
           print(f"decode_seconds_per_token={d} bandwidth_gb_per_token={m.get('bandwidth_gb_per_token')} passed_correctness={m.get('passed_correctness')}")
           PY
+          # Machine-indexed filenames so combine can pair score+host per machine
+          # regardless of how download-artifact lays the tree out (nested per
+          # artifact, or flattened) -- unique names never collide across machines.
+          cp score.local-iterate.json "score-${{ matrix.machine }}.json"
+          cp host.txt "host-${{ matrix.machine }}.txt"
 
       - name: Upload machine artifact
         if: always()
@@ -243,8 +248,8 @@ jobs:
         with:
           name: blacksmith-baseline-variance-probe-${{ github.run_id }}-machine-${{ matrix.machine }}
           path: |
-            score.local-iterate.json
-            host.txt
+            score-${{ matrix.machine }}.json
+            host-${{ matrix.machine }}.txt
           if-no-files-found: error
           retention-days: 14
 
@@ -280,15 +285,19 @@ jobs:
                   return None
               return None
 
+          # Machine-indexed filenames, found recursively so any download-artifact
+          # layout works. Pair score-<idx>.json with host-<idx>.txt by index.
+          score_files = sorted(glob.glob("machines/**/score-*.json", recursive=True))
           rows = []
-          for d in sorted(glob.glob("machines/*")):
-              sp, hp = os.path.join(d, "score.local-iterate.json"), os.path.join(d, "host.txt")
-              idx = host_field(hp, "machine_index") or re.sub(r".*machine-", "", d)
-              row = {"machine": idx,
+          for sp in score_files:
+              idx = re.sub(r"^score-(.+)\.json$", r"\1", os.path.basename(sp))
+              hosts = glob.glob(f"machines/**/host-{idx}.txt", recursive=True)
+              hp = hosts[0] if hosts else ""
+              row = {"machine": (host_field(hp, "machine_index") or idx),
                      "host": (host_field(hp, "hostname") or "?"),
+                     "host_ip": (host_field(hp, "BLACKSMITH_HOST_PUBLIC_IP") or "?"),
                      "setup_s": host_field(hp, "setup_seconds"),
-                     "raw_gbps": host_field(hp, "raw_read_gbps"),
-                     "dl_gbps": host_field(hp, "checkpoint_du_bytes")}
+                     "raw_gbps": host_field(hp, "raw_read_gbps")}
               try:
                   m = json.load(open(sp))["metrics"]
                   row.update(
@@ -310,12 +319,17 @@ jobs:
           print(f"- machines requested: `{os.environ.get('MACHINES','')}`  ·  reported: {len(rows)}")
           print("- metric: unmodified `main` via `./benchmark.sh --local-iterate` (16-step) — the SAME command participants iterate with locally on M4 Pro. Compare these numbers directly against a local M4 `--local-iterate` run.")
           print("- NOT the 128-step ranked path (baseline diverges from the public golden at the known M4 bf16 tie ~step 5, which the strict ranked path can't complete without the hidden golden), so these s/tok are NOT the calibrated 4.2205/0.17331 denominators.")
+          ips = [r.get("host_ip") for r in rows if r.get("host_ip") and r.get("host_ip") != "?"]
+          distinct = len(set(ips))
+          print(f"- host IPs: {len(ips)} reporting, **{distinct} distinct** "
+                + ("⇒ some machines CO-LOCATED on the same physical host (shared storage/network)."
+                   if ips and distinct < len(ips) else "⇒ each machine on a distinct host."))
           print()
-          print("| m | host | decode s/tok | prefill s/tok | bw GB/tok | peak RAM GB | raw read GB/s | setup s |")
-          print("|---|------|-------------|---------------|-----------|-------------|---------------|---------|")
+          print("| m | host IP | decode s/tok | prefill s/tok | bw GB/tok | peak RAM GB | raw read GB/s | setup s |")
+          print("|---|---------|-------------|---------------|-----------|-------------|---------------|---------|")
           for r in rows:
-              print("| {m} | {h} | {dc} | {pf} | {bw} | {ram} | {raw} | {su} |".format(
-                  m=r["machine"], h=(r.get("host") or "?")[-12:],
+              print("| {m} | {ip} | {dc} | {pf} | {bw} | {ram} | {raw} | {su} |".format(
+                  m=r["machine"], ip=(r.get("host_ip") or "?"),
                   dc=f(r.get("decode")), pf=f(r.get("prefill"), 5),
                   bw=f(r.get("bw"), 3), ram=f(r.get("ram"), 2),
                   raw=f(float(r["raw_gbps"]), 3) if r.get("raw_gbps") else "n/a",
