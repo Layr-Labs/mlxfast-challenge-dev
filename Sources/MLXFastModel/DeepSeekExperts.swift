@@ -70,8 +70,10 @@ public enum DeepSeekRoutedExperts {
            let plan = loader.stagedExpertLayerPlan(layerIndex: spec.layerIndex)
         {
             stager.schedule(plan)
-            if let nextPlan = loader.stagedExpertLayerPlan(layerIndex: spec.layerIndex + 1) {
-                stager.schedule(nextPlan)
+            for lookahead in 1...stagingLookaheadLayerCount {
+                if let nextPlan = loader.stagedExpertLayerPlan(layerIndex: spec.layerIndex + lookahead) {
+                    stager.schedule(nextPlan)
+                }
             }
             stagingScheduled = true
         }
@@ -234,3 +236,9 @@ public enum DeepSeekRoutedExperts {
 /// activations) the expected unique-expert coverage already exceeds 3/4 of
 /// the stack, and the scored 512-token prefills touch essentially all of it.
 private let stagingMinimumTokenCount = 64
+
+/// Keep the staging thread ahead across attention/MLP compute. One additional
+/// future layer costs about 3.2 GiB of staged expert codes; depth 2 keeps the
+/// official 48 GB runner within the existing memory budget while avoiding idle
+/// gaps when the staging queue finishes the next layer before it is requested.
+private let stagingLookaheadLayerCount = 2
