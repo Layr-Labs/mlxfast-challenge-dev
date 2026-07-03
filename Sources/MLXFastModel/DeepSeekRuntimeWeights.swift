@@ -40,10 +40,18 @@ public final class DeepSeekRuntimeWeightCache {
                 continue
             }
             let experts = entry.table[base..<(base + entry.topK)].map(Int.init)
-            loader.expertPrefetcher.prefetch(
+            let fullyPinned = loader.schedulePinnedDecodeExpertCodes(
                 layerIndex: entry.layerIndex,
-                expertIndices: experts
+                expertIndices: experts,
+                hiddenSize: config.hiddenSize,
+                intermediateSize: config.moeIntermediateSize
             )
+            if !fullyPinned {
+                loader.expertPrefetcher.prefetch(
+                    layerIndex: entry.layerIndex,
+                    expertIndices: experts
+                )
+            }
         }
     }
 
@@ -82,13 +90,13 @@ public final class DeepSeekRuntimeWeightCache {
             }
             if let tokenToExpert = (try? moeWeights(layerIndex: layerIndex))?.tokenToExpert,
                tokenToExpert.shape.count == 2,
-               tokenToExpert.shape[1] > 0,
-               loader.stagedExpertLayerPlan(layerIndex: layerIndex) != nil
+               tokenToExpert.shape[1] > 0
             {
                 // asArray on this untimed init path is the table's only host
-                // materialization; ~6 MB per hash layer. Layers whose codes
-                // are RAM-pinned resolve no staging plan and need no
-                // prefetch — their reads never touch the disk.
+                // materialization; ~6 MB per hash layer. The decode entry path
+                // uses it either for exact disk read-ahead or, when hash-layer
+                // codes are RAM-pinned, to start code-array prebuilds before
+                // the layer reaches MoE.
                 hashLayerTables.append((
                     layerIndex: layerIndex,
                     table: tokenToExpert.asType(.int32).asArray(Int32.self),
