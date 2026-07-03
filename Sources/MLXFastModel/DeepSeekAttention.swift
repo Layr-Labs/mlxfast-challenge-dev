@@ -503,7 +503,11 @@ public enum DeepSeekLocalAttention {
         q = DeepSeekOps.linear(input: q, weight: weights.wqB)
         q = q.reshaped([batchSize, sequenceLength, spec.numAttentionHeads, spec.headDim])
         q = DeepSeekHyperConnection.weightlessRMSNorm(q, eps: spec.rmsNormEps)
-        q = q.transposed(0, 2, 1, 3)
+        if sequenceLength == 1 {
+            q = q.reshaped([batchSize, spec.numAttentionHeads, 1, spec.headDim])
+        } else {
+            q = q.transposed(0, 2, 1, 3)
+        }
         q = try rope.applied(to: q, offset: positionOffset)
 
         var kv = DeepSeekOps.linear(input: x, weight: weights.wkv)
@@ -533,10 +537,16 @@ public enum DeepSeekLocalAttention {
         )
         out = try rope.applied(to: out, offset: positionOffset, inverse: true)
 
-        out = out.reshaped([batchSize, spec.outputGroups, -1, sequenceLength, spec.headDim])
-        out = out.transposed(0, 1, 3, 2, 4).flattened(start: -2)
-        out = try DeepSeekOps.multiLinear(input: out, weight: weights.woA)
-        out = out.transposed(0, 2, 1, 3).flattened(start: -2)
+        if sequenceLength == 1 {
+            out = out.reshaped([batchSize, spec.outputGroups, 1, -1])
+            out = try DeepSeekOps.multiLinear(input: out, weight: weights.woA)
+            out = out.reshaped([batchSize, 1, -1])
+        } else {
+            out = out.reshaped([batchSize, spec.outputGroups, -1, sequenceLength, spec.headDim])
+            out = out.transposed(0, 1, 3, 2, 4).flattened(start: -2)
+            out = try DeepSeekOps.multiLinear(input: out, weight: weights.woA)
+            out = out.transposed(0, 2, 1, 3).flattened(start: -2)
+        }
         return DeepSeekOps.linear(input: out, weight: weights.woB, bias: weights.woBBias)
     }
 
@@ -581,7 +591,11 @@ public enum DeepSeekCompressedAttention {
         var q = DeepSeekOps.linear(input: qResidual, weight: weights.attention.wqB)
         q = q.reshaped([batchSize, sequenceLength, spec.numAttentionHeads, spec.headDim])
         q = DeepSeekHyperConnection.weightlessRMSNorm(q, eps: spec.rmsNormEps)
-        q = q.transposed(0, 2, 1, 3)
+        if sequenceLength == 1 {
+            q = q.reshaped([batchSize, spec.numAttentionHeads, 1, spec.headDim])
+        } else {
+            q = q.transposed(0, 2, 1, 3)
+        }
         q = try rope.applied(to: q, offset: positionOffset)
 
         var kv = DeepSeekOps.linear(input: x, weight: weights.attention.wkv)
@@ -696,10 +710,16 @@ public enum DeepSeekCompressedAttention {
         }
         out = try rope.applied(to: out, offset: positionOffset, inverse: true)
 
-        out = out.reshaped([batchSize, spec.outputGroups, -1, sequenceLength, spec.headDim])
-        out = out.transposed(0, 1, 3, 2, 4).flattened(start: -2)
-        out = try DeepSeekOps.multiLinear(input: out, weight: weights.attention.woA)
-        out = out.transposed(0, 2, 1, 3).flattened(start: -2)
+        if sequenceLength == 1 {
+            out = out.reshaped([batchSize, spec.outputGroups, 1, -1])
+            out = try DeepSeekOps.multiLinear(input: out, weight: weights.attention.woA)
+            out = out.reshaped([batchSize, 1, -1])
+        } else {
+            out = out.reshaped([batchSize, spec.outputGroups, -1, sequenceLength, spec.headDim])
+            out = out.transposed(0, 1, 3, 2, 4).flattened(start: -2)
+            out = try DeepSeekOps.multiLinear(input: out, weight: weights.attention.woA)
+            out = out.transposed(0, 2, 1, 3).flattened(start: -2)
+        }
         return DeepSeekOps.linear(
             input: out,
             weight: weights.attention.woB,
