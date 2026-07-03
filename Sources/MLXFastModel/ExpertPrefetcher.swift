@@ -94,6 +94,22 @@ public final class ExpertPrefetcher {
         projection: (projection: DeepSeekExpertProjection, expectedRank: Int),
         into ranges: inout [ByteRange]
     ) {
+        for candidate in DeepSeekWeightNames.layer(
+            layerIndex,
+            "ffn.switch_mlp.\(projection.projection.rawValue).weight"
+        ) {
+            guard let record = expertBank.record(named: candidate) else {
+                continue
+            }
+            appendResolved(
+                record: record,
+                candidate: candidate,
+                expertIndex: expertIndex,
+                expectedRank: projection.expectedRank,
+                into: &ranges
+            )
+            return
+        }
         let candidates = DeepSeekWeightNames.routedExpert(
             layerIndex: layerIndex,
             expertIndex: expertIndex,
@@ -104,24 +120,40 @@ public final class ExpertPrefetcher {
             guard let record = expertBank.record(named: candidate) else {
                 continue
             }
-            let isStacked = record.shape.count == projection.expectedRank + 1
-                && record.shape.first.map { expertIndex < $0 } == true
-            append(record: record, expertIndex: expertIndex, sliced: isStacked, into: &ranges)
-            // Companion tensors are read only for quantized (U32) weights.
-            if record.dtype == "U32" {
-                for suffix in ["scales", "biases"] {
-                    let companion = companionName(for: candidate, suffix: suffix)
-                    if let companionRecord = expertBank.record(named: companion) {
-                        append(
-                            record: companionRecord,
-                            expertIndex: expertIndex,
-                            sliced: isStacked,
-                            into: &ranges
-                        )
-                    }
+            appendResolved(
+                record: record,
+                candidate: candidate,
+                expertIndex: expertIndex,
+                expectedRank: projection.expectedRank,
+                into: &ranges
+            )
+            return
+        }
+    }
+
+    private func appendResolved(
+        record: ExpertTensorRecord,
+        candidate: String,
+        expertIndex: Int,
+        expectedRank: Int,
+        into ranges: inout [ByteRange]
+    ) {
+        let isStacked = record.shape.count == expectedRank + 1
+            && record.shape.first.map { expertIndex < $0 } == true
+        append(record: record, expertIndex: expertIndex, sliced: isStacked, into: &ranges)
+        // Companion tensors are read only for quantized (U32) weights.
+        if record.dtype == "U32" {
+            for suffix in ["scales", "biases"] {
+                let companion = companionName(for: candidate, suffix: suffix)
+                if let companionRecord = expertBank.record(named: companion) {
+                    append(
+                        record: companionRecord,
+                        expertIndex: expertIndex,
+                        sliced: isStacked,
+                        into: &ranges
+                    )
                 }
             }
-            return
         }
     }
 

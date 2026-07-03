@@ -193,34 +193,25 @@ public enum DeepSeekRoutedExperts {
         decodePrefetch: [String: StagedExpertCode]? = nil
     ) throws -> DeepSeekMLPWeights {
         try DeepSeekMLPWeights(
-            gate: loader.expertLinearWeight(
-                candidates: DeepSeekWeightNames.routedExpert(
-                    layerIndex: spec.layerIndex,
-                    expertIndex: expertIndex,
-                    projection: .gate
-                ),
+            gate: loader.routedExpertLinearWeight(
+                layerIndex: spec.layerIndex,
+                projection: .gate,
                 expectedShape: [spec.intermediateSize, spec.hiddenSize],
                 expertIndex: expertIndex,
                 preferStaged: preferStaged,
                 decodePrefetch: decodePrefetch
             ),
-            up: loader.expertLinearWeight(
-                candidates: DeepSeekWeightNames.routedExpert(
-                    layerIndex: spec.layerIndex,
-                    expertIndex: expertIndex,
-                    projection: .up
-                ),
+            up: loader.routedExpertLinearWeight(
+                layerIndex: spec.layerIndex,
+                projection: .up,
                 expectedShape: [spec.intermediateSize, spec.hiddenSize],
                 expertIndex: expertIndex,
                 preferStaged: preferStaged,
                 decodePrefetch: decodePrefetch
             ),
-            down: loader.expertLinearWeight(
-                candidates: DeepSeekWeightNames.routedExpert(
-                    layerIndex: spec.layerIndex,
-                    expertIndex: expertIndex,
-                    projection: .down
-                ),
+            down: loader.routedExpertLinearWeight(
+                layerIndex: spec.layerIndex,
+                projection: .down,
                 expectedShape: [spec.hiddenSize, spec.intermediateSize],
                 expertIndex: expertIndex,
                 preferStaged: preferStaged,

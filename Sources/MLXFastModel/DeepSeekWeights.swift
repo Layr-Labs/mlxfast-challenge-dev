@@ -343,28 +343,19 @@ public struct DeepSeekWeightLoader {
         var seen = Set<String>()
         for expertIndex in expertIndices {
             for (projection, expectedShape) in projections {
-                let candidates = DeepSeekWeightNames.routedExpert(
+                guard let resolved = stackedRoutedExpertRecord(
                     layerIndex: layerIndex,
                     expertIndex: expertIndex,
-                    projection: projection
-                )
-                for candidate in candidates {
-                    guard let record = expertBank.record(named: candidate) else {
-                        continue
-                    }
-                    let isStacked = record.shape.count == expectedShape.count + 1
-                        && record.shape.first.map { expertIndex < $0 } == true
-                    // Match expertLinearWeight: first matching candidate wins.
-                    guard isStacked else {
-                        break
-                    }
-                    let key = Self.decodePrefetchKey(candidate, expertIndex)
-                    if seen.insert(key).inserted {
-                        keys.append(key)
-                        names.append(candidate)
-                        indices.append(expertIndex)
-                    }
-                    break
+                    projection: projection,
+                    expectedShape: expectedShape
+                ) else {
+                    continue
+                }
+                let key = Self.decodePrefetchKey(resolved.name, expertIndex)
+                if seen.insert(key).inserted {
+                    keys.append(key)
+                    names.append(resolved.name)
+                    indices.append(expertIndex)
                 }
             }
         }
@@ -489,30 +480,19 @@ public struct DeepSeekWeightLoader {
         var seen = Set<String>()
         for expertIndex in expertIndices {
             for (projection, expectedShape) in projections {
-                let candidates = DeepSeekWeightNames.routedExpert(
+                guard let resolved = stackedRoutedExpertRecord(
                     layerIndex: layerIndex,
                     expertIndex: expertIndex,
-                    projection: projection
-                )
-                for candidate in candidates {
-                    guard let record = expertBank.record(named: candidate) else {
-                        continue
-                    }
-                    let isStacked = record.shape.count == expectedShape.count + 1
-                        && record.shape.first.map { expertIndex < $0 } == true
-                    guard isStacked else {
-                        break
-                    }
-                    guard pinnedCodes.isResident(name: candidate) else {
-                        break
-                    }
-                    let key = Self.decodePrefetchKey(candidate, expertIndex)
-                    if seen.insert(key).inserted {
-                        keys.append(key)
-                        names.append(candidate)
-                        indices.append(expertIndex)
-                    }
-                    break
+                    projection: projection,
+                    expectedShape: expectedShape
+                ), pinnedCodes.isResident(name: resolved.name) else {
+                    continue
+                }
+                let key = Self.decodePrefetchKey(resolved.name, expertIndex)
+                if seen.insert(key).inserted {
+                    keys.append(key)
+                    names.append(resolved.name)
+                    indices.append(expertIndex)
                 }
             }
         }
@@ -591,30 +571,19 @@ public struct DeepSeekWeightLoader {
         var seen = Set<String>()
         for expertIndex in expertIndices {
             for (projection, expectedShape) in projections {
-                let candidates = DeepSeekWeightNames.routedExpert(
+                guard let resolved = stackedRoutedExpertRecord(
                     layerIndex: layerIndex,
                     expertIndex: expertIndex,
-                    projection: projection
-                )
-                for candidate in candidates {
-                    guard let record = expertBank.record(named: candidate) else {
-                        continue
-                    }
-                    let isStacked = record.shape.count == expectedShape.count + 1
-                        && record.shape.first.map { expertIndex < $0 } == true
-                    guard isStacked else {
-                        break
-                    }
-                    if pinnedExpertCodes?.isResident(name: candidate) == true {
-                        break
-                    }
-                    let key = Self.decodePrefetchKey(candidate, expertIndex)
-                    if seen.insert(key).inserted {
-                        keys.append(key)
-                        names.append(candidate)
-                        indices.append(expertIndex)
-                    }
-                    break
+                    projection: projection,
+                    expectedShape: expectedShape
+                ), pinnedExpertCodes?.isResident(name: resolved.name) != true else {
+                    continue
+                }
+                let key = Self.decodePrefetchKey(resolved.name, expertIndex)
+                if seen.insert(key).inserted {
+                    keys.append(key)
+                    names.append(resolved.name)
+                    indices.append(expertIndex)
                 }
             }
         }
@@ -673,8 +642,104 @@ public struct DeepSeekWeightLoader {
             guard let record = expertBank.record(named: candidate) else {
                 continue
             }
-            let isStacked = record.shape.count == expectedShape.count + 1
-                && record.shape.first.map { expertIndex < $0 } == true
+            return try resolvedExpertLinearWeight(
+                candidate: candidate,
+                record: record,
+                expectedShape: expectedShape,
+                expertIndex: expertIndex,
+                preferStaged: preferStaged,
+                decodePrefetch: decodePrefetch
+            )
+        }
+        throw MLXFastError.invalidInput(
+            "expert tensor not found; tried \(candidates.joined(separator: ", "))"
+        )
+    }
+
+    public func routedExpertLinearWeight(
+        layerIndex: Int,
+        projection: DeepSeekExpertProjection,
+        expectedShape: [Int],
+        expertIndex: Int,
+        preferStaged: Bool = false,
+        decodePrefetch: [String: StagedExpertCode]? = nil
+    ) throws -> DeepSeekLinearWeight {
+        if let resolved = stackedRoutedExpertRecord(
+            layerIndex: layerIndex,
+            expertIndex: expertIndex,
+            projection: projection,
+            expectedShape: expectedShape
+        ) {
+            return try resolvedExpertLinearWeight(
+                candidate: resolved.name,
+                record: resolved.record,
+                expectedShape: expectedShape,
+                expertIndex: expertIndex,
+                preferStaged: preferStaged,
+                decodePrefetch: decodePrefetch
+            )
+        }
+        return try expertLinearWeight(
+            candidates: DeepSeekWeightNames.routedExpert(
+                layerIndex: layerIndex,
+                expertIndex: expertIndex,
+                projection: projection
+            ),
+            expectedShape: expectedShape,
+            expertIndex: expertIndex,
+            preferStaged: preferStaged,
+            decodePrefetch: decodePrefetch
+        )
+    }
+
+    private func stackedRoutedExpertRecord(
+        layerIndex: Int,
+        expertIndex: Int,
+        projection: DeepSeekExpertProjection,
+        expectedShape: [Int]
+    ) -> (name: String, record: ExpertTensorRecord)? {
+        for candidate in DeepSeekWeightNames.layer(
+            layerIndex,
+            "ffn.switch_mlp.\(projection.rawValue).weight"
+        ) {
+            guard let record = expertBank.record(named: candidate) else {
+                continue
+            }
+            guard record.shape.count == expectedShape.count + 1,
+                  record.shape.first.map({ expertIndex < $0 }) == true
+            else {
+                return nil
+            }
+            return (candidate, record)
+        }
+        for candidate in DeepSeekWeightNames.routedExpert(
+            layerIndex: layerIndex,
+            expertIndex: expertIndex,
+            projection: projection
+        ) {
+            guard let record = expertBank.record(named: candidate) else {
+                continue
+            }
+            guard record.shape.count == expectedShape.count + 1,
+                  record.shape.first.map({ expertIndex < $0 }) == true
+            else {
+                return nil
+            }
+            return (candidate, record)
+        }
+        return nil
+    }
+
+    private func resolvedExpertLinearWeight(
+        candidate: String,
+        record: ExpertTensorRecord,
+        expectedShape: [Int],
+        expertIndex: Int,
+        preferStaged: Bool,
+        decodePrefetch: [String: StagedExpertCode]?
+    ) throws -> DeepSeekLinearWeight {
+        let isStacked = record.shape.count == expectedShape.count + 1
+            && record.shape.first.map { expertIndex < $0 } == true
             let tensor: MaterializedTensor
             // When present, a base weight MLXArray already built off the compute
             // thread by prefetchDecodeExpertCodes (byte-identical to
@@ -734,10 +799,6 @@ public struct DeepSeekWeightLoader {
                 },
                 shouldSliceCompanions: isStacked
             )
-        }
-        throw MLXFastError.invalidInput(
-            "expert tensor not found; tried \(candidates.joined(separator: ", "))"
-        )
     }
 
     /// Stacked expert record names for one layer, for whole-tensor staging:
