@@ -319,8 +319,9 @@ public struct DeepSeekWeightLoader {
     /// map keyed by `decodePrefetchKey`. Returns nil when the fast path does
     /// not apply (no side bank, main byte-cache disabled, or nothing to fetch);
     /// callers then use the normal serial per-expert bank reads. Only reads
-    /// slices that would otherwise be serial bank preads — pinned codes come
-    /// from RAM and are skipped. Byte-identical to the serial path.
+    /// slices that would otherwise be serial bank preads, and also builds
+    /// pinned-code arrays off-thread when a hash layer is RAM-resident.
+    /// Byte-identical to the serial path.
     public func prefetchDecodeExpertCodes(
         layerIndex: Int,
         expertIndices: [Int],
@@ -356,9 +357,6 @@ public struct DeepSeekWeightLoader {
                     guard isStacked else {
                         break
                     }
-                    if pinnedExpertCodes?.isResident(name: candidate) == true {
-                        break
-                    }
                     let key = Self.decodePrefetchKey(candidate, expertIndex)
                     if seen.insert(key).inserted {
                         keys.append(key)
@@ -378,16 +376,21 @@ public struct DeepSeekWeightLoader {
         results.withUnsafeMutableBufferPointer { buffer in
             let sink = DecodePrefetchSink(buffer: buffer)
             DispatchQueue.concurrentPerform(iterations: keys.count) { index in
+                let name = names[index]
+                let expertIndex = indices[index]
                 // Read the slice AND build its base MLXArray (the eager
                 // Data->Metal copy) here on the worker thread. The compute
                 // thread's per-expert loop then skips that memcpy and only
                 // wires the lazy reshape/quant assembly into the graph.
                 // Byte-identical: same bytes, same array constructor.
                 guard
-                    let tensor = try? sideBank.materializedTensor(
-                        named: names[index],
-                        firstAxisIndex: indices[index]
-                    ),
+                    let tensor = pinnedExpertCodes?.materializedTensor(
+                        named: name,
+                        firstAxisIndex: expertIndex
+                    ) ?? (try? sideBank.materializedTensor(
+                        named: name,
+                        firstAxisIndex: expertIndex
+                    )),
                     let array = try? bridge.makeArray(from: tensor)
                 else {
                     return
@@ -396,8 +399,8 @@ public struct DeepSeekWeightLoader {
                 let scalesArray = Self.residentScalesArray(
                     residentScales: residentScales,
                     bridge: bridge,
-                    codeName: names[index],
-                    expertIndex: indices[index]
+                    codeName: name,
+                    expertIndex: expertIndex
                 )
                 sink.buffer[index] = StagedExpertCode(
                     tensor: tensor,
@@ -534,19 +537,20 @@ public struct DeepSeekWeightLoader {
             var prebuiltWeightArray: MLXArray?
             var prebuiltScalesArray: MLXArray?
             if isStacked,
+               let prefetched = decodePrefetch?[Self.decodePrefetchKey(candidate, expertIndex)] {
+                // Concurrently pre-read slice + pre-built base arrays (decode
+                // side-bank OR prefill staged-buffer). Checked before the
+                // serial pinned/staged paths so the prebuilt copies are used
+                // when present.
+                tensor = prefetched.tensor
+                prebuiltWeightArray = prefetched.array
+                prebuiltScalesArray = prefetched.scalesArray
+            } else if isStacked,
                let pinned = pinnedExpertCodes?.materializedTensor(
                    named: candidate,
                    firstAxisIndex: expertIndex
                ) {
                 tensor = pinned
-            } else if isStacked,
-               let prefetched = decodePrefetch?[Self.decodePrefetchKey(candidate, expertIndex)] {
-                // Concurrently pre-read slice + pre-built base arrays (decode
-                // side-bank OR prefill staged-buffer). Checked before the
-                // serial staged path so the prebuilt copies are used when present.
-                tensor = prefetched.tensor
-                prebuiltWeightArray = prefetched.array
-                prebuiltScalesArray = prefetched.scalesArray
             } else if preferStaged, isStacked,
                let staged = stagedSliceTensor(recordName: candidate, expertIndex: expertIndex) {
                 tensor = staged
