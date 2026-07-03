@@ -94,6 +94,33 @@ public enum DeepSeekRoutedExperts {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
         }
 
+        // Decode fast path: a single token has nothing to reorder, so the
+        // general dict-group -> take -> concat -> inverse-take pipeline below
+        // is pure overhead (~13 MLX dispatches per layer with no arithmetic
+        // benefit). selectedExperts already holds exactly topK entries in
+        // slot order for tokenCount == 1, and argPartition-based routing
+        // guarantees those topK indices are distinct, so computing each slot
+        // independently and concatenating in slot order is algebraically
+        // identical to the general path's result.
+        if tokenCount == 1 {
+            let xFlat = x.reshaped([tokenCount, hiddenSize])
+            var expertOutputs: [MLXArray] = []
+            expertOutputs.reserveCapacity(topK)
+            for expertIndex in selectedExperts {
+                let expertWeights = try weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec,
+                    preferStaged: useStaged
+                )
+                expertOutputs.append(
+                    DeepSeekMLP.forward(xFlat, weights: expertWeights, swigluLimit: spec.swigluLimit)
+                )
+            }
+            return concatenated(expertOutputs, axis: 0)
+                .reshaped([batchSize, sequenceLength, topK, hiddenSize])
+        }
+
         // Group activation flat-indices by expert so each expert runs one batched
         // matmul over all of its tokens instead of one matmul per token.
         var flatIndicesByExpert: [Int: [Int]] = [:]
