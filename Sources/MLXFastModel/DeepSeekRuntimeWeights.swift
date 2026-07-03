@@ -5,6 +5,11 @@ public final class DeepSeekRuntimeWeightCache {
     public let loader: DeepSeekWeightLoader
     public let config: DeepSeekConfig
 
+    private struct EarlyDecodePrefetchKey: Hashable {
+        let generation: Int
+        let layerIndex: Int
+    }
+
     private var cachedModelWeights: DeepSeekModelWeights?
     private var cachedBlockWeights: [Int: DeepSeekBlockWeights] = [:]
     private var cachedLocalAttentionWeights: [Int: DeepSeekLocalAttentionWeights] = [:]
@@ -18,6 +23,15 @@ public final class DeepSeekRuntimeWeightCache {
     // can issue exact read-ahead for those layers from the input token id
     // before the forward pass starts. Values are used only as prefetch hints.
     private var hashLayerTables: [(layerIndex: Int, table: [Int32], topK: Int)] = []
+    private let earlyDecodePrefetchQueue = DispatchQueue(
+        label: "mlxfast.hash.decode.prefetch",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+    private let earlyDecodePrefetchCondition = NSCondition()
+    private var earlyDecodePrefetchGeneration = 0
+    private var earlyDecodePrefetchPending: Set<EarlyDecodePrefetchKey> = []
+    private var earlyDecodePrefetches: [EarlyDecodePrefetchKey: [String: StagedExpertCode]] = [:]
 
     public init(loader: DeepSeekWeightLoader, config: DeepSeekConfig) {
         self.loader = loader
@@ -34,6 +48,7 @@ public final class DeepSeekRuntimeWeightCache {
         guard !hashLayerTables.isEmpty, token >= 0 else {
             return
         }
+        let generation = nextEarlyDecodePrefetchGeneration()
         for entry in hashLayerTables {
             let base = token * entry.topK
             guard base + entry.topK <= entry.table.count else {
@@ -44,6 +59,74 @@ public final class DeepSeekRuntimeWeightCache {
                 layerIndex: entry.layerIndex,
                 expertIndices: experts
             )
+            scheduleEarlyDecodePrefetch(
+                generation: generation,
+                layerIndex: entry.layerIndex,
+                expertIndices: experts
+            )
+        }
+    }
+
+    /// Returns the code-slice prefetch for a hash-routed decode layer,
+    /// blocking only if the exact layer was scheduled at this token's decode
+    /// start and is still reading. Missing/failed prefetches return nil and
+    /// the caller falls back to the normal per-layer synchronous prefetch.
+    public func takeEarlyDecodePrefetch(layerIndex: Int) -> [String: StagedExpertCode]? {
+        earlyDecodePrefetchCondition.lock()
+        let key = EarlyDecodePrefetchKey(
+            generation: earlyDecodePrefetchGeneration,
+            layerIndex: layerIndex
+        )
+        while earlyDecodePrefetchPending.contains(key) {
+            earlyDecodePrefetchCondition.wait()
+        }
+        let result = earlyDecodePrefetches.removeValue(forKey: key)
+        earlyDecodePrefetchCondition.unlock()
+        return result
+    }
+
+    private func nextEarlyDecodePrefetchGeneration() -> Int {
+        earlyDecodePrefetchCondition.lock()
+        earlyDecodePrefetchGeneration &+= 1
+        earlyDecodePrefetchPending.removeAll(keepingCapacity: true)
+        earlyDecodePrefetches.removeAll(keepingCapacity: true)
+        let generation = earlyDecodePrefetchGeneration
+        earlyDecodePrefetchCondition.unlock()
+        return generation
+    }
+
+    private func scheduleEarlyDecodePrefetch(
+        generation: Int,
+        layerIndex: Int,
+        expertIndices: [Int]
+    ) {
+        let key = EarlyDecodePrefetchKey(generation: generation, layerIndex: layerIndex)
+        earlyDecodePrefetchCondition.lock()
+        earlyDecodePrefetchPending.insert(key)
+        earlyDecodePrefetchCondition.unlock()
+
+        let loader = self.loader
+        let hiddenSize = config.hiddenSize
+        let intermediateSize = config.moeIntermediateSize
+        earlyDecodePrefetchQueue.async { [weak self] in
+            let result = loader.prefetchDecodeExpertCodes(
+                layerIndex: layerIndex,
+                expertIndices: expertIndices,
+                hiddenSize: hiddenSize,
+                intermediateSize: intermediateSize
+            )
+            guard let self else {
+                return
+            }
+            self.earlyDecodePrefetchCondition.lock()
+            if self.earlyDecodePrefetchGeneration == generation {
+                if let result {
+                    self.earlyDecodePrefetches[key] = result
+                }
+                self.earlyDecodePrefetchPending.remove(key)
+                self.earlyDecodePrefetchCondition.broadcast()
+            }
+            self.earlyDecodePrefetchCondition.unlock()
         }
     }
 
