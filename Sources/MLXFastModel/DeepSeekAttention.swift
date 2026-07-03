@@ -589,8 +589,10 @@ public enum DeepSeekCompressedAttention {
         kv = kv.reshaped([batchSize, 1, sequenceLength, spec.headDim])
         kv = try rope.applied(to: kv, offset: positionOffset)
         var localMask = mask
+        var localKeyOffset: Int? = nil
         if let localCache = cache?.local {
             let cached = try localCache.updateAndFetch(kv)
+            localKeyOffset = cached.keyOffset
             kv = cached.kv
             localMask = try DeepSeekMaskCache.causal(
                 queryLength: sequenceLength,
@@ -676,11 +678,26 @@ public enum DeepSeekCompressedAttention {
                     positionOffset: positionOffset
                 )
             }
-            let attentionMask = try extendMask(
-                localMask,
-                pooledLength: pooledLength,
-                pooledMask: pooledMask
-            )
+            let attentionMask: MLXArray?
+            if sequenceLength == 1,
+               pooledMask == nil,
+               let keyOffset = localKeyOffset
+            {
+                attentionMask = try DeepSeekMaskCache.causalWithPooledSuffix(
+                    queryLength: sequenceLength,
+                    keyLength: kv.shape[2],
+                    queryOffset: positionOffset,
+                    keyOffset: keyOffset,
+                    windowSize: windowSize,
+                    pooledLength: pooledLength
+                )
+            } else {
+                attentionMask = try extendMask(
+                    localMask,
+                    pooledLength: pooledLength,
+                    pooledMask: pooledMask
+                )
+            }
             if pooledLength > 0 {
                 kv = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
             }

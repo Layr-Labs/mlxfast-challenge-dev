@@ -51,7 +51,16 @@ public enum DeepSeekMaskCache {
         let windowSize: Int
     }
 
+    private struct ExtendedKey: Hashable {
+        let queryLength: Int
+        let keyLength: Int
+        let offsetDelta: Int
+        let windowSize: Int
+        let pooledLength: Int
+    }
+
     private static let cache = LockedCache<Key, MLXArray>(capacity: 128)
+    private static let extendedCache = LockedCache<ExtendedKey, MLXArray>(capacity: 128)
 
     public static func causal(
         queryLength: Int,
@@ -75,6 +84,42 @@ public enum DeepSeekMaskCache {
                 keyOffset: keyOffset,
                 windowSize: windowSize
             )
+        }
+    }
+
+    public static func causalWithPooledSuffix(
+        queryLength: Int,
+        keyLength: Int? = nil,
+        queryOffset: Int = 0,
+        keyOffset: Int = 0,
+        windowSize: Int? = nil,
+        pooledLength: Int
+    ) throws -> MLXArray {
+        guard pooledLength >= 0 else {
+            throw MLXFastError.invalidInput("pooled mask suffix length must be non-negative")
+        }
+        let resolvedKeyLength = keyLength ?? queryLength
+        let key = ExtendedKey(
+            queryLength: queryLength,
+            keyLength: resolvedKeyLength,
+            offsetDelta: queryOffset - keyOffset,
+            windowSize: windowSize ?? -1,
+            pooledLength: pooledLength
+        )
+        return try extendedCache.value(for: key) {
+            let local = try causal(
+                queryLength: queryLength,
+                keyLength: resolvedKeyLength,
+                queryOffset: queryOffset,
+                keyOffset: keyOffset,
+                windowSize: windowSize
+            )
+            guard pooledLength > 0 else {
+                return local
+            }
+            let pooledShape = Array(local.shape.dropLast()) + [pooledLength]
+            let pooled = ones(pooledShape, dtype: local.dtype)
+            return concatenated([local, pooled], axis: -1)
         }
     }
 }
