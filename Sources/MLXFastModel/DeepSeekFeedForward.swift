@@ -130,7 +130,7 @@ public enum DeepSeekMoE {
             expertIndices: routing.indices,
             loader: loader,
             spec: spec.routedExperts,
-            onRoutingSynced: { eval(shared) }
+            onRoutingSynced: { eval([shared, routing.weights]) }
         )
         return combine(
             routedExpertOutput: routed,

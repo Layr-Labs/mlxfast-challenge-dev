@@ -121,7 +121,9 @@ public final class ExpertLayerStager {
         else {
             return
         }
-        pendingLayers.insert(plan.layerIndex)
+        let layerIndex = plan.layerIndex
+        let names = plan.recordNames
+        pendingLayers.insert(layerIndex)
         queue.async { [self] in
             // Read the layer's ~1 GiB projection tensors concurrently instead
             // of one after another. The side bank is capacity 0, so it never
@@ -130,7 +132,6 @@ public final class ExpertLayerStager {
             // NSLock-guarded); concurrent reads are therefore race-free and
             // stage byte-identical data — only the order/overlap of the reads
             // changes, so consumers see the exact same bytes.
-            let names = plan.recordNames
             var results = [Data?](repeating: nil, count: names.count)
             let failed = StagerFailureFlag()
             results.withUnsafeMutableBufferPointer { buffer in
@@ -155,14 +156,14 @@ public final class ExpertLayerStager {
                 }
             }
             condition.lock()
-            pendingLayers.remove(plan.layerIndex)
+            pendingLayers.remove(layerIndex)
             if succeeded {
-                recordNamesByLayer[plan.layerIndex] = plan.recordNames
+                recordNamesByLayer[layerIndex] = names
                 for (name, bytes) in loaded {
                     stagedBytesByRecordName[name] = bytes
                 }
             } else {
-                failedLayers.insert(plan.layerIndex)
+                failedLayers.insert(layerIndex)
             }
             condition.broadcast()
             condition.unlock()

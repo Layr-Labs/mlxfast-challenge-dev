@@ -109,6 +109,11 @@ public enum DeepSeekRoutedExperts {
         // per-token slice+concat that built each expert batch previously.
         let xFlat = x.reshaped([tokenCount, hiddenSize])
 
+        let expertGroups = tokenCount == 1
+            ? flatIndicesByExpert.sorted { $0.key < $1.key }
+            : Array(flatIndicesByExpert)
+        let groupedExpertIndices = expertGroups.map(\.key)
+
         // The shared expert depends only on x (RAM-resident weights, no SSD
         // read), so it is the one piece of GPU work that can run during the
         // routed experts' blocking SSD reads below. Fire the overlap hook
@@ -125,11 +130,11 @@ public enum DeepSeekRoutedExperts {
         // ranges), so the per-expert loop below builds its MLXArrays from
         // already-fetched bytes instead of serializing on each pread. Anything
         // not prefetched falls back to the normal per-expert bank read.
-        var decodePrefetch: [String: StagedExpertCode]?
+        var decodePrefetch: [DeepSeekDecodePrefetchKey: StagedExpertCode]?
         if tokenCount == 1, !useStaged {
             decodePrefetch = loader.prefetchDecodeExpertCodes(
                 layerIndex: spec.layerIndex,
-                expertIndices: Array(flatIndicesByExpert.keys),
+                expertIndices: groupedExpertIndices,
                 hiddenSize: spec.hiddenSize,
                 intermediateSize: spec.intermediateSize
             )
@@ -139,7 +144,7 @@ public enum DeepSeekRoutedExperts {
             // below skips the serial Data->Metal copy (same win as decode).
             decodePrefetch = loader.prefetchStagedExpertCodes(
                 layerIndex: spec.layerIndex,
-                expertIndices: Array(flatIndicesByExpert.keys),
+                expertIndices: groupedExpertIndices,
                 hiddenSize: spec.hiddenSize,
                 intermediateSize: spec.intermediateSize
             )
@@ -150,7 +155,7 @@ public enum DeepSeekRoutedExperts {
         var scatterOrder: [Int] = []
         scatterOrder.reserveCapacity(outputCount)
 
-        for (expertIndex, flatIndices) in flatIndicesByExpert {
+        for (expertIndex, flatIndices) in expertGroups {
             let expertWeights = try weights(
                 forExpert: expertIndex,
                 loader: loader,
@@ -188,9 +193,9 @@ public enum DeepSeekRoutedExperts {
         loader: DeepSeekWeightLoader,
         spec: DeepSeekRoutedExpertSpec,
         preferStaged: Bool = false,
-        decodePrefetch: [String: StagedExpertCode]? = nil
+        decodePrefetch: [DeepSeekDecodePrefetchKey: StagedExpertCode]? = nil
     ) throws -> DeepSeekMLPWeights {
-        try DeepSeekMLPWeights(
+        return try DeepSeekMLPWeights(
             gate: loader.expertLinearWeight(
                 candidates: DeepSeekWeightNames.routedExpert(
                     layerIndex: spec.layerIndex,
