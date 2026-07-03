@@ -40,16 +40,18 @@ public final class DeepSeekRuntimeWeightCache {
                 continue
             }
             let experts = entry.table[base..<(base + entry.topK)].map(Int.init)
-            if entry.layerIndex == 0, loader.pinnedExpertCodes != nil {
+            let hasPinnedCodes = loader.hasPinnedDecodeExpertCodes(layerIndex: entry.layerIndex)
+            if entry.layerIndex == 0, hasPinnedCodes {
                 continue
             }
-            let fullyPinned = loader.schedulePinnedDecodeExpertCodes(
-                layerIndex: entry.layerIndex,
-                expertIndices: experts,
-                hiddenSize: config.hiddenSize,
-                intermediateSize: config.moeIntermediateSize
-            )
-            if !fullyPinned {
+            if hasPinnedCodes {
+                _ = loader.schedulePinnedDecodeExpertCodes(
+                    layerIndex: entry.layerIndex,
+                    expertIndices: experts,
+                    hiddenSize: config.hiddenSize,
+                    intermediateSize: config.moeIntermediateSize
+                )
+            } else {
                 loader.expertPrefetcher.prefetch(
                     layerIndex: entry.layerIndex,
                     expertIndices: experts
