@@ -95,6 +95,54 @@ public enum DeepSeekRoutedExperts {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
         }
 
+        // Decode fast path: a single token has nothing to reorder, so the
+        // general dict-group -> take -> concat -> inverse-take pipeline below
+        // is pure dispatch overhead with no arithmetic benefit.
+        // selectedExperts already holds exactly topK entries in slot order,
+        // and argPartition/hash routing guarantee those indices are distinct,
+        // so computing each slot directly and concatenating in slot order is
+        // algebraically identical to the general path's result. The shared
+        // expert overlap hook and the concurrent code prefetch fire exactly
+        // as on the general path, with the same expert set.
+        if tokenCount == 1 {
+            let xFlat = x.reshaped([tokenCount, hiddenSize])
+            if !useStaged {
+                onRoutingSynced?()
+            }
+            var decodePrefetch: [String: StagedExpertCode]?
+            if !useStaged {
+                decodePrefetch = loader.prefetchDecodeExpertCodes(
+                    layerIndex: spec.layerIndex,
+                    expertIndices: selectedExperts,
+                    hiddenSize: spec.hiddenSize,
+                    intermediateSize: spec.intermediateSize
+                )
+            } else {
+                decodePrefetch = loader.prefetchStagedExpertCodes(
+                    layerIndex: spec.layerIndex,
+                    expertIndices: selectedExperts,
+                    hiddenSize: spec.hiddenSize,
+                    intermediateSize: spec.intermediateSize
+                )
+            }
+            var expertOutputs: [MLXArray] = []
+            expertOutputs.reserveCapacity(topK)
+            for expertIndex in selectedExperts {
+                let expertWeights = try weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec,
+                    preferStaged: useStaged,
+                    decodePrefetch: decodePrefetch
+                )
+                expertOutputs.append(
+                    DeepSeekMLP.forward(xFlat, weights: expertWeights, swigluLimit: spec.swigluLimit)
+                )
+            }
+            return concatenated(expertOutputs, axis: 0)
+                .reshaped([batchSize, sequenceLength, topK, hiddenSize])
+        }
+
         // Group activation flat-indices by expert so each expert runs one batched
         // matmul over all of its tokens instead of one matmul per token.
         var flatIndicesByExpert: [Int: [Int]] = [:]

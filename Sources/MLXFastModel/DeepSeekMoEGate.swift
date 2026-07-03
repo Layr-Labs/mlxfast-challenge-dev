@@ -24,8 +24,7 @@ public enum DeepSeekMoEGate {
         topK: Int,
         routedScalingFactor: Double,
         normTopKProb: Bool,
-        scoring: DeepSeekGateScoring,
-        asyncEvalIndices: Bool = false
+        scoring: DeepSeekGateScoring
     ) throws -> DeepSeekMoEGateResult {
         let logits = DeepSeekOps.cast(
             matmul(hidden, weightTransposed ?? weight.T),
@@ -45,10 +44,6 @@ public enum DeepSeekMoEGate {
                 .ellipsis,
                 0..<topK
             ].asType(.int32)
-        }
-
-        if asyncEvalIndices {
-            asyncEval(indices)
         }
 
         var selectedWeights = takeAlong(scores, indices, axis: -1)
