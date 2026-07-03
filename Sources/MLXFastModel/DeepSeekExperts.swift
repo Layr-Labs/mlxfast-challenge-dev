@@ -94,6 +94,35 @@ public enum DeepSeekRoutedExperts {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
         }
 
+        // Decode fast path: with a single token the activation flat order IS
+        // top-k slot order, so the general gather/scatter below degenerates to
+        // identity permutations. Feed the one row straight to each selected
+        // expert and concatenate in slot order — no dict grouping, no per-expert
+        // row gather, no inverse-permutation gather. Outputs are bit-identical:
+        // the MLP is per-row and receives the same [1, hidden] values either way.
+        if tokenCount == 1 {
+            let xFlat = x.reshaped([tokenCount, hiddenSize])
+            var slotOutputs: [MLXArray] = []
+            slotOutputs.reserveCapacity(topK)
+            for expertIndex in selectedExperts {
+                let expertWeights = try weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec,
+                    preferStaged: useStaged
+                )
+                slotOutputs.append(
+                    DeepSeekMLP.forward(
+                        xFlat,
+                        weights: expertWeights,
+                        swigluLimit: spec.swigluLimit
+                    )
+                )
+            }
+            let combined = concatenated(slotOutputs, axis: 0)
+            return combined.reshaped([batchSize, sequenceLength, topK, hiddenSize])
+        }
+
         // Group activation flat-indices by expert so each expert runs one batched
         // matmul over all of its tokens instead of one matmul per token.
         var flatIndicesByExpert: [Int: [Int]] = [:]
