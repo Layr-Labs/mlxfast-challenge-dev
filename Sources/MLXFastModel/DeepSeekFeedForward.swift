@@ -115,22 +115,16 @@ public enum DeepSeekMoE {
             normTopKProb: spec.normTopKProb,
             scoring: spec.scoring
         )
-        // Build the shared expert graph up front: it depends only on x and
-        // RAM-resident shared weights (no SSD read), so eval-ing it during
-        // the routed experts' blocking SSD reads fills otherwise-idle GPU
-        // time. The computation and combine are unchanged; only when the
-        // shared result is evaluated differs.
-        let shared = DeepSeekMLP.forward(
-            x,
-            weights: weights.sharedExperts,
-            swigluLimit: spec.routedExperts.swigluLimit
-        )
         let routed = try DeepSeekRoutedExperts.forward(
             x,
             expertIndices: routing.indices,
             loader: loader,
-            spec: spec.routedExperts,
-            onRoutingSynced: { eval(shared) }
+            spec: spec.routedExperts
+        )
+        let shared = DeepSeekMLP.forward(
+            x,
+            weights: weights.sharedExperts,
+            swigluLimit: spec.routedExperts.swigluLimit
         )
         return combine(
             routedExpertOutput: routed,
