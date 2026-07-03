@@ -75,7 +75,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        machine: ${{ fromJSON(inputs.machines || '[1,2,3,4,5,6]') }}
+        machine: ${{ fromJSON(inputs.machines || '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]') }}
     runs-on: blacksmith-12vcpu-macos-26
     timeout-minutes: 360
     env:
@@ -189,6 +189,66 @@ jobs:
             } | tee -a host.txt
           fi
 
+      - name: CPU compute microbench (I/O-free)
+        # Fixed single-thread arithmetic work, zero I/O -- isolates per-host CPU /
+        # scheduling availability from storage. If cpu_mops varies across
+        # concurrent machines in step with decode while cold_read stays flat, the
+        # decode variance is compute / neighbour-CPU, not the read path.
+        run: |
+          set -uo pipefail
+          python3 - <<'PY' | tee -a host.txt
+          import time
+          N = 60_000_000
+          t = time.monotonic(); s = 0.0
+          for i in range(N):
+              s += (i * 1.0000001) % 7.0
+          dt = time.monotonic() - t
+          print(f"cpu_loop_seconds={dt:.4f}")
+          print(f"cpu_mops={N/dt/1e6:.3f}")
+          PY
+
+      - name: Cold storage read microbench (working set > RAM)
+        # Reads MORE bytes than the VM has RAM, so page cache cannot serve it --
+        # measures sustained COLD storage throughput, unlike the warm sequential
+        # raw-read above (which the sticky-disk-resident checkpoint served from
+        # cache, hence its flat ~3.25 GB/s). Under co-located concurrent machines
+        # this is the direct shared-storage-contention probe.
+        env:
+          COLD_READ_GIB: "56"
+        run: |
+          set -uo pipefail
+          ref="${MLXFAST_REFERENCE_DIR}"
+          mapfile -t shards < <(find "${ref}" -type f -name '*.safetensors' | sort)
+          if [[ "${#shards[@]}" -eq 0 ]]; then
+            echo "cold_read_status=no_shards" | tee -a host.txt
+          else
+            python3 - "${COLD_READ_GIB}" "${shards[@]}" <<'PY' | tee -a host.txt
+          import fcntl, sys, time
+          target = int(sys.argv[1]) * (1024**3)
+          shards = sys.argv[2:]
+          buf = bytearray(8 * 1024 * 1024)
+          read = 0
+          t = time.monotonic()
+          for path in shards:
+              if read >= target:
+                  break
+              with open(path, "rb", buffering=0) as fh:
+                  try:
+                      fcntl.fcntl(fh.fileno(), 48, 1)  # F_NOCACHE on macOS; best effort
+                  except OSError:
+                      pass
+                  while read < target:
+                      n = fh.readinto(buf)
+                      if not n:
+                          break
+                      read += n
+          dt = time.monotonic() - t
+          print(f"cold_read_bytes={read}")
+          print(f"cold_read_seconds={dt:.3f}")
+          print(f"cold_read_gbps={read/1e9/max(dt,1e-9):.3f}")
+          PY
+          fi
+
       - name: Transform reference checkpoint
         run: |
           set -euo pipefail
@@ -297,7 +357,9 @@ jobs:
                      "host": (host_field(hp, "hostname") or "?"),
                      "host_ip": (host_field(hp, "BLACKSMITH_HOST_PUBLIC_IP") or "?"),
                      "setup_s": host_field(hp, "setup_seconds"),
-                     "raw_gbps": host_field(hp, "raw_read_gbps")}
+                     "raw_gbps": host_field(hp, "raw_read_gbps"),
+                     "cold_gbps": host_field(hp, "cold_read_gbps"),
+                     "cpu_mops": host_field(hp, "cpu_mops")}
               try:
                   m = json.load(open(sp))["metrics"]
                   row.update(
@@ -325,13 +387,14 @@ jobs:
                 + ("⇒ some machines CO-LOCATED on the same physical host (shared storage/network)."
                    if ips and distinct < len(ips) else "⇒ each machine on a distinct host."))
           print()
-          print("| m | host IP | decode s/tok | prefill s/tok | bw GB/tok | peak RAM GB | raw read GB/s | setup s |")
-          print("|---|---------|-------------|---------------|-----------|-------------|---------------|---------|")
+          print("| m | host IP | decode s/tok | prefill s/tok | cpu Mops | cold read GB/s | warm read GB/s | setup s |")
+          print("|---|---------|-------------|---------------|----------|----------------|----------------|---------|")
           for r in rows:
-              print("| {m} | {ip} | {dc} | {pf} | {bw} | {ram} | {raw} | {su} |".format(
+              print("| {m} | {ip} | {dc} | {pf} | {cpu} | {cold} | {raw} | {su} |".format(
                   m=r["machine"], ip=(r.get("host_ip") or "?"),
                   dc=f(r.get("decode")), pf=f(r.get("prefill"), 5),
-                  bw=f(r.get("bw"), 3), ram=f(r.get("ram"), 2),
+                  cpu=f(float(r["cpu_mops"]), 2) if r.get("cpu_mops") else "n/a",
+                  cold=f(float(r["cold_gbps"]), 3) if r.get("cold_gbps") else "n/a",
                   raw=f(float(r["raw_gbps"]), 3) if r.get("raw_gbps") else "n/a",
                   su=r.get("setup_s") or "n/a"))
 
@@ -349,8 +412,9 @@ jobs:
           for name, conv in [
               ("decode s/tok", lambda r: r.get("decode")),
               ("prefill s/tok", lambda r: r.get("prefill")),
-              ("bandwidth GB/tok", lambda r: r.get("bw")),
-              ("raw read GB/s", lambda r: float(r["raw_gbps"]) if r.get("raw_gbps") else None),
+              ("cpu Mops (I/O-free)", lambda r: float(r["cpu_mops"]) if r.get("cpu_mops") else None),
+              ("cold read GB/s", lambda r: float(r["cold_gbps"]) if r.get("cold_gbps") else None),
+              ("warm read GB/s", lambda r: float(r["raw_gbps"]) if r.get("raw_gbps") else None),
               ("setup s", lambda r: int(r["setup_s"]) if r.get("setup_s") else None),
           ]:
               s = stats(conv)
@@ -358,10 +422,9 @@ jobs:
                   mean, sd, cv, lo, hi, ratio = s
                   print(f"| {name} | {mean:.4f} | {sd:.4f} | {cv:.1f}% | {lo:.4f} | {hi:.4f} | {ratio:.2f}× |")
           print()
-          print("**Read as:** high CV% / max÷min ≫ 1 on decode & bandwidth across concurrent machines ⇒ contention on the shared read path. "
-                "raw read GB/s (model-independent) tracking decode ⇒ storage/read (not compute) is the variable. "
-                "decode s/tok well above a local M4 `--local-iterate` run ⇒ Blacksmith is slower than local, contended or not. "
-                "Repeat the stress run at different times to catch external (cross-tenant) contention.")
+          print("**Read as (mechanism isolation):** decode varies but cpu Mops + cold read GB/s stay flat ⇒ latency/scheduling jitter, not throughput. "
+                "cpu Mops tracks decode ⇒ neighbour-CPU contention. cold read GB/s tracks decode ⇒ shared-storage contention (the real test, esp. when host IPs repeat = co-located). "
+                "warm read GB/s is cache-served and expected flat. Compare decode s/tok to a local M4 `--local-iterate` run for the Blacksmith-vs-local delta. One run is one moment — repeat over time for external contention.")
           PY
 
       - name: Upload combined summary
