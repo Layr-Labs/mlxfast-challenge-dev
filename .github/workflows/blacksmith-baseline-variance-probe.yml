@@ -198,56 +198,44 @@ jobs:
             --reference "${MLXFAST_REFERENCE_DIR}" \
             --output weights
 
-      - name: Synthesize a benchmark oracle from the public fixture
-        # The public golden is {version, cases}; the timing path requires a
-        # `benchmark` oracle. Baseline main reproduces the reference's
-        # teacher-forced trajectory (the correctness contract), so an oracle
-        # built from the public case's own tokens passes on baseline and lets us
-        # run the real 128-step timing path with no hidden material.
-        run: |
-          set -euo pipefail
-          python3 - "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" golden_with_oracle.json <<'PY'
-          import json, sys
-          src, dst = sys.argv[1], sys.argv[2]
-          d = json.load(open(src))
-          case = d["cases"][0]
-          prompt = case["prompt_tokens"]
-          expected = case["expected_tokens"]
-          assert len(expected) >= 129, f"need >=129 expected tokens, got {len(expected)}"
-          d["benchmark"] = {
-              "prefill_prompt_tokens": prompt,
-              "expected_prefill_token": expected[0],
-              "decode_seed_tokens": prompt,
-              "expected_decode_seed_token": expected[0],
-              "expected_decode_tokens": expected[1:],
-          }
-          json.dump(d, open(dst, "w"))
-          print(f"oracle: prefill_tokens={len(prompt)} decode_oracle={len(expected[1:])}")
-          PY
-
-      - name: Run baseline timing benchmark (full 128-step official path)
-        # Timing only: no gates, no base correctness steps. Same sandbox + worker
-        # posture as a ranked run (MLXFAST_OFFICIAL_BENCHMARK_RUN=1) so the
-        # measurement environment matches official; only the hidden goldens/gates
-        # are omitted (irrelevant to timing). Baseline main passes the synthesized
-        # oracle, so this produces a real, passing score.json with full timing +
-        # bandwidth diagnostics.
+      - name: Run baseline local-iterate timing
+        # This is the SAME command participants run to iterate locally on their
+        # M4 Pro (`./benchmark.sh --local-iterate`, THE local edit-loop signal per
+        # CLAUDE.md), so Blacksmith-vs-local-M4 is measured apples-to-apples with
+        # one methodology -- exactly the comparison the hypothesis is about. It
+        # runs the real worker + expert-streaming path and records timing +
+        # bandwidth over the 16-step local-iterate window.
+        #
+        # We do NOT use the full 128-step official path here: it strict-validates
+        # decode tokens and THROWS on the first mismatch, and baseline main
+        # diverges from the public golden at the known M4 bf16 tie (~step 5), so
+        # it can never complete on Blacksmith's M4 without the hidden golden.
+        # local-iterate RECORDS that tie as a correctness miss but still completes
+        # all timing (it never throws), so `passed:false` here is EXPECTED and
+        # irrelevant -- we read timing, not correctness. benchmark.sh turns a
+        # failing score into exit 1, hence `|| true`; we then require the timing
+        # fields to be present rather than trusting the exit code.
         env:
           MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
           MLXFAST_SKIP_TRANSFORM: "1"
           MLXFAST_WEIGHTS_PATH: weights
-          MLXFAST_CORRECTNESS_GOLDEN_PATH: golden_with_oracle.json
-          MLXFAST_SCORE_PATH: score.json
-          MLXFAST_BENCHMARK_CORRECTNESS_STEPS: "0"
-          MLXFAST_BENCHMARK_CHECK_GATES: "0"
-          MLXFAST_BENCHMARK_SKIP_TIMED: "0"
           MLXFAST_NOTE: "blacksmith-baseline-variance-probe machine=${{ matrix.machine }} label=${{ inputs.label || 'push' }}"
         run: |
-          set -euo pipefail
+          set -uo pipefail
           echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a host.txt
-          ./benchmark.sh
-          echo "== score.json =="
-          cat score.json
+          ./benchmark.sh --local-iterate || echo "benchmark.sh exit=$? (expected on the M4 bf16 tie; timing still captured)"
+          echo "== score.local-iterate.json =="
+          cat score.local-iterate.json || true
+          # Require real timing regardless of the correctness verdict.
+          python3 - <<'PY'
+          import json, sys
+          m = json.load(open("score.local-iterate.json"))["metrics"]
+          d = m.get("decode_seconds_per_token")
+          if not isinstance(d, (int, float)) or d <= 0:
+              print(f"::error::local-iterate produced no usable decode timing: {d}")
+              sys.exit(1)
+          print(f"decode_seconds_per_token={d} bandwidth_gb_per_token={m.get('bandwidth_gb_per_token')} passed_correctness={m.get('passed_correctness')}")
+          PY
 
       - name: Upload machine artifact
         if: always()
@@ -255,7 +243,7 @@ jobs:
         with:
           name: blacksmith-baseline-variance-probe-${{ github.run_id }}-machine-${{ matrix.machine }}
           path: |
-            score.json
+            score.local-iterate.json
             host.txt
           if-no-files-found: error
           retention-days: 14
@@ -283,9 +271,6 @@ jobs:
           python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
           import glob, json, os, re, statistics
 
-          BASE_DECODE = 4.220506571617188
-          BASE_PREFILL = 0.17330563175390626
-
           def host_field(path, key):
               try:
                   for line in open(path):
@@ -297,22 +282,21 @@ jobs:
 
           rows = []
           for d in sorted(glob.glob("machines/*")):
-              sp, hp = os.path.join(d, "score.json"), os.path.join(d, "host.txt")
+              sp, hp = os.path.join(d, "score.local-iterate.json"), os.path.join(d, "host.txt")
               idx = host_field(hp, "machine_index") or re.sub(r".*machine-", "", d)
               row = {"machine": idx,
                      "host": (host_field(hp, "hostname") or "?"),
                      "setup_s": host_field(hp, "setup_seconds"),
-                     "raw_gbps": host_field(hp, "raw_read_gbps")}
+                     "raw_gbps": host_field(hp, "raw_read_gbps"),
+                     "dl_gbps": host_field(hp, "checkpoint_du_bytes")}
               try:
                   m = json.load(open(sp))["metrics"]
                   row.update(
                       decode=m.get("decode_seconds_per_token"),
                       prefill=m.get("prefill_seconds_per_token"),
                       bw=m.get("bandwidth_gb_per_token"),
-                      eread=m.get("expert_read_seconds"),
-                      ebytes=m.get("expert_bytes_read"),
                       ram=m.get("peak_ram_gb"),
-                      timed=m.get("timed_benchmark_seconds"),
+                      ebytes=m.get("expert_bytes_read"),
                   )
               except (FileNotFoundError, KeyError, json.JSONDecodeError):
                   row["decode"] = None
@@ -321,28 +305,24 @@ jobs:
           def f(x, nd=4):
               return "n/a" if x is None else (f"{x:.{nd}f}" if isinstance(x, float) else str(x))
 
-          def spd(base, v):
-              return None if not v else base / v
-
           print(f"## Blacksmith baseline variance probe — `{os.environ.get('LABEL','')}`")
           print()
           print(f"- machines requested: `{os.environ.get('MACHINES','')}`  ·  reported: {len(rows)}")
-          print(f"- baseline denominators: decode `{BASE_DECODE:.4f}` s/tok, prefill `{BASE_PREFILL:.5f}` s/tok")
+          print("- metric: unmodified `main` via `./benchmark.sh --local-iterate` (16-step) — the SAME command participants iterate with locally on M4 Pro. Compare these numbers directly against a local M4 `--local-iterate` run.")
+          print("- NOT the 128-step ranked path (baseline diverges from the public golden at the known M4 bf16 tie ~step 5, which the strict ranked path can't complete without the hidden golden), so these s/tok are NOT the calibrated 4.2205/0.17331 denominators.")
           print()
-          print("| m | host | decode s/tok | decode×base | prefill s/tok | prefill×base | bw GB/tok | expert_read s | peak RAM GB | raw read GB/s | setup s | timed s |")
-          print("|---|------|-------------|-------------|---------------|--------------|-----------|---------------|-------------|---------------|---------|---------|")
+          print("| m | host | decode s/tok | prefill s/tok | bw GB/tok | peak RAM GB | raw read GB/s | setup s |")
+          print("|---|------|-------------|---------------|-----------|-------------|---------------|---------|")
           for r in rows:
-              print("| {m} | {h} | {dc} | {dcs} | {pf} | {pfs} | {bw} | {er} | {ram} | {raw} | {su} | {ti} |".format(
+              print("| {m} | {h} | {dc} | {pf} | {bw} | {ram} | {raw} | {su} |".format(
                   m=r["machine"], h=(r.get("host") or "?")[-12:],
-                  dc=f(r.get("decode")), dcs=f(spd(BASE_DECODE, r.get("decode")), 3),
-                  pf=f(r.get("prefill"), 5), pfs=f(spd(BASE_PREFILL, r.get("prefill")), 3),
-                  bw=f(r.get("bw"), 3), er=f(r.get("eread"), 2), ram=f(r.get("ram"), 2),
+                  dc=f(r.get("decode")), pf=f(r.get("prefill"), 5),
+                  bw=f(r.get("bw"), 3), ram=f(r.get("ram"), 2),
                   raw=f(float(r["raw_gbps"]), 3) if r.get("raw_gbps") else "n/a",
-                  su=r.get("setup_s") or "n/a", ti=f(r.get("timed"), 1)))
+                  su=r.get("setup_s") or "n/a"))
 
-          def stats(key, conv=lambda r: r.get(key)):
-              vals = [conv(r) for r in rows]
-              vals = [v for v in vals if isinstance(v, (int, float))]
+          def stats(conv):
+              vals = [v for v in (conv(r) for r in rows) if isinstance(v, (int, float))]
               if len(vals) < 2:
                   return None
               mean = statistics.mean(vals)
@@ -352,22 +332,22 @@ jobs:
           print()
           print("| metric | mean | stdev | CV% | min | max | max/min |")
           print("|--------|------|-------|-----|-----|-----|---------|")
-          for name, key, conv in [
-              ("decode s/tok", "decode", lambda r: r.get("decode")),
-              ("prefill s/tok", "prefill", lambda r: r.get("prefill")),
-              ("bandwidth GB/tok", "bw", lambda r: r.get("bw")),
-              ("expert_read s", "eread", lambda r: r.get("eread")),
-              ("raw read GB/s", "raw", lambda r: float(r["raw_gbps"]) if r.get("raw_gbps") else None),
-              ("setup s", "setup", lambda r: int(r["setup_s"]) if r.get("setup_s") else None),
+          for name, conv in [
+              ("decode s/tok", lambda r: r.get("decode")),
+              ("prefill s/tok", lambda r: r.get("prefill")),
+              ("bandwidth GB/tok", lambda r: r.get("bw")),
+              ("raw read GB/s", lambda r: float(r["raw_gbps"]) if r.get("raw_gbps") else None),
+              ("setup s", lambda r: int(r["setup_s"]) if r.get("setup_s") else None),
           ]:
-              s = stats(key, conv)
+              s = stats(conv)
               if s:
                   mean, sd, cv, lo, hi, ratio = s
                   print(f"| {name} | {mean:.4f} | {sd:.4f} | {cv:.1f}% | {lo:.4f} | {hi:.4f} | {ratio:.2f}× |")
           print()
-          print("**Read as:** high CV% / max÷min ≫ 1 on decode & bandwidth across concurrent machines ⇒ contention on the read path. "
-                "`decode×base` well below 1.0 ⇒ baseline main no longer reproduces the calibrated 4.2205 s/tok on Blacksmith today. "
-                "raw read GB/s tracking decode ⇒ the storage/read path (not compute) is the variable.")
+          print("**Read as:** high CV% / max÷min ≫ 1 on decode & bandwidth across concurrent machines ⇒ contention on the shared read path. "
+                "raw read GB/s (model-independent) tracking decode ⇒ storage/read (not compute) is the variable. "
+                "decode s/tok well above a local M4 `--local-iterate` run ⇒ Blacksmith is slower than local, contended or not. "
+                "Repeat the stress run at different times to catch external (cross-tenant) contention.")
           PY
 
       - name: Upload combined summary
