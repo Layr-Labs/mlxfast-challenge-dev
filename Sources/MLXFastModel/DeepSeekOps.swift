@@ -3,12 +3,6 @@ import MLX
 import MLXFastCore
 
 public enum DeepSeekOps {
-    /// Cast that skips the graph node when the array is already in the target
-    /// dtype (MLXArray.asType emits a node even for a no-op cast).
-    public static func cast(_ input: MLXArray, to dtype: DType) -> MLXArray {
-        input.dtype == dtype ? input : input.asType(dtype)
-    }
-
     public static func embedding(inputIDs: MLXArray, weight: MLXArray) -> MLXArray {
         weight[inputIDs]
     }
@@ -89,27 +83,6 @@ public enum DeepSeekOps {
             )
         }
         let outputDimensions = weight.logicalShape[1]
-
-        if input.shape[0] == 1, let scales = weight.scales {
-            let packedInput = weight.weight.shape[weight.weight.shape.count - 1]
-            let scaleGroups = scales.shape[scales.shape.count - 1]
-            let grouped = gatherQuantizedMM(
-                input.squeezed(axis: 0),
-                weight.weight.reshaped([groupCount, outputDimensions, packedInput]),
-                scales: scales.reshaped([groupCount, outputDimensions, scaleGroups]),
-                biases: weight.biases.map {
-                    $0.reshaped([groupCount, outputDimensions, scaleGroups])
-                },
-                rhsIndices: MLXArray((0..<Int32(groupCount)).map { $0 }),
-                transpose: true,
-                groupSize: weight.groupSize,
-                bits: weight.bits,
-                mode: weight.mode,
-                sortedIndices: true
-            )
-            return grouped.expandedDimensions(axis: 0)
-        }
-
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(groupCount)
         for groupIndex in 0..<groupCount {

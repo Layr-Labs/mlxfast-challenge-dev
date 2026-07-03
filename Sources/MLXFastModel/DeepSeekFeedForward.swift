@@ -27,9 +27,6 @@ public struct DeepSeekMoEWeights {
     public let correctionBias: MLXArray?
     public let tokenToExpert: MLXArray?
     public let sharedExperts: DeepSeekMLPWeights
-    // Router matmul consumes gate transposed; sharing one transpose view
-    // avoids a fresh node per layer per forward. Same dtype, same values.
-    public let gateTransposed: MLXArray
 
     public init(
         gate: MLXArray,
@@ -41,7 +38,6 @@ public struct DeepSeekMoEWeights {
         self.correctionBias = correctionBias
         self.tokenToExpert = tokenToExpert
         self.sharedExperts = sharedExperts
-        self.gateTransposed = gate.T
     }
 }
 
@@ -107,7 +103,6 @@ public enum DeepSeekMoE {
             hidden: x,
             inputIDs: inputIDs,
             weight: weights.gate,
-            weightTransposed: weights.gateTransposed,
             correctionBias: weights.correctionBias,
             tokenToExpert: weights.tokenToExpert,
             topK: spec.expertsPerToken,
@@ -115,22 +110,16 @@ public enum DeepSeekMoE {
             normTopKProb: spec.normTopKProb,
             scoring: spec.scoring
         )
-        // Build the shared expert graph up front: it depends only on x and
-        // RAM-resident shared weights (no SSD read), so eval-ing it during
-        // the routed experts' blocking SSD reads fills otherwise-idle GPU
-        // time. The computation and combine are unchanged; only when the
-        // shared result is evaluated differs.
-        let shared = DeepSeekMLP.forward(
-            x,
-            weights: weights.sharedExperts,
-            swigluLimit: spec.routedExperts.swigluLimit
-        )
         let routed = try DeepSeekRoutedExperts.forward(
             x,
             expertIndices: routing.indices,
             loader: loader,
-            spec: spec.routedExperts,
-            onRoutingSynced: { eval(shared) }
+            spec: spec.routedExperts
+        )
+        let shared = DeepSeekMLP.forward(
+            x,
+            weights: weights.sharedExperts,
+            swigluLimit: spec.routedExperts.swigluLimit
         )
         return combine(
             routedExpertOutput: routed,
