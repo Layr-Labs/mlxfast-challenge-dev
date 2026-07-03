@@ -3,10 +3,18 @@ import MLX
 import MLXFastCore
 
 public enum DeepSeekOps {
+    private static let groupedRHSIndicesCache = LockedCache<Int, MLXArray>()
+
     /// Cast that skips the graph node when the array is already in the target
     /// dtype (MLXArray.asType emits a node even for a no-op cast).
     public static func cast(_ input: MLXArray, to dtype: DType) -> MLXArray {
         input.dtype == dtype ? input : input.asType(dtype)
+    }
+
+    private static func groupedRHSIndices(count: Int) -> MLXArray {
+        groupedRHSIndicesCache.value(for: count) {
+            MLXArray((0..<Int32(count)).map { $0 })
+        }
     }
 
     public static func embedding(inputIDs: MLXArray, weight: MLXArray) -> MLXArray {
@@ -100,7 +108,7 @@ public enum DeepSeekOps {
                 biases: weight.biases.map {
                     $0.reshaped([groupCount, outputDimensions, scaleGroups])
                 },
-                rhsIndices: MLXArray((0..<Int32(groupCount)).map { $0 }),
+                rhsIndices: groupedRHSIndices(count: groupCount),
                 transpose: true,
                 groupSize: weight.groupSize,
                 bits: weight.bits,
