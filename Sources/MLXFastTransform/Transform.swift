@@ -80,6 +80,7 @@ public enum SwiftTransform {
         let manifestPath = expertsDirectory.appendingPathComponent("manifest.json")
         try writeExpertManifest(
             referenceDirectory: referenceDirectory,
+            outputDirectory: outputDirectory,
             manifestPath: manifestPath,
             expertKeys: expertKeys,
             index: index
@@ -220,6 +221,7 @@ public enum SwiftTransform {
 
     private static func writeExpertManifest(
         referenceDirectory: URL,
+        outputDirectory: URL,
         manifestPath: URL,
         expertKeys: Set<String>,
         index: CheckpointIndex
@@ -261,5 +263,11 @@ public enum SwiftTransform {
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         )
         try data.write(to: manifestPath)
+
+        try ExpertCodeDedupCensus.run(
+            referenceDirectory: referenceDirectory,
+            outputDirectory: outputDirectory,
+            expertKeysByShard: expertKeysByShard
+        )
     }
 }
