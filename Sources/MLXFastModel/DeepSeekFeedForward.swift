@@ -126,15 +126,15 @@ public enum DeepSeekMoE {
             weights: weights.sharedExperts,
             swigluLimit: spec.routedExperts.swigluLimit
         )
-        // Dispatch the shared expert too; the onRoutingSynced hook below stays
-        // as a cheap wait and preserves the existing overlap with expert reads.
+        // Dispatch the shared expert too. The final combine depends on it, so
+        // avoid an explicit sync here and let routed expert graph construction
+        // proceed while the shared MLP drains in the background.
         asyncEval(shared)
         let routed = try DeepSeekRoutedExperts.forward(
             x,
             expertIndices: routing.indices,
             loader: loader,
-            spec: spec.routedExperts,
-            onRoutingSynced: { eval(shared) }
+            spec: spec.routedExperts
         )
         return combine(
             routedExpertOutput: routed,
