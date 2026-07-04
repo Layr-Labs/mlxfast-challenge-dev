@@ -319,12 +319,20 @@ public struct DeepSeekCompressorSpec {
 public struct DeepSeekCompressorWeights {
     public let wkv: DeepSeekLinearWeight
     public let wgate: DeepSeekLinearWeight
+    public let kvGate: DeepSeekLinearWeight?
     public let ape: MLXArray
     public let norm: MLXArray
 
-    public init(wkv: DeepSeekLinearWeight, wgate: DeepSeekLinearWeight, ape: MLXArray, norm: MLXArray) {
+    public init(
+        wkv: DeepSeekLinearWeight,
+        wgate: DeepSeekLinearWeight,
+        kvGate: DeepSeekLinearWeight? = nil,
+        ape: MLXArray,
+        norm: MLXArray
+    ) {
         self.wkv = wkv
         self.wgate = wgate
+        self.kvGate = kvGate
         self.ape = ape
         self.norm = norm
     }
@@ -333,6 +341,7 @@ public struct DeepSeekCompressorWeights {
         self.init(
             wkv: DeepSeekLinearWeight(wkv),
             wgate: DeepSeekLinearWeight(wgate),
+            kvGate: nil,
             ape: ape,
             norm: norm
         )
@@ -340,6 +349,21 @@ public struct DeepSeekCompressorWeights {
 }
 
 public enum DeepSeekKVCompressor {
+    private static func projectKVGate(
+        _ x: MLXArray,
+        weights: DeepSeekCompressorWeights
+    ) -> (kv: MLXArray, gate: MLXArray) {
+        if let kvGate = weights.kvGate {
+            let fused = DeepSeekOps.linear(input: x, weight: kvGate)
+            let parts = fused.split(parts: 2, axis: -1)
+            return (parts[0], parts[1])
+        }
+        return (
+            DeepSeekOps.linear(input: x, weight: weights.wkv),
+            DeepSeekOps.linear(input: x, weight: weights.wgate)
+        )
+    }
+
     public static func forward(
         _ x: MLXArray,
         weights: DeepSeekCompressorWeights,
@@ -362,8 +386,9 @@ public enum DeepSeekKVCompressor {
             throw MLXFastError.invalidInput("compressor ratio must be positive")
         }
 
-        let kv = DeepSeekOps.linear(input: x, weight: weights.wkv)
-        let gate = DeepSeekOps.linear(input: x, weight: weights.wgate)
+        let projected = projectKVGate(x, weights: weights)
+        let kv = projected.kv
+        let gate = projected.gate
         let ready = try poolingCache.accumulateWindows(
             kv: kv,
             gate: gate,
@@ -398,12 +423,13 @@ public enum DeepSeekKVCompressor {
             return zeros([batchSize, 0, spec.headDim], dtype: x.dtype)
         }
 
-        let kv = DeepSeekOps.linear(input: x, weight: weights.wkv)[
+        let projected = projectKVGate(x, weights: weights)
+        let kv = projected.kv[
             0...,
             0..<usable,
             0...
         ]
-        let gate = DeepSeekOps.linear(input: x, weight: weights.wgate)[
+        let gate = projected.gate[
             0...,
             0..<usable,
             0...
