@@ -85,6 +85,17 @@ public enum SwiftTransform {
             index: index
         )
 
+        do {
+            _ = try MXFP4PredictiveEntropyCensus.run(
+                referenceDirectory: referenceDirectory,
+                expertKeys: expertKeys,
+                index: index,
+                outputDirectory: outputDirectory
+            )
+        } catch {
+            print("warning: MXFP4 predictive entropy census failed: \(error)")
+        }
+
         return TransformReport(
             referencePath: referenceDirectory.path,
             outputPath: outputDirectory.path,
