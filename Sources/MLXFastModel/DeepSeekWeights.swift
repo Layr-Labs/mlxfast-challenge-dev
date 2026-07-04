@@ -127,6 +127,7 @@ public struct DeepSeekWeightLoader {
     public let residentExpertScales: ResidentExpertTensors?
     public let pinnedExpertCodes: ResidentExpertTensors?
     public let expertLayerStager: ExpertLayerStager?
+    private let decodeExpertCodeBundles: DecodeExpertCodeBundleStore?
     // Dedicated capacity-0 side bank for concurrent decode-step slice reads.
     // Capacity 0 => no cache/LRU mutation, so concurrent preads are race-free
     // and read byte-identical ranges through the trusted metered path.
@@ -182,6 +183,10 @@ public struct DeepSeekWeightLoader {
                 metrics: metrics
             )
             : nil
+        self.decodeExpertCodeBundles = DecodeExpertCodeBundleStore(
+            manifestPath: "\(weightsPath)/experts/decode-code-bundles.manifest.json",
+            metrics: metrics
+        )
         self.expertLayerStager = ExpertLayerStager(
             manifestPath: manifestPath,
             metrics: metrics
@@ -210,6 +215,7 @@ public struct DeepSeekWeightLoader {
         self.residentExpertScales = nil
         self.pinnedExpertCodes = nil
         self.expertLayerStager = nil
+        self.decodeExpertCodeBundles = nil
         self.decodeSideBank = nil
         self.bridge = bridge
     }
@@ -403,6 +409,14 @@ public struct DeepSeekWeightLoader {
         hiddenSize: Int,
         intermediateSize: Int
     ) -> [String: StagedExpertCode]? {
+        if let bundled = decodeExpertCodeBundles?.prefetch(
+            layerIndex: layerIndex,
+            expertIndices: expertIndices,
+            residentScales: residentExpertScales,
+            bridge: bridge
+        ) {
+            return bundled
+        }
         guard let sideBank = decodeSideBank, expertBank.capacity > 0, !expertIndices.isEmpty else {
             return nil
         }
@@ -517,6 +531,19 @@ public struct DeepSeekWeightLoader {
         hiddenSize: Int,
         intermediateSize: Int
     ) -> Bool {
+        if let bundles = decodeExpertCodeBundles, bundles.containsLayer(layerIndex), !expertIndices.isEmpty {
+            let residentScales = self.residentExpertScales
+            let bridge = self.bridge
+            scheduledPinnedDecodePrefetches.schedule(layerIndex: layerIndex) {
+                bundles.prefetch(
+                    layerIndex: layerIndex,
+                    expertIndices: expertIndices,
+                    residentScales: residentScales,
+                    bridge: bridge
+                )
+            }
+            return true
+        }
         guard let pinnedCodes = self.pinnedExpertCodes, !expertIndices.isEmpty else {
             scheduledPinnedDecodePrefetches.remove(layerIndex: layerIndex)
             return false
