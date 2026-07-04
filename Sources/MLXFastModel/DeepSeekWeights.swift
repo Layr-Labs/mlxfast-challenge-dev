@@ -134,11 +134,21 @@ public struct DeepSeekWeightLoader {
     private let bridge: MLXArrayTensorBridge
     private let scheduledPinnedDecodePrefetches = ScheduledDecodePrefetches()
     private let routedExpertProjectionPlans: [RoutedExpertProjectionKey: RoutedExpertProjectionPlan]
+    // Decode-only bounded hot-expert cache over assembled weight triples;
+    // nil below the official runner's memory budget. Hash-routed layers never
+    // consult it (see decodeExpertWeightCache(layerIndex:)).
+    private let decodeExpertCache: DecodeExpertWeightCache?
+    private let hashLayerCount: Int
 
     /// Sized for the official 48 GB runner: pin only where at least that
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
     private static let pinnedHashLayerCap = 2
+    /// Decode hot-expert LRU capacity per dynamic layer: 8 experts x
+    /// ~12.6 MB x 40 dynamic layers ~= 4.0 GiB worst case, inside the
+    /// official 48 GB runner budget next to the resident scales, pinned
+    /// codes, and staging buffers.
+    private static let decodeExpertCacheCapacityPerLayer = 8
 
     public init(
         weightsPath: String,
@@ -175,6 +185,10 @@ public struct DeepSeekWeightLoader {
         // that budget. Both constants encode the OFFICIAL runner's memory
         // math — do not raise them because a larger local machine has room.
         let hashLayerCount = (try? DeepSeekConfig.load(from: weightsPath))?.numHashLayers ?? 0
+        self.hashLayerCount = hashLayerCount
+        self.decodeExpertCache = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
+            ? DecodeExpertWeightCache(capacityPerLayer: Self.decodeExpertCacheCapacityPerLayer)
+            : nil
         self.pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
             ? ResidentExpertStoreRegistry.pinnedHashLayerCodes(
                 manifestPath: manifestPath,
@@ -211,7 +225,21 @@ public struct DeepSeekWeightLoader {
         self.pinnedExpertCodes = nil
         self.expertLayerStager = nil
         self.decodeSideBank = nil
+        self.decodeExpertCache = nil
+        self.hashLayerCount = 0
         self.bridge = bridge
+    }
+
+    /// Per-layer decode hot-expert cache. Returns nil for hash-routed layers
+    /// (token-id routing; pinned layers never touch disk and the unpinned
+    /// hash layer keeps its exact read-ahead path untouched) and when the
+    /// machine lacks the official runner's memory budget, so those paths are
+    /// byte-for-byte the frontier's.
+    public func decodeExpertWeightCache(layerIndex: Int) -> DecodeExpertWeightCache? {
+        guard layerIndex >= hashLayerCount else {
+            return nil
+        }
+        return decodeExpertCache
     }
 
     public func resolveDenseName(_ candidates: [String]) throws -> String {

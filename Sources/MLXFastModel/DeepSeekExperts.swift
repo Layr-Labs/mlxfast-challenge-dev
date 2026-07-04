@@ -84,10 +84,34 @@ public enum DeepSeekRoutedExperts {
                 loader.expertLayerStager?.releaseLayer(spec.layerIndex)
             }
         }
+        // Decode-only bounded hot-expert cache: consecutive decode tokens
+        // re-route a large share of the previous tokens' experts, so serve
+        // those from the exact weight triples assembled on an earlier step.
+        // A hit hands the graph the same MLXArray objects (same Metal
+        // buffers, same bytes) a rebuild would produce — values are unchanged
+        // by construction — and its byte ranges are removed from BOTH the
+        // advisory list and the side-bank read set below, so no byte of a
+        // hit is demanded again. Hash layers and prefill-shaped calls never
+        // consult the cache (decodeExpertWeightCache returns nil / tokenCount
+        // guard), leaving those paths untouched.
+        let decodeCache = tokenCount == 1
+            ? loader.decodeExpertWeightCache(layerIndex: spec.layerIndex)
+            : nil
+        let cachedWeights = decodeCache?.hits(
+            layerIndex: spec.layerIndex,
+            expertIndices: selectedExperts
+        ) ?? [:]
         if !useStaged {
             // Kernel read-ahead for every byte range this layer is about to
             // pread, so SSD I/O overlaps the per-expert GPU compute below.
-            loader.expertPrefetcher.prefetch(layerIndex: spec.layerIndex, expertIndices: selectedExperts)
+            // Cache hits are never read again; keep them out of the advisory
+            // (F_RDADVISE physically reads).
+            let advisoryExperts = cachedWeights.isEmpty
+                ? selectedExperts
+                : selectedExperts.filter { cachedWeights[$0] == nil }
+            if !advisoryExperts.isEmpty {
+                loader.expertPrefetcher.prefetch(layerIndex: spec.layerIndex, expertIndices: advisoryExperts)
+            }
         }
 
         let outputCount = tokenCount * topK
@@ -156,14 +180,18 @@ public enum DeepSeekRoutedExperts {
         // not prefetched falls back to the normal per-expert bank read.
         var decodePrefetch: [String: StagedExpertCode]?
         if tokenCount == 1, !useStaged {
+            // Cache hits need no side-bank read; fetch only the misses.
+            let missOrder = cachedWeights.isEmpty
+                ? expertOrder
+                : expertOrder.filter { cachedWeights[$0] == nil }
             decodePrefetch = loader.consumeScheduledPinnedDecodeExpertCodes(
                 layerIndex: spec.layerIndex
-            ) ?? loader.prefetchDecodeExpertCodes(
+            ) ?? (missOrder.isEmpty ? nil : loader.prefetchDecodeExpertCodes(
                 layerIndex: spec.layerIndex,
-                expertIndices: expertOrder,
+                expertIndices: missOrder,
                 hiddenSize: spec.hiddenSize,
                 intermediateSize: spec.intermediateSize
-            )
+            ))
         } else if useStaged {
             // Prefill/warmup staged path: build the active experts' base
             // MLXArrays from the staged layer buffer concurrently so the loop
@@ -185,13 +213,23 @@ public enum DeepSeekRoutedExperts {
             guard let flatIndices = flatIndicesByExpert[expertIndex] else {
                 continue
             }
-            let expertWeights = try weights(
-                forExpert: expertIndex,
-                loader: loader,
-                spec: spec,
-                preferStaged: useStaged,
-                decodePrefetch: decodePrefetch
-            )
+            let expertWeights: DeepSeekMLPWeights
+            if let cached = cachedWeights[expertIndex] {
+                expertWeights = cached
+            } else {
+                expertWeights = try weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec,
+                    preferStaged: useStaged,
+                    decodePrefetch: decodePrefetch
+                )
+                decodeCache?.insert(
+                    layerIndex: spec.layerIndex,
+                    expertIndex: expertIndex,
+                    weights: expertWeights
+                )
+            }
             let tokens: MLXArray
             if tokenCount == 1, flatIndices.count == 1 {
                 tokens = xFlat
