@@ -47,7 +47,7 @@ public enum DeepSeekMoEGate {
             ].asType(.int32)
         }
 
-        if asyncEvalIndices {
+        if asyncEvalIndices, tokenToExpert == nil {
             asyncEval(indices)
         }
 
