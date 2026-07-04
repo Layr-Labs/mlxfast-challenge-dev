@@ -69,9 +69,23 @@ public enum DeepSeekRoutedExperts {
            let stager = loader.expertLayerStager,
            let plan = loader.stagedExpertLayerPlan(layerIndex: spec.layerIndex)
         {
-            stager.schedule(plan)
+            let hiddenSize = spec.hiddenSize
+            let intermediateSize = spec.intermediateSize
+            stager.schedule(plan, onStaged: { [loader] in
+                loader.prebuildStackedProjections(
+                    layerIndex: plan.layerIndex,
+                    hiddenSize: hiddenSize,
+                    intermediateSize: intermediateSize
+                )
+            })
             if let nextPlan = loader.stagedExpertLayerPlan(layerIndex: spec.layerIndex + 1) {
-                stager.schedule(nextPlan)
+                stager.schedule(nextPlan, onStaged: { [loader] in
+                    loader.prebuildStackedProjections(
+                        layerIndex: nextPlan.layerIndex,
+                        hiddenSize: hiddenSize,
+                        intermediateSize: intermediateSize
+                    )
+                })
             }
             stagingScheduled = true
         }
@@ -229,27 +243,45 @@ public enum DeepSeekRoutedExperts {
         loader: DeepSeekWeightLoader,
         spec: DeepSeekRoutedExpertSpec
     ) -> MLXArray? {
-        // Build the three stacked projections concurrently: each is one big
-        // Data->Metal copy (vs 256 slice copies on the per-expert path).
-        var projections = [DeepSeekWeightLoader.StackedExpertProjection?](repeating: nil, count: 3)
-        let expectedShapes: [[Int]] = [
-            [spec.intermediateSize, spec.hiddenSize],
-            [spec.intermediateSize, spec.hiddenSize],
-            [spec.hiddenSize, spec.intermediateSize],
-        ]
-        let kinds: [DeepSeekExpertProjection] = [.gate, .up, .down]
-        projections.withUnsafeMutableBufferPointer { buffer in
-            let sink = StackedProjectionSink(buffer: buffer)
-            DispatchQueue.concurrentPerform(iterations: 3) { index in
-                sink.buffer[index] = loader.stackedExpertProjection(
-                    layerIndex: spec.layerIndex,
-                    projection: kinds[index],
-                    expectedShape: expectedShapes[index]
-                )
+        // Prefer projections prebuilt off-thread right after staging landed
+        // (the ~1 GiB Data->Metal copies then ran in the background); build
+        // them concurrently inline otherwise — each is one big copy vs 256
+        // slice copies on the per-expert path.
+        let gate: DeepSeekWeightLoader.StackedExpertProjection
+        let up: DeepSeekWeightLoader.StackedExpertProjection
+        let down: DeepSeekWeightLoader.StackedExpertProjection
+        if let prebuilt = loader.consumePrebuiltStackedProjections(layerIndex: spec.layerIndex),
+           prebuilt.count == 3 {
+            gate = prebuilt[0]
+            up = prebuilt[1]
+            down = prebuilt[2]
+        } else {
+            var projections = [DeepSeekWeightLoader.StackedExpertProjection?](repeating: nil, count: 3)
+            let expectedShapes: [[Int]] = [
+                [spec.intermediateSize, spec.hiddenSize],
+                [spec.intermediateSize, spec.hiddenSize],
+                [spec.hiddenSize, spec.intermediateSize],
+            ]
+            let kinds: [DeepSeekExpertProjection] = [.gate, .up, .down]
+            projections.withUnsafeMutableBufferPointer { buffer in
+                let sink = StackedProjectionSink(buffer: buffer)
+                DispatchQueue.concurrentPerform(iterations: 3) { index in
+                    sink.buffer[index] = loader.stackedExpertProjection(
+                        layerIndex: spec.layerIndex,
+                        projection: kinds[index],
+                        expectedShape: expectedShapes[index]
+                    )
+                }
             }
-        }
-        guard let gate = projections[0], let up = projections[1], let down = projections[2] else {
-            return nil
+            guard let builtGate = projections[0],
+                  let builtUp = projections[1],
+                  let builtDown = projections[2]
+            else {
+                return nil
+            }
+            gate = builtGate
+            up = builtUp
+            down = builtDown
         }
 
         let outputCount = selectedExperts.count

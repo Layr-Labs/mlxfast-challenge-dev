@@ -111,6 +111,7 @@ public struct DeepSeekWeightLoader {
     private let decodeSideBank: ExpertSlotBank?
     private let bridge: MLXArrayTensorBridge
     private let scheduledPinnedDecodePrefetches = ScheduledDecodePrefetches()
+    private let prebuiltStackedProjections = PrebuiltStackedProjections()
 
     /// Sized for the official 48 GB runner: pin only where at least that
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
@@ -786,6 +787,54 @@ public struct DeepSeekWeightLoader {
             bits: bits,
             mode: mode
         )
+    }
+
+    /// Kicks off an off-thread build of a staged layer's three stacked
+    /// projections (the ~1 GiB Data->Metal copies) so the compute thread's
+    /// batched MoE consumption finds them ready instead of paying the copies
+    /// on the critical path after waitForLayer. On success the staged Data is
+    /// released early (the arrays hold copies), keeping peak memory level.
+    public func prebuildStackedProjections(
+        layerIndex: Int,
+        hiddenSize: Int,
+        intermediateSize: Int
+    ) {
+        guard let entry = prebuiltStackedProjections.beginBuild(layerIndex: layerIndex) else {
+            return
+        }
+        let loader = self
+        DispatchQueue.global(qos: .userInitiated).async {
+            var projections = [StackedExpertProjection?](repeating: nil, count: 3)
+            let expectedShapes: [[Int]] = [
+                [intermediateSize, hiddenSize],
+                [intermediateSize, hiddenSize],
+                [hiddenSize, intermediateSize],
+            ]
+            let kinds: [DeepSeekExpertProjection] = [.gate, .up, .down]
+            projections.withUnsafeMutableBufferPointer { buffer in
+                let sink = StackedProjectionBuildSink(buffer: buffer)
+                DispatchQueue.concurrentPerform(iterations: 3) { index in
+                    sink.buffer[index] = loader.stackedExpertProjection(
+                        layerIndex: layerIndex,
+                        projection: kinds[index],
+                        expectedShape: expectedShapes[index]
+                    )
+                }
+            }
+            if let gate = projections[0], let up = projections[1], let down = projections[2] {
+                entry.finish([gate, up, down])
+                loader.expertLayerStager?.releaseStagedBytesKeepingLayer(layerIndex)
+            } else {
+                entry.finish(nil)
+            }
+        }
+    }
+
+    /// Waits for (and removes) the layer's prebuild when one is in flight;
+    /// nil when none was scheduled — callers then build inline. Waiting is
+    /// never worse than the inline rebuild it replaces.
+    public func consumePrebuiltStackedProjections(layerIndex: Int) -> [StackedExpertProjection]? {
+        prebuiltStackedProjections.consume(layerIndex: layerIndex)
     }
 
     /// True when every projection's stacked code tensor for the layer is
@@ -1855,6 +1904,67 @@ public struct StagedExpertCode {
         self.tensor = tensor
         self.array = array
         self.scalesArray = scalesArray
+    }
+}
+
+private struct StackedProjectionBuildSink: @unchecked Sendable {
+    let buffer: UnsafeMutableBufferPointer<DeepSeekWeightLoader.StackedExpertProjection?>
+}
+
+/// Lock-guarded store of off-thread stacked-projection prebuilds. `beginBuild`
+/// claims a layer so redundant callbacks do not duplicate the ~3 GiB copies;
+/// `consume` removes the entry and, when the build is in flight, WAITS for it
+/// instead of letting the compute thread duplicate the copies — duplication
+/// is what let unconsumed ~3 GiB entries accumulate across a 40-layer prefill
+/// and OOM the worker in an earlier experiment. Removing on every consume
+/// bounds live entries to the ≤2-layer staging lookahead.
+private final class PrebuiltStackedProjections {
+    final class Entry {
+        fileprivate let group = DispatchGroup()
+        fileprivate let lock = NSLock()
+        fileprivate var result: [DeepSeekWeightLoader.StackedExpertProjection]?
+
+        fileprivate init() {
+            group.enter()
+        }
+
+        func finish(_ projections: [DeepSeekWeightLoader.StackedExpertProjection]?) {
+            lock.lock()
+            result = projections
+            lock.unlock()
+            group.leave()
+        }
+    }
+
+    private let lock = NSLock()
+    private var entries: [Int: Entry] = [:]
+
+    func beginBuild(layerIndex: Int) -> Entry? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard entries[layerIndex] == nil else {
+            return nil
+        }
+        let entry = Entry()
+        entries[layerIndex] = entry
+        return entry
+    }
+
+    func consume(layerIndex: Int) -> [DeepSeekWeightLoader.StackedExpertProjection]? {
+        lock.lock()
+        let entry = entries.removeValue(forKey: layerIndex)
+        lock.unlock()
+        guard let entry else {
+            return nil
+        }
+        // Backstop only; the build normally finishes well before consume.
+        guard entry.group.wait(timeout: .now() + .seconds(10)) == .success else {
+            return nil
+        }
+        entry.lock.lock()
+        let result = entry.result
+        entry.lock.unlock()
+        return result
     }
 }
 

@@ -55,14 +55,32 @@ public final class ExpertLayerStager {
 
     /// Enqueues background staging for a layer. Non-blocking, so callers can
     /// schedule before their routing sync and let the sequential reads overlap
-    /// GPU work. Duplicate schedules are ignored.
-    public func schedule(_ plan: LayerPlan) {
+    /// GPU work. Duplicate schedules are ignored. `onStaged` (attached by the
+    /// first schedule of a layer) runs right after the layer's bytes land, so
+    /// consumers can chain derived work (stacked MLXArray prebuilds) off the
+    /// compute thread.
+    public func schedule(_ plan: LayerPlan, onStaged: (() -> Void)? = nil) {
         guard !plan.recordNames.isEmpty else {
             return
         }
         condition.lock()
         if !failedLayers.contains(plan.layerIndex) {
-            scheduleLocked(plan)
+            scheduleLocked(plan, onStaged: onStaged)
+        }
+        condition.unlock()
+    }
+
+    /// Frees a layer's staged byte buffers while keeping the layer marked as
+    /// staged (waitForLayer keeps returning true). For callers that already
+    /// copied the bytes into derived arrays, the staged Data is dead weight
+    /// until releaseLayer; dropping it early keeps ~3 GiB out of the peak
+    /// while the next layer stages.
+    public func releaseStagedBytesKeepingLayer(_ layerIndex: Int) {
+        condition.lock()
+        if let names = recordNamesByLayer[layerIndex] {
+            for name in names {
+                stagedBytesByRecordName.removeValue(forKey: name)
+            }
         }
         condition.unlock()
     }
@@ -114,7 +132,7 @@ public final class ExpertLayerStager {
         let buffer: UnsafeMutableBufferPointer<Data?>
     }
 
-    private func scheduleLocked(_ plan: LayerPlan) {
+    private func scheduleLocked(_ plan: LayerPlan, onStaged: (() -> Void)? = nil) {
         guard
             recordNamesByLayer[plan.layerIndex] == nil,
             !pendingLayers.contains(plan.layerIndex)
@@ -166,6 +184,9 @@ public final class ExpertLayerStager {
             }
             condition.broadcast()
             condition.unlock()
+            if succeeded {
+                onStaged?()
+            }
         }
     }
 }
