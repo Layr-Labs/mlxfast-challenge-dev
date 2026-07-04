@@ -227,8 +227,8 @@ decode_speedup >= 0.95
 prefill_speedup >= 0.95
 ```
 
-With the current Blacksmith M4 baseline, those floors allow at most
-`3.8280590145312505` seconds/token for decode and `0.18242698079358555`
+With the current tenki-macos-latest-xlarge baseline, those floors allow at most
+`6.692046315789474` seconds/token for decode and `0.3193778947368421`
 seconds/token for prefill. A run below either floor fails eligibility even if
 the weighted score would otherwise be above baseline.
 

@@ -232,10 +232,10 @@ prefill_speedup >= 0.95
 
 The floor prevents a submission from sacrificing one serving phase badly to
 improve the other. The exact baseline timings are emitted in each `score.json`
-and kept in `MLXFastConstants` after trusted Blacksmith calibration.
-On the current Blacksmith M4 baseline, that means decode must be at most
-`3.8280590145312505` seconds/token and prefill must be at most
-`0.18242698079358555` seconds/token.
+and kept in `MLXFastConstants` after trusted calibration on the ranked runner.
+On the current tenki-macos-latest-xlarge baseline, that means decode must be at
+most `6.692046315789474` seconds/token and prefill must be at most
+`0.3193778947368421` seconds/token.
 For scoring, decode is trusted parent wall-clock time for decode setup plus the
 checked decode-token window, not worker-reported per-step time. That charges
 prompt-specific seed prefill to the decode phase so submitted model code cannot
