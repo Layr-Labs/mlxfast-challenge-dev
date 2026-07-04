@@ -175,7 +175,7 @@ jobs:
   # that mode.
   correctness-only:
     if: ${{ !inputs.run_benchmark }}
-    runs-on: blacksmith-12vcpu-macos-26
+    runs-on: tenki-macos-latest-small
     timeout-minutes: 720
     environment: benchmark-private-prompts
     env:
