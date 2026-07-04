@@ -376,10 +376,14 @@ public enum DeepSeekRoutedExperts {
 
         let combined = concatenated(expertOutputs, axis: 0)
         var inverse = [Int32](repeating: 0, count: outputCount)
+        var isIdentity = true
         for (row, flatIndex) in scatterOrder.enumerated() {
             inverse[flatIndex] = Int32(row)
+            if flatIndex != row {
+                isIdentity = false
+            }
         }
-        let ordered = combined.take(MLXArray(inverse), axis: 0)
+        let ordered = isIdentity ? combined : combined.take(MLXArray(inverse), axis: 0)
         return ordered.reshaped([batchSize, sequenceLength, topK, spec.hiddenSize])
     }
 
