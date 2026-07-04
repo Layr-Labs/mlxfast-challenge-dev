@@ -111,11 +111,13 @@ public struct DeepSeekWeightLoader {
     private let decodeSideBank: ExpertSlotBank?
     private let bridge: MLXArrayTensorBridge
     private let scheduledPinnedDecodePrefetches = ScheduledDecodePrefetches()
+    private let lockedExpertPages: ExpertFilePageLocker?
 
     /// Sized for the official 48 GB runner: pin only where at least that
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
     private static let pinnedHashLayerCap = 2
+    private static let lockedHashLayerCodeCount = 1
 
     public init(
         weightsPath: String,
@@ -151,11 +153,22 @@ public struct DeepSeekWeightLoader {
         // that budget. Both constants encode the OFFICIAL runner's memory
         // math — do not raise them because a larger local machine has room.
         let hashLayerCount = (try? DeepSeekConfig.load(from: weightsPath))?.numHashLayers ?? 0
-        self.pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
+        let hasOfficialMemory = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
+        let pinnedHashLayerCount = min(hashLayerCount, Self.pinnedHashLayerCap)
+        self.pinnedExpertCodes = hasOfficialMemory
             ? ResidentExpertStoreRegistry.pinnedHashLayerCodes(
                 manifestPath: manifestPath,
-                hashLayerCount: min(hashLayerCount, Self.pinnedHashLayerCap),
+                hashLayerCount: pinnedHashLayerCount,
                 metrics: metrics
+            )
+            : nil
+        self.lockedExpertPages = hasOfficialMemory
+            ? ExpertFilePageLockRegistry.hashLayerCodes(
+                manifestPath: manifestPath,
+                layerRange: pinnedHashLayerCount..<min(
+                    hashLayerCount,
+                    pinnedHashLayerCount + Self.lockedHashLayerCodeCount
+                )
             )
             : nil
         self.expertLayerStager = ExpertLayerStager(
@@ -187,6 +200,7 @@ public struct DeepSeekWeightLoader {
         self.expertLayerStager = nil
         self.decodeSideBank = nil
         self.bridge = bridge
+        self.lockedExpertPages = nil
     }
 
     public func resolveDenseName(_ candidates: [String]) throws -> String {
