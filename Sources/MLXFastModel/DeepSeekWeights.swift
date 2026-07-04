@@ -1201,6 +1201,88 @@ public struct DeepSeekWeightLoader {
         )
     }
 
+    private func fusedRowLinearWeight(
+        first: DeepSeekLinearWeight,
+        second: DeepSeekLinearWeight,
+        expectedShape: [Int],
+        label: String
+    ) -> DeepSeekLinearWeight? {
+        guard expectedShape.count == 2,
+              first.logicalShape.count == 2,
+              second.logicalShape.count == 2,
+              first.logicalShape[1] == second.logicalShape[1],
+              first.logicalShape[0] + second.logicalShape[0] == expectedShape[0],
+              first.logicalShape[1] == expectedShape[1],
+              first.isQuantized == second.isQuantized
+        else {
+            return nil
+        }
+
+        if first.isQuantized {
+            guard first.groupSize == second.groupSize,
+                  first.bits == second.bits,
+                  first.mode == second.mode,
+                  first.weight.shape.count == 2,
+                  second.weight.shape.count == 2,
+                  first.weight.shape[1] == second.weight.shape[1],
+                  let firstScales = first.scales,
+                  let secondScales = second.scales,
+                  firstScales.shape.count == 2,
+                  secondScales.shape.count == 2,
+                  firstScales.shape[1] == secondScales.shape[1]
+            else {
+                return nil
+            }
+            let fusedBiases: MLXArray?
+            switch (first.biases, second.biases) {
+            case (nil, nil):
+                fusedBiases = nil
+            case let (firstBiases?, secondBiases?):
+                guard firstBiases.shape.count == 2,
+                      secondBiases.shape.count == 2,
+                      firstBiases.shape[1] == secondBiases.shape[1]
+                else {
+                    return nil
+                }
+                fusedBiases = concatenated([firstBiases, secondBiases], axis: 0)
+            default:
+                return nil
+            }
+
+            let fusedWeight = concatenated([first.weight, second.weight], axis: 0)
+            let fusedScales = concatenated([firstScales, secondScales], axis: 0)
+            return DeepSeekLinearWeight(
+                weight: fusedWeight,
+                scales: fusedScales,
+                biases: fusedBiases,
+                logicalShape: expectedShape,
+                groupSize: first.groupSize,
+                bits: first.bits,
+                mode: first.mode
+            )
+        }
+
+        guard first.weight.shape.count == 2,
+              second.weight.shape.count == 2,
+              first.weight.shape[1] == second.weight.shape[1],
+              first.weight.dtype == second.weight.dtype,
+              first.biases == nil,
+              second.biases == nil
+        else {
+            return nil
+        }
+        let fusedWeight = concatenated([first.weight, second.weight], axis: 0)
+        return DeepSeekLinearWeight(
+            weight: fusedWeight,
+            scales: nil,
+            biases: nil,
+            logicalShape: expectedShape,
+            groupSize: 0,
+            bits: 0,
+            mode: first.mode
+        )
+    }
+
     public func localAttentionWeights(
         layerIndex: Int,
         config: DeepSeekConfig
@@ -1224,11 +1306,22 @@ public struct DeepSeekWeightLoader {
         attentionBias: Bool = false
     ) throws -> DeepSeekLocalAttentionWeights {
         let groupedInput = spec.numAttentionHeads * spec.headDim / spec.outputGroups
+        let wqA = try denseLinearWeight(
+            candidates: DeepSeekWeightNames.attention(layerIndex, "wq_a.weight"),
+            expectedShape: [qLoraRank, hiddenSize]
+        )
+        let wkv = try denseLinearWeight(
+            candidates: DeepSeekWeightNames.attention(layerIndex, "wkv.weight"),
+            expectedShape: [spec.headDim, hiddenSize]
+        )
+        let wqAKV = fusedRowLinearWeight(
+            first: wqA,
+            second: wkv,
+            expectedShape: [qLoraRank + spec.headDim, hiddenSize],
+            label: "attn.wq_a+wkv layer \(layerIndex)"
+        )
         return try DeepSeekLocalAttentionWeights(
-            wqA: denseLinearWeight(
-                candidates: DeepSeekWeightNames.attention(layerIndex, "wq_a.weight"),
-                expectedShape: [qLoraRank, hiddenSize]
-            ),
+            wqA: wqA,
             qNorm: denseArray(
                 candidates: DeepSeekWeightNames.attention(layerIndex, "q_norm.weight"),
                 expectedShape: [qLoraRank]
@@ -1237,10 +1330,7 @@ public struct DeepSeekWeightLoader {
                 candidates: DeepSeekWeightNames.attention(layerIndex, "wq_b.weight"),
                 expectedShape: [spec.numAttentionHeads * spec.headDim, qLoraRank]
             ),
-            wkv: denseLinearWeight(
-                candidates: DeepSeekWeightNames.attention(layerIndex, "wkv.weight"),
-                expectedShape: [spec.headDim, hiddenSize]
-            ),
+            wkv: wkv,
             kvNorm: denseArray(
                 candidates: DeepSeekWeightNames.attention(layerIndex, "kv_norm.weight"),
                 expectedShape: [spec.headDim]
@@ -1262,7 +1352,8 @@ public struct DeepSeekWeightLoader {
             attentionSink: optionalDenseArray(
                 candidates: DeepSeekWeightNames.attention(layerIndex, "attn_sink"),
                 expectedShape: [spec.numAttentionHeads]
-            )
+            ),
+            wqAKV: wqAKV
         )
     }
 

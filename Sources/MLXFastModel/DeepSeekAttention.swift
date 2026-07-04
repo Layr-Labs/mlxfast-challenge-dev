@@ -160,6 +160,7 @@ public struct DeepSeekLocalAttentionWeights {
     public let woB: DeepSeekLinearWeight
     public let woBBias: MLXArray?
     public let attentionSink: MLXArray?
+    public let wqAKV: DeepSeekLinearWeight?
 
     public init(
         wqA: DeepSeekLinearWeight,
@@ -170,7 +171,8 @@ public struct DeepSeekLocalAttentionWeights {
         woA: DeepSeekLinearWeight,
         woB: DeepSeekLinearWeight,
         woBBias: MLXArray? = nil,
-        attentionSink: MLXArray? = nil
+        attentionSink: MLXArray? = nil,
+        wqAKV: DeepSeekLinearWeight? = nil
     ) {
         self.wqA = wqA
         self.qNorm = qNorm
@@ -181,6 +183,7 @@ public struct DeepSeekLocalAttentionWeights {
         self.woB = woB
         self.woBBias = woBBias
         self.attentionSink = attentionSink
+        self.wqAKV = wqAKV
     }
 
     public init(
@@ -203,7 +206,8 @@ public struct DeepSeekLocalAttentionWeights {
             woA: DeepSeekLinearWeight(woA),
             woB: DeepSeekLinearWeight(woB),
             woBBias: woBBias,
-            attentionSink: attentionSink
+            attentionSink: attentionSink,
+            wqAKV: nil
         )
     }
 }
@@ -479,6 +483,16 @@ public enum DeepSeekKVCompressor {
 }
 
 public enum DeepSeekLocalAttention {
+    static func splitQAKV(
+        _ projected: MLXArray,
+        qDim: Int,
+        kvDim: Int
+    ) -> (qA: MLXArray, kv: MLXArray) {
+        let qA = projected[0..., 0..., 0..<qDim]
+        let kv = projected[0..., 0..., qDim..<(qDim + kvDim)]
+        return (qA, kv)
+    }
+
     public static func forward(
         _ x: MLXArray,
         weights: DeepSeekLocalAttentionWeights,
@@ -498,16 +512,30 @@ public enum DeepSeekLocalAttention {
             maxPositionEmbeddings: spec.maxPositionEmbeddings
         )
 
-        var q = DeepSeekOps.linear(input: x, weight: weights.wqA)
-        q = DeepSeekOps.rmsNorm(input: q, weight: weights.qNorm, eps: spec.rmsNormEps)
+        let qAProjection: MLXArray
+        let kvProjection: MLXArray
+        if let wqAKV = weights.wqAKV {
+            let projected = DeepSeekOps.linear(input: x, weight: wqAKV)
+            let split = splitQAKV(
+                projected,
+                qDim: weights.wqA.logicalShape[0],
+                kvDim: weights.wkv.logicalShape[0]
+            )
+            qAProjection = split.qA
+            kvProjection = split.kv
+        } else {
+            qAProjection = DeepSeekOps.linear(input: x, weight: weights.wqA)
+            kvProjection = DeepSeekOps.linear(input: x, weight: weights.wkv)
+        }
+
+        var q = DeepSeekOps.rmsNorm(input: qAProjection, weight: weights.qNorm, eps: spec.rmsNormEps)
         q = DeepSeekOps.linear(input: q, weight: weights.wqB)
         q = q.reshaped([batchSize, sequenceLength, spec.numAttentionHeads, spec.headDim])
         q = DeepSeekHyperConnection.weightlessRMSNorm(q, eps: spec.rmsNormEps)
         q = q.transposed(0, 2, 1, 3)
         q = try rope.applied(to: q, offset: positionOffset)
 
-        var kv = DeepSeekOps.linear(input: x, weight: weights.wkv)
-        kv = DeepSeekOps.rmsNorm(input: kv, weight: weights.kvNorm, eps: spec.rmsNormEps)
+        var kv = DeepSeekOps.rmsNorm(input: kvProjection, weight: weights.kvNorm, eps: spec.rmsNormEps)
         kv = kv.reshaped([batchSize, 1, sequenceLength, spec.headDim])
         kv = try rope.applied(to: kv, offset: positionOffset)
         var attentionMask = mask
@@ -573,8 +601,24 @@ public enum DeepSeekCompressedAttention {
             maxPositionEmbeddings: spec.maxPositionEmbeddings
         )
 
+        let qAProjection: MLXArray
+        let kvProjection: MLXArray
+        if let wqAKV = weights.attention.wqAKV {
+            let projected = DeepSeekOps.linear(input: x, weight: wqAKV)
+            let split = DeepSeekLocalAttention.splitQAKV(
+                projected,
+                qDim: weights.attention.wqA.logicalShape[0],
+                kvDim: weights.attention.wkv.logicalShape[0]
+            )
+            qAProjection = split.qA
+            kvProjection = split.kv
+        } else {
+            qAProjection = DeepSeekOps.linear(input: x, weight: weights.attention.wqA)
+            kvProjection = DeepSeekOps.linear(input: x, weight: weights.attention.wkv)
+        }
+
         let qResidual = DeepSeekOps.rmsNorm(
-            input: DeepSeekOps.linear(input: x, weight: weights.attention.wqA),
+            input: qAProjection,
             weight: weights.attention.qNorm,
             eps: spec.rmsNormEps
         )
@@ -584,8 +628,7 @@ public enum DeepSeekCompressedAttention {
         q = q.transposed(0, 2, 1, 3)
         q = try rope.applied(to: q, offset: positionOffset)
 
-        var kv = DeepSeekOps.linear(input: x, weight: weights.attention.wkv)
-        kv = DeepSeekOps.rmsNorm(input: kv, weight: weights.attention.kvNorm, eps: spec.rmsNormEps)
+        var kv = DeepSeekOps.rmsNorm(input: kvProjection, weight: weights.attention.kvNorm, eps: spec.rmsNormEps)
         kv = kv.reshaped([batchSize, 1, sequenceLength, spec.headDim])
         kv = try rope.applied(to: kv, offset: positionOffset)
         var localMask = mask
