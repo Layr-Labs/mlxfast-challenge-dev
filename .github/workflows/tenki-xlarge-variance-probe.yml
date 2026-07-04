@@ -1,0 +1,339 @@
+name: tenki-xlarge-variance-probe
+
+# Manual experiment: run the SAME timing measurement on N tenki-macos-latest-xlarge
+# machines concurrently and compare what each reports, to quantify tenki-xlarge
+# run-to-run / machine-to-machine variance for the DeepSeek V4 Flash workload --
+# the tenki analogue of blacksmith-baseline-variance-probe.yml. This branch is
+# switch-benchmark-runner-tenki (origin/main + the @unchecked Sendable build fix
+# required by tenki's newer Swift toolchain) plus only this workflow file; the
+# editable model surface is otherwise untouched.
+#
+# NOT part of CI or scoring. Secret-free by design: checked-in public fixture
+# only, a locally synthesized benchmark oracle, no hidden goldens, no R2/Anthropic
+# secrets, no environment protection. Its logs/artifacts are public to anyone who
+# can trigger it, so it must never touch private material.
+#
+# Metric: unmodified branch code via `./benchmark.sh --local-iterate` (16-step) --
+# the local edit-loop signal. These s/tok are NOT the 128-step ranked baseline
+# (which measured ~6.36 decode / ~0.303 prefill on tenki-xlarge, ~1.5x slower
+# than the Blacksmith-calibrated 4.2205 / 0.17331 constants and outside the
+# paired-baseline sanity band). The point here is the SPREAD across machines, not
+# the absolute value. Observed: tenki-xlarge exposes exactly 2 concurrent runners,
+# so a 5-machine matrix runs in ~3 waves.
+on:
+  # push runs the branch's OWN copy (no default-branch requirement, unlike
+  # workflow_dispatch), so the probe runs straight from its branch. push carries
+  # no inputs, so every ${{ inputs.* }} falls back to its literal default; the
+  # push-path machine count is the fallback in the matrix `machine:` line.
+  push:
+    branches:
+      - probe/tenki-xlarge-variance
+  workflow_dispatch:
+    inputs:
+      machines:
+        description: 'JSON array of machine indices to run concurrently, e.g. "[1,2,3,4,5]".'
+        required: false
+        default: "[1,2,3,4,5]"
+        type: string
+      reference_download_jobs:
+        description: "Parallel shard downloads for setup.sh, per machine."
+        required: false
+        default: "12"
+        type: string
+      reference_min_free_gib:
+        description: "Minimum free GiB required before reference checkpoint download."
+        required: false
+        default: "170"
+        type: string
+      label:
+        description: "Free-text label to distinguish repeated dispatches in the summary."
+        required: false
+        default: "baseline"
+        type: string
+
+concurrency:
+  group: tenki-xlarge-variance-probe-${{ github.ref }}-${{ inputs.label || 'push' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  timing:
+    name: "timing machine ${{ matrix.machine }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(inputs.machines || '[1,2,3,4,5]') }}
+    runs-on: tenki-macos-latest-xlarge
+    timeout-minutes: 360
+    env:
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
+      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Capture host identity
+        run: |
+          set -uo pipefail
+          {
+            echo "machine_index=${{ matrix.machine }}"
+            echo "hostname=$(hostname 2>/dev/null || true)"
+            echo "cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)"
+            echo "ncpu=$(sysctl -n hw.ncpu 2>/dev/null || true)"
+            echo "memsize_bytes=$(sysctl -n hw.memsize 2>/dev/null || true)"
+            echo "model=$(sysctl -n hw.model 2>/dev/null || true)"
+            echo "boottime=$(sysctl -n kern.boottime 2>/dev/null || true)"
+            echo "os=$(sw_vers -productVersion 2>/dev/null || true) build=$(sw_vers -buildVersion 2>/dev/null || true)"
+            echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            env | grep -iE '^(TENKI|RUNNER_NAME|RUNNER_ENVIRONMENT|IMAGEOS|IMAGEVERSION)' | sort || true
+          } | tee host.txt
+
+      - name: Restore SwiftPM cache
+        id: restore_swiftpm_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        # No repo secrets by design. setup.sh falls back to its public
+        # DEFAULT_REFERENCE_BASE_URL and an empty auth header when unset. We time
+        # the whole setup (dominated by checkpoint fetch/verify) as a recorded,
+        # comparable-across-machines number.
+        env:
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs || '12' }}
+          MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib || '170' }}
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+        run: |
+          set -euo pipefail
+          started="${SECONDS}"
+          ./setup.sh
+          echo "setup_seconds=$((SECONDS - started))" | tee -a host.txt
+
+      - name: Save SwiftPM cache
+        if: ${{ steps.restore_swiftpm_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: ${{ steps.restore_swiftpm_cache.outputs.cache-primary-key }}
+
+      - name: CPU compute microbench (I/O-free)
+        continue-on-error: true
+        # Fixed single-thread arithmetic work, zero I/O -- isolates per-host CPU /
+        # scheduling availability from storage. If cpu_mops varies across
+        # concurrent machines in step with decode, the decode variance is
+        # compute/neighbour-CPU; if cpu_mops is flat while decode varies, it is
+        # not CPU (points at GPU/memory latency, as on Blacksmith).
+        run: |
+          set -uo pipefail
+          python3 - <<'PY' | tee -a host.txt
+          import time
+          N = 60_000_000
+          t = time.monotonic(); s = 0.0
+          for i in range(N):
+              s += (i * 1.0000001) % 7.0
+          dt = time.monotonic() - t
+          print(f"cpu_loop_seconds={dt:.4f}")
+          print(f"cpu_mops={N/dt/1e6:.3f}")
+          PY
+
+      - name: Transform reference checkpoint
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" \
+            --output weights
+
+      - name: Run local-iterate timing
+        # Same command participants iterate with locally (`./benchmark.sh
+        # --local-iterate`). It runs the real worker + expert-streaming path and
+        # records timing over the 16-step window. `--local-iterate` RECORDS any
+        # correctness miss (e.g. an fp tie) but still completes ALL timing (never
+        # throws), so a `passed:false` verdict is irrelevant here -- we read
+        # timing, not correctness. benchmark.sh turns a failing score into exit 1,
+        # hence `|| echo`; we then require the timing fields to be present.
+        env:
+          MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+          MLXFAST_SKIP_TRANSFORM: "1"
+          MLXFAST_WEIGHTS_PATH: weights
+          MLXFAST_NOTE: "tenki-xlarge-variance-probe machine=${{ matrix.machine }} label=${{ inputs.label || 'push' }}"
+        run: |
+          set -uo pipefail
+          echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a host.txt
+          ./benchmark.sh --local-iterate || echo "benchmark.sh exit=$? (timing still captured; correctness verdict irrelevant here)"
+          echo "== score.local-iterate.json =="
+          cat score.local-iterate.json || true
+          python3 - <<'PY'
+          import json, sys
+          m = json.load(open("score.local-iterate.json"))["metrics"]
+          d = m.get("decode_seconds_per_token")
+          if not isinstance(d, (int, float)) or d <= 0:
+              print(f"::error::local-iterate produced no usable decode timing: {d}")
+              sys.exit(1)
+          print(f"decode_seconds_per_token={d} prefill={m.get('prefill_seconds_per_token')} passed_correctness={m.get('passed_correctness')}")
+          PY
+          cp score.local-iterate.json "score-${{ matrix.machine }}.json"
+          cp host.txt "host-${{ matrix.machine }}.txt"
+
+      - name: Upload machine artifact
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: tenki-xlarge-variance-probe-${{ github.run_id }}-machine-${{ matrix.machine }}
+          path: |
+            score-${{ matrix.machine }}.json
+            host-${{ matrix.machine }}.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  combine:
+    name: combine
+    needs: [timing]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download machine artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: tenki-xlarge-variance-probe-${{ github.run_id }}-machine-*
+          path: machines
+          merge-multiple: false
+
+      - name: Tabulate variance
+        env:
+          LABEL: ${{ inputs.label || 'push' }}
+          MACHINES: ${{ inputs.machines }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
+          import glob, json, math, os, re, statistics
+
+          def host_field(path, key):
+              try:
+                  for line in open(path):
+                      if line.startswith(key + "="):
+                          return line.split("=", 1)[1].strip()
+              except FileNotFoundError:
+                  return None
+              return None
+
+          score_files = sorted(glob.glob("machines/**/score-*.json", recursive=True))
+          rows = []
+          for sp in score_files:
+              idx = re.sub(r"^score-(.+)\.json$", r"\1", os.path.basename(sp))
+              hosts = glob.glob(f"machines/**/host-{idx}.txt", recursive=True)
+              hp = hosts[0] if hosts else ""
+              row = {"machine": host_field(hp, "machine_index") or idx,
+                     "host": host_field(hp, "hostname") or "?",
+                     "model": host_field(hp, "model") or "?",
+                     "ncpu": host_field(hp, "ncpu") or "?",
+                     "mem": host_field(hp, "memsize_bytes"),
+                     "cpu_mops": host_field(hp, "cpu_mops"),
+                     "setup_s": host_field(hp, "setup_seconds")}
+              try:
+                  m = json.load(open(sp))["metrics"]
+                  row.update(decode=m.get("decode_seconds_per_token"),
+                             prefill=m.get("prefill_seconds_per_token"),
+                             bw=m.get("bandwidth_gb_per_token"),
+                             passed=m.get("passed_correctness"))
+              except (FileNotFoundError, KeyError, json.JSONDecodeError):
+                  row["decode"] = None
+              rows.append(row)
+
+          def f(x, nd=4):
+              return "n/a" if x is None else (f"{x:.{nd}f}" if isinstance(x, float) else str(x))
+
+          def gb(x):
+              try:
+                  return f"{int(x)/1e9:.0f}GB"
+              except (TypeError, ValueError):
+                  return "?"
+
+          print(f"## tenki-macos-latest-xlarge variance probe — `{os.environ.get('LABEL','')}`")
+          print()
+          print(f"- machines requested: `{os.environ.get('MACHINES','')}`  ·  reported: {len(rows)}")
+          print("- metric: branch code via `./benchmark.sh --local-iterate` (16-step). Absolute s/tok are NOT the ranked 128-step baseline (~6.36 / ~0.303 seen there); the SPREAD is the point.")
+          hosts = [r.get("host") for r in rows if r.get("host") and r.get("host") != "?"]
+          distinct = len(set(hosts))
+          print(f"- distinct hostnames: {distinct} of {len(hosts)} (VMs are normally distinct; identical decode across two ⇒ possible shared physical host).")
+          print()
+          print("| m | host | model | cores | mem | decode s/tok | prefill s/tok | bw gb/tok | cpu Mops | corr ok | setup s |")
+          print("|---|------|-------|-------|-----|--------------|---------------|-----------|----------|---------|---------|")
+          for r in rows:
+              print("| {m} | {h} | {mo} | {c} | {mem} | {dc} | {pf} | {bw} | {cpu} | {pc} | {su} |".format(
+                  m=r["machine"], h=r["host"], mo=r["model"], c=r["ncpu"], mem=gb(r.get("mem")),
+                  dc=f(r.get("decode")), pf=f(r.get("prefill"), 5), bw=f(r.get("bw"), 3),
+                  cpu=(f(float(r["cpu_mops"]), 2) if r.get("cpu_mops") else "n/a"),
+                  pc=r.get("passed"), su=r.get("setup_s") or "n/a"))
+
+          def num(r, key):
+              v = r.get(key)
+              try:
+                  return float(v)
+              except (TypeError, ValueError):
+                  return None
+
+          def stats(key):
+              vals = [v for v in (num(r, key) for r in rows) if isinstance(v, (int, float))]
+              if len(vals) < 2:
+                  return None
+              mean = statistics.mean(vals); sd = statistics.pstdev(vals)
+              return mean, sd, (sd / mean * 100 if mean else 0), min(vals), max(vals), (max(vals) / min(vals) if min(vals) else 0)
+
+          print()
+          print("| metric | mean | stdev | CV% | min | max | max/min |")
+          print("|--------|------|-------|-----|-----|-----|---------|")
+          for name, key in [("decode s/tok", "decode"), ("prefill s/tok", "prefill"),
+                            ("bandwidth gb/tok", "bw"), ("cpu Mops (1 core)", "cpu_mops"),
+                            ("setup s", "setup_s")]:
+              s = stats(key)
+              if s:
+                  mean, sd, cv, lo, hi, ratio = s
+                  print(f"| {name} | {mean:.4f} | {sd:.4f} | {cv:.1f}% | {lo:.4f} | {hi:.4f} | {ratio:.2f}× |")
+
+          def corr(kx, ky):
+              pairs = [(num(r, kx), num(r, ky)) for r in rows]
+              pairs = [(x, y) for x, y in pairs if isinstance(x, (int, float)) and isinstance(y, (int, float))]
+              n = len(pairs)
+              if n < 3:
+                  return None, n
+              mx = sum(x for x, _ in pairs) / n; my = sum(y for _, y in pairs) / n
+              cov = sum((x - mx) * (y - my) for x, y in pairs)
+              sx = math.sqrt(sum((x - mx) ** 2 for x, _ in pairs)); sy = math.sqrt(sum((y - my) ** 2 for _, y in pairs))
+              return (cov / (sx * sy) if sx and sy else None), n
+
+          c, n = corr("decode", "cpu_mops")
+          print()
+          print(f"- decode vs cpu_mops correlation: {('%+.2f' % c) if c is not None else 'n/a'} (n={n}). "
+                "Strong negative ⇒ variance is CPU/neighbour-CPU; ~0 while decode still spreads ⇒ not CPU (GPU/memory latency, as on Blacksmith).")
+          print()
+          print("**Read as:** decode/prefill max/min and CV% quantify tenki-xlarge run-to-run variance. "
+                "Compare against the Blacksmith probe (~1.3–1.4× decode max/min) to judge whether tenki is steadier or noisier. One run is one moment; repeat over time for external contention.")
+          PY
+
+      - name: Upload combined summary
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: tenki-xlarge-variance-probe-${{ github.run_id }}-combined
+          path: machines
+          if-no-files-found: warn
+          retention-days: 14
