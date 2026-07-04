@@ -193,6 +193,23 @@ public enum DeepSeekModel {
             hidden = try layer(layerIndex, hidden)
         }
 
+        // The only consumers of these logits (greedyToken / topLogits in the
+        // harness) read exclusively the last sequence position. The head
+        // collapse, finalNorm, and lm_head are all per-position independent
+        // (no mixing across the length axis), so the last row's value does not
+        // depend on the earlier positions. Keeping only the last row here skips
+        // an oversized head-collapse + rmsNorm + [vocab x hidden] lm_head matmul
+        // over the (length - 1) dead positions on the 512-token prefill and the
+        // decode-charged 512-token seed forward. Note: MLX specializes kernels
+        // on tensor shape, so the last-row result matches the unsliced result to
+        // floating-point epsilon (~1e-5 relative) rather than bit-for-bit; the
+        // selected (argmax) token is unchanged, which the correctness gate
+        // confirms.
+        if hidden.shape[1] > 1 {
+            let last = hidden.shape[1] - 1
+            hidden = hidden[0..., last..., 0..., 0...]
+        }
+
         let collapsed = try DeepSeekHyperConnection.head(
             hidden,
             fn: weights.headHyperConnection.fn,
