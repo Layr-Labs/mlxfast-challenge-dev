@@ -89,6 +89,24 @@ enum DeepSeekWarmup {
             ))
         }
 
+        // Fused gate+up first-projection shape on the batched staged prefill
+        // path: one mxfp4 QMM per expert with 2*moeIntermediateSize output
+        // rows. Warm the same m buckets so the first scored forward pays no
+        // pipeline-state creation for the doubled row count.
+        let fusedRows = 2 * config.moeIntermediateSize
+        if fusedRows > 0 {
+            let fusedWeight = zeros([fusedRows, hidden / 8], dtype: .uint32)
+            let fusedScales = zeros([fusedRows, hidden / 32], dtype: .uint8)
+            for m in [12, 512] {
+                let x = zeros([1, m, hidden], dtype: .bfloat16)
+                eval(quantizedMM(
+                    x, fusedWeight,
+                    scales: fusedScales, biases: nil,
+                    transpose: true, groupSize: 32, bits: 4, mode: .mxfp4
+                ))
+            }
+        }
+
         let heads = config.numAttentionHeads
         let headDim = config.headDim
         let window = max(config.slidingWindow, 1)

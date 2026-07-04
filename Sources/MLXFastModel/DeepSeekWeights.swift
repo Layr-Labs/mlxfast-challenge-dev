@@ -184,7 +184,8 @@ public struct DeepSeekWeightLoader {
             : nil
         self.expertLayerStager = ExpertLayerStager(
             manifestPath: manifestPath,
-            metrics: metrics
+            metrics: metrics,
+            residentScales: self.residentExpertScales
         )
         self.decodeSideBank = try? ExpertSlotBank(
             manifestPath: manifestPath,
@@ -887,6 +888,94 @@ public struct DeepSeekWeightLoader {
         )
     }
 
+    /// The stager-assembled fused gate+up stacked projection for a staged
+    /// layer: logical shape [2*intermediateSize, hiddenSize] per expert, codes
+    /// [E, 2I, packed] and scales [E, 2I, groups] built from the fused host
+    /// buffers the stager interleaved off-thread. One first-projection QMM per
+    /// expert then replaces the separate gate and up QMMs; each output row is
+    /// the identical quantized dot product over identical bytes (output-row
+    /// concatenation touches no row's reduction). Returns nil whenever the
+    /// layer was not staged with fusion or any metadata mismatches — callers
+    /// fall back to the separate-projection path unchanged.
+    public func fusedFirstStackedProjection(
+        layerIndex: Int,
+        hiddenSize: Int,
+        intermediateSize: Int
+    ) -> StackedExpertProjection? {
+        guard
+            let stager = expertLayerStager,
+            let fused = stager.fusedFirstProjection(layerIndex: layerIndex)
+        else {
+            return nil
+        }
+        let candidates = DeepSeekWeightNames.routedExpert(
+            layerIndex: layerIndex,
+            expertIndex: 0,
+            projection: .gate
+        )
+        guard
+            let candidate = candidates.first(where: { expertBank.record(named: $0) != nil }),
+            let record = expertBank.record(named: candidate),
+            record.shape.count == 3,
+            record.dtype == "U32",
+            record.shape.first == fused.expertCount,
+            fused.expertCount > 0,
+            record.shape[1] == intermediateSize,
+            let packedInput = record.shape.last,
+            packedInput > 0,
+            (packedInput * 32) % hiddenSize == 0,
+            fused.codes.count == 2 * record.byteLength
+        else {
+            return nil
+        }
+        let bits = packedInput * 32 / hiddenSize
+        guard [2, 4, 8].contains(bits) else {
+            return nil
+        }
+        let scalesName = Self.companionName(for: candidate, suffix: "scales")
+        guard
+            let scalesRecord = expertBank.record(named: scalesName),
+            scalesRecord.shape.count == 3,
+            scalesRecord.shape.first == fused.expertCount,
+            scalesRecord.shape[1] == intermediateSize,
+            let scaleGroups = scalesRecord.shape.last,
+            scaleGroups > 0,
+            hiddenSize % scaleGroups == 0,
+            fused.scales.count == 2 * scalesRecord.byteLength,
+            let scalesDType = try? TensorDType.parse(scalesRecord.dtype),
+            scalesDType == .u8,
+            expertBank.record(named: Self.companionName(for: candidate, suffix: "biases")) == nil
+        else {
+            return nil
+        }
+        guard
+            let codesTensor = try? MaterializedTensor(
+                name: "\(candidate).fused_gate_up",
+                dtype: .u32,
+                shape: [fused.expertCount, 2 * intermediateSize, packedInput],
+                bytes: fused.codes
+            ),
+            let scalesTensor = try? MaterializedTensor(
+                name: "\(scalesName).fused_gate_up",
+                dtype: scalesDType,
+                shape: [fused.expertCount, 2 * intermediateSize, scaleGroups],
+                bytes: fused.scales
+            ),
+            let weightArray = try? bridge.makeArray(from: codesTensor),
+            let scalesArray = try? bridge.makeArray(from: scalesTensor)
+        else {
+            return nil
+        }
+        return StackedExpertProjection(
+            weight: weightArray,
+            scales: scalesArray,
+            biases: nil,
+            groupSize: hiddenSize / scaleGroups,
+            bits: bits,
+            mode: .mxfp4
+        )
+    }
+
     /// True when every projection's stacked code tensor for the layer is
     /// RAM-pinned, so the batched prefill path can serve the layer without
     /// staging.
@@ -1069,6 +1158,19 @@ public struct DeepSeekWeightLoader {
             return nil
         }
         var names: [String] = []
+        // Per-projection facts for the optional gate+up fusion descriptor:
+        // (name, record, staged-not-pinned, biases present, scales name,
+        // scales resident).
+        var firstProjectionFacts: [DeepSeekExpertProjection: (
+            name: String,
+            shape: [Int],
+            byteLength: Int,
+            dtype: String,
+            staged: Bool,
+            hasBiases: Bool,
+            scalesName: String,
+            scalesResident: Bool
+        )] = [:]
         for projection in [DeepSeekExpertProjection.gate, .up, .down] {
             let candidates = DeepSeekWeightNames.routedExpert(
                 layerIndex: layerIndex,
@@ -1084,21 +1186,43 @@ public struct DeepSeekWeightLoader {
             else {
                 return nil
             }
-            if pinnedExpertCodes?.isResident(name: candidate) != true {
+            let staged = pinnedExpertCodes?.isResident(name: candidate) != true
+            if staged {
                 names.append(candidate)
             }
+            var hasBiases = false
+            var scalesResident = false
+            let scalesName = Self.companionName(for: candidate, suffix: "scales")
             if record.dtype == "U32" {
                 for suffix in ["scales", "biases"] {
                     let companion = Self.companionName(for: candidate, suffix: suffix)
                     guard let companionRecord = expertBank.record(named: companion) else {
                         continue
                     }
-                    let scalesResident = suffix == "scales"
+                    if suffix == "biases" {
+                        hasBiases = true
+                    }
+                    let isResidentScales = suffix == "scales"
                         && residentExpertScales?.isResident(name: companion) == true
-                    if !scalesResident, companionRecord.shape.count >= 2 {
+                    if isResidentScales {
+                        scalesResident = true
+                    }
+                    if !isResidentScales, companionRecord.shape.count >= 2 {
                         names.append(companion)
                     }
                 }
+            }
+            if projection != .down {
+                firstProjectionFacts[projection] = (
+                    name: candidate,
+                    shape: record.shape,
+                    byteLength: record.byteLength,
+                    dtype: record.dtype,
+                    staged: staged,
+                    hasBiases: hasBiases,
+                    scalesName: scalesName,
+                    scalesResident: scalesResident
+                )
             }
         }
         guard !names.isEmpty else {
@@ -1106,7 +1230,33 @@ public struct DeepSeekWeightLoader {
             // the per-slice path serves those layers from memory.
             return nil
         }
-        return ExpertLayerStager.LayerPlan(layerIndex: layerIndex, recordNames: names)
+        // Gate+up fusion applies only when both stacked code tensors are
+        // staged (not pinned), identically shaped U32, bias-free, and their
+        // scales are RAM-resident (the stager interleaves scales from the
+        // resident store, off disk). Otherwise stage exactly as before.
+        var fusion: ExpertLayerStager.FusedFirstProjectionPlan?
+        if let gate = firstProjectionFacts[.gate],
+           let up = firstProjectionFacts[.up],
+           gate.staged, up.staged,
+           gate.dtype == "U32", up.dtype == "U32",
+           gate.shape == up.shape,
+           gate.byteLength == up.byteLength,
+           !gate.hasBiases, !up.hasBiases,
+           gate.scalesResident, up.scalesResident,
+           let expertCount = gate.shape.first {
+            fusion = ExpertLayerStager.FusedFirstProjectionPlan(
+                gateName: gate.name,
+                upName: up.name,
+                gateScalesName: gate.scalesName,
+                upScalesName: up.scalesName,
+                expertCount: expertCount
+            )
+        }
+        return ExpertLayerStager.LayerPlan(
+            layerIndex: layerIndex,
+            recordNames: names,
+            fusedFirstProjection: fusion
+        )
     }
 
     /// Fabricates the same MaterializedTensor the bank's firstAxisIndex read
@@ -1116,20 +1266,31 @@ public struct DeepSeekWeightLoader {
         guard
             let stager = expertLayerStager,
             let record = expertBank.record(named: recordName),
-            let bytes = stager.stagedBytes(recordName: recordName),
             let firstDimension = record.shape.first,
             record.shape.count >= 2,
             expertIndex >= 0,
             expertIndex < firstDimension,
             record.byteLength % firstDimension == 0,
-            bytes.count == record.byteLength,
             let dtype = try? TensorDType.parse(record.dtype)
         else {
             return nil
         }
         let sliceByteLength = record.byteLength / firstDimension
-        let start = bytes.startIndex + expertIndex * sliceByteLength
-        let slice = bytes[start..<(start + sliceByteLength)]
+        let slice: Data
+        if let bytes = stager.stagedBytes(recordName: recordName),
+           bytes.count == record.byteLength {
+            let start = bytes.startIndex + expertIndex * sliceByteLength
+            slice = bytes[start..<(start + sliceByteLength)]
+        } else if let fusedSlice = stager.fusedSliceBytes(
+            recordName: recordName,
+            expertIndex: expertIndex
+        ), fusedSlice.count == sliceByteLength {
+            // The layer's gate/up wholes were replaced by the fused buffer;
+            // this view is the same bytes at the fused offset.
+            slice = fusedSlice
+        } else {
+            return nil
+        }
         return try? MaterializedTensor(
             name: "\(recordName)[\(expertIndex)]",
             dtype: dtype,

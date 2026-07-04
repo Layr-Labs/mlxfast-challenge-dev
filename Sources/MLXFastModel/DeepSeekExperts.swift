@@ -258,6 +258,20 @@ public enum DeepSeekRoutedExperts {
         loader: DeepSeekWeightLoader,
         spec: DeepSeekRoutedExpertSpec
     ) -> MLXArray? {
+        // Staged layers whose gate+up bytes were fused off-thread run ONE
+        // first-projection QMM per expert instead of two. Pinned hash layers
+        // never have a fused entry and keep the three-projection path below.
+        if let fused = fusedBatchedResidentForward(
+            x,
+            selectedExperts: selectedExperts,
+            batchSize: batchSize,
+            sequenceLength: sequenceLength,
+            topK: topK,
+            loader: loader,
+            spec: spec
+        ) {
+            return fused
+        }
         // Build the three stacked projections concurrently: each is one big
         // Data->Metal copy (vs 256 slice copies on the per-expert path).
         var projections = [DeepSeekWeightLoader.StackedExpertProjection?](repeating: nil, count: 3)
@@ -362,6 +376,144 @@ public enum DeepSeekRoutedExperts {
         let hiddenAll = DeepSeekOps.limitedSwiGLU(
             gate: concatenated(gateOutputs, axis: 0),
             up: concatenated(upOutputs, axis: 0),
+            limit: spec.swigluLimit
+        )
+
+        var expertOutputs: [MLXArray] = []
+        expertOutputs.reserveCapacity(downWeights.count)
+        var segmentStart = 0
+        for (index, weight) in downWeights.enumerated() {
+            let segment = hiddenAll[segmentStart..<(segmentStart + segmentLengths[index])]
+            expertOutputs.append(DeepSeekOps.linear(input: segment, weight: weight))
+            segmentStart += segmentLengths[index]
+        }
+
+        let combined = concatenated(expertOutputs, axis: 0)
+        var inverse = [Int32](repeating: 0, count: outputCount)
+        for (row, flatIndex) in scatterOrder.enumerated() {
+            inverse[flatIndex] = Int32(row)
+        }
+        let ordered = combined.take(MLXArray(inverse), axis: 0)
+        return ordered.reshaped([batchSize, sequenceLength, topK, spec.hiddenSize])
+    }
+
+    /// Fused-gate+up variant of `batchedResidentForward` for staged layers.
+    ///
+    /// Bit-identity contract: each expert runs the SAME per-expert quantizedMM
+    /// kernel over the SAME token batch; the weight's output rows are gate_e's
+    /// rows followed by up_e's rows (host-interleaved from the identical file
+    /// bytes), so every output element is the same quantized dot product with
+    /// the same reduction order as the separate gate/up QMMs — output-row
+    /// concatenation touches no row's bytes, scales, or accumulation. The
+    /// concatenated [N, 2I] activations are split back by columns before the
+    /// unchanged elementwise limitedSwiGLU: concatenated(fused)[.., 0..<I]
+    /// holds exactly the elements concatenated(gateOutputs) held, position for
+    /// position. Down projection, segment slicing, inverse permutation, and
+    /// reshape are copied verbatim from the three-projection path.
+    private static func fusedBatchedResidentForward(
+        _ x: MLXArray,
+        selectedExperts: [Int],
+        batchSize: Int,
+        sequenceLength: Int,
+        topK: Int,
+        loader: DeepSeekWeightLoader,
+        spec: DeepSeekRoutedExpertSpec
+    ) -> MLXArray? {
+        // Build the fused first projection and the down projection
+        // concurrently: each is one big Data->Metal copy.
+        var projections = [DeepSeekWeightLoader.StackedExpertProjection?](repeating: nil, count: 2)
+        projections.withUnsafeMutableBufferPointer { buffer in
+            let sink = StackedProjectionSink(buffer: buffer)
+            DispatchQueue.concurrentPerform(iterations: 2) { index in
+                if index == 0 {
+                    sink.buffer[0] = loader.fusedFirstStackedProjection(
+                        layerIndex: spec.layerIndex,
+                        hiddenSize: spec.hiddenSize,
+                        intermediateSize: spec.intermediateSize
+                    )
+                } else {
+                    sink.buffer[1] = loader.stackedExpertProjection(
+                        layerIndex: spec.layerIndex,
+                        projection: .down,
+                        expectedShape: [spec.hiddenSize, spec.intermediateSize]
+                    )
+                }
+            }
+        }
+        guard let fused = projections[0], let down = projections[1] else {
+            return nil
+        }
+
+        let outputCount = selectedExperts.count
+        // Group activation flat-indices by expert exactly like the per-expert
+        // path; iteration order only affects concat order, which the inverse
+        // permutation undoes.
+        var flatIndicesByExpert: [Int: [Int]] = [:]
+        flatIndicesByExpert.reserveCapacity(min(outputCount, 256))
+        for (flatIndex, expertIndex) in selectedExperts.enumerated() {
+            flatIndicesByExpert[expertIndex, default: []].append(flatIndex)
+        }
+
+        let xFlat = x.reshaped([batchSize * sequenceLength, spec.hiddenSize])
+        let fusedLogical = [2 * spec.intermediateSize, spec.hiddenSize]
+        let downLogical = [spec.hiddenSize, spec.intermediateSize]
+
+        // One gather for every expert's token batch. Each expert's segment
+        // view of xSorted holds the same rows in the same within-expert order
+        // as the per-expert take, so the per-expert GEMM inputs are identical.
+        var scatterOrder: [Int] = []
+        scatterOrder.reserveCapacity(outputCount)
+        var segmentLengths: [Int] = []
+        segmentLengths.reserveCapacity(flatIndicesByExpert.count)
+        var expertOrder: [Int] = []
+        expertOrder.reserveCapacity(flatIndicesByExpert.count)
+        for (expertIndex, flatIndices) in flatIndicesByExpert {
+            expertOrder.append(expertIndex)
+            segmentLengths.append(flatIndices.count)
+            scatterOrder.append(contentsOf: flatIndices)
+        }
+        let sortedRows = scatterOrder.map { Int32($0 / topK) }
+        let xSorted = xFlat.take(MLXArray(sortedRows), axis: 0)
+
+        var fusedOutputs: [MLXArray] = []
+        var downWeights: [DeepSeekLinearWeight] = []
+        fusedOutputs.reserveCapacity(expertOrder.count)
+        downWeights.reserveCapacity(expertOrder.count)
+
+        var tokenStart = 0
+        for (position, expertIndex) in expertOrder.enumerated() {
+            let fusedWeight = DeepSeekLinearWeight(
+                weight: fused.weight[expertIndex],
+                scales: fused.scales[expertIndex],
+                biases: nil,
+                logicalShape: fusedLogical,
+                groupSize: fused.groupSize,
+                bits: fused.bits,
+                mode: fused.mode
+            )
+            downWeights.append(
+                DeepSeekLinearWeight(
+                    weight: down.weight[expertIndex],
+                    scales: down.scales[expertIndex],
+                    biases: down.biases.map { $0[expertIndex] },
+                    logicalShape: downLogical,
+                    groupSize: down.groupSize,
+                    bits: down.bits,
+                    mode: down.mode
+                )
+            )
+            let tokens = xSorted[tokenStart..<(tokenStart + segmentLengths[position])]
+            tokenStart += segmentLengths[position]
+            fusedOutputs.append(DeepSeekOps.linear(input: tokens, weight: fusedWeight))
+        }
+
+        // Split the fused activations back into gate/up columns, then run the
+        // SAME single elementwise SwiGLU over all experts' activations.
+        let allFused = concatenated(fusedOutputs, axis: 0)
+        let intermediate = spec.intermediateSize
+        let hiddenAll = DeepSeekOps.limitedSwiGLU(
+            gate: allFused[0..., 0..<intermediate],
+            up: allFused[0..., intermediate..<(2 * intermediate)],
             limit: spec.swigluLimit
         )
 
