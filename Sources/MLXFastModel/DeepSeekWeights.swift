@@ -126,6 +126,7 @@ public struct DeepSeekWeightLoader {
     public let expertPrefetcher: ExpertPrefetcher
     public let residentExpertScales: ResidentExpertTensors?
     public let pinnedExpertCodes: ResidentExpertTensors?
+    private let pinnedStackedExpertArrays: PinnedStackedExpertArrayCache?
     public let expertLayerStager: ExpertLayerStager?
     // Dedicated capacity-0 side bank for concurrent decode-step slice reads.
     // Capacity 0 => no cache/LRU mutation, so concurrent preads are race-free
@@ -175,13 +176,22 @@ public struct DeepSeekWeightLoader {
         // that budget. Both constants encode the OFFICIAL runner's memory
         // math — do not raise them because a larger local machine has room.
         let hashLayerCount = (try? DeepSeekConfig.load(from: weightsPath))?.numHashLayers ?? 0
-        self.pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
+        let pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
             ? ResidentExpertStoreRegistry.pinnedHashLayerCodes(
                 manifestPath: manifestPath,
                 hashLayerCount: min(hashLayerCount, Self.pinnedHashLayerCap),
                 metrics: metrics
             )
             : nil
+        self.pinnedExpertCodes = pinnedExpertCodes
+        self.pinnedStackedExpertArrays = ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1"
+            ? nil
+            : ResidentExpertStoreRegistry.pinnedStackedArrays(
+                manifestPath: manifestPath,
+                pinnedCodes: pinnedExpertCodes,
+                residentScales: self.residentExpertScales,
+                bridge: bridge
+            )
         self.expertLayerStager = ExpertLayerStager(
             manifestPath: manifestPath,
             metrics: metrics
@@ -209,6 +219,7 @@ public struct DeepSeekWeightLoader {
         self.expertPrefetcher = ExpertPrefetcher(expertBank: expertBank)
         self.residentExpertScales = nil
         self.pinnedExpertCodes = nil
+        self.pinnedStackedExpertArrays = nil
         self.expertLayerStager = nil
         self.decodeSideBank = nil
         self.bridge = bridge
@@ -539,6 +550,7 @@ public struct DeepSeekWeightLoader {
         }
         let bridge = self.bridge
         let residentScales = self.residentExpertScales
+        let pinnedStackedArrays = self.pinnedStackedExpertArrays
         scheduledPinnedDecodePrefetches.schedule(layerIndex: layerIndex) {
             Self.buildPinnedDecodeExpertCodes(
                 keys: plan.keys,
@@ -546,6 +558,7 @@ public struct DeepSeekWeightLoader {
                 indices: plan.indices,
                 pinnedCodes: pinnedCodes,
                 residentScales: residentScales,
+                pinnedStackedArrays: pinnedStackedArrays,
                 bridge: bridge
             )
         }
@@ -624,6 +637,7 @@ public struct DeepSeekWeightLoader {
         indices: [Int],
         pinnedCodes: ResidentExpertTensors,
         residentScales: ResidentExpertTensors?,
+        pinnedStackedArrays: PinnedStackedExpertArrayCache?,
         bridge: MLXArrayTensorBridge
     ) -> [String: StagedExpertCode]? {
         var results = [StagedExpertCode?](repeating: nil, count: keys.count)
@@ -636,17 +650,22 @@ public struct DeepSeekWeightLoader {
                     let tensor = pinnedCodes.materializedTensor(
                         named: name,
                         firstAxisIndex: expertIndex
-                    ),
-                    let array = try? bridge.makeArray(from: tensor)
+                    )
                 else {
                     return
                 }
-                let scalesArray = Self.residentScalesArray(
-                    residentScales: residentScales,
-                    bridge: bridge,
-                    codeName: name,
-                    expertIndex: expertIndex
-                )
+                let array = pinnedStackedArrays?.projection(named: name)?.weight[expertIndex]
+                    ?? (try? bridge.makeArray(from: tensor))
+                guard let array else {
+                    return
+                }
+                let scalesArray = pinnedStackedArrays?.projection(named: name)?.scales[expertIndex]
+                    ?? Self.residentScalesArray(
+                        residentScales: residentScales,
+                        bridge: bridge,
+                        codeName: name,
+                        expertIndex: expertIndex
+                    )
                 sink.buffer[index] = StagedExpertCode(
                     tensor: tensor,
                     array: array,
@@ -808,25 +827,6 @@ public struct DeepSeekWeightLoader {
             return nil
         }
 
-        // Whole-tensor code bytes: staged layer buffer first, then the pinned
-        // hash-layer store. Both hold the exact stacked tensor bytes.
-        let codesTensor: MaterializedTensor?
-        if let staged = expertLayerStager?.stagedBytes(recordName: candidate),
-           staged.count == record.byteLength,
-           let dtype = try? TensorDType.parse(record.dtype) {
-            codesTensor = try? MaterializedTensor(
-                name: candidate,
-                dtype: dtype,
-                shape: record.shape,
-                bytes: staged
-            )
-        } else {
-            codesTensor = pinnedExpertCodes?.materializedTensor(named: candidate, firstAxisIndex: nil)
-        }
-        guard let codesTensor, let weightArray = try? bridge.makeArray(from: codesTensor) else {
-            return nil
-        }
-
         let scalesName = Self.companionName(for: candidate, suffix: "scales")
         guard let scalesRecord = expertBank.record(named: scalesName),
               scalesRecord.shape.count == expectedShape.count + 1,
@@ -836,47 +836,82 @@ public struct DeepSeekWeightLoader {
         else {
             return nil
         }
-        let scalesTensor: MaterializedTensor?
-        if let resident = residentExpertScales?.materializedTensor(named: scalesName, firstAxisIndex: nil) {
-            scalesTensor = resident
-        } else if let staged = expertLayerStager?.stagedBytes(recordName: scalesName),
-                  staged.count == scalesRecord.byteLength,
-                  let dtype = try? TensorDType.parse(scalesRecord.dtype) {
-            scalesTensor = try? MaterializedTensor(
-                name: scalesName,
-                dtype: dtype,
-                shape: scalesRecord.shape,
-                bytes: staged
-            )
-        } else {
-            scalesTensor = nil
-        }
-        guard let scalesTensor, let scalesArray = try? bridge.makeArray(from: scalesTensor) else {
-            return nil
-        }
-
         let biasesName = Self.companionName(for: candidate, suffix: "biases")
-        var biasesArray: MLXArray?
-        if let biasesRecord = expertBank.record(named: biasesName) {
-            // Biases exist but are only in RAM when staged; without them the
-            // batched path cannot reproduce the affine math — bail out.
-            guard let staged = expertLayerStager?.stagedBytes(recordName: biasesName),
-                  staged.count == biasesRecord.byteLength,
-                  let dtype = try? TensorDType.parse(biasesRecord.dtype),
-                  let tensor = try? MaterializedTensor(
-                      name: biasesName,
-                      dtype: dtype,
-                      shape: biasesRecord.shape,
-                      bytes: staged
-                  ),
-                  let array = try? bridge.makeArray(from: tensor)
-            else {
+
+        let weightArray: MLXArray
+        let scalesArray: MLXArray
+        let biasesArray: MLXArray?
+        let scalesDType: TensorDType
+        if let pinned = pinnedStackedExpertArrays?.projection(named: candidate) {
+            weightArray = pinned.weight
+            scalesArray = pinned.scales
+            biasesArray = pinned.biases
+            scalesDType = pinned.scalesDType
+        } else {
+            // Whole-tensor code bytes: staged layer buffer first, then the pinned
+            // hash-layer store. Both hold the exact stacked tensor bytes.
+            let codesTensor: MaterializedTensor?
+            if let staged = expertLayerStager?.stagedBytes(recordName: candidate),
+               staged.count == record.byteLength,
+               let dtype = try? TensorDType.parse(record.dtype) {
+                codesTensor = try? MaterializedTensor(
+                    name: candidate,
+                    dtype: dtype,
+                    shape: record.shape,
+                    bytes: staged
+                )
+            } else {
+                codesTensor = pinnedExpertCodes?.materializedTensor(named: candidate, firstAxisIndex: nil)
+            }
+            guard let codesTensor, let array = try? bridge.makeArray(from: codesTensor) else {
                 return nil
             }
-            biasesArray = array
+            weightArray = array
+
+            let scalesTensor: MaterializedTensor?
+            if let resident = residentExpertScales?.materializedTensor(named: scalesName, firstAxisIndex: nil) {
+                scalesTensor = resident
+            } else if let staged = expertLayerStager?.stagedBytes(recordName: scalesName),
+                      staged.count == scalesRecord.byteLength,
+                      let dtype = try? TensorDType.parse(scalesRecord.dtype) {
+                scalesTensor = try? MaterializedTensor(
+                    name: scalesName,
+                    dtype: dtype,
+                    shape: scalesRecord.shape,
+                    bytes: staged
+                )
+            } else {
+                scalesTensor = nil
+            }
+            guard let scalesTensor, let array = try? bridge.makeArray(from: scalesTensor) else {
+                return nil
+            }
+            scalesArray = array
+            scalesDType = scalesTensor.dtype
+
+            var stagedBiasesArray: MLXArray?
+            if let biasesRecord = expertBank.record(named: biasesName) {
+                // Biases exist but are only in RAM when staged; without them the
+                // batched path cannot reproduce the affine math — bail out.
+                guard let staged = expertLayerStager?.stagedBytes(recordName: biasesName),
+                      staged.count == biasesRecord.byteLength,
+                      let dtype = try? TensorDType.parse(biasesRecord.dtype),
+                      let tensor = try? MaterializedTensor(
+                          name: biasesName,
+                          dtype: dtype,
+                          shape: biasesRecord.shape,
+                          bytes: staged
+                      ),
+                      let array = try? bridge.makeArray(from: tensor)
+                else {
+                    return nil
+                }
+                stagedBiasesArray = array
+            }
+            biasesArray = stagedBiasesArray
         }
 
-        let mode: QuantizationMode = biasesArray == nil && scalesTensor.dtype == .u8 ? .mxfp4 : .affine
+        let mode: QuantizationMode = biasesArray == nil && scalesDType == .u8 ? .mxfp4 : .affine
         return StackedExpertProjection(
             weight: weightArray,
             scales: scalesArray,

@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 import MLXFastCore
 
 /// RAM-resident copies of selected routed-expert tensors, serving
@@ -116,6 +117,91 @@ public final class ResidentExpertTensors {
     }
 }
 
+/// MLXArray-backed whole stacked projections for RAM-pinned hash-MoE code
+/// tensors. Construction happens during loader/runtime initialization, outside
+/// scored windows, and every array is built from the same resident bytes that
+/// the per-call path would bridge later. Scored decode and resident prefill then
+/// take first-axis views of these arrays instead of repeatedly constructing the
+/// same whole-tensor MLXArray descriptors/copies.
+public final class PinnedStackedExpertArrayCache {
+    public struct Projection {
+        public let weight: MLXArray
+        public let scales: MLXArray
+        public let biases: MLXArray?
+        public let scalesDType: TensorDType
+    }
+
+    private let projections: [String: Projection]
+
+    public init?(
+        manifestPath: String,
+        pinnedCodes: ResidentExpertTensors?,
+        residentScales: ResidentExpertTensors?,
+        bridge: MLXArrayTensorBridge
+    ) {
+        guard let pinnedCodes, let residentScales,
+              let bank = try? ExpertSlotBank(manifestPath: manifestPath, capacity: 0, metrics: nil)
+        else {
+            return nil
+        }
+
+        var loaded: [String: Projection] = [:]
+        for record in bank.manifest.expertTensors {
+            guard record.dtype == "U32",
+                  pinnedCodes.isResident(name: record.name),
+                  let codesTensor = pinnedCodes.materializedTensor(named: record.name, firstAxisIndex: nil),
+                  let weightArray = try? bridge.makeArray(from: codesTensor)
+            else {
+                continue
+            }
+
+            let scalesName = Self.companionName(for: record.name, suffix: "scales")
+            guard let scalesTensor = residentScales.materializedTensor(named: scalesName, firstAxisIndex: nil),
+                  let scalesArray = try? bridge.makeArray(from: scalesTensor)
+            else {
+                continue
+            }
+
+            let biasesName = Self.companionName(for: record.name, suffix: "biases")
+            var biasesArray: MLXArray?
+            if bank.record(named: biasesName) != nil {
+                // Pinned hash-code residency intentionally covers code tensors;
+                // if a quantized affine companion bias exists but is not resident
+                // here, leave this projection uncached so the caller's existing
+                // staged/streamed path preserves behavior.
+                guard let biasesTensor = residentScales.materializedTensor(named: biasesName, firstAxisIndex: nil),
+                      let array = try? bridge.makeArray(from: biasesTensor)
+                else {
+                    continue
+                }
+                biasesArray = array
+            }
+
+            loaded[record.name] = Projection(
+                weight: weightArray,
+                scales: scalesArray,
+                biases: biasesArray,
+                scalesDType: scalesTensor.dtype
+            )
+        }
+        guard !loaded.isEmpty else {
+            return nil
+        }
+        self.projections = loaded
+    }
+
+    public func projection(named name: String) -> Projection? {
+        projections[name]
+    }
+
+    private static func companionName(for weightName: String, suffix: String) -> String {
+        if weightName.hasSuffix(".weight") {
+            return String(weightName.dropLast(".weight".count)) + ".\(suffix)"
+        }
+        return "\(weightName).\(suffix)"
+    }
+}
+
 extension ResidentExpertTensors {
     /// All `*.scales` records — the store behind resident expert scales.
     public convenience init?(scalesFromManifest manifestPath: String, metrics: ExpertStreamingMetrics?) {
@@ -161,6 +247,7 @@ extension ResidentExpertTensors {
 public enum ResidentExpertStoreRegistry {
     private static let scalesCache = LockedCache<String, ResidentExpertTensors?>()
     private static let pinnedCodesCache = LockedCache<String, ResidentExpertTensors?>()
+    private static let pinnedStackedArrayCache = LockedCache<String, PinnedStackedExpertArrayCache?>()
 
     public static func scales(
         manifestPath: String,
@@ -181,6 +268,25 @@ public enum ResidentExpertStoreRegistry {
                 hashLayerCodesFromManifest: manifestPath,
                 hashLayerCount: hashLayerCount,
                 metrics: metrics
+            )
+        }
+    }
+
+    public static func pinnedStackedArrays(
+        manifestPath: String,
+        pinnedCodes: ResidentExpertTensors?,
+        residentScales: ResidentExpertTensors?,
+        bridge: MLXArrayTensorBridge
+    ) -> PinnedStackedExpertArrayCache? {
+        guard pinnedCodes != nil, residentScales != nil else {
+            return nil
+        }
+        return pinnedStackedArrayCache.value(for: manifestPath) {
+            PinnedStackedExpertArrayCache(
+                manifestPath: manifestPath,
+                pinnedCodes: pinnedCodes,
+                residentScales: residentScales,
+                bridge: bridge
             )
         }
     }
