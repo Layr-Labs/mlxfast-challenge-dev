@@ -193,6 +193,15 @@ public enum DeepSeekModel {
             hidden = try layer(layerIndex, hidden)
         }
 
+        // The only consumers of the returned logits read the last sequence
+        // position (greedy/top-logits); the head collapse, final norm, and
+        // lm_head are per-position ops, so slice to the last position first
+        // and skip their compute over the dead rows.
+        if hidden.shape[1] > 1 {
+            let last = hidden.shape[1] - 1
+            hidden = hidden[0..., last..., 0..., 0...]
+        }
+
         let collapsed = try DeepSeekHyperConnection.head(
             hidden,
             fn: weights.headHyperConnection.fn,
