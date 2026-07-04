@@ -148,8 +148,9 @@ public enum DeepSeekMoE {
         routeWeights: MLXArray,
         sharedExpertOutput: MLXArray
     ) -> MLXArray {
+        let typedRouteWeights = DeepSeekOps.cast(routeWeights, to: routedExpertOutput.dtype)
         let weightedRouted = (
-            routedExpertOutput * routeWeights.expandedDimensions(axis: -1).asType(routedExpertOutput.dtype)
+            routedExpertOutput * typedRouteWeights.expandedDimensions(axis: -1)
         ).sum(axis: -2)
         return weightedRouted + sharedExpertOutput
     }

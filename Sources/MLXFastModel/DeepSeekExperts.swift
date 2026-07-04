@@ -76,7 +76,15 @@ public enum DeepSeekRoutedExperts {
             stagingScheduled = true
         }
 
-        let selectedExperts = expertIndices.asArray(Int32.self).map(Int.init)
+        let outputCount = tokenCount * topK
+        let selectedExperts = (
+            tokenCount == 1
+                ? loader.consumeDecodeHostExpertIndices(
+                    layerIndex: spec.layerIndex,
+                    expectedCount: outputCount
+                )
+                : nil
+        ) ?? expertIndices.asArray(Int32.self).map(Int.init)
         let useStaged = stagingScheduled
             && loader.expertLayerStager?.waitForLayer(spec.layerIndex) == true
         defer {
@@ -90,7 +98,6 @@ public enum DeepSeekRoutedExperts {
             loader.expertPrefetcher.prefetch(layerIndex: spec.layerIndex, expertIndices: selectedExperts)
         }
 
-        let outputCount = tokenCount * topK
         guard outputCount > 0 else {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
         }
@@ -208,16 +215,11 @@ public enum DeepSeekRoutedExperts {
             scatterOrder.append(contentsOf: flatIndices)
         }
 
-        let combined = concatenated(expertOutputs, axis: 0)
-
-        // scatterOrder[row] is the activation flat index that produced combined
-        // row `row`. Invert it so a single gather places every output back into
-        // activation order, replacing the previous per-row scatter loop.
-        var inverse = [Int32](repeating: 0, count: outputCount)
-        for (row, flatIndex) in scatterOrder.enumerated() {
-            inverse[flatIndex] = Int32(row)
-        }
-        let ordered = combined.take(MLXArray(inverse), axis: 0)
+        let ordered = orderedCombined(
+            concatenated(expertOutputs, axis: 0),
+            scatterOrder: scatterOrder,
+            outputCount: outputCount
+        )
 
         return ordered.reshaped([batchSize, sequenceLength, topK, hiddenSize])
     }
@@ -359,13 +361,30 @@ public enum DeepSeekRoutedExperts {
             segmentStart += segmentLengths[index]
         }
 
-        let combined = concatenated(expertOutputs, axis: 0)
+        let ordered = orderedCombined(
+            concatenated(expertOutputs, axis: 0),
+            scatterOrder: scatterOrder,
+            outputCount: outputCount
+        )
+        return ordered.reshaped([batchSize, sequenceLength, topK, spec.hiddenSize])
+    }
+
+    private static func orderedCombined(
+        _ combined: MLXArray,
+        scatterOrder: [Int],
+        outputCount: Int
+    ) -> MLXArray {
+        if scatterOrder.enumerated().allSatisfy({ pair in pair.offset == pair.element }) {
+            return combined
+        }
+        // scatterOrder[row] is the activation flat index that produced combined
+        // row `row`. Invert it so a single gather places every output back into
+        // activation order, replacing the previous per-row scatter loop.
         var inverse = [Int32](repeating: 0, count: outputCount)
         for (row, flatIndex) in scatterOrder.enumerated() {
             inverse[flatIndex] = Int32(row)
         }
-        let ordered = combined.take(MLXArray(inverse), axis: 0)
-        return ordered.reshaped([batchSize, sequenceLength, topK, spec.hiddenSize])
+        return combined.take(MLXArray(inverse), axis: 0)
     }
 
     public static func weights(

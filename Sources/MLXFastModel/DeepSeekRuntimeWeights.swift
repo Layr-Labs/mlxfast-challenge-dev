@@ -40,6 +40,10 @@ public final class DeepSeekRuntimeWeightCache {
                 continue
             }
             let experts = entry.table[base..<(base + entry.topK)].map(Int.init)
+            loader.rememberDecodeHostExpertIndices(
+                layerIndex: entry.layerIndex,
+                expertIndices: experts
+            )
             if entry.layerIndex == 0, loader.pinnedExpertCodes != nil {
                 continue
             }
@@ -50,10 +54,18 @@ public final class DeepSeekRuntimeWeightCache {
                 intermediateSize: config.moeIntermediateSize
             )
             if !fullyPinned {
-                loader.expertPrefetcher.prefetch(
+                let scheduled = loader.scheduleDecodeExpertCodes(
                     layerIndex: entry.layerIndex,
-                    expertIndices: experts
+                    expertIndices: experts,
+                    hiddenSize: config.hiddenSize,
+                    intermediateSize: config.moeIntermediateSize
                 )
+                if !scheduled {
+                    loader.expertPrefetcher.prefetch(
+                        layerIndex: entry.layerIndex,
+                        expertIndices: experts
+                    )
+                }
             }
         }
     }
