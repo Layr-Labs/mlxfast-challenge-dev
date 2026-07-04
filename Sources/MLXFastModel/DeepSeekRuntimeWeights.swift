@@ -58,6 +58,16 @@ public final class DeepSeekRuntimeWeightCache {
         }
     }
 
+    public func hashLayerExpertIndices(layerIndex: Int, token: Int) -> [Int]? {
+        guard token >= 0 else { return nil }
+        guard let entry = hashLayerTables.first(where: { $0.layerIndex == layerIndex }) else {
+            return nil
+        }
+        let base = token * entry.topK
+        guard base + entry.topK <= entry.table.count else { return nil }
+        return entry.table[base..<(base + entry.topK)].map(Int.init)
+    }
+
     /// For full-size checkpoints, populate every memoized weight struct and
     /// spec and warm the hot Metal kernels during construction. The runtime
     /// worker constructs this cache before the benchmark handshake, so the

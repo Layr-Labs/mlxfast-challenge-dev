@@ -101,7 +101,8 @@ public enum DeepSeekMoE {
         inputIDs: MLXArray?,
         weights: DeepSeekMoEWeights,
         loader: DeepSeekWeightLoader,
-        spec: DeepSeekMoESpec
+        spec: DeepSeekMoESpec,
+        hostSelectedExperts: [Int]? = nil
     ) throws -> MLXArray {
         let routing = try DeepSeekMoEGate.route(
             hidden: x,
@@ -134,6 +135,7 @@ public enum DeepSeekMoE {
             expertIndices: routing.indices,
             loader: loader,
             spec: spec.routedExperts,
+            hostSelectedExperts: hostSelectedExperts,
             onRoutingSynced: { eval(shared) }
         )
         return combine(

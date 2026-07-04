@@ -36,6 +36,7 @@ public enum DeepSeekRoutedExperts {
         expertIndices: MLXArray,
         loader: DeepSeekWeightLoader,
         spec: DeepSeekRoutedExpertSpec,
+        hostSelectedExperts: [Int]? = nil,
         onRoutingSynced: (() -> Void)? = nil
     ) throws -> MLXArray {
         guard x.shape.count == 3 else {
@@ -76,7 +77,16 @@ public enum DeepSeekRoutedExperts {
             stagingScheduled = true
         }
 
-        let selectedExperts = expertIndices.asArray(Int32.self).map(Int.init)
+        let outputCount = tokenCount * topK
+        let selectedExperts: [Int]
+        if tokenCount == 1,
+           let hostSelectedExperts,
+           hostSelectedExperts.count == outputCount
+        {
+            selectedExperts = hostSelectedExperts
+        } else {
+            selectedExperts = expertIndices.asArray(Int32.self).map(Int.init)
+        }
         let useStaged = stagingScheduled
             && loader.expertLayerStager?.waitForLayer(spec.layerIndex) == true
         defer {
@@ -90,7 +100,6 @@ public enum DeepSeekRoutedExperts {
             loader.expertPrefetcher.prefetch(layerIndex: spec.layerIndex, expertIndices: selectedExperts)
         }
 
-        let outputCount = tokenCount * topK
         guard outputCount > 0 else {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
         }
