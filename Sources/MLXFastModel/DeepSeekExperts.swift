@@ -147,6 +147,29 @@ public enum DeepSeekRoutedExperts {
             )
         }
 
+        if tokenCount == 1, selectedExperts.count == topK, Set(selectedExperts).count == selectedExperts.count {
+            var routeOutputs: [MLXArray] = []
+            routeOutputs.reserveCapacity(topK)
+            for expertIndex in selectedExperts {
+                let expertWeights = try weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec,
+                    preferStaged: useStaged,
+                    decodePrefetch: decodePrefetch
+                )
+                routeOutputs.append(
+                    DeepSeekMLP.forward(
+                        xFlat,
+                        weights: expertWeights,
+                        swigluLimit: spec.swigluLimit
+                    )
+                )
+            }
+            return concatenated(routeOutputs, axis: 0)
+                .reshaped([batchSize, sequenceLength, topK, hiddenSize])
+        }
+
         var expertOutputs: [MLXArray] = []
         expertOutputs.reserveCapacity(flatIndicesByExpert.count)
         var scatterOrder: [Int] = []
@@ -160,8 +183,13 @@ public enum DeepSeekRoutedExperts {
                 preferStaged: useStaged,
                 decodePrefetch: decodePrefetch
             )
-            let tokenRows = flatIndices.map { Int32($0 / topK) }
-            let tokens = xFlat.take(MLXArray(tokenRows), axis: 0)
+            let tokens: MLXArray
+            if tokenCount == 1, flatIndices.count == 1 {
+                tokens = xFlat
+            } else {
+                let tokenRows = flatIndices.map { Int32($0 / topK) }
+                tokens = xFlat.take(MLXArray(tokenRows), axis: 0)
+            }
             let expertOutput = DeepSeekMLP.forward(
                 tokens,
                 weights: expertWeights,

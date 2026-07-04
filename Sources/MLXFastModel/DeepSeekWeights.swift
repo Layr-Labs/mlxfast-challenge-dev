@@ -113,9 +113,10 @@ public struct DeepSeekWeightLoader {
     private let scheduledPinnedDecodePrefetches = ScheduledDecodePrefetches()
 
     /// Sized for the official 48 GB runner: pin only where at least that
-    /// budget exists, and never more than two layers of codes (~6.4 GiB).
+    /// budget exists, and never more than the three token-id-routed layers of
+    /// codes (~9.6 GiB).
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
-    private static let pinnedHashLayerCap = 2
+    private static let pinnedHashLayerCap = 3
 
     public init(
         weightsPath: String,
@@ -146,9 +147,10 @@ public struct DeepSeekWeightLoader {
         )
         // Pinning trades RAM for guaranteed hits on the token-id-routed
         // layers; only worthwhile at the official 48 GB budget or above,
-        // and capped so the pinned codes (~3.2 GiB per layer) leave headroom
-        // for the resident scales, staging buffers, and page cache inside
-        // that budget. Both constants encode the OFFICIAL runner's memory
+        // and capped at the hash-routed prefix so the pinned codes (~3.2 GiB
+        // per layer) leave headroom for the resident scales, staging buffers,
+        // and page cache inside that budget. Both constants encode the
+        // OFFICIAL runner's memory
         // math — do not raise them because a larger local machine has room.
         let hashLayerCount = (try? DeepSeekConfig.load(from: weightsPath))?.numHashLayers ?? 0
         self.pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
