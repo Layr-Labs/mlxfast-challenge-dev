@@ -85,6 +85,14 @@ public enum SwiftTransform {
             index: index
         )
 
+        if ProcessInfo.processInfo.environment["MLXFAST_DISABLE_BLOCK_ANCHOR_CENSUS"] != "1" {
+            _ = try BlockLocalAnchorPatchCensus.run(
+                referenceDirectory: referenceDirectory,
+                manifestPath: manifestPath,
+                outputDirectory: expertsDirectory
+            )
+        }
+
         return TransformReport(
             referencePath: referenceDirectory.path,
             outputPath: outputDirectory.path,
