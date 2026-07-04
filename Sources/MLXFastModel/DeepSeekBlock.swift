@@ -127,6 +127,9 @@ public enum DeepSeekBlock {
             post: feedForwardMix.post,
             combination: feedForwardMix.combination
         )
+        if hidden.shape.count >= 2, hidden.shape[1] == 1 {
+            asyncEval(hidden)
+        }
         return hidden
     }
 }
