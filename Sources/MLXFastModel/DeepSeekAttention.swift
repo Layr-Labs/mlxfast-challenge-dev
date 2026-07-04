@@ -362,6 +362,28 @@ public enum DeepSeekKVCompressor {
             throw MLXFastError.invalidInput("compressor ratio must be positive")
         }
 
+        if spec.compressRatio == 128 {
+            let ready = try poolingCache.accumulateInputWindows(
+                x,
+                offset: positionOffset
+            )
+            guard ready.input.shape[1] > 0 else {
+                return poolingCache.updateAndFetch(
+                    zeros([x.shape[0], 0, spec.headDim], dtype: x.dtype)
+                )
+            }
+            let kv = DeepSeekOps.linear(input: ready.input, weight: weights.wkv)
+            let gate = DeepSeekOps.linear(input: ready.input, weight: weights.wgate)
+            let newPooled = try compressReadyWindows(
+                kv: kv,
+                gate: gate,
+                weights: weights,
+                spec: spec,
+                positionOffset: ready.baseOffset
+            )
+            return poolingCache.updateAndFetch(newPooled)
+        }
+
         let kv = DeepSeekOps.linear(input: x, weight: weights.wkv)
         let gate = DeepSeekOps.linear(input: x, weight: weights.wgate)
         let ready = try poolingCache.accumulateWindows(

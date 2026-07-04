@@ -66,8 +66,14 @@ public struct DeepSeekPoolingWindow {
     public let baseOffset: Int
 }
 
+public struct DeepSeekInputPoolingWindow {
+    public let input: MLXArray
+    public let baseOffset: Int
+}
+
 public final class DeepSeekPoolingCache {
     public let ratio: Int
+    private var bufferedInput: MLXArray?
     private var bufferedKV: MLXArray?
     private var bufferedGate: MLXArray?
     private var pooled: MLXArray?
@@ -78,6 +84,42 @@ public final class DeepSeekPoolingCache {
 
     public var pooledLength: Int {
         pooled?.shape[1] ?? 0
+    }
+
+    public func accumulateInputWindows(
+        _ newInput: MLXArray,
+        offset: Int
+    ) throws -> DeepSeekInputPoolingWindow {
+        guard ratio > 0 else {
+            throw MLXFastError.invalidInput("pooling cache ratio must be positive")
+        }
+        guard newInput.shape.count == 3 else {
+            throw MLXFastError.invalidInput("pooling cache input must have shape [batch, length, hidden]")
+        }
+
+        let previousRemainder = bufferedInput?.shape[1] ?? 0
+        let combinedInput = bufferedInput.map { concatenated([$0, newInput], axis: 1) } ?? newInput
+        let total = combinedInput.shape[1]
+        let usable = (total / ratio) * ratio
+        let remainder = total - usable
+
+        let readyInput: MLXArray
+        if usable > 0 {
+            readyInput = combinedInput[0..., 0..<usable, 0...]
+        } else {
+            readyInput = zeros([newInput.shape[0], 0, newInput.shape[2]], dtype: newInput.dtype)
+        }
+
+        if remainder > 0 {
+            bufferedInput = combinedInput[0..., usable..., 0...]
+        } else {
+            bufferedInput = nil
+        }
+
+        return DeepSeekInputPoolingWindow(
+            input: readyInput,
+            baseOffset: offset - previousRemainder
+        )
     }
 
     public func accumulateWindows(
@@ -153,7 +195,7 @@ public final class DeepSeekPoolingCache {
     }
 
     func arraysForMaterialization() -> [MLXArray] {
-        [bufferedKV, bufferedGate, pooled].compactMap { $0 }
+        [bufferedInput, bufferedKV, bufferedGate, pooled].compactMap { $0 }
     }
 }
 
