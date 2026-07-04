@@ -341,14 +341,16 @@ public struct DeepSeekWeightLoader {
                 }
                 let scalesName = Self.companionName(for: candidate, suffix: "scales")
                 let biasesName = Self.companionName(for: candidate, suffix: "biases")
+                let scalesRecord = expertBank.record(named: scalesName)
+                let biasesRecord = expertBank.record(named: biasesName)
                 plans[RoutedExpertProjectionKey(layerIndex: layerIndex, projection: projection)] =
                     RoutedExpertProjectionPlan(
                         name: candidate,
                         record: record,
                         scalesName: scalesName,
-                        scalesRecord: expertBank.record(named: scalesName),
+                        scalesRecord: scalesRecord,
                         biasesName: biasesName,
-                        biasesRecord: expertBank.record(named: biasesName),
+                        biasesRecord: biasesRecord,
                         decodePrefetchKeys: (0..<expertCount).map { Self.decodePrefetchKey(candidate, $0) }
                     )
             }
@@ -504,6 +506,33 @@ public struct DeepSeekWeightLoader {
             }
         }
         return map.isEmpty ? nil : map
+    }
+
+    /// Starts the normal decode side-bank prebuild before a layer reaches MoE.
+    /// This is useful for hash-routed layers where the selected experts are
+    /// known from the token id at decode entry even when their code tensors are
+    /// not RAM-pinned. If the scheduled work misses the consume window, callers
+    /// fall back to the synchronous prefetch path and preserve behavior.
+    @discardableResult
+    public func scheduleDecodeExpertCodes(
+        layerIndex: Int,
+        expertIndices: [Int],
+        hiddenSize: Int,
+        intermediateSize: Int
+    ) -> Bool {
+        guard decodeSideBank != nil, expertBank.capacity > 0, !expertIndices.isEmpty else {
+            scheduledPinnedDecodePrefetches.remove(layerIndex: layerIndex)
+            return false
+        }
+        scheduledPinnedDecodePrefetches.schedule(layerIndex: layerIndex) {
+            prefetchDecodeExpertCodes(
+                layerIndex: layerIndex,
+                expertIndices: expertIndices,
+                hiddenSize: hiddenSize,
+                intermediateSize: intermediateSize
+            )
+        }
+        return true
     }
 
     /// Starts building resident pinned-code decode slices for a hash-routed
@@ -978,85 +1007,87 @@ public struct DeepSeekWeightLoader {
         decodePrefetch: [String: StagedExpertCode]?,
         plan: RoutedExpertProjectionPlan?
     ) throws -> DeepSeekLinearWeight {
-            let isStacked = record.shape.count == expectedShape.count + 1
-                && record.shape.first.map { expertIndex < $0 } == true
-            let tensor: MaterializedTensor
-            // When present, a base weight MLXArray already built off the compute
-            // thread by prefetchDecodeExpertCodes (byte-identical to
-            // bridge.makeArray(from: tensor)); using it skips the eager
-            // Data->Metal copy here on the compute thread.
-            var prebuiltWeightArray: MLXArray?
-            var prebuiltScalesArray: MLXArray?
-            let prefetchKey = plan?.decodePrefetchKey(for: expertIndex)
-                ?? Self.decodePrefetchKey(candidate, expertIndex)
-            if isStacked,
-               let prefetched = decodePrefetch?[prefetchKey] {
-                // Concurrently pre-read slice + pre-built base arrays (decode
-                // side-bank, pinned resident prebuild, OR prefill staged-buffer).
-                // Checked before the resident/staged fallbacks so prebuilt base
-                // arrays are used when present.
-                tensor = prefetched.tensor
-                prebuiltWeightArray = prefetched.array
-                prebuiltScalesArray = prefetched.scalesArray
-            } else if isStacked,
-               let pinned = pinnedExpertCodes?.materializedTensor(
-                   named: candidate,
-                   firstAxisIndex: expertIndex
-               ) {
-                tensor = pinned
-            } else if preferStaged, isStacked,
-               let staged = stagedSliceTensor(recordName: candidate, expertIndex: expertIndex) {
-                tensor = staged
-            } else if isStacked {
-                tensor = try expertBank.materializedTensor(named: candidate, firstAxisIndex: expertIndex)
-            } else {
-                tensor = try expertBank.materializedTensor(named: candidate)
-            }
-            return try linearWeight(
-                baseName: candidate,
-                expectedShape: expectedShape,
-                tensor: tensor,
-                prebuiltWeightArray: prebuiltWeightArray,
-                prebuiltScalesArray: prebuiltScalesArray,
-                companionTensor: { companionName, shouldSlice in
-                    if let resident = residentExpertScales?.materializedTensor(
-                        named: companionName,
-                        firstAxisIndex: shouldSlice ? expertIndex : nil
-                    ) {
-                        return resident
-                    }
-                    if preferStaged, shouldSlice,
-                       let staged = stagedSliceTensor(
-                           recordName: companionName,
-                           expertIndex: expertIndex
-                        ) {
-                        return staged
-                    }
-                    if let plan {
-                        if companionName == plan.scalesName {
-                            guard plan.scalesRecord != nil else {
-                                return nil
-                            }
-                        } else if companionName == plan.biasesName {
-                            guard plan.biasesRecord != nil else {
-                                return nil
-                            }
-                        } else {
-                            guard expertBank.record(named: companionName) != nil else {
-                                return nil
-                            }
+        let isStacked = record.shape.count == expectedShape.count + 1
+            && record.shape.first.map { expertIndex < $0 } == true
+        let tensor: MaterializedTensor
+        // When present, a base weight MLXArray already built off the compute
+        // thread by prefetchDecodeExpertCodes (byte-identical to
+        // bridge.makeArray(from: tensor)); using it skips the eager
+        // Data->Metal copy here on the compute thread.
+        var prebuiltWeightArray: MLXArray?
+        var prebuiltScalesArray: MLXArray?
+        let prefetchKey = plan?.decodePrefetchKey(for: expertIndex)
+            ?? Self.decodePrefetchKey(candidate, expertIndex)
+        if isStacked,
+           let prefetched = decodePrefetch?[prefetchKey] {
+            // Concurrently pre-read slice + pre-built base arrays (decode
+            // side-bank, pinned resident prebuild, OR prefill staged-buffer).
+            // Checked before the resident/staged fallbacks so prebuilt base
+            // arrays are used when present.
+            tensor = prefetched.tensor
+            prebuiltWeightArray = prefetched.array
+            prebuiltScalesArray = prefetched.scalesArray
+        } else if isStacked,
+           let pinned = pinnedExpertCodes?.materializedTensor(
+               named: candidate,
+               firstAxisIndex: expertIndex
+           ) {
+            tensor = pinned
+        } else if preferStaged, isStacked,
+                  let staged = stagedSliceTensor(recordName: candidate, expertIndex: expertIndex)
+        {
+            tensor = staged
+        } else if isStacked {
+            tensor = try expertBank.materializedTensor(named: candidate, firstAxisIndex: expertIndex)
+        } else {
+            tensor = try expertBank.materializedTensor(named: candidate)
+        }
+        return try linearWeight(
+            baseName: candidate,
+            expectedShape: expectedShape,
+            tensor: tensor,
+            prebuiltWeightArray: prebuiltWeightArray,
+            prebuiltScalesArray: prebuiltScalesArray,
+            companionTensor: { companionName, shouldSlice in
+                if let resident = residentExpertScales?.materializedTensor(
+                    named: companionName,
+                    firstAxisIndex: shouldSlice ? expertIndex : nil
+                ) {
+                    return resident
+                }
+                if preferStaged, shouldSlice,
+                   let staged = stagedSliceTensor(
+                       recordName: companionName,
+                       expertIndex: expertIndex
+                   )
+                {
+                    return staged
+                }
+                if let plan {
+                    if companionName == plan.scalesName {
+                        guard plan.scalesRecord != nil else {
+                            return nil
+                        }
+                    } else if companionName == plan.biasesName {
+                        guard plan.biasesRecord != nil else {
+                            return nil
                         }
                     } else {
                         guard expertBank.record(named: companionName) != nil else {
                             return nil
                         }
                     }
-                    return try shouldSlice
-                        ? expertBank.materializedTensor(named: companionName, firstAxisIndex: expertIndex)
-                        : expertBank.materializedTensor(named: companionName)
-                },
-                shouldSliceCompanions: isStacked
-            )
+                } else {
+                    guard expertBank.record(named: companionName) != nil else {
+                        return nil
+                    }
+                }
+                return try shouldSlice
+                    ? expertBank.materializedTensor(named: companionName, firstAxisIndex: expertIndex)
+                    : expertBank.materializedTensor(named: companionName)
+            },
+            shouldSliceCompanions: isStacked
+        )
     }
 
     /// Stacked expert record names for one layer, for whole-tensor staging:

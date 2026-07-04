@@ -50,10 +50,18 @@ public final class DeepSeekRuntimeWeightCache {
                 intermediateSize: config.moeIntermediateSize
             )
             if !fullyPinned {
-                loader.expertPrefetcher.prefetch(
+                let scheduled = loader.scheduleDecodeExpertCodes(
                     layerIndex: entry.layerIndex,
-                    expertIndices: experts
+                    expertIndices: experts,
+                    hiddenSize: config.hiddenSize,
+                    intermediateSize: config.moeIntermediateSize
                 )
+                if !scheduled {
+                    loader.expertPrefetcher.prefetch(
+                        layerIndex: entry.layerIndex,
+                        expertIndices: experts
+                    )
+                }
             }
         }
     }
