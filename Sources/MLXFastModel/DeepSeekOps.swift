@@ -3,6 +3,12 @@ import MLX
 import MLXFastCore
 
 public enum DeepSeekOps {
+    private static let gatherGroupIndexCache = GatherGroupIndexCache()
+
+    private static func gatherGroupIndices(count: Int) -> MLXArray {
+        gatherGroupIndexCache.indices(count: count)
+    }
+
     /// Cast that skips the graph node when the array is already in the target
     /// dtype (MLXArray.asType emits a node even for a no-op cast).
     public static func cast(_ input: MLXArray, to dtype: DType) -> MLXArray {
@@ -100,7 +106,7 @@ public enum DeepSeekOps {
                 biases: weight.biases.map {
                     $0.reshaped([groupCount, outputDimensions, scaleGroups])
                 },
-                rhsIndices: MLXArray((0..<Int32(groupCount)).map { $0 }),
+                rhsIndices: gatherGroupIndices(count: groupCount),
                 transpose: true,
                 groupSize: weight.groupSize,
                 bits: weight.bits,
@@ -143,5 +149,21 @@ public enum DeepSeekOps {
         let cappedGate = minimum(gate, Float(limit))
         let clippedUp = clip(up, min: Float(-limit), max: Float(limit))
         return silu(cappedGate) * clippedUp
+    }
+}
+
+private final class GatherGroupIndexCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var arrays: [Int: MLXArray] = [:]
+
+    func indices(count: Int) -> MLXArray {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = arrays[count] {
+            return cached
+        }
+        let array = MLXArray((0..<Int32(count)).map { $0 })
+        arrays[count] = array
+        return array
     }
 }

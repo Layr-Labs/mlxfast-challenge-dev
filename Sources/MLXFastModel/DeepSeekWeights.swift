@@ -506,6 +506,33 @@ public struct DeepSeekWeightLoader {
         return map.isEmpty ? nil : map
     }
 
+    /// Starts the normal decode side-bank prebuild before a layer reaches MoE.
+    /// This is useful for hash-routed layers where the selected experts are
+    /// known from the token id at decode entry even when their code tensors are
+    /// not RAM-pinned. If the scheduled work misses the consume window, callers
+    /// fall back to the synchronous prefetch path and preserve behavior.
+    @discardableResult
+    public func scheduleDecodeExpertCodes(
+        layerIndex: Int,
+        expertIndices: [Int],
+        hiddenSize: Int,
+        intermediateSize: Int
+    ) -> Bool {
+        guard decodeSideBank != nil, expertBank.capacity > 0, !expertIndices.isEmpty else {
+            scheduledPinnedDecodePrefetches.remove(layerIndex: layerIndex)
+            return false
+        }
+        scheduledPinnedDecodePrefetches.schedule(layerIndex: layerIndex) {
+            prefetchDecodeExpertCodes(
+                layerIndex: layerIndex,
+                expertIndices: expertIndices,
+                hiddenSize: hiddenSize,
+                intermediateSize: intermediateSize
+            )
+        }
+        return true
+    }
+
     /// Starts building resident pinned-code decode slices for a hash-routed
     /// layer before that layer reaches MoE. Only the first two hash layers are
     /// pinned on the official runner; unpinned layers return false so callers
