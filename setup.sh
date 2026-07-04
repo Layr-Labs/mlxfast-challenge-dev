@@ -65,12 +65,12 @@ Important environment variables:
                                      one checkpoint) used for new downloads when
                                      MLXFAST_REFERENCE_DIR is not set.
                                      Default: ${REFERENCE_CACHE_DIR}
-  MLXFAST_REFERENCE_SEED_DIR         Ready checkpoint to COPY into
-                                     MLXFAST_REFERENCE_DIR instead of downloading,
+  MLXFAST_REFERENCE_SEED_DIR         Ready local checkpoint to reuse instead of
+                                     downloading: symlinked into (or, as a
+                                     fallback, copied into) MLXFAST_REFERENCE_DIR
                                      when the reference dir is empty and the seed
                                      is a different, populated directory (e.g. a
-                                     runner with a warm cache disk). Falls back to
-                                     download if the copy fails or is incomplete.
+                                     runner pre-provisioned with the checkpoint).
                                      Default: ${REFERENCE_SEED_DIR}
   MLXFAST_REFERENCE_BASE_URL         HTTP prefix for checkpoint files.
                                      Default: ${DEFAULT_REFERENCE_BASE_URL}
@@ -1426,35 +1426,48 @@ EOF
 }
 
 seed_reference_from_local_cache() {
-  # Copy a ready checkpoint from a local seed dir (default: the shared HF cache,
-  # e.g. a runner's warm cache disk) into the reference dir so we skip the
-  # multi-GB network download. Best-effort: the verify/repair path below still
-  # validates the result and fetches anything missing or stale, so a partial or
-  # failed copy is safe.
+  # Make the reference dir resolve to a ready local checkpoint (default seed: the
+  # shared HF cache, e.g. a runner pre-provisioned with the checkpoint on a local
+  # SSD) so we skip the multi-GB download AND the redundant copy. The seed is a
+  # local disk (measured ~2 GB/s on the tenki runner, same as the workspace SSD),
+  # so we SYMLINK the reference dir at it rather than duplicating ~141 GiB: reads
+  # hit the same disk and setup just verifies. Falls back to a parallel copy
+  # (then the normal download/repair) if the link can't be made; a partial or
+  # failed copy is safe because the verify/repair path fills any gaps.
   local reference_dir="$1"
   local seed="${REFERENCE_SEED_DIR:-}"
   # Already usable, no seed configured, or seed has no checkpoint: nothing to do.
   [[ -f "${reference_dir}/config.json" ]] && return 0
   [[ -n "${seed}" ]] || return 0
   [[ -f "${seed}/config.json" ]] || return 0
-  local seed_abs dst_abs
+  local seed_abs
   seed_abs="$(cd "${seed}" 2>/dev/null && pwd -P || true)"
   [[ -n "${seed_abs}" ]] || return 0
+  mkdir -p "$(dirname "${reference_dir}")"
+
+  # Symlink the reference dir at the resident cache: zero copy, zero extra disk.
+  if [[ ! -e "${reference_dir}" || -L "${reference_dir}" ]]; then
+    rm -f "${reference_dir}" 2>/dev/null || true
+    if ln -s "${seed_abs}" "${reference_dir}" 2>/dev/null; then
+      echo "setup.sh: linked reference to local resident cache (no copy/download)"
+      echo "setup.sh:   ${reference_dir} -> ${seed_abs}"
+      return 0
+    fi
+  fi
+
+  # Fallback: real parallel copy into the reference dir, then verify/repair.
   mkdir -p "${reference_dir}"
+  local dst_abs
   dst_abs="$(cd "${reference_dir}" 2>/dev/null && pwd -P || true)"
   # Don't copy a directory onto itself (e.g. local dev where DIR == CACHE_DIR).
   [[ -n "${dst_abs}" && "${seed_abs}" != "${dst_abs}" ]] || return 0
-  echo "setup.sh: seeding reference checkpoint from local cache (no download)"
+  echo "setup.sh: copying reference checkpoint from local cache (no download)"
   echo "setup.sh:   source ${seed_abs}"
   echo "setup.sh:   dest   ${dst_abs}"
   ensure_reference_space "$(dirname "${reference_dir}")"
-  # Parallel per-file copy: a throughput-limited network mount copies at about
-  # download speed on one stream but usually has aggregate headroom, so fan out
-  # REFERENCE_DOWNLOAD_JOBS concurrent copies (a single rsync stream measured
-  # ~26 min for this checkpoint -- no better than downloading). -L dereferences
-  # the HF cache's blob symlinks so real files land in dest. Best-effort: the
-  # verify/repair path below fetches anything the copy missed, so a partial or
-  # failed copy is safe.
+  # Parallel per-file copy: fan out REFERENCE_DOWNLOAD_JOBS concurrent copies so
+  # a throughput-limited seed uses its aggregate bandwidth. -L dereferences the
+  # HF cache's blob symlinks so real files land in dest.
   local seed_jobs="${REFERENCE_DOWNLOAD_JOBS:-8}"
   export MLXFAST_SEED_SRC="${seed_abs}" MLXFAST_SEED_DST="${dst_abs}"
   if command -v xargs >/dev/null 2>&1; then
