@@ -1,12 +1,11 @@
 name: tenki-disk-probe
 
-# Throwaway diagnostic: discover the tenki-macos-latest-xlarge disk layout and
-# whether any LOCAL path persists between jobs on the same bare-metal runner
-# (a DIY "sticky disk"). A 4-job matrix on the 2-runner pool runs in ~2 waves:
-# wave-1 jobs write hostname-tagged markers, wave-2 jobs reuse the same two
-# physical runners and report which markers survived. If a wave-2 job finds a
-# marker written by an earlier job on the SAME host, that path persists.
-# No build, no checkpoint -- fast.
+# Throwaway diagnostic for tenki-macos-latest-xlarge:
+#  - is ~/.cache a local disk or a network mount, and is the DeepSeek checkpoint
+#    resident on this runner?
+#  - does any LOCAL path persist between jobs on the same host (DIY sticky disk)?
+# 8-job matrix forces host reuse across waves; each job also re-checks markers
+# left by earlier jobs/runs (cross-run persistence) and reports its hostname.
 on:
   push:
     branches:
@@ -25,45 +24,38 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        n: [1, 2, 3, 4]
+        n: [1, 2, 3, 4, 5, 6, 7, 8]
     runs-on: tenki-macos-latest-xlarge
     timeout-minutes: 15
     steps:
-      - name: Disk layout and cross-job persistence
+      - name: Probe checkpoint residency, fs type, and persistence
         run: |
           set -uo pipefail
           host="$(hostname 2>/dev/null || echo unknown)"
-          echo "########## matrix.n=${{ matrix.n }} host=${host} run=${{ github.run_id }} started=$(date -u +%H:%M:%S) ##########"
-          echo "HOME=${HOME:-} GITHUB_WORKSPACE=${GITHUB_WORKSPACE:-} RUNNER_TEMP=${RUNNER_TEMP:-} RUNNER_TOOL_CACHE=${RUNNER_TOOL_CACHE:-}"
+          ref="${HOME}/.cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main"
+          echo "########## matrix.n=${{ matrix.n }} host=${host} run=${{ github.run_id }} t=$(date -u +%H:%M:%S) ##########"
           echo
-          echo "===== df -h ====="
-          df -h || true
+          echo "===== is ~/.cache local or network? ====="
+          echo "df: $(df -h "${HOME}/.cache" 2>/dev/null | tail -1)"
+          echo "fstype: $(df "${HOME}/.cache" 2>/dev/null | tail -1 | awk '{print $1}')  =>  $(mount 2>/dev/null | grep -iE " on ${HOME}/\.cache | on ${HOME} | on /System/Volumes/Data " | head -3)"
+          echo "mount lines mentioning network fs (nfs/smb/afp) anywhere:"
+          mount 2>/dev/null | grep -iE "nfs|smbfs|afpfs|webdav|osxfuse|macfuse" || echo "  (none -- no network mounts on this host)"
           echo
-          echo "===== mount (apfs/hfs=local, nfs/smbfs/afpfs=network) ====="
-          mount || true
+          echo "===== is the 141GB DeepSeek checkpoint resident here? ====="
+          echo "ref path: ${ref}"
+          echo "config.json: $([ -f "${ref}/config.json" ] && echo PRESENT || echo ABSENT)"
+          echo "shard count: $(ls "${ref}"/*.safetensors 2>/dev/null | wc -l | tr -d ' ')"
+          echo "checkpoint size: $(du -sh "${ref}" 2>/dev/null | cut -f1 || echo n/a)"
+          echo "~/.cache total size: $(du -sh "${HOME}/.cache" 2>/dev/null | cut -f1 || echo n/a)"
           echo
-          # Candidate persistent dirs: .cache is the known (slow) network mount,
-          # used as a control; the rest test for a persistent LOCAL path.
-          probe_dirs="${HOME}/.cache/mlxfast-sticky-probe ${HOME}/mlxfast-sticky-probe /Users/Shared/mlxfast-sticky-probe /opt/mlxfast-sticky-probe /var/tmp/mlxfast-sticky-probe /tmp/mlxfast-sticky-probe ${RUNNER_TOOL_CACHE:-/nonexist-tc}/mlxfast-sticky-probe"
-          echo "===== markers from PRIOR jobs/runs (present => path persisted) ====="
+          probe_dirs="${HOME}/.cache/mlxfast-sticky-probe ${HOME}/mlxfast-sticky-probe /Users/Shared/mlxfast-sticky-probe /var/tmp/mlxfast-sticky-probe"
+          echo "===== markers from PRIOR jobs/runs (present => that path persisted on this host) ====="
           for d in ${probe_dirs}; do
             m="${d}/marker.txt"
-            if [ -f "${m}" ]; then
-              echo "PERSISTED  ${m} :: $(cat "${m}" 2>/dev/null)"
-            else
-              echo "absent     ${m}"
-            fi
+            if [ -f "${m}" ]; then echo "PERSISTED  ${m} :: $(cat "${m}" 2>/dev/null)"; else echo "absent     ${m}"; fi
           done
-          echo
           echo "===== writing this job's marker ====="
           for d in ${probe_dirs}; do
             m="${d}/marker.txt"
-            if mkdir -p "${d}" 2>/dev/null && echo "host=${host} matn=${{ matrix.n }} run=${{ github.run_id }} t=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${m}" 2>/dev/null; then
-              echo "wrote      ${m}"
-            else
-              echo "cannot     ${m}"
-            fi
+            mkdir -p "${d}" 2>/dev/null && echo "host=${host} matn=${{ matrix.n }} run=${{ github.run_id }}" > "${m}" 2>/dev/null && echo "wrote ${m}" || echo "cannot ${m}"
           done
-          echo
-          echo "===== env (tenki / sticky / cache / runner hints) ====="
-          env | grep -iE 'TENKI|STICKY|CACHE|IMAGEOS|IMAGEVERSION|RUNNER_' | sort || true
