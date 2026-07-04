@@ -79,6 +79,7 @@ public enum DeepSeekRoutedExperts {
         let selectedExperts = expertIndices.asArray(Int32.self).map(Int.init)
         let useStaged = stagingScheduled
             && loader.expertLayerStager?.waitForLayer(spec.layerIndex) == true
+        let useFusedGateUp = !useStaged && loader.hasFusedGateUp(layerIndex: spec.layerIndex)
         defer {
             if useStaged {
                 loader.expertLayerStager?.releaseLayer(spec.layerIndex)
@@ -87,7 +88,11 @@ public enum DeepSeekRoutedExperts {
         if !useStaged {
             // Kernel read-ahead for every byte range this layer is about to
             // pread, so SSD I/O overlaps the per-expert GPU compute below.
-            loader.expertPrefetcher.prefetch(layerIndex: spec.layerIndex, expertIndices: selectedExperts)
+            loader.expertPrefetcher.prefetch(
+                layerIndex: spec.layerIndex,
+                expertIndices: selectedExperts,
+                projections: useFusedGateUp ? [.down] : [.gate, .up, .down]
+            )
         }
 
         let outputCount = tokenCount * topK
@@ -155,14 +160,22 @@ public enum DeepSeekRoutedExperts {
         // already-fetched bytes instead of serializing on each pread. Anything
         // not prefetched falls back to the normal per-expert bank read.
         var decodePrefetch: [String: StagedExpertCode]?
+        var fusedGateUpPrefetch: [String: StagedExpertCode]?
         if tokenCount == 1, !useStaged {
+            if useFusedGateUp {
+                fusedGateUpPrefetch = loader.prefetchDecodeFusedGateUpCodes(
+                    layerIndex: spec.layerIndex,
+                    expertIndices: expertOrder
+                )
+            }
             decodePrefetch = loader.consumeScheduledPinnedDecodeExpertCodes(
                 layerIndex: spec.layerIndex
             ) ?? loader.prefetchDecodeExpertCodes(
                 layerIndex: spec.layerIndex,
                 expertIndices: expertOrder,
                 hiddenSize: spec.hiddenSize,
-                intermediateSize: spec.intermediateSize
+                intermediateSize: spec.intermediateSize,
+                projections: useFusedGateUp ? [.down] : [.gate, .up, .down]
             )
         } else if useStaged {
             // Prefill/warmup staged path: build the active experts' base
@@ -185,13 +198,6 @@ public enum DeepSeekRoutedExperts {
             guard let flatIndices = flatIndicesByExpert[expertIndex] else {
                 continue
             }
-            let expertWeights = try weights(
-                forExpert: expertIndex,
-                loader: loader,
-                spec: spec,
-                preferStaged: useStaged,
-                decodePrefetch: decodePrefetch
-            )
             let tokens: MLXArray
             if tokenCount == 1, flatIndices.count == 1 {
                 tokens = xFlat
@@ -199,11 +205,45 @@ public enum DeepSeekRoutedExperts {
                 let tokenRows = flatIndices.map { Int32($0 / topK) }
                 tokens = xFlat.take(MLXArray(tokenRows), axis: 0)
             }
-            let expertOutput = DeepSeekMLP.forward(
-                tokens,
-                weights: expertWeights,
-                swigluLimit: spec.swigluLimit
-            )
+            let expertOutput: MLXArray
+            if useFusedGateUp,
+               let fusedGateUp = try loader.fusedGateUpLinearWeight(
+                   layerIndex: spec.layerIndex,
+                   expectedShape: [spec.intermediateSize * 2, spec.hiddenSize],
+                   expertIndex: expertIndex,
+                   decodePrefetch: fusedGateUpPrefetch
+               ) {
+                let down = try loader.routedExpertLinearWeight(
+                    layerIndex: spec.layerIndex,
+                    projection: .down,
+                    expectedShape: [spec.hiddenSize, spec.intermediateSize],
+                    expertIndex: expertIndex,
+                    preferStaged: false,
+                    decodePrefetch: decodePrefetch
+                )
+                let gateUp = DeepSeekOps.linear(input: tokens, weight: fusedGateUp)
+                let gate = gateUp[0..., 0..<spec.intermediateSize]
+                let up = gateUp[0..., spec.intermediateSize..<(spec.intermediateSize * 2)]
+                let hidden = DeepSeekOps.limitedSwiGLU(
+                    gate: gate,
+                    up: up,
+                    limit: spec.swigluLimit
+                )
+                expertOutput = DeepSeekOps.linear(input: hidden, weight: down)
+            } else {
+                let expertWeights = try weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec,
+                    preferStaged: useStaged,
+                    decodePrefetch: decodePrefetch
+                )
+                expertOutput = DeepSeekMLP.forward(
+                    tokens,
+                    weights: expertWeights,
+                    swigluLimit: spec.swigluLimit
+                )
+            }
             expertOutputs.append(expertOutput)
             scatterOrder.append(contentsOf: flatIndices)
         }
@@ -212,29 +252,14 @@ public enum DeepSeekRoutedExperts {
 
         // scatterOrder[row] is the activation flat index that produced combined
         // row `row`. Invert it so a single gather places every output back into
-        // activation order, replacing the previous per-row scatter loop. When
-        // the scatter order is already the identity (decode's first-seen
-        // expert order visits slots in order), the gather is a no-op node --
-        // skip it; the tensor values are identical by definition.
+        // activation order, replacing the previous per-row scatter loop.
         var inverse = [Int32](repeating: 0, count: outputCount)
-        var isIdentity = true
         for (row, flatIndex) in scatterOrder.enumerated() {
             inverse[flatIndex] = Int32(row)
-            if flatIndex != row {
-                isIdentity = false
-            }
         }
-        let ordered = isIdentity ? combined : combined.take(MLXArray(inverse), axis: 0)
+        let ordered = combined.take(MLXArray(inverse), axis: 0)
 
-        let result = ordered.reshaped([batchSize, sequenceLength, topK, hiddenSize])
-        // Decode path: dispatch this layer's routed-expert graph now so the
-        // GPU runs the QMMs while the CPU builds the next block's graph,
-        // matching the batched prefill path's layer-exit dispatch. Scheduling
-        // only; identical nodes evaluate either way.
-        if tokenCount == 1 {
-            asyncEval(result)
-        }
-        return result
+        return ordered.reshaped([batchSize, sequenceLength, topK, hiddenSize])
     }
 
     /// Whole-layer routed-expert forward over RAM-resident stacked tensors.

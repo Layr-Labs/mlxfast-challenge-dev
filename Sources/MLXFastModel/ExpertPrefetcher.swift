@@ -52,18 +52,28 @@ public final class ExpertPrefetcher {
 
     /// Call on the model thread right after routing indices materialize.
     public func prefetch(layerIndex: Int, expertIndices: [Int]) {
+        prefetch(layerIndex: layerIndex, expertIndices: expertIndices, projections: [.gate, .up, .down])
+    }
+
+    /// Variant used by fused gate/up layers: the fused sidecar handles those
+    /// reads, so the original bank should only advise the remaining projection.
+    public func prefetch(
+        layerIndex: Int,
+        expertIndices: [Int],
+        projections: [DeepSeekExpertProjection]
+    ) {
         guard enabled, !expertIndices.isEmpty else {
             return
         }
         var seen = Set<Int>()
         var ranges: [ByteRange] = []
-        ranges.reserveCapacity(expertIndices.count * 6)
+        ranges.reserveCapacity(expertIndices.count * max(1, projections.count) * 2)
         for expertIndex in expertIndices where seen.insert(expertIndex).inserted {
-            for projection in Self.projections {
+            for projection in projections {
                 appendRanges(
                     layerIndex: layerIndex,
                     expertIndex: expertIndex,
-                    projection: projection,
+                    projection: (projection, 2),
                     into: &ranges
                 )
             }
@@ -82,11 +92,6 @@ public final class ExpertPrefetcher {
     }
 
     // MARK: - Range resolution (model thread)
-
-    nonisolated(unsafe) private static let projections:
-        [(projection: DeepSeekExpertProjection, expectedRank: Int)] = [
-            (.gate, 2), (.up, 2), (.down, 2),
-        ]
 
     private func appendRanges(
         layerIndex: Int,
