@@ -68,7 +68,8 @@ public enum DeepSeekOps {
     public static func multiLinear(
         input: MLXArray,
         weight: DeepSeekLinearWeight,
-        transpose: Bool = true
+        transpose: Bool = true,
+        groups: [DeepSeekLinearWeight]? = nil
     ) throws -> MLXArray {
         guard weight.isQuantized else {
             return multiLinear(input: input, weight: weight.weight, transpose: transpose)
@@ -112,12 +113,11 @@ public enum DeepSeekOps {
 
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(groupCount)
+        let precomputedGroups = groups?.count == groupCount ? groups : nil
         for groupIndex in 0..<groupCount {
             let groupInput = input[0..., groupIndex, 0..., 0...]
-            let rowStart = groupIndex * outputDimensions
-            let rowEnd = rowStart + outputDimensions
-            let groupWeight = weight.rows(
-                rowStart..<rowEnd,
+            let groupWeight = precomputedGroups?[groupIndex] ?? weight.rows(
+                (groupIndex * outputDimensions)..<((groupIndex + 1) * outputDimensions),
                 logicalShape: [outputDimensions, weight.logicalShape[2]]
             )
             outputs.append(

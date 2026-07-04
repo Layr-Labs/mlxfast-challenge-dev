@@ -160,6 +160,10 @@ public struct DeepSeekLocalAttentionWeights {
     public let woB: DeepSeekLinearWeight
     public let woBBias: MLXArray?
     public let attentionSink: MLXArray?
+    /// woA's per-group row slices, computed once here instead of ~24 fresh
+    /// slice nodes per layer per forward inside the grouped-linear loop.
+    /// Values and kernels are unchanged; only node construction moves.
+    public let woAGroups: [DeepSeekLinearWeight]?
 
     public init(
         wqA: DeepSeekLinearWeight,
@@ -181,6 +185,18 @@ public struct DeepSeekLocalAttentionWeights {
         self.woB = woB
         self.woBBias = woBBias
         self.attentionSink = attentionSink
+        if woA.logicalShape.count == 3, woA.logicalShape[0] > 0, woA.logicalShape[1] > 0 {
+            let groupCount = woA.logicalShape[0]
+            let outputDimensions = woA.logicalShape[1]
+            self.woAGroups = (0..<groupCount).map { groupIndex in
+                woA.rows(
+                    (groupIndex * outputDimensions)..<((groupIndex + 1) * outputDimensions),
+                    logicalShape: [outputDimensions, woA.logicalShape[2]]
+                )
+            }
+        } else {
+            self.woAGroups = nil
+        }
     }
 
     public init(
@@ -535,7 +551,7 @@ public enum DeepSeekLocalAttention {
 
         out = out.reshaped([batchSize, spec.outputGroups, -1, sequenceLength, spec.headDim])
         out = out.transposed(0, 1, 3, 2, 4).flattened(start: -2)
-        out = try DeepSeekOps.multiLinear(input: out, weight: weights.woA)
+        out = try DeepSeekOps.multiLinear(input: out, weight: weights.woA, groups: weights.woAGroups)
         out = out.transposed(0, 2, 1, 3).flattened(start: -2)
         return DeepSeekOps.linear(input: out, weight: weights.woB, bias: weights.woBBias)
     }
@@ -698,7 +714,7 @@ public enum DeepSeekCompressedAttention {
 
         out = out.reshaped([batchSize, spec.outputGroups, -1, sequenceLength, spec.headDim])
         out = out.transposed(0, 1, 3, 2, 4).flattened(start: -2)
-        out = try DeepSeekOps.multiLinear(input: out, weight: weights.attention.woA)
+        out = try DeepSeekOps.multiLinear(input: out, weight: weights.attention.woA, groups: weights.attention.woAGroups)
         out = out.transposed(0, 2, 1, 3).flattened(start: -2)
         return DeepSeekOps.linear(
             input: out,
@@ -724,6 +740,8 @@ public enum DeepSeekCompressedAttention {
         }
     }
 
+    private static let extendedMaskCache = LockedCache<String, MLXArray>(capacity: 128)
+
     private static func extendMask(
         _ mask: MLXArray?,
         pooledLength: Int,
@@ -732,6 +750,24 @@ public enum DeepSeekCompressedAttention {
         guard let mask, pooledLength > 0 else {
             return mask
         }
+        // Decode rebuilds concat(mask, ones) per layer per step; with masks
+        // shared via DeepSeekMaskCache this is a pure function of the mask
+        // instance and pooled length, so memoize it. Prefill passes a real
+        // pooledMask and skips the cache.
+        if pooledMask == nil {
+            let key = "\(ObjectIdentifier(mask).hashValue)|\(pooledLength)"
+            return try extendedMaskCache.value(for: key) {
+                try buildExtendedMask(mask, pooledLength: pooledLength, pooledMask: nil)
+            }
+        }
+        return try buildExtendedMask(mask, pooledLength: pooledLength, pooledMask: pooledMask)
+    }
+
+    private static func buildExtendedMask(
+        _ mask: MLXArray,
+        pooledLength: Int,
+        pooledMask: MLXArray?
+    ) throws -> MLXArray {
         guard mask.shape.count == 2 || mask.shape.count == 4 else {
             throw MLXFastError.invalidInput(
                 "compressed attention mask must have shape [query, key] or [batch, heads, query, key]"
@@ -745,6 +781,7 @@ public enum DeepSeekCompressedAttention {
         )
         return concatenated([mask, poolMask], axis: -1)
     }
+
 
     private static func expandedPooledMask(
         _ pooledMask: MLXArray?,

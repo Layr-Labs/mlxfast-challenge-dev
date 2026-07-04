@@ -136,9 +136,12 @@ public struct DeepSeekWeightLoader {
     private let routedExpertProjectionPlans: [RoutedExpertProjectionKey: RoutedExpertProjectionPlan]
 
     /// Sized for the official 48 GB runner: pin only where at least that
-    /// budget exists, and never more than two layers of codes (~6.4 GiB).
+    /// budget exists, and never more than four layers of codes (~12.8 GiB).
+    /// Official-run telemetry on the two-layer tree reported ~12 GB peak
+    /// RAM, so two more pinned layers still leave well over half the 48 GB
+    /// budget for the page cache that the streamed expert reads depend on.
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
-    private static let pinnedHashLayerCap = 2
+    private static let pinnedLeadingLayerCap = 4
 
     public init(
         weightsPath: String,
@@ -168,17 +171,22 @@ public struct DeepSeekWeightLoader {
             manifestPath: manifestPath,
             metrics: metrics
         )
-        // Pinning trades RAM for guaranteed hits on the token-id-routed
-        // layers; only worthwhile at the official 48 GB budget or above,
-        // and capped so the pinned codes (~3.2 GiB per layer) leave headroom
-        // for the resident scales, staging buffers, and page cache inside
-        // that budget. Both constants encode the OFFICIAL runner's memory
-        // math — do not raise them because a larger local machine has room.
-        let hashLayerCount = (try? DeepSeekConfig.load(from: weightsPath))?.numHashLayers ?? 0
+        // Pinning trades RAM for guaranteed hits on the leading layers'
+        // expert code reads in every prefill and decode step; only
+        // worthwhile at the official 48 GB budget or above, and capped so
+        // the pinned codes (~3.2 GiB per layer) leave headroom for the
+        // resident scales, staging buffers, and page cache inside that
+        // budget. The first `numHashLayers` pinned layers additionally get
+        // their decode reads scheduled pre-forward from token-id routing;
+        // later pinned layers serve the same resident bytes without the
+        // routing prediction. Both constants encode the OFFICIAL runner's
+        // memory math — do not raise them because a larger local machine
+        // has room.
+        let layerCount = (try? DeepSeekConfig.load(from: weightsPath))?.numHiddenLayers ?? 0
         self.pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
             ? ResidentExpertStoreRegistry.pinnedHashLayerCodes(
                 manifestPath: manifestPath,
-                hashLayerCount: min(hashLayerCount, Self.pinnedHashLayerCap),
+                hashLayerCount: min(layerCount, Self.pinnedLeadingLayerCap),
                 metrics: metrics
             )
             : nil
