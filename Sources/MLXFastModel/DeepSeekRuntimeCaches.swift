@@ -51,7 +51,16 @@ public enum DeepSeekMaskCache {
         let windowSize: Int
     }
 
+    private struct CompressedKey: Hashable {
+        let queryLength: Int
+        let localKeyLength: Int
+        let pooledLength: Int
+        let offsetDelta: Int
+        let windowSize: Int
+    }
+
     private static let cache = LockedCache<Key, MLXArray>(capacity: 128)
+    private static let compressedCache = LockedCache<CompressedKey, MLXArray>(capacity: 256)
 
     public static func causal(
         queryLength: Int,
@@ -75,6 +84,53 @@ public enum DeepSeekMaskCache {
                 keyOffset: keyOffset,
                 windowSize: windowSize
             )
+        }
+    }
+
+    public static func compressedCausal(
+        queryLength: Int,
+        localKeyLength: Int,
+        pooledLength: Int,
+        queryOffset: Int = 0,
+        keyOffset: Int = 0,
+        windowSize: Int? = nil
+    ) throws -> MLXArray {
+        guard pooledLength > 0 else {
+            return try causal(
+                queryLength: queryLength,
+                keyLength: localKeyLength,
+                queryOffset: queryOffset,
+                keyOffset: keyOffset,
+                windowSize: windowSize
+            )
+        }
+        let key = CompressedKey(
+            queryLength: queryLength,
+            localKeyLength: localKeyLength,
+            pooledLength: pooledLength,
+            offsetDelta: queryOffset - keyOffset,
+            windowSize: windowSize ?? -1
+        )
+        return try compressedCache.value(for: key) {
+            let local = try DeepSeekAttentionMask.causal(
+                queryLength: queryLength,
+                keyLength: localKeyLength,
+                queryOffset: queryOffset,
+                keyOffset: keyOffset,
+                windowSize: windowSize
+            )
+            let pooledShape = Array(local.shape.dropLast()) + [pooledLength]
+            return concatenated([local, ones(pooledShape, dtype: local.dtype)], axis: -1)
+        }
+    }
+}
+
+public enum DeepSeekArrayCache {
+    private static let int32RangeCache = LockedCache<Int, MLXArray>(capacity: 32)
+
+    public static func int32Range(count: Int) -> MLXArray {
+        int32RangeCache.value(for: count) {
+            MLXArray((0..<Int32(count)).map { $0 })
         }
     }
 }

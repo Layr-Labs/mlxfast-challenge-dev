@@ -100,7 +100,7 @@ public enum DeepSeekOps {
                 biases: weight.biases.map {
                     $0.reshaped([groupCount, outputDimensions, scaleGroups])
                 },
-                rhsIndices: MLXArray((0..<Int32(groupCount)).map { $0 }),
+                rhsIndices: DeepSeekArrayCache.int32Range(count: groupCount),
                 transpose: true,
                 groupSize: weight.groupSize,
                 bits: weight.bits,
