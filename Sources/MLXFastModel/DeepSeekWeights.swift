@@ -139,6 +139,8 @@ public struct DeepSeekWeightLoader {
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
     private static let pinnedHashLayerCap = 2
+    private static let pageLockedExpertLayerCap = 4
+    private static let pageLockedExpertLayerMaxTensorBytes = 13 * 1024 * 1024 * 1024
 
     public init(
         weightsPath: String,
@@ -174,7 +176,9 @@ public struct DeepSeekWeightLoader {
         // for the resident scales, staging buffers, and page cache inside
         // that budget. Both constants encode the OFFICIAL runner's memory
         // math — do not raise them because a larger local machine has room.
-        let hashLayerCount = (try? DeepSeekConfig.load(from: weightsPath))?.numHashLayers ?? 0
+        let config = try? DeepSeekConfig.load(from: weightsPath)
+        let hashLayerCount = config?.numHashLayers ?? 0
+        let layerCount = config?.numHiddenLayers ?? hashLayerCount
         self.pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
             ? ResidentExpertStoreRegistry.pinnedHashLayerCodes(
                 manifestPath: manifestPath,
@@ -182,6 +186,15 @@ public struct DeepSeekWeightLoader {
                 metrics: metrics
             )
             : nil
+        if ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes,
+           layerCount > Self.pinnedHashLayerCap {
+            _ = ExpertPageLockRegistry.expertCodePages(
+                manifestPath: manifestPath,
+                firstLayer: Self.pinnedHashLayerCap,
+                layerCount: min(layerCount - Self.pinnedHashLayerCap, Self.pageLockedExpertLayerCap),
+                maxTensorBytes: Self.pageLockedExpertLayerMaxTensorBytes
+            )
+        }
         self.expertLayerStager = ExpertLayerStager(
             manifestPath: manifestPath,
             metrics: metrics

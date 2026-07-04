@@ -136,11 +136,15 @@ public enum DeepSeekMoE {
             spec: spec.routedExperts,
             onRoutingSynced: { eval(shared) }
         )
-        return combine(
+        let output = combine(
             routedExpertOutput: routed,
             routeWeights: routing.weights,
             sharedExpertOutput: shared
         )
+        if x.shape[0] == 1, x.shape[1] == 1 {
+            asyncEval(output)
+        }
+        return output
     }
 
     public static func combine(
