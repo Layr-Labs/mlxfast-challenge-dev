@@ -1,11 +1,9 @@
 name: tenki-disk-probe
 
-# Throwaway diagnostic for tenki-macos-latest-xlarge:
-#  - is ~/.cache a local disk or a network mount, and is the DeepSeek checkpoint
-#    resident on this runner?
-#  - does any LOCAL path persist between jobs on the same host (DIY sticky disk)?
-# 8-job matrix forces host reuse across waves; each job also re-checks markers
-# left by earlier jobs/runs (cross-run persistence) and reports its hostname.
+# Decisive test: the 141GB checkpoint is already resident at ~/.cache on every
+# tenki-xlarge runner. Is ~/.cache FAST (local SSD) or SLOW (network)? Measure
+# read bandwidth of a real shard. >1 GB/s => local, point the benchmark straight
+# at it (no copy). ~100 MB/s => network, keep copying to the local workspace.
 on:
   push:
     branches:
@@ -24,38 +22,44 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        n: [1, 2, 3, 4, 5, 6, 7, 8]
+        n: [1, 2]
     runs-on: tenki-macos-latest-xlarge
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
-      - name: Probe checkpoint residency, fs type, and persistence
+      - name: Measure ~/.cache read bandwidth vs workspace
         run: |
           set -uo pipefail
           host="$(hostname 2>/dev/null || echo unknown)"
           ref="${HOME}/.cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main"
-          echo "########## matrix.n=${{ matrix.n }} host=${host} run=${{ github.run_id }} t=$(date -u +%H:%M:%S) ##########"
+          echo "########## matrix.n=${{ matrix.n }} host=${host} ##########"
+          echo "===== mount type of ~/.cache ====="
+          # Resolve which mounted filesystem backs ~/.cache and its type.
+          cache_src="$(df "${HOME}/.cache" 2>/dev/null | tail -1 | awk '{print $1}')"
+          echo "backing device: ${cache_src}"
+          mount 2>/dev/null | grep -F "${cache_src}" || echo "(device not in mount table)"
+          echo "any network fs on host: $(mount 2>/dev/null | grep -icE 'nfs|smbfs|afpfs|webdav|fuse') matches"
           echo
-          echo "===== is ~/.cache local or network? ====="
-          echo "df: $(df -h "${HOME}/.cache" 2>/dev/null | tail -1)"
-          echo "fstype: $(df "${HOME}/.cache" 2>/dev/null | tail -1 | awk '{print $1}')  =>  $(mount 2>/dev/null | grep -iE " on ${HOME}/\.cache | on ${HOME} | on /System/Volumes/Data " | head -3)"
-          echo "mount lines mentioning network fs (nfs/smb/afp) anywhere:"
-          mount 2>/dev/null | grep -iE "nfs|smbfs|afpfs|webdav|osxfuse|macfuse" || echo "  (none -- no network mounts on this host)"
+          shard="$(ls -S "${ref}"/*.safetensors 2>/dev/null | head -1)"
+          echo "largest shard: ${shard}"
+          if [ -z "${shard}" ]; then echo "NO SHARD FOUND"; exit 0; fi
+          bytes="$(stat -f%z "${shard}" 2>/dev/null || echo 0)"
+          echo "shard bytes: ${bytes}"
+          # Best-effort drop caches so we measure real backing-store reads.
+          sudo purge >/dev/null 2>&1 || purge >/dev/null 2>&1 || echo "(purge unavailable; read may be partly cached)"
+          echo "===== READ from ~/.cache (the resident checkpoint) ====="
+          t0=$(python3 -c 'import time;print(time.monotonic())')
+          dd if="${shard}" of=/dev/null bs=1048576 2>/dev/null
+          t1=$(python3 -c 'import time;print(time.monotonic())')
+          python3 -c "b=${bytes}; s=${t1}-${t0}; print(f'cache_read_seconds={s:.2f}  cache_read_GBps={b/s/1e9:.3f}  (b={b})')"
           echo
-          echo "===== is the 141GB DeepSeek checkpoint resident here? ====="
-          echo "ref path: ${ref}"
-          echo "config.json: $([ -f "${ref}/config.json" ] && echo PRESENT || echo ABSENT)"
-          echo "shard count: $(ls "${ref}"/*.safetensors 2>/dev/null | wc -l | tr -d ' ')"
-          echo "checkpoint size: $(du -sh "${ref}" 2>/dev/null | cut -f1 || echo n/a)"
-          echo "~/.cache total size: $(du -sh "${HOME}/.cache" 2>/dev/null | cut -f1 || echo n/a)"
-          echo
-          probe_dirs="${HOME}/.cache/mlxfast-sticky-probe ${HOME}/mlxfast-sticky-probe /Users/Shared/mlxfast-sticky-probe /var/tmp/mlxfast-sticky-probe"
-          echo "===== markers from PRIOR jobs/runs (present => that path persisted on this host) ====="
-          for d in ${probe_dirs}; do
-            m="${d}/marker.txt"
-            if [ -f "${m}" ]; then echo "PERSISTED  ${m} :: $(cat "${m}" 2>/dev/null)"; else echo "absent     ${m}"; fi
-          done
-          echo "===== writing this job's marker ====="
-          for d in ${probe_dirs}; do
-            m="${d}/marker.txt"
-            mkdir -p "${d}" 2>/dev/null && echo "host=${host} matn=${{ matrix.n }} run=${{ github.run_id }}" > "${m}" 2>/dev/null && echo "wrote ${m}" || echo "cannot ${m}"
-          done
+          echo "===== WRITE a shard-sized file to workspace, then READ it (local SSD baseline) ====="
+          w="${GITHUB_WORKSPACE}/.ws-speed-test.bin"
+          t0=$(python3 -c 'import time;print(time.monotonic())')
+          dd if="${shard}" of="${w}" bs=1048576 2>/dev/null
+          t1=$(python3 -c 'import time;print(time.monotonic())')
+          sync; sudo purge >/dev/null 2>&1 || purge >/dev/null 2>&1 || true
+          t2=$(python3 -c 'import time;print(time.monotonic())')
+          dd if="${w}" of=/dev/null bs=1048576 2>/dev/null
+          t3=$(python3 -c 'import time;print(time.monotonic())')
+          python3 -c "b=${bytes}; print(f'workspace_write_GBps={b/(${t1}-${t0})/1e9:.3f}  workspace_read_GBps={b/(${t3}-${t2})/1e9:.3f}')"
+          rm -f "${w}" || true
