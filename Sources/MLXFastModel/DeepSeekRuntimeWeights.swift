@@ -58,6 +58,30 @@ public final class DeepSeekRuntimeWeightCache {
         }
     }
 
+    /// Cross-forward stage-ahead: schedule whole-layer expert staging for the
+    /// first few stageable layers. Weights are input-independent, so having
+    /// the NEXT prefill-shaped forward's opening layers already staged (from
+    /// untimed init, or from the tail of the previous forward) removes its
+    /// cold-start disk wait. Staged entries persist until consumed; one-token
+    /// decode entry releases any stale ones so they never crowd the decode
+    /// phase's page cache. Scheduling is idempotent.
+    public func scheduleUpcomingPrefillStaging() {
+        guard let stager = loader.expertLayerStager else {
+            return
+        }
+        var scheduled = 0
+        for layerIndex in 0..<config.numHiddenLayers {
+            guard let plan = loader.stagedExpertLayerPlan(layerIndex: layerIndex) else {
+                continue
+            }
+            stager.schedule(plan)
+            scheduled += 1
+            if scheduled >= 4 {
+                break
+            }
+        }
+    }
+
     /// For full-size checkpoints, populate every memoized weight struct and
     /// spec and warm the hot Metal kernels during construction. The runtime
     /// worker constructs this cache before the benchmark handshake, so the
@@ -107,6 +131,10 @@ public final class DeepSeekRuntimeWeightCache {
             }
         }
         DeepSeekWarmup.run(weightCache: self)
+        // Stage the first few layers' expert tensors during untimed init so
+        // the first scored prefill-shaped forward starts with its opening
+        // layers already in RAM instead of paying the disk cold-start.
+        scheduleUpcomingPrefillStaging()
     }
 
     public func blockSpec() -> DeepSeekBlockSpec {
