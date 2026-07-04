@@ -212,12 +212,19 @@ public enum DeepSeekRoutedExperts {
 
         // scatterOrder[row] is the activation flat index that produced combined
         // row `row`. Invert it so a single gather places every output back into
-        // activation order, replacing the previous per-row scatter loop.
+        // activation order, replacing the previous per-row scatter loop. When
+        // the scatter order is already the identity (decode's first-seen
+        // expert order visits slots in order), the gather is a no-op node --
+        // skip it; the tensor values are identical by definition.
         var inverse = [Int32](repeating: 0, count: outputCount)
+        var isIdentity = true
         for (row, flatIndex) in scatterOrder.enumerated() {
             inverse[flatIndex] = Int32(row)
+            if flatIndex != row {
+                isIdentity = false
+            }
         }
-        let ordered = combined.take(MLXArray(inverse), axis: 0)
+        let ordered = isIdentity ? combined : combined.take(MLXArray(inverse), axis: 0)
 
         return ordered.reshaped([batchSize, sequenceLength, topK, hiddenSize])
     }
@@ -365,7 +372,13 @@ public enum DeepSeekRoutedExperts {
             inverse[flatIndex] = Int32(row)
         }
         let ordered = combined.take(MLXArray(inverse), axis: 0)
-        return ordered.reshaped([batchSize, sequenceLength, topK, spec.hiddenSize])
+        let result = ordered.reshaped([batchSize, sequenceLength, topK, spec.hiddenSize])
+        // Dispatch the finished layer's expert graph now so the GPU starts
+        // its GEMMs while the CPU builds the next block's graph, instead of
+        // waiting for the next layer's routing sync. Scheduling only; the
+        // same nodes evaluate either way.
+        asyncEval(result)
+        return result
     }
 
     public static func weights(
