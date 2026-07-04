@@ -31,6 +31,84 @@ public struct DeepSeekRoutedExpertSpec: Equatable {
 }
 
 public enum DeepSeekRoutedExperts {
+    public static func forwardWeightedDecode(
+        _ x: MLXArray,
+        expertIndices: MLXArray,
+        routeWeights: MLXArray,
+        addTo sharedExpertOutput: MLXArray? = nil,
+        loader: DeepSeekWeightLoader,
+        spec: DeepSeekRoutedExpertSpec,
+        onRoutingSynced: (() -> Void)? = nil
+    ) throws -> MLXArray {
+        guard x.shape.count == 3 else {
+            throw MLXFastError.invalidInput("routed expert input must have shape [batch, length, hidden]")
+        }
+        guard expertIndices.shape.count == 3, routeWeights.shape.count == 3 else {
+            throw MLXFastError.invalidInput("decode expert indices and route weights must have shape [batch, length, topK]")
+        }
+        guard x.shape[0] == 1, x.shape[1] == 1 else {
+            throw MLXFastError.invalidInput("weighted decode fast path requires a single token")
+        }
+        guard expertIndices.shape == routeWeights.shape,
+              expertIndices.shape[0] == 1,
+              expertIndices.shape[1] == 1
+        else {
+            throw MLXFastError.invalidInput("decode route weights must match expert indices")
+        }
+        guard x.shape[2] == spec.hiddenSize else {
+            throw MLXFastError.invalidInput(
+                "routed expert input hidden size \(x.shape[2]) expected \(spec.hiddenSize)"
+            )
+        }
+
+        let topK = expertIndices.shape[2]
+        guard topK > 0 else {
+            return zeros([1, 1, spec.hiddenSize], dtype: x.dtype)
+        }
+
+        let selectedExperts = expertIndices.asArray(Int32.self).map(Int.init)
+        onRoutingSynced?()
+
+        let decodePrefetch = loader.consumeScheduledPinnedDecodeExpertCodes(
+            layerIndex: spec.layerIndex
+        ) ?? loader.prefetchDecodeExpertCodes(
+            layerIndex: spec.layerIndex,
+            expertIndices: selectedExperts,
+            hiddenSize: spec.hiddenSize,
+            intermediateSize: spec.intermediateSize
+        )
+
+        let token = x.reshaped([1, spec.hiddenSize])
+        var expertOutputs: [MLXArray] = []
+        expertOutputs.reserveCapacity(topK)
+
+        for expertIndex in selectedExperts {
+            let expertWeights = try weights(
+                forExpert: expertIndex,
+                loader: loader,
+                spec: spec,
+                preferStaged: false,
+                decodePrefetch: decodePrefetch
+            )
+            expertOutputs.append(
+                DeepSeekMLP.forward(
+                    token,
+                    weights: expertWeights,
+                    swigluLimit: spec.swigluLimit
+                )
+            )
+        }
+
+        let expertMatrix = concatenated(expertOutputs, axis: 0)
+        let reshapedWeights = routeWeights.asType(expertMatrix.dtype).reshaped([1, topK])
+        let weighted = if let sharedExpertOutput {
+            addMM(sharedExpertOutput.reshaped([1, spec.hiddenSize]), reshapedWeights, expertMatrix)
+        } else {
+            matmul(reshapedWeights, expertMatrix)
+        }
+        return weighted.reshaped([1, 1, spec.hiddenSize])
+    }
+
     public static func forward(
         _ x: MLXArray,
         expertIndices: MLXArray,
@@ -93,6 +171,45 @@ public enum DeepSeekRoutedExperts {
         let outputCount = tokenCount * topK
         guard outputCount > 0 else {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
+        }
+
+        if tokenCount == 1, !useStaged {
+            // Same overlap point as the general decode path: dispatch shared expert
+            // work while routed expert code slices are being fetched/built.
+            onRoutingSynced?()
+
+            let decodePrefetch = loader.consumeScheduledPinnedDecodeExpertCodes(
+                layerIndex: spec.layerIndex
+            ) ?? loader.prefetchDecodeExpertCodes(
+                layerIndex: spec.layerIndex,
+                expertIndices: selectedExperts,
+                hiddenSize: spec.hiddenSize,
+                intermediateSize: spec.intermediateSize
+            )
+
+            let token = x.reshaped([1, hiddenSize])
+            var expertOutputs: [MLXArray] = []
+            expertOutputs.reserveCapacity(topK)
+
+            for expertIndex in selectedExperts {
+                let expertWeights = try weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec,
+                    preferStaged: false,
+                    decodePrefetch: decodePrefetch
+                )
+                expertOutputs.append(
+                    DeepSeekMLP.forward(
+                        token,
+                        weights: expertWeights,
+                        swigluLimit: spec.swigluLimit
+                    )
+                )
+            }
+
+            return concatenated(expertOutputs, axis: 0)
+                .reshaped([batchSize, sequenceLength, topK, hiddenSize])
         }
 
         // Group activation flat-indices by expert so each expert runs one batched
