@@ -148,6 +148,22 @@ public enum DeepSeekMoE {
         routeWeights: MLXArray,
         sharedExpertOutput: MLXArray
     ) -> MLXArray {
+        if routedExpertOutput.shape.count == 4,
+           routeWeights.shape.count == 3,
+           routedExpertOutput.shape[0] == 1,
+           routedExpertOutput.shape[1] == 1,
+           routeWeights.shape[0] == 1,
+           routeWeights.shape[1] == 1,
+           routeWeights.shape[2] == routedExpertOutput.shape[2]
+        {
+            let topK = routedExpertOutput.shape[2]
+            let weightedRouted = matmul(
+                routeWeights.asType(routedExpertOutput.dtype).reshaped([1, 1, 1, topK]),
+                routedExpertOutput
+            ).squeezed(axis: -2)
+            return weightedRouted + sharedExpertOutput
+        }
+
         let weightedRouted = (
             routedExpertOutput * routeWeights.expandedDimensions(axis: -1).asType(routedExpertOutput.dtype)
         ).sum(axis: -2)
