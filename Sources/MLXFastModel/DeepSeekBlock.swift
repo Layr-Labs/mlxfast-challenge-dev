@@ -96,6 +96,14 @@ public enum DeepSeekBlock {
             eps: spec.rmsNormEps
         )
         let attentionOutput = try attention(attentionInput)
+        // Decode path: dispatch attention's graph now so the GPU runs it while
+        // the CPU builds the following expand -> feed-forward-collapse -> MoE
+        // route graph, mirroring the routed-expert layer-exit asyncEval. Pure
+        // scheduling; identical nodes evaluate either way. Gated to single-token
+        // decode where the CPU-build/GPU-compute overlap window exists.
+        if hidden.shape.count >= 2, hidden.shape[1] == 1 {
+            asyncEval(attentionOutput)
+        }
         var hidden = DeepSeekHyperConnection.expand(
             attentionOutput,
             residual: attentionResidual,
