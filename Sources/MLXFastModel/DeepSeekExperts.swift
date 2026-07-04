@@ -118,6 +118,47 @@ public enum DeepSeekRoutedExperts {
             return batched
         }
 
+        if tokenCount == 1, selectedExpertsAreUnique(selectedExperts) {
+            let xFlat = x.reshaped([1, hiddenSize])
+            if !useStaged {
+                onRoutingSynced?()
+            }
+            let decodePrefetch = !useStaged
+                ? loader.consumeScheduledPinnedDecodeExpertCodes(
+                    layerIndex: spec.layerIndex
+                ) ?? loader.prefetchDecodeExpertCodes(
+                    layerIndex: spec.layerIndex,
+                    expertIndices: selectedExperts,
+                    hiddenSize: spec.hiddenSize,
+                    intermediateSize: spec.intermediateSize
+                )
+                : nil
+
+            var expertOutputs: [MLXArray] = []
+            expertOutputs.reserveCapacity(topK)
+            for expertIndex in selectedExperts {
+                let expertWeights = try weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec,
+                    preferStaged: useStaged,
+                    decodePrefetch: decodePrefetch
+                )
+                expertOutputs.append(
+                    DeepSeekMLP.forward(
+                        xFlat,
+                        weights: expertWeights,
+                        swigluLimit: spec.swigluLimit
+                    )
+                )
+            }
+
+            let result = concatenated(expertOutputs, axis: 0)
+                .reshaped([batchSize, sequenceLength, topK, hiddenSize])
+            asyncEval(result)
+            return result
+        }
+
         // Group activation flat-indices by expert so each expert runs one batched
         // matmul over all of its tokens instead of one matmul per token.
         var flatIndicesByExpert: [Int: [Int]] = [:]
@@ -235,6 +276,17 @@ public enum DeepSeekRoutedExperts {
             asyncEval(result)
         }
         return result
+    }
+
+    private static func selectedExpertsAreUnique(_ selectedExperts: [Int]) -> Bool {
+        for index in 1..<selectedExperts.count {
+            for previous in 0..<index {
+                if selectedExperts[index] == selectedExperts[previous] {
+                    return false
+                }
+            }
+        }
+        return true
     }
 
     /// Whole-layer routed-expert forward over RAM-resident stacked tensors.
