@@ -105,6 +105,7 @@ public struct DeepSeekWeightLoader {
     public let residentExpertScales: ResidentExpertTensors?
     public let pinnedExpertCodes: ResidentExpertTensors?
     public let expertLayerStager: ExpertLayerStager?
+    private let compressedExpertCodes: CompressedExpertCodeStore?
     // Dedicated capacity-0 side bank for concurrent decode-step slice reads.
     // Capacity 0 => no cache/LRU mutation, so concurrent preads are race-free
     // and read byte-identical ranges through the trusted metered path.
@@ -134,7 +135,12 @@ public struct DeepSeekWeightLoader {
             metrics: metrics
         )
         self.expertBank = expertBank
-        self.expertPrefetcher = ExpertPrefetcher(expertBank: expertBank)
+        let compressedCodes = CompressedExpertCodeStore(weightsPath: weightsPath)
+        self.compressedExpertCodes = compressedCodes
+        self.expertPrefetcher = ExpertPrefetcher(
+            expertBank: expertBank,
+            compressedExpertCodes: compressedCodes
+        )
         // Resident stores come from a process-wide registry: the trusted
         // benchmark harness keeps two loaders alive at once, and duplicating
         // ~14 GiB of resident data per loader would threaten the 48 GB
@@ -181,6 +187,7 @@ public struct DeepSeekWeightLoader {
         self.expertBank = expertBank
         self.expertStreamingConfig = expertStreamingConfig
         self.expertStreamingMetrics = expertStreamingMetrics ?? expertBank.metrics
+        self.compressedExpertCodes = nil
         self.expertPrefetcher = ExpertPrefetcher(expertBank: expertBank)
         self.residentExpertScales = nil
         self.pinnedExpertCodes = nil
@@ -374,6 +381,7 @@ public struct DeepSeekWeightLoader {
         let bridge = self.bridge
         let residentScales = self.residentExpertScales
         let pinnedCodes = self.pinnedExpertCodes
+        let compressedCodes = self.compressedExpertCodes
         var results = [StagedExpertCode?](repeating: nil, count: keys.count)
         results.withUnsafeMutableBufferPointer { buffer in
             let sink = DecodePrefetchSink(buffer: buffer)
@@ -389,6 +397,9 @@ public struct DeepSeekWeightLoader {
                     let tensor = pinnedCodes?.materializedTensor(
                         named: name,
                         firstAxisIndex: expertIndex
+                    ) ?? compressedCodes?.materializedTensor(
+                        recordName: name,
+                        expertIndex: expertIndex
                     ) ?? (try? sideBank.materializedTensor(
                         named: name,
                         firstAxisIndex: expertIndex
@@ -700,6 +711,12 @@ public struct DeepSeekWeightLoader {
             } else if preferStaged, isStacked,
                let staged = stagedSliceTensor(recordName: candidate, expertIndex: expertIndex) {
                 tensor = staged
+            } else if isStacked,
+                      let compressed = compressedExpertCodes?.materializedTensor(
+                          recordName: candidate,
+                          expertIndex: expertIndex
+                      ) {
+                tensor = compressed
             } else if isStacked {
                 tensor = try expertBank.materializedTensor(named: candidate, firstAxisIndex: expertIndex)
             } else {

@@ -21,6 +21,7 @@ public final class ExpertPrefetcher {
     }
 
     private let expertBank: ExpertSlotBank
+    private let compressedExpertCodes: CompressedExpertCodeStore?
     private let referenceBaseURL: URL
     private let enabled: Bool
     private let queue = DispatchQueue(label: "mlxfast.expert.prefetch", qos: .userInitiated)
@@ -28,9 +29,11 @@ public final class ExpertPrefetcher {
 
     public init(
         expertBank: ExpertSlotBank,
+        compressedExpertCodes: CompressedExpertCodeStore? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) {
         self.expertBank = expertBank
+        self.compressedExpertCodes = compressedExpertCodes
         // Mirrors ExpertSlotBank's referenceBaseURL construction so advisories
         // target byte-identical files.
         self.referenceBaseURL = URL(
@@ -106,7 +109,11 @@ public final class ExpertPrefetcher {
             }
             let isStacked = record.shape.count == projection.expectedRank + 1
                 && record.shape.first.map { expertIndex < $0 } == true
-            append(record: record, expertIndex: expertIndex, sliced: isStacked, into: &ranges)
+            let codeServedBySidecar = record.dtype == "U32"
+                && compressedExpertCodes?.contains(recordName: record.name, expertIndex: expertIndex) == true
+            if !codeServedBySidecar {
+                append(record: record, expertIndex: expertIndex, sliced: isStacked, into: &ranges)
+            }
             // Companion tensors are read only for quantized (U32) weights.
             if record.dtype == "U32" {
                 for suffix in ["scales", "biases"] {

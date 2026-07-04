@@ -1,3 +1,4 @@
+import Compression
 import Foundation
 import MLXFastCore
 
@@ -81,6 +82,12 @@ public enum SwiftTransform {
         try writeExpertManifest(
             referenceDirectory: referenceDirectory,
             manifestPath: manifestPath,
+            expertKeys: expertKeys,
+            index: index
+        )
+        _ = try writeCompressedExpertCodePack(
+            referenceDirectory: referenceDirectory,
+            expertsDirectory: expertsDirectory,
             expertKeys: expertKeys,
             index: index
         )
@@ -216,6 +223,189 @@ public enum SwiftTransform {
         default:
             return name == "tokenizer" || name == "vocab"
         }
+    }
+
+    private struct CodePackReport {
+        let entryCount: Int
+        let totalEligibleBytes: Int64
+        let totalOriginalBytesCovered: Int64
+        let totalCompressedBytes: Int64
+    }
+
+    private static func writeCompressedExpertCodePack(
+        referenceDirectory: URL,
+        expertsDirectory: URL,
+        expertKeys: Set<String>,
+        index: CheckpointIndex
+    ) throws -> CodePackReport {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: expertsDirectory, withIntermediateDirectories: true)
+        for file in try fileManager.contentsOfDirectory(at: expertsDirectory, includingPropertiesForKeys: nil) {
+            if file.lastPathComponent == "codepack_manifest.json"
+                || (file.lastPathComponent.hasPrefix("codepack-") && file.lastPathComponent.hasSuffix(".bin")) {
+                try fileManager.removeItem(at: file)
+            }
+        }
+
+        var entries: [[String: Any]] = []
+        var totalEligibleBytes: Int64 = 0
+        var totalOriginalBytesCovered: Int64 = 0
+        var totalCompressedBytes: Int64 = 0
+        let rotateByteLimit: Int64 = 2_000_000_000
+        var packIndex = 0
+        var packOffset: Int64 = 0
+        var currentPackHandle: FileHandle?
+        var currentPackName = String(format: "codepack-%03d.bin", packIndex)
+
+        func closePack() {
+            try? currentPackHandle?.close()
+            currentPackHandle = nil
+        }
+
+        func handleForAppend(byteCount: Int) throws -> FileHandle {
+            if currentPackHandle == nil || (packOffset > 0 && packOffset + Int64(byteCount) > rotateByteLimit) {
+                closePack()
+                if packOffset > 0 {
+                    packIndex += 1
+                    packOffset = 0
+                    currentPackName = String(format: "codepack-%03d.bin", packIndex)
+                }
+                let url = expertsDirectory.appendingPathComponent(currentPackName)
+                try Data().write(to: url, options: [])
+                currentPackHandle = try FileHandle(forWritingTo: url)
+            }
+            return currentPackHandle!
+        }
+
+        defer { closePack() }
+
+        let expertKeysByShard = Dictionary(grouping: expertKeys) { key in
+            index.weightMap[key] ?? ""
+        }
+
+        for shardName in expertKeysByShard.keys.sorted() {
+            let shardURL = referenceDirectory.appendingPathComponent(shardName)
+            let header = try Safetensors.readHeader(shardURL)
+            let inputFD = open(shardURL.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            guard inputFD >= 0 else {
+                throw MLXFastError.missingFile(
+                    "failed to open checkpoint shard \(shardURL.path): \(String(cString: strerror(errno)))"
+                )
+            }
+            defer { close(inputFD) }
+            var inputBuffer = [UInt8]()
+            var compressedBuffer = [UInt8]()
+
+            for key in expertKeysByShard[shardName, default: []].sorted() {
+                guard let info = header.tensors[key] else {
+                    throw MLXFastError.invalidInput(
+                        "expert tensor \(key) is listed in index but missing from \(shardName)"
+                    )
+                }
+                guard info.dtype == "U32",
+                      info.shape.count >= 3,
+                      let firstDim = info.shape.first,
+                      firstDim > 0,
+                      info.byteCount % firstDim == 0
+                else {
+                    continue
+                }
+
+                let sliceByteLength = info.byteCount / firstDim
+                totalEligibleBytes += Int64(info.byteCount)
+                for expertIndex in 0..<firstDim {
+                    let offset = Int64(header.dataBaseOffset) + Int64(info.dataStart + expertIndex * sliceByteLength)
+                    if inputBuffer.count != sliceByteLength {
+                        inputBuffer = [UInt8](repeating: 0, count: sliceByteLength)
+                    }
+                    let bytesRead = inputBuffer.withUnsafeMutableBytes { buffer -> Int in
+                        pread(inputFD, buffer.baseAddress!, sliceByteLength, off_t(offset))
+                    }
+                    guard bytesRead == sliceByteLength else {
+                        let reason = bytesRead < 0 ? String(cString: strerror(errno)) : "short read \(bytesRead)/\(sliceByteLength)"
+                        throw MLXFastError.invalidInput(
+                            "failed to read expert code slice \(key)[\(expertIndex)] from \(shardName): \(reason)"
+                        )
+                    }
+
+                    let maxCompressedLength = sliceByteLength + sliceByteLength / 255 + 64
+                    if compressedBuffer.count != maxCompressedLength {
+                        compressedBuffer = [UInt8](repeating: 0, count: maxCompressedLength)
+                    }
+                    let compressedLength = inputBuffer.withUnsafeBytes { sourceBuffer in
+                        compressedBuffer.withUnsafeMutableBytes { destinationBuffer in
+                            compression_encode_buffer(
+                                destinationBuffer.bindMemory(to: UInt8.self).baseAddress!,
+                                maxCompressedLength,
+                                sourceBuffer.bindMemory(to: UInt8.self).baseAddress!,
+                                sliceByteLength,
+                                nil,
+                                COMPRESSION_LZ4
+                            )
+                        }
+                    }
+                    guard compressedLength > 0,
+                          compressedLength + 32 < Int(Double(sliceByteLength) * 0.97)
+                    else {
+                        continue
+                    }
+
+                    let handle = try handleForAppend(byteCount: compressedLength)
+                    let entryPackName = currentPackName
+                    let entryOffset = packOffset
+                    compressedBuffer.withUnsafeBytes { buffer in
+                        if let base = buffer.baseAddress {
+                            handle.write(Data(bytes: base, count: compressedLength))
+                        }
+                    }
+                    packOffset += Int64(compressedLength)
+
+                    entries.append([
+                        "name": key,
+                        "expert_index": expertIndex,
+                        "dtype": info.dtype,
+                        "shape": Array(info.shape.dropFirst()),
+                        "original_byte_length": sliceByteLength,
+                        "pack": entryPackName,
+                        "offset": entryOffset,
+                        "compressed_byte_length": compressedLength,
+                    ])
+                    totalOriginalBytesCovered += Int64(sliceByteLength)
+                    totalCompressedBytes += Int64(compressedLength)
+                }
+            }
+        }
+
+        let manifest: [String: Any] = [
+            "version": 1,
+            "algorithm": "lz4",
+            "entries": entries,
+            "total_original_bytes_covered": totalOriginalBytesCovered,
+            "total_compressed_bytes": totalCompressedBytes,
+        ]
+        let data = try JSONSerialization.data(
+            withJSONObject: manifest,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        )
+        try data.write(to: expertsDirectory.appendingPathComponent("codepack_manifest.json"))
+
+        let coverage = totalEligibleBytes > 0
+            ? 100.0 * Double(totalOriginalBytesCovered) / Double(totalEligibleBytes)
+            : 0.0
+        let saved = totalEligibleBytes > 0
+            ? 100.0 * Double(totalOriginalBytesCovered - totalCompressedBytes) / Double(totalEligibleBytes)
+            : 0.0
+        let ratio = totalOriginalBytesCovered > 0
+            ? Double(totalCompressedBytes) / Double(totalOriginalBytesCovered)
+            : 1.0
+        print(String(format: "Expert U32 LZ4 codepack: entries=%d covered=%lld compressed=%lld eligible=%lld coverage=%.2f%% ratio=%.4f net_saved=%.2f%%", entries.count, totalOriginalBytesCovered, totalCompressedBytes, totalEligibleBytes, coverage, ratio, saved))
+
+        return CodePackReport(
+            entryCount: entries.count,
+            totalEligibleBytes: totalEligibleBytes,
+            totalOriginalBytesCovered: totalOriginalBytesCovered,
+            totalCompressedBytes: totalCompressedBytes
+        )
     }
 
     private static func writeExpertManifest(
