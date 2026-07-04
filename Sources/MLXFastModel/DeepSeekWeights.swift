@@ -374,12 +374,15 @@ public struct DeepSeekWeightLoader {
         let bridge = self.bridge
         let residentScales = self.residentExpertScales
         let pinnedCodes = self.pinnedExpertCodes
+        let workNames = names
+        let workIndices = indices
+        let sideBankBox = UncheckedSendableBox(sideBank)
         var results = [StagedExpertCode?](repeating: nil, count: keys.count)
         results.withUnsafeMutableBufferPointer { buffer in
             let sink = DecodePrefetchSink(buffer: buffer)
             DispatchQueue.concurrentPerform(iterations: keys.count) { index in
-                let name = names[index]
-                let expertIndex = indices[index]
+                let name = workNames[index]
+                let expertIndex = workIndices[index]
                 // Read the slice AND build its base MLXArray (the eager
                 // Data->Metal copy) here on the worker thread. The compute
                 // thread's per-expert loop then skips that memcpy and only
@@ -389,7 +392,7 @@ public struct DeepSeekWeightLoader {
                     let tensor = pinnedCodes?.materializedTensor(
                         named: name,
                         firstAxisIndex: expertIndex
-                    ) ?? (try? sideBank.materializedTensor(
+                    ) ?? (try? sideBankBox.value.materializedTensor(
                         named: name,
                         firstAxisIndex: expertIndex
                     )),
@@ -623,6 +626,9 @@ public struct DeepSeekWeightLoader {
         }
         let bridge = self.bridge
         let residentScales = self.residentExpertScales
+        let workNames = names
+        let workIndices = indices
+        let selfBox = UncheckedSendableBox(self)
         var results = [StagedExpertCode?](repeating: nil, count: keys.count)
         results.withUnsafeMutableBufferPointer { buffer in
             let sink = DecodePrefetchSink(buffer: buffer)
@@ -631,9 +637,9 @@ public struct DeepSeekWeightLoader {
                 // MLXArray concurrently; the compute thread then only wires the
                 // lazy reshape/quant assembly. Byte-identical to the serial path.
                 guard
-                    let tensor = self.stagedSliceTensor(
-                        recordName: names[index],
-                        expertIndex: indices[index]
+                    let tensor = selfBox.value.stagedSliceTensor(
+                        recordName: workNames[index],
+                        expertIndex: workIndices[index]
                     ),
                     let array = try? bridge.makeArray(from: tensor)
                 else {
@@ -642,8 +648,8 @@ public struct DeepSeekWeightLoader {
                 let scalesArray = Self.residentScalesArray(
                     residentScales: residentScales,
                     bridge: bridge,
-                    codeName: names[index],
-                    expertIndex: indices[index]
+                    codeName: workNames[index],
+                    expertIndex: workIndices[index]
                 )
                 sink.buffer[index] = StagedExpertCode(
                     tensor: tensor,
@@ -1715,6 +1721,11 @@ public struct StagedExpertCode {
 // disjoint and the unchecked Sendable conformance is sound.
 private struct DecodePrefetchSink: @unchecked Sendable {
     let buffer: UnsafeMutableBufferPointer<StagedExpertCode?>
+}
+
+private struct UncheckedSendableBox<Value>: @unchecked Sendable {
+    let value: Value
+    init(_ value: Value) { self.value = value }
 }
 
 private final class ScheduledDecodePrefetches {

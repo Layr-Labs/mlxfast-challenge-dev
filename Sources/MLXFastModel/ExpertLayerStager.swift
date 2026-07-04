@@ -22,8 +22,8 @@ import MLXFastCore
 /// loader's metrics: no LRU is mutated (capacity-0 banks never insert, which
 /// also makes them safe to use from this background thread) and every staged
 /// byte is recorded honestly on the same counters the benchmark reports.
-public final class ExpertLayerStager {
-    public struct LayerPlan {
+public final class ExpertLayerStager: @unchecked Sendable {
+    public struct LayerPlan: Sendable {
         public let layerIndex: Int
         public let recordNames: [String]
 

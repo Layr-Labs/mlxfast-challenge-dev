@@ -24,7 +24,7 @@ import MLXFastCore
 /// reports. Slices are Data views into the retained stacked buffer — the
 /// same file bytes the bank's firstAxisIndex read would return, by the
 /// bank's own slice arithmetic (byteLength / firstDimension).
-public final class ResidentExpertTensors {
+public final class ResidentExpertTensors: @unchecked Sendable {
     private struct Entry {
         let dtype: TensorDType
         let shape: [Int]

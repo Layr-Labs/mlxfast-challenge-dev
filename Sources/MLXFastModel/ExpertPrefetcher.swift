@@ -13,7 +13,7 @@ import MLXFastCore
 /// `DeepSeekWeightLoader.expertLinearWeight` name/slice logic); only plain
 /// integers cross onto the background queue, which exclusively owns the
 /// per-shard file descriptors.
-public final class ExpertPrefetcher {
+public final class ExpertPrefetcher: @unchecked Sendable {
     struct ByteRange {
         let shard: String
         let offset: Int
@@ -72,12 +72,13 @@ public final class ExpertPrefetcher {
             return
         }
         ranges.sort { ($0.shard, $0.offset) < ($1.shard, $1.offset) }
+        let sortedRanges = ranges
         // Weak capture so a queued advisory can never hold the last strong
         // reference: if it did, deinit would run ON this serial queue and its
         // queue.sync fd cleanup would self-deadlock. Once deinit is reachable,
         // pending advisories see nil and no-op before the fds close.
         queue.async { [weak self] in
-            self?.advise(ranges)
+            self?.advise(sortedRanges)
         }
     }
 

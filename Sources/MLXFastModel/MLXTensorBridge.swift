@@ -8,7 +8,7 @@ public protocol MLXTensorBridge {
     func makeArray(from tensor: MaterializedTensor) throws -> Array
 }
 
-public struct MLXArrayTensorBridge: MLXTensorBridge {
+public struct MLXArrayTensorBridge: MLXTensorBridge, Sendable {
     public typealias Array = MLXArray
 
     public init() {}
