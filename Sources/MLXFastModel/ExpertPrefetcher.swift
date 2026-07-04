@@ -21,6 +21,7 @@ public final class ExpertPrefetcher {
     }
 
     private let expertBank: ExpertSlotBank
+    private let residentCodes: ResidentExpertTensors?
     private let referenceBaseURL: URL
     private let enabled: Bool
     private let queue = DispatchQueue(label: "mlxfast.expert.prefetch", qos: .userInitiated)
@@ -28,9 +29,11 @@ public final class ExpertPrefetcher {
 
     public init(
         expertBank: ExpertSlotBank,
+        residentCodes: ResidentExpertTensors? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) {
         self.expertBank = expertBank
+        self.residentCodes = residentCodes
         // Mirrors ExpertSlotBank's referenceBaseURL construction so advisories
         // target byte-identical files.
         self.referenceBaseURL = URL(
@@ -103,6 +106,9 @@ public final class ExpertPrefetcher {
         for candidate in candidates {
             guard let record = expertBank.record(named: candidate) else {
                 continue
+            }
+            guard residentCodes?.isResident(name: candidate) != true else {
+                return
             }
             let isStacked = record.shape.count == projection.expectedRank + 1
                 && record.shape.first.map { expertIndex < $0 } == true

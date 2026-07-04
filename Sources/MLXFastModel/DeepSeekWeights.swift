@@ -134,7 +134,6 @@ public struct DeepSeekWeightLoader {
             metrics: metrics
         )
         self.expertBank = expertBank
-        self.expertPrefetcher = ExpertPrefetcher(expertBank: expertBank)
         // Resident stores come from a process-wide registry: the trusted
         // benchmark harness keeps two loaders alive at once, and duplicating
         // ~14 GiB of resident data per loader would threaten the 48 GB
@@ -158,6 +157,10 @@ public struct DeepSeekWeightLoader {
                 metrics: metrics
             )
             : nil
+        self.expertPrefetcher = ExpertPrefetcher(
+            expertBank: expertBank,
+            residentCodes: self.pinnedExpertCodes
+        )
         self.expertLayerStager = ExpertLayerStager(
             manifestPath: manifestPath,
             metrics: metrics
