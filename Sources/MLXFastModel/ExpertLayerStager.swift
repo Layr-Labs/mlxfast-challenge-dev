@@ -81,6 +81,20 @@ public final class ExpertLayerStager {
         return isStaged
     }
 
+    /// Same wait as `waitForLayer`, but does NOT clear the layer's failure
+    /// flag. Background consumers (the stacked-projection prebuilder) use this
+    /// so a failed stage keeps today's exact schedule/retry semantics for the
+    /// compute thread's own `waitForLayer` call.
+    public func waitForLayerPreservingFailure(_ layerIndex: Int) -> Bool {
+        condition.lock()
+        while pendingLayers.contains(layerIndex) {
+            condition.wait()
+        }
+        let isStaged = recordNamesByLayer[layerIndex] != nil
+        condition.unlock()
+        return isStaged
+    }
+
     /// Whole-tensor bytes for a staged record, or nil when not staged.
     public func stagedBytes(recordName: String) -> Data? {
         condition.lock()

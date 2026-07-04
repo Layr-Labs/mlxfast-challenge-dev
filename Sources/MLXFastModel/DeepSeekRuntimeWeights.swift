@@ -28,8 +28,11 @@ public final class DeepSeekRuntimeWeightCache {
     /// Exact expert read-ahead for hash-routed layers: their routing depends
     /// only on the input token id, so a single-token decode step can advise
     /// the kernel about layers 0..2's expert byte ranges before the embedding
-    /// even runs. Wrong or dropped advisories only waste bandwidth — the
-    /// model still reads every tensor through the trusted bank.
+    /// even runs. Pinned layers are fully served by the persistent stacked
+    /// projections (zero-copy views, nothing to schedule or read); unpinned
+    /// hash layers get disk read-ahead. Wrong or dropped advisories only
+    /// waste bandwidth — the model still reads every tensor through the
+    /// trusted bank.
     public func prefetchHashLayerExperts(token: Int) {
         guard !hashLayerTables.isEmpty, token >= 0 else {
             return
@@ -40,9 +43,6 @@ public final class DeepSeekRuntimeWeightCache {
                 continue
             }
             let experts = entry.table[base..<(base + entry.topK)].map(Int.init)
-            if entry.layerIndex == 0, loader.pinnedExpertCodes != nil {
-                continue
-            }
             let fullyPinned = loader.schedulePinnedDecodeExpertCodes(
                 layerIndex: entry.layerIndex,
                 expertIndices: experts,
