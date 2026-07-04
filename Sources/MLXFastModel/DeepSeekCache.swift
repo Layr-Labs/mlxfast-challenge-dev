@@ -16,12 +16,22 @@ public final class DeepSeekLocalKVCache {
     public let maxSize: Int
     public private(set) var offset: Int
     public private(set) var startPosition: Int
+    private var storedStartPosition: Int
     private var kv: MLXArray?
 
     public init(maxSize: Int, offset: Int = 0, startPosition: Int = 0) {
         self.maxSize = maxSize
         self.offset = offset
         self.startPosition = startPosition
+        self.storedStartPosition = startPosition
+    }
+
+    private func trimStoredIfNeeded() {
+        guard let current = kv, current.shape[2] > maxSize else { return }
+        let drop = current.shape[2] - maxSize
+        kv = current[0..., 0..., drop..., 0...]
+        storedStartPosition += drop
+        startPosition = storedStartPosition
     }
 
     public func updateAndFetch(_ newKV: MLXArray) throws -> DeepSeekCachedKV {
@@ -34,21 +44,29 @@ public final class DeepSeekLocalKVCache {
         let incoming = newKV.shape[2]
         guard incoming > 0 else {
             if let kv {
-                return DeepSeekCachedKV(kv: kv, keyOffset: startPosition)
+                return DeepSeekCachedKV(kv: kv, keyOffset: storedStartPosition)
             }
             return DeepSeekCachedKV(kv: newKV, keyOffset: offset)
         }
 
-        let combinedStart = startPosition
+        trimStoredIfNeeded()
+
+        let combinedStart = storedStartPosition
         let combined = kv.map { concatenated([$0, newKV], axis: 2) } ?? newKV
         offset += incoming
 
-        if combined.shape[2] > maxSize {
+        if incoming == 1 && combined.shape[2] == maxSize + 1 {
+            kv = combined
+            storedStartPosition = combinedStart
+            startPosition = combinedStart + 1
+        } else if combined.shape[2] > maxSize {
             let drop = combined.shape[2] - maxSize
             kv = combined[0..., 0..., drop..., 0...]
-            startPosition = combinedStart + drop
+            storedStartPosition = combinedStart + drop
+            startPosition = storedStartPosition
         } else {
             kv = combined
+            storedStartPosition = combinedStart
             startPosition = combinedStart
         }
 

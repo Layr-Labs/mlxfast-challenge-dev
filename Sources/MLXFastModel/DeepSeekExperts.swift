@@ -147,6 +147,30 @@ public enum DeepSeekRoutedExperts {
             )
         }
 
+        if tokenCount == 1, !useStaged {
+            let xFlat = x.reshaped([1, hiddenSize])
+            var outputs: [MLXArray] = []
+            outputs.reserveCapacity(topK)
+            for expertIndex in selectedExperts {
+                let expertWeights = try weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec,
+                    preferStaged: false,
+                    decodePrefetch: decodePrefetch
+                )
+                outputs.append(
+                    DeepSeekMLP.forward(
+                        xFlat,
+                        weights: expertWeights,
+                        swigluLimit: spec.swigluLimit
+                    )
+                )
+            }
+            return concatenated(outputs, axis: 0)
+                .reshaped([batchSize, sequenceLength, topK, hiddenSize])
+        }
+
         var expertOutputs: [MLXArray] = []
         expertOutputs.reserveCapacity(flatIndicesByExpert.count)
         var scatterOrder: [Int] = []
