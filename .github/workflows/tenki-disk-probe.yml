@@ -1,10 +1,11 @@
 name: tenki-disk-probe
 
-# Throwaway diagnostic: inspect the tenki-macos-latest-xlarge runner's disk
-# layout and discover which paths PERSIST between runs (a "sticky disk"). Run it
-# twice: the first run writes markers, the second reveals which survived and
-# therefore persist. Also dumps df/mount so we can tell local (apfs) volumes
-# from the slow network mount, and env for any tenki/sticky cache hints.
+# Throwaway diagnostic: discover the tenki-macos-latest-xlarge disk layout and
+# whether any LOCAL path persists between jobs on the same bare-metal runner
+# (a DIY "sticky disk"). A 4-job matrix on the 2-runner pool runs in ~2 waves:
+# wave-1 jobs write hostname-tagged markers, wave-2 jobs reuse the same two
+# physical runners and report which markers survived. If a wave-2 job finds a
+# marker written by an earlier job on the SAME host, that path persists.
 # No build, no checkpoint -- fast.
 on:
   push:
@@ -21,25 +22,32 @@ permissions:
 
 jobs:
   probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3, 4]
     runs-on: tenki-macos-latest-xlarge
     timeout-minutes: 15
     steps:
-      - name: Disk layout and persistence markers
+      - name: Disk layout and cross-job persistence
         run: |
           set -uo pipefail
+          host="$(hostname 2>/dev/null || echo unknown)"
+          echo "########## matrix.n=${{ matrix.n }} host=${host} run=${{ github.run_id }} started=$(date -u +%H:%M:%S) ##########"
+          echo "HOME=${HOME:-} GITHUB_WORKSPACE=${GITHUB_WORKSPACE:-} RUNNER_TEMP=${RUNNER_TEMP:-} RUNNER_TOOL_CACHE=${RUNNER_TOOL_CACHE:-}"
+          echo
           echo "===== df -h ====="
           df -h || true
           echo
-          echo "===== mount (fs types: apfs/hfs=local, nfs/smbfs/afpfs=network) ====="
+          echo "===== mount (apfs/hfs=local, nfs/smbfs/afpfs=network) ====="
           mount || true
           echo
-          echo "HOME=${HOME:-} GITHUB_WORKSPACE=${GITHUB_WORKSPACE:-}"
-          echo "RUNNER_TEMP=${RUNNER_TEMP:-} RUNNER_TOOL_CACHE=${RUNNER_TOOL_CACHE:-}"
-          echo
-          probe_paths="${HOME}/.cache ${HOME} /tmp /private/tmp /opt/tenki /var/tmp ${RUNNER_TOOL_CACHE:-/nonexist-tc} ${RUNNER_TEMP:-/nonexist-rt}"
-          echo "===== markers from PRIOR runs (present => that path PERSISTS) ====="
-          for p in ${probe_paths}; do
-            m="${p}/.mlxfast-persist-probe"
+          # Candidate persistent dirs: .cache is the known (slow) network mount,
+          # used as a control; the rest test for a persistent LOCAL path.
+          probe_dirs="${HOME}/.cache/mlxfast-sticky-probe ${HOME}/mlxfast-sticky-probe /Users/Shared/mlxfast-sticky-probe /opt/mlxfast-sticky-probe /var/tmp/mlxfast-sticky-probe /tmp/mlxfast-sticky-probe ${RUNNER_TOOL_CACHE:-/nonexist-tc}/mlxfast-sticky-probe"
+          echo "===== markers from PRIOR jobs/runs (present => path persisted) ====="
+          for d in ${probe_dirs}; do
+            m="${d}/marker.txt"
             if [ -f "${m}" ]; then
               echo "PERSISTED  ${m} :: $(cat "${m}" 2>/dev/null)"
             else
@@ -47,10 +55,10 @@ jobs:
             fi
           done
           echo
-          echo "===== writing fresh markers (run=${{ github.run_id }}) ====="
-          for p in ${probe_paths}; do
-            m="${p}/.mlxfast-persist-probe"
-            if mkdir -p "${p}" 2>/dev/null && echo "run=${{ github.run_id }} date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${m}" 2>/dev/null; then
+          echo "===== writing this job's marker ====="
+          for d in ${probe_dirs}; do
+            m="${d}/marker.txt"
+            if mkdir -p "${d}" 2>/dev/null && echo "host=${host} matn=${{ matrix.n }} run=${{ github.run_id }} t=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${m}" 2>/dev/null; then
               echo "wrote      ${m}"
             else
               echo "cannot     ${m}"
