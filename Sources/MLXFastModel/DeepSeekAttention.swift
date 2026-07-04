@@ -627,6 +627,29 @@ public enum DeepSeekCompressedAttention {
                     "Swift DeepSeek sparse compressed attention requires indexer weights"
                 )
             }
+            if let layerCache = cache,
+               let indexPooled = layerCache.indexPooled,
+               layerCache.hasDeferredIndexerInputs
+            {
+                let deferred = layerCache.drainDeferredIndexerInputs()
+                for item in deferred {
+                    _ = try DeepSeekKVCompressor.forward(
+                        item.x,
+                        weights: indexer.compressor,
+                        spec: DeepSeekCompressorSpec(
+                            compressRatio: spec.compressRatio,
+                            headDim: spec.indexHeadDim,
+                            ropeHeadDim: spec.qkRopeHeadDim,
+                            ropeTheta: spec.ropeTheta,
+                            ropeScaling: spec.ropeScaling,
+                            maxPositionEmbeddings: spec.maxPositionEmbeddings,
+                            rmsNormEps: spec.rmsNormEps
+                        ),
+                        poolingCache: indexPooled,
+                        positionOffset: item.positionOffset
+                    )
+                }
+            }
             let topK = try DeepSeekIndexer.topKNoCache(
                 x: x,
                 qResidual: qResidual,
@@ -657,24 +680,29 @@ public enum DeepSeekCompressedAttention {
             )
         } else {
             if spec.compressRatio == 4,
-               let indexer = weights.indexer,
-               let indexPooled = cache?.indexPooled
+               weights.indexer != nil,
+               let layerCache = cache,
+               layerCache.indexPooled != nil
             {
-                _ = try DeepSeekKVCompressor.forward(
-                    x,
-                    weights: indexer.compressor,
-                    spec: DeepSeekCompressorSpec(
-                        compressRatio: spec.compressRatio,
-                        headDim: spec.indexHeadDim,
-                        ropeHeadDim: spec.qkRopeHeadDim,
-                        ropeTheta: spec.ropeTheta,
-                        ropeScaling: spec.ropeScaling,
-                        maxPositionEmbeddings: spec.maxPositionEmbeddings,
-                        rmsNormEps: spec.rmsNormEps
-                    ),
-                    poolingCache: indexPooled,
-                    positionOffset: positionOffset
-                )
+                if sequenceLength == 1 && spec.indexTopK >= 512 {
+                    layerCache.deferIndexerInput(x, positionOffset: positionOffset)
+                } else if let indexer = weights.indexer, let indexPooled = layerCache.indexPooled {
+                    _ = try DeepSeekKVCompressor.forward(
+                        x,
+                        weights: indexer.compressor,
+                        spec: DeepSeekCompressorSpec(
+                            compressRatio: spec.compressRatio,
+                            headDim: spec.indexHeadDim,
+                            ropeHeadDim: spec.qkRopeHeadDim,
+                            ropeTheta: spec.ropeTheta,
+                            ropeScaling: spec.ropeScaling,
+                            maxPositionEmbeddings: spec.maxPositionEmbeddings,
+                            rmsNormEps: spec.rmsNormEps
+                        ),
+                        poolingCache: indexPooled,
+                        positionOffset: positionOffset
+                    )
+                }
             }
             let attentionMask = try extendMask(
                 localMask,

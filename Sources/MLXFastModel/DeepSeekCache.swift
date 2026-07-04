@@ -12,6 +12,16 @@ public struct DeepSeekCachedKV {
     }
 }
 
+public struct DeepSeekDeferredIndexerInput {
+    public let x: MLXArray
+    public let positionOffset: Int
+
+    public init(x: MLXArray, positionOffset: Int) {
+        self.x = x
+        self.positionOffset = positionOffset
+    }
+}
+
 public final class DeepSeekLocalKVCache {
     public let maxSize: Int
     public private(set) var offset: Int
@@ -161,6 +171,7 @@ public final class DeepSeekLayerCache {
     public let local: DeepSeekLocalKVCache
     public let pooled: DeepSeekPoolingCache?
     public let indexPooled: DeepSeekPoolingCache?
+    private var deferredIndexerInputs: [DeepSeekDeferredIndexerInput] = []
 
     public init(local: DeepSeekLocalKVCache, pooled: DeepSeekPoolingCache?, indexPooled: DeepSeekPoolingCache?) {
         self.local = local
@@ -168,10 +179,25 @@ public final class DeepSeekLayerCache {
         self.indexPooled = indexPooled
     }
 
+    public func deferIndexerInput(_ x: MLXArray, positionOffset: Int) {
+        deferredIndexerInputs.append(.init(x: x, positionOffset: positionOffset))
+    }
+
+    public func drainDeferredIndexerInputs() -> [DeepSeekDeferredIndexerInput] {
+        let inputs = deferredIndexerInputs
+        deferredIndexerInputs.removeAll(keepingCapacity: true)
+        return inputs
+    }
+
+    public var hasDeferredIndexerInputs: Bool {
+        !deferredIndexerInputs.isEmpty
+    }
+
     func arraysForMaterialization() -> [MLXArray] {
         local.arraysForMaterialization()
             + (pooled?.arraysForMaterialization() ?? [])
             + (indexPooled?.arraysForMaterialization() ?? [])
+            + deferredIndexerInputs.map { $0.x }
     }
 }
 
