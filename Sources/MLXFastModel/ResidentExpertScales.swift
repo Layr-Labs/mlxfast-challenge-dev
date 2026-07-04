@@ -128,14 +128,23 @@ extension ResidentExpertTensors {
     public convenience init?(
         hashLayerCodesFromManifest manifestPath: String,
         hashLayerCount: Int,
+        partialNextLayerProjections: Set<String> = [],
         metrics: ExpertStreamingMetrics?
     ) {
-        guard hashLayerCount > 0 else {
+        guard hashLayerCount > 0 || !partialNextLayerProjections.isEmpty else {
             return nil
         }
         self.init(manifestPath: manifestPath, metrics: metrics) { record in
-            record.dtype == "U32"
-                && Self.layerIndex(fromRecordName: record.name).map { $0 < hashLayerCount } == true
+            guard record.dtype == "U32",
+                  let layerIndex = Self.layerIndex(fromRecordName: record.name)
+            else {
+                return false
+            }
+            if layerIndex < hashLayerCount {
+                return true
+            }
+            return layerIndex == hashLayerCount
+                && record.projection.map { partialNextLayerProjections.contains($0) } == true
         }
     }
 
@@ -174,12 +183,15 @@ public enum ResidentExpertStoreRegistry {
     public static func pinnedHashLayerCodes(
         manifestPath: String,
         hashLayerCount: Int,
+        partialNextLayerProjections: Set<String> = [],
         metrics: ExpertStreamingMetrics?
     ) -> ResidentExpertTensors? {
-        pinnedCodesCache.value(for: "\(hashLayerCount)|\(manifestPath)") {
+        let partialKey = partialNextLayerProjections.sorted().joined(separator: ",")
+        return pinnedCodesCache.value(for: "\(hashLayerCount)|\(partialKey)|\(manifestPath)") {
             ResidentExpertTensors(
                 hashLayerCodesFromManifest: manifestPath,
                 hashLayerCount: hashLayerCount,
+                partialNextLayerProjections: partialNextLayerProjections,
                 metrics: metrics
             )
         }
