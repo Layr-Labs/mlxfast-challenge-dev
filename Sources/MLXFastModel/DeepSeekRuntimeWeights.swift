@@ -75,9 +75,11 @@ public final class DeepSeekRuntimeWeightCache {
         // ballooning resident memory far beyond live data. 6 GiB comfortably
         // covers a few layers of in-flight expert buffers while keeping the
         // process inside the official 48 GB budget next to the RAM-resident
-        // scales, pinned codes, and staging buffers. Set here — the one
+        // scales, pinned codes, and staging buffers. A modest 10 GiB cap keeps
+        // more decode-side buffers warm without returning to the effectively
+        // unbounded default. Set here — the one
         // full-model runtime-init chokepoint — not in a warmup helper.
-        Memory.cacheLimit = 6 << 30
+        Memory.cacheLimit = 10 << 30
         _ = try? modelWeights()
         _ = blockSpec()
         _ = localAttentionSpec()
