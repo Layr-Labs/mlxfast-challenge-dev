@@ -40,21 +40,10 @@ public final class DeepSeekRuntimeWeightCache {
                 continue
             }
             let experts = entry.table[base..<(base + entry.topK)].map(Int.init)
-            if entry.layerIndex == 0, loader.pinnedExpertCodes != nil {
-                continue
-            }
-            let fullyPinned = loader.schedulePinnedDecodeExpertCodes(
+            loader.expertPrefetcher.prefetch(
                 layerIndex: entry.layerIndex,
-                expertIndices: experts,
-                hiddenSize: config.hiddenSize,
-                intermediateSize: config.moeIntermediateSize
+                expertIndices: experts
             )
-            if !fullyPinned {
-                loader.expertPrefetcher.prefetch(
-                    layerIndex: entry.layerIndex,
-                    expertIndices: experts
-                )
-            }
         }
     }
 
@@ -77,7 +66,7 @@ public final class DeepSeekRuntimeWeightCache {
         // process inside the official 48 GB budget next to the RAM-resident
         // scales, pinned codes, and staging buffers. Set here — the one
         // full-model runtime-init chokepoint — not in a warmup helper.
-        Memory.cacheLimit = 6 << 30
+        Memory.cacheLimit = 4 << 30
         _ = try? modelWeights()
         _ = blockSpec()
         _ = localAttentionSpec()
@@ -93,12 +82,13 @@ public final class DeepSeekRuntimeWeightCache {
             }
             if let tokenToExpert = (try? moeWeights(layerIndex: layerIndex))?.tokenToExpert,
                tokenToExpert.shape.count == 2,
-               tokenToExpert.shape[1] > 0
+               tokenToExpert.shape[1] > 0,
+               loader.stagedExpertLayerPlan(layerIndex: layerIndex) != nil
             {
                 // asArray on this untimed init path is the table's only host
-                // materialization; ~6 MB per hash layer. The decode entry path
-                // uses it for exact disk read-ahead on unpinned hash layers,
-                // and to start resident pinned-code prebuilds for pinned ones.
+                // materialization; ~6 MB per hash layer. Layers whose codes
+                // are RAM-pinned resolve no staging plan and need no
+                // prefetch — their reads never touch the disk.
                 hashLayerTables.append((
                     layerIndex: layerIndex,
                     table: tokenToExpert.asType(.int32).asArray(Int32.self),

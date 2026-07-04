@@ -127,9 +127,7 @@ public enum DeepSeekRoutedExperts {
         // not prefetched falls back to the normal per-expert bank read.
         var decodePrefetch: [String: StagedExpertCode]?
         if tokenCount == 1, !useStaged {
-            decodePrefetch = loader.consumeScheduledPinnedDecodeExpertCodes(
-                layerIndex: spec.layerIndex
-            ) ?? loader.prefetchDecodeExpertCodes(
+            decodePrefetch = loader.prefetchDecodeExpertCodes(
                 layerIndex: spec.layerIndex,
                 expertIndices: Array(flatIndicesByExpert.keys),
                 hiddenSize: spec.hiddenSize,
