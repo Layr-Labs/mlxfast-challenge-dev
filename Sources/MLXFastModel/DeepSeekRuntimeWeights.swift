@@ -40,9 +40,6 @@ public final class DeepSeekRuntimeWeightCache {
                 continue
             }
             let experts = entry.table[base..<(base + entry.topK)].map(Int.init)
-            if entry.layerIndex == 0, loader.pinnedExpertCodes != nil {
-                continue
-            }
             let fullyPinned = loader.schedulePinnedDecodeExpertCodes(
                 layerIndex: entry.layerIndex,
                 expertIndices: experts,

@@ -124,18 +124,22 @@ extension ResidentExpertTensors {
         }
     }
 
-    /// The packed U32 code tensors of the first `hashLayerCount` layers.
+    /// The packed U32 code tensors of a contiguous hash-layer window.
     public convenience init?(
         hashLayerCodesFromManifest manifestPath: String,
+        hashLayerStart: Int = 0,
         hashLayerCount: Int,
         metrics: ExpertStreamingMetrics?
     ) {
         guard hashLayerCount > 0 else {
             return nil
         }
+        let hashLayerEnd = hashLayerStart + hashLayerCount
         self.init(manifestPath: manifestPath, metrics: metrics) { record in
             record.dtype == "U32"
-                && Self.layerIndex(fromRecordName: record.name).map { $0 < hashLayerCount } == true
+                && Self.layerIndex(fromRecordName: record.name).map {
+                    $0 >= hashLayerStart && $0 < hashLayerEnd
+                } == true
         }
     }
 
@@ -173,12 +177,14 @@ public enum ResidentExpertStoreRegistry {
 
     public static func pinnedHashLayerCodes(
         manifestPath: String,
+        hashLayerStart: Int = 0,
         hashLayerCount: Int,
         metrics: ExpertStreamingMetrics?
     ) -> ResidentExpertTensors? {
-        pinnedCodesCache.value(for: "\(hashLayerCount)|\(manifestPath)") {
+        pinnedCodesCache.value(for: "\(hashLayerStart)|\(hashLayerCount)|\(manifestPath)") {
             ResidentExpertTensors(
                 hashLayerCodesFromManifest: manifestPath,
+                hashLayerStart: hashLayerStart,
                 hashLayerCount: hashLayerCount,
                 metrics: metrics
             )

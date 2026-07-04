@@ -138,6 +138,7 @@ public struct DeepSeekWeightLoader {
     /// Sized for the official 48 GB runner: pin only where at least that
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
+    private static let pinnedHashLayerStart = 1
     private static let pinnedHashLayerCap = 2
 
     public init(
@@ -178,7 +179,8 @@ public struct DeepSeekWeightLoader {
         self.pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
             ? ResidentExpertStoreRegistry.pinnedHashLayerCodes(
                 manifestPath: manifestPath,
-                hashLayerCount: min(hashLayerCount, Self.pinnedHashLayerCap),
+                hashLayerStart: min(Self.pinnedHashLayerStart, hashLayerCount),
+                hashLayerCount: min(max(hashLayerCount - Self.pinnedHashLayerStart, 0), Self.pinnedHashLayerCap),
                 metrics: metrics
             )
             : nil
