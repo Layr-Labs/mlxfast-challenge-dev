@@ -84,6 +84,12 @@ public enum SwiftTransform {
             expertKeys: expertKeys,
             index: index
         )
+        try CrossExpertDeltaCensus.run(
+            referenceDirectory: referenceDirectory,
+            expertKeys: expertKeys,
+            index: index,
+            outputDirectory: outputDirectory
+        )
 
         return TransformReport(
             referencePath: referenceDirectory.path,
