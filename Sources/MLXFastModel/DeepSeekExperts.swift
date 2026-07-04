@@ -150,9 +150,40 @@ public enum DeepSeekRoutedExperts {
         // not prefetched falls back to the normal per-expert bank read.
         var decodePrefetch: [String: StagedExpertCode]?
         if tokenCount == 1, !useStaged {
-            decodePrefetch = loader.consumeScheduledPinnedDecodeExpertCodes(
-                layerIndex: spec.layerIndex
-            ) ?? loader.prefetchDecodeExpertCodes(
+            // Batched decode path: one stacked buffer per projection and three
+            // gatherQuantizedMM dispatches replace ~6 per-expert QMM chains.
+            // Every routed slot must map to a distinct expert (the M=1 matvec
+            // per stacked row then matches the per-expert [1, hidden] QMM);
+            // duplicate-expert slots would change the per-expert GEMM shape,
+            // so they fall back to the per-expert path.
+            if flatIndicesByExpert.values.allSatisfy({ $0.count == 1 }) {
+                var seenExperts = Set<Int>()
+                let orderedExperts = selectedExperts.filter { seenExperts.insert($0).inserted }
+                let stacked = loader.consumeScheduledPinnedDecodeExpertCodes(
+                    layerIndex: spec.layerIndex
+                ) ?? loader.decodeStackedExpertCodes(
+                    layerIndex: spec.layerIndex,
+                    experts: orderedExperts,
+                    hiddenSize: spec.hiddenSize,
+                    intermediateSize: spec.intermediateSize
+                )
+                if let stacked,
+                   stacked.experts.count == flatIndicesByExpert.count,
+                   Set(stacked.experts) == seenExperts
+                {
+                    return decodeBatchedForward(
+                        stacked,
+                        xFlat: xFlat,
+                        flatIndicesByExpert: flatIndicesByExpert,
+                        outputCount: outputCount,
+                        batchSize: batchSize,
+                        sequenceLength: sequenceLength,
+                        topK: topK,
+                        spec: spec
+                    )
+                }
+            }
+            decodePrefetch = loader.prefetchDecodeExpertCodes(
                 layerIndex: spec.layerIndex,
                 expertIndices: Array(flatIndicesByExpert.keys),
                 hiddenSize: spec.hiddenSize,
@@ -206,6 +237,79 @@ public enum DeepSeekRoutedExperts {
         let ordered = combined.take(MLXArray(inverse), axis: 0)
 
         return ordered.reshaped([batchSize, sequenceLength, topK, hiddenSize])
+    }
+
+    /// One-token decode MoE over the step's stacked expert buffers: three
+    /// gatherQuantizedMM dispatches (each stacked row is an M=1 matvec of the
+    /// single decode row against its own expert, the same shape the
+    /// per-expert [1, hidden] QMM ran) plus one elementwise SwiGLU chain. The
+    /// final gather maps expert rows back to routing slots exactly like the
+    /// per-expert path's inverse permutation.
+    private static func decodeBatchedForward(
+        _ stacked: DeepSeekWeightLoader.StackedDecodeExpertCodes,
+        xFlat: MLXArray,
+        flatIndicesByExpert: [Int: [Int]],
+        outputCount: Int,
+        batchSize: Int,
+        sequenceLength: Int,
+        topK: Int,
+        spec: DeepSeekRoutedExpertSpec
+    ) -> MLXArray {
+        let xIn = xFlat.expandedDimensions(axis: 0)
+        let expertCount = stacked.experts.count
+        let rhsIndices = MLXArray((0..<expertCount).map(Int32.init))
+
+        let gateOut = gatherQuantizedMM(
+            xIn,
+            stacked.gate.weight,
+            scales: stacked.gate.scales,
+            biases: stacked.gate.biases,
+            rhsIndices: rhsIndices,
+            transpose: true,
+            groupSize: stacked.gate.groupSize,
+            bits: stacked.gate.bits,
+            mode: stacked.gate.mode,
+            sortedIndices: true
+        )
+        let upOut = gatherQuantizedMM(
+            xIn,
+            stacked.up.weight,
+            scales: stacked.up.scales,
+            biases: stacked.up.biases,
+            rhsIndices: rhsIndices,
+            transpose: true,
+            groupSize: stacked.up.groupSize,
+            bits: stacked.up.bits,
+            mode: stacked.up.mode,
+            sortedIndices: true
+        )
+        let hidden = DeepSeekOps.limitedSwiGLU(
+            gate: gateOut,
+            up: upOut,
+            limit: spec.swigluLimit
+        )
+        let downOut = gatherQuantizedMM(
+            hidden,
+            stacked.down.weight,
+            scales: stacked.down.scales,
+            biases: stacked.down.biases,
+            rhsIndices: rhsIndices,
+            transpose: true,
+            groupSize: stacked.down.groupSize,
+            bits: stacked.down.bits,
+            mode: stacked.down.mode,
+            sortedIndices: true
+        )
+
+        let combined = downOut.squeezed(axis: 1)
+        var rowForSlot = [Int32](repeating: 0, count: outputCount)
+        for (row, expertIndex) in stacked.experts.enumerated() {
+            for flatIndex in flatIndicesByExpert[expertIndex] ?? [] {
+                rowForSlot[flatIndex] = Int32(row)
+            }
+        }
+        let ordered = combined.take(MLXArray(rowForSlot), axis: 0)
+        return ordered.reshaped([batchSize, sequenceLength, topK, spec.hiddenSize])
     }
 
     /// Whole-layer routed-expert forward over RAM-resident stacked tensors.

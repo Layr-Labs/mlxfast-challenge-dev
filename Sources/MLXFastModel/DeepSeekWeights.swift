@@ -421,6 +421,204 @@ public struct DeepSeekWeightLoader {
         return map.isEmpty ? nil : map
     }
 
+    /// One decode step's routed experts stacked per projection: `[k, rows,
+    /// packed]` codes plus `[k, rows, groups]` scales, in `experts` order.
+    /// Consumed by the batched decode path (three gatherQuantizedMM calls per
+    /// layer). The slice bytes are the same pinned/side-bank reads the
+    /// per-expert path performs; only the destination buffer layout changes.
+    public struct StackedDecodeExpertCodes {
+        public let gate: StackedExpertProjection
+        public let up: StackedExpertProjection
+        public let down: StackedExpertProjection
+        public let experts: [Int]
+    }
+
+    /// Builds one decode step's stacked expert projections for a layer.
+    /// Byte sources per slice: the RAM-pinned hash-layer store, else a
+    /// concurrent read through the trusted capacity-0 side bank (identical
+    /// ranges and metering to the per-expert path). Scales come from the
+    /// resident scales store. Returns nil when any piece is missing (biases
+    /// present, non-stacked layout, scales not resident, read failure) so
+    /// callers fall back to the existing per-expert map path.
+    public func decodeStackedExpertCodes(
+        layerIndex: Int,
+        experts: [Int],
+        hiddenSize: Int,
+        intermediateSize: Int
+    ) -> StackedDecodeExpertCodes? {
+        guard !experts.isEmpty else {
+            return nil
+        }
+        struct ProjectionPlan {
+            let name: String
+            let sliceByteLength: Int
+            let sliceShape: [Int]
+            let scalesData: Data
+            let scalesShape: [Int]
+            let scalesDType: TensorDType
+            let groupSize: Int
+            let bits: Int
+            let mode: QuantizationMode
+        }
+        let projections: [(DeepSeekExpertProjection, [Int])] = [
+            (.gate, [intermediateSize, hiddenSize]),
+            (.up, [intermediateSize, hiddenSize]),
+            (.down, [hiddenSize, intermediateSize]),
+        ]
+        let k = experts.count
+        var plans: [ProjectionPlan] = []
+        plans.reserveCapacity(3)
+        for (projection, expectedShape) in projections {
+            let candidates = DeepSeekWeightNames.routedExpert(
+                layerIndex: layerIndex,
+                expertIndex: 0,
+                projection: projection
+            )
+            guard
+                let candidate = candidates.first(where: { expertBank.record(named: $0) != nil }),
+                let record = expertBank.record(named: candidate),
+                record.dtype == "U32",
+                record.shape.count == expectedShape.count + 1,
+                let expertCount = record.shape.first,
+                experts.allSatisfy({ $0 >= 0 && $0 < expertCount }),
+                record.byteLength % expertCount == 0,
+                let logicalInput = expectedShape.last,
+                let packedInput = record.shape.last,
+                logicalInput > 0,
+                packedInput > 0,
+                (packedInput * 32) % logicalInput == 0,
+                [2, 4, 8].contains(packedInput * 32 / logicalInput)
+            else {
+                return nil
+            }
+            // Biases exist only for affine tensors whose bytes are not in RAM
+            // on the decode path; the batched math would need them, so bail.
+            let biasesName = companionName(for: candidate, suffix: "biases")
+            guard expertBank.record(named: biasesName) == nil else {
+                return nil
+            }
+            let scalesName = companionName(for: candidate, suffix: "scales")
+            guard
+                let scalesRecord = expertBank.record(named: scalesName),
+                scalesRecord.shape.count == expectedShape.count + 1,
+                scalesRecord.byteLength % expertCount == 0,
+                let scaleGroups = scalesRecord.shape.last,
+                scaleGroups > 0,
+                logicalInput % scaleGroups == 0,
+                let scalesDType = try? TensorDType.parse(scalesRecord.dtype),
+                let residentScales = residentExpertScales
+            else {
+                return nil
+            }
+            let scalesSliceLength = scalesRecord.byteLength / expertCount
+            var scalesData = Data(count: k * scalesSliceLength)
+            for (position, expertIndex) in experts.enumerated() {
+                guard let slice = residentScales.materializedTensor(
+                    named: scalesName,
+                    firstAxisIndex: expertIndex
+                ), slice.bytes.count == scalesSliceLength else {
+                    return nil
+                }
+                scalesData.replaceSubrange(
+                    (position * scalesSliceLength)..<((position + 1) * scalesSliceLength),
+                    with: slice.bytes
+                )
+            }
+            plans.append(
+                ProjectionPlan(
+                    name: candidate,
+                    sliceByteLength: record.byteLength / expertCount,
+                    sliceShape: Array(record.shape.dropFirst()),
+                    scalesData: scalesData,
+                    scalesShape: [k] + Array(scalesRecord.shape.dropFirst().dropLast()) + [scaleGroups],
+                    scalesDType: scalesDType,
+                    groupSize: logicalInput / scaleGroups,
+                    bits: packedInput * 32 / logicalInput,
+                    mode: scalesDType == .u8 ? .mxfp4 : .affine
+                )
+            )
+        }
+
+        // Read every (projection, expert) slice concurrently into its slot in
+        // the per-projection stacked buffer. Pinned bytes come from RAM; the
+        // rest go through the trusted side bank exactly like the per-expert
+        // prefetch.
+        let sideBank = decodeSideBank
+        let pinnedCodes = pinnedExpertCodes
+        let codeBuffers = plans.map { plan in
+            UnsafeMutableRawPointer.allocate(byteCount: k * plan.sliceByteLength, alignment: 16)
+        }
+        let failed = DecodeStackFailureFlag()
+        let taskCount = 3 * k
+        DispatchQueue.concurrentPerform(iterations: taskCount) { taskIndex in
+            let projectionIndex = taskIndex / k
+            let position = taskIndex % k
+            let plan = plans[projectionIndex]
+            let expertIndex = experts[position]
+            guard
+                let tensor = pinnedCodes?.materializedTensor(
+                    named: plan.name,
+                    firstAxisIndex: expertIndex
+                ) ?? (try? sideBank?.materializedTensor(
+                    named: plan.name,
+                    firstAxisIndex: expertIndex
+                )),
+                tensor.bytes.count == plan.sliceByteLength
+            else {
+                failed.set()
+                return
+            }
+            tensor.bytes.withUnsafeBytes { source in
+                guard let base = source.baseAddress else {
+                    failed.set()
+                    return
+                }
+                codeBuffers[projectionIndex]
+                    .advanced(by: position * plan.sliceByteLength)
+                    .copyMemory(from: base, byteCount: plan.sliceByteLength)
+            }
+        }
+        guard !failed.value else {
+            for buffer in codeBuffers {
+                buffer.deallocate()
+            }
+            return nil
+        }
+
+        var stacked: [StackedExpertProjection] = []
+        stacked.reserveCapacity(3)
+        for (projectionIndex, plan) in plans.enumerated() {
+            let byteCount = k * plan.sliceByteLength
+            let data = Data(
+                bytesNoCopy: codeBuffers[projectionIndex],
+                count: byteCount,
+                deallocator: .custom { pointer, _ in pointer.deallocate() }
+            )
+            let weight = MLXArray(data, [k] + plan.sliceShape, dtype: .uint32)
+            let scales = MLXArray(
+                plan.scalesData,
+                plan.scalesShape,
+                dtype: MLXArrayTensorBridge.mlxDType(for: plan.scalesDType)
+            )
+            stacked.append(
+                StackedExpertProjection(
+                    weight: weight,
+                    scales: scales,
+                    biases: nil,
+                    groupSize: plan.groupSize,
+                    bits: plan.bits,
+                    mode: plan.mode
+                )
+            )
+        }
+        return StackedDecodeExpertCodes(
+            gate: stacked[0],
+            up: stacked[1],
+            down: stacked[2],
+            experts: experts
+        )
+    }
+
     /// Starts building resident pinned-code decode slices for a hash-routed
     /// layer before that layer reaches MoE. Only the first two hash layers are
     /// pinned on the official runner; unpinned layers return false so callers
@@ -452,22 +650,23 @@ public struct DeepSeekWeightLoader {
             scheduledPinnedDecodePrefetches.remove(layerIndex: layerIndex)
             return false
         }
-        let bridge = self.bridge
-        let residentScales = self.residentExpertScales
+        // Distinct experts in first-appearance order: matches the batched
+        // decode consumer's grouping of routing slots by expert.
+        var seen = Set<Int>()
+        let orderedExperts = expertIndices.filter { seen.insert($0).inserted }
+        let loader = self
         scheduledPinnedDecodePrefetches.schedule(layerIndex: layerIndex) {
-            Self.buildPinnedDecodeExpertCodes(
-                keys: plan.keys,
-                names: plan.names,
-                indices: plan.indices,
-                pinnedCodes: pinnedCodes,
-                residentScales: residentScales,
-                bridge: bridge
+            loader.decodeStackedExpertCodes(
+                layerIndex: layerIndex,
+                experts: orderedExperts,
+                hiddenSize: hiddenSize,
+                intermediateSize: intermediateSize
             )
         }
         return true
     }
 
-    public func consumeScheduledPinnedDecodeExpertCodes(layerIndex: Int) -> [String: StagedExpertCode]? {
+    public func consumeScheduledPinnedDecodeExpertCodes(layerIndex: Int) -> StackedDecodeExpertCodes? {
         scheduledPinnedDecodePrefetches.consume(layerIndex: layerIndex)
     }
 
@@ -517,52 +716,6 @@ public struct DeepSeekWeightLoader {
             }
         }
         return (keys, names, indices)
-    }
-
-    private static func buildPinnedDecodeExpertCodes(
-        keys: [String],
-        names: [String],
-        indices: [Int],
-        pinnedCodes: ResidentExpertTensors,
-        residentScales: ResidentExpertTensors?,
-        bridge: MLXArrayTensorBridge
-    ) -> [String: StagedExpertCode]? {
-        var results = [StagedExpertCode?](repeating: nil, count: keys.count)
-        results.withUnsafeMutableBufferPointer { buffer in
-            let sink = DecodePrefetchSink(buffer: buffer)
-            DispatchQueue.concurrentPerform(iterations: keys.count) { index in
-                let name = names[index]
-                let expertIndex = indices[index]
-                guard
-                    let tensor = pinnedCodes.materializedTensor(
-                        named: name,
-                        firstAxisIndex: expertIndex
-                    ),
-                    let array = try? bridge.makeArray(from: tensor)
-                else {
-                    return
-                }
-                let scalesArray = Self.residentScalesArray(
-                    residentScales: residentScales,
-                    bridge: bridge,
-                    codeName: name,
-                    expertIndex: expertIndex
-                )
-                sink.buffer[index] = StagedExpertCode(
-                    tensor: tensor,
-                    array: array,
-                    scalesArray: scalesArray
-                )
-            }
-        }
-        var map: [String: StagedExpertCode] = [:]
-        map.reserveCapacity(keys.count)
-        for (index, key) in keys.enumerated() {
-            if let staged = results[index] {
-                map[key] = staged
-            }
-        }
-        return map.isEmpty ? nil : map
     }
 
     /// Prefill/warmup analogue of prefetchDecodeExpertCodes for the staged
@@ -1865,11 +2018,23 @@ private struct DecodePrefetchSink: @unchecked Sendable {
     let buffer: UnsafeMutableBufferPointer<StagedExpertCode?>
 }
 
+// Concurrent-write failure flag for the stacked decode buffer fill.
+private final class DecodeStackFailureFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var failed = false
+    var value: Bool {
+        lock.lock(); defer { lock.unlock() }; return failed
+    }
+    func set() {
+        lock.lock(); failed = true; lock.unlock()
+    }
+}
+
 private final class ScheduledDecodePrefetches {
     private final class Entry {
         let group = DispatchGroup()
         let lock = NSLock()
-        var result: [String: StagedExpertCode]?
+        var result: DeepSeekWeightLoader.StackedDecodeExpertCodes?
     }
 
     private let lock = NSLock()
@@ -1878,7 +2043,7 @@ private final class ScheduledDecodePrefetches {
 
     func schedule(
         layerIndex: Int,
-        build: @escaping () -> [String: StagedExpertCode]?
+        build: @escaping () -> DeepSeekWeightLoader.StackedDecodeExpertCodes?
     ) {
         let entry = Entry()
         entry.group.enter()
@@ -1895,7 +2060,7 @@ private final class ScheduledDecodePrefetches {
         }
     }
 
-    func consume(layerIndex: Int) -> [String: StagedExpertCode]? {
+    func consume(layerIndex: Int) -> DeepSeekWeightLoader.StackedDecodeExpertCodes? {
         lock.lock()
         let entry = entries.removeValue(forKey: layerIndex)
         lock.unlock()
@@ -1908,7 +2073,7 @@ private final class ScheduledDecodePrefetches {
         entry.lock.lock()
         let result = entry.result
         entry.lock.unlock()
-        return result?.isEmpty == true ? nil : result
+        return result
     }
 
     func remove(layerIndex: Int) {
