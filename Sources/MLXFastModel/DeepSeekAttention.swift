@@ -505,11 +505,17 @@ public enum DeepSeekLocalAttention {
         q = DeepSeekHyperConnection.weightlessRMSNorm(q, eps: spec.rmsNormEps)
         q = q.transposed(0, 2, 1, 3)
         q = try rope.applied(to: q, offset: positionOffset)
+        if sequenceLength == 1, cache != nil {
+            asyncEval(q)
+        }
 
         var kv = DeepSeekOps.linear(input: x, weight: weights.wkv)
         kv = DeepSeekOps.rmsNorm(input: kv, weight: weights.kvNorm, eps: spec.rmsNormEps)
         kv = kv.reshaped([batchSize, 1, sequenceLength, spec.headDim])
         kv = try rope.applied(to: kv, offset: positionOffset)
+        if sequenceLength == 1, cache != nil {
+            asyncEval(kv)
+        }
         var attentionMask = mask
         if let cache {
             let cached = try cache.updateAndFetch(kv)
@@ -583,11 +589,17 @@ public enum DeepSeekCompressedAttention {
         q = DeepSeekHyperConnection.weightlessRMSNorm(q, eps: spec.rmsNormEps)
         q = q.transposed(0, 2, 1, 3)
         q = try rope.applied(to: q, offset: positionOffset)
+        if sequenceLength == 1, cache != nil {
+            asyncEval(q)
+        }
 
         var kv = DeepSeekOps.linear(input: x, weight: weights.attention.wkv)
         kv = DeepSeekOps.rmsNorm(input: kv, weight: weights.attention.kvNorm, eps: spec.rmsNormEps)
         kv = kv.reshaped([batchSize, 1, sequenceLength, spec.headDim])
         kv = try rope.applied(to: kv, offset: positionOffset)
+        if sequenceLength == 1, cache != nil {
+            asyncEval(kv)
+        }
         var localMask = mask
         if let localCache = cache?.local {
             let cached = try localCache.updateAndFetch(kv)
