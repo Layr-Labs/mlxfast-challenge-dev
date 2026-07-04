@@ -65,19 +65,23 @@ public enum MLXFastConstants {
     // and add minutes to the job -- keep zero warmup and one measured run.
     public static let benchmarkPrefillWarmupRuns = 0
     public static let benchmarkPrefillTimedRuns = 1
-    // Official baseline measured on the Blacksmith runner for this model. After
-    // changing timed windows, run one trusted baseline validation before using
-    // scores for the public leaderboard. Raw RAM, bandwidth, and read metrics
-    // remain audit fields instead of primary score factors.
+    // Official baseline measured on the ranked runner (tenki-macos-latest-xlarge)
+    // for this model. After changing timed windows, run one trusted baseline
+    // validation before using scores for the public leaderboard. Raw RAM,
+    // bandwidth, and read metrics remain audit fields instead of primary score
+    // factors.
     //
-    // Decode recalibrated after the decode_begin single-seed change (the warmup
-    // forward was removed, so the reference model now streams experts cold for
-    // the seed prefill and reads slower on the decode axis): re-measured on the
-    // baseline reference under the current harness at 3.6366560638046876 s/tok
-    // (yukon/baseline run). Prefill is unchanged -- that path did not change, and
-    // the baseline run's prefill was within single-shot noise of the value below.
-    public static let officialBaselinePrefillSecondsPerToken = 0.17330563175390626
-    public static let officialBaselineDecodeSecondsPerToken = 3.6366560638046876
+    // Re-anchored to tenki-macos-latest-xlarge when the ranked runner moved to
+    // tenki: it runs this streaming workload ~1.5x slower on decode and ~1.75x
+    // slower on prefill than the prior Blacksmith M4 Pro calibration, which put
+    // the old anchor outside the paired-baseline sanity band. Values are the
+    // paired-baseline reference (ref 7e2191c) measured under the current harness
+    // on tenki-xlarge. With the paired baseline active these constants are the
+    // sanity-band anchor plus the local-mode / gates-placeholder fallback; the
+    // ranked decode/prefill denominator is the same-session paired baseline, so
+    // absolute machine speed cancels in the score.
+    public static let officialBaselinePrefillSecondsPerToken = 0.303409
+    public static let officialBaselineDecodeSecondsPerToken = 6.357444
     public static let scorePrefillWeight = 0.25
     public static let scoreDecodeWeight = 0.75
     public static let scorePrefillSpeedupFloor = 0.95

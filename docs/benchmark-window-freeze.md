@@ -67,12 +67,16 @@ same test:
 
 ## Current calibrated baseline
 
-Measured on the baseline reference under the current (single-seed) harness:
+Measured on the baseline reference (paired-baseline ref `7e2191c`) under the
+current (single-seed) harness on the ranked runner, tenki-macos-latest-xlarge:
 
-- `officialBaselineDecodeSecondsPerToken = 3.6366560638046876`
-  (recalibrated after the `decode_begin` warmup-forward removal).
-- `officialBaselinePrefillSecondsPerToken = 0.17330563175390626`
-  (prefill path unchanged; within single-shot noise of the prior value).
+- `officialBaselineDecodeSecondsPerToken = 6.357444`
+  (re-anchored from the Blacksmith calibration `3.6366560638046876` when the
+  ranked runner moved to tenki-xlarge, which runs this workload ~1.5x slower on
+  the decode axis).
+- `officialBaselinePrefillSecondsPerToken = 0.303409`
+  (re-anchored from `0.17330563175390626`; tenki-xlarge is ~1.75x slower on the
+  prefill path).
 
 If either number here disagrees with `Sources/MLXFastCore/Constants.swift`, the
 freeze test fails on purpose -- the doc and the code must move together.
