@@ -95,6 +95,45 @@ public enum DeepSeekRoutedExperts {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
         }
 
+        if tokenCount == 1, !useStaged {
+            let decodePrefetch = loader.consumeScheduledPinnedDecodeExpertCodes(
+                layerIndex: spec.layerIndex
+            ) ?? loader.prefetchDecodeExpertCodes(
+                layerIndex: spec.layerIndex,
+                expertIndices: selectedExperts,
+                hiddenSize: spec.hiddenSize,
+                intermediateSize: spec.intermediateSize
+            )
+            // The shared expert was already asyncEval'd by DeepSeekMoE. Wait
+            // only after the blocking CPU-side expert prebuild, so the shared
+            // GPU work can overlap that read/copy window instead of preceding it.
+            onRoutingSynced?()
+
+            let token = x.reshaped([1, hiddenSize])
+            var expertOutputs: [MLXArray] = []
+            expertOutputs.reserveCapacity(topK)
+
+            for expertIndex in selectedExperts {
+                let expertWeights = try weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec,
+                    preferStaged: false,
+                    decodePrefetch: decodePrefetch
+                )
+                expertOutputs.append(
+                    DeepSeekMLP.forward(
+                        token,
+                        weights: expertWeights,
+                        swigluLimit: spec.swigluLimit
+                    )
+                )
+            }
+
+            return concatenated(expertOutputs, axis: 0)
+                .reshaped([batchSize, sequenceLength, topK, hiddenSize])
+        }
+
         // Group activation flat-indices by expert so each expert runs one batched
         // matmul over all of its tokens instead of one matmul per token.
         var flatIndicesByExpert: [Int: [Int]] = [:]
@@ -108,16 +147,6 @@ public enum DeepSeekRoutedExperts {
         // flatIndex / topK. Gathering rows with a single `take` replaces the
         // per-token slice+concat that built each expert batch previously.
         let xFlat = x.reshaped([tokenCount, hiddenSize])
-
-        // The shared expert depends only on x (RAM-resident weights, no SSD
-        // read), so it is the one piece of GPU work that can run during the
-        // routed experts' blocking SSD reads below. Fire the overlap hook
-        // (which evals the already-built shared MLP graph) right before the
-        // concurrentPerform barrier, filling the GPU-idle read window. Only
-        // on the decode path where that idle window exists.
-        if tokenCount == 1, !useStaged {
-            onRoutingSynced?()
-        }
 
         // Decode/1-token path: the per-expert code slices are otherwise read
         // one blocking pread at a time on the compute thread. Read them
