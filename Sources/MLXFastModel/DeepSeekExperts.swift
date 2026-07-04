@@ -245,6 +245,10 @@ public enum DeepSeekRoutedExperts {
     ) -> MLXArray? {
         // Build the three stacked projections concurrently: each is one big
         // Data->Metal copy (vs 256 slice copies on the per-expert path).
+        // Gate and up are then concatenated along the row/output axis so each
+        // expert runs one quantizedMM producing [gate ; up] rows. This keeps
+        // every per-row dot product on the ordinary per-expert quantizedMM
+        // kernel while removing one QMM node per active expert.
         var projections = [DeepSeekWeightLoader.StackedExpertProjection?](repeating: nil, count: 3)
         let expectedShapes: [[Int]] = [
             [spec.intermediateSize, spec.hiddenSize],
@@ -265,6 +269,24 @@ public enum DeepSeekRoutedExperts {
         guard let gate = projections[0], let up = projections[1], let down = projections[2] else {
             return nil
         }
+        guard gate.groupSize == up.groupSize,
+              gate.bits == up.bits,
+              gate.mode == up.mode,
+              gate.weight.shape.count == up.weight.shape.count,
+              gate.scales.shape.count == up.scales.shape.count
+        else {
+            return nil
+        }
+        let gateUpWeight = concatenated([gate.weight, up.weight], axis: 1)
+        let gateUpScales = concatenated([gate.scales, up.scales], axis: 1)
+        let gateUpBiases: MLXArray?
+        if let gateBiases = gate.biases, let upBiases = up.biases {
+            gateUpBiases = concatenated([gateBiases, upBiases], axis: 1)
+        } else if gate.biases == nil, up.biases == nil {
+            gateUpBiases = nil
+        } else {
+            return nil
+        }
 
         let outputCount = selectedExperts.count
         // Group activation flat-indices by expert exactly like the per-expert
@@ -277,7 +299,7 @@ public enum DeepSeekRoutedExperts {
         }
 
         let xFlat = x.reshaped([batchSize * sequenceLength, spec.hiddenSize])
-        let gateLogical = [spec.intermediateSize, spec.hiddenSize]
+        let gateUpLogical = [spec.intermediateSize * 2, spec.hiddenSize]
         let downLogical = [spec.hiddenSize, spec.intermediateSize]
 
         // One gather for every expert's token batch. Each expert's segment
@@ -297,32 +319,21 @@ public enum DeepSeekRoutedExperts {
         let sortedRows = scatterOrder.map { Int32($0 / topK) }
         let xSorted = xFlat.take(MLXArray(sortedRows), axis: 0)
 
-        var gateOutputs: [MLXArray] = []
-        var upOutputs: [MLXArray] = []
+        var gateUpOutputs: [MLXArray] = []
         var downWeights: [DeepSeekLinearWeight] = []
-        gateOutputs.reserveCapacity(expertOrder.count)
-        upOutputs.reserveCapacity(expertOrder.count)
+        gateUpOutputs.reserveCapacity(expertOrder.count)
         downWeights.reserveCapacity(expertOrder.count)
 
         var tokenStart = 0
         for (position, expertIndex) in expertOrder.enumerated() {
-            let gateWeight = DeepSeekLinearWeight(
-                weight: gate.weight[expertIndex],
-                scales: gate.scales[expertIndex],
-                biases: gate.biases.map { $0[expertIndex] },
-                logicalShape: gateLogical,
+            let gateUpWeightForExpert = DeepSeekLinearWeight(
+                weight: gateUpWeight[expertIndex],
+                scales: gateUpScales[expertIndex],
+                biases: gateUpBiases.map { $0[expertIndex] },
+                logicalShape: gateUpLogical,
                 groupSize: gate.groupSize,
                 bits: gate.bits,
                 mode: gate.mode
-            )
-            let upWeight = DeepSeekLinearWeight(
-                weight: up.weight[expertIndex],
-                scales: up.scales[expertIndex],
-                biases: up.biases.map { $0[expertIndex] },
-                logicalShape: gateLogical,
-                groupSize: up.groupSize,
-                bits: up.bits,
-                mode: up.mode
             )
             downWeights.append(
                 DeepSeekLinearWeight(
@@ -337,16 +348,18 @@ public enum DeepSeekRoutedExperts {
             )
             let tokens = xSorted[tokenStart..<(tokenStart + segmentLengths[position])]
             tokenStart += segmentLengths[position]
-            gateOutputs.append(DeepSeekOps.linear(input: tokens, weight: gateWeight))
-            upOutputs.append(DeepSeekOps.linear(input: tokens, weight: upWeight))
+            gateUpOutputs.append(DeepSeekOps.linear(input: tokens, weight: gateUpWeightForExpert))
         }
+
+        let gateUpAll = concatenated(gateUpOutputs, axis: 0)
 
         // One elementwise SwiGLU over all experts' activations. Elementwise
         // ops are batch-size invariant, so each row matches the per-expert
-        // evaluation bit for bit.
+        // evaluation bit for bit. The fused projection is split back into the
+        // original gate and up row ranges before the unchanged SwiGLU.
         let hiddenAll = DeepSeekOps.limitedSwiGLU(
-            gate: concatenated(gateOutputs, axis: 0),
-            up: concatenated(upOutputs, axis: 0),
+            gate: gateUpAll[0..., 0..<spec.intermediateSize],
+            up: gateUpAll[0..., spec.intermediateSize..<(spec.intermediateSize * 2)],
             limit: spec.swigluLimit
         )
 
