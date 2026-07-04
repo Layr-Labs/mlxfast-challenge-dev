@@ -33,7 +33,7 @@ permissions:
 
 jobs:
   run:
-    runs-on: tenki-macos-latest-large
+    runs-on: tenki-macos-latest-xlarge
     timeout-minutes: 720
     environment: benchmark-private-prompts
     env:
