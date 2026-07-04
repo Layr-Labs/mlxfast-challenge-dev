@@ -33,7 +33,7 @@ permissions:
 
 jobs:
   slice:
-    runs-on: tenki-macos-latest-small
+    runs-on: tenki-macos-latest-large
     timeout-minutes: 360
     environment: benchmark-private-prompts
     env:
