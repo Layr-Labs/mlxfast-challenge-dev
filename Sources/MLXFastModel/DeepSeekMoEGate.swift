@@ -21,6 +21,7 @@ public enum DeepSeekMoEGate {
         weightTransposed: MLXArray? = nil,
         correctionBias: MLXArray? = nil,
         tokenToExpert: MLXArray? = nil,
+        fixedTokenToExpertIndices: MLXArray? = nil,
         topK: Int,
         routedScalingFactor: Double,
         normTopKProb: Bool,
@@ -35,10 +36,19 @@ public enum DeepSeekMoEGate {
 
         let indices: MLXArray
         if let tokenToExpert {
-            guard let inputIDs else {
-                throw MLXFastError.invalidInput("hash routing requires input ids")
+            if let fixed = fixedTokenToExpertIndices,
+               fixed.shape.count == 3,
+               fixed.shape[0] == hidden.shape[0],
+               fixed.shape[1] == hidden.shape[1],
+               fixed.shape[2] == topK
+            {
+                indices = DeepSeekOps.cast(fixed, to: .int32)
+            } else {
+                guard let inputIDs else {
+                    throw MLXFastError.invalidInput("hash routing requires input ids")
+                }
+                indices = tokenToExpert[inputIDs].asType(.int32)
             }
-            indices = tokenToExpert[inputIDs].asType(.int32)
         } else {
             let biased = correctionBias.map { scores + $0 } ?? scores
             indices = argPartition(-biased, kth: topK - 1, axis: -1)[

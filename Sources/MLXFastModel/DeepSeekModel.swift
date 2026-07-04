@@ -128,14 +128,17 @@ public enum DeepSeekModel {
         let config = weightCache.config
         let spec = DeepSeekModelSpec(config: config)
         let weights = try weightCache.modelWeights()
+        let decodeToken: Int?
         if inputIDs.shape == [1, 1] {
             // Decode step: hash-layer routing depends only on the token id,
             // so advise the kernel about those layers' expert ranges before
             // the forward starts. inputIDs is a leaf array on every decode
             // path, so this host read forces no GPU synchronization.
-            weightCache.prefetchHashLayerExperts(
-                token: Int(DeepSeekOps.cast(inputIDs, to: .int32).asArray(Int32.self)[0])
-            )
+            let token = Int(DeepSeekOps.cast(inputIDs, to: .int32).asArray(Int32.self)[0])
+            weightCache.prefetchHashLayerExperts(token: token)
+            decodeToken = token
+        } else {
+            decodeToken = nil
         }
         return try logits(
             inputIDs: inputIDs,
@@ -149,7 +152,8 @@ public enum DeepSeekModel {
                 inputIDs: inputIDs,
                 weightCache: weightCache,
                 cache: cache?.layers[layerIndex],
-                positionOffset: positionOffset
+                positionOffset: positionOffset,
+                decodeToken: decodeToken
             )
         }
     }
@@ -266,7 +270,8 @@ public enum DeepSeekModel {
         inputIDs: MLXArray,
         weightCache: DeepSeekRuntimeWeightCache,
         cache: DeepSeekLayerCache? = nil,
-        positionOffset: Int = 0
+        positionOffset: Int = 0,
+        decodeToken: Int? = nil
     ) throws -> MLXArray {
         let config = weightCache.config
         let compressRatio = config.compressRatios[layerIndex]
@@ -325,7 +330,10 @@ public enum DeepSeekModel {
                     inputIDs: inputIDs,
                     weights: moeWeights,
                     loader: weightCache.loader,
-                    spec: moeSpec
+                    spec: moeSpec,
+                    fixedTokenToExpertIndices: decodeToken.flatMap {
+                        weightCache.hashLayerExpertIndicesArray(layerIndex: layerIndex, token: $0)
+                    }
                 )
             }
         )

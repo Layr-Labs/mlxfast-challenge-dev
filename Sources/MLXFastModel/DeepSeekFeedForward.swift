@@ -101,7 +101,8 @@ public enum DeepSeekMoE {
         inputIDs: MLXArray?,
         weights: DeepSeekMoEWeights,
         loader: DeepSeekWeightLoader,
-        spec: DeepSeekMoESpec
+        spec: DeepSeekMoESpec,
+        fixedTokenToExpertIndices: MLXArray? = nil
     ) throws -> MLXArray {
         let routing = try DeepSeekMoEGate.route(
             hidden: x,
@@ -110,6 +111,7 @@ public enum DeepSeekMoE {
             weightTransposed: weights.gateTransposed,
             correctionBias: weights.correctionBias,
             tokenToExpert: weights.tokenToExpert,
+            fixedTokenToExpertIndices: fixedTokenToExpertIndices,
             topK: spec.expertsPerToken,
             routedScalingFactor: spec.routedScalingFactor,
             normTopKProb: spec.normTopKProb,
