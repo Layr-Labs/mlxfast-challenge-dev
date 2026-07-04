@@ -1448,17 +1448,30 @@ seed_reference_from_local_cache() {
   echo "setup.sh:   source ${seed_abs}"
   echo "setup.sh:   dest   ${dst_abs}"
   ensure_reference_space "$(dirname "${reference_dir}")"
-  # -L dereferences the HF cache's blob symlinks so real files land in dest.
-  if command -v rsync >/dev/null 2>&1; then
-    if ! rsync -rL "${seed_abs}/" "${dst_abs}/"; then
-      echo "setup.sh: seed copy (rsync) failed; falling back to download" >&2
-      return 0
-    fi
-  elif ! ( cd "${seed_abs}" && cp -RL . "${dst_abs}/" ); then
-    echo "setup.sh: seed copy (cp) failed; falling back to download" >&2
-    return 0
+  # Parallel per-file copy: a throughput-limited network mount copies at about
+  # download speed on one stream but usually has aggregate headroom, so fan out
+  # REFERENCE_DOWNLOAD_JOBS concurrent copies (a single rsync stream measured
+  # ~26 min for this checkpoint -- no better than downloading). -L dereferences
+  # the HF cache's blob symlinks so real files land in dest. Best-effort: the
+  # verify/repair path below fetches anything the copy missed, so a partial or
+  # failed copy is safe.
+  local seed_jobs="${REFERENCE_DOWNLOAD_JOBS:-8}"
+  export MLXFAST_SEED_SRC="${seed_abs}" MLXFAST_SEED_DST="${dst_abs}"
+  if command -v xargs >/dev/null 2>&1; then
+    ( cd "${MLXFAST_SEED_SRC}" \
+        && find . \( -type f -o -type l \) -print \
+        | xargs -P "${seed_jobs}" -I {} sh -c '
+            rel="${1#./}"
+            mkdir -p "${MLXFAST_SEED_DST}/$(dirname "${rel}")"
+            cp -L "${MLXFAST_SEED_SRC}/${rel}" "${MLXFAST_SEED_DST}/${rel}"
+          ' _ {} ) \
+      || echo "setup.sh: parallel seed copy reported errors; verify will repair any gaps" >&2
+  else
+    ( cd "${seed_abs}" && cp -RL . "${dst_abs}/" ) \
+      || echo "setup.sh: seed copy failed; verify will repair or download" >&2
   fi
-  echo "setup.sh: seeded reference ($(path_size_gib "${reference_dir}") GiB) from local cache; verifying"
+  unset MLXFAST_SEED_SRC MLXFAST_SEED_DST
+  echo "setup.sh: local-cache seed pass done ($(path_size_gib "${reference_dir}") GiB present); verifying"
 }
 
 download_reference_weights() {
