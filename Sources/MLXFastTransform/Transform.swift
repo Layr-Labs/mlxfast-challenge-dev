@@ -84,6 +84,13 @@ public enum SwiftTransform {
             expertKeys: expertKeys,
             index: index
         )
+        // Transform-only storage census; the runtime ignores its JSON report.
+        _ = try MXFP4EntropyCensus.run(
+            referenceDirectory: referenceDirectory,
+            outputDirectory: outputDirectory,
+            expertKeys: expertKeys,
+            index: index
+        )
 
         return TransformReport(
             referencePath: referenceDirectory.path,
