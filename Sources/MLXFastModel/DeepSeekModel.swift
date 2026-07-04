@@ -193,6 +193,10 @@ public enum DeepSeekModel {
             hidden = try layer(layerIndex, hidden)
         }
 
+        if hidden.shape[1] > 1 {
+            hidden = hidden[0..., (hidden.shape[1] - 1)..., 0..., 0...]
+        }
+
         let collapsed = try DeepSeekHyperConnection.head(
             hidden,
             fn: weights.headHyperConnection.fn,
