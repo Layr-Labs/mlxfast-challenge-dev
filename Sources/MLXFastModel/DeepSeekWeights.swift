@@ -377,38 +377,42 @@ public struct DeepSeekWeightLoader {
         var results = [StagedExpertCode?](repeating: nil, count: keys.count)
         results.withUnsafeMutableBufferPointer { buffer in
             let sink = DecodePrefetchSink(buffer: buffer)
-            DispatchQueue.concurrentPerform(iterations: keys.count) { index in
-                let name = names[index]
-                let expertIndex = indices[index]
-                // Read the slice AND build its base MLXArray (the eager
-                // Data->Metal copy) here on the worker thread. The compute
-                // thread's per-expert loop then skips that memcpy and only
-                // wires the lazy reshape/quant assembly into the graph.
-                // Byte-identical: same bytes, same array constructor.
-                guard
-                    let tensor = pinnedCodes?.materializedTensor(
-                        named: name,
-                        firstAxisIndex: expertIndex
-                    ) ?? (try? sideBank.materializedTensor(
-                        named: name,
-                        firstAxisIndex: expertIndex
-                    )),
-                    let array = try? bridge.makeArray(from: tensor)
-                else {
-                    return
+            let workerCount = min(keys.count, 6)
+            DispatchQueue.concurrentPerform(iterations: workerCount) { workerIndex in
+                var index = workerIndex
+                while index < keys.count {
+                    let name = names[index]
+                    let expertIndex = indices[index]
+                    // Read the slice AND build its base MLXArray (the eager
+                    // Data->Metal copy) here on the worker thread. The compute
+                    // thread's per-expert loop then skips that memcpy and only
+                    // wires the lazy reshape/quant assembly into the graph.
+                    // Byte-identical: same bytes, same array constructor.
+                    if
+                        let tensor = pinnedCodes?.materializedTensor(
+                            named: name,
+                            firstAxisIndex: expertIndex
+                        ) ?? (try? sideBank.materializedTensor(
+                            named: name,
+                            firstAxisIndex: expertIndex
+                        )),
+                        let array = try? bridge.makeArray(from: tensor)
+                    {
+                        // Also build the resident scales' base array off-thread.
+                        let scalesArray = Self.residentScalesArray(
+                            residentScales: residentScales,
+                            bridge: bridge,
+                            codeName: name,
+                            expertIndex: expertIndex
+                        )
+                        sink.buffer[index] = StagedExpertCode(
+                            tensor: tensor,
+                            array: array,
+                            scalesArray: scalesArray
+                        )
+                    }
+                    index += workerCount
                 }
-                // Also build the resident scales' base array off-thread.
-                let scalesArray = Self.residentScalesArray(
-                    residentScales: residentScales,
-                    bridge: bridge,
-                    codeName: name,
-                    expertIndex: expertIndex
-                )
-                sink.buffer[index] = StagedExpertCode(
-                    tensor: tensor,
-                    array: array,
-                    scalesArray: scalesArray
-                )
             }
         }
         var map: [String: StagedExpertCode] = [:]
@@ -530,29 +534,33 @@ public struct DeepSeekWeightLoader {
         var results = [StagedExpertCode?](repeating: nil, count: keys.count)
         results.withUnsafeMutableBufferPointer { buffer in
             let sink = DecodePrefetchSink(buffer: buffer)
-            DispatchQueue.concurrentPerform(iterations: keys.count) { index in
-                let name = names[index]
-                let expertIndex = indices[index]
-                guard
-                    let tensor = pinnedCodes.materializedTensor(
-                        named: name,
-                        firstAxisIndex: expertIndex
-                    ),
-                    let array = try? bridge.makeArray(from: tensor)
-                else {
-                    return
+            let workerCount = min(keys.count, 6)
+            DispatchQueue.concurrentPerform(iterations: workerCount) { workerIndex in
+                var index = workerIndex
+                while index < keys.count {
+                    let name = names[index]
+                    let expertIndex = indices[index]
+                    if
+                        let tensor = pinnedCodes.materializedTensor(
+                            named: name,
+                            firstAxisIndex: expertIndex
+                        ),
+                        let array = try? bridge.makeArray(from: tensor)
+                    {
+                        let scalesArray = Self.residentScalesArray(
+                            residentScales: residentScales,
+                            bridge: bridge,
+                            codeName: name,
+                            expertIndex: expertIndex
+                        )
+                        sink.buffer[index] = StagedExpertCode(
+                            tensor: tensor,
+                            array: array,
+                            scalesArray: scalesArray
+                        )
+                    }
+                    index += workerCount
                 }
-                let scalesArray = Self.residentScalesArray(
-                    residentScales: residentScales,
-                    bridge: bridge,
-                    codeName: name,
-                    expertIndex: expertIndex
-                )
-                sink.buffer[index] = StagedExpertCode(
-                    tensor: tensor,
-                    array: array,
-                    scalesArray: scalesArray
-                )
             }
         }
         var map: [String: StagedExpertCode] = [:]
