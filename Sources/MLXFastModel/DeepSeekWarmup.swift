@@ -169,8 +169,16 @@ enum DeepSeekWarmup {
     }
 
     private static func collect(_ attention: DeepSeekLocalAttentionWeights) -> [MLXArray] {
-        var arrays = collect(attention.wqA) + collect(attention.wqB)
-            + collect(attention.wkv) + collect(attention.woA) + collect(attention.woB)
+        var arrays = collect(attention.wqB) + collect(attention.woA) + collect(attention.woB)
+        // Warm the projection actually evaluated on the timed path: the fused
+        // wq_a+wkv matmul when it was built offline, otherwise the two originals.
+        // Warming the originals here would leave the fused weight a cold
+        // `concatenated(...)` node materialized on the first timed forward.
+        if let fused = attention.wqAKV {
+            arrays += collect(fused)
+        } else {
+            arrays += collect(attention.wqA) + collect(attention.wkv)
+        }
         arrays.append(attention.qNorm)
         arrays.append(attention.kvNorm)
         if let bias = attention.woBBias { arrays.append(bias) }
@@ -179,6 +187,13 @@ enum DeepSeekWarmup {
     }
 
     private static func collect(_ compressor: DeepSeekCompressorWeights) -> [MLXArray] {
-        collect(compressor.wkv) + collect(compressor.wgate) + [compressor.ape, compressor.norm]
+        // Warm the fused wkv+wgate matmul when present, else the two originals.
+        let projections: [MLXArray]
+        if let fused = compressor.kvGate {
+            projections = collect(fused)
+        } else {
+            projections = collect(compressor.wkv) + collect(compressor.wgate)
+        }
+        return projections + [compressor.ape, compressor.norm]
     }
 }

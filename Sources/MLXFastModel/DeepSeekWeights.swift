@@ -314,6 +314,44 @@ public struct DeepSeekWeightLoader {
         "\(name)#\(index)"
     }
 
+    private static func fusedOutputRows(
+        _ first: DeepSeekLinearWeight,
+        _ second: DeepSeekLinearWeight
+    ) -> DeepSeekLinearWeight? {
+        guard first.logicalShape.count == 2,
+              second.logicalShape.count == 2,
+              first.logicalShape[1] == second.logicalShape[1],
+              first.groupSize == second.groupSize,
+              first.bits == second.bits,
+              first.mode == second.mode,
+              (first.scales == nil) == (second.scales == nil),
+              (first.biases == nil) == (second.biases == nil)
+        else { return nil }
+
+        let fusedWeight = concatenated([first.weight, second.weight], axis: 0)
+        let fusedScales: MLXArray?
+        if let firstScales = first.scales, let secondScales = second.scales {
+            fusedScales = concatenated([firstScales, secondScales], axis: 0)
+        } else {
+            fusedScales = nil
+        }
+        let fusedBiases: MLXArray?
+        if let firstBiases = first.biases, let secondBiases = second.biases {
+            fusedBiases = concatenated([firstBiases, secondBiases], axis: 0)
+        } else {
+            fusedBiases = nil
+        }
+        return DeepSeekLinearWeight(
+            weight: fusedWeight,
+            scales: fusedScales,
+            biases: fusedBiases,
+            logicalShape: [first.logicalShape[0] + second.logicalShape[0], first.logicalShape[1]],
+            groupSize: first.groupSize,
+            bits: first.bits,
+            mode: first.mode
+        )
+    }
+
     private static func buildRoutedExpertProjectionPlans(
         expertBank: ExpertSlotBank
     ) -> [RoutedExpertProjectionKey: RoutedExpertProjectionPlan] {
@@ -1224,11 +1262,17 @@ public struct DeepSeekWeightLoader {
         attentionBias: Bool = false
     ) throws -> DeepSeekLocalAttentionWeights {
         let groupedInput = spec.numAttentionHeads * spec.headDim / spec.outputGroups
+        let wqA = try denseLinearWeight(
+            candidates: DeepSeekWeightNames.attention(layerIndex, "wq_a.weight"),
+            expectedShape: [qLoraRank, hiddenSize]
+        )
+        let wkv = try denseLinearWeight(
+            candidates: DeepSeekWeightNames.attention(layerIndex, "wkv.weight"),
+            expectedShape: [spec.headDim, hiddenSize]
+        )
+        let wqAKV = Self.fusedOutputRows(wqA, wkv)
         return try DeepSeekLocalAttentionWeights(
-            wqA: denseLinearWeight(
-                candidates: DeepSeekWeightNames.attention(layerIndex, "wq_a.weight"),
-                expectedShape: [qLoraRank, hiddenSize]
-            ),
+            wqA: wqA,
             qNorm: denseArray(
                 candidates: DeepSeekWeightNames.attention(layerIndex, "q_norm.weight"),
                 expectedShape: [qLoraRank]
@@ -1237,10 +1281,8 @@ public struct DeepSeekWeightLoader {
                 candidates: DeepSeekWeightNames.attention(layerIndex, "wq_b.weight"),
                 expectedShape: [spec.numAttentionHeads * spec.headDim, qLoraRank]
             ),
-            wkv: denseLinearWeight(
-                candidates: DeepSeekWeightNames.attention(layerIndex, "wkv.weight"),
-                expectedShape: [spec.headDim, hiddenSize]
-            ),
+            wkv: wkv,
+            wqAKV: wqAKV,
             kvNorm: denseArray(
                 candidates: DeepSeekWeightNames.attention(layerIndex, "kv_norm.weight"),
                 expectedShape: [spec.headDim]
@@ -1272,17 +1314,21 @@ public struct DeepSeekWeightLoader {
     ) throws -> DeepSeekCompressedAttentionWeights {
         let ratio = config.compressRatios[layerIndex]
         let outDim = config.headDim * (ratio == 4 ? 2 : 1)
+        let wkv = try denseLinearWeight(
+            candidates: DeepSeekWeightNames.attention(layerIndex, "compressor.wkv.weight"),
+            expectedShape: [outDim, config.hiddenSize]
+        )
+        let wgate = try denseLinearWeight(
+            candidates: DeepSeekWeightNames.attention(layerIndex, "compressor.wgate.weight"),
+            expectedShape: [outDim, config.hiddenSize]
+        )
+        let kvGate = Self.fusedOutputRows(wkv, wgate)
         return try DeepSeekCompressedAttentionWeights(
             attention: localAttentionWeights(layerIndex: layerIndex, config: config),
             compressor: DeepSeekCompressorWeights(
-                wkv: denseLinearWeight(
-                    candidates: DeepSeekWeightNames.attention(layerIndex, "compressor.wkv.weight"),
-                    expectedShape: [outDim, config.hiddenSize]
-                ),
-                wgate: denseLinearWeight(
-                    candidates: DeepSeekWeightNames.attention(layerIndex, "compressor.wgate.weight"),
-                    expectedShape: [outDim, config.hiddenSize]
-                ),
+                wkv: wkv,
+                wgate: wgate,
+                kvGate: kvGate,
                 ape: denseArray(
                     candidates: DeepSeekWeightNames.attention(layerIndex, "compressor.ape"),
                     expectedShape: [ratio, outDim]
@@ -1302,6 +1348,15 @@ public struct DeepSeekWeightLoader {
     ) throws -> DeepSeekIndexerWeights {
         let ratio = config.compressRatios[layerIndex]
         let outDim = config.indexHeadDim * (ratio == 4 ? 2 : 1)
+        let compressorWKV = try denseLinearWeight(
+            candidates: DeepSeekWeightNames.attention(layerIndex, "indexer.compressor.wkv.weight"),
+            expectedShape: [outDim, config.hiddenSize]
+        )
+        let compressorWGate = try denseLinearWeight(
+            candidates: DeepSeekWeightNames.attention(layerIndex, "indexer.compressor.wgate.weight"),
+            expectedShape: [outDim, config.hiddenSize]
+        )
+        let compressorKVGate = Self.fusedOutputRows(compressorWKV, compressorWGate)
         return try DeepSeekIndexerWeights(
             wqB: denseLinearWeight(
                 candidates: DeepSeekWeightNames.attention(layerIndex, "indexer.wq_b.weight"),
@@ -1312,14 +1367,9 @@ public struct DeepSeekWeightLoader {
                 expectedShape: [config.indexHeads, config.hiddenSize]
             ),
             compressor: DeepSeekCompressorWeights(
-                wkv: denseLinearWeight(
-                    candidates: DeepSeekWeightNames.attention(layerIndex, "indexer.compressor.wkv.weight"),
-                    expectedShape: [outDim, config.hiddenSize]
-                ),
-                wgate: denseLinearWeight(
-                    candidates: DeepSeekWeightNames.attention(layerIndex, "indexer.compressor.wgate.weight"),
-                    expectedShape: [outDim, config.hiddenSize]
-                ),
+                wkv: compressorWKV,
+                wgate: compressorWGate,
+                kvGate: compressorKVGate,
                 ape: denseArray(
                     candidates: DeepSeekWeightNames.attention(layerIndex, "indexer.compressor.ape"),
                     expectedShape: [ratio, outDim]
