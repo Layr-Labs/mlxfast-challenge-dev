@@ -125,8 +125,10 @@ public final class ExpertLayerStager {
         }
     }
 
-    private struct StagerResultSink: @unchecked Sendable {
-        let buffer: UnsafeMutableBufferPointer<Data?>
+    // Workers write disjoint byte ranges of preallocated buffers, so the
+    // aliasing is disjoint and the unchecked Sendable conformance is sound.
+    private struct StagerBufferSink: @unchecked Sendable {
+        let buffers: [UnsafeMutableRawPointer]
     }
 
     private func scheduleLocked(_ plan: LayerPlan) {
@@ -138,35 +140,101 @@ public final class ExpertLayerStager {
         }
         pendingLayers.insert(plan.layerIndex)
         queue.async { [self] in
-            // Read the layer's ~1 GiB projection tensors concurrently instead
-            // of one after another. The side bank is capacity 0, so it never
-            // mutates its cache/LRU and each read is an independent
-            // open/pread/close through the trusted read path (metrics are
-            // NSLock-guarded); concurrent reads are therefore race-free and
-            // stage byte-identical data — only the order/overlap of the reads
-            // changes, so consumers see the exact same bytes.
+            // Read each ~1 GiB projection tensor as MANY concurrent
+            // first-axis slice reads through the trusted side bank instead of
+            // one whole-tensor pread per record. Rationale: the official
+            // runner's disk throughput scales with queue depth (serial slice
+            // reads measured ~0.8 GB/s, 18-wide concurrent decode reads
+            // several times that), so 3 sequential streams underdrive it,
+            // while local Apple SSDs saturate either way. Each worker copies
+            // its slice into the assembled buffer at the bank's own slice
+            // offset (byteLength / firstDimension), so the assembled bytes
+            // are identical to the whole-tensor read byte-for-byte, and
+            // every byte is metered by the same counters. Records that are
+            // not cleanly sliceable fall back to one whole-tensor read.
             let names = plan.recordNames
-            var results = [Data?](repeating: nil, count: names.count)
+            struct SliceTask {
+                let recordIndex: Int
+                let sliceIndex: Int  // -1 => whole-tensor read
+            }
+            var buffers: [UnsafeMutableRawPointer] = []
+            var byteLengths: [Int] = []
+            var sliceLengths: [Int] = []
+            var tasks: [SliceTask] = []
+            var planFailed = false
+            for (recordIndex, name) in names.enumerated() {
+                guard let record = sideBank.record(named: name), record.byteLength > 0 else {
+                    planFailed = true
+                    break
+                }
+                buffers.append(
+                    UnsafeMutableRawPointer.allocate(byteCount: record.byteLength, alignment: 16)
+                )
+                byteLengths.append(record.byteLength)
+                if let firstDimension = record.shape.first,
+                   firstDimension > 1,
+                   record.shape.count >= 2,
+                   record.byteLength % firstDimension == 0 {
+                    sliceLengths.append(record.byteLength / firstDimension)
+                    for sliceIndex in 0..<firstDimension {
+                        tasks.append(SliceTask(recordIndex: recordIndex, sliceIndex: sliceIndex))
+                    }
+                } else {
+                    sliceLengths.append(record.byteLength)
+                    tasks.append(SliceTask(recordIndex: recordIndex, sliceIndex: -1))
+                }
+            }
             let failed = StagerFailureFlag()
-            results.withUnsafeMutableBufferPointer { buffer in
-                let sink = StagerResultSink(buffer: buffer)
-                DispatchQueue.concurrentPerform(iterations: names.count) { index in
-                    if let tensor = try? sideBank.materializedTensor(named: names[index]) {
-                        sink.buffer[index] = tensor.bytes
+            if planFailed {
+                failed.set()
+            } else {
+                let sink = StagerBufferSink(buffers: buffers)
+                DispatchQueue.concurrentPerform(iterations: tasks.count) { taskIndex in
+                    let task = tasks[taskIndex]
+                    let name = names[task.recordIndex]
+                    let tensor: MaterializedTensor?
+                    let offset: Int
+                    let expected: Int
+                    if task.sliceIndex >= 0 {
+                        tensor = try? sideBank.materializedTensor(
+                            named: name,
+                            firstAxisIndex: task.sliceIndex
+                        )
+                        offset = task.sliceIndex * sliceLengths[task.recordIndex]
+                        expected = sliceLengths[task.recordIndex]
                     } else {
+                        tensor = try? sideBank.materializedTensor(named: name)
+                        offset = 0
+                        expected = byteLengths[task.recordIndex]
+                    }
+                    guard let tensor, tensor.bytes.count == expected else {
                         failed.set()
+                        return
+                    }
+                    tensor.bytes.withUnsafeBytes { source in
+                        guard let base = source.baseAddress else {
+                            failed.set()
+                            return
+                        }
+                        sink.buffers[task.recordIndex]
+                            .advanced(by: offset)
+                            .copyMemory(from: base, byteCount: expected)
                     }
                 }
             }
             var loaded: [String: Data] = [:]
-            var succeeded = !failed.value
+            let succeeded = !failed.value && !planFailed
             if succeeded {
                 for (index, name) in names.enumerated() {
-                    guard let bytes = results[index] else {
-                        succeeded = false
-                        break
-                    }
-                    loaded[name] = bytes
+                    loaded[name] = Data(
+                        bytesNoCopy: buffers[index],
+                        count: byteLengths[index],
+                        deallocator: .custom { pointer, _ in pointer.deallocate() }
+                    )
+                }
+            } else {
+                for buffer in buffers {
+                    buffer.deallocate()
                 }
             }
             condition.lock()
