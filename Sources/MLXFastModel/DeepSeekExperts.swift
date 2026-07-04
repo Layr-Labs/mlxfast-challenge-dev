@@ -95,6 +95,45 @@ public enum DeepSeekRoutedExperts {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
         }
 
+        if tokenCount == 1, !useStaged {
+            // Same overlap point as the general decode path: dispatch shared
+            // expert work while routed expert code slices are fetched/built.
+            onRoutingSynced?()
+
+            let decodePrefetch = loader.consumeScheduledPinnedDecodeExpertCodes(
+                layerIndex: spec.layerIndex
+            ) ?? loader.prefetchDecodeExpertCodes(
+                layerIndex: spec.layerIndex,
+                expertIndices: selectedExperts,
+                hiddenSize: spec.hiddenSize,
+                intermediateSize: spec.intermediateSize
+            )
+
+            let token = x.reshaped([1, hiddenSize])
+            var expertOutputs: [MLXArray] = []
+            expertOutputs.reserveCapacity(topK)
+
+            for expertIndex in selectedExperts {
+                let expertWeights = try weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec,
+                    preferStaged: false,
+                    decodePrefetch: decodePrefetch
+                )
+                expertOutputs.append(
+                    DeepSeekMLP.forward(
+                        token,
+                        weights: expertWeights,
+                        swigluLimit: spec.swigluLimit
+                    )
+                )
+            }
+
+            return concatenated(expertOutputs, axis: 0)
+                .reshaped([batchSize, sequenceLength, topK, hiddenSize])
+        }
+
         // Group activation flat-indices by expert so each expert runs one batched
         // matmul over all of its tokens instead of one matmul per token.
         var flatIndicesByExpert: [Int: [Int]] = [:]
