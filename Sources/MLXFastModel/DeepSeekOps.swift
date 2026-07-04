@@ -140,8 +140,39 @@ public enum DeepSeekOps {
         guard limit > 0 else {
             return silu(gate) * up
         }
-        let cappedGate = minimum(gate, Float(limit))
-        let clippedUp = clip(up, min: Float(-limit), max: Float(limit))
-        return silu(cappedGate) * clippedUp
+        // Fuse the cap/clip/silu/multiply chain (~6 elementwise kernels plus
+        // their intermediates) into one compiled kernel, mirroring the
+        // HyperConnection tails. Runs once per MoE layer over the batched
+        // resident activations and per-expert on the fallback path. Purely
+        // elementwise and dtype-preserving at each node, so the result is
+        // bit-identical to the unfused chain — no accumulation-order change.
+        let fused = compiledLimitedSwiGLU(limit: Float(limit), dtype: gate.dtype)
+        return fused(gate, up)
+    }
+
+    private struct LimitedSwiGLUKey: Hashable {
+        let limitBits: UInt32
+        let dtype: DType
+    }
+
+    private static let compiledLimitedSwiGLUCache =
+        LockedCache<LimitedSwiGLUKey, @Sendable (MLXArray, MLXArray) -> MLXArray>()
+
+    private static func compiledLimitedSwiGLU(
+        limit: Float,
+        dtype: DType
+    ) -> @Sendable (MLXArray, MLXArray) -> MLXArray {
+        let key = LimitedSwiGLUKey(limitBits: limit.bitPattern, dtype: dtype)
+        return compiledLimitedSwiGLUCache.value(for: key) {
+            // shapeless: the batched prefill path calls this over [N, inter]
+            // where N (total routed tokens) varies per layer; without it MLX
+            // retraces the graph on every distinct N. One compile handles all
+            // shapes since the op is purely elementwise.
+            compile(shapeless: true) { (gate: MLXArray, up: MLXArray) -> MLXArray in
+                let cappedGate = minimum(gate, limit)
+                let clippedUp = clip(up, min: -limit, max: limit)
+                return (cappedGate * sigmoid(cappedGate)) * clippedUp
+            }
+        }
     }
 }
