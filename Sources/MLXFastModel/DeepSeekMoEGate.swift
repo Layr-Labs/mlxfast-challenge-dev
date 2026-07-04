@@ -27,25 +27,65 @@ public enum DeepSeekMoEGate {
         scoring: DeepSeekGateScoring,
         asyncEvalIndices: Bool = false
     ) throws -> DeepSeekMoEGateResult {
-        let logits = DeepSeekOps.cast(
-            matmul(hidden, weightTransposed ?? weight.T),
-            to: .float32
-        )
-        let scores = score(logits, scoring: scoring)
-
         let indices: MLXArray
         if let tokenToExpert {
             guard let inputIDs else {
                 throw MLXFastError.invalidInput("hash routing requires input ids")
             }
             indices = tokenToExpert[inputIDs].asType(.int32)
+            if hidden.shape.count == 3,
+               hidden.shape[0] == 1,
+               hidden.shape[1] == 1,
+               scoring != .softmax
+            {
+                if asyncEvalIndices {
+                    asyncEval(indices)
+                }
+                let selectedWeight = weight[indices]
+                let selectedLogits = DeepSeekOps.cast(
+                    matmul(
+                        hidden.expandedDimensions(axis: 2),
+                        selectedWeight.swappedAxes(-1, -2)
+                    ).squeezed(axis: 2),
+                    to: .float32
+                )
+                var selectedWeights = score(selectedLogits, scoring: scoring)
+                if normTopKProb {
+                    selectedWeights = selectedWeights / (selectedWeights.sum(axis: -1, keepDims: true) + 1e-20)
+                }
+                selectedWeights = selectedWeights * Float(routedScalingFactor)
+                return DeepSeekMoEGateResult(indices: indices, weights: selectedWeights)
+            }
         } else {
+            let logits = DeepSeekOps.cast(
+                matmul(hidden, weightTransposed ?? weight.T),
+                to: .float32
+            )
+            let scores = score(logits, scoring: scoring)
             let biased = correctionBias.map { scores + $0 } ?? scores
             indices = argPartition(-biased, kth: topK - 1, axis: -1)[
                 .ellipsis,
                 0..<topK
             ].asType(.int32)
+
+            if asyncEvalIndices {
+                asyncEval(indices)
+            }
+
+            var selectedWeights = takeAlong(scores, indices, axis: -1)
+            if scoring != .softmax && normTopKProb {
+                selectedWeights = selectedWeights / (selectedWeights.sum(axis: -1, keepDims: true) + 1e-20)
+            }
+            selectedWeights = selectedWeights * Float(routedScalingFactor)
+
+            return DeepSeekMoEGateResult(indices: indices, weights: selectedWeights)
         }
+
+        let logits = DeepSeekOps.cast(
+            matmul(hidden, weightTransposed ?? weight.T),
+            to: .float32
+        )
+        let scores = score(logits, scoring: scoring)
 
         if asyncEvalIndices {
             asyncEval(indices)
