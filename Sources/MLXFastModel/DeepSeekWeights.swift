@@ -1932,7 +1932,26 @@ public struct DeepSeekWeightLoader {
         shouldSliceCompanions: Bool = false
     ) throws -> DeepSeekLinearWeight {
         let scalesName = Self.companionName(for: baseName, suffix: "scales")
-        guard tensor.dtype == .u32, let scalesTensor = try companionTensor(scalesName, shouldSliceCompanions) else {
+
+        // Resolve the scales' shape/dtype and, only if we still need to build
+        // its MLXArray, the scales MaterializedTensor. When the scales array was
+        // already built off the compute thread (prebuiltScalesArray) we read its
+        // shape/dtype directly and DO NOT call the scales companion closure —
+        // for the palette-packed resident scales store that closure would
+        // otherwise redundantly decode the whole slice again on the compute
+        // thread just to discard its bytes.
+        let scalesShape: [Int]
+        let scalesIsU8: Bool
+        let scalesTensorForArray: MaterializedTensor?
+        if tensor.dtype == .u32, let prebuiltScalesArray {
+            scalesShape = prebuiltScalesArray.shape
+            scalesIsU8 = prebuiltScalesArray.dtype == .uint8
+            scalesTensorForArray = nil
+        } else if tensor.dtype == .u32, let scalesTensor = try companionTensor(scalesName, shouldSliceCompanions) {
+            scalesShape = scalesTensor.shape
+            scalesIsU8 = scalesTensor.dtype == .u8
+            scalesTensorForArray = scalesTensor
+        } else {
             try validateShape(tensor.shape, expectedShape: expectedShape, tensorName: baseName)
             return DeepSeekLinearWeight(try prebuiltWeightArray ?? bridge.makeArray(from: tensor))
         }
@@ -1966,12 +1985,12 @@ public struct DeepSeekWeightLoader {
         guard [2, 4, 8].contains(bits) else {
             throw MLXFastError.invalidInput("quantized tensor \(baseName) inferred unsupported bits=\(bits)")
         }
-        guard let scaleGroups = scalesTensor.shape.last, scaleGroups > 0, expectedInput % scaleGroups == 0 else {
+        guard let scaleGroups = scalesShape.last, scaleGroups > 0, expectedInput % scaleGroups == 0 else {
             throw MLXFastError.invalidInput(
-                "quantized tensor \(baseName) scales shape \(scalesTensor.shape) is incompatible with logical input \(expectedInput)"
+                "quantized tensor \(baseName) scales shape \(scalesShape) is incompatible with logical input \(expectedInput)"
             )
         }
-        let scaleRows = scalesTensor.shape.dropLast().reduce(1, *)
+        let scaleRows = scalesShape.dropLast().reduce(1, *)
         guard scaleRows == expectedRows else {
             throw MLXFastError.invalidInput(
                 "quantized tensor \(baseName) scales have \(scaleRows) rows; expected \(expectedRows)"
@@ -1981,15 +2000,15 @@ public struct DeepSeekWeightLoader {
             let biasRows = biasesTensor.shape.dropLast().reduce(1, *)
             guard biasRows == expectedRows, biasesTensor.shape.last == scaleGroups else {
                 throw MLXFastError.invalidInput(
-                    "quantized tensor \(baseName) biases shape \(biasesTensor.shape) does not match scales shape \(scalesTensor.shape)"
+                    "quantized tensor \(baseName) biases shape \(biasesTensor.shape) does not match scales shape \(scalesShape)"
                 )
             }
         }
 
-        let mode: QuantizationMode = biasesTensor == nil && scalesTensor.dtype == .u8 ? .mxfp4 : .affine
+        let mode: QuantizationMode = biasesTensor == nil && scalesIsU8 ? .mxfp4 : .affine
         let weightArray = try (prebuiltWeightArray ?? bridge.makeArray(from: tensor))
             .reshaped([expectedRows, packedInput])
-        let scalesArray = try (prebuiltScalesArray ?? bridge.makeArray(from: scalesTensor))
+        let scalesArray = try (prebuiltScalesArray ?? bridge.makeArray(from: scalesTensorForArray!))
             .reshaped([expectedRows, scaleGroups])
         let biasesArray = try biasesTensor.map { try bridge.makeArray(from: $0).reshaped([expectedRows, scaleGroups]) }
         return DeepSeekLinearWeight(
