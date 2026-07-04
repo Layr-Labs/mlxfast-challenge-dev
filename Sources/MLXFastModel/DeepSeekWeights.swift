@@ -105,6 +105,7 @@ public struct DeepSeekWeightLoader {
     public let residentExpertScales: ResidentExpertTensors?
     public let pinnedExpertCodes: ResidentExpertTensors?
     public let expertLayerStager: ExpertLayerStager?
+    private let expertPageLocker: ExpertPageLocker?
     // Dedicated capacity-0 side bank for concurrent decode-step slice reads.
     // Capacity 0 => no cache/LRU mutation, so concurrent preads are race-free
     // and read byte-identical ranges through the trusted metered path.
@@ -116,6 +117,8 @@ public struct DeepSeekWeightLoader {
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
     private static let pinnedHashLayerCap = 2
+    private static let pageLockedCodeLayerCount = 4
+    private static let pageLockedCodeBytes = 12 << 30
 
     public init(
         weightsPath: String,
@@ -158,6 +161,14 @@ public struct DeepSeekWeightLoader {
                 metrics: metrics
             )
             : nil
+        self.expertPageLocker = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
+            ? ExpertPageLockRegistry.prefixCodePages(
+                manifestPath: manifestPath,
+                startLayer: min(hashLayerCount, Self.pinnedHashLayerCap),
+                layerCount: Self.pageLockedCodeLayerCount,
+                maximumBytes: Self.pageLockedCodeBytes
+            )
+            : nil
         self.expertLayerStager = ExpertLayerStager(
             manifestPath: manifestPath,
             metrics: metrics
@@ -185,6 +196,7 @@ public struct DeepSeekWeightLoader {
         self.residentExpertScales = nil
         self.pinnedExpertCodes = nil
         self.expertLayerStager = nil
+        self.expertPageLocker = nil
         self.decodeSideBank = nil
         self.bridge = bridge
     }
