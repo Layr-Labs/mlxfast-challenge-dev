@@ -27,6 +27,7 @@ public enum SwiftTransform {
         )
         let outputDirectory = URL(fileURLWithPath: options.outputPath)
         let expertsDirectory = outputDirectory.appendingPathComponent("experts", isDirectory: true)
+        let fusedExpertsDirectory = outputDirectory.appendingPathComponent("fused_experts", isDirectory: true)
 
         try requireFile(
             referenceDirectory.appendingPathComponent("config.json").path,
@@ -52,6 +53,9 @@ public enum SwiftTransform {
             at: expertsDirectory,
             withIntermediateDirectories: true
         )
+        if FileManager.default.fileExists(atPath: fusedExpertsDirectory.path) {
+            try FileManager.default.removeItem(at: fusedExpertsDirectory)
+        }
 
         let denseKeysByShard = Dictionary(grouping: denseKeys) { key in
             index.weightMap[key] ?? ""
@@ -81,6 +85,12 @@ public enum SwiftTransform {
         try writeExpertManifest(
             referenceDirectory: referenceDirectory,
             manifestPath: manifestPath,
+            expertKeys: expertKeys,
+            index: index
+        )
+        try writeFusedGateUpExperts(
+            referenceDirectory: referenceDirectory,
+            fusedDirectory: fusedExpertsDirectory,
             expertKeys: expertKeys,
             index: index
         )
@@ -261,5 +271,340 @@ public enum SwiftTransform {
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         )
         try data.write(to: manifestPath)
+    }
+
+    private static let fusedGateUpLayerCount = 7
+    private static let fusedChunkSize = 8 * 1024 * 1024
+
+    private struct FusedSourceTensor {
+        let name: String
+        let shardName: String
+        let shardURL: URL
+        let info: SafetensorInfo
+        let dataBaseOffset: UInt64
+    }
+
+    private struct FusedTensorPlan {
+        let name: String
+        let dtype: String
+        let shape: [Int]
+        let gate: FusedSourceTensor
+        let up: FusedSourceTensor
+        let byteCount: Int
+        let gateSliceByteCount: Int
+        let upSliceByteCount: Int
+        let expertCount: Int
+    }
+
+    private static func writeFusedGateUpExperts(
+        referenceDirectory: URL,
+        fusedDirectory: URL,
+        expertKeys: Set<String>,
+        index: CheckpointIndex
+    ) throws {
+        var records: [[String: Any]] = []
+        var headerCache: [String: SafetensorsHeader] = [:]
+
+        for layerIndex in 0..<fusedGateUpLayerCount {
+            guard
+                let gateWeight = try resolveSourceTensor(
+                    layerIndex: layerIndex,
+                    projection: "gate_proj",
+                    suffix: "weight",
+                    referenceDirectory: referenceDirectory,
+                    expertKeys: expertKeys,
+                    index: index,
+                    headerCache: &headerCache
+                ),
+                let upWeight = try resolveSourceTensor(
+                    layerIndex: layerIndex,
+                    projection: "up_proj",
+                    suffix: "weight",
+                    referenceDirectory: referenceDirectory,
+                    expertKeys: expertKeys,
+                    index: index,
+                    headerCache: &headerCache
+                ),
+                let gateScales = try resolveSourceTensor(
+                    layerIndex: layerIndex,
+                    projection: "gate_proj",
+                    suffix: "scales",
+                    referenceDirectory: referenceDirectory,
+                    expertKeys: expertKeys,
+                    index: index,
+                    headerCache: &headerCache
+                ),
+                let upScales = try resolveSourceTensor(
+                    layerIndex: layerIndex,
+                    projection: "up_proj",
+                    suffix: "scales",
+                    referenceDirectory: referenceDirectory,
+                    expertKeys: expertKeys,
+                    index: index,
+                    headerCache: &headerCache
+                )
+            else {
+                continue
+            }
+            _ = (gateScales, upScales)
+
+            let fusedWeightName = fusedGateUpName(from: gateWeight.name, suffix: "weight")
+            let plans = [
+                try fusedPlan(
+                    name: fusedWeightName,
+                    gate: gateWeight,
+                    up: upWeight
+                ),
+            ]
+
+            if let _ = try resolveSourceTensor(
+                layerIndex: layerIndex,
+                projection: "gate_proj",
+                suffix: "biases",
+                referenceDirectory: referenceDirectory,
+                expertKeys: expertKeys,
+                index: index,
+                headerCache: &headerCache
+            ) {
+                throw MLXFastError.invalidInput(
+                    "fused gate/up sidecar does not support quantized expert biases in layer \(layerIndex)"
+                )
+            }
+
+            try FileManager.default.createDirectory(
+                at: fusedDirectory,
+                withIntermediateDirectories: true
+            )
+            let shardName = String(format: "fused-gate-up-layer-%02d.safetensors", layerIndex)
+            let shardURL = fusedDirectory.appendingPathComponent(shardName)
+            records += try writeFusedSafetensors(
+                plans: plans,
+                shardName: shardName,
+                destination: shardURL
+            )
+        }
+
+        guard !records.isEmpty else {
+            if FileManager.default.fileExists(atPath: fusedDirectory.path) {
+                try FileManager.default.removeItem(at: fusedDirectory)
+            }
+            return
+        }
+
+        let object: [String: Any] = [
+            "version": 1,
+            "source": "safetensors",
+            "reference_path": fusedDirectory.path,
+            "expert_tensors": records,
+        ]
+        let data = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        )
+        try data.write(to: fusedDirectory.appendingPathComponent("manifest.json"))
+    }
+
+    private static func resolveSourceTensor(
+        layerIndex: Int,
+        projection: String,
+        suffix: String,
+        referenceDirectory: URL,
+        expertKeys: Set<String>,
+        index: CheckpointIndex,
+        headerCache: inout [String: SafetensorsHeader]
+    ) throws -> FusedSourceTensor? {
+        let marker = ".layers.\(layerIndex)."
+        let suffixText = ".\(projection).\(suffix)"
+        let candidates = expertKeys
+            .filter { $0.contains(marker) && $0.hasSuffix(suffixText) }
+            .sorted()
+        for name in candidates {
+            guard let shardName = index.weightMap[name] else {
+                continue
+            }
+            let shardURL = referenceDirectory.appendingPathComponent(shardName)
+            let header: SafetensorsHeader
+            if let cached = headerCache[shardName] {
+                header = cached
+            } else {
+                header = try Safetensors.readHeader(shardURL)
+                headerCache[shardName] = header
+            }
+            guard let info = header.tensors[name], info.shape.count == 3 else {
+                continue
+            }
+            return FusedSourceTensor(
+                name: name,
+                shardName: shardName,
+                shardURL: shardURL,
+                info: info,
+                dataBaseOffset: header.dataBaseOffset
+            )
+        }
+        return nil
+    }
+
+    private static func fusedGateUpName(from gateName: String, suffix: String) -> String {
+        if gateName.hasSuffix(".gate_proj.\(suffix)") {
+            return String(gateName.dropLast(".gate_proj.\(suffix)".count)) + ".gate_up_proj.\(suffix)"
+        }
+        return gateName + ".gate_up_proj.\(suffix)"
+    }
+
+    private static func fusedPlan(
+        name: String,
+        gate: FusedSourceTensor,
+        up: FusedSourceTensor
+    ) throws -> FusedTensorPlan {
+        guard gate.info.dtype == up.info.dtype else {
+            throw MLXFastError.invalidInput(
+                "cannot fuse \(gate.name) and \(up.name): dtype mismatch \(gate.info.dtype) vs \(up.info.dtype)"
+            )
+        }
+        guard gate.info.shape.count == 3, up.info.shape.count == 3 else {
+            throw MLXFastError.invalidInput("fused gate/up tensors must be stacked rank-3 tensors")
+        }
+        let gateShape = gate.info.shape
+        let upShape = up.info.shape
+        guard gateShape[0] == upShape[0], gateShape[2] == upShape[2] else {
+            throw MLXFastError.invalidInput(
+                "cannot fuse \(gate.name) shape \(gateShape) with \(up.name) shape \(upShape)"
+            )
+        }
+        let expertCount = gateShape[0]
+        guard expertCount > 0,
+              gate.info.byteCount % expertCount == 0,
+              up.info.byteCount % expertCount == 0
+        else {
+            throw MLXFastError.invalidInput("fused gate/up tensors must be evenly sliceable by expert")
+        }
+        let shape = [expertCount, gateShape[1] + upShape[1], gateShape[2]]
+        return FusedTensorPlan(
+            name: name,
+            dtype: gate.info.dtype,
+            shape: shape,
+            gate: gate,
+            up: up,
+            byteCount: gate.info.byteCount + up.info.byteCount,
+            gateSliceByteCount: gate.info.byteCount / expertCount,
+            upSliceByteCount: up.info.byteCount / expertCount,
+            expertCount: expertCount
+        )
+    }
+
+    private static func writeFusedSafetensors(
+        plans: [FusedTensorPlan],
+        shardName: String,
+        destination: URL
+    ) throws -> [[String: Any]] {
+        if FileManager.default.fileExists(atPath: destination.path) {
+            try FileManager.default.removeItem(at: destination)
+        }
+        try Data().write(to: destination, options: [])
+
+        let (headerData, offsets) = try fusedHeaderData(plans: plans)
+        let dataBaseOffset = 8 + headerData.count
+        let output = try FileHandle(forWritingTo: destination)
+        defer {
+            try? output.close()
+        }
+
+        var headerLength = UInt64(headerData.count).littleEndian
+        output.write(Data(bytes: &headerLength, count: 8))
+        output.write(headerData)
+
+        var readers: [String: FileHandle] = [:]
+        defer {
+            for reader in readers.values {
+                try? reader.close()
+            }
+        }
+        for plan in plans {
+            for expertIndex in 0..<plan.expertCount {
+                try copySlice(
+                    source: plan.gate,
+                    expertIndex: expertIndex,
+                    sliceByteCount: plan.gateSliceByteCount,
+                    readers: &readers,
+                    output: output
+                )
+                try copySlice(
+                    source: plan.up,
+                    expertIndex: expertIndex,
+                    sliceByteCount: plan.upSliceByteCount,
+                    readers: &readers,
+                    output: output
+                )
+            }
+        }
+
+        return plans.map { plan in
+            let start = offsets[plan.name, default: 0]
+            return [
+                "name": plan.name,
+                "shard": shardName,
+                "dtype": plan.dtype,
+                "shape": plan.shape,
+                "data_offsets": [start, start + plan.byteCount],
+                "byte_offset": dataBaseOffset + start,
+                "byte_length": plan.byteCount,
+            ]
+        }
+    }
+
+    private static func fusedHeaderData(
+        plans: [FusedTensorPlan]
+    ) throws -> (Data, [String: Int]) {
+        var object: [String: Any] = [:]
+        var offsets: [String: Int] = [:]
+        var cursor = 0
+        for plan in plans {
+            offsets[plan.name] = cursor
+            object[plan.name] = [
+                "dtype": plan.dtype,
+                "shape": plan.shape,
+                "data_offsets": [cursor, cursor + plan.byteCount],
+            ]
+            cursor += plan.byteCount
+        }
+
+        var data = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys]
+        )
+        while data.count % 8 != 0 {
+            data.append(0x20)
+        }
+        return (data, offsets)
+    }
+
+    private static func copySlice(
+        source: FusedSourceTensor,
+        expertIndex: Int,
+        sliceByteCount: Int,
+        readers: inout [String: FileHandle],
+        output: FileHandle
+    ) throws {
+        let key = source.shardURL.path
+        let reader: FileHandle
+        if let existing = readers[key] {
+            reader = existing
+        } else {
+            reader = try FileHandle(forReadingFrom: source.shardURL)
+            readers[key] = reader
+        }
+        let offset = source.dataBaseOffset
+            + UInt64(source.info.dataStart)
+            + UInt64(expertIndex * sliceByteCount)
+        try reader.seek(toOffset: offset)
+        var remaining = sliceByteCount
+        while remaining > 0 {
+            let data = reader.readData(ofLength: min(fusedChunkSize, remaining))
+            if data.isEmpty {
+                throw MLXFastError.invalidInput("unexpected EOF while writing fused expert tensor")
+            }
+            output.write(data)
+            remaining -= data.count
+        }
     }
 }

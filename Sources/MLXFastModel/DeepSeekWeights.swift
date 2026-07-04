@@ -51,6 +51,10 @@ public enum DeepSeekWeightNames {
         return candidates
     }
 
+    public static func fusedGateUpExpert(layerIndex: Int) -> [String] {
+        layer(layerIndex, "ffn.switch_mlp.gate_up_proj.weight")
+    }
+
     public static func attentionNorm(_ layerIndex: Int) -> [String] {
         layer(layerIndex, "attn_norm.weight")
     }
@@ -127,10 +131,14 @@ public struct DeepSeekWeightLoader {
     public let residentExpertScales: ResidentExpertTensors?
     public let pinnedExpertCodes: ResidentExpertTensors?
     public let expertLayerStager: ExpertLayerStager?
+    public let fusedGateUpBank: ExpertSlotBank?
+    public let residentFusedGateUpScales: ResidentExpertTensors?
+    public let pinnedFusedGateUpCodes: ResidentExpertTensors?
     // Dedicated capacity-0 side bank for concurrent decode-step slice reads.
     // Capacity 0 => no cache/LRU mutation, so concurrent preads are race-free
     // and read byte-identical ranges through the trusted metered path.
     private let decodeSideBank: ExpertSlotBank?
+    private let fusedGateUpSideBank: ExpertSlotBank?
     private let bridge: MLXArrayTensorBridge
     private let scheduledPinnedDecodePrefetches = ScheduledDecodePrefetches()
     private let routedExpertProjectionPlans: [RoutedExpertProjectionKey: RoutedExpertProjectionPlan]
@@ -191,6 +199,33 @@ public struct DeepSeekWeightLoader {
             capacity: 0,
             metrics: metrics
         )
+        let fusedManifestPath = "\(weightsPath)/fused_experts/manifest.json"
+        if FileManager.default.fileExists(atPath: fusedManifestPath),
+           let fusedBank = try? ExpertSlotBank(
+               manifestPath: fusedManifestPath,
+               capacity: min(
+                   expertStreamingConfig.tensorCacheCapacity,
+                   ExpertStreamingConfig.defaultExpertCacheCapacity
+               ),
+               metrics: metrics
+        ) {
+            self.fusedGateUpBank = fusedBank
+            // Fused sidecar stores code bytes only. Scales are built from the
+            // already-resident original gate/up scales to avoid duplicating
+            // ~0.9 GiB of transformed artifacts and init-time resident data.
+            self.residentFusedGateUpScales = nil
+            self.pinnedFusedGateUpCodes = nil
+            self.fusedGateUpSideBank = try? ExpertSlotBank(
+                manifestPath: fusedManifestPath,
+                capacity: 0,
+                metrics: metrics
+            )
+        } else {
+            self.fusedGateUpBank = nil
+            self.residentFusedGateUpScales = nil
+            self.pinnedFusedGateUpCodes = nil
+            self.fusedGateUpSideBank = nil
+        }
         self.bridge = bridge
     }
 
@@ -211,6 +246,10 @@ public struct DeepSeekWeightLoader {
         self.pinnedExpertCodes = nil
         self.expertLayerStager = nil
         self.decodeSideBank = nil
+        self.fusedGateUpBank = nil
+        self.residentFusedGateUpScales = nil
+        self.pinnedFusedGateUpCodes = nil
+        self.fusedGateUpSideBank = nil
         self.bridge = bridge
     }
 
@@ -389,6 +428,113 @@ public struct DeepSeekWeightLoader {
         return try? bridge.makeArray(from: scalesTensor)
     }
 
+    public func hasFusedGateUp(layerIndex: Int) -> Bool {
+        guard let fusedGateUpBank else {
+            return false
+        }
+        return DeepSeekWeightNames.fusedGateUpExpert(layerIndex: layerIndex).contains {
+            fusedGateUpBank.record(named: $0) != nil
+        }
+    }
+
+    private func fusedGateUpRecord(layerIndex: Int) -> (name: String, record: ExpertTensorRecord)? {
+        guard let fusedGateUpBank else {
+            return nil
+        }
+        for candidate in DeepSeekWeightNames.fusedGateUpExpert(layerIndex: layerIndex) {
+            if let record = fusedGateUpBank.record(named: candidate) {
+                return (candidate, record)
+            }
+        }
+        return nil
+    }
+
+    private func expectedShapes(
+        hiddenSize: Int,
+        intermediateSize: Int,
+        projections: [DeepSeekExpertProjection]
+    ) -> [(DeepSeekExpertProjection, [Int])] {
+        projections.map { projection in
+            switch projection {
+            case .gate, .up:
+                return (projection, [intermediateSize, hiddenSize])
+            case .down:
+                return (projection, [hiddenSize, intermediateSize])
+            }
+        }
+    }
+
+    public func prefetchDecodeFusedGateUpCodes(
+        layerIndex: Int,
+        expertIndices: [Int]
+    ) -> [String: StagedExpertCode]? {
+        guard
+            let sideBank = fusedGateUpSideBank,
+            let (name, record) = fusedGateUpRecord(layerIndex: layerIndex),
+            !expertIndices.isEmpty
+        else {
+            return nil
+        }
+        var keys: [String] = []
+        var indices: [Int] = []
+        var seen = Set<String>()
+        for expertIndex in expertIndices {
+            guard record.shape.first.map({ expertIndex < $0 }) == true else {
+                continue
+            }
+            let key = Self.decodePrefetchKey(name, expertIndex)
+            if seen.insert(key).inserted {
+                keys.append(key)
+                indices.append(expertIndex)
+            }
+        }
+        guard !keys.isEmpty else {
+            return nil
+        }
+
+        let bridge = self.bridge
+        let residentScales = self.residentFusedGateUpScales
+        let pinnedCodes = self.pinnedFusedGateUpCodes
+        var results = [StagedExpertCode?](repeating: nil, count: keys.count)
+        results.withUnsafeMutableBufferPointer { buffer in
+            let sink = DecodePrefetchSink(buffer: buffer)
+            DispatchQueue.concurrentPerform(iterations: keys.count) { index in
+                let expertIndex = indices[index]
+                guard
+                    let tensor = pinnedCodes?.materializedTensor(
+                        named: name,
+                        firstAxisIndex: expertIndex
+                    ) ?? (try? sideBank.materializedTensor(
+                        named: name,
+                        firstAxisIndex: expertIndex
+                    )),
+                    let array = try? bridge.makeArray(from: tensor)
+                else {
+                    return
+                }
+                let scalesArray = Self.residentScalesArray(
+                    residentScales: residentScales,
+                    bridge: bridge,
+                    codeName: name,
+                    expertIndex: expertIndex
+                )
+                sink.buffer[index] = StagedExpertCode(
+                    tensor: tensor,
+                    array: array,
+                    scalesArray: scalesArray
+                )
+            }
+        }
+        var map: [String: StagedExpertCode] = [:]
+        map.reserveCapacity(keys.count)
+        for (index, key) in keys.enumerated() {
+            if let staged = results[index] {
+                map[key] = staged
+            }
+        }
+        return map.isEmpty ? nil : map
+    }
+
     /// Concurrently pre-reads the routed-expert code slices a 1-token decode
     /// step is about to consume, through the capacity-0 side bank, returning a
     /// map keyed by `decodePrefetchKey`. Returns nil when the fast path does
@@ -401,22 +547,23 @@ public struct DeepSeekWeightLoader {
         layerIndex: Int,
         expertIndices: [Int],
         hiddenSize: Int,
-        intermediateSize: Int
+        intermediateSize: Int,
+        projections: [DeepSeekExpertProjection] = [.gate, .up, .down]
     ) -> [String: StagedExpertCode]? {
-        guard let sideBank = decodeSideBank, expertBank.capacity > 0, !expertIndices.isEmpty else {
+        guard let sideBank = decodeSideBank, expertBank.capacity > 0, !expertIndices.isEmpty, !projections.isEmpty else {
             return nil
         }
-        let projections: [(DeepSeekExpertProjection, [Int])] = [
-            (.gate, [intermediateSize, hiddenSize]),
-            (.up, [intermediateSize, hiddenSize]),
-            (.down, [hiddenSize, intermediateSize]),
-        ]
+        let projectionShapes = expectedShapes(
+            hiddenSize: hiddenSize,
+            intermediateSize: intermediateSize,
+            projections: projections
+        )
         var keys: [String] = []
         var names: [String] = []
         var indices: [Int] = []
         var seen = Set<String>()
         for expertIndex in expertIndices {
-            for (projection, expectedShape) in projections {
+            for (projection, expectedShape) in projectionShapes {
                 if let plan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: projection),
                    plan.record.shape.count == expectedShape.count + 1,
                    plan.record.shape.first.map({ expertIndex < $0 }) == true {
@@ -515,7 +662,8 @@ public struct DeepSeekWeightLoader {
         layerIndex: Int,
         expertIndices: [Int],
         hiddenSize: Int,
-        intermediateSize: Int
+        intermediateSize: Int,
+        projections: [DeepSeekExpertProjection] = [.gate, .up, .down]
     ) -> Bool {
         guard let pinnedCodes = self.pinnedExpertCodes, !expertIndices.isEmpty else {
             scheduledPinnedDecodePrefetches.remove(layerIndex: layerIndex)
@@ -526,13 +674,14 @@ public struct DeepSeekWeightLoader {
             layerIndex: layerIndex,
             expertIndices: expertIndices,
             hiddenSize: hiddenSize,
-            intermediateSize: intermediateSize
+            intermediateSize: intermediateSize,
+            projections: projections
         )
         guard !plan.keys.isEmpty else {
             scheduledPinnedDecodePrefetches.remove(layerIndex: layerIndex)
             return false
         }
-        let fullyPinned = plan.keys.count == Set(expertIndices).count * 3
+        let fullyPinned = plan.keys.count == Set(expertIndices).count * projections.count
         guard fullyPinned else {
             scheduledPinnedDecodePrefetches.remove(layerIndex: layerIndex)
             return false
@@ -561,19 +710,20 @@ public struct DeepSeekWeightLoader {
         layerIndex: Int,
         expertIndices: [Int],
         hiddenSize: Int,
-        intermediateSize: Int
+        intermediateSize: Int,
+        projections: [DeepSeekExpertProjection]
     ) -> (keys: [String], names: [String], indices: [Int]) {
-        let projections: [(DeepSeekExpertProjection, [Int])] = [
-            (.gate, [intermediateSize, hiddenSize]),
-            (.up, [intermediateSize, hiddenSize]),
-            (.down, [hiddenSize, intermediateSize]),
-        ]
+        let projectionShapes = expectedShapes(
+            hiddenSize: hiddenSize,
+            intermediateSize: intermediateSize,
+            projections: projections
+        )
         var keys: [String] = []
         var names: [String] = []
         var indices: [Int] = []
         var seen = Set<String>()
         for expertIndex in expertIndices {
-            for (projection, expectedShape) in projections {
+            for (projection, expectedShape) in projectionShapes {
                 if let plan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: projection),
                    plan.record.shape.count == expectedShape.count + 1,
                    plan.record.shape.first.map({ expertIndex < $0 }) == true {
@@ -966,6 +1116,92 @@ public struct DeepSeekWeightLoader {
             expertIndex: expertIndex,
             preferStaged: preferStaged,
             decodePrefetch: decodePrefetch
+        )
+    }
+
+    public func fusedGateUpLinearWeight(
+        layerIndex: Int,
+        expectedShape: [Int],
+        expertIndex: Int,
+        decodePrefetch: [String: StagedExpertCode]? = nil
+    ) throws -> DeepSeekLinearWeight? {
+        guard let (candidate, record) = fusedGateUpRecord(layerIndex: layerIndex) else {
+            return nil
+        }
+        let isStacked = record.shape.count == expectedShape.count + 1
+            && record.shape.first.map { expertIndex < $0 } == true
+        guard isStacked, record.dtype == "U32" else {
+            return nil
+        }
+
+        let tensor: MaterializedTensor
+        var prebuiltWeightArray: MLXArray?
+        let prefetchKey = Self.decodePrefetchKey(candidate, expertIndex)
+        if let prefetched = decodePrefetch?[prefetchKey] {
+            tensor = prefetched.tensor
+            prebuiltWeightArray = prefetched.array
+        } else if let pinned = pinnedFusedGateUpCodes?.materializedTensor(
+            named: candidate,
+            firstAxisIndex: expertIndex
+        ) {
+            tensor = pinned
+        } else if let bank = fusedGateUpBank {
+            tensor = try bank.materializedTensor(named: candidate, firstAxisIndex: expertIndex)
+        } else {
+            return nil
+        }
+
+        guard
+            let expectedInput = expectedShape.last,
+            let packedInput = tensor.shape.last,
+            expectedInput > 0,
+            packedInput > 0,
+            expectedShape.dropLast().reduce(1, *) == tensor.shape.dropLast().reduce(1, *)
+        else {
+            return nil
+        }
+        let packedBits = packedInput * 32
+        guard packedBits % expectedInput == 0 else {
+            return nil
+        }
+        let bits = packedBits / expectedInput
+        guard [2, 4, 8].contains(bits) else {
+            return nil
+        }
+        guard
+            let gatePlan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: .gate),
+            let upPlan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: .up),
+            gatePlan.biasesRecord == nil,
+            upPlan.biasesRecord == nil,
+            let gateScales = Self.residentScalesArray(
+                residentScales: residentExpertScales,
+                bridge: bridge,
+                codeName: gatePlan.name,
+                expertIndex: expertIndex
+            ),
+            let upScales = Self.residentScalesArray(
+                residentScales: residentExpertScales,
+                bridge: bridge,
+                codeName: upPlan.name,
+                expertIndex: expertIndex
+            )
+        else {
+            return nil
+        }
+        let scales = concatenated([gateScales, upScales], axis: 0)
+        guard let scaleGroups = scales.shape.last, scaleGroups > 0, expectedInput % scaleGroups == 0 else {
+            return nil
+        }
+        let mode: QuantizationMode = scales.dtype == .uint8 ? .mxfp4 : .affine
+        return DeepSeekLinearWeight(
+            weight: try (prebuiltWeightArray ?? bridge.makeArray(from: tensor))
+                .reshaped([expectedShape.dropLast().reduce(1, *), packedInput]),
+            scales: scales.reshaped([expectedShape.dropLast().reduce(1, *), scaleGroups]),
+            biases: nil,
+            logicalShape: expectedShape,
+            groupSize: expectedInput / scaleGroups,
+            bits: bits,
+            mode: mode
         )
     }
 
