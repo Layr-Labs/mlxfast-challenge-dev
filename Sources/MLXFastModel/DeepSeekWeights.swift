@@ -113,9 +113,10 @@ public struct DeepSeekWeightLoader {
     private let scheduledPinnedDecodePrefetches = ScheduledDecodePrefetches()
 
     /// Sized for the official 48 GB runner: pin only where at least that
-    /// budget exists, and never more than two layers of codes (~6.4 GiB).
+    /// budget exists, and keep the cap conservative so code residency leaves
+    /// more headroom for page cache and staged buffers.
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
-    private static let pinnedHashLayerCap = 2
+    private static let pinnedHashLayerCap = 1
 
     public init(
         weightsPath: String,
