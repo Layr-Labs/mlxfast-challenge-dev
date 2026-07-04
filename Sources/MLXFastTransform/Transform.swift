@@ -1,6 +1,14 @@
 import Foundation
 import MLXFastCore
 
+private extension JSONEncoder {
+    static var prettySorted: JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        return encoder
+    }
+}
+
 public struct TransformOptions: Equatable {
     public let referencePath: String
     public let outputPath: String
@@ -84,6 +92,19 @@ public enum SwiftTransform {
             expertKeys: expertKeys,
             index: index
         )
+
+        if ProcessInfo.processInfo.environment["MLXFAST_DISABLE_MXFP4_GROUP_ELISION_CENSUS"] != "1" {
+            let census = try MXFP4GroupElisionCensus.run(
+                referenceDirectory: referenceDirectory,
+                expertsDirectory: expertsDirectory,
+                expertKeys: expertKeys,
+                index: index
+            )
+            let censusData = try JSONEncoder.prettySorted.encode(census)
+            try censusData.write(
+                to: expertsDirectory.appendingPathComponent("mxfp4-group-elision-census.json")
+            )
+        }
 
         return TransformReport(
             referencePath: referenceDirectory.path,
