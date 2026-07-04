@@ -155,6 +155,7 @@ public enum DeepSeekRoutedExperts {
         // already-fetched bytes instead of serializing on each pread. Anything
         // not prefetched falls back to the normal per-expert bank read.
         var decodePrefetch: [String: StagedExpertCode]?
+        var decodeWeightPrefetch: [Int: DeepSeekMLPWeights]?
         if tokenCount == 1, !useStaged {
             decodePrefetch = loader.consumeScheduledPinnedDecodeExpertCodes(
                 layerIndex: spec.layerIndex
@@ -164,6 +165,15 @@ public enum DeepSeekRoutedExperts {
                 hiddenSize: spec.hiddenSize,
                 intermediateSize: spec.intermediateSize
             )
+            if let decodePrefetch {
+                decodeWeightPrefetch = loader.prefetchedDecodeExpertWeights(
+                    layerIndex: spec.layerIndex,
+                    expertIndices: expertOrder,
+                    hiddenSize: spec.hiddenSize,
+                    intermediateSize: spec.intermediateSize,
+                    decodePrefetch: decodePrefetch
+                )
+            }
         } else if useStaged {
             // Prefill/warmup staged path: build the active experts' base
             // MLXArrays from the staged layer buffer concurrently so the loop
@@ -185,13 +195,18 @@ public enum DeepSeekRoutedExperts {
             guard let flatIndices = flatIndicesByExpert[expertIndex] else {
                 continue
             }
-            let expertWeights = try weights(
-                forExpert: expertIndex,
-                loader: loader,
-                spec: spec,
-                preferStaged: useStaged,
-                decodePrefetch: decodePrefetch
-            )
+            let expertWeights: DeepSeekMLPWeights
+            if let prefetchedWeights = decodeWeightPrefetch?[expertIndex] {
+                expertWeights = prefetchedWeights
+            } else {
+                expertWeights = try weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec,
+                    preferStaged: useStaged,
+                    decodePrefetch: decodePrefetch
+                )
+            }
             let tokens: MLXArray
             if tokenCount == 1, flatIndices.count == 1 {
                 tokens = xFlat

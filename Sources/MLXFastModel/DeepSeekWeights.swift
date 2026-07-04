@@ -556,6 +556,60 @@ public struct DeepSeekWeightLoader {
         scheduledPinnedDecodePrefetches.consume(layerIndex: layerIndex)
     }
 
+    public func prefetchedDecodeExpertWeights(
+        layerIndex: Int,
+        expertIndices: [Int],
+        hiddenSize: Int,
+        intermediateSize: Int,
+        decodePrefetch: [String: StagedExpertCode]
+    ) -> [Int: DeepSeekMLPWeights]? {
+        guard !expertIndices.isEmpty, !decodePrefetch.isEmpty else {
+            return nil
+        }
+        var results = [DeepSeekMLPWeights?](repeating: nil, count: expertIndices.count)
+        results.withUnsafeMutableBufferPointer { buffer in
+            let sink = DecodeWeightPrefetchSink(buffer: buffer)
+            DispatchQueue.concurrentPerform(iterations: expertIndices.count) { index in
+                let expertIndex = expertIndices[index]
+                guard
+                    let gate = prefetchedRoutedExpertLinearWeight(
+                        layerIndex: layerIndex,
+                        projection: .gate,
+                        expectedShape: [intermediateSize, hiddenSize],
+                        expertIndex: expertIndex,
+                        decodePrefetch: decodePrefetch
+                    ),
+                    let up = prefetchedRoutedExpertLinearWeight(
+                        layerIndex: layerIndex,
+                        projection: .up,
+                        expectedShape: [intermediateSize, hiddenSize],
+                        expertIndex: expertIndex,
+                        decodePrefetch: decodePrefetch
+                    ),
+                    let down = prefetchedRoutedExpertLinearWeight(
+                        layerIndex: layerIndex,
+                        projection: .down,
+                        expectedShape: [hiddenSize, intermediateSize],
+                        expertIndex: expertIndex,
+                        decodePrefetch: decodePrefetch
+                    )
+                else {
+                    return
+                }
+                sink.buffer[index] = DeepSeekMLPWeights(gate: gate, up: up, down: down)
+            }
+        }
+
+        var map: [Int: DeepSeekMLPWeights] = [:]
+        map.reserveCapacity(expertIndices.count)
+        for (index, expertIndex) in expertIndices.enumerated() {
+            if let weights = results[index] {
+                map[expertIndex] = weights
+            }
+        }
+        return map.isEmpty ? nil : map
+    }
+
     private func pinnedDecodeExpertCodePlan(
         pinnedCodes: ResidentExpertTensors,
         layerIndex: Int,
@@ -967,6 +1021,60 @@ public struct DeepSeekWeightLoader {
             preferStaged: preferStaged,
             decodePrefetch: decodePrefetch
         )
+    }
+
+    private func prefetchedRoutedExpertLinearWeight(
+        layerIndex: Int,
+        projection: DeepSeekExpertProjection,
+        expectedShape: [Int],
+        expertIndex: Int,
+        decodePrefetch: [String: StagedExpertCode]
+    ) -> DeepSeekLinearWeight? {
+        if let plan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: projection),
+           plan.record.shape.count == expectedShape.count + 1,
+           plan.record.shape.first.map({ expertIndex < $0 }) == true {
+            guard decodePrefetch[plan.decodePrefetchKey(for: expertIndex)] != nil else {
+                return nil
+            }
+            return try? buildExpertLinearWeight(
+                candidate: plan.name,
+                record: plan.record,
+                expectedShape: expectedShape,
+                expertIndex: expertIndex,
+                preferStaged: false,
+                decodePrefetch: decodePrefetch,
+                plan: plan
+            )
+        }
+
+        let candidates = DeepSeekWeightNames.routedExpert(
+            layerIndex: layerIndex,
+            expertIndex: expertIndex,
+            projection: projection
+        )
+        for candidate in candidates {
+            guard let record = expertBank.record(named: candidate) else {
+                continue
+            }
+            let isStacked = record.shape.count == expectedShape.count + 1
+                && record.shape.first.map { expertIndex < $0 } == true
+            guard isStacked else {
+                break
+            }
+            guard decodePrefetch[Self.decodePrefetchKey(candidate, expertIndex)] != nil else {
+                return nil
+            }
+            return try? buildExpertLinearWeight(
+                candidate: candidate,
+                record: record,
+                expectedShape: expectedShape,
+                expertIndex: expertIndex,
+                preferStaged: false,
+                decodePrefetch: decodePrefetch,
+                plan: nil
+            )
+        }
+        return nil
     }
 
     private func buildExpertLinearWeight(
@@ -2034,6 +2142,10 @@ public struct StagedExpertCode {
 // disjoint and the unchecked Sendable conformance is sound.
 private struct DecodePrefetchSink: @unchecked Sendable {
     let buffer: UnsafeMutableBufferPointer<StagedExpertCode?>
+}
+
+private struct DecodeWeightPrefetchSink: @unchecked Sendable {
+    let buffer: UnsafeMutableBufferPointer<DeepSeekMLPWeights?>
 }
 
 private final class ScheduledDecodePrefetches {
