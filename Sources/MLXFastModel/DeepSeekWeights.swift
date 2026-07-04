@@ -139,6 +139,8 @@ public struct DeepSeekWeightLoader {
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
     private static let pinnedHashLayerCap = 2
+    private static let pageLockedHashLayerCap = 1
+    private static let pageLockedHashLayerMaxTensorBytes = 4 * 1024 * 1024 * 1024
 
     public init(
         weightsPath: String,
@@ -182,6 +184,15 @@ public struct DeepSeekWeightLoader {
                 metrics: metrics
             )
             : nil
+        if ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes,
+           hashLayerCount > Self.pinnedHashLayerCap {
+            _ = ExpertPageLockRegistry.hashLayerCodes(
+                manifestPath: manifestPath,
+                firstLayer: Self.pinnedHashLayerCap,
+                layerCount: min(hashLayerCount - Self.pinnedHashLayerCap, Self.pageLockedHashLayerCap),
+                maxTensorBytes: Self.pageLockedHashLayerMaxTensorBytes
+            )
+        }
         self.expertLayerStager = ExpertLayerStager(
             manifestPath: manifestPath,
             metrics: metrics
