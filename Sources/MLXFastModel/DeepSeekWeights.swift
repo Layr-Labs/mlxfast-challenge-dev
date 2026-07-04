@@ -690,6 +690,20 @@ public struct DeepSeekWeightLoader {
         var seen = Set<String>()
         for expertIndex in expertIndices {
             for (projection, expectedShape) in projections {
+                if let plan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: projection),
+                   plan.record.shape.count == expectedShape.count + 1,
+                   plan.record.shape.first.map({ expertIndex < $0 }) == true {
+                    guard pinnedExpertCodes?.isResident(name: plan.name) != true else {
+                        continue
+                    }
+                    let key = plan.decodePrefetchKey(for: expertIndex)
+                    if seen.insert(key).inserted {
+                        keys.append(key)
+                        names.append(plan.name)
+                        indices.append(expertIndex)
+                    }
+                    continue
+                }
                 let candidates = DeepSeekWeightNames.routedExpert(
                     layerIndex: layerIndex,
                     expertIndex: expertIndex,
@@ -785,14 +799,12 @@ public struct DeepSeekWeightLoader {
         projection: DeepSeekExpertProjection,
         expectedShape: [Int]
     ) -> StackedExpertProjection? {
-        let candidates = DeepSeekWeightNames.routedExpert(
-            layerIndex: layerIndex,
-            expertIndex: 0,
-            projection: projection
-        )
+        guard let plan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: projection) else {
+            return nil
+        }
+        let candidate = plan.name
+        let record = plan.record
         guard
-            let candidate = candidates.first(where: { expertBank.record(named: $0) != nil }),
-            let record = expertBank.record(named: candidate),
             record.shape.count == expectedShape.count + 1,
             record.dtype == "U32",
             let logicalInput = expectedShape.last,
@@ -895,13 +907,8 @@ public struct DeepSeekWeightLoader {
             return false
         }
         for projection in [DeepSeekExpertProjection.gate, .up, .down] {
-            let candidates = DeepSeekWeightNames.routedExpert(
-                layerIndex: layerIndex,
-                expertIndex: 0,
-                projection: projection
-            )
-            guard let candidate = candidates.first(where: { expertBank.record(named: $0) != nil }),
-                  pinnedCodes.isResident(name: candidate)
+            guard let plan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: projection),
+                  pinnedCodes.isResident(name: plan.name)
             else {
                 return false
             }
@@ -1070,14 +1077,12 @@ public struct DeepSeekWeightLoader {
         }
         var names: [String] = []
         for projection in [DeepSeekExpertProjection.gate, .up, .down] {
-            let candidates = DeepSeekWeightNames.routedExpert(
-                layerIndex: layerIndex,
-                expertIndex: 0,
-                projection: projection
-            )
-            guard let candidate = candidates.first(where: { expertBank.record(named: $0) != nil }),
-                  let record = expertBank.record(named: candidate),
-                  record.shape.count == 3,
+            guard let plan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: projection) else {
+                return nil
+            }
+            let candidate = plan.name
+            let record = plan.record
+            guard record.shape.count == 3,
                   let firstDimension = record.shape.first,
                   firstDimension > 0,
                   record.byteLength % firstDimension == 0
@@ -1088,12 +1093,12 @@ public struct DeepSeekWeightLoader {
                 names.append(candidate)
             }
             if record.dtype == "U32" {
-                for suffix in ["scales", "biases"] {
-                    let companion = Self.companionName(for: candidate, suffix: suffix)
-                    guard let companionRecord = expertBank.record(named: companion) else {
-                        continue
-                    }
-                    let scalesResident = suffix == "scales"
+                for (companion, companionRecord, isScales) in [
+                    (plan.scalesName, plan.scalesRecord, true),
+                    (plan.biasesName, plan.biasesRecord, false),
+                ] {
+                    guard let companionRecord else { continue }
+                    let scalesResident = isScales
                         && residentExpertScales?.isResident(name: companion) == true
                     if !scalesResident, companionRecord.shape.count >= 2 {
                         names.append(companion)

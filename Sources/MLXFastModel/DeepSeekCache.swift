@@ -193,8 +193,9 @@ public final class DeepSeekModelCache {
     }
 
     public func materializeCachedState() {
-        for array in arraysForMaterialization() {
-            eval(array)
+        let arrays = arraysForMaterialization()
+        if !arrays.isEmpty {
+            eval(arrays)
         }
     }
 }

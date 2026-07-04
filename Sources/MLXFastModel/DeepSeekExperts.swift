@@ -209,32 +209,13 @@ public enum DeepSeekRoutedExperts {
         }
 
         let combined = concatenated(expertOutputs, axis: 0)
+        let ordered = orderedCombined(
+            combined,
+            scatterOrder: scatterOrder,
+            outputCount: outputCount
+        )
 
-        // scatterOrder[row] is the activation flat index that produced combined
-        // row `row`. Invert it so a single gather places every output back into
-        // activation order, replacing the previous per-row scatter loop. When
-        // the scatter order is already the identity (decode's first-seen
-        // expert order visits slots in order), the gather is a no-op node --
-        // skip it; the tensor values are identical by definition.
-        var inverse = [Int32](repeating: 0, count: outputCount)
-        var isIdentity = true
-        for (row, flatIndex) in scatterOrder.enumerated() {
-            inverse[flatIndex] = Int32(row)
-            if flatIndex != row {
-                isIdentity = false
-            }
-        }
-        let ordered = isIdentity ? combined : combined.take(MLXArray(inverse), axis: 0)
-
-        let result = ordered.reshaped([batchSize, sequenceLength, topK, hiddenSize])
-        // Decode path: dispatch this layer's routed-expert graph now so the
-        // GPU runs the QMMs while the CPU builds the next block's graph,
-        // matching the batched prefill path's layer-exit dispatch. Scheduling
-        // only; identical nodes evaluate either way.
-        if tokenCount == 1 {
-            asyncEval(result)
-        }
-        return result
+        return ordered.reshaped([batchSize, sequenceLength, topK, hiddenSize])
     }
 
     /// Whole-layer routed-expert forward over RAM-resident stacked tensors.
@@ -374,13 +355,34 @@ public enum DeepSeekRoutedExperts {
             segmentStart += segmentLengths[index]
         }
 
-        let combined = concatenated(expertOutputs, axis: 0)
+        let ordered = orderedCombined(
+            concatenated(expertOutputs, axis: 0),
+            scatterOrder: scatterOrder,
+            outputCount: outputCount
+        )
+        return ordered.reshaped([batchSize, sequenceLength, topK, spec.hiddenSize])
+    }
+
+    private static func orderedCombined(
+        _ combined: MLXArray,
+        scatterOrder: [Int],
+        outputCount: Int
+    ) -> MLXArray {
+        if isIdentityScatterOrder(scatterOrder) {
+            return combined
+        }
+        // scatterOrder[row] is the activation flat index that produced combined
+        // row `row`. Invert it so a single gather places every output back into
+        // activation order, replacing the previous per-row scatter loop.
         var inverse = [Int32](repeating: 0, count: outputCount)
         for (row, flatIndex) in scatterOrder.enumerated() {
             inverse[flatIndex] = Int32(row)
         }
-        let ordered = combined.take(MLXArray(inverse), axis: 0)
-        return ordered.reshaped([batchSize, sequenceLength, topK, spec.hiddenSize])
+        return combined.take(MLXArray(inverse), axis: 0)
+    }
+
+    private static func isIdentityScatterOrder(_ scatterOrder: [Int]) -> Bool {
+        scatterOrder.enumerated().allSatisfy { pair in pair.offset == pair.element }
     }
 
     public static func weights(

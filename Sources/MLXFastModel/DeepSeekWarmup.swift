@@ -72,10 +72,7 @@ enum DeepSeekWarmup {
         let affineBiases = zeros([rows, hidden / 64], dtype: .bfloat16)
         let mxfp4Scales = zeros([rows, hidden / 32], dtype: .uint8)
 
-        // m=12 covers the batched staged prefill's per-expert GEMM shape
-        // bucket (~512*6/256 rows per expert), so the first scored forward
-        // pays no pipeline-state creation for it.
-        for m in [1, 12, 512] {
+        for m in [1, 512] {
             let x = zeros([1, m, hidden], dtype: .bfloat16)
             eval(quantizedMM(
                 x, affineWeight,
