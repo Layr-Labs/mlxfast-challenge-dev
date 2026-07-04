@@ -134,11 +134,24 @@ public struct DeepSeekWeightLoader {
     private let bridge: MLXArrayTensorBridge
     private let scheduledPinnedDecodePrefetches = ScheduledDecodePrefetches()
     private let routedExpertProjectionPlans: [RoutedExpertProjectionKey: RoutedExpertProjectionPlan]
+    // Decode-only bounded hot-expert cache over assembled weight triples;
+    // nil below the official runner's memory budget. Hash-routed layers never
+    // consult it (see decodeExpertWeightCache(layerIndex:)).
+    private let decodeExpertCache: DecodeExpertWeightCache?
+    private let hashLayerCount: Int
 
     /// Sized for the official 48 GB runner: pin only where at least that
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
     private static let pinnedHashLayerCap = 2
+    /// Decode hot-expert LRU: per-layer retention capacity 3 (3 experts x
+    /// ~13.4 MB x 40 dynamic layers ~= 1.6 GB uncapped) under a HARD global
+    /// byte budget of 1.5 GB enforced by exact byte accounting with
+    /// admission control — sized to leave the official 48 GB runner's page
+    /// cache room next to the resident scales, pinned codes, and staging
+    /// buffers. Do not raise either because a larger local machine has room.
+    private static let decodeExpertCacheCapacityPerLayer = 3
+    private static let decodeExpertCacheByteBudget = 1_500_000_000
 
     public init(
         weightsPath: String,
@@ -175,6 +188,13 @@ public struct DeepSeekWeightLoader {
         // that budget. Both constants encode the OFFICIAL runner's memory
         // math — do not raise them because a larger local machine has room.
         let hashLayerCount = (try? DeepSeekConfig.load(from: weightsPath))?.numHashLayers ?? 0
+        self.hashLayerCount = hashLayerCount
+        self.decodeExpertCache = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
+            ? DecodeExpertWeightCache(
+                capacityPerLayer: Self.decodeExpertCacheCapacityPerLayer,
+                byteBudget: Self.decodeExpertCacheByteBudget
+            )
+            : nil
         self.pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
             ? ResidentExpertStoreRegistry.pinnedHashLayerCodes(
                 manifestPath: manifestPath,
@@ -211,7 +231,21 @@ public struct DeepSeekWeightLoader {
         self.pinnedExpertCodes = nil
         self.expertLayerStager = nil
         self.decodeSideBank = nil
+        self.decodeExpertCache = nil
+        self.hashLayerCount = 0
         self.bridge = bridge
+    }
+
+    /// Per-layer decode hot-expert cache. Returns nil for hash-routed layers
+    /// (token-id routing; pinned layers never touch disk and the unpinned
+    /// hash layer keeps its exact read-ahead path untouched) and when the
+    /// machine lacks the official runner's memory budget, so those paths are
+    /// byte-for-byte the frontier's.
+    public func decodeExpertWeightCache(layerIndex: Int) -> DecodeExpertWeightCache? {
+        guard layerIndex >= hashLayerCount else {
+            return nil
+        }
+        return decodeExpertCache
     }
 
     public func resolveDenseName(_ candidates: [String]) throws -> String {
