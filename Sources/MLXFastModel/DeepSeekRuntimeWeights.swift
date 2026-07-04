@@ -40,9 +40,6 @@ public final class DeepSeekRuntimeWeightCache {
                 continue
             }
             let experts = entry.table[base..<(base + entry.topK)].map(Int.init)
-            if entry.layerIndex == 0, loader.pinnedExpertCodes != nil {
-                continue
-            }
             let fullyPinned = loader.schedulePinnedDecodeExpertCodes(
                 layerIndex: entry.layerIndex,
                 expertIndices: experts,
@@ -98,7 +95,9 @@ public final class DeepSeekRuntimeWeightCache {
                 // asArray on this untimed init path is the table's only host
                 // materialization; ~6 MB per hash layer. The decode entry path
                 // uses it for exact disk read-ahead on unpinned hash layers,
-                // and to start resident pinned-code prebuilds for pinned ones.
+                // and to start resident pinned-code prebuilds for pinned ones,
+                // including layer 0 so its code arrays can overlap the
+                // embedding/attention work before the first MoE.
                 hashLayerTables.append((
                     layerIndex: layerIndex,
                     table: tokenToExpert.asType(.int32).asArray(Int32.self),
