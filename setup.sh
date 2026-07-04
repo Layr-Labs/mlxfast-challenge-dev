@@ -30,6 +30,10 @@ else
   REFERENCE_DIR="${REFERENCE_CACHE_DIR}"
 fi
 REFERENCE_COMPAT_LINK="${MLXFAST_REFERENCE_COMPAT_LINK:-${DEFAULT_REFERENCE_DIR}}"
+# Local checkpoint to copy into REFERENCE_DIR instead of downloading. Defaults to
+# the shared HF-style cache, so a runner with a warm cache disk (config.json
+# present there) is copied in rather than re-downloaded over the network.
+REFERENCE_SEED_DIR="${MLXFAST_REFERENCE_SEED_DIR:-${REFERENCE_CACHE_DIR}}"
 REFERENCE_CACHE_LOCK_PATH="${MLXFAST_REFERENCE_CACHE_LOCK_PATH:-${REFERENCE_DIR}/.mlxfast-reference-cache.lock}"
 SETUP_STARTED_SECONDS="${SECONDS}"
 METALLIB_BUILD_PID=""
@@ -61,6 +65,13 @@ Important environment variables:
                                      one checkpoint) used for new downloads when
                                      MLXFAST_REFERENCE_DIR is not set.
                                      Default: ${REFERENCE_CACHE_DIR}
+  MLXFAST_REFERENCE_SEED_DIR         Ready checkpoint to COPY into
+                                     MLXFAST_REFERENCE_DIR instead of downloading,
+                                     when the reference dir is empty and the seed
+                                     is a different, populated directory (e.g. a
+                                     runner with a warm cache disk). Falls back to
+                                     download if the copy fails or is incomplete.
+                                     Default: ${REFERENCE_SEED_DIR}
   MLXFAST_REFERENCE_BASE_URL         HTTP prefix for checkpoint files.
                                      Default: ${DEFAULT_REFERENCE_BASE_URL}
   MLXFAST_REFERENCE_MANIFEST_PATH    SHA256 manifest for the reference files.
@@ -1414,6 +1425,42 @@ EOF
   echo "setup.sh: linked ${link_path} -> ${reference_dir}"
 }
 
+seed_reference_from_local_cache() {
+  # Copy a ready checkpoint from a local seed dir (default: the shared HF cache,
+  # e.g. a runner's warm cache disk) into the reference dir so we skip the
+  # multi-GB network download. Best-effort: the verify/repair path below still
+  # validates the result and fetches anything missing or stale, so a partial or
+  # failed copy is safe.
+  local reference_dir="$1"
+  local seed="${REFERENCE_SEED_DIR:-}"
+  # Already usable, no seed configured, or seed has no checkpoint: nothing to do.
+  [[ -f "${reference_dir}/config.json" ]] && return 0
+  [[ -n "${seed}" ]] || return 0
+  [[ -f "${seed}/config.json" ]] || return 0
+  local seed_abs dst_abs
+  seed_abs="$(cd "${seed}" 2>/dev/null && pwd -P || true)"
+  [[ -n "${seed_abs}" ]] || return 0
+  mkdir -p "${reference_dir}"
+  dst_abs="$(cd "${reference_dir}" 2>/dev/null && pwd -P || true)"
+  # Don't copy a directory onto itself (e.g. local dev where DIR == CACHE_DIR).
+  [[ -n "${dst_abs}" && "${seed_abs}" != "${dst_abs}" ]] || return 0
+  echo "setup.sh: seeding reference checkpoint from local cache (no download)"
+  echo "setup.sh:   source ${seed_abs}"
+  echo "setup.sh:   dest   ${dst_abs}"
+  ensure_reference_space "$(dirname "${reference_dir}")"
+  # -L dereferences the HF cache's blob symlinks so real files land in dest.
+  if command -v rsync >/dev/null 2>&1; then
+    if ! rsync -rL "${seed_abs}/" "${dst_abs}/"; then
+      echo "setup.sh: seed copy (rsync) failed; falling back to download" >&2
+      return 0
+    fi
+  elif ! ( cd "${seed_abs}" && cp -RL . "${dst_abs}/" ); then
+    echo "setup.sh: seed copy (cp) failed; falling back to download" >&2
+    return 0
+  fi
+  echo "setup.sh: seeded reference ($(path_size_gib "${reference_dir}") GiB) from local cache; verifying"
+}
+
 download_reference_weights() {
   local reference_dir="$1"
   local parent_dir
@@ -1422,6 +1469,8 @@ download_reference_weights() {
   local post_verify_status
   local shard_list
   local shard_files=()
+
+  seed_reference_from_local_cache "${reference_dir}"
 
   if [[ -f "${reference_dir}/config.json" ]]; then
     if verify_reference_weights "${reference_dir}"; then
