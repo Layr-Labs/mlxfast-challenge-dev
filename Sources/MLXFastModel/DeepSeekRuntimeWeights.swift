@@ -43,16 +43,21 @@ public final class DeepSeekRuntimeWeightCache {
             if entry.layerIndex == 0, loader.pinnedExpertCodes != nil {
                 continue
             }
+            let projections: [DeepSeekExpertProjection] = loader.hasFusedGateUp(layerIndex: entry.layerIndex)
+                ? [.down]
+                : [.gate, .up, .down]
             let fullyPinned = loader.schedulePinnedDecodeExpertCodes(
                 layerIndex: entry.layerIndex,
                 expertIndices: experts,
                 hiddenSize: config.hiddenSize,
-                intermediateSize: config.moeIntermediateSize
+                intermediateSize: config.moeIntermediateSize,
+                projections: projections
             )
             if !fullyPinned {
                 loader.expertPrefetcher.prefetch(
                     layerIndex: entry.layerIndex,
-                    expertIndices: experts
+                    expertIndices: experts,
+                    projections: projections
                 )
             }
         }
