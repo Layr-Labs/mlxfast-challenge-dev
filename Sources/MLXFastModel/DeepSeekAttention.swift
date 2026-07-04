@@ -155,6 +155,7 @@ public struct DeepSeekLocalAttentionWeights {
     public let qNorm: MLXArray
     public let wqB: DeepSeekLinearWeight
     public let wkv: DeepSeekLinearWeight
+    public let wqAKV: DeepSeekLinearWeight?
     public let kvNorm: MLXArray
     public let woA: DeepSeekLinearWeight
     public let woB: DeepSeekLinearWeight
@@ -166,6 +167,7 @@ public struct DeepSeekLocalAttentionWeights {
         qNorm: MLXArray,
         wqB: DeepSeekLinearWeight,
         wkv: DeepSeekLinearWeight,
+        wqAKV: DeepSeekLinearWeight? = nil,
         kvNorm: MLXArray,
         woA: DeepSeekLinearWeight,
         woB: DeepSeekLinearWeight,
@@ -176,6 +178,7 @@ public struct DeepSeekLocalAttentionWeights {
         self.qNorm = qNorm
         self.wqB = wqB
         self.wkv = wkv
+        self.wqAKV = wqAKV
         self.kvNorm = kvNorm
         self.woA = woA
         self.woB = woB
@@ -199,6 +202,7 @@ public struct DeepSeekLocalAttentionWeights {
             qNorm: qNorm,
             wqB: DeepSeekLinearWeight(wqB),
             wkv: DeepSeekLinearWeight(wkv),
+            wqAKV: nil,
             kvNorm: kvNorm,
             woA: DeepSeekLinearWeight(woA),
             woB: DeepSeekLinearWeight(woB),
@@ -319,20 +323,35 @@ public struct DeepSeekCompressorSpec {
 public struct DeepSeekCompressorWeights {
     public let wkv: DeepSeekLinearWeight
     public let wgate: DeepSeekLinearWeight
+    public let kvGate: DeepSeekLinearWeight?
     public let ape: MLXArray
     public let norm: MLXArray
 
-    public init(wkv: DeepSeekLinearWeight, wgate: DeepSeekLinearWeight, ape: MLXArray, norm: MLXArray) {
+    public init(
+        wkv: DeepSeekLinearWeight,
+        wgate: DeepSeekLinearWeight,
+        kvGate: DeepSeekLinearWeight? = nil,
+        ape: MLXArray,
+        norm: MLXArray
+    ) {
         self.wkv = wkv
         self.wgate = wgate
+        self.kvGate = kvGate
         self.ape = ape
         self.norm = norm
     }
 
-    public init(wkv: MLXArray, wgate: MLXArray, ape: MLXArray, norm: MLXArray) {
+    public init(
+        wkv: MLXArray,
+        wgate: MLXArray,
+        kvGate: DeepSeekLinearWeight? = nil,
+        ape: MLXArray,
+        norm: MLXArray
+    ) {
         self.init(
             wkv: DeepSeekLinearWeight(wkv),
             wgate: DeepSeekLinearWeight(wgate),
+            kvGate: kvGate,
             ape: ape,
             norm: norm
         )
@@ -362,11 +381,10 @@ public enum DeepSeekKVCompressor {
             throw MLXFastError.invalidInput("compressor ratio must be positive")
         }
 
-        let kv = DeepSeekOps.linear(input: x, weight: weights.wkv)
-        let gate = DeepSeekOps.linear(input: x, weight: weights.wgate)
+        let projected = projectKVGate(x, weights: weights)
         let ready = try poolingCache.accumulateWindows(
-            kv: kv,
-            gate: gate,
+            kv: projected.kv,
+            gate: projected.gate,
             offset: positionOffset
         )
         let newPooled = try compressReadyWindows(
@@ -398,12 +416,13 @@ public enum DeepSeekKVCompressor {
             return zeros([batchSize, 0, spec.headDim], dtype: x.dtype)
         }
 
-        let kv = DeepSeekOps.linear(input: x, weight: weights.wkv)[
+        let projected = projectKVGate(x, weights: weights)
+        let kv = projected.kv[
             0...,
             0..<usable,
             0...
         ]
-        let gate = DeepSeekOps.linear(input: x, weight: weights.wgate)[
+        let gate = projected.gate[
             0...,
             0..<usable,
             0...
@@ -415,6 +434,24 @@ public enum DeepSeekKVCompressor {
             spec: spec,
             positionOffset: positionOffset
         )
+    }
+
+    private static func projectKVGate(
+        _ x: MLXArray,
+        weights: DeepSeekCompressorWeights
+    ) -> (kv: MLXArray, gate: MLXArray) {
+        guard let kvGate = weights.kvGate else {
+            return (
+                DeepSeekOps.linear(input: x, weight: weights.wkv),
+                DeepSeekOps.linear(input: x, weight: weights.wgate)
+            )
+        }
+        let kvDim = weights.wkv.logicalShape[0]
+        let gateDim = weights.wgate.logicalShape[0]
+        let fused = DeepSeekOps.linear(input: x, weight: kvGate)
+        let kv = fused[0..., 0..., 0..<kvDim]
+        let gate = fused[0..., 0..., kvDim..<(kvDim + gateDim)]
+        return (kv, gate)
     }
 
     private static func compressReadyWindows(
@@ -498,16 +535,15 @@ public enum DeepSeekLocalAttention {
             maxPositionEmbeddings: spec.maxPositionEmbeddings
         )
 
-        var q = DeepSeekOps.linear(input: x, weight: weights.wqA)
-        q = DeepSeekOps.rmsNorm(input: q, weight: weights.qNorm, eps: spec.rmsNormEps)
+        let projected = projectQAKV(x, weights: weights)
+        var q = DeepSeekOps.rmsNorm(input: projected.qA, weight: weights.qNorm, eps: spec.rmsNormEps)
         q = DeepSeekOps.linear(input: q, weight: weights.wqB)
         q = q.reshaped([batchSize, sequenceLength, spec.numAttentionHeads, spec.headDim])
         q = DeepSeekHyperConnection.weightlessRMSNorm(q, eps: spec.rmsNormEps)
         q = q.transposed(0, 2, 1, 3)
         q = try rope.applied(to: q, offset: positionOffset)
 
-        var kv = DeepSeekOps.linear(input: x, weight: weights.wkv)
-        kv = DeepSeekOps.rmsNorm(input: kv, weight: weights.kvNorm, eps: spec.rmsNormEps)
+        var kv = DeepSeekOps.rmsNorm(input: projected.kv, weight: weights.kvNorm, eps: spec.rmsNormEps)
         kv = kv.reshaped([batchSize, 1, sequenceLength, spec.headDim])
         kv = try rope.applied(to: kv, offset: positionOffset)
         var attentionMask = mask
@@ -538,6 +574,24 @@ public enum DeepSeekLocalAttention {
         out = try DeepSeekOps.multiLinear(input: out, weight: weights.woA)
         out = out.transposed(0, 2, 1, 3).flattened(start: -2)
         return DeepSeekOps.linear(input: out, weight: weights.woB, bias: weights.woBBias)
+    }
+
+    fileprivate static func projectQAKV(
+        _ x: MLXArray,
+        weights: DeepSeekLocalAttentionWeights
+    ) -> (qA: MLXArray, kv: MLXArray) {
+        guard let wqAKV = weights.wqAKV else {
+            return (
+                DeepSeekOps.linear(input: x, weight: weights.wqA),
+                DeepSeekOps.linear(input: x, weight: weights.wkv)
+            )
+        }
+        let qDim = weights.wqA.logicalShape[0]
+        let kvDim = weights.wkv.logicalShape[0]
+        let fused = DeepSeekOps.linear(input: x, weight: wqAKV)
+        let qA = fused[0..., 0..., 0..<qDim]
+        let kv = fused[0..., 0..., qDim..<(qDim + kvDim)]
+        return (qA, kv)
     }
 
     private static func validateInput(_ x: MLXArray, spec: DeepSeekLocalAttentionSpec) throws {
@@ -573,8 +627,9 @@ public enum DeepSeekCompressedAttention {
             maxPositionEmbeddings: spec.maxPositionEmbeddings
         )
 
+        let projected = DeepSeekLocalAttention.projectQAKV(x, weights: weights.attention)
         let qResidual = DeepSeekOps.rmsNorm(
-            input: DeepSeekOps.linear(input: x, weight: weights.attention.wqA),
+            input: projected.qA,
             weight: weights.attention.qNorm,
             eps: spec.rmsNormEps
         )
@@ -584,8 +639,7 @@ public enum DeepSeekCompressedAttention {
         q = q.transposed(0, 2, 1, 3)
         q = try rope.applied(to: q, offset: positionOffset)
 
-        var kv = DeepSeekOps.linear(input: x, weight: weights.attention.wkv)
-        kv = DeepSeekOps.rmsNorm(input: kv, weight: weights.attention.kvNorm, eps: spec.rmsNormEps)
+        var kv = DeepSeekOps.rmsNorm(input: projected.kv, weight: weights.attention.kvNorm, eps: spec.rmsNormEps)
         kv = kv.reshaped([batchSize, 1, sequenceLength, spec.headDim])
         kv = try rope.applied(to: kv, offset: positionOffset)
         var localMask = mask
