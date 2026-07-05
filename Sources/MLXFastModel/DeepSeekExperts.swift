@@ -330,7 +330,7 @@ public enum DeepSeekRoutedExperts {
         var tokenStart = 0
         for (position, expertIndex) in expertOrder.enumerated() {
             let gateWeight = DeepSeekLinearWeight(
-                weight: gate.weight[expertIndex],
+                weight: gate.weight(forExpert: expertIndex),
                 scales: gate.scales[expertIndex],
                 biases: gate.biases.map { $0[expertIndex] },
                 logicalShape: gateLogical,
@@ -339,7 +339,7 @@ public enum DeepSeekRoutedExperts {
                 mode: gate.mode
             )
             let upWeight = DeepSeekLinearWeight(
-                weight: up.weight[expertIndex],
+                weight: up.weight(forExpert: expertIndex),
                 scales: up.scales[expertIndex],
                 biases: up.biases.map { $0[expertIndex] },
                 logicalShape: gateLogical,
@@ -349,7 +349,7 @@ public enum DeepSeekRoutedExperts {
             )
             downWeights.append(
                 DeepSeekLinearWeight(
-                    weight: down.weight[expertIndex],
+                    weight: down.weight(forExpert: expertIndex),
                     scales: down.scales[expertIndex],
                     biases: down.biases.map { $0[expertIndex] },
                     logicalShape: downLogical,
