@@ -168,7 +168,7 @@ public final class DeepSeekRuntimeWeightCache {
                 stager.releaseLayer(layerIndex)
             }
             warmed += 1
-            if warmed >= 9 {
+            if warmed >= 10 {
                 break
             }
         }
