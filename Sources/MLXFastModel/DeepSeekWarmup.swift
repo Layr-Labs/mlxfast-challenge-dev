@@ -147,18 +147,27 @@ enum DeepSeekWarmup {
         else {
             return
         }
-        var warmed = 0
+        // Warm in REVERSE order (layer K down to the first stageable layer):
+        // if any eviction happens between init and the first scored prefill,
+        // LRU evicts the least-recently-touched pages — reverse warming makes
+        // those the DEEPEST warmed layers, which the prefill reaches last and
+        // whose loss costs the least head-start. Same layers, same bytes.
+        var stageable: [Int] = []
         for layerIndex in 0..<weightCache.config.numHiddenLayers {
-            guard warmed < pageCacheWarmLayerCount else {
+            if weightCache.loader.stagedExpertLayerPlan(layerIndex: layerIndex) != nil {
+                stageable.append(layerIndex)
+            }
+            if stageable.count >= pageCacheWarmLayerCount {
                 break
             }
+        }
+        for layerIndex in stageable.reversed() {
             guard let plan = weightCache.loader.stagedExpertLayerPlan(layerIndex: layerIndex) else {
                 continue
             }
             stager.schedule(plan)
             if stager.waitForLayer(layerIndex) {
                 stager.releaseLayer(layerIndex)
-                warmed += 1
             }
         }
     }
