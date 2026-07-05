@@ -139,6 +139,8 @@ public struct DeepSeekWeightLoader {
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
     private static let pinnedHashLayerCap = 2
+    private static let partialPinnedHashLayerIndex = 2
+    private static let partialPinnedHashLayerProjections: Set<String> = ["gate_proj", "up_proj"]
 
     public init(
         weightsPath: String,
@@ -178,7 +180,11 @@ public struct DeepSeekWeightLoader {
         self.pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
             ? ResidentExpertStoreRegistry.pinnedHashLayerCodes(
                 manifestPath: manifestPath,
-                hashLayerCount: min(hashLayerCount, Self.pinnedHashLayerCap),
+                fullHashLayerCount: min(hashLayerCount, Self.pinnedHashLayerCap),
+                partialLayerIndex: hashLayerCount > Self.partialPinnedHashLayerIndex
+                    ? Self.partialPinnedHashLayerIndex
+                    : nil,
+                partialProjections: Self.partialPinnedHashLayerProjections,
                 metrics: metrics
             )
             : nil
@@ -401,10 +407,15 @@ public struct DeepSeekWeightLoader {
         layerIndex: Int,
         expertIndices: [Int],
         hiddenSize: Int,
-        intermediateSize: Int
+        intermediateSize: Int,
+        existing: [String: StagedExpertCode]? = nil
     ) -> [String: StagedExpertCode]? {
-        guard let sideBank = decodeSideBank, expertBank.capacity > 0, !expertIndices.isEmpty else {
-            return nil
+        var prefetched = existing ?? [:]
+        guard !expertIndices.isEmpty else {
+            return prefetched.isEmpty ? nil : prefetched
+        }
+        guard let sideBank = decodeSideBank, expertBank.capacity > 0 else {
+            return prefetched.isEmpty ? nil : prefetched
         }
         let projections: [(DeepSeekExpertProjection, [Int])] = [
             (.gate, [intermediateSize, hiddenSize]),
@@ -414,7 +425,7 @@ public struct DeepSeekWeightLoader {
         var keys: [String] = []
         var names: [String] = []
         var indices: [Int] = []
-        var seen = Set<String>()
+        var seen = Set(prefetched.keys)
         for expertIndex in expertIndices {
             for (projection, expectedShape) in projections {
                 if let plan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: projection),
@@ -496,20 +507,18 @@ public struct DeepSeekWeightLoader {
                 )
             }
         }
-        var map: [String: StagedExpertCode] = [:]
-        map.reserveCapacity(keys.count)
+        prefetched.reserveCapacity(prefetched.count + keys.count)
         for (index, key) in keys.enumerated() {
             if let staged = results[index] {
-                map[key] = staged
+                prefetched[key] = staged
             }
         }
-        return map.isEmpty ? nil : map
+        return prefetched.isEmpty ? nil : prefetched
     }
 
     /// Starts building resident pinned-code decode slices for a hash-routed
-    /// layer before that layer reaches MoE. Only the first two hash layers are
-    /// pinned on the official runner; unpinned layers return false so callers
-    /// still issue the normal disk read-ahead.
+    /// layer before that layer reaches MoE. Partially pinned layers still
+    /// return false so callers issue normal disk read-ahead for missing slices.
     @discardableResult
     public func schedulePinnedDecodeExpertCodes(
         layerIndex: Int,
@@ -533,10 +542,6 @@ public struct DeepSeekWeightLoader {
             return false
         }
         let fullyPinned = plan.keys.count == Set(expertIndices).count * 3
-        guard fullyPinned else {
-            scheduledPinnedDecodePrefetches.remove(layerIndex: layerIndex)
-            return false
-        }
         let bridge = self.bridge
         let residentScales = self.residentExpertScales
         scheduledPinnedDecodePrefetches.schedule(layerIndex: layerIndex) {
@@ -549,7 +554,7 @@ public struct DeepSeekWeightLoader {
                 bridge: bridge
             )
         }
-        return true
+        return fullyPinned
     }
 
     public func consumeScheduledPinnedDecodeExpertCodes(layerIndex: Int) -> [String: StagedExpertCode]? {

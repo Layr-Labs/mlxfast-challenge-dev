@@ -156,14 +156,16 @@ public enum DeepSeekRoutedExperts {
         // not prefetched falls back to the normal per-expert bank read.
         var decodePrefetch: [String: StagedExpertCode]?
         if tokenCount == 1, !useStaged {
-            decodePrefetch = loader.consumeScheduledPinnedDecodeExpertCodes(
+            let scheduledPrefetch = loader.consumeScheduledPinnedDecodeExpertCodes(
                 layerIndex: spec.layerIndex
-            ) ?? loader.prefetchDecodeExpertCodes(
+            )
+            decodePrefetch = loader.prefetchDecodeExpertCodes(
                 layerIndex: spec.layerIndex,
                 expertIndices: expertOrder,
                 hiddenSize: spec.hiddenSize,
-                intermediateSize: spec.intermediateSize
-            )
+                intermediateSize: spec.intermediateSize,
+                existing: scheduledPrefetch
+            ) ?? scheduledPrefetch
         } else if useStaged {
             // Prefill/warmup staged path: build the active experts' base
             // MLXArrays from the staged layer buffer concurrently so the loop
