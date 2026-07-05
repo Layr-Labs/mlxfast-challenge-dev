@@ -136,9 +136,9 @@ public struct DeepSeekWeightLoader {
     private let routedExpertProjectionPlans: [RoutedExpertProjectionKey: RoutedExpertProjectionPlan]
 
     /// Sized for the official 48 GB runner: pin only where at least that
-    /// budget exists, and never more than two layers of codes (~6.4 GiB).
+    /// budget exists, and include all token-id-routed hash layers (~9.6 GiB).
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
-    private static let pinnedHashLayerCap = 2
+    private static let pinnedHashLayerCap = 3
 
     public init(
         weightsPath: String,
@@ -170,7 +170,7 @@ public struct DeepSeekWeightLoader {
         )
         // Pinning trades RAM for guaranteed hits on the token-id-routed
         // layers; only worthwhile at the official 48 GB budget or above,
-        // and capped so the pinned codes (~3.2 GiB per layer) leave headroom
+        // and capped to the three hash layers (~3.2 GiB per layer) to leave headroom
         // for the resident scales, staging buffers, and page cache inside
         // that budget. Both constants encode the OFFICIAL runner's memory
         // math — do not raise them because a larger local machine has room.
