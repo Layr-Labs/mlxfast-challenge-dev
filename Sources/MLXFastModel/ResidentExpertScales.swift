@@ -7,23 +7,28 @@ import MLXFastCore
 ///
 /// Two instances back the runtime:
 ///
-/// - **Scales** (all layers, ~8 GiB): e8m0 scales are only ~6% of streamed
-///   expert bytes but half of all bank round-trips — every expert
+/// - **Scales** (all layers, ~8 GiB raw): e8m0 scales are only ~6% of
+///   streamed expert bytes but half of all bank round-trips — every expert
 ///   materialization pays a second open/fstat/pread/close for its small
-///   scales slice.
-/// - **Hash-layer codes** (layers routed by token id, ~9.6 GiB, only on
+///   scales slice. When the offline transform emitted the palette-packed
+///   scale overlay (`experts/scales_packed.safetensors` +
+///   `scale_compression.json`), the store reads the compact 4-bit form
+///   (~4.3 GiB from disk, half the raw bytes) and expands it ONCE, in this
+///   untimed constructor, back to the byte-identical raw U8 tensors. Steady
+///   state then serves zero-copy raw views exactly like the store always
+///   did — no per-forward or per-step decode work anywhere on a scored path.
+/// - **Hash-layer codes** (layers routed by token id, only on
 ///   machines with the official 48 GB or more): the expert working set
 ///   cycles through far more bytes than any cache, and cyclic scans defeat
 ///   LRU — pinning converts those layers' reads into guaranteed RAM hits
 ///   every token instead of probabilistic page-cache hits.
 ///
-/// Loads happen once in the (untimed) loader constructor through a dedicated
-/// capacity-0 ExpertSlotBank that shares the loader's metrics: capacity 0
-/// never populates an LRU (no double residency), and the whole-tensor reads
-/// are recorded as honest misses/bytes on the same counters the benchmark
-/// reports. Slices are Data views into the retained stacked buffer — the
-/// same file bytes the bank's firstAxisIndex read would return, by the
-/// bank's own slice arithmetic (byteLength / firstDimension).
+/// Loads happen once in the (untimed) loader constructor. Raw entries come
+/// through a dedicated capacity-0 ExpertSlotBank that shares the loader's
+/// metrics; packed scale entries are read directly from the transform's
+/// compact overlay shard and expanded here. In both cases the bytes handed to
+/// the runtime are identical to what the bank's firstAxisIndex read would
+/// return, by the bank's own slice arithmetic (byteLength / firstDimension).
 public final class ResidentExpertTensors {
     private struct Entry {
         let dtype: TensorDType
@@ -79,6 +84,15 @@ public final class ResidentExpertTensors {
         self.entries = loaded
     }
 
+    /// Builds the store directly from prebuilt entries (used by the packed
+    /// scale loader). Fails when empty so callers fall back to streaming.
+    private init?(entries: [String: Entry]) {
+        guard !entries.isEmpty else {
+            return nil
+        }
+        self.entries = entries
+    }
+
     public func isResident(name: String) -> Bool {
         entries[name] != nil
     }
@@ -114,13 +128,63 @@ public final class ResidentExpertTensors {
             bytes: slice
         )
     }
+
+    /// Expands `count` U8 values from packed 4-bit palette indices (low nibble
+    /// = even element). Used once per tensor at load time; the output buffer
+    /// is allocated uninitialized and fully written by the loop.
+    fileprivate static func decode(nibbles: Data, palette: [UInt8], count: Int) -> Data {
+        guard count > 0, let destination = malloc(count)?.assumingMemoryBound(to: UInt8.self) else {
+            return Data()
+        }
+        nibbles.withUnsafeBytes { rawInput in
+            guard let source = rawInput.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                memset(destination, 0, count)
+                return
+            }
+            palette.withUnsafeBufferPointer { lut in
+                var writeIndex = 0
+                var readIndex = 0
+                let pairEnd = count - (count % 2)
+                while writeIndex < pairEnd {
+                    let byte = source[readIndex]
+                    destination[writeIndex] = lut[Int(byte & 0x0F)]
+                    destination[writeIndex + 1] = lut[Int(byte >> 4)]
+                    writeIndex += 2
+                    readIndex += 1
+                }
+                if writeIndex < count {
+                    destination[writeIndex] = lut[Int(source[readIndex] & 0x0F)]
+                }
+            }
+        }
+        return Data(bytesNoCopy: destination, count: count, deallocator: .free)
+    }
 }
 
 extension ResidentExpertTensors {
-    /// All `*.scales` records — the store behind resident expert scales.
+    /// Filenames of the offline scale-compression overlay. These MUST match
+    /// `ScaleCompression` in MLXFastTransform (a small cross-module contract;
+    /// MLXFastModel does not depend on MLXFastTransform).
+    private static let packedScaleShardName = "scales_packed.safetensors"
+    private static let packedScaleSidecarName = "scale_compression.json"
+    private static let packedScaleVersion = 1
+
+    /// All `*.scales` records — the store behind resident expert scales. Reads
+    /// the compact palette-packed overlay emitted by the transform when it is
+    /// present and valid (half the disk bytes, expanded to raw U8 here, once,
+    /// untimed); otherwise falls back to the uncompressed bank load. Either
+    /// way the resident entries hold the exact raw bytes, so every steady-state
+    /// consumer is byte- and machinery-identical to the raw store.
     public convenience init?(scalesFromManifest manifestPath: String, metrics: ExpertStreamingMetrics?) {
-        self.init(manifestPath: manifestPath, metrics: metrics) { record in
-            record.name.hasSuffix(".scales")
+        if let entries = ResidentExpertTensors.loadPackedScaleEntries(
+            manifestPath: manifestPath,
+            metrics: metrics
+        ) {
+            self.init(entries: entries)
+        } else {
+            self.init(manifestPath: manifestPath, metrics: metrics) { record in
+                record.name.hasSuffix(".scales")
+            }
         }
     }
 
@@ -149,12 +213,162 @@ extension ResidentExpertTensors {
         }
         return Int(components[components.index(after: layersPosition)])
     }
+
+    /// Loads resident scale entries from the transform's palette-packed
+    /// overlay next to the manifest, expanding each tensor to its raw U8 bytes
+    /// here (once, untimed init). Returns nil (caller falls back to the bank
+    /// load) when the overlay is absent, malformed, or inconsistent with the
+    /// manifest.
+    private static func loadPackedScaleEntries(
+        manifestPath: String,
+        metrics: ExpertStreamingMetrics?
+    ) -> [String: Entry]? {
+        let manifestURL = URL(fileURLWithPath: manifestPath)
+        let expertsDirectory = manifestURL.deletingLastPathComponent()
+        let sidecarURL = expertsDirectory.appendingPathComponent(packedScaleSidecarName)
+        let shardURL = expertsDirectory.appendingPathComponent(packedScaleShardName)
+
+        guard
+            FileManager.default.fileExists(atPath: sidecarURL.path),
+            FileManager.default.fileExists(atPath: shardURL.path),
+            let sidecarData = try? Data(contentsOf: sidecarURL),
+            let sidecarObject = (try? JSONSerialization.jsonObject(with: sidecarData)) as? [String: Any],
+            (sidecarObject["version"] as? Int) == packedScaleVersion,
+            let packedMeta = sidecarObject["tensors"] as? [String: Any],
+            let header = try? Safetensors.readHeader(shardURL),
+            let bank = try? ExpertSlotBank(manifestPath: manifestPath, capacity: 0, metrics: metrics),
+            let shardHandle = try? FileHandle(forReadingFrom: shardURL)
+        else {
+            return nil
+        }
+        defer { try? shardHandle.close() }
+
+        var loaded: [String: Entry] = [:]
+        for record in bank.manifest.expertTensors where record.name.hasSuffix(".scales") {
+            guard
+                let firstDimension = record.shape.first,
+                record.shape.count >= 2,
+                firstDimension > 0,
+                record.byteLength % firstDimension == 0
+            else {
+                return nil
+            }
+
+            if let entry = expandedPackedEntry(
+                record: record,
+                firstDimension: firstDimension,
+                packedMeta: packedMeta,
+                header: header,
+                shardHandle: shardHandle
+            ) {
+                loaded[record.name] = entry
+                continue
+            }
+
+            // Any scale tensor missing from the overlay (or inconsistent with
+            // it) is served raw from the bank so the store stays complete.
+            guard let tensor = try? bank.materializedTensor(named: record.name) else {
+                return nil
+            }
+            loaded[record.name] = Entry(
+                dtype: tensor.dtype,
+                shape: tensor.shape,
+                bytes: tensor.bytes,
+                sliceByteLength: record.byteLength / firstDimension
+            )
+        }
+
+        guard !loaded.isEmpty else {
+            return nil
+        }
+        return loaded
+    }
+
+    /// Reads one tensor's packed nibbles from the overlay shard and expands
+    /// them to the raw U8 entry. Returns nil when the overlay's metadata does
+    /// not exactly match the manifest record.
+    private static func expandedPackedEntry(
+        record: ExpertTensorRecord,
+        firstDimension: Int,
+        packedMeta: [String: Any],
+        header: SafetensorsHeader,
+        shardHandle: FileHandle
+    ) -> Entry? {
+        guard
+            record.dtype == "U8",
+            let meta = packedMeta[record.name] as? [String: Any],
+            let paletteValues = meta["palette"] as? [Int],
+            let shape = meta["shape"] as? [Int],
+            let elementCount = meta["elementCount"] as? Int,
+            let packedByteLength = meta["packedByteLength"] as? Int,
+            let info = header.tensors[record.name],
+            shape == record.shape,
+            elementCount == record.shape.reduce(1, *),
+            elementCount == record.byteLength,
+            (elementCount / firstDimension) % 2 == 0,
+            packedByteLength == (elementCount + 1) / 2,
+            info.byteCount == packedByteLength,
+            paletteValues.count <= 16,
+            !paletteValues.isEmpty,
+            paletteValues.allSatisfy({ $0 >= 0 && $0 <= 255 })
+        else {
+            return nil
+        }
+
+        let absoluteOffset = header.dataBaseOffset + UInt64(info.dataStart)
+        guard let nibbles = readShardBytes(
+            shardHandle,
+            offset: absoluteOffset,
+            length: packedByteLength
+        ) else {
+            return nil
+        }
+
+        // Pad the palette to 16 entries. Only indices 0..<paletteValues.count
+        // are ever produced by the packer, so the padding value is irrelevant;
+        // it exists solely so a raw nibble (0..15) can index without bounds risk.
+        var palette = [UInt8](repeating: 0, count: 16)
+        for index in 0..<paletteValues.count {
+            palette[index] = UInt8(paletteValues[index])
+        }
+
+        let decoded = decode(nibbles: nibbles, palette: palette, count: elementCount)
+        guard decoded.count == elementCount else {
+            return nil
+        }
+        return Entry(
+            dtype: .u8,
+            shape: shape,
+            bytes: decoded,
+            sliceByteLength: elementCount / firstDimension
+        )
+    }
+
+    private static func readShardBytes(_ handle: FileHandle, offset: UInt64, length: Int) -> Data? {
+        do {
+            try handle.seek(toOffset: offset)
+        } catch {
+            return nil
+        }
+        var data = Data()
+        data.reserveCapacity(length)
+        var remaining = length
+        while remaining > 0 {
+            let chunk = handle.readData(ofLength: min(remaining, 32 * 1024 * 1024))
+            if chunk.isEmpty {
+                break
+            }
+            data.append(chunk)
+            remaining -= chunk.count
+        }
+        return data.count == length ? data : nil
+    }
 }
 
 /// Process-wide registry so every DeepSeekWeightLoader for the same manifest
 /// shares ONE copy of each resident store. The trusted benchmark harness holds
 /// two loaders alive at once (a correctness loader and a benchmark loader);
-/// without sharing, the ~14 GiB of resident scales and pinned codes would be
+/// without sharing, the resident scales and pinned codes would be
 /// duplicated and could exceed the 48 GB runner budget before scoring starts.
 /// Stores are immutable after construction, so sharing is safe; nil results
 /// are cached too so a failed load is not retried per loader.
