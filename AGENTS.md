@@ -22,19 +22,23 @@ and prefill must also stay within the configured 0.95 speedup floors.
 
 ## Official Hardware
 
-Ranked benchmark runs execute through GitHub Actions on:
+Ranked benchmark runs execute through GitHub Actions on Blacksmith-hosted
+Apple Silicon runners, like the rest of the Darkbloom inference benchmarks.
+The runner label configured in `.github/` is the source of truth; today that
+is:
 
 ```text
 blacksmith-12vcpu-macos-26
 ```
 
-Treat this as the source of truth for performance. The ranked run targets an
-Apple M3 Ultra with at least 256 GB of unified memory. On that contract the
-full 4-bit expert set (~141 GiB) is RAM-resident: the runtime loads every
-expert tensor once during untimed initialization and no scored prefill or
-decode window reads expert bytes from SSD. Optimization effort should go into
-compute — kernels, attention, MoE dispatch, memory layout, and MLX scheduling —
-not disk I/O.
+The ranked hardware contract for this benchmark is an Apple M3 Ultra with at
+least 256 GB of unified memory (the label above moves to Blacksmith's M3 Ultra
+machine class when it is provisioned; Blacksmith stays the CI provider either
+way). On that contract the full 4-bit expert set (~141 GiB) is RAM-resident:
+the runtime loads every expert tensor once during untimed initialization and
+no scored prefill or decode window reads expert bytes from SSD. Optimization
+effort should go into compute — kernels, attention, MoE dispatch, memory
+layout, and MLX scheduling — not disk I/O.
 
 Local machines below 192 GiB fall back to the previous SSD-streaming runtime
 automatically (see `ExpertResidencyPolicy` in `Sources/MLXFastCore/`), so
