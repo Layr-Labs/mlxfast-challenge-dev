@@ -172,7 +172,34 @@ enum DeepSeekWarmup {
                 stager.releaseLayer(layerIndex)
             }
         }
+        // Init-hold: after the read-and-release warm pass, stage the first
+        // few layers again and KEEP them staged (untimed init RAM, same
+        // machinery as the promoted cross-forward tail capture). The next
+        // prefill-shaped forward's entry schedule is deduped by the stager,
+        // its waitForLayer returns instantly, and the layer is consumed from
+        // app RAM with ZERO read time in the scored window, then released by
+        // the forward's own defer as usual. The re-stage reads are pure
+        // page-cache memcpy (those layers were warmed by the loop above,
+        // shallow layers last = freshest). A one-token forward entry
+        // (throwaway decode ran BEFORE this warm; real decode steps and
+        // GPQA generation) releases any unconsumed holds via the existing
+        // releaseAllStagedLayers cancellation, so nothing leaks. Held bytes
+        // (~4 layers x ~3.2 GB) sit inside the same transient envelope the
+        // promoted K=6 tail capture already exercises (~19 GB).
+        for layerIndex in stageable.prefix(initHoldLayerCount) {
+            guard let plan = weightCache.loader.stagedExpertLayerPlan(layerIndex: layerIndex) else {
+                continue
+            }
+            stager.schedule(plan)
+            _ = stager.waitForLayer(layerIndex)
+        }
     }
+
+    /// Layers held staged across the init->scored-window boundary. 4 layers
+    /// ≈ 12.8 GB transient, comfortably under the promoted tail capture's
+    /// ~19 GB precedent; released progressively as the first forward
+    /// consumes them (layer 0 frees after the very first MoE block).
+    private static let initHoldLayerCount = 4
 
     private static func warmHeadHyperConnection(model: DeepSeekModelWeights, config: DeepSeekConfig) {
         let hidden = zeros([1, 512, config.hcMult, config.hiddenSize], dtype: .bfloat16)
