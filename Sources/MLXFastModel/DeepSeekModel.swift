@@ -129,6 +129,10 @@ public enum DeepSeekModel {
         let spec = DeepSeekModelSpec(config: config)
         let weights = try weightCache.modelWeights()
         if inputIDs.shape == [1, 1] {
+            // Decode never consumes staged data; release stale cross-forward
+            // stage-ahead (and cancel its queued reads) before it can crowd
+            // the page cache or the disk the decode steps depend on.
+            weightCache.loader.expertLayerStager?.releaseAllStagedLayers()
             // Decode step: hash-layer routing depends only on the token id,
             // so advise the kernel about those layers' expert ranges before
             // the forward starts. inputIDs is a leaf array on every decode
@@ -137,7 +141,7 @@ public enum DeepSeekModel {
                 token: Int(DeepSeekOps.cast(inputIDs, to: .int32).asArray(Int32.self)[0])
             )
         }
-        return try logits(
+        let result = try logits(
             inputIDs: inputIDs,
             weights: weights,
             spec: spec,
@@ -152,6 +156,13 @@ public enum DeepSeekModel {
                 positionOffset: positionOffset
             )
         }
+        if inputIDs.shape[1] >= 64 {
+            // Prefill-shaped forward complete: stage the next prefill's
+            // opening layers (measured prefill -> seed). Stale entries are
+            // cancelled at one-token decode entry above.
+            weightCache.scheduleUpcomingPrefillStaging()
+        }
+        return result
     }
 
     public static func logits(

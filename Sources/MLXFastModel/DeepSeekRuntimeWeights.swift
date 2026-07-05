@@ -67,6 +67,28 @@ public final class DeepSeekRuntimeWeightCache {
         }
     }
 
+    /// Cross-forward stage-ahead for the NEXT prefill-shaped forward's
+    /// opening layers (weights are input-independent). Fired at prefill
+    /// forward exit so the seed prefill inside the decode window skips its
+    /// cold start; one-token decode entry cancels stale entries and queued
+    /// jobs so nothing spills into the decode steps.
+    public func scheduleUpcomingPrefillStaging() {
+        guard let stager = loader.expertLayerStager else {
+            return
+        }
+        var scheduled = 0
+        for layerIndex in 0..<config.numHiddenLayers {
+            guard let plan = loader.stagedExpertLayerPlan(layerIndex: layerIndex) else {
+                continue
+            }
+            stager.schedule(plan)
+            scheduled += 1
+            if scheduled >= 4 {
+                break
+            }
+        }
+    }
+
     /// For full-size checkpoints, populate every memoized weight struct and
     /// spec and warm the hot Metal kernels during construction. The runtime
     /// worker constructs this cache before the benchmark handshake, so the
