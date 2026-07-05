@@ -16,7 +16,11 @@ import MLXFastCore
 /// prompt-independent and cannot affect model output.
 enum DeepSeekWarmup {
     private static let pageCacheWarmMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
-    private static let pageCacheWarmLayerCount = 9
+    /// One more layer than the promoted 9: the palette-packed resident scales
+    /// free ~4.3 GiB of the worker's footprint (8.7 GiB raw -> 4.3 packed),
+    /// which is more than one staged layer's bytes of extra page-cache
+    /// headroom on the official runner.
+    private static let pageCacheWarmLayerCount = 10
 
     static func run(weightCache: DeepSeekRuntimeWeightCache) {
         let config = weightCache.config

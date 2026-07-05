@@ -836,18 +836,24 @@ public struct DeepSeekWeightLoader {
         else {
             return nil
         }
+        // Staged whole-tensor scale bytes first: packed-resident scales are
+        // deliberately kept in the staging plan so this no-decode byte path
+        // serves prefill; the packed store then only ever expands small
+        // per-expert slices on worker threads (decode steps), never whole
+        // tensors on a scored path. Raw-resident scales (excluded from the
+        // plan) fall through to the zero-copy resident branch as before.
         let scalesTensor: MaterializedTensor?
-        if let resident = residentExpertScales?.materializedTensor(named: scalesName, firstAxisIndex: nil) {
-            scalesTensor = resident
-        } else if let staged = expertLayerStager?.stagedBytes(recordName: scalesName),
-                  staged.count == scalesRecord.byteLength,
-                  let dtype = try? TensorDType.parse(scalesRecord.dtype) {
+        if let staged = expertLayerStager?.stagedBytes(recordName: scalesName),
+           staged.count == scalesRecord.byteLength,
+           let dtype = try? TensorDType.parse(scalesRecord.dtype) {
             scalesTensor = try? MaterializedTensor(
                 name: scalesName,
                 dtype: dtype,
                 shape: scalesRecord.shape,
                 bytes: staged
             )
+        } else if let resident = residentExpertScales?.materializedTensor(named: scalesName, firstAxisIndex: nil) {
+            scalesTensor = resident
         } else {
             scalesTensor = nil
         }
@@ -1093,8 +1099,14 @@ public struct DeepSeekWeightLoader {
                     guard let companionRecord = expertBank.record(named: companion) else {
                         continue
                     }
+                    // Scales skip staging only when the resident store can
+                    // hand back the whole tensor as zero-copy raw bytes.
+                    // Packed-resident scales stay IN the staging plan: the
+                    // prefill batched path then builds them from the staged
+                    // bytes (the no-decode byte path) instead of paying a
+                    // whole-tensor palette expansion per forward.
                     let scalesResident = suffix == "scales"
-                        && residentExpertScales?.isResident(name: companion) == true
+                        && residentExpertScales?.servesZeroCopyBytes(name: companion) == true
                     if !scalesResident, companionRecord.shape.count >= 2 {
                         names.append(companion)
                     }
@@ -1932,7 +1944,26 @@ public struct DeepSeekWeightLoader {
         shouldSliceCompanions: Bool = false
     ) throws -> DeepSeekLinearWeight {
         let scalesName = Self.companionName(for: baseName, suffix: "scales")
-        guard tensor.dtype == .u32, let scalesTensor = try companionTensor(scalesName, shouldSliceCompanions) else {
+
+        // Resolve the scales' shape/dtype and, only if we still need to build
+        // its MLXArray, the scales MaterializedTensor. When the scales array
+        // was already built off the compute thread (prebuiltScalesArray) we
+        // read its shape/dtype directly and DO NOT call the scales companion
+        // closure — for the palette-packed resident scales store that closure
+        // would otherwise redundantly expand the slice again on the compute
+        // thread just to discard its bytes.
+        let scalesShape: [Int]
+        let scalesIsU8: Bool
+        let scalesTensorForArray: MaterializedTensor?
+        if tensor.dtype == .u32, let prebuiltScalesArray {
+            scalesShape = prebuiltScalesArray.shape
+            scalesIsU8 = prebuiltScalesArray.dtype == .uint8
+            scalesTensorForArray = nil
+        } else if tensor.dtype == .u32, let scalesTensor = try companionTensor(scalesName, shouldSliceCompanions) {
+            scalesShape = scalesTensor.shape
+            scalesIsU8 = scalesTensor.dtype == .u8
+            scalesTensorForArray = scalesTensor
+        } else {
             try validateShape(tensor.shape, expectedShape: expectedShape, tensorName: baseName)
             return DeepSeekLinearWeight(try prebuiltWeightArray ?? bridge.makeArray(from: tensor))
         }
@@ -1966,12 +1997,12 @@ public struct DeepSeekWeightLoader {
         guard [2, 4, 8].contains(bits) else {
             throw MLXFastError.invalidInput("quantized tensor \(baseName) inferred unsupported bits=\(bits)")
         }
-        guard let scaleGroups = scalesTensor.shape.last, scaleGroups > 0, expectedInput % scaleGroups == 0 else {
+        guard let scaleGroups = scalesShape.last, scaleGroups > 0, expectedInput % scaleGroups == 0 else {
             throw MLXFastError.invalidInput(
-                "quantized tensor \(baseName) scales shape \(scalesTensor.shape) is incompatible with logical input \(expectedInput)"
+                "quantized tensor \(baseName) scales shape \(scalesShape) is incompatible with logical input \(expectedInput)"
             )
         }
-        let scaleRows = scalesTensor.shape.dropLast().reduce(1, *)
+        let scaleRows = scalesShape.dropLast().reduce(1, *)
         guard scaleRows == expectedRows else {
             throw MLXFastError.invalidInput(
                 "quantized tensor \(baseName) scales have \(scaleRows) rows; expected \(expectedRows)"
@@ -1981,15 +2012,15 @@ public struct DeepSeekWeightLoader {
             let biasRows = biasesTensor.shape.dropLast().reduce(1, *)
             guard biasRows == expectedRows, biasesTensor.shape.last == scaleGroups else {
                 throw MLXFastError.invalidInput(
-                    "quantized tensor \(baseName) biases shape \(biasesTensor.shape) does not match scales shape \(scalesTensor.shape)"
+                    "quantized tensor \(baseName) biases shape \(biasesTensor.shape) does not match scales shape \(scalesShape)"
                 )
             }
         }
 
-        let mode: QuantizationMode = biasesTensor == nil && scalesTensor.dtype == .u8 ? .mxfp4 : .affine
+        let mode: QuantizationMode = biasesTensor == nil && scalesIsU8 ? .mxfp4 : .affine
         let weightArray = try (prebuiltWeightArray ?? bridge.makeArray(from: tensor))
             .reshaped([expectedRows, packedInput])
-        let scalesArray = try (prebuiltScalesArray ?? bridge.makeArray(from: scalesTensor))
+        let scalesArray = try (prebuiltScalesArray ?? bridge.makeArray(from: scalesTensorForArray!))
             .reshaped([expectedRows, scaleGroups])
         let biasesArray = try biasesTensor.map { try bridge.makeArray(from: $0).reshaped([expectedRows, scaleGroups]) }
         return DeepSeekLinearWeight(
