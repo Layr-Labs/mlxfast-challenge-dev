@@ -1193,7 +1193,9 @@ func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
     #expect(workerRuntime.contains("try checkWorkerBenchmarkInputs("))
 
     let preflightRange = try #require(workerRuntime.range(of: "progress(\"preflight start\")"))
-    let timedBenchmarkRange = try #require(workerRuntime.range(of: "progress(\"timed benchmark start\")"))
+    let timedBenchmarkRange = try #require(
+        workerRuntime.range(of: "\"timed benchmark start expert_residency=\"")
+    )
     let weightsDigestRange = try #require(workerRuntime.range(of: "progress(\"weights digest start\")"))
     let correctnessRange = try #require(workerRuntime.range(of: "progress(\"correctness start cases=\\(golden.totalCorrectnessCaseCount)\")"))
     #expect(preflightRange.lowerBound < weightsDigestRange.lowerBound)

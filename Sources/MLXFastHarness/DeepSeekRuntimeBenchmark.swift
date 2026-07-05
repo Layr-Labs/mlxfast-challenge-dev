@@ -171,7 +171,10 @@ extension DeepSeekRuntime {
 
             Memory.peakMemory = 0
             let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
-            progress("timed benchmark start")
+            progress(
+                "timed benchmark start expert_residency="
+                    + (ExpertResidencyPolicy.fullResidencyEnabled() ? "full" : "streaming")
+            )
             let prefillSecondsPerToken = try measurePrefillSecondsPerToken(
                 promptTokens: promptPlan.prefillTokens,
                 expectedToken: promptPlan.expectedPrefillToken,
@@ -504,7 +507,10 @@ extension DeepSeekRuntime {
                 benchmarkExpertStats = .zero
             } else {
                 let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
-                progress("timed benchmark start")
+                progress(
+                    "timed benchmark start expert_residency="
+                        + (ExpertResidencyPolicy.fullResidencyEnabled() ? "full" : "streaming")
+                )
                 progress("benchmark prefill worker start")
                 do {
                     let prefillWorker = try RuntimeWorkerClient(

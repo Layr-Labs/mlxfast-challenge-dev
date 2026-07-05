@@ -98,6 +98,44 @@ func residentAllExpertsStoreServesStackedSlicesByteIdenticallyToBank() throws {
 }
 
 @Test
+func residentStoreLoadEmitsProgressThroughInjectedSink() throws {
+    let root = try temporaryDirectory()
+    let reference = root.appendingPathComponent("reference", isDirectory: true)
+    let experts = root.appendingPathComponent("weights/experts", isDirectory: true)
+    try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: experts, withIntermediateDirectories: true)
+    let shard = reference.appendingPathComponent("model-00001.safetensors")
+    try Data([0, 1, 2, 3]).write(to: shard)
+    let manifestURL = experts.appendingPathComponent("manifest.json")
+    try manifestJSON(
+        referencePath: reference.path,
+        records: [
+            record(
+                name: "model.layers.0.ffn.switch_mlp.gate_proj.weight",
+                shard: shard.lastPathComponent,
+                offset: 0,
+                length: 4,
+                shape: [2, 2]
+            )
+        ]
+    ).write(to: manifestURL, atomically: true, encoding: .utf8)
+
+    var lines: [String] = []
+    let store = ResidentExpertTensors(
+        manifestPath: manifestURL.path,
+        metrics: nil,
+        loadProgress: { lines.append($0) }
+    ) { _ in true }
+
+    #expect(store != nil)
+    #expect(lines.first?.contains("expert residency load start tensors=1") == true)
+    #expect(lines.last?.contains("expert residency load complete tensors=1") == true)
+    // Without an injected sink, small (fixture-sized) loads stay quiet: the
+    // default stderr emitter only kicks in above the large-load threshold.
+    #expect(ResidentExpertTensors.loadProgressMinimumTotalBytes >= 1 << 30)
+}
+
+@Test
 func fullyResidentBandwidthDiagnosticsLabelZeroReadsInsteadOfFailing() throws {
     let zeroReads = ExpertStreamingStats()
 
@@ -170,6 +208,12 @@ func benchmarkHarnessDecidesResidencyParentSideAndSkipsSeedGateOnlyThen() throws
             separatedBy: "fullyResidentExperts: ExpertResidencyPolicy.fullResidencyEnabled()"
         ).count >= 3
     )
+
+    // Both run entrypoints announce the sanctioned residency mode up front so
+    // console output and diagnostics (bandwidth=0, hit_rate=0) have context.
+    #expect(benchmark.contains("timed benchmark start expert_residency="))
+    #expect(localIterate.contains("\\(modeName) expert_residency="))
+    #expect(localIterate.contains("summary expert_residency="))
 }
 
 private func manifestJSON(referencePath: String, records: [String]) -> String {

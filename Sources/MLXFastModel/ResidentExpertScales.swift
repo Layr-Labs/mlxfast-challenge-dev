@@ -38,6 +38,14 @@ public final class ResidentExpertTensors {
         entries.count
     }
 
+    /// Progress lines are printed for large loads (the ~141 GiB full-residency
+    /// store takes tens of seconds to minutes) so a worker's stderr shows
+    /// liveness instead of a silent hang; local modes forward these lines to
+    /// the console. Small stores (fixtures, scales-only) stay quiet unless a
+    /// sink is injected for tests.
+    static let loadProgressByteInterval: Int = 8 << 30
+    static let loadProgressMinimumTotalBytes: Int = 16 << 30
+
     /// Builds the store by reading every manifest record accepted by the
     /// filter. Returns nil (callers fall back to streaming) when nothing
     /// matches or any read fails — behavior is then identical to the
@@ -45,6 +53,7 @@ public final class ResidentExpertTensors {
     public init?(
         manifestPath: String,
         metrics: ExpertStreamingMetrics?,
+        loadProgress: ((String) -> Void)? = nil,
         recordFilter: (ExpertTensorRecord) -> Bool
     ) {
         guard let bank = try? ExpertSlotBank(
@@ -55,8 +64,25 @@ public final class ResidentExpertTensors {
             return nil
         }
 
+        let records = bank.manifest.expertTensors.filter(recordFilter)
+        let totalBytes = records.reduce(0) { $0 + $1.byteLength }
+        let emit: ((String) -> Void)? = loadProgress
+            ?? (totalBytes >= Self.loadProgressMinimumTotalBytes
+                ? { line in
+                    fputs("mlxfast-model: \(line)\n", stderr)
+                    fflush(stderr)
+                }
+                : nil)
+        let loadStart = DispatchTime.now().uptimeNanoseconds
+        emit?(
+            "expert residency load start tensors=\(records.count) "
+                + "gb=\(String(format: "%.1f", Double(totalBytes) / Double(1 << 30)))"
+        )
+
         var loaded: [String: Entry] = [:]
-        for record in bank.manifest.expertTensors where recordFilter(record) {
+        var loadedBytes = 0
+        var nextProgressBytes = Self.loadProgressByteInterval
+        for record in records {
             guard
                 let firstDimension = record.shape.first,
                 record.shape.count >= 2,
@@ -72,10 +98,25 @@ public final class ResidentExpertTensors {
                 bytes: tensor.bytes,
                 sliceByteLength: record.byteLength / firstDimension
             )
+            loadedBytes += record.byteLength
+            if loadedBytes >= nextProgressBytes {
+                nextProgressBytes += Self.loadProgressByteInterval
+                emit?(
+                    "expert residency load progress "
+                        + "gb=\(String(format: "%.1f", Double(loadedBytes) / Double(1 << 30)))"
+                        + "/\(String(format: "%.1f", Double(totalBytes) / Double(1 << 30)))"
+                )
+            }
         }
         guard !loaded.isEmpty else {
             return nil
         }
+        let loadSeconds = Double(DispatchTime.now().uptimeNanoseconds - loadStart) / 1_000_000_000.0
+        emit?(
+            "expert residency load complete tensors=\(loaded.count) "
+                + "gb=\(String(format: "%.1f", Double(loadedBytes) / Double(1 << 30))) "
+                + "seconds=\(String(format: "%.1f", loadSeconds))"
+        )
         self.entries = loaded
     }
 

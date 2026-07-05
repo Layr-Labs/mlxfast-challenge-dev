@@ -33,6 +33,12 @@ extension DeepSeekRuntime {
                 + formatDouble(MLXFastConstants.officialBaselineDecodeSecondsPerToken)
                 + " (official-runner constants; local speedups are directional)"
         )
+        progress(
+            "\(modeName) expert_residency="
+                + (ExpertResidencyPolicy.fullResidencyEnabled() ? "full" : "streaming")
+                + " (official contract is full residency on an M3 Ultra 256 GB machine; "
+                + "streaming-fallback timings exercise a different bottleneck)"
+        )
 
         func failed(
             _ error: String,
@@ -401,7 +407,9 @@ extension DeepSeekRuntime {
             )
         }
         progress(
-            "\(modeName) summary expert_hit_rate=\(formatRatio(timing.expertStats.hitRate)) "
+            "\(modeName) summary expert_residency="
+                + (ExpertResidencyPolicy.fullResidencyEnabled() ? "full" : "streaming")
+                + " expert_hit_rate=\(formatRatio(timing.expertStats.hitRate)) "
                 + "decode_bandwidth_gb_per_token=\(formatDouble(timing.decode.bandwidthGBPerToken)) "
                 + "peak_ram_gb=\(formatRatio(timing.peakRamGB))"
         )

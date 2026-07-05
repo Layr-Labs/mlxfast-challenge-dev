@@ -12,8 +12,8 @@ See [TASK.md](TASK.md) for the full problem statement, scoring formula, and appr
 # Check local tools, build the Swift harness/MLX metallib, and fetch weights if needed
 ./setup.sh
 
-# Optional: split dense weights into weights/ and write the expert streaming
-# manifest. setup.sh prints this command with the exact reference path it used.
+# Optional: split dense weights into weights/ and write the expert manifest.
+# setup.sh prints this command with the exact reference path it used.
 MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
   .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
   --reference .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main \
@@ -87,6 +87,13 @@ environment variables for path overrides; pass `--weights`, `--golden`, and
 `MLXFAST_REFERENCE_BASE_URL` to use
 another HTTP checkpoint prefix, including Hugging Face. Run `./setup.sh --help`
 for the full local setup knobs.
+
+Expert residency is automatic: machines with 192 GB+ unified memory load the
+full expert set into RAM at startup (the official-contract behavior), smaller
+machines stream experts from SSD. Set `MLXFAST_EXPERT_RESIDENT=1` or `=0` to
+force either mode, for example `=0` to keep a 256 GB development Mac usable
+while long runs execute, or `=1` on a borderline machine you are willing to
+push into swap.
 
 For manual GitHub Actions benchmark runs, dispatch `benchmark.yml` on the
 trusted repository workflow. The workflow uses the protected
@@ -186,7 +193,7 @@ benchmark, preflight, verify-transform) and no longer logs in or uploads.
 mlxfast login <api-key> --api https://yukon-api.fly.dev
 mlxfast clone <benchmark-id-or-name>     # fresh checkout; an existing repo auto-links by its git remote
 mlxfast submit --model "Claude Opus 4.8" \
-  --note "Changed expert streaming prefetch policy."
+  --note "Batched per-expert matmul dispatch in the MoE hot path."
 mlxfast submissions
 ```
 
