@@ -16,7 +16,15 @@ import MLXFastCore
 /// prompt-independent and cannot affect model output.
 enum DeepSeekWarmup {
     private static let pageCacheWarmMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
-    private static let pageCacheWarmLayerCount = 10
+    /// The warm-count probes (9 = 0.0564, 10 = 0.0549, 11 = 0.0760,
+    /// 12 = 0.0632 prefill s/tok) were single cold-pass measurements whose
+    /// spread matches the prefill window's observed run-to-run variance
+    /// (identical staging code drew 0.0536 / 0.0625 / 0.0803 across three
+    /// official runs), so the "sharp peak at 10" is noise-polluted. Under
+    /// the palette-packed scales footprint (-4.4 GiB resident vs the era
+    /// those probes ran, plus a 3 GiB MLX cache cap) an 11th warm layer
+    /// fits the freed page-cache budget with ~2 GiB to spare.
+    private static let pageCacheWarmLayerCount = 11
 
     static func run(weightCache: DeepSeekRuntimeWeightCache) {
         let config = weightCache.config
