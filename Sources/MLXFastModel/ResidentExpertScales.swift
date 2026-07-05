@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 import MLXFastCore
 
 /// RAM-resident copies of selected routed-expert tensors, serving
@@ -25,6 +26,15 @@ import MLXFastCore
 /// same file bytes the bank's firstAxisIndex read would return, by the
 /// bank's own slice arithmetic (byteLength / firstDimension).
 public final class ResidentExpertTensors {
+    private struct ArrayCacheKey: Hashable {
+        let name: String
+        let firstAxisIndex: Int
+    }
+
+    private enum ArrayCacheError: Error {
+        case missingTensor
+    }
+
     private struct Entry {
         let dtype: TensorDType
         let shape: [Int]
@@ -33,6 +43,7 @@ public final class ResidentExpertTensors {
     }
 
     private let entries: [String: Entry]
+    private let arrayCache = LockedCache<ArrayCacheKey, MLXArray>(capacity: 6144)
 
     public var residentTensorCount: Int {
         entries.count
@@ -113,6 +124,20 @@ public final class ResidentExpertTensors {
             shape: Array(entry.shape.dropFirst()),
             bytes: slice
         )
+    }
+
+    public func materializedArray(
+        named name: String,
+        firstAxisIndex: Int,
+        bridge: MLXArrayTensorBridge
+    ) -> MLXArray? {
+        let key = ArrayCacheKey(name: name, firstAxisIndex: firstAxisIndex)
+        return try? arrayCache.value(for: key) {
+            guard let tensor = materializedTensor(named: name, firstAxisIndex: firstAxisIndex) else {
+                throw ArrayCacheError.missingTensor
+            }
+            return try bridge.makeArray(from: tensor)
+        }
     }
 }
 

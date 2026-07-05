@@ -127,6 +127,7 @@ public struct DeepSeekWeightLoader {
     public let residentExpertScales: ResidentExpertTensors?
     public let pinnedExpertCodes: ResidentExpertTensors?
     public let expertLayerStager: ExpertLayerStager?
+    private let decodeExpertCodeBundles: DecodeExpertCodeBundleStore?
     // Dedicated capacity-0 side bank for concurrent decode-step slice reads.
     // Capacity 0 => no cache/LRU mutation, so concurrent preads are race-free
     // and read byte-identical ranges through the trusted metered path.
@@ -139,6 +140,7 @@ public struct DeepSeekWeightLoader {
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
     private static let pinnedHashLayerCap = 2
+    private static let cachedScaleArrayLayerCap = 6
 
     public init(
         weightsPath: String,
@@ -182,6 +184,10 @@ public struct DeepSeekWeightLoader {
                 metrics: metrics
             )
             : nil
+        self.decodeExpertCodeBundles = DecodeExpertCodeBundleStore(
+            manifestPath: "\(weightsPath)/experts/decode-code-bundles.manifest.json",
+            metrics: metrics
+        )
         self.expertLayerStager = ExpertLayerStager(
             manifestPath: manifestPath,
             metrics: metrics
@@ -210,6 +216,7 @@ public struct DeepSeekWeightLoader {
         self.residentExpertScales = nil
         self.pinnedExpertCodes = nil
         self.expertLayerStager = nil
+        self.decodeExpertCodeBundles = nil
         self.decodeSideBank = nil
         self.bridge = bridge
     }
@@ -380,6 +387,14 @@ public struct DeepSeekWeightLoader {
         let scalesName = codeName.hasSuffix(".weight")
             ? String(codeName.dropLast(".weight".count)) + ".scales"
             : codeName + ".scales"
+        if ResidentExpertTensors.layerIndex(fromRecordName: scalesName).map({ $0 < cachedScaleArrayLayerCap }) == true,
+           let cached = residentScales.materializedArray(
+               named: scalesName,
+               firstAxisIndex: expertIndex,
+               bridge: bridge
+           ) {
+            return cached
+        }
         guard let scalesTensor = residentScales.materializedTensor(
             named: scalesName,
             firstAxisIndex: expertIndex
@@ -403,6 +418,14 @@ public struct DeepSeekWeightLoader {
         hiddenSize: Int,
         intermediateSize: Int
     ) -> [String: StagedExpertCode]? {
+        if let bundled = decodeExpertCodeBundles?.prefetch(
+            layerIndex: layerIndex,
+            expertIndices: expertIndices,
+            residentScales: residentExpertScales,
+            bridge: bridge
+        ) {
+            return bundled
+        }
         guard let sideBank = decodeSideBank, expertBank.capacity > 0, !expertIndices.isEmpty else {
             return nil
         }
@@ -517,6 +540,19 @@ public struct DeepSeekWeightLoader {
         hiddenSize: Int,
         intermediateSize: Int
     ) -> Bool {
+        if let bundles = decodeExpertCodeBundles, bundles.containsLayer(layerIndex), !expertIndices.isEmpty {
+            let residentScales = self.residentExpertScales
+            let bridge = self.bridge
+            scheduledPinnedDecodePrefetches.schedule(layerIndex: layerIndex) {
+                bundles.prefetch(
+                    layerIndex: layerIndex,
+                    expertIndices: expertIndices,
+                    residentScales: residentScales,
+                    bridge: bridge
+                )
+            }
+            return true
+        }
         guard let pinnedCodes = self.pinnedExpertCodes, !expertIndices.isEmpty else {
             scheduledPinnedDecodePrefetches.remove(layerIndex: layerIndex)
             return false
