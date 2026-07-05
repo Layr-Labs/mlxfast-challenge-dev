@@ -1,0 +1,179 @@
+name: runner-variance-compare
+
+# Apples-to-apples runner stability comparison: measure the SAME candidate code
+# (this branch = main + Sendable fix) via `./benchmark.sh --local-iterate` on
+# BOTH tenki-macos-latest-xlarge and blacksmith-12vcpu-macos-26 in one matrix,
+# so every dispatch samples both runners at the same moment (controls for
+# time-of-day). Re-dispatch across several rounds for the temporal dimension.
+# Combine reports per-runner mean / CV / min / max of decode & prefill seconds.
+# We compare raw seconds (not speedup), so the recalibrated constants are
+# irrelevant. NOT part of CI or scoring; secret-free (public fixture, public
+# reference download fallback).
+on:
+  push:
+    branches:
+      - probe/variance-compare
+  workflow_dispatch:
+
+concurrency:
+  group: runner-variance-compare-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: "measure ${{ matrix.tag }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: tenki-macos-latest-xlarge, tag: tenki-1 }
+          - { runner: tenki-macos-latest-xlarge, tag: tenki-2 }
+          - { runner: tenki-macos-latest-xlarge, tag: tenki-3 }
+          - { runner: tenki-macos-latest-xlarge, tag: tenki-4 }
+          - { runner: blacksmith-12vcpu-macos-26, tag: blacksmith-1 }
+          - { runner: blacksmith-12vcpu-macos-26, tag: blacksmith-2 }
+          - { runner: blacksmith-12vcpu-macos-26, tag: blacksmith-3 }
+          - { runner: blacksmith-12vcpu-macos-26, tag: blacksmith-4 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    env:
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
+      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
+      MLXFAST_REFERENCE_SEED_DIR: /Users/runner/.cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Host identity
+        run: |
+          set -uo pipefail
+          {
+            echo "tag=${{ matrix.tag }}"
+            echo "runner_label=${{ matrix.runner }}"
+            echo "hostname=$(hostname 2>/dev/null || true)"
+            echo "model=$(sysctl -n hw.model 2>/dev/null || true)"
+            echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee host.txt
+
+      - name: Restore SwiftPM cache
+        id: restore_swiftpm_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        env:
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: "12"
+          MLXFAST_REFERENCE_MIN_FREE_GIB: "170"
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+        run: |
+          set -euo pipefail
+          started="${SECONDS}"
+          ./setup.sh
+          echo "setup_seconds=$((SECONDS - started))" | tee -a host.txt
+
+      - name: Transform reference checkpoint
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" \
+            --output weights
+
+      - name: Run local-iterate timing
+        env:
+          MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+          MLXFAST_SKIP_TRANSFORM: "1"
+          MLXFAST_WEIGHTS_PATH: weights
+          MLXFAST_NOTE: "runner-variance-compare ${{ matrix.tag }}"
+        run: |
+          set -uo pipefail
+          echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a host.txt
+          ./benchmark.sh --local-iterate || echo "benchmark.sh exit=$? (timing still captured)"
+          python3 - <<'PY'
+          import json, sys
+          m = json.load(open("score.local-iterate.json"))["metrics"]
+          d = m.get("decode_seconds_per_token")
+          if not isinstance(d, (int, float)) or d <= 0:
+              print(f"::error::no usable decode timing: {d}"); sys.exit(1)
+          print(f"decode={d} prefill={m.get('prefill_seconds_per_token')}")
+          PY
+          cp score.local-iterate.json "score-${{ matrix.tag }}.json"
+          cp host.txt "host-${{ matrix.tag }}.txt"
+
+      - name: Upload sample
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: rvc-${{ github.run_id }}-${{ matrix.tag }}
+          path: |
+            score-${{ matrix.tag }}.json
+            host-${{ matrix.tag }}.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  combine:
+    name: combine
+    needs: [measure]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download samples
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: rvc-${{ github.run_id }}-*
+          path: samples
+          merge-multiple: false
+      - name: Per-runner variance
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
+          import glob, json, os, re, statistics
+          rows = {"tenki": [], "blacksmith": []}
+          for sp in sorted(glob.glob("samples/**/score-*.json", recursive=True)):
+              tag = re.sub(r"^score-(.+)\.json$", r"\1", os.path.basename(sp))
+              runner = "tenki" if tag.startswith("tenki") else "blacksmith"
+              try:
+                  m = json.load(open(sp))["metrics"]
+                  rows[runner].append((tag, m.get("decode_seconds_per_token"), m.get("prefill_seconds_per_token")))
+              except Exception as e:
+                  print(f"skip {sp}: {e}")
+          print("## runner-variance-compare (one round; same code, --local-iterate)")
+          print()
+          for runner in ("tenki", "blacksmith"):
+              vals = rows[runner]
+              print(f"### {runner}  (n={len(vals)})")
+              for tag, d, p in vals:
+                  print(f"- {tag}: decode={d}  prefill={p}")
+              for name, i in (("decode", 1), ("prefill", 2)):
+                  xs = [v[i] for v in vals if isinstance(v[i], (int, float))]
+                  if len(xs) >= 2:
+                      mean = statistics.mean(xs); sd = statistics.pstdev(xs)
+                      cv = sd / mean * 100 if mean else 0
+                      print(f"  - **{name}: mean={mean:.4f} CV={cv:.2f}% min={min(xs):.4f} max={max(xs):.4f} max/min={max(xs)/min(xs):.3f}x**")
+              print()
+          print("Note: same-moment (within one dispatch) = spatial CV. Re-run across rounds and compare across dispatches for temporal CV.")
+          PY
+      - name: Upload combined
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: rvc-${{ github.run_id }}-combined
+          path: samples
+          if-no-files-found: warn
+          retention-days: 14
