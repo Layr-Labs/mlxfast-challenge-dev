@@ -130,6 +130,7 @@ public final class DeepSeekRuntimeWeightCache {
                 ))
             }
         }
+        ExpertPageLockRegistry.lockInitialExpertCodePages(loader: loader, config: config)
         DeepSeekWarmup.run(weightCache: self)
         // NOTE: no init-time stage-ahead (held Data) here. The trusted
         // harness keeps TWO loaders alive at once (see
