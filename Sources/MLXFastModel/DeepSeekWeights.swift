@@ -286,7 +286,12 @@ public struct DeepSeekWeightLoader {
         named name: String,
         expectedShape: [Int]? = nil
     ) throws -> MaterializedTensor {
-        let tensor = try expertBank.materializedTensor(named: name)
+        // Resident-first: in full-residency mode these bytes are already in
+        // RAM, so a bank read would be a redundant SSD round-trip for the
+        // same content (callers are init-time router/gate loads). Byte-
+        // identical either way; non-resident names fall through to the bank.
+        let tensor = try residentAllExperts?.materializedTensor(named: name, firstAxisIndex: nil)
+            ?? expertBank.materializedTensor(named: name)
         try validateShape(tensor.shape, expectedShape: expectedShape, tensorName: name)
         return tensor
     }

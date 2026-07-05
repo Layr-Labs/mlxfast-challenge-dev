@@ -119,6 +119,10 @@ func deepSeekWeightLoaderFullResidencyServesExpertsFromRAMAndSkipsStreamingHelpe
         resident.residentAllExperts?.materializedTensor(named: stackedName, firstAxisIndex: 1)
     )
     #expect(try slice.uint8Values() == [7, 6])
+    // Whole-tensor reads (init-time router/gate loads) are served resident-
+    // first and stay byte-identical to the bank read they replace.
+    let wholeTensor = try resident.materializedExpertTensor(named: stackedName, expectedShape: [2, 2])
+    #expect(try wholeTensor.uint8Values() == [9, 8, 7, 6])
 
     // The memberwise config default keeps the streaming fallback (pinned
     // explicitly here because the loader's own default is .fromEnvironment(),
