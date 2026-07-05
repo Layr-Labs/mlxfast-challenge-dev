@@ -18,6 +18,9 @@ public final class DeepSeekRuntimeWeightCache {
     // can issue exact read-ahead for those layers from the input token id
     // before the forward pass starts. Values are used only as prefetch hints.
     private var hashLayerTables: [(layerIndex: Int, table: [Int32], topK: Int)] = []
+    private static let stageAheadMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
+    private static let stageAheadMinimumTokenCount = 64
+    private static let stageAheadLayerCount = 4
 
     public init(loader: DeepSeekWeightLoader, config: DeepSeekConfig) {
         self.loader = loader
@@ -55,6 +58,31 @@ public final class DeepSeekRuntimeWeightCache {
                     expertIndices: experts
                 )
             }
+        }
+    }
+
+    func cancelStagedExpertLayersForDecode() {
+        loader.expertLayerStager?.cancelAll()
+    }
+
+    func stageInitialExpertLayersForNextPrefill(tokenCount: Int) {
+        guard tokenCount >= Self.stageAheadMinimumTokenCount,
+              ProcessInfo.processInfo.physicalMemory >= Self.stageAheadMinimumPhysicalMemoryBytes,
+              let stager = loader.expertLayerStager
+        else {
+            return
+        }
+
+        var scheduled = 0
+        for layerIndex in 0..<config.numHiddenLayers {
+            guard scheduled < Self.stageAheadLayerCount else {
+                break
+            }
+            guard let plan = loader.stagedExpertLayerPlan(layerIndex: layerIndex) else {
+                continue
+            }
+            stager.schedule(plan)
+            scheduled += 1
         }
     }
 

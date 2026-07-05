@@ -129,6 +129,7 @@ public enum DeepSeekModel {
         let spec = DeepSeekModelSpec(config: config)
         let weights = try weightCache.modelWeights()
         if inputIDs.shape == [1, 1] {
+            weightCache.cancelStagedExpertLayersForDecode()
             // Decode step: hash-layer routing depends only on the token id,
             // so advise the kernel about those layers' expert ranges before
             // the forward starts. inputIDs is a leaf array on every decode
@@ -137,7 +138,7 @@ public enum DeepSeekModel {
                 token: Int(DeepSeekOps.cast(inputIDs, to: .int32).asArray(Int32.self)[0])
             )
         }
-        return try logits(
+        let result = try logits(
             inputIDs: inputIDs,
             weights: weights,
             spec: spec,
@@ -152,6 +153,12 @@ public enum DeepSeekModel {
                 positionOffset: positionOffset
             )
         }
+        if inputIDs.shape.count == 2 {
+            weightCache.stageInitialExpertLayersForNextPrefill(
+                tokenCount: inputIDs.shape[0] * inputIDs.shape[1]
+            )
+        }
+        return result
     }
 
     public static func logits(

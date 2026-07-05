@@ -41,6 +41,7 @@ public final class ExpertLayerStager {
     private var recordNamesByLayer: [Int: [String]] = [:]
     private var pendingLayers: Set<Int> = []
     private var failedLayers: Set<Int> = []
+    private var generation = 0
 
     public init?(manifestPath: String, metrics: ExpertStreamingMetrics?) {
         guard let bank = try? ExpertSlotBank(
@@ -99,6 +100,20 @@ public final class ExpertLayerStager {
         condition.unlock()
     }
 
+    /// Drops every retained staged layer and invalidates queued jobs. Jobs
+    /// already inside a blocking pread may finish, but their bytes are
+    /// discarded instead of being published into the next decode step.
+    public func cancelAll() {
+        condition.lock()
+        generation += 1
+        stagedBytesByRecordName.removeAll(keepingCapacity: true)
+        recordNamesByLayer.removeAll(keepingCapacity: true)
+        pendingLayers.removeAll(keepingCapacity: true)
+        failedLayers.removeAll(keepingCapacity: true)
+        condition.broadcast()
+        condition.unlock()
+    }
+
     private final class StagerFailureFlag: @unchecked Sendable {
         private let lock = NSLock()
         private var failed = false
@@ -121,8 +136,15 @@ public final class ExpertLayerStager {
         else {
             return
         }
+        let jobGeneration = generation
         pendingLayers.insert(plan.layerIndex)
         queue.async { [self] in
+            condition.lock()
+            let shouldRun = generation == jobGeneration && pendingLayers.contains(plan.layerIndex)
+            condition.unlock()
+            guard shouldRun else {
+                return
+            }
             // Read the layer's ~1 GiB projection tensors concurrently instead
             // of one after another. The side bank is capacity 0, so it never
             // mutates its cache/LRU and each read is an independent
@@ -155,14 +177,15 @@ public final class ExpertLayerStager {
                 }
             }
             condition.lock()
-            pendingLayers.remove(plan.layerIndex)
-            if succeeded {
-                recordNamesByLayer[plan.layerIndex] = plan.recordNames
-                for (name, bytes) in loaded {
-                    stagedBytesByRecordName[name] = bytes
+            if generation == jobGeneration, pendingLayers.remove(plan.layerIndex) != nil {
+                if succeeded {
+                    recordNamesByLayer[plan.layerIndex] = plan.recordNames
+                    for (name, bytes) in loaded {
+                        stagedBytesByRecordName[name] = bytes
+                    }
+                } else {
+                    failedLayers.insert(plan.layerIndex)
                 }
-            } else {
-                failedLayers.insert(plan.layerIndex)
             }
             condition.broadcast()
             condition.unlock()
