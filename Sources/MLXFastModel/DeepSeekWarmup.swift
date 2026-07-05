@@ -16,12 +16,23 @@ import MLXFastCore
 /// prompt-independent and cannot affect model output.
 enum DeepSeekWarmup {
     private static let pageCacheWarmMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
-    /// 10 is the officially mapped optimum (9 = 0.0564, 10 = 0.0549,
-    /// 11 = 0.0760, 12 = 0.0632 prefill s/tok) — keep the champion value.
-    /// The palette-packed resident scales free ~4.3 GiB of RAM which the
-    /// kernel spends on page cache adaptively; re-probing warm-11 under the
-    /// packed footprint is a separate experiment, not part of this change.
-    private static let pageCacheWarmLayerCount = 10
+    /// Next-rung re-probe of the init-warm count under the freed footprint.
+    /// 10 was the mapped optimum (9 = 0.0564, 10 = 0.0549, 11 = 0.0760,
+    /// 12 = 0.0632 prefill s/tok) UNDER THE OLD FOOTPRINT — note 12 already
+    /// beat 11 there. Palette-packed resident scales have since freed ~4.3 GiB
+    /// to the page cache; warm-11 then measured 4.5424 on CI (> its 4.5027
+    /// base), confirming the old warm-N regressions were page-cache pressure
+    /// the freed budget removed. This probes warm-12: if the freed budget
+    /// supports 11 it may support 12 (the stronger of the two pre-footprint).
+    /// Soft warming (read then releaseLayer'd — evictable, no wired growth),
+    /// so it cannot OOM.
+    private static var pageCacheWarmLayerCount: Int {
+        let physicalMemory = ProcessInfo.processInfo.physicalMemory
+        let base = 12
+        guard physicalMemory > (48 << 30) else { return base }
+        let extra = Int((physicalMemory - (48 << 30)) / (16 << 30))
+        return min(base + extra, 15)
+    }
 
     static func run(weightCache: DeepSeekRuntimeWeightCache) {
         let config = weightCache.config
