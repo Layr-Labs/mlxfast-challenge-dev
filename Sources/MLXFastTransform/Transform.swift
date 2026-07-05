@@ -20,6 +20,11 @@ public struct TransformReport: Equatable {
     public let manifestPath: String
 }
 
+private let decodeCodeBundleLayerRange = 2..<6
+private let decodeCodeBundleShardName = "decode-code-bundles.safetensors"
+private let decodeCodeBundleManifestName = "decode-code-bundles.manifest.json"
+private let decodeCodeBundleReferencePath = "weights/experts"
+
 public enum SwiftTransform {
     public static func run(_ options: TransformOptions) throws -> TransformReport {
         let referenceDirectory = try findReferenceDirectory(
@@ -81,6 +86,12 @@ public enum SwiftTransform {
         try writeExpertManifest(
             referenceDirectory: referenceDirectory,
             manifestPath: manifestPath,
+            expertKeys: expertKeys,
+            index: index
+        )
+        try writeDecodeCodeBundles(
+            referenceDirectory: referenceDirectory,
+            expertsDirectory: expertsDirectory,
             expertKeys: expertKeys,
             index: index
         )
@@ -261,5 +272,334 @@ public enum SwiftTransform {
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         )
         try data.write(to: manifestPath)
+    }
+
+    private struct DecodeBundleSourceRecord {
+        let name: String
+        let shard: String
+        let dtype: String
+        let shape: [Int]
+        let byteOffset: Int
+        let byteLength: Int
+    }
+
+    private struct DecodeBundleProjectionPlan {
+        let projection: String
+        let source: DecodeBundleSourceRecord
+        let sliceShape: [Int]
+        let sliceByteLength: Int
+        let bundleOffset: Int
+    }
+
+    private struct DecodeBundleLayerPlan {
+        let layerIndex: Int
+        let expertCount: Int
+        let projections: [DecodeBundleProjectionPlan]
+        let bundleByteLength: Int
+    }
+
+    private struct DecodeBundleTensorInfo {
+        let name: String
+        let dataStart: Int
+        let dataEnd: Int
+        let byteLength: Int
+    }
+
+    private static func writeDecodeCodeBundles(
+        referenceDirectory: URL,
+        expertsDirectory: URL,
+        expertKeys: Set<String>,
+        index: CheckpointIndex
+    ) throws {
+        let manifestURL = expertsDirectory.appendingPathComponent(decodeCodeBundleManifestName)
+        let shardURL = expertsDirectory.appendingPathComponent(decodeCodeBundleShardName)
+        let sourceRecords = try loadDecodeBundleSourceRecords(
+            referenceDirectory: referenceDirectory,
+            expertKeys: expertKeys,
+            index: index
+        )
+        let plans = decodeCodeBundleLayerRange.compactMap {
+            makeDecodeBundleLayerPlan(layerIndex: $0, sourceRecords: sourceRecords)
+        }
+        guard !plans.isEmpty else {
+            try? FileManager.default.removeItem(at: manifestURL)
+            try? FileManager.default.removeItem(at: shardURL)
+            return
+        }
+
+        let tensors = try writeDecodeBundleShard(
+            plans: plans,
+            referenceDirectory: referenceDirectory,
+            shardURL: shardURL
+        )
+        try writeDecodeBundleManifest(
+            plans: plans,
+            tensors: tensors,
+            expertsDirectory: expertsDirectory,
+            manifestURL: manifestURL
+        )
+    }
+
+    private static func loadDecodeBundleSourceRecords(
+        referenceDirectory: URL,
+        expertKeys: Set<String>,
+        index: CheckpointIndex
+    ) throws -> [String: DecodeBundleSourceRecord] {
+        var records: [String: DecodeBundleSourceRecord] = [:]
+        let expertKeysByShard = Dictionary(grouping: expertKeys) { key in
+            index.weightMap[key] ?? ""
+        }
+        for shardName in expertKeysByShard.keys.sorted() {
+            let shardURL = referenceDirectory.appendingPathComponent(shardName)
+            let header = try Safetensors.readHeader(shardURL)
+            for key in expertKeysByShard[shardName, default: []].sorted() {
+                guard let info = header.tensors[key] else {
+                    continue
+                }
+                records[key] = DecodeBundleSourceRecord(
+                    name: key,
+                    shard: shardName,
+                    dtype: info.dtype,
+                    shape: info.shape,
+                    byteOffset: Int(header.dataBaseOffset) + info.dataStart,
+                    byteLength: info.byteCount
+                )
+            }
+        }
+        return records
+    }
+
+    private static func makeDecodeBundleLayerPlan(
+        layerIndex: Int,
+        sourceRecords: [String: DecodeBundleSourceRecord]
+    ) -> DecodeBundleLayerPlan? {
+        var projections: [DecodeBundleProjectionPlan] = []
+        projections.reserveCapacity(3)
+        var bundleOffset = 0
+        for projection in ["gate_proj", "up_proj", "down_proj"] {
+            guard let source = findStackedDecodeCodeRecord(
+                layerIndex: layerIndex,
+                projection: projection,
+                sourceRecords: sourceRecords
+            ),
+                  source.dtype == "U32",
+                  source.shape.count == 3,
+                  source.shape.first == MLXFastConstants.routedExperts,
+                  source.byteLength % MLXFastConstants.routedExperts == 0
+            else {
+                return nil
+            }
+            let sliceByteLength = source.byteLength / MLXFastConstants.routedExperts
+            projections.append(
+                DecodeBundleProjectionPlan(
+                    projection: projection,
+                    source: source,
+                    sliceShape: Array(source.shape.dropFirst()),
+                    sliceByteLength: sliceByteLength,
+                    bundleOffset: bundleOffset
+                )
+            )
+            bundleOffset += sliceByteLength
+        }
+        return DecodeBundleLayerPlan(
+            layerIndex: layerIndex,
+            expertCount: MLXFastConstants.routedExperts,
+            projections: projections,
+            bundleByteLength: bundleOffset
+        )
+    }
+
+    private static func findStackedDecodeCodeRecord(
+        layerIndex: Int,
+        projection: String,
+        sourceRecords: [String: DecodeBundleSourceRecord]
+    ) -> DecodeBundleSourceRecord? {
+        let layerNeedle = ".layers.\(layerIndex)."
+        let aliases: [String]
+        switch projection {
+        case "gate_proj":
+            aliases = ["gate_proj", "w1"]
+        case "down_proj":
+            aliases = ["down_proj", "w2"]
+        case "up_proj":
+            aliases = ["up_proj", "w3"]
+        default:
+            aliases = [projection]
+        }
+        return sourceRecords.values
+            .filter { record in
+                guard record.name.contains(layerNeedle),
+                      record.name.hasSuffix(".weight"),
+                      record.shape.count == 3,
+                      record.shape.first == MLXFastConstants.routedExperts
+                else {
+                    return false
+                }
+                return aliases.contains { alias in
+                    record.name.contains(".ffn.switch_mlp.\(alias).")
+                        || record.name.contains(".ffn.experts.\(alias).")
+                }
+            }
+            .sorted { $0.name < $1.name }
+            .first
+    }
+
+    private static func writeDecodeBundleShard(
+        plans: [DecodeBundleLayerPlan],
+        referenceDirectory: URL,
+        shardURL: URL
+    ) throws -> [DecodeBundleTensorInfo] {
+        var tensors: [DecodeBundleTensorInfo] = []
+        var cursor = 0
+        for plan in plans {
+            for expertIndex in 0..<plan.expertCount {
+                let end = cursor + plan.bundleByteLength
+                tensors.append(
+                    DecodeBundleTensorInfo(
+                        name: decodeBundleName(layerIndex: plan.layerIndex, expertIndex: expertIndex),
+                        dataStart: cursor,
+                        dataEnd: end,
+                        byteLength: plan.bundleByteLength
+                    )
+                )
+                cursor = end
+            }
+        }
+
+        let headerData = try makeDecodeBundleSafetensorsHeader(tensors: tensors)
+        if FileManager.default.fileExists(atPath: shardURL.path) {
+            try FileManager.default.removeItem(at: shardURL)
+        }
+        try Data().write(to: shardURL, options: [])
+        let output = try FileHandle(forWritingTo: shardURL)
+        defer {
+            try? output.close()
+        }
+        var headerLength = UInt64(headerData.count).littleEndian
+        output.write(Data(bytes: &headerLength, count: 8))
+        output.write(headerData)
+
+        var handles: [String: FileHandle] = [:]
+        defer {
+            for handle in handles.values {
+                try? handle.close()
+            }
+        }
+        for plan in plans {
+            for expertIndex in 0..<plan.expertCount {
+                for projection in plan.projections {
+                    let handle = try inputHandle(
+                        shard: projection.source.shard,
+                        referenceDirectory: referenceDirectory,
+                        handles: &handles
+                    )
+                    let offset = projection.source.byteOffset + expertIndex * projection.sliceByteLength
+                    try handle.seek(toOffset: UInt64(offset))
+                    let data = handle.readData(ofLength: projection.sliceByteLength)
+                    guard data.count == projection.sliceByteLength else {
+                        throw MLXFastError.invalidInput(
+                            "short read while writing decode bundle \(projection.source.name)[\(expertIndex)]"
+                        )
+                    }
+                    output.write(data)
+                }
+            }
+        }
+        return tensors
+    }
+
+    private static func inputHandle(
+        shard: String,
+        referenceDirectory: URL,
+        handles: inout [String: FileHandle]
+    ) throws -> FileHandle {
+        if let handle = handles[shard] {
+            return handle
+        }
+        let handle = try FileHandle(forReadingFrom: referenceDirectory.appendingPathComponent(shard))
+        handles[shard] = handle
+        return handle
+    }
+
+    private static func makeDecodeBundleSafetensorsHeader(
+        tensors: [DecodeBundleTensorInfo]
+    ) throws -> Data {
+        var object: [String: Any] = [
+            "__metadata__": [
+                "format": "mlxfast_decode_code_bundles",
+            ],
+        ]
+        for tensor in tensors {
+            object[tensor.name] = [
+                "dtype": "U8",
+                "shape": [tensor.byteLength],
+                "data_offsets": [tensor.dataStart, tensor.dataEnd],
+            ]
+        }
+        var data = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys]
+        )
+        while data.count % 8 != 0 {
+            data.append(0x20)
+        }
+        return data
+    }
+
+    private static func writeDecodeBundleManifest(
+        plans: [DecodeBundleLayerPlan],
+        tensors: [DecodeBundleTensorInfo],
+        expertsDirectory: URL,
+        manifestURL: URL
+    ) throws {
+        let headerData = try makeDecodeBundleSafetensorsHeader(tensors: tensors)
+        let dataBaseOffset = 8 + headerData.count
+        let expertTensorRecords: [[String: Any]] = tensors.map { tensor in
+            [
+                "name": tensor.name,
+                "shard": decodeCodeBundleShardName,
+                "dtype": "U8",
+                "shape": [tensor.byteLength],
+                "data_offsets": [tensor.dataStart, tensor.dataEnd],
+                "byte_offset": dataBaseOffset + tensor.dataStart,
+                "byte_length": tensor.byteLength,
+            ]
+        }
+        let layerRecords: [[String: Any]] = plans.map { plan in
+            [
+                "layer_index": plan.layerIndex,
+                "expert_count": plan.expertCount,
+                "bundle_byte_length": plan.bundleByteLength,
+                "records": plan.projections.map { projection in
+                    [
+                        "projection": projection.projection,
+                        "name": projection.source.name,
+                        "dtype": projection.source.dtype,
+                        "slice_shape": projection.sliceShape,
+                        "slice_byte_length": projection.sliceByteLength,
+                        "bundle_offset": projection.bundleOffset,
+                    ] as [String: Any]
+                },
+            ]
+        }
+        let object: [String: Any] = [
+            "version": 1,
+            "source": "safetensors",
+            "reference_path": decodeCodeBundleReferencePath,
+            "expert_tensors": expertTensorRecords,
+            "decode_code_bundles": [
+                "version": 1,
+                "layers": layerRecords,
+            ],
+        ]
+        let data = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        )
+        try data.write(to: manifestURL)
+    }
+
+    private static func decodeBundleName(layerIndex: Int, expertIndex: Int) -> String {
+        "mlxfast.decode_code_bundle.layer_\(layerIndex).expert_\(expertIndex)"
     }
 }
