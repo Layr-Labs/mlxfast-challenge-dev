@@ -64,16 +64,21 @@ public enum DeepSeekRoutedExperts {
         // the routing sync below: the sequential ~1 GiB reads then overlap
         // the GPU drain instead of following it. Staging needs no routing
         // indices, and a failed stage falls back to the per-slice path.
+        // RAM-pinned layers have no plan of their own, but the NEXT layer's
+        // staging must still start now — otherwise the first streamed layer
+        // after the pinned prefix reads its ~3 GiB cold instead of during the
+        // pinned layers' compute.
         var stagingScheduled = false
         if tokenCount >= stagingMinimumTokenCount,
-           let stager = loader.expertLayerStager,
-           let plan = loader.stagedExpertLayerPlan(layerIndex: spec.layerIndex)
+           let stager = loader.expertLayerStager
         {
-            stager.schedule(plan)
+            if let plan = loader.stagedExpertLayerPlan(layerIndex: spec.layerIndex) {
+                stager.schedule(plan)
+                stagingScheduled = true
+            }
             if let nextPlan = loader.stagedExpertLayerPlan(layerIndex: spec.layerIndex + 1) {
                 stager.schedule(nextPlan)
             }
-            stagingScheduled = true
         }
 
         let selectedExperts = expertIndices.asArray(Int32.self).map(Int.init)
@@ -138,40 +143,48 @@ public enum DeepSeekRoutedExperts {
         // per-token slice+concat that built each expert batch previously.
         let xFlat = x.reshaped([tokenCount, hiddenSize])
 
-        // The shared expert depends only on x (RAM-resident weights, no SSD
-        // read), so it is the one piece of GPU work that can run during the
-        // routed experts' blocking SSD reads below. Fire the overlap hook
-        // (which evals the already-built shared MLP graph) right before the
-        // concurrentPerform barrier, filling the GPU-idle read window. Only
-        // on the decode path where that idle window exists.
-        if tokenCount == 1, !useStaged {
-            onRoutingSynced?()
-        }
-
         // Decode/1-token path: the per-expert code slices are otherwise read
         // one blocking pread at a time on the compute thread. Read them
         // concurrently up front through a capacity-0 side bank (byte-identical
         // ranges), so the per-expert loop below builds its MLXArrays from
         // already-fetched bytes instead of serializing on each pread. Anything
         // not prefetched falls back to the normal per-expert bank read.
+        //
+        // The reads are LAUNCHED on a side queue before the shared-expert
+        // overlap eval runs: the shared expert depends only on x
+        // (RAM-resident weights, no SSD read), so its eval is the one piece
+        // of GPU work that can fill the read window — but its CPU wait must
+        // not delay the start of the reads. Same reads, same arrays, same
+        // eval; only the launch order changes.
+        //
+        // NOTE: temporal next-step expert prediction was measured on the
+        // official runner (d4e4f946) and REGRESSED ~33 ms/step — decode is
+        // disk-saturated, so speculative reads for layer n+1 steal
+        // bandwidth from layer n's demand reads. Only the hash layers'
+        // EXACT token-derived prefetch (scheduled at decode entry, no
+        // speculation) remains.
         var decodePrefetch: [String: StagedExpertCode]?
         if tokenCount == 1, !useStaged {
-            // NOTE: temporal next-step expert prediction was measured on the
-            // official runner (d4e4f946) and REGRESSED ~33 ms/step — decode is
-            // disk-saturated, so speculative reads for layer n+1 steal
-            // bandwidth from layer n's demand reads. Only the hash layers'
-            // EXACT token-derived prefetch (scheduled at decode entry, no
-            // speculation) remains.
-            let consumed = loader.consumeScheduledPinnedDecodeExpertCodes(
-                layerIndex: spec.layerIndex
-            )
-            decodePrefetch = loader.mergeMissingDecodeExpertCodes(
-                consumed,
-                layerIndex: spec.layerIndex,
-                experts: expertOrder,
-                hiddenSize: spec.hiddenSize,
-                intermediateSize: spec.intermediateSize
-            )
+            let group = DispatchGroup()
+            let box = DecodePrefetchResultBox()
+            let prefetchExpertOrder = expertOrder
+            group.enter()
+            decodePrefetchLaunchQueue.async {
+                let consumed = loader.consumeScheduledPinnedDecodeExpertCodes(
+                    layerIndex: spec.layerIndex
+                )
+                box.value = loader.mergeMissingDecodeExpertCodes(
+                    consumed,
+                    layerIndex: spec.layerIndex,
+                    experts: prefetchExpertOrder,
+                    hiddenSize: spec.hiddenSize,
+                    intermediateSize: spec.intermediateSize
+                )
+                group.leave()
+            }
+            onRoutingSynced?()
+            group.wait()
+            decodePrefetch = box.value
         } else if useStaged {
             // Prefill/warmup staged path: build the active experts' base
             // MLXArrays from the staged layer buffer concurrently so the loop
@@ -432,6 +445,20 @@ public enum DeepSeekRoutedExperts {
 private struct StackedProjectionSink: @unchecked Sendable {
     let buffer: UnsafeMutableBufferPointer<DeepSeekWeightLoader.StackedExpertProjection?>
 }
+
+// Single-producer result slot for the decode-step prefetch launched on the
+// side queue; the DispatchGroup wait orders the write before the read.
+private final class DecodePrefetchResultBox: @unchecked Sendable {
+    var value: [String: StagedExpertCode]?
+}
+
+// Side queue that only launches the decode-step slice prefetch, so the
+// shared-expert overlap eval on the compute thread runs concurrently with the
+// reads instead of preceding them.
+private let decodePrefetchLaunchQueue = DispatchQueue(
+    label: "mlxfast.decode.prefetch-launch",
+    qos: .userInitiated
+)
 
 /// Below this many tokens the unique-expert count is small enough that
 /// per-slice streaming reads less than a whole stacked tensor; decode and the
