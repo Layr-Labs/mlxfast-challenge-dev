@@ -1,7 +1,8 @@
 # mlxfast — DeepSeek V4 Flash
 
-A benchmark arena for memory-bandwidth-optimal LLM inference on Apple Silicon.
-Run DeepSeek V4 Flash without loading all 256 experts into RAM — and beat the baseline score.
+A benchmark arena for compute- and memory-bandwidth-optimal LLM inference on
+Apple Silicon. Run DeepSeek V4 Flash with the full expert set RAM-resident on
+a big-memory Mac — and beat the baseline score.
 
 See [TASK.md](TASK.md) for the full problem statement, scoring formula, and approach space.
 
@@ -142,18 +143,23 @@ the private prompt and artifact handling model.
 ## Why this challenge exists
 
 DeepSeek V4 Flash has 256 routed experts per layer, 6 activated per token.
-The checkpoint is too large to keep fully resident on typical Apple Silicon
-machines. The baseline ships with SSD streaming: expert tensors stay on disk and
-only the routed tensors needed for the current forward pass are materialized.
+The official benchmark contract is an Apple M3 Ultra with at least 256 GB of
+unified memory: the full 4-bit expert set (~141 GiB) is loaded RAM-resident
+once during untimed initialization, and every scored forward is served from
+memory. The challenge is making that in-memory model fast — kernels, routing,
+dispatch, materialization, and MLX scheduling — not disk I/O. (Machines below
+192 GiB automatically fall back to the previous SSD-streaming runtime so local
+iteration still works, but those timings are directional only.)
 
-That baseline is functional but naive. Expert reads block the forward pass,
-there is no prefetching, no cross-layer reuse, and the weights are stored in
-their original 4-bit form. Every one of these is an optimisation target.
-The generated `weights/` tree is expected to stay small: it is a runtime
-artifact overlay on top of the frozen reference checkpoint, not a second full
-model copy. Submissions may change both the Swift transform and Swift runtime
-to adjust metadata, caching, or streaming strategy, as long as the generated
-runnable artifacts pass the hidden correctness and benchmark checks.
+The baseline is functional but naive: resident expert bytes are converted to
+MLXArrays per forward, per-expert matmuls launch serially, and the weights are
+stored in their original 4-bit form. Every one of these is an optimisation
+target. The generated `weights/` tree is expected to stay small: it is a
+runtime artifact overlay on top of the frozen reference checkpoint, not a
+second full model copy. Submissions may change both the Swift transform and
+Swift runtime to adjust metadata, layout, or materialization strategy, as long
+as the generated runnable artifacts pass the hidden correctness and benchmark
+checks.
 
 ## The modifiable surface
 
@@ -163,7 +169,7 @@ in scope. Submissions should focus on the Swift targets listed in
 
 | Path | What it controls |
 |---|---|
-| `Sources/MLXFastModel/` | DeepSeek V4 Flash runtime, MLX Swift array bridge, dense/expert loading, SSD streaming, decode/prefill logic. **Primary target.** |
+| `Sources/MLXFastModel/` | DeepSeek V4 Flash runtime, MLX Swift array bridge, dense/expert loading, resident expert store (plus the SSD-streaming fallback), decode/prefill logic. **Primary target.** |
 | `Sources/MLXFastTransform/` | Offline weight transform from frozen reference safetensors into benchmark-ready `weights/`. |
 
 The repository is Swift-only: setup, transform, correctness, and benchmark all
@@ -369,7 +375,11 @@ tokenizer whitespace variants.
 
 ## Requirements
 
-- Apple Silicon Mac, 24 GB+ unified memory (M2 or newer)
+- Apple Silicon Mac (M2 or newer). To run the official RAM-resident expert
+  mode locally you need 192 GB+ unified memory (the ranked runner is an M3
+  Ultra with 256 GB+); smaller machines automatically use the SSD-streaming
+  fallback, which works from about 24 GB but is slow, memory-hungry, and only
+  directional for performance
 - macOS Sequoia or later
 - Swift 6 through Xcode or Xcode Command Line Tools
 - Xcode Metal Toolchain for `mlx.metallib`; `./setup.sh` tries

@@ -84,9 +84,11 @@ public enum DeepSeekRoutedExperts {
                 loader.expertLayerStager?.releaseLayer(spec.layerIndex)
             }
         }
-        if !useStaged {
+        if !useStaged, !loader.isFullyExpertResident {
             // Kernel read-ahead for every byte range this layer is about to
             // pread, so SSD I/O overlaps the per-expert GPU compute below.
+            // Skipped entirely when the full expert set is RAM-resident:
+            // there are no upcoming preads to advise the kernel about.
             loader.expertPrefetcher.prefetch(layerIndex: spec.layerIndex, expertIndices: selectedExperts)
         }
 

@@ -77,10 +77,13 @@ weights/
 ```
 
 The generated `weights/` tree is a compact runtime artifact set, not a second
-full copy of the checkpoint. It stores dense/shared tensors plus metadata, while
-the baseline runtime streams routed expert tensors from the frozen reference
-checkpoint. Submissions may adjust this overlay by changing both
-`Sources/MLXFastTransform/` and `Sources/MLXFastModel/`; correctness and
+full copy of the checkpoint. It stores dense/shared tensors plus metadata,
+while routed expert tensors are read from the frozen reference checkpoint via
+the expert manifest. Under the official contract (Apple M3 Ultra, 256 GB+
+unified memory) the runtime loads the full expert set RAM-resident once at
+untimed initialization; machines below 192 GiB fall back to streaming those
+tensors from SSD on demand. Submissions may adjust this overlay by changing
+both `Sources/MLXFastTransform/` and `Sources/MLXFastModel/`; correctness and
 benchmark results are the authority, not byte equality with the baseline
 layout.
 
@@ -108,7 +111,7 @@ The active editable surface is Swift-only and is defined by `benchmark.json`:
 
 | Path | Scope |
 |---|---|
-| `Sources/MLXFastModel/` | DeepSeek V4 Flash model implementation: attention, MoE, expert streaming, caches, weight loading, and prefill/decode execution. |
+| `Sources/MLXFastModel/` | DeepSeek V4 Flash model implementation: attention, MoE, resident expert store (plus streaming fallback), caches, weight loading, and prefill/decode execution. |
 | `Sources/MLXFastTransform/` | Offline safetensors transform and expert manifest generation. |
 
 `Sources/MLXFastCore/`, `Sources/MLXFastHarness/`,

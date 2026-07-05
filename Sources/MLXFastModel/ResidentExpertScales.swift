@@ -117,6 +117,24 @@ public final class ResidentExpertTensors {
 }
 
 extension ResidentExpertTensors {
+    /// EVERY stacked manifest record — codes, scales, and biases for all
+    /// layers. This is the official-contract store: the ranked runner (Apple
+    /// M3 Ultra, >= 256 GB unified memory) holds the full 4-bit expert set
+    /// (~141 GiB) in RAM, loaded once in the untimed loader constructor, so no
+    /// scored window ever touches the SSD for expert weights. Records the
+    /// store cannot hold (non-stacked shapes) are left to the bank's normal
+    /// read path instead of disabling residency for everything else.
+    public convenience init?(allExpertsFromManifest manifestPath: String, metrics: ExpertStreamingMetrics?) {
+        self.init(manifestPath: manifestPath, metrics: metrics) { record in
+            guard let firstDimension = record.shape.first else {
+                return false
+            }
+            return record.shape.count >= 2
+                && firstDimension > 0
+                && record.byteLength % firstDimension == 0
+        }
+    }
+
     /// All `*.scales` records — the store behind resident expert scales.
     public convenience init?(scalesFromManifest manifestPath: String, metrics: ExpertStreamingMetrics?) {
         self.init(manifestPath: manifestPath, metrics: metrics) { record in
@@ -161,6 +179,20 @@ extension ResidentExpertTensors {
 public enum ResidentExpertStoreRegistry {
     private static let scalesCache = LockedCache<String, ResidentExpertTensors?>()
     private static let pinnedCodesCache = LockedCache<String, ResidentExpertTensors?>()
+    private static let allExpertsCache = LockedCache<String, ResidentExpertTensors?>()
+
+    /// Full-residency store (all expert tensors). Shared per manifest for the
+    /// same reason as the others, but far more important here: duplicating a
+    /// ~141 GiB store per loader would not fit even the 256 GB official
+    /// runner.
+    public static func allExperts(
+        manifestPath: String,
+        metrics: ExpertStreamingMetrics?
+    ) -> ResidentExpertTensors? {
+        allExpertsCache.value(for: manifestPath) {
+            ResidentExpertTensors(allExpertsFromManifest: manifestPath, metrics: metrics)
+        }
+    }
 
     public static func scales(
         manifestPath: String,

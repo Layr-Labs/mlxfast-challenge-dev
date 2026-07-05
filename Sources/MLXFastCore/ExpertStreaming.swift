@@ -12,15 +12,24 @@ public struct ExpertStreamingConfig: Equatable, Sendable {
     public let mode: Mode
     public let tensorCacheCapacity: Int
     public let recordsMetrics: Bool
+    // When true the loader keeps EVERY expert tensor RAM-resident (loaded once
+    // at untimed init) and no scored forward reads expert bytes from SSD.
+    // Defaults false in the memberwise init so fixture-driven tests exercise
+    // the streaming fallback deterministically on any machine;
+    // fromEnvironment applies ExpertResidencyPolicy (the official M3 Ultra
+    // >= 256 GB contract) for real runtime processes.
+    public let fullResidency: Bool
 
     public init(
         mode: Mode = .directNVMe,
         tensorCacheCapacity: Int = Self.defaultTensorCacheCapacity,
-        recordsMetrics: Bool = false
+        recordsMetrics: Bool = false,
+        fullResidency: Bool = false
     ) {
         self.mode = mode
         self.tensorCacheCapacity = max(0, tensorCacheCapacity)
         self.recordsMetrics = recordsMetrics
+        self.fullResidency = fullResidency
     }
 
     public static func fromEnvironment(
@@ -35,7 +44,8 @@ public struct ExpertStreamingConfig: Equatable, Sendable {
             ?? Self.defaultTensorCacheCapacity
         return ExpertStreamingConfig(
             tensorCacheCapacity: tensorCapacity,
-            recordsMetrics: parseBool(environment["MLXFAST_EXPERT_STREAM_METRICS"]) ?? recordsMetricsDefault
+            recordsMetrics: parseBool(environment["MLXFAST_EXPERT_STREAM_METRICS"]) ?? recordsMetricsDefault,
+            fullResidency: ExpertResidencyPolicy.fullResidencyEnabled(environment: environment)
         )
     }
 

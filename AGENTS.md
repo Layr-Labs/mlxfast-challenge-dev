@@ -28,14 +28,20 @@ Ranked benchmark runs execute through GitHub Actions on:
 blacksmith-12vcpu-macos-26
 ```
 
-Treat this as the source of truth for performance. The ranked run is calibrated
-for a Blacksmith Apple Silicon M4 Pro runner with 48 GB unified memory. Local
-M2, M3, M4, or M5 machines are useful for iteration, but local speedups are only
-directional. A kernel, cache, or streaming strategy that helps on one Apple
-Silicon generation can move differently on the official runner, so always rely
-on the official benchmark for ranking. Do not design for a 64 GB, 96 GB, or
-128 GB local machine unless the same approach still fits the 48 GB official
-runner budget.
+Treat this as the source of truth for performance. The ranked run targets an
+Apple M3 Ultra with at least 256 GB of unified memory. On that contract the
+full 4-bit expert set (~141 GiB) is RAM-resident: the runtime loads every
+expert tensor once during untimed initialization and no scored prefill or
+decode window reads expert bytes from SSD. Optimization effort should go into
+compute — kernels, attention, MoE dispatch, memory layout, and MLX scheduling —
+not disk I/O.
+
+Local machines below 192 GiB fall back to the previous SSD-streaming runtime
+automatically (see `ExpertResidencyPolicy` in `Sources/MLXFastCore/`), so
+iteration still works on laptops, but those timings exercise a different
+bottleneck than the ranked run and are directional at best. A kernel or layout
+strategy that helps on one Apple Silicon generation can move differently on the
+official runner, so always rely on the official benchmark for ranking.
 
 ## What You May Optimize
 
@@ -53,8 +59,8 @@ Focus on:
   projections, KV-cache handling, and expert materialization.
 - Reducing model execution work on the hot path: MLX ops, synchronization,
   materialization, copies, routing overhead, and cache misses.
-- Improving expert streaming, caching, prefetching, and layout only when it
-  shows up as lower scored prefill/decode latency.
+- Improving the RAM-resident expert layout and materialization: how resident
+  expert bytes become MLXArrays, batching across experts, and dispatch order.
 - Making the offline transform produce better runtime metadata or compact
   transformed artifacts.
 - Improving prefill and decode execution inside the Swift/MLX model path.
@@ -224,11 +230,10 @@ uploads the editable-path archive for official validation.
 
 Good submissions are likely to improve one or more of:
 
-- Expert tensor layout that reduces blocking work in measured prefill/decode.
-- Per-layer or cross-step expert cache policy that fits the 48 GB runner.
-- Predictive expert prefetch that lowers measured latency without depending on
-  hidden prompts.
-- MoE routing and dispatch overhead on the hot path.
+- RAM-resident expert layout and materialization: fewer copies and lazier
+  Data-to-Metal conversions between the resident bytes and the MoE matmuls.
+- MoE routing and dispatch overhead on the hot path, including batching tokens
+  per expert and reducing per-expert kernel launches.
 - Dense/shared weight loading and reuse.
 - KV cache handling and attention hot paths.
 - MLX operation scheduling and synchronization.
@@ -241,16 +246,18 @@ public local fixtures, and official scoring happens on the Blacksmith runner.
 ## Avoid These Wrong Strategies
 
 Do not assume the benchmark machine has the same memory budget as your local
-Mac. In particular, do not build a solution that relies on keeping thousands of
-expert `MLXArray`s resident because it happens to fit on a high-memory local
-machine. The challenge is about making DeepSeek V4 Flash fast under the official
-runner contract, not about replacing SSD streaming with an unbounded in-memory
-expert cache.
+Mac. The official contract is an M3 Ultra with at least 256 GB of unified
+memory and a fully RAM-resident expert set; machines below 192 GiB fall back to
+SSD streaming, whose bottleneck (disk I/O) is different from the ranked run's
+(compute and memory bandwidth). Do not spend effort optimizing the streaming
+fallback expecting ranked gains, and do not tune resident-mode data structures
+against a small local machine's swap behavior.
 
 Avoid double-caching and cache bypasses that make diagnostics misleading. If
 you add a cache, account for its memory use, eviction behavior, and interaction
-with `ExpertSlotBank`; do not simply disable the existing byte cache or report
-fake read/cache metrics to make the run look better.
+with `ExpertSlotBank` and the resident expert store; do not simply disable the
+existing byte cache or report fake read/cache metrics to make the run look
+better.
 
 Do not copy strategies from files outside this checkout or from parent
 directories unless they are part of the public challenge repository. A

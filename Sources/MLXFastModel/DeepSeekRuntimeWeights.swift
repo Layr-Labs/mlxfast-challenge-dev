@@ -73,10 +73,10 @@ public final class DeepSeekRuntimeWeightCache {
         // The default MLX buffer cache is effectively unbounded; a full run
         // churns hundreds of GB of short-lived expert buffers through it,
         // ballooning resident memory far beyond live data. 6 GiB comfortably
-        // covers a few layers of in-flight expert buffers while keeping the
-        // process inside the official 48 GB budget next to the RAM-resident
-        // scales, pinned codes, and staging buffers. Set here — the one
-        // full-model runtime-init chokepoint — not in a warmup helper.
+        // covers a few layers of in-flight expert buffers next to the
+        // RAM-resident expert store (full residency on the official 256 GB
+        // contract, scales/pinned codes on the streaming fallback). Set here —
+        // the one full-model runtime-init chokepoint — not in a warmup helper.
         Memory.cacheLimit = 6 << 30
         _ = try? modelWeights()
         _ = blockSpec()

@@ -610,7 +610,8 @@ extension DeepSeekRuntime {
 
         let bandwidth = localIterateBandwidthGBPerToken(
             bytesRead: totalDecodeBytesRead,
-            decodedTokens: totalDecodeSteps
+            decodedTokens: totalDecodeSteps,
+            fullyResidentExperts: ExpertResidencyPolicy.fullResidencyEnabled()
         )
         latestStats = DeepSeekRuntime.expertStats(from: weightCache)
         let correctness = localIterateCorrectnessReport(
@@ -812,7 +813,8 @@ extension DeepSeekRuntime {
         }
         let bandwidth = localIterateBandwidthGBPerToken(
             bytesRead: totalDecodeBytesRead,
-            decodedTokens: totalDecodeSteps
+            decodedTokens: totalDecodeSteps,
+            fullyResidentExperts: ExpertResidencyPolicy.fullResidencyEnabled()
         )
         let correctness = localIterateCorrectnessReport(
             passed: failureStep == nil,
@@ -874,24 +876,38 @@ extension DeepSeekRuntime {
     static func localIterateBandwidthGBPerToken(
         before: ExpertStreamingStats?,
         after: ExpertStreamingStats?,
-        decodedTokens: Int
+        decodedTokens: Int,
+        fullyResidentExperts: Bool = false
     ) -> (gbPerToken: Double, source: String) {
         guard decodedTokens > 0, let after else {
             return (0, "")
         }
         let bytesRead = expertBytesReadDelta(before: before, after: after)
-        return localIterateBandwidthGBPerToken(bytesRead: bytesRead, decodedTokens: decodedTokens)
+        return localIterateBandwidthGBPerToken(
+            bytesRead: bytesRead,
+            decodedTokens: decodedTokens,
+            fullyResidentExperts: fullyResidentExperts
+        )
     }
 
     static func localIterateBandwidthGBPerToken(
         bytesRead: UInt64,
-        decodedTokens: Int
+        decodedTokens: Int,
+        fullyResidentExperts: Bool = false
     ) -> (gbPerToken: Double, source: String) {
         guard decodedTokens > 0 else {
             return (0, "")
         }
         guard bytesRead > 0 else {
-            return (0, ExpertStreamingMetrics.bandwidthSource)
+            // RAM-resident experts read nothing during decode by design; label
+            // the diagnostic accordingly instead of implying a streaming run
+            // that observed no reads.
+            return (
+                0,
+                fullyResidentExperts
+                    ? ExpertResidencyPolicy.residentBandwidthSource
+                    : ExpertStreamingMetrics.bandwidthSource
+            )
         }
         return (
             Double(bytesRead) / Double(1 << 30) / Double(decodedTokens),

@@ -80,6 +80,62 @@ func deepSeekWeightLoaderReadsExpertManifestTensor() throws {
 }
 
 @Test
+func deepSeekWeightLoaderFullResidencyServesExpertsFromRAMAndSkipsStreamingHelpers() throws {
+    let stackedName = "model.layers.0.ffn.switch_mlp.gate_proj.weight"
+    let denseTensors = [
+        TensorFixture(
+            name: "model.embed_tokens.weight",
+            dtype: "U8",
+            shape: [1],
+            data: Data([1])
+        )
+    ]
+    let expertTensors = [
+        TensorFixture(
+            name: stackedName,
+            dtype: "U8",
+            shape: [2, 2],
+            data: Data([9, 8, 7, 6])
+        )
+    ]
+
+    // Full residency (the official M3 Ultra >= 256 GB contract, forced here
+    // via config): every stacked expert tensor is RAM-resident, the scales and
+    // pinned-code lookups alias the same store, and the streaming helpers
+    // (layer stager) are not constructed.
+    let resident = try DeepSeekWeightLoader(
+        weightsPath: makeWeightLoaderFixture(
+            denseTensors: denseTensors,
+            expertTensors: expertTensors
+        ).weights.path,
+        expertStreamingConfig: ExpertStreamingConfig(fullResidency: true)
+    )
+    #expect(resident.isFullyExpertResident)
+    #expect(resident.residentAllExperts?.isResident(name: stackedName) == true)
+    #expect(resident.residentExpertScales === resident.residentAllExperts)
+    #expect(resident.pinnedExpertCodes === resident.residentAllExperts)
+    #expect(resident.expertLayerStager == nil)
+    let slice = try #require(
+        resident.residentAllExperts?.materializedTensor(named: stackedName, firstAxisIndex: 1)
+    )
+    #expect(try slice.uint8Values() == [7, 6])
+
+    // The memberwise config default keeps the streaming fallback (pinned
+    // explicitly here because the loader's own default is .fromEnvironment(),
+    // which would flip to resident on a big-memory machine).
+    let streaming = try DeepSeekWeightLoader(
+        weightsPath: makeWeightLoaderFixture(
+            denseTensors: denseTensors,
+            expertTensors: expertTensors
+        ).weights.path,
+        expertStreamingConfig: ExpertStreamingConfig()
+    )
+    #expect(!streaming.isFullyExpertResident)
+    #expect(streaming.residentAllExperts == nil)
+    #expect(streaming.expertLayerStager != nil)
+}
+
+@Test
 func deepSeekWeightLoaderBuildsAffineQuantizedDenseLinearWeight() throws {
     guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
         return

@@ -76,6 +76,15 @@ public enum MLXFastConstants {
     // baseline reference under the current harness at 3.6366560638046876 s/tok
     // (yukon/baseline run). Prefill is unchanged -- that path did not change, and
     // the baseline run's prefill was within single-shot noise of the value below.
+    //
+    // STALE UNDER THE RESIDENT-EXPERT CONTRACT: these values were measured on
+    // the 48 GB streaming runner. The official contract is now an Apple M3
+    // Ultra (256 GB+) running with the full expert set RAM-resident
+    // (ExpertResidencyPolicy), where decode is far faster than the streaming
+    // number below. Recalibrate both constants with a trusted baseline run on
+    // that hardware before publishing ranked scores; until then, ranked runs
+    // should rely on the paired/per-prompt baseline paths, which measure the
+    // reference implementation in-session.
     public static let officialBaselinePrefillSecondsPerToken = 0.17330563175390626
     public static let officialBaselineDecodeSecondsPerToken = 3.6366560638046876
     public static let scorePrefillWeight = 0.25

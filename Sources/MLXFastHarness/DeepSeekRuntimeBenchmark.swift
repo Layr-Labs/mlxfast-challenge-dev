@@ -184,7 +184,8 @@ extension DeepSeekRuntime {
                 expectedTokens: promptPlan.expectedDecodeTokens,
                 decodeSteps: options.benchmarkDecodeSteps,
                 weightCache: benchmarkCache,
-                progress: progress
+                progress: progress,
+                fullyResidentExperts: ExpertResidencyPolicy.fullResidencyEnabled()
             )
             timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
             let peakRamGB = Double(Memory.peakMemory) / Double(1 << 30)
@@ -539,7 +540,11 @@ extension DeepSeekRuntime {
                         worker: decodeWorker,
                         progress: progress,
                         peakRamGB: &peakRamGB,
-                        expertStats: &lastExpertStats
+                        expertStats: &lastExpertStats,
+                        // Trusted parent-side determination (same machine and
+                        // environment as the worker): the sandboxed worker
+                        // cannot claim residency the parent did not sanction.
+                        fullyResidentExperts: ExpertResidencyPolicy.fullResidencyEnabled()
                     )
                 }
                 timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
@@ -860,7 +865,8 @@ extension DeepSeekRuntime {
         expectedTokens: [Int],
         decodeSteps: Int = MLXFastConstants.benchmarkDecodeSteps,
         weightCache: DeepSeekRuntimeWeightCache,
-        progress: ((String) -> Void)? = nil
+        progress: ((String) -> Void)? = nil,
+        fullyResidentExperts: Bool = false
     ) throws -> DecodeMeasurement {
         guard !seedTokens.isEmpty else {
             throw MLXFastError.invalidInput("benchmark decode seed must not be empty")
@@ -954,7 +960,8 @@ extension DeepSeekRuntime {
         let bandwidth = try expertStreamingBandwidthGBPerToken(
             before: metricsBeforeDecode,
             after: weightCache.loader.expertStreamingMetrics?.snapshot(),
-            decodedTokens: timingPlan.decodeSteps
+            decodedTokens: timingPlan.decodeSteps,
+            fullyResidentExperts: fullyResidentExperts
         )
         progress?(
             "decode measured complete seconds=\(formatSeconds(elapsed)) "
@@ -977,7 +984,8 @@ extension DeepSeekRuntime {
         worker: RuntimeWorkerClient,
         progress: ((String) -> Void)? = nil,
         peakRamGB: inout Double,
-        expertStats: inout ExpertStreamingStats
+        expertStats: inout ExpertStreamingStats,
+        fullyResidentExperts: Bool = false
     ) throws -> DecodeMeasurement {
         guard !seedTokens.isEmpty else {
             throw MLXFastError.invalidInput("benchmark decode seed must not be empty")
@@ -1042,7 +1050,8 @@ extension DeepSeekRuntime {
         let bandwidth = try expertStreamingBandwidthGBPerToken(
             before: statsBeforeDecode,
             after: expertStats,
-            decodedTokens: decodeSteps
+            decodedTokens: decodeSteps,
+            fullyResidentExperts: fullyResidentExperts
         )
         // Physical-plausibility gate on the trusted expert-read counter. The seed
         // prefill forwards every prompt token through the MoE, so its incremental
@@ -1052,20 +1061,30 @@ extension DeepSeekRuntime {
         // bypass submissions/0ddfcd37 used. Measured as the delta between the
         // worker's pre-forward hello baseline and its post-seed counter, so a
         // submission cannot pre-stream at startup to hide a memoized seed.
-        let initialExpertBytes = worker.initialExpertStats?.bytesRead ?? 0
-        let seedCumulativeBytes = statsBeforeDecode?.bytesRead ?? 0
-        let finalCumulativeBytes = expertStats.bytesRead
-        let seedForwardBytesRead = seedCumulativeBytes >= initialExpertBytes
-            ? seedCumulativeBytes - initialExpertBytes
-            : seedCumulativeBytes
-        let decodeStepsBytesRead = finalCumulativeBytes >= seedCumulativeBytes
-            ? finalCumulativeBytes - seedCumulativeBytes
-            : finalCumulativeBytes
-        try requirePlausibleSeedForwardExpertReads(
-            seedForwardBytesRead: seedForwardBytesRead,
-            decodeStepsBytesRead: decodeStepsBytesRead,
-            decodeSteps: decodeSteps
-        )
+        //
+        // Only meaningful when experts stream per-forward: under the official
+        // full-residency contract (M3 Ultra >= 256 GB) the entire expert set is
+        // read once at untimed init, both windows legitimately read ~0 bytes,
+        // and this gate is skipped. The parent decides fullyResidentExperts
+        // from its own environment, so a submission cannot opt out of the gate
+        // on a streaming machine; memoization defenses on resident runs remain
+        // the single-seed timed protocol and the static review.
+        if !fullyResidentExperts {
+            let initialExpertBytes = worker.initialExpertStats?.bytesRead ?? 0
+            let seedCumulativeBytes = statsBeforeDecode?.bytesRead ?? 0
+            let finalCumulativeBytes = expertStats.bytesRead
+            let seedForwardBytesRead = seedCumulativeBytes >= initialExpertBytes
+                ? seedCumulativeBytes - initialExpertBytes
+                : seedCumulativeBytes
+            let decodeStepsBytesRead = finalCumulativeBytes >= seedCumulativeBytes
+                ? finalCumulativeBytes - seedCumulativeBytes
+                : finalCumulativeBytes
+            try requirePlausibleSeedForwardExpertReads(
+                seedForwardBytesRead: seedForwardBytesRead,
+                decodeStepsBytesRead: decodeStepsBytesRead,
+                decodeSteps: decodeSteps
+            )
+        }
         let measuredSeconds = secondsSince(decodePhaseStart)
         let secondsPerToken = measuredSeconds / Double(decodeSteps)
         let actualTokensComparison = BenchmarkOutputValidator.compareDecodeTokens(
@@ -1115,7 +1134,8 @@ extension DeepSeekRuntime {
     static func expertStreamingBandwidthGBPerToken(
         before: ExpertStreamingMetrics.Snapshot?,
         after: ExpertStreamingMetrics.Snapshot?,
-        decodedTokens: Int
+        decodedTokens: Int,
+        fullyResidentExperts: Bool = false
     ) throws -> (gbPerToken: Double, source: String) {
         guard decodedTokens > 0 else {
             throw MLXFastError.invalidInput("benchmark decode steps must be positive")
@@ -1126,6 +1146,11 @@ extension DeepSeekRuntime {
         let beforeBytes = before?.bytesRead ?? 0
         let bytesRead = after.bytesRead >= beforeBytes ? after.bytesRead - beforeBytes : after.bytesRead
         guard bytesRead > 0 else {
+            // Under the full-residency contract the decode window legitimately
+            // reads no expert bytes: everything was loaded at untimed init.
+            if fullyResidentExperts {
+                return (0, ExpertResidencyPolicy.residentBandwidthSource)
+            }
             throw MLXFastError.invalidInput("expert streaming bandwidth diagnostic observed no decoded expert reads")
         }
         return (
@@ -1137,7 +1162,8 @@ extension DeepSeekRuntime {
     static func expertStreamingBandwidthGBPerToken(
         before: ExpertStreamingStats?,
         after: ExpertStreamingStats?,
-        decodedTokens: Int
+        decodedTokens: Int,
+        fullyResidentExperts: Bool = false
     ) throws -> (gbPerToken: Double, source: String) {
         guard decodedTokens > 0 else {
             throw MLXFastError.invalidInput("benchmark decode steps must be positive")
@@ -1148,6 +1174,11 @@ extension DeepSeekRuntime {
         let beforeBytes = before?.bytesRead ?? 0
         let bytesRead = after.bytesRead >= beforeBytes ? after.bytesRead - beforeBytes : after.bytesRead
         guard bytesRead > 0 else {
+            // Under the full-residency contract the decode window legitimately
+            // reads no expert bytes: everything was loaded at untimed init.
+            if fullyResidentExperts {
+                return (0, ExpertResidencyPolicy.residentBandwidthSource)
+            }
             throw MLXFastError.invalidInput("expert streaming bandwidth diagnostic observed no decoded expert reads")
         }
         return (

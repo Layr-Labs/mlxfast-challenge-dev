@@ -104,6 +104,12 @@ public struct DeepSeekWeightLoader {
     public let expertPrefetcher: ExpertPrefetcher
     public let residentExpertScales: ResidentExpertTensors?
     public let pinnedExpertCodes: ResidentExpertTensors?
+    // Official-contract mode (Apple M3 Ultra, >= 256 GB): the FULL expert set
+    // is loaded RAM-resident once at untimed init and every scored forward is
+    // served from memory. When set, residentExpertScales and pinnedExpertCodes
+    // alias this same store so every existing resident-first lookup hits, and
+    // the streaming machinery (prefetcher, stager, side bank) is bypassed.
+    public let residentAllExperts: ResidentExpertTensors?
     public let expertLayerStager: ExpertLayerStager?
     // Dedicated capacity-0 side bank for concurrent decode-step slice reads.
     // Capacity 0 => no cache/LRU mutation, so concurrent preads are race-free
@@ -112,8 +118,9 @@ public struct DeepSeekWeightLoader {
     private let bridge: MLXArrayTensorBridge
     private let scheduledPinnedDecodePrefetches = ScheduledDecodePrefetches()
 
-    /// Sized for the official 48 GB runner: pin only where at least that
-    /// budget exists, and never more than two layers of codes (~6.4 GiB).
+    /// Streaming-fallback tuning only (machines below the full-residency
+    /// threshold in ExpertResidencyPolicy): pin hash-layer codes where at
+    /// least ~40 GiB exists, never more than two layers (~6.4 GiB).
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
     private static let pinnedHashLayerCap = 2
 
@@ -137,19 +144,39 @@ public struct DeepSeekWeightLoader {
         self.expertPrefetcher = ExpertPrefetcher(expertBank: expertBank)
         // Resident stores come from a process-wide registry: the trusted
         // benchmark harness keeps two loaders alive at once, and duplicating
-        // ~14 GiB of resident data per loader would threaten the 48 GB
-        // runner budget.
+        // resident data per loader would waste RAM (fatally so for the full
+        // ~141 GiB store below).
         let manifestPath = "\(weightsPath)/experts/manifest.json"
+        if expertStreamingConfig.fullResidency,
+           let allExperts = ResidentExpertStoreRegistry.allExperts(
+               manifestPath: manifestPath,
+               metrics: metrics
+           )
+        {
+            // Official contract (Apple M3 Ultra, >= 256 GB): everything
+            // resident. Scales and pinned-code lookups alias the same store so
+            // every resident-first branch on the hot path hits RAM, and the
+            // SSD-streaming helpers (stager, side bank) are not constructed.
+            self.residentAllExperts = allExperts
+            self.residentExpertScales = allExperts
+            self.pinnedExpertCodes = allExperts
+            self.expertLayerStager = nil
+            self.decodeSideBank = nil
+            self.bridge = bridge
+            return
+        }
+        // SSD-streaming fallback for machines that cannot hold the full
+        // expert set (or when the resident load failed): the previous runtime,
+        // unchanged. Local timings in this mode are directional only.
+        self.residentAllExperts = nil
         self.residentExpertScales = ResidentExpertStoreRegistry.scales(
             manifestPath: manifestPath,
             metrics: metrics
         )
         // Pinning trades RAM for guaranteed hits on the token-id-routed
-        // layers; only worthwhile at the official 48 GB budget or above,
-        // and capped so the pinned codes (~3.2 GiB per layer) leave headroom
-        // for the resident scales, staging buffers, and page cache inside
-        // that budget. Both constants encode the OFFICIAL runner's memory
-        // math — do not raise them because a larger local machine has room.
+        // layers, capped so the pinned codes (~3.2 GiB per layer) leave
+        // headroom for the resident scales, staging buffers, and page cache
+        // on mid-size machines.
         let hashLayerCount = (try? DeepSeekConfig.load(from: weightsPath))?.numHashLayers ?? 0
         self.pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
             ? ResidentExpertStoreRegistry.pinnedHashLayerCodes(
@@ -182,11 +209,18 @@ public struct DeepSeekWeightLoader {
         self.expertStreamingConfig = expertStreamingConfig
         self.expertStreamingMetrics = expertStreamingMetrics ?? expertBank.metrics
         self.expertPrefetcher = ExpertPrefetcher(expertBank: expertBank)
+        self.residentAllExperts = nil
         self.residentExpertScales = nil
         self.pinnedExpertCodes = nil
         self.expertLayerStager = nil
         self.decodeSideBank = nil
         self.bridge = bridge
+    }
+
+    /// True when every expert tensor is RAM-resident and no forward should
+    /// touch the SSD-streaming machinery.
+    public var isFullyExpertResident: Bool {
+        residentAllExperts != nil
     }
 
     public func resolveDenseName(_ candidates: [String]) throws -> String {
@@ -329,9 +363,12 @@ public struct DeepSeekWeightLoader {
         hiddenSize: Int,
         intermediateSize: Int
     ) -> [String: StagedExpertCode]? {
-        guard let sideBank = decodeSideBank, expertBank.capacity > 0, !expertIndices.isEmpty else {
+        // Full residency has no side bank (nothing to read from disk), but the
+        // concurrent base-array builds from resident bytes are still worth it.
+        guard decodeSideBank != nil || isFullyExpertResident, expertBank.capacity > 0, !expertIndices.isEmpty else {
             return nil
         }
+        let sideBank = decodeSideBank
         let projections: [(DeepSeekExpertProjection, [Int])] = [
             (.gate, [intermediateSize, hiddenSize]),
             (.up, [intermediateSize, hiddenSize]),
@@ -389,10 +426,10 @@ public struct DeepSeekWeightLoader {
                     let tensor = pinnedCodes?.materializedTensor(
                         named: name,
                         firstAxisIndex: expertIndex
-                    ) ?? (try? sideBank.materializedTensor(
+                    ) ?? sideBank.flatMap({ try? $0.materializedTensor(
                         named: name,
                         firstAxisIndex: expertIndex
-                    )),
+                    ) }),
                     let array = try? bridge.makeArray(from: tensor)
                 else {
                     return
@@ -702,6 +739,14 @@ public struct DeepSeekWeightLoader {
                 tensor = staged
             } else if isStacked {
                 tensor = try expertBank.materializedTensor(named: candidate, firstAxisIndex: expertIndex)
+            } else if let resident = residentAllExperts?.materializedTensor(
+                named: candidate,
+                firstAxisIndex: nil
+            ) {
+                // Full-residency mode: non-stacked records are not covered by
+                // the pinned-codes alias above, so serve them from the
+                // resident store instead of a bank SSD read.
+                tensor = resident
             } else {
                 tensor = try expertBank.materializedTensor(named: candidate)
             }
