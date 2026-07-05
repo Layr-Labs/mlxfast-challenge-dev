@@ -82,21 +82,41 @@ public final class DeepSeekRuntimeWeightCache {
         guard let stager = loader.expertLayerStager else {
             return
         }
-        var tail: [Int] = []
-        for layerIndex in stride(from: config.numHiddenLayers - 1, through: 0, by: -1) {
-            if loader.stagedExpertLayerPlan(layerIndex: layerIndex) != nil {
-                tail.append(layerIndex)
+        // Deferred launch: at the SEED forward's exit (decode worker) the
+        // very next event is a one-token decode step whose entry cancels the
+        // capture — but jobs already running when the cancel lands finish
+        // their in-flight layer memcpy INSIDE the timed decode window,
+        // contending with step 1's demand reads. A short defer lets that
+        // cancel arrive before any capture job starts (teacher-forced step
+        // requests follow the seed response within milliseconds), while the
+        // useful capture site — the prefill worker's exit, where the process
+        // idles for seconds until the parent closes it — is unaffected.
+        // Generation snapshot: if a decode step (or any release-all) happens
+        // during the defer, the capture belongs to a dead generation and
+        // must not schedule at all.
+        let generationAtSchedule = stager.currentGeneration()
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(
+            deadline: .now() + .milliseconds(150)
+        ) { [weak self] in
+            guard let self, stager.currentGeneration() == generationAtSchedule else {
+                return
             }
-            if tail.count >= 6 {
-                break
+            var tail: [Int] = []
+            for layerIndex in stride(from: self.config.numHiddenLayers - 1, through: 0, by: -1) {
+                if self.loader.stagedExpertLayerPlan(layerIndex: layerIndex) != nil {
+                    tail.append(layerIndex)
+                }
+                if tail.count >= 6 {
+                    break
+                }
             }
-        }
-        // Schedule shallowest-first so consumption order matches read order.
-        for layerIndex in tail.reversed() {
-            guard let plan = loader.stagedExpertLayerPlan(layerIndex: layerIndex) else {
-                continue
+            // Schedule shallowest-first so consumption order matches read order.
+            for layerIndex in tail.reversed() {
+                guard let plan = self.loader.stagedExpertLayerPlan(layerIndex: layerIndex) else {
+                    continue
+                }
+                stager.schedule(plan)
             }
-            stager.schedule(plan)
         }
     }
 

@@ -92,6 +92,16 @@ public final class ExpertLayerStager {
         return stagedBytesByRecordName[recordName]
     }
 
+    /// Current cancellation generation. Deferred cross-forward captures
+    /// snapshot this at schedule time and re-check before staging so a
+    /// decode entry (or any release-all) between schedule and launch turns
+    /// the capture into a no-op.
+    public func currentGeneration() -> Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return generation
+    }
+
     /// Frees every staged layer and cancels queued stage jobs. Called at
     /// one-token decode entry: decode never consumes staged data, so anything
     /// staged there is a stale cross-forward capture.
