@@ -133,12 +133,18 @@ public struct DeepSeekWeightLoader {
     private let decodeSideBank: ExpertSlotBank?
     private let bridge: MLXArrayTensorBridge
     private let scheduledPinnedDecodePrefetches = ScheduledDecodePrefetches()
+    private let scheduledStackedProjections = ScheduledStackedProjections()
     private let decodeExpertHistory = DecodeExpertHistory()
     private let routedExpertProjectionPlans: [RoutedExpertProjectionKey: RoutedExpertProjectionPlan]
 
     /// Sized for the official 48 GB runner: pin only where at least that
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
+    /// The prefill stacked-projection prebuild holds up to one extra layer's
+    /// three stacked Metal arrays (~3.3 GiB transient) between build and
+    /// consumption; only worth spending that headroom at the official 48 GB
+    /// runner budget or above. Same sizing rationale as the pinning floor.
+    private static let stackedPrebuildMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
     // Pinning trades 3.2 GiB of RAM per hash layer for guaranteed hits on
     // ~2/43 layers. With init page-cache warming and predictive decode
     // prefetch in place, those same gigabytes serve ALL layers better as
@@ -943,18 +949,24 @@ public struct DeepSeekWeightLoader {
         else {
             return nil
         }
+        // Staged whole-tensor scale bytes first: packed-resident scales are
+        // deliberately kept in the staging plan so this no-decode byte path
+        // serves prefill; the packed store then only ever expands small
+        // per-expert slices on worker threads (decode steps), never whole
+        // tensors on a scored path. Raw-resident scales (excluded from the
+        // plan) fall through to the zero-copy resident branch as before.
         let scalesTensor: MaterializedTensor?
-        if let resident = residentExpertScales?.materializedTensor(named: scalesName, firstAxisIndex: nil) {
-            scalesTensor = resident
-        } else if let staged = expertLayerStager?.stagedBytes(recordName: scalesName),
-                  staged.count == scalesRecord.byteLength,
-                  let dtype = try? TensorDType.parse(scalesRecord.dtype) {
+        if let staged = expertLayerStager?.stagedBytes(recordName: scalesName),
+           staged.count == scalesRecord.byteLength,
+           let dtype = try? TensorDType.parse(scalesRecord.dtype) {
             scalesTensor = try? MaterializedTensor(
                 name: scalesName,
                 dtype: dtype,
                 shape: scalesRecord.shape,
                 bytes: staged
             )
+        } else if let resident = residentExpertScales?.materializedTensor(named: scalesName, firstAxisIndex: nil) {
+            scalesTensor = resident
         } else {
             scalesTensor = nil
         }
@@ -992,6 +1004,70 @@ public struct DeepSeekWeightLoader {
             bits: bits,
             mode: mode
         )
+    }
+
+    /// Schedules a background build of a layer's three whole stacked
+    /// projections as soon as its staged bytes land, so the ~3.3 GiB of
+    /// Data->Metal copies overlap the previous layer's GPU compute and the
+    /// staging reads instead of serializing on the compute thread at layer
+    /// entry. The worker runs the SAME stackedExpertProjection calls over the
+    /// SAME staged bytes the inline build would use, so consumers receive
+    /// byte-identical arrays feeding identical kernels; when anything is
+    /// missing the consumer falls back to the inline build unchanged.
+    /// Duplicate schedules for a layer are ignored.
+    public func scheduleStackedProjectionPrebuild(
+        layerIndex: Int,
+        hiddenSize: Int,
+        intermediateSize: Int
+    ) {
+        // The prebuilt arrays add up to ~3.3 GiB of transient peak while they
+        // wait for consumption — headroom that only exists at the official
+        // 48 GB runner budget. Below it, consumers inline-build as before.
+        guard
+            let stager = expertLayerStager,
+            ProcessInfo.processInfo.physicalMemory >= Self.stackedPrebuildMinimumPhysicalMemoryBytes
+        else {
+            return
+        }
+        let loader = self
+        scheduledStackedProjections.schedule(layerIndex: layerIndex) {
+            // Block until the layer's bytes are staged — the same
+            // waitForLayer call the forward path makes at consumption time
+            // (idempotent once staged). Waiting only; releaseLayer stays with
+            // the forward path's defer. A failed stage returns nil results so
+            // the consumer falls back to the inline build.
+            guard stager.waitForLayer(layerIndex) else {
+                return nil
+            }
+            let expectedShapes: [[Int]] = [
+                [intermediateSize, hiddenSize],
+                [intermediateSize, hiddenSize],
+                [hiddenSize, intermediateSize],
+            ]
+            let kinds: [DeepSeekExpertProjection] = [.gate, .up, .down]
+            var projections = [StackedExpertProjection?](repeating: nil, count: 3)
+            projections.withUnsafeMutableBufferPointer { buffer in
+                let sink = StackedProjectionPrebuildSink(buffer: buffer)
+                DispatchQueue.concurrentPerform(iterations: 3) { index in
+                    sink.buffer[index] = loader.stackedExpertProjection(
+                        layerIndex: layerIndex,
+                        projection: kinds[index],
+                        expectedShape: expectedShapes[index]
+                    )
+                }
+            }
+            return projections
+        }
+    }
+
+    /// Consumes a scheduled stacked-projection prebuild, waiting for its
+    /// background build to finish. Returns nil when nothing was scheduled;
+    /// entries are ordered gate, up, down and each may be nil when that
+    /// projection could not be built (callers fall back to the inline build).
+    public func consumeStackedProjectionPrebuild(
+        layerIndex: Int
+    ) -> [StackedExpertProjection?]? {
+        scheduledStackedProjections.consume(layerIndex: layerIndex)
     }
 
     /// True when every projection's stacked code tensor for the layer is
@@ -1200,8 +1276,14 @@ public struct DeepSeekWeightLoader {
                     guard let companionRecord = expertBank.record(named: companion) else {
                         continue
                     }
+                    // Scales skip staging only when the resident store can
+                    // hand back the whole tensor as zero-copy raw bytes.
+                    // Packed-resident scales stay IN the staging plan: the
+                    // prefill batched path then builds them from the staged
+                    // bytes (the no-decode byte path) instead of paying a
+                    // whole-tensor palette expansion per forward.
                     let scalesResident = suffix == "scales"
-                        && residentExpertScales?.isResident(name: companion) == true
+                        && residentExpertScales?.servesZeroCopyBytes(name: companion) == true
                     if !scalesResident, companionRecord.shape.count >= 2 {
                         names.append(companion)
                     }
@@ -2039,7 +2121,26 @@ public struct DeepSeekWeightLoader {
         shouldSliceCompanions: Bool = false
     ) throws -> DeepSeekLinearWeight {
         let scalesName = Self.companionName(for: baseName, suffix: "scales")
-        guard tensor.dtype == .u32, let scalesTensor = try companionTensor(scalesName, shouldSliceCompanions) else {
+
+        // Resolve the scales' shape/dtype and, only if we still need to build
+        // its MLXArray, the scales MaterializedTensor. When the scales array
+        // was already built off the compute thread (prebuiltScalesArray) we
+        // read its shape/dtype directly and DO NOT call the scales companion
+        // closure — for the palette-packed resident scales store that closure
+        // would otherwise redundantly expand the slice again on the compute
+        // thread just to discard its bytes.
+        let scalesShape: [Int]
+        let scalesIsU8: Bool
+        let scalesTensorForArray: MaterializedTensor?
+        if tensor.dtype == .u32, let prebuiltScalesArray {
+            scalesShape = prebuiltScalesArray.shape
+            scalesIsU8 = prebuiltScalesArray.dtype == .uint8
+            scalesTensorForArray = nil
+        } else if tensor.dtype == .u32, let scalesTensor = try companionTensor(scalesName, shouldSliceCompanions) {
+            scalesShape = scalesTensor.shape
+            scalesIsU8 = scalesTensor.dtype == .u8
+            scalesTensorForArray = scalesTensor
+        } else {
             try validateShape(tensor.shape, expectedShape: expectedShape, tensorName: baseName)
             return DeepSeekLinearWeight(try prebuiltWeightArray ?? bridge.makeArray(from: tensor))
         }
@@ -2073,12 +2174,12 @@ public struct DeepSeekWeightLoader {
         guard [2, 4, 8].contains(bits) else {
             throw MLXFastError.invalidInput("quantized tensor \(baseName) inferred unsupported bits=\(bits)")
         }
-        guard let scaleGroups = scalesTensor.shape.last, scaleGroups > 0, expectedInput % scaleGroups == 0 else {
+        guard let scaleGroups = scalesShape.last, scaleGroups > 0, expectedInput % scaleGroups == 0 else {
             throw MLXFastError.invalidInput(
-                "quantized tensor \(baseName) scales shape \(scalesTensor.shape) is incompatible with logical input \(expectedInput)"
+                "quantized tensor \(baseName) scales shape \(scalesShape) is incompatible with logical input \(expectedInput)"
             )
         }
-        let scaleRows = scalesTensor.shape.dropLast().reduce(1, *)
+        let scaleRows = scalesShape.dropLast().reduce(1, *)
         guard scaleRows == expectedRows else {
             throw MLXFastError.invalidInput(
                 "quantized tensor \(baseName) scales have \(scaleRows) rows; expected \(expectedRows)"
@@ -2088,15 +2189,15 @@ public struct DeepSeekWeightLoader {
             let biasRows = biasesTensor.shape.dropLast().reduce(1, *)
             guard biasRows == expectedRows, biasesTensor.shape.last == scaleGroups else {
                 throw MLXFastError.invalidInput(
-                    "quantized tensor \(baseName) biases shape \(biasesTensor.shape) does not match scales shape \(scalesTensor.shape)"
+                    "quantized tensor \(baseName) biases shape \(biasesTensor.shape) does not match scales shape \(scalesShape)"
                 )
             }
         }
 
-        let mode: QuantizationMode = biasesTensor == nil && scalesTensor.dtype == .u8 ? .mxfp4 : .affine
+        let mode: QuantizationMode = biasesTensor == nil && scalesIsU8 ? .mxfp4 : .affine
         let weightArray = try (prebuiltWeightArray ?? bridge.makeArray(from: tensor))
             .reshaped([expectedRows, packedInput])
-        let scalesArray = try (prebuiltScalesArray ?? bridge.makeArray(from: scalesTensor))
+        let scalesArray = try (prebuiltScalesArray ?? bridge.makeArray(from: scalesTensorForArray!))
             .reshaped([expectedRows, scaleGroups])
         let biasesArray = try biasesTensor.map { try bridge.makeArray(from: $0).reshaped([expectedRows, scaleGroups]) }
         return DeepSeekLinearWeight(
@@ -2216,6 +2317,88 @@ private final class ScheduledDecodePrefetches {
         let result = entry.result
         entry.lock.unlock()
         return result?.isEmpty == true ? nil : result
+    }
+
+    func remove(layerIndex: Int) {
+        lock.lock()
+        entries.removeValue(forKey: layerIndex)
+        lock.unlock()
+    }
+}
+
+// Lets the prebuild worker's concurrentPerform write the three stacked
+// projections into distinct slots from worker threads; each index is written
+// by exactly one iteration (same pattern as the inline build's sink).
+private struct StackedProjectionPrebuildSink: @unchecked Sendable {
+    let buffer: UnsafeMutableBufferPointer<DeepSeekWeightLoader.StackedExpertProjection?>
+}
+
+// Background prebuild registry for whole stacked prefill projections: layer
+// index -> in-flight/finished build of the three stacked projection arrays
+// (gate, up, down). Modeled on ScheduledDecodePrefetches. The consume wait is
+// effectively unbounded (generous safety timeout) because the build it waits
+// on is strictly less work than the inline build the consumer would otherwise
+// run serially on the compute thread.
+private final class ScheduledStackedProjections {
+    private final class Entry {
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var result: [DeepSeekWeightLoader.StackedExpertProjection?]?
+    }
+
+    private let lock = NSLock()
+    // .userInitiated, never .background: background QoS work on the shared
+    // pool can priority-invert against the compute thread's consume wait on
+    // the 12-vCPU official runner.
+    private let queue = DispatchQueue(
+        label: "mlxfast.prefill.stacked-prebuild",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+    private var entries: [Int: Entry] = [:]
+
+    /// Schedules a build for the layer unless one is already in flight or
+    /// awaiting consumption (dedupe is atomic under the registry lock).
+    func schedule(
+        layerIndex: Int,
+        build: @escaping () -> [DeepSeekWeightLoader.StackedExpertProjection?]?
+    ) {
+        let entry = Entry()
+        lock.lock()
+        guard entries[layerIndex] == nil else {
+            lock.unlock()
+            return
+        }
+        entry.group.enter()
+        entries[layerIndex] = entry
+        lock.unlock()
+
+        queue.async {
+            let result = build()
+            entry.lock.lock()
+            entry.result = result
+            entry.lock.unlock()
+            entry.group.leave()
+        }
+    }
+
+    func consume(layerIndex: Int) -> [DeepSeekWeightLoader.StackedExpertProjection?]? {
+        lock.lock()
+        let entry = entries.removeValue(forKey: layerIndex)
+        lock.unlock()
+        guard let entry else {
+            return nil
+        }
+        // The build is bounded by the same staging wait plus array builds the
+        // consumer would otherwise run inline; the timeout is a safety valve
+        // (fall back to the inline build), not an expected path.
+        guard entry.group.wait(timeout: .now() + .seconds(30)) == .success else {
+            return nil
+        }
+        entry.lock.lock()
+        let result = entry.result
+        entry.lock.unlock()
+        return result
     }
 
     func remove(layerIndex: Int) {
