@@ -234,17 +234,12 @@ public enum DeepSeekRoutedExperts {
             // prebuilt entries are visible; later experts' reads keep
             // landing in the background while this subgraph is built.
             var expertPrefetch = decodePrefetch
+            var fusedGateUp: DeepSeekLinearWeight?
             if let decodeStream {
                 decodeStream.waitForExpert(expertIndex)
                 expertPrefetch = decodeStream.snapshotResults()
+                fusedGateUp = decodeStream.fusedGateUpWeight(expertIndex)
             }
-            let expertWeights = try weights(
-                forExpert: expertIndex,
-                loader: loader,
-                spec: spec,
-                preferStaged: useStaged,
-                decodePrefetch: expertPrefetch
-            )
             let tokens: MLXArray
             if tokenCount == 1, flatIndices.count == 1 {
                 tokens = xFlat
@@ -252,11 +247,51 @@ public enum DeepSeekRoutedExperts {
                 let tokenRows = flatIndices.map { Int32($0 / topK) }
                 tokens = xFlat.take(MLXArray(tokenRows), axis: 0)
             }
-            let expertOutput = DeepSeekMLP.forward(
-                tokens,
-                weights: expertWeights,
-                swigluLimit: spec.swigluLimit
-            )
+            let expertOutput: MLXArray
+            if let fusedGateUp,
+               fusedGateUp.logicalShape == [2 * spec.intermediateSize, spec.hiddenSize],
+               let downWeight = try? loader.routedExpertLinearWeight(
+                   layerIndex: spec.layerIndex,
+                   projection: .down,
+                   expectedShape: [spec.hiddenSize, spec.intermediateSize],
+                   expertIndex: expertIndex,
+                   preferStaged: useStaged,
+                   decodePrefetch: expertPrefetch
+               )
+            {
+                // Fused gate+up: ONE quantizedMM at M=1 replaces the two
+                // per-projection dispatches (3 -> 2 per expert). The linear
+                // output is [tokens, outputRows], so the gate half is columns
+                // [0..<intermediate] and the up half [intermediate..<2*inter]
+                // on the LAST axis; each output element is the same
+                // independent per-row dot product the separate gate/up QMMs
+                // compute (see buildFusedGateUpWeight), and limitedSwiGLU is
+                // elementwise, so the down input matches DeepSeekMLP.forward
+                // bit for bit. A failed down build falls through to the
+                // unfused path, which reports the same error as today.
+                let fusedOut = DeepSeekOps.linear(input: tokens, weight: fusedGateUp)
+                let gateOut = fusedOut[0..., 0..<spec.intermediateSize]
+                let upOut = fusedOut[0..., spec.intermediateSize..<(2 * spec.intermediateSize)]
+                let hidden = DeepSeekOps.limitedSwiGLU(
+                    gate: gateOut,
+                    up: upOut,
+                    limit: spec.swigluLimit
+                )
+                expertOutput = DeepSeekOps.linear(input: hidden, weight: downWeight)
+            } else {
+                let expertWeights = try weights(
+                    forExpert: expertIndex,
+                    loader: loader,
+                    spec: spec,
+                    preferStaged: useStaged,
+                    decodePrefetch: expertPrefetch
+                )
+                expertOutput = DeepSeekMLP.forward(
+                    tokens,
+                    weights: expertWeights,
+                    swigluLimit: spec.swigluLimit
+                )
+            }
             // NOTE: an early asyncEval of the first expert's output was
             // measured locally at ~+5-7% decode s/token — the extra command
             // buffer per layer (43/step) costs more than the earlier dispatch
