@@ -133,18 +133,14 @@ public struct DeepSeekWeightLoader {
     private let decodeSideBank: ExpertSlotBank?
     private let bridge: MLXArrayTensorBridge
     private let scheduledPinnedDecodePrefetches = ScheduledDecodePrefetches()
-    private let decodeExpertHistory = DecodeExpertHistory()
     private let routedExpertProjectionPlans: [RoutedExpertProjectionKey: RoutedExpertProjectionPlan]
 
     /// Sized for the official 48 GB runner: pin only where at least that
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
     private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
-    // Pinning trades 3.2 GiB of RAM per hash layer for guaranteed hits on
-    // ~2/43 layers. With init page-cache warming and predictive decode
-    // prefetch in place, those same gigabytes serve ALL layers better as
-    // kernel page cache, and the hash layers' exact token-derived experts are
-    // side-bank prefetched at step entry instead (same overlap, no residency).
-    private static let pinnedHashLayerCap = 0
+    private static let pinnedHashLayerCap = 2
+    private static let partialPinnedHashLayerIndex = 2
+    private static let partialPinnedHashLayerProjections: Set<String> = ["gate_proj", "up_proj"]
 
     public init(
         weightsPath: String,
@@ -184,7 +180,11 @@ public struct DeepSeekWeightLoader {
         self.pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
             ? ResidentExpertStoreRegistry.pinnedHashLayerCodes(
                 manifestPath: manifestPath,
-                hashLayerCount: min(hashLayerCount, Self.pinnedHashLayerCap),
+                fullHashLayerCount: min(hashLayerCount, Self.pinnedHashLayerCap),
+                partialLayerIndex: hashLayerCount > Self.partialPinnedHashLayerIndex
+                    ? Self.partialPinnedHashLayerIndex
+                    : nil,
+                partialProjections: Self.partialPinnedHashLayerProjections,
                 metrics: metrics
             )
             : nil
@@ -407,10 +407,15 @@ public struct DeepSeekWeightLoader {
         layerIndex: Int,
         expertIndices: [Int],
         hiddenSize: Int,
-        intermediateSize: Int
+        intermediateSize: Int,
+        existing: [String: StagedExpertCode]? = nil
     ) -> [String: StagedExpertCode]? {
-        guard let sideBank = decodeSideBank, expertBank.capacity > 0, !expertIndices.isEmpty else {
-            return nil
+        var prefetched = existing ?? [:]
+        guard !expertIndices.isEmpty else {
+            return prefetched.isEmpty ? nil : prefetched
+        }
+        guard let sideBank = decodeSideBank, expertBank.capacity > 0 else {
+            return prefetched.isEmpty ? nil : prefetched
         }
         let projections: [(DeepSeekExpertProjection, [Int])] = [
             (.gate, [intermediateSize, hiddenSize]),
@@ -420,7 +425,7 @@ public struct DeepSeekWeightLoader {
         var keys: [String] = []
         var names: [String] = []
         var indices: [Int] = []
-        var seen = Set<String>()
+        var seen = Set(prefetched.keys)
         for expertIndex in expertIndices {
             for (projection, expectedShape) in projections {
                 if let plan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: projection),
@@ -502,20 +507,18 @@ public struct DeepSeekWeightLoader {
                 )
             }
         }
-        var map: [String: StagedExpertCode] = [:]
-        map.reserveCapacity(keys.count)
+        prefetched.reserveCapacity(prefetched.count + keys.count)
         for (index, key) in keys.enumerated() {
             if let staged = results[index] {
-                map[key] = staged
+                prefetched[key] = staged
             }
         }
-        return map.isEmpty ? nil : map
+        return prefetched.isEmpty ? nil : prefetched
     }
 
     /// Starts building resident pinned-code decode slices for a hash-routed
-    /// layer before that layer reaches MoE. Only the first two hash layers are
-    /// pinned on the official runner; unpinned layers return false so callers
-    /// still issue the normal disk read-ahead.
+    /// layer before that layer reaches MoE. Partially pinned layers still
+    /// return false so callers issue normal disk read-ahead for missing slices.
     @discardableResult
     public func schedulePinnedDecodeExpertCodes(
         layerIndex: Int,
@@ -539,10 +542,6 @@ public struct DeepSeekWeightLoader {
             return false
         }
         let fullyPinned = plan.keys.count == Set(expertIndices).count * 3
-        guard fullyPinned else {
-            scheduledPinnedDecodePrefetches.remove(layerIndex: layerIndex)
-            return false
-        }
         let bridge = self.bridge
         let residentScales = self.residentExpertScales
         scheduledPinnedDecodePrefetches.schedule(layerIndex: layerIndex) {
@@ -555,112 +554,11 @@ public struct DeepSeekWeightLoader {
                 bridge: bridge
             )
         }
-        return true
+        return fullyPinned
     }
 
     public func consumeScheduledPinnedDecodeExpertCodes(layerIndex: Int) -> [String: StagedExpertCode]? {
         scheduledPinnedDecodePrefetches.consume(layerIndex: layerIndex)
-    }
-
-    /// Records the experts a one-token decode step routed at a layer. Used
-    /// only as a prefetch hint for the NEXT step (decode expert selection has
-    /// strong step-to-step locality); never affects routing or outputs.
-    public func recordDecodeExperts(layerIndex: Int, experts: [Int]) {
-        decodeExpertHistory.record(layerIndex: layerIndex, experts: experts)
-    }
-
-    /// Predictive decode prefetch (sanctioned: latency-only, prompt-agnostic
-    /// mechanism — predictions come from the CURRENT request's own routing
-    /// history, like KV reuse). Schedules a background side-bank read + base
-    /// MLXArray build for the experts the layer routed on the PREVIOUS decode
-    /// step, so when the layer's actual routing resolves, correctly predicted
-    /// slices are already read and built. Mispredicted experts are simply not
-    /// consumed; missing ones are fetched on demand exactly as before, so
-    /// outputs are unchanged by construction.
-    public func schedulePredictedDecodeExpertCodes(
-        layerIndex: Int,
-        hiddenSize: Int,
-        intermediateSize: Int
-    ) {
-        schedulePredictedDecodeExpertCodes(
-            layerIndex: layerIndex,
-            experts: decodeExpertHistory.predicted(layerIndex: layerIndex) ?? [],
-            hiddenSize: hiddenSize,
-            intermediateSize: intermediateSize
-        )
-    }
-
-    /// Variant with an explicit expert set — used with the hash layers' exact
-    /// token-derived routing at decode entry, where the experts are known
-    /// before the forward begins.
-    public func schedulePredictedDecodeExpertCodes(
-        layerIndex: Int,
-        experts: [Int],
-        hiddenSize: Int,
-        intermediateSize: Int
-    ) {
-        guard
-            !scheduledPinnedDecodePrefetches.hasEntry(layerIndex: layerIndex),
-            !experts.isEmpty
-        else {
-            return
-        }
-        let loader = self
-        scheduledPinnedDecodePrefetches.schedule(layerIndex: layerIndex) {
-            loader.prefetchDecodeExpertCodes(
-                layerIndex: layerIndex,
-                expertIndices: experts,
-                hiddenSize: hiddenSize,
-                intermediateSize: intermediateSize
-            )
-        }
-    }
-
-    /// Fills in any experts the consumed (possibly predicted) prefetch map is
-    /// missing, using the same concurrent side-bank reads as the full
-    /// prefetch. Returns the merged map (or the fresh map when nothing was
-    /// consumed).
-    public func mergeMissingDecodeExpertCodes(
-        _ consumed: [String: StagedExpertCode]?,
-        layerIndex: Int,
-        experts: [Int],
-        hiddenSize: Int,
-        intermediateSize: Int
-    ) -> [String: StagedExpertCode]? {
-        guard var map = consumed else {
-            return prefetchDecodeExpertCodes(
-                layerIndex: layerIndex,
-                expertIndices: experts,
-                hiddenSize: hiddenSize,
-                intermediateSize: intermediateSize
-            )
-        }
-        // An expert is covered when its gate-projection key is present (all
-        // three projections are always built together).
-        var missing: [Int] = []
-        for expertIndex in experts {
-            let candidates = DeepSeekWeightNames.routedExpert(
-                layerIndex: layerIndex,
-                expertIndex: expertIndex,
-                projection: .gate
-            )
-            let covered = candidates.contains { candidate in
-                map[Self.decodePrefetchKey(candidate, expertIndex)] != nil
-            }
-            if !covered {
-                missing.append(expertIndex)
-            }
-        }
-        if !missing.isEmpty,
-           let fetched = prefetchDecodeExpertCodes(
-               layerIndex: layerIndex,
-               expertIndices: missing,
-               hiddenSize: hiddenSize,
-               intermediateSize: intermediateSize
-           ) {
-            map.merge(fetched) { current, _ in current }
-        }
-        return map
     }
 
     private func pinnedDecodeExpertCodePlan(
@@ -2143,25 +2041,6 @@ private struct DecodePrefetchSink: @unchecked Sendable {
     let buffer: UnsafeMutableBufferPointer<StagedExpertCode?>
 }
 
-/// Last decode step's routed experts per layer — a prefetch hint store.
-/// Lock-guarded; values are only ever used to pre-position weight bytes.
-private final class DecodeExpertHistory {
-    private let lock = NSLock()
-    private var lastExperts: [Int: [Int]] = [:]
-
-    func record(layerIndex: Int, experts: [Int]) {
-        lock.lock()
-        lastExperts[layerIndex] = experts
-        lock.unlock()
-    }
-
-    func predicted(layerIndex: Int) -> [Int]? {
-        lock.lock()
-        defer { lock.unlock() }
-        return lastExperts[layerIndex]
-    }
-}
-
 private final class ScheduledDecodePrefetches {
     private final class Entry {
         let group = DispatchGroup()
@@ -2192,12 +2071,6 @@ private final class ScheduledDecodePrefetches {
         }
     }
 
-    func hasEntry(layerIndex: Int) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return entries[layerIndex] != nil
-    }
-
     func consume(layerIndex: Int) -> [String: StagedExpertCode]? {
         lock.lock()
         let entry = entries.removeValue(forKey: layerIndex)
@@ -2205,7 +2078,7 @@ private final class ScheduledDecodePrefetches {
         guard let entry else {
             return nil
         }
-        guard entry.group.wait(timeout: .now() + .milliseconds(10)) == .success else {
+        guard entry.group.wait(timeout: .now() + .milliseconds(2)) == .success else {
             return nil
         }
         entry.lock.lock()

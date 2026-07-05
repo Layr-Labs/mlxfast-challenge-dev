@@ -124,18 +124,33 @@ extension ResidentExpertTensors {
         }
     }
 
-    /// The packed U32 code tensors of the first `hashLayerCount` layers.
+    /// The packed U32 code tensors of fully pinned hash layers, plus optional
+    /// projection-limited records from one additional hash layer.
     public convenience init?(
         hashLayerCodesFromManifest manifestPath: String,
-        hashLayerCount: Int,
+        fullHashLayerCount: Int,
+        partialLayerIndex: Int? = nil,
+        partialProjections: Set<String> = [],
         metrics: ExpertStreamingMetrics?
     ) {
-        guard hashLayerCount > 0 else {
+        guard fullHashLayerCount > 0 || (partialLayerIndex != nil && !partialProjections.isEmpty) else {
             return nil
         }
         self.init(manifestPath: manifestPath, metrics: metrics) { record in
-            record.dtype == "U32"
-                && Self.layerIndex(fromRecordName: record.name).map { $0 < hashLayerCount } == true
+            guard record.dtype == "U32",
+                  let layerIndex = Self.layerIndex(fromRecordName: record.name)
+            else {
+                return false
+            }
+            if layerIndex < fullHashLayerCount {
+                return true
+            }
+            guard layerIndex == partialLayerIndex,
+                  let projection = record.projection
+            else {
+                return false
+            }
+            return partialProjections.contains(projection)
         }
     }
 
@@ -173,13 +188,19 @@ public enum ResidentExpertStoreRegistry {
 
     public static func pinnedHashLayerCodes(
         manifestPath: String,
-        hashLayerCount: Int,
+        fullHashLayerCount: Int,
+        partialLayerIndex: Int? = nil,
+        partialProjections: Set<String> = [],
         metrics: ExpertStreamingMetrics?
     ) -> ResidentExpertTensors? {
-        pinnedCodesCache.value(for: "\(hashLayerCount)|\(manifestPath)") {
+        let projectionKey = partialProjections.sorted().joined(separator: ",")
+        let key = "\(fullHashLayerCount)|\(partialLayerIndex.map(String.init) ?? "-")|\(projectionKey)|\(manifestPath)"
+        return pinnedCodesCache.value(for: key) {
             ResidentExpertTensors(
                 hashLayerCodesFromManifest: manifestPath,
-                hashLayerCount: hashLayerCount,
+                fullHashLayerCount: fullHashLayerCount,
+                partialLayerIndex: partialLayerIndex,
+                partialProjections: partialProjections,
                 metrics: metrics
             )
         }
