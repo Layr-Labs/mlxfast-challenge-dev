@@ -75,9 +75,28 @@ public enum DeepSeekRoutedExperts {
             if let plan = loader.stagedExpertLayerPlan(layerIndex: spec.layerIndex) {
                 stager.schedule(plan)
                 stagingScheduled = true
+                // Background-build this layer's stacked projection arrays as
+                // soon as its staging completes: covers the first staged
+                // layer of a pass and seed-tail-captured layers, whose bytes
+                // are already resident by now. Duplicate schedules (the
+                // common steady-state case, scheduled one layer ahead below)
+                // are ignored.
+                loader.schedulePrebuild(
+                    layerIndex: spec.layerIndex,
+                    hiddenSize: spec.hiddenSize,
+                    intermediateSize: spec.intermediateSize
+                )
             }
             if let nextPlan = loader.stagedExpertLayerPlan(layerIndex: spec.layerIndex + 1) {
                 stager.schedule(nextPlan)
+                // One layer ahead: by the time the consumer reaches L+1 its
+                // ~3.2 GB of Data->Metal copies have already run on the
+                // prebuild queue, off this compute thread.
+                loader.schedulePrebuild(
+                    layerIndex: spec.layerIndex + 1,
+                    hiddenSize: spec.hiddenSize,
+                    intermediateSize: spec.intermediateSize
+                )
             }
         }
 
@@ -341,27 +360,49 @@ public enum DeepSeekRoutedExperts {
         loader: DeepSeekWeightLoader,
         spec: DeepSeekRoutedExpertSpec
     ) -> MLXArray? {
-        // Build the three stacked projections concurrently: each is one big
-        // Data->Metal copy (vs 256 slice copies on the per-expert path).
-        var projections = [DeepSeekWeightLoader.StackedExpertProjection?](repeating: nil, count: 3)
-        let expectedShapes: [[Int]] = [
-            [spec.intermediateSize, spec.hiddenSize],
-            [spec.intermediateSize, spec.hiddenSize],
-            [spec.hiddenSize, spec.intermediateSize],
-        ]
-        let kinds: [DeepSeekExpertProjection] = [.gate, .up, .down]
-        projections.withUnsafeMutableBufferPointer { buffer in
-            let sink = StackedProjectionSink(buffer: buffer)
-            DispatchQueue.concurrentPerform(iterations: 3) { index in
-                sink.buffer[index] = loader.stackedExpertProjection(
-                    layerIndex: spec.layerIndex,
-                    projection: kinds[index],
-                    expectedShape: expectedShapes[index]
-                )
+        // Prefer the prebuilt stacked projections: the SAME arrays the code
+        // below would build (same stackedExpertProjection calls over the same
+        // staged bytes), constructed on the prebuild queue while this thread
+        // ran the previous layer. Claiming waits out an in-flight build (never
+        // longer than building inline) and returns nil when nothing was
+        // scheduled, in which case the existing inline build runs unchanged.
+        let gate: DeepSeekWeightLoader.StackedExpertProjection
+        let up: DeepSeekWeightLoader.StackedExpertProjection
+        let down: DeepSeekWeightLoader.StackedExpertProjection
+        if let triple = loader.claimPrebuiltStackedProjections(layerIndex: spec.layerIndex),
+           triple.count == 3
+        {
+            gate = triple[0]
+            up = triple[1]
+            down = triple[2]
+        } else {
+            // Build the three stacked projections concurrently: each is one big
+            // Data->Metal copy (vs 256 slice copies on the per-expert path).
+            var projections = [DeepSeekWeightLoader.StackedExpertProjection?](repeating: nil, count: 3)
+            let expectedShapes: [[Int]] = [
+                [spec.intermediateSize, spec.hiddenSize],
+                [spec.intermediateSize, spec.hiddenSize],
+                [spec.hiddenSize, spec.intermediateSize],
+            ]
+            let kinds: [DeepSeekExpertProjection] = [.gate, .up, .down]
+            projections.withUnsafeMutableBufferPointer { buffer in
+                let sink = StackedProjectionSink(buffer: buffer)
+                DispatchQueue.concurrentPerform(iterations: 3) { index in
+                    sink.buffer[index] = loader.stackedExpertProjection(
+                        layerIndex: spec.layerIndex,
+                        projection: kinds[index],
+                        expectedShape: expectedShapes[index]
+                    )
+                }
             }
-        }
-        guard let gate = projections[0], let up = projections[1], let down = projections[2] else {
-            return nil
+            guard let builtGate = projections[0], let builtUp = projections[1],
+                  let builtDown = projections[2]
+            else {
+                return nil
+            }
+            gate = builtGate
+            up = builtUp
+            down = builtDown
         }
 
         let outputCount = selectedExperts.count

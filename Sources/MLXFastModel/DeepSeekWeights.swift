@@ -127,6 +127,11 @@ public struct DeepSeekWeightLoader {
     public let residentExpertScales: ResidentExpertTensors?
     public let pinnedExpertCodes: ResidentExpertTensors?
     public let expertLayerStager: ExpertLayerStager?
+    // One-layer-ahead background builder for the batched prefill path's
+    // stacked projection arrays. Nil without a stager or below the official
+    // runner's memory budget (same gate as pinning), so sub-runner machines
+    // and unit-test fixtures keep byte-identical existing behavior.
+    let stackedProjectionPrebuilder: StackedProjectionPrebuilder?
     // Dedicated capacity-0 side bank for concurrent decode-step slice reads.
     // Capacity 0 => no cache/LRU mutation, so concurrent preads are race-free
     // and read byte-identical ranges through the trusted metered path.
@@ -192,6 +197,10 @@ public struct DeepSeekWeightLoader {
             manifestPath: manifestPath,
             metrics: metrics
         )
+        self.stackedProjectionPrebuilder = ProcessInfo.processInfo.physicalMemory
+            >= Self.pinningMinimumPhysicalMemoryBytes
+            ? self.expertLayerStager.map { StackedProjectionPrebuilder(stager: $0) }
+            : nil
         self.decodeSideBank = try? ExpertSlotBank(
             manifestPath: manifestPath,
             capacity: 0,
@@ -216,8 +225,34 @@ public struct DeepSeekWeightLoader {
         self.residentExpertScales = nil
         self.pinnedExpertCodes = nil
         self.expertLayerStager = nil
+        self.stackedProjectionPrebuilder = nil
         self.decodeSideBank = nil
         self.bridge = bridge
+    }
+
+    /// Enqueues a background build of the layer's stacked projections (no-op
+    /// without a prebuilder). Callers schedule right after the layer's
+    /// staging so the Data->Metal copies run off the compute thread.
+    public func schedulePrebuild(layerIndex: Int, hiddenSize: Int, intermediateSize: Int) {
+        stackedProjectionPrebuilder?.schedule(
+            layerIndex: layerIndex,
+            hiddenSize: hiddenSize,
+            intermediateSize: intermediateSize,
+            loader: self
+        )
+    }
+
+    /// Claims the prebuilt [gate, up, down] triple for a layer, waiting while
+    /// a build is in flight; nil when nothing was scheduled (or the build
+    /// failed), in which case callers run the existing inline build.
+    public func claimPrebuiltStackedProjections(layerIndex: Int) -> [StackedExpertProjection]? {
+        stackedProjectionPrebuilder?.claim(layerIndex: layerIndex)
+    }
+
+    /// Drops every prebuilt stacked array. Called at one-token decode entry
+    /// alongside `releaseAllStagedLayers`.
+    public func releaseAllPrebuiltStackedProjections() {
+        stackedProjectionPrebuilder?.releaseAll()
     }
 
     public func resolveDenseName(_ candidates: [String]) throws -> String {

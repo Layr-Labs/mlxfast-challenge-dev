@@ -87,6 +87,48 @@ public final class ExpertLayerStager {
         return isStaged
     }
 
+    /// Blocks until a scheduled layer is staged, WITHOUT mutating the failed
+    /// set. Used only by the stacked-projection prebuilder so the consumer's
+    /// `waitForLayer` failure semantics are untouched.
+    public func waitForLayerStaged(_ layerIndex: Int) -> Bool {
+        condition.lock()
+        while pendingLayers.contains(layerIndex) {
+            condition.wait()
+        }
+        let isStaged = recordNamesByLayer[layerIndex] != nil
+        condition.unlock()
+        return isStaged
+    }
+
+    /// Current cancellation generation, for prebuild jobs to bail after a
+    /// decode-entry release exactly like staging jobs do.
+    public var currentGeneration: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return generation
+    }
+
+    /// Drops a staged layer's byte buffers while KEEPING the layer's staged
+    /// marker, so the consumer's `waitForLayer` still reports the layer as
+    /// staged. Called by the prebuilder at publication: the built stacked
+    /// MLXArrays replace the staged Data atomically (bytes out, arrays in).
+    /// Returns false — releasing nothing — when the generation moved on
+    /// (decode entry cancelled everything) or the layer is not staged.
+    public func releaseLayerBytesKeepingMarker(
+        _ layerIndex: Int,
+        ifGeneration expected: Int
+    ) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        guard expected == generation, let names = recordNamesByLayer[layerIndex] else {
+            return false
+        }
+        for name in names {
+            stagedBytesByRecordName.removeValue(forKey: name)
+        }
+        return true
+    }
+
     /// Whole-tensor bytes for a staged record, or nil when not staged.
     public func stagedBytes(recordName: String) -> Data? {
         condition.lock()

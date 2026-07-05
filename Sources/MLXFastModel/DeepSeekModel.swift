@@ -133,6 +133,7 @@ public enum DeepSeekModel {
             // cross-forward tail capture before it can hold memory or run
             // reads during the decode steps.
             weightCache.loader.expertLayerStager?.releaseAllStagedLayers()
+            weightCache.loader.releaseAllPrebuiltStackedProjections()
             // Decode step: hash-layer routing depends only on the token id,
             // so advise the kernel about those layers' expert ranges before
             // the forward starts. inputIDs is a leaf array on every decode
