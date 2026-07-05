@@ -73,6 +73,13 @@ public enum DeepSeekRoutedExperts {
             if let nextPlan = loader.stagedExpertLayerPlan(layerIndex: spec.layerIndex + 1) {
                 stager.schedule(nextPlan)
             }
+            // Depth-3 lookahead: with pinning removed and the batched path's
+            // fast consume, the read pipeline can run a layer deeper without
+            // the memory pressure that made this negative on the pre-batching
+            // code. Never isolated on the current lineage until now.
+            if let nextNextPlan = loader.stagedExpertLayerPlan(layerIndex: spec.layerIndex + 2) {
+                stager.schedule(nextNextPlan)
+            }
             stagingScheduled = true
         }
 
