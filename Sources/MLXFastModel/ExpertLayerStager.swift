@@ -160,6 +160,19 @@ public final class ExpertLayerStager {
             results.withUnsafeMutableBufferPointer { buffer in
                 let sink = StagerResultSink(buffer: buffer)
                 DispatchQueue.concurrentPerform(iterations: names.count) { index in
+                    // Per-record cancellation check: a cancelled cross-forward
+                    // capture (decode entry bumped the generation) stops
+                    // between records instead of finishing the whole ~3.2 GB
+                    // layer, bounding in-window churn to one record's read.
+                    // Live stage jobs never observe a bumped generation, so
+                    // the consumed path is unchanged.
+                    condition.lock()
+                    let cancelled = scheduledGeneration != generation
+                    condition.unlock()
+                    if cancelled {
+                        failed.set()
+                        return
+                    }
                     if let tensor = try? sideBank.materializedTensor(named: names[index]) {
                         sink.buffer[index] = tensor.bytes
                     } else {
