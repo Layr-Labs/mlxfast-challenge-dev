@@ -87,7 +87,14 @@ public final class DeepSeekRuntimeWeightCache {
             if loader.stagedExpertLayerPlan(layerIndex: layerIndex) != nil {
                 tail.append(layerIndex)
             }
-            if tail.count >= 6 {
+            // K=7: one layer deeper than the promoted K=6. The capture cost
+            // stays a background page-cache memcpy as long as the marginal
+            // layer's pages are still resident at prefill exit; the eviction
+            // frontier at that moment sits well below the last ~7 layers
+            // (the pass ends having just streamed them). App-held capture
+            // RAM (~22 GB transient) exists only in the untimed phase gap
+            // and is freed at first decode-step entry or seed consumption.
+            if tail.count >= 7 {
                 break
             }
         }
