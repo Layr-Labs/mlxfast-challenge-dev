@@ -87,7 +87,7 @@ public final class DeepSeekRuntimeWeightCache {
             if loader.stagedExpertLayerPlan(layerIndex: layerIndex) != nil {
                 tail.append(layerIndex)
             }
-            if tail.count >= 6 {
+            if tail.count >= 8 {
                 break
             }
         }
