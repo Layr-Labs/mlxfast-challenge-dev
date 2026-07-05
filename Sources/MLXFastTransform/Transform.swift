@@ -85,6 +85,16 @@ public enum SwiftTransform {
             index: index
         )
 
+        // Losslessly palette-pack the routed-expert e8m0 scales into a compact
+        // overlay (experts/scales_packed.safetensors + scale_compression.json).
+        // The manifest above still describes the original U8 scales, so this is
+        // purely additive: the runtime resident-scales store consumes the packed
+        // overlay when present and falls back to streaming otherwise.
+        try ScaleCompression.writePackedScales(
+            referenceDirectory: referenceDirectory,
+            expertsDirectory: expertsDirectory
+        )
+
         return TransformReport(
             referencePath: referenceDirectory.path,
             outputPath: outputDirectory.path,
