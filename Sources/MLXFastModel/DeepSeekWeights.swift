@@ -170,10 +170,13 @@ public struct DeepSeekWeightLoader {
         // ~14 GiB of resident data per loader would threaten the 48 GB
         // runner budget.
         let manifestPath = "\(weightsPath)/experts/manifest.json"
-        self.residentExpertScales = ResidentExpertStoreRegistry.scales(
-            manifestPath: manifestPath,
-            metrics: metrics
-        )
+        // Scales residency (8.4 GiB) is disabled: the same gigabytes serve
+        // ALL streamed bytes better as kernel page cache (the mechanism that
+        // produced the 4.12 and 4.32 promotions when applied to the pinned
+        // codes). Scales slices are read through the trusted side bank
+        // concurrently with their code slices below; their small, per-step
+        // repeating working set stays page-cache-hot.
+        self.residentExpertScales = nil
         // Pinning trades RAM for guaranteed hits on the token-id-routed
         // layers; only worthwhile at the official 48 GB budget or above,
         // and capped so the pinned codes (~3.2 GiB per layer) leave headroom
@@ -378,18 +381,20 @@ public struct DeepSeekWeightLoader {
         residentScales: ResidentExpertTensors?,
         bridge: MLXArrayTensorBridge,
         codeName: String,
-        expertIndex: Int
+        expertIndex: Int,
+        sideBank: ExpertSlotBank? = nil
     ) -> MLXArray? {
-        guard let residentScales else {
-            return nil
-        }
         let scalesName = codeName.hasSuffix(".weight")
             ? String(codeName.dropLast(".weight".count)) + ".scales"
             : codeName + ".scales"
-        guard let scalesTensor = residentScales.materializedTensor(
+        let scalesTensor = residentScales?.materializedTensor(
             named: scalesName,
             firstAxisIndex: expertIndex
-        ) else {
+        ) ?? (try? sideBank?.materializedTensor(
+            named: scalesName,
+            firstAxisIndex: expertIndex
+        ))
+        guard let scalesTensor else {
             return nil
         }
         return try? bridge.makeArray(from: scalesTensor)
@@ -465,6 +470,7 @@ public struct DeepSeekWeightLoader {
         let bridge = self.bridge
         let residentScales = self.residentExpertScales
         let pinnedCodes = self.pinnedExpertCodes
+        let scalesSideBank = self.decodeSideBank
         var results = [StagedExpertCode?](repeating: nil, count: keys.count)
         results.withUnsafeMutableBufferPointer { buffer in
             let sink = DecodePrefetchSink(buffer: buffer)
@@ -493,7 +499,8 @@ public struct DeepSeekWeightLoader {
                     residentScales: residentScales,
                     bridge: bridge,
                     codeName: name,
-                    expertIndex: expertIndex
+                    expertIndex: expertIndex,
+                    sideBank: scalesSideBank
                 )
                 sink.buffer[index] = StagedExpertCode(
                     tensor: tensor,
@@ -545,6 +552,7 @@ public struct DeepSeekWeightLoader {
         }
         let bridge = self.bridge
         let residentScales = self.residentExpertScales
+        let scalesSideBank = self.decodeSideBank
         scheduledPinnedDecodePrefetches.schedule(layerIndex: layerIndex) {
             Self.buildPinnedDecodeExpertCodes(
                 keys: plan.keys,
@@ -552,7 +560,8 @@ public struct DeepSeekWeightLoader {
                 indices: plan.indices,
                 pinnedCodes: pinnedCodes,
                 residentScales: residentScales,
-                bridge: bridge
+                bridge: bridge,
+                scalesSideBank: scalesSideBank
             )
         }
         return true
@@ -731,7 +740,8 @@ public struct DeepSeekWeightLoader {
         indices: [Int],
         pinnedCodes: ResidentExpertTensors,
         residentScales: ResidentExpertTensors?,
-        bridge: MLXArrayTensorBridge
+        bridge: MLXArrayTensorBridge,
+        scalesSideBank: ExpertSlotBank? = nil
     ) -> [String: StagedExpertCode]? {
         var results = [StagedExpertCode?](repeating: nil, count: keys.count)
         results.withUnsafeMutableBufferPointer { buffer in
@@ -752,7 +762,8 @@ public struct DeepSeekWeightLoader {
                     residentScales: residentScales,
                     bridge: bridge,
                     codeName: name,
-                    expertIndex: expertIndex
+                    expertIndex: expertIndex,
+                    sideBank: scalesSideBank
                 )
                 sink.buffer[index] = StagedExpertCode(
                     tensor: tensor,
@@ -829,6 +840,7 @@ public struct DeepSeekWeightLoader {
         }
         let bridge = self.bridge
         let residentScales = self.residentExpertScales
+        let scalesSideBank = self.decodeSideBank
         var results = [StagedExpertCode?](repeating: nil, count: keys.count)
         results.withUnsafeMutableBufferPointer { buffer in
             let sink = DecodePrefetchSink(buffer: buffer)
@@ -849,7 +861,8 @@ public struct DeepSeekWeightLoader {
                     residentScales: residentScales,
                     bridge: bridge,
                     codeName: names[index],
-                    expertIndex: indices[index]
+                    expertIndex: indices[index],
+                    sideBank: scalesSideBank
                 )
                 sink.buffer[index] = StagedExpertCode(
                     tensor: tensor,
@@ -2170,11 +2183,7 @@ private final class ScheduledDecodePrefetches {
     }
 
     private let lock = NSLock()
-    private let queue = DispatchQueue(
-        label: "mlxfast.decode.pinned-prefetch",
-        qos: .userInitiated,
-        attributes: .concurrent
-    )
+    private let queue = DispatchQueue(label: "mlxfast.decode.pinned-prefetch", qos: .userInitiated)
     private var entries: [Int: Entry] = [:]
 
     func schedule(
