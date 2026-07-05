@@ -6,11 +6,24 @@ public struct DeepSeekMLPWeights {
     public let gate: DeepSeekLinearWeight
     public let up: DeepSeekLinearWeight
     public let down: DeepSeekLinearWeight
+    /// Optional load-time row-concatenation of `gate` and `up` into ONE
+    /// quantized weight ([2*intermediate, hidden] logical; gate rows first).
+    /// Built only by the dense shared-expert loader when every fusion guard
+    /// passes (see DeepSeekWeightLoader.fusedRowConcatWeight); nil keeps the
+    /// two-projection path bit-for-bit as before. Per-expert routed weights
+    /// never set this — their fusion lives on the decode stream instead.
+    public let fusedGateUp: DeepSeekLinearWeight?
 
-    public init(gate: DeepSeekLinearWeight, up: DeepSeekLinearWeight, down: DeepSeekLinearWeight) {
+    public init(
+        gate: DeepSeekLinearWeight,
+        up: DeepSeekLinearWeight,
+        down: DeepSeekLinearWeight,
+        fusedGateUp: DeepSeekLinearWeight? = nil
+    ) {
         self.gate = gate
         self.up = up
         self.down = down
+        self.fusedGateUp = fusedGateUp
     }
 
     public init(gate: MLXArray, up: MLXArray, down: MLXArray) {
@@ -88,9 +101,34 @@ public enum DeepSeekMLP {
         weights: DeepSeekMLPWeights,
         swigluLimit: Double
     ) -> MLXArray {
-        let gate = DeepSeekOps.linear(input: x, weight: weights.gate)
-        let up = DeepSeekOps.linear(input: x, weight: weights.up)
-        let hidden = DeepSeekOps.limitedSwiGLU(gate: gate, up: up, limit: swigluLimit)
+        let hidden: MLXArray
+        if let fusedGateUp = weights.fusedGateUp,
+           let fusedRows = fusedGateUp.logicalShape.first,
+           fusedRows % 2 == 0
+        {
+            // ONE quantizedMM replaces the separate gate and up dispatches.
+            // The linear output's LAST axis is the fused weight's output rows
+            // (gate rows first), so columns [0..<intermediate] are exactly the
+            // gate output and [intermediate..<2*intermediate] exactly the up
+            // output: quantizedMM computes each output row as an independent
+            // per-group dot product over the shared input, so row-concatenating
+            // the two weights changes no row's accumulation order or bits (see
+            // DeepSeekWeightLoader.fusedRowConcatWeight). limitedSwiGLU is
+            // elementwise, so the down input matches the unfused path bit for
+            // bit. The intermediate size comes from the fused logical shape —
+            // no config access on this hot path.
+            let intermediate = fusedRows / 2
+            let fusedOut = DeepSeekOps.linear(input: x, weight: fusedGateUp)
+            hidden = DeepSeekOps.limitedSwiGLU(
+                gate: fusedOut[.ellipsis, 0..<intermediate],
+                up: fusedOut[.ellipsis, intermediate..<fusedRows],
+                limit: swigluLimit
+            )
+        } else {
+            let gate = DeepSeekOps.linear(input: x, weight: weights.gate)
+            let up = DeepSeekOps.linear(input: x, weight: weights.up)
+            hidden = DeepSeekOps.limitedSwiGLU(gate: gate, up: up, limit: swigluLimit)
+        }
         return DeepSeekOps.linear(input: hidden, weight: weights.down)
     }
 }

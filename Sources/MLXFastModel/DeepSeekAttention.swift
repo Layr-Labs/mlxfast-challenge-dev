@@ -160,6 +160,14 @@ public struct DeepSeekLocalAttentionWeights {
     public let woB: DeepSeekLinearWeight
     public let woBBias: MLXArray?
     public let attentionSink: MLXArray?
+    /// Optional load-time row-concatenation of `wqA` and `wkv` into ONE
+    /// quantized weight ([qLoraRank + headDim, hidden] logical; wqA rows
+    /// first). Valid because both projections consume the exact same
+    /// post-norm hidden tensor in the attention forwards; built only by the
+    /// dense loader when every fusion guard passes (see
+    /// DeepSeekWeightLoader.fusedRowConcatWeight). nil keeps the separate
+    /// wqA/wkv dispatches bit-for-bit as before.
+    public let fusedWqAWkv: DeepSeekLinearWeight?
 
     public init(
         wqA: DeepSeekLinearWeight,
@@ -170,7 +178,8 @@ public struct DeepSeekLocalAttentionWeights {
         woA: DeepSeekLinearWeight,
         woB: DeepSeekLinearWeight,
         woBBias: MLXArray? = nil,
-        attentionSink: MLXArray? = nil
+        attentionSink: MLXArray? = nil,
+        fusedWqAWkv: DeepSeekLinearWeight? = nil
     ) {
         self.wqA = wqA
         self.qNorm = qNorm
@@ -181,6 +190,7 @@ public struct DeepSeekLocalAttentionWeights {
         self.woB = woB
         self.woBBias = woBBias
         self.attentionSink = attentionSink
+        self.fusedWqAWkv = fusedWqAWkv
     }
 
     public init(
@@ -478,6 +488,36 @@ public enum DeepSeekKVCompressor {
     }
 }
 
+/// Runs the wq_a and wkv projections over the SAME input tensor. When the
+/// loader built the fused wq_a+wkv weight, ONE quantizedMM replaces the two
+/// per-layer dispatches and the halves are sliced off the output's LAST axis
+/// (wq_a's qLoraRank columns first, then wkv's headDim columns). Each output
+/// element is the same independent per-row dot product the separate QMMs
+/// compute (see DeepSeekWeightLoader.fusedRowConcatWeight), so both consumers
+/// see bit-identical values; the slices are lazy views, so downstream chains
+/// consume them exactly where they consumed the separate outputs. Absent or
+/// shape-inconsistent fused weights keep the two-dispatch path unchanged.
+private func projectQueryAndKV(
+    _ x: MLXArray,
+    weights: DeepSeekLocalAttentionWeights
+) -> (q: MLXArray, kv: MLXArray) {
+    if let fused = weights.fusedWqAWkv,
+       let qRows = weights.wqA.logicalShape.first,
+       let kvRows = weights.wkv.logicalShape.first,
+       fused.logicalShape.first == qRows + kvRows
+    {
+        let fusedOut = DeepSeekOps.linear(input: x, weight: fused)
+        return (
+            q: fusedOut[.ellipsis, 0..<qRows],
+            kv: fusedOut[.ellipsis, qRows..<(qRows + kvRows)]
+        )
+    }
+    return (
+        q: DeepSeekOps.linear(input: x, weight: weights.wqA),
+        kv: DeepSeekOps.linear(input: x, weight: weights.wkv)
+    )
+}
+
 public enum DeepSeekLocalAttention {
     public static func forward(
         _ x: MLXArray,
@@ -498,7 +538,8 @@ public enum DeepSeekLocalAttention {
             maxPositionEmbeddings: spec.maxPositionEmbeddings
         )
 
-        var q = DeepSeekOps.linear(input: x, weight: weights.wqA)
+        let projections = projectQueryAndKV(x, weights: weights)
+        var q = projections.q
         q = DeepSeekOps.rmsNorm(input: q, weight: weights.qNorm, eps: spec.rmsNormEps)
         q = DeepSeekOps.linear(input: q, weight: weights.wqB)
         q = q.reshaped([batchSize, sequenceLength, spec.numAttentionHeads, spec.headDim])
@@ -506,7 +547,7 @@ public enum DeepSeekLocalAttention {
         q = q.transposed(0, 2, 1, 3)
         q = try rope.applied(to: q, offset: positionOffset)
 
-        var kv = DeepSeekOps.linear(input: x, weight: weights.wkv)
+        var kv = projections.kv
         kv = DeepSeekOps.rmsNorm(input: kv, weight: weights.kvNorm, eps: spec.rmsNormEps)
         kv = kv.reshaped([batchSize, 1, sequenceLength, spec.headDim])
         kv = try rope.applied(to: kv, offset: positionOffset)
@@ -573,8 +614,9 @@ public enum DeepSeekCompressedAttention {
             maxPositionEmbeddings: spec.maxPositionEmbeddings
         )
 
+        let projections = projectQueryAndKV(x, weights: weights.attention)
         let qResidual = DeepSeekOps.rmsNorm(
-            input: DeepSeekOps.linear(input: x, weight: weights.attention.wqA),
+            input: projections.q,
             weight: weights.attention.qNorm,
             eps: spec.rmsNormEps
         )
@@ -584,7 +626,7 @@ public enum DeepSeekCompressedAttention {
         q = q.transposed(0, 2, 1, 3)
         q = try rope.applied(to: q, offset: positionOffset)
 
-        var kv = DeepSeekOps.linear(input: x, weight: weights.attention.wkv)
+        var kv = projections.kv
         kv = DeepSeekOps.rmsNorm(input: kv, weight: weights.attention.kvNorm, eps: spec.rmsNormEps)
         kv = kv.reshaped([batchSize, 1, sequenceLength, spec.headDim])
         kv = try rope.applied(to: kv, offset: positionOffset)

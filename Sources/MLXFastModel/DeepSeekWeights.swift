@@ -369,6 +369,27 @@ public struct DeepSeekWeightLoader {
         routedExpertProjectionPlans[RoutedExpertProjectionKey(layerIndex: layerIndex, projection: projection)]
     }
 
+    /// Resolves a code tensor's RAM-resident scales slice as a
+    /// MaterializedTensor (raw bytes + shape/dtype), off the compute thread.
+    /// Thread-safe: the resident store is immutable and every decode returns
+    /// a fresh buffer. Returns nil when the scales are not resident.
+    static func residentScalesTensor(
+        residentScales: ResidentExpertTensors?,
+        codeName: String,
+        expertIndex: Int
+    ) -> MaterializedTensor? {
+        guard let residentScales else {
+            return nil
+        }
+        let scalesName = codeName.hasSuffix(".weight")
+            ? String(codeName.dropLast(".weight".count)) + ".scales"
+            : codeName + ".scales"
+        return residentScales.materializedTensor(
+            named: scalesName,
+            firstAxisIndex: expertIndex
+        )
+    }
+
     /// Builds the base scales MLXArray for a code tensor off the compute
     /// thread, but only when the scales are RAM-resident (the common frontier
     /// path). Thread-safe: the resident store is immutable and makeArray is a
@@ -380,15 +401,10 @@ public struct DeepSeekWeightLoader {
         codeName: String,
         expertIndex: Int
     ) -> MLXArray? {
-        guard let residentScales else {
-            return nil
-        }
-        let scalesName = codeName.hasSuffix(".weight")
-            ? String(codeName.dropLast(".weight".count)) + ".scales"
-            : codeName + ".scales"
-        guard let scalesTensor = residentScales.materializedTensor(
-            named: scalesName,
-            firstAxisIndex: expertIndex
+        guard let scalesTensor = residentScalesTensor(
+            residentScales: residentScales,
+            codeName: codeName,
+            expertIndex: expertIndex
         ) else {
             return nil
         }
@@ -697,7 +713,20 @@ public struct DeepSeekWeightLoader {
         var keys: [String] = []
         var names: [String] = []
         var indices: [Int] = []
+        var roles: [DeepSeekExpertProjection] = []
         var seen = Set<String>()
+        // Fused gate+up decode weight: eligibility is a per-LAYER record
+        // contract check (identical stacked shapes/dtypes, no biases). An
+        // expert additionally participates only when BOTH its gate and up
+        // slices are scheduled on THIS stream via the plan path, so
+        // prepopulated entries (scheduled pinned/predicted prebuilds) and the
+        // candidates fallback keep the unfused path exactly as before.
+        let fusionEligible = decodeGateUpFusionEligible(
+            layerIndex: layerIndex,
+            hiddenSize: hiddenSize,
+            intermediateSize: intermediateSize
+        )
+        var scheduledFusionHalves: [Int: (gate: Bool, up: Bool)] = [:]
         // Same (expert, projection) -> (key, name) resolution as
         // prefetchDecodeExpertCodes; the only addition is skipping slices the
         // consumed map already holds.
@@ -711,6 +740,16 @@ public struct DeepSeekWeightLoader {
                         keys.append(key)
                         names.append(plan.name)
                         indices.append(expertIndex)
+                        roles.append(projection)
+                        if fusionEligible, projection != .down {
+                            var halves = scheduledFusionHalves[expertIndex] ?? (gate: false, up: false)
+                            if projection == .gate {
+                                halves.gate = true
+                            } else {
+                                halves.up = true
+                            }
+                            scheduledFusionHalves[expertIndex] = halves
+                        }
                     }
                     continue
                 }
@@ -734,6 +773,7 @@ public struct DeepSeekWeightLoader {
                         keys.append(key)
                         names.append(candidate)
                         indices.append(expertIndex)
+                        roles.append(projection)
                     }
                     break
                 }
@@ -753,6 +793,12 @@ public struct DeepSeekWeightLoader {
             expertGroups[expertIndex] = DispatchGroup()
         }
         let stream = DecodeExpertCodeStream(results: prepopulated, expertGroups: expertGroups)
+        let fusionExperts = Set(
+            scheduledFusionHalves.filter { $0.value.gate && $0.value.up }.map(\.key)
+        )
+        let fusion: DecodeGateUpFusionState? = fusionExperts.isEmpty
+            ? nil
+            : DecodeGateUpFusionState(experts: fusionExperts)
         let bridge = self.bridge
         let residentScales = self.residentExpertScales
         let pinnedCodes = self.pinnedExpertCodes
@@ -763,6 +809,7 @@ public struct DeepSeekWeightLoader {
             let key = keys[index]
             let name = names[index]
             let expertIndex = indices[index]
+            let role = roles[index]
             guard let group = expertGroups[expertIndex] else {
                 continue
             }
@@ -785,20 +832,261 @@ public struct DeepSeekWeightLoader {
                 else {
                     return
                 }
-                // Also build the resident scales' base array off-thread.
-                let scalesArray = Self.residentScalesArray(
+                // Also build the resident scales' base array off-thread. The
+                // slice is resolved tensor-first (the exact two calls
+                // residentScalesArray makes) so the fusion step below can
+                // reuse the raw scales bytes without a second expansion.
+                let scalesTensor = Self.residentScalesTensor(
                     residentScales: residentScales,
-                    bridge: bridge,
                     codeName: name,
                     expertIndex: expertIndex
                 )
+                let scalesArray = scalesTensor.flatMap { try? bridge.makeArray(from: $0) }
                 stream.store(
                     key: key,
                     code: StagedExpertCode(tensor: tensor, array: array, scalesArray: scalesArray)
                 )
+                // Fused gate+up build: deposit this half; whichever of the
+                // expert's gate/up workers lands SECOND receives the pair and
+                // builds the fused weight here, before its group.leave, so a
+                // successful waitForExpert always observes the fused entry.
+                // Failure at any step (non-resident scales, guard mismatch)
+                // simply leaves the fused slot empty and the consumer keeps
+                // the unfused per-projection path over the individual entries
+                // stored above — correctness never depends on the fusion.
+                guard
+                    let fusion,
+                    role != .down,
+                    let scalesTensor,
+                    let pair = fusion.deposit(
+                        expertIndex: expertIndex,
+                        projection: role,
+                        half: DecodeGateUpFusionState.Half(codes: tensor, scales: scalesTensor)
+                    ),
+                    let fused = Self.buildFusedGateUpWeight(
+                        gate: pair.gate,
+                        up: pair.up,
+                        hiddenSize: hiddenSize,
+                        intermediateSize: intermediateSize,
+                        bridge: bridge
+                    )
+                else {
+                    return
+                }
+                stream.storeFusedGateUp(expertIndex: expertIndex, weight: fused)
             }
         }
         return stream
+    }
+
+    /// Layer-level record contract for the decode fused gate+up weight: both
+    /// projections must resolve through the precomputed plan to stacked U32
+    /// code tensors of IDENTICAL shape sized for [intermediateSize,
+    /// hiddenSize], with scales companions of identical shape/dtype, and
+    /// neither may carry a biases companion (the fused weight is built
+    /// biases-free, so mode/groupSize/bits derivation matches the
+    /// per-projection linearWeight exactly). Any mismatch keeps the whole
+    /// layer on the unfused path.
+    private func decodeGateUpFusionEligible(
+        layerIndex: Int,
+        hiddenSize: Int,
+        intermediateSize: Int
+    ) -> Bool {
+        guard
+            let gatePlan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: .gate),
+            let upPlan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: .up),
+            gatePlan.record.dtype == "U32",
+            upPlan.record.dtype == "U32",
+            gatePlan.record.shape.count == 3,
+            gatePlan.record.shape == upPlan.record.shape,
+            gatePlan.record.shape[1] == intermediateSize,
+            let packedInput = gatePlan.record.shape.last,
+            packedInput > 0,
+            (packedInput * 32) % hiddenSize == 0,
+            [2, 4, 8].contains(packedInput * 32 / hiddenSize),
+            let gateScales = gatePlan.scalesRecord,
+            let upScales = upPlan.scalesRecord,
+            gateScales.dtype == upScales.dtype,
+            gateScales.shape == upScales.shape,
+            gateScales.shape.count == 3,
+            gateScales.shape[0] == gatePlan.record.shape[0],
+            gateScales.shape[1] == intermediateSize,
+            let scaleGroups = gateScales.shape.last,
+            scaleGroups > 0,
+            hiddenSize % scaleGroups == 0,
+            gatePlan.biasesRecord == nil,
+            upPlan.biasesRecord == nil
+        else {
+            return false
+        }
+        return true
+    }
+
+    /// Builds ONE fused quantized weight whose output rows are the gate
+    /// projection's rows followed by the up projection's rows, for the decode
+    /// streamed path. Bit-exactness: quantizedMM computes each OUTPUT row as
+    /// an independent per-group dot product over that row's code/scale bytes
+    /// and the shared input, so row-concatenating two weight matrices that
+    /// share the same input leaves every row's accumulation order — and
+    /// therefore its result bits — unchanged; rows [0..<intermediate] of the
+    /// fused output are exactly the gate output and rows [intermediate...]
+    /// exactly the up output (the same argument the batched prefill path
+    /// documents for slicing experts out of one stacked tensor). The byte
+    /// concatenation IS axis-0 concat for row-major [rows, width] tensors,
+    /// and groupSize/bits/mode are derived from the same inputs linearWeight
+    /// uses for each half (biases were guarded absent at the layer level), so
+    /// they match the individual weights by construction. Returns nil when
+    /// any shape/dtype guard fails; callers then keep the unfused path.
+    private static func buildFusedGateUpWeight(
+        gate: DecodeGateUpFusionState.Half,
+        up: DecodeGateUpFusionState.Half,
+        hiddenSize: Int,
+        intermediateSize: Int,
+        bridge: MLXArrayTensorBridge
+    ) -> DeepSeekLinearWeight? {
+        guard
+            gate.codes.dtype == .u32,
+            up.codes.dtype == .u32,
+            gate.codes.shape.count == 2,
+            gate.codes.shape == up.codes.shape,
+            gate.scales.dtype == up.scales.dtype,
+            gate.scales.shape.count == 2,
+            gate.scales.shape == up.scales.shape,
+            let rows = gate.codes.shape.first,
+            rows == intermediateSize,
+            gate.scales.shape.first == rows,
+            let packedInput = gate.codes.shape.last,
+            packedInput > 0,
+            (packedInput * 32) % hiddenSize == 0,
+            let scaleGroups = gate.scales.shape.last,
+            scaleGroups > 0,
+            hiddenSize % scaleGroups == 0
+        else {
+            return nil
+        }
+        let bits = packedInput * 32 / hiddenSize
+        guard [2, 4, 8].contains(bits) else {
+            return nil
+        }
+        var fusedCodeBytes = Data(capacity: gate.codes.bytes.count + up.codes.bytes.count)
+        fusedCodeBytes.append(gate.codes.bytes)
+        fusedCodeBytes.append(up.codes.bytes)
+        var fusedScalesBytes = Data(capacity: gate.scales.bytes.count + up.scales.bytes.count)
+        fusedScalesBytes.append(gate.scales.bytes)
+        fusedScalesBytes.append(up.scales.bytes)
+        guard
+            let fusedCodes = try? MaterializedTensor(
+                name: "\(gate.codes.name)#fused-gate-up",
+                dtype: .u32,
+                shape: [2 * rows, packedInput],
+                bytes: fusedCodeBytes
+            ),
+            let fusedScales = try? MaterializedTensor(
+                name: "\(gate.scales.name)#fused-gate-up",
+                dtype: gate.scales.dtype,
+                shape: [2 * rows, scaleGroups],
+                bytes: fusedScalesBytes
+            ),
+            let weightArray = try? bridge.makeArray(from: fusedCodes),
+            let scalesArray = try? bridge.makeArray(from: fusedScales)
+        else {
+            return nil
+        }
+        // Same mode predicate as linearWeight with the biases companion
+        // guarded absent: u8 scales => mxfp4, otherwise affine.
+        let mode: QuantizationMode = gate.scales.dtype == .u8 ? .mxfp4 : .affine
+        return DeepSeekLinearWeight(
+            weight: weightArray,
+            scales: scalesArray,
+            biases: nil,
+            logicalShape: [2 * rows, hiddenSize],
+            groupSize: hiddenSize / scaleGroups,
+            bits: bits,
+            mode: mode
+        )
+    }
+
+    /// Load-time row-concatenation of two quantized dense weights that
+    /// consume the SAME input vector, into ONE quantized weight whose output
+    /// rows are `first`'s rows followed by `second`'s rows.
+    ///
+    /// Bit-exactness: quantizedMM computes each OUTPUT row as an independent
+    /// per-group dot product over that row's code/scale(/bias) bytes and the
+    /// shared input, so row-concatenation changes neither any row's
+    /// accumulation order nor its result bits — columns [0..<firstRows] of
+    /// the fused linear output are exactly `first`'s output and
+    /// [firstRows..<firstRows+secondRows] exactly `second`'s (the same
+    /// argument the decode streamed gate+up fusion above and the batched
+    /// prefill path document). `concatenated(axis: 0)` on the row-major 2-D
+    /// packed codes/scales/biases IS the byte-level row concat, and the fused
+    /// weight reuses the halves' identical groupSize/bits/mode verbatim.
+    /// Guards: both quantized with identical groupSize/bits/mode and scales
+    /// dtype, 2-D packed layouts with matching widths and logical input, and
+    /// biases either both absent or both present with matching shapes/dtypes;
+    /// any mismatch returns nil and callers keep the unfused per-projection
+    /// path. Call at LOAD time only — the concat allocates real buffers that
+    /// warmup then materializes outside every scored window.
+    static func fusedRowConcatWeight(
+        _ first: DeepSeekLinearWeight,
+        _ second: DeepSeekLinearWeight
+    ) -> DeepSeekLinearWeight? {
+        guard
+            let firstScales = first.scales,
+            let secondScales = second.scales,
+            first.groupSize == second.groupSize,
+            first.bits == second.bits,
+            first.mode == second.mode,
+            first.weight.dtype == second.weight.dtype,
+            firstScales.dtype == secondScales.dtype,
+            first.logicalShape.count == 2,
+            second.logicalShape.count == 2,
+            let firstRows = first.logicalShape.first,
+            let secondRows = second.logicalShape.first,
+            firstRows > 0,
+            secondRows > 0,
+            first.logicalShape.last == second.logicalShape.last,
+            first.weight.shape.count == 2,
+            second.weight.shape.count == 2,
+            first.weight.shape[0] == firstRows,
+            second.weight.shape[0] == secondRows,
+            first.weight.shape[1] == second.weight.shape[1],
+            firstScales.shape.count == 2,
+            secondScales.shape.count == 2,
+            firstScales.shape[0] == firstRows,
+            secondScales.shape[0] == secondRows,
+            firstScales.shape[1] == secondScales.shape[1]
+        else {
+            return nil
+        }
+        let fusedBiases: MLXArray?
+        switch (first.biases, second.biases) {
+        case (nil, nil):
+            fusedBiases = nil
+        case (let firstBiases?, let secondBiases?):
+            guard
+                firstBiases.dtype == secondBiases.dtype,
+                firstBiases.shape.count == 2,
+                secondBiases.shape.count == 2,
+                firstBiases.shape[0] == firstRows,
+                secondBiases.shape[0] == secondRows,
+                firstBiases.shape[1] == firstScales.shape[1],
+                secondBiases.shape[1] == secondScales.shape[1]
+            else {
+                return nil
+            }
+            fusedBiases = concatenated([firstBiases, secondBiases], axis: 0)
+        default:
+            return nil
+        }
+        return DeepSeekLinearWeight(
+            weight: concatenated([first.weight, second.weight], axis: 0),
+            scales: concatenated([firstScales, secondScales], axis: 0),
+            biases: fusedBiases,
+            logicalShape: [firstRows + secondRows, first.logicalShape[1]],
+            groupSize: first.groupSize,
+            bits: first.bits,
+            mode: first.mode
+        )
     }
 
     private func pinnedDecodeExpertCodePlan(
@@ -1481,11 +1769,16 @@ public struct DeepSeekWeightLoader {
         attentionBias: Bool = false
     ) throws -> DeepSeekLocalAttentionWeights {
         let groupedInput = spec.numAttentionHeads * spec.headDim / spec.outputGroups
+        let wqA = try denseLinearWeight(
+            candidates: DeepSeekWeightNames.attention(layerIndex, "wq_a.weight"),
+            expectedShape: [qLoraRank, hiddenSize]
+        )
+        let wkv = try denseLinearWeight(
+            candidates: DeepSeekWeightNames.attention(layerIndex, "wkv.weight"),
+            expectedShape: [spec.headDim, hiddenSize]
+        )
         return try DeepSeekLocalAttentionWeights(
-            wqA: denseLinearWeight(
-                candidates: DeepSeekWeightNames.attention(layerIndex, "wq_a.weight"),
-                expectedShape: [qLoraRank, hiddenSize]
-            ),
+            wqA: wqA,
             qNorm: denseArray(
                 candidates: DeepSeekWeightNames.attention(layerIndex, "q_norm.weight"),
                 expectedShape: [qLoraRank]
@@ -1494,10 +1787,7 @@ public struct DeepSeekWeightLoader {
                 candidates: DeepSeekWeightNames.attention(layerIndex, "wq_b.weight"),
                 expectedShape: [spec.numAttentionHeads * spec.headDim, qLoraRank]
             ),
-            wkv: denseLinearWeight(
-                candidates: DeepSeekWeightNames.attention(layerIndex, "wkv.weight"),
-                expectedShape: [spec.headDim, hiddenSize]
-            ),
+            wkv: wkv,
             kvNorm: denseArray(
                 candidates: DeepSeekWeightNames.attention(layerIndex, "kv_norm.weight"),
                 expectedShape: [spec.headDim]
@@ -1519,7 +1809,15 @@ public struct DeepSeekWeightLoader {
             attentionSink: optionalDenseArray(
                 candidates: DeepSeekWeightNames.attention(layerIndex, "attn_sink"),
                 expectedShape: [spec.numAttentionHeads]
-            )
+            ),
+            // Load-time wq_a+wkv fusion: BOTH projections consume the exact
+            // same post-norm hidden tensor in DeepSeekLocalAttention.forward
+            // and DeepSeekCompressedAttention.forward, so one QMM whose
+            // output rows are [qLoraRank of wq_a | headDim of wkv] replaces
+            // two dispatches per layer forward with bit-identical rows.
+            // Guard failures leave fusedWqAWkv nil and the unfused path
+            // untouched.
+            fusedWqAWkv: Self.fusedRowConcatWeight(wqA, wkv)
         )
     }
 
@@ -1694,19 +1992,28 @@ public struct DeepSeekWeightLoader {
         hiddenSize: Int,
         intermediateSize: Int
     ) throws -> DeepSeekMLPWeights {
-        try DeepSeekMLPWeights(
-            gate: denseLinearWeight(
-                candidates: DeepSeekWeightNames.feedForward(layerIndex, "shared_experts.gate_proj.weight"),
-                expectedShape: [intermediateSize, hiddenSize]
-            ),
-            up: denseLinearWeight(
-                candidates: DeepSeekWeightNames.feedForward(layerIndex, "shared_experts.up_proj.weight"),
-                expectedShape: [intermediateSize, hiddenSize]
-            ),
-            down: denseLinearWeight(
+        let gate = try denseLinearWeight(
+            candidates: DeepSeekWeightNames.feedForward(layerIndex, "shared_experts.gate_proj.weight"),
+            expectedShape: [intermediateSize, hiddenSize]
+        )
+        let up = try denseLinearWeight(
+            candidates: DeepSeekWeightNames.feedForward(layerIndex, "shared_experts.up_proj.weight"),
+            expectedShape: [intermediateSize, hiddenSize]
+        )
+        // Load-time gate+up fusion: both halves were validated against the
+        // identical [intermediateSize, hiddenSize] logical shape above and
+        // consume the same MoE input, so one QMM + last-axis halves replaces
+        // two dispatches per shared-expert forward (decode AND prefill) with
+        // bit-identical rows. Guard failures (unquantized halves, metadata
+        // mismatch) leave fusedGateUp nil and the unfused path untouched.
+        return DeepSeekMLPWeights(
+            gate: gate,
+            up: up,
+            down: try denseLinearWeight(
                 candidates: DeepSeekWeightNames.feedForward(layerIndex, "shared_experts.down_proj.weight"),
                 expectedShape: [hiddenSize, intermediateSize]
-            )
+            ),
+            fusedGateUp: Self.fusedRowConcatWeight(gate, up)
         )
     }
 
@@ -2325,6 +2632,12 @@ private struct DecodePrefetchSink: @unchecked Sendable {
 public final class DecodeExpertCodeStream: @unchecked Sendable {
     private let lock = NSLock()
     private var results: [String: StagedExpertCode]
+    // Fused gate+up weights per expert, built by the second-finishing of the
+    // expert's gate/up stream workers before that worker's group.leave; a
+    // per-step transient exactly like the per-slice entries above. Absent
+    // entries (guards failed, timeout, prepopulated halves) mean consumers
+    // keep the unfused per-projection path.
+    private var fusedGateUpWeights: [Int: DeepSeekLinearWeight] = [:]
     // Immutable after init: one group per expert with scheduled reads,
     // entered once per slice before the stream is handed to the consumer.
     private let expertGroups: [Int: DispatchGroup]
@@ -2361,6 +2674,73 @@ public final class DecodeExpertCodeStream: @unchecked Sendable {
         lock.lock()
         results[key] = code
         lock.unlock()
+    }
+
+    /// The expert's prebuilt fused gate+up weight, when both halves landed on
+    /// this stream and every fusion guard passed. Read AFTER waitForExpert:
+    /// the fusing worker stores before its group.leave, so a successful wait
+    /// orders the store before this read. nil => use the unfused path.
+    public func fusedGateUpWeight(_ expertIndex: Int) -> DeepSeekLinearWeight? {
+        lock.lock()
+        defer { lock.unlock() }
+        return fusedGateUpWeights[expertIndex]
+    }
+
+    fileprivate func storeFusedGateUp(expertIndex: Int, weight: DeepSeekLinearWeight) {
+        lock.lock()
+        fusedGateUpWeights[expertIndex] = weight
+        lock.unlock()
+    }
+}
+
+/// Per-expert rendezvous for the decode gate+up fusion: each of the expert's
+/// two participating stream workers deposits its finished half (code slice +
+/// resident scales slice, both immutable), and the SECOND depositor receives
+/// the completed pair to build the fused weight on its own thread. Experts
+/// outside the scheduled set — or halves whose scales were not resident —
+/// never complete a pair, which is safe: nothing waits on fusion, and the
+/// consumer falls back to the unfused path when the fused entry is absent.
+private final class DecodeGateUpFusionState: @unchecked Sendable {
+    struct Half {
+        let codes: MaterializedTensor
+        let scales: MaterializedTensor
+    }
+
+    private let lock = NSLock()
+    private let experts: Set<Int>
+    private var pendingGate: [Int: Half] = [:]
+    private var pendingUp: [Int: Half] = [:]
+
+    init(experts: Set<Int>) {
+        self.experts = experts
+    }
+
+    func deposit(
+        expertIndex: Int,
+        projection: DeepSeekExpertProjection,
+        half: Half
+    ) -> (gate: Half, up: Half)? {
+        guard experts.contains(expertIndex) else {
+            return nil
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        switch projection {
+        case .gate:
+            if let up = pendingUp.removeValue(forKey: expertIndex) {
+                return (gate: half, up: up)
+            }
+            pendingGate[expertIndex] = half
+            return nil
+        case .up:
+            if let gate = pendingGate.removeValue(forKey: expertIndex) {
+                return (gate: gate, up: half)
+            }
+            pendingUp[expertIndex] = half
+            return nil
+        case .down:
+            return nil
+        }
     }
 }
 

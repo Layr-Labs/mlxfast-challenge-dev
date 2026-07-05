@@ -191,7 +191,14 @@ enum DeepSeekWarmup {
     }
 
     private static func collect(_ mlp: DeepSeekMLPWeights) -> [MLXArray] {
-        collect(mlp.gate) + collect(mlp.up) + collect(mlp.down)
+        var arrays = collect(mlp.gate) + collect(mlp.up) + collect(mlp.down)
+        // The fused gate+up weight is a load-time concat graph; evaluating it
+        // here materializes the fused buffers inside the untimed constructor
+        // so no scored forward pays for the concatenation.
+        if let fused = mlp.fusedGateUp {
+            arrays += collect(fused)
+        }
+        return arrays
     }
 
     private static func collect(_ hyperConnection: DeepSeekHyperConnectionWeights) -> [MLXArray] {
@@ -209,6 +216,11 @@ enum DeepSeekWarmup {
         arrays.append(attention.kvNorm)
         if let bias = attention.woBBias { arrays.append(bias) }
         if let sink = attention.attentionSink { arrays.append(sink) }
+        // Materialize the load-time fused wq_a+wkv concat inside the untimed
+        // constructor so no scored forward pays for it.
+        if let fused = attention.fusedWqAWkv {
+            arrays += collect(fused)
+        }
         return arrays
     }
 
