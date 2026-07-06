@@ -18,11 +18,35 @@ public final class DeepSeekRuntimeWeightCache {
     // can issue exact read-ahead for those layers from the input token id
     // before the forward pass starts. Values are used only as prefetch hints.
     private var hashLayerTables: [(layerIndex: Int, table: [Int32], topK: Int)] = []
+    // Set at full-model init only, mirroring the cacheLimit guard: small
+    // fixture configs (unit tests, convenience callers) stay behavior-free.
+    private let managesBufferCachePhases: Bool
+    private var decodePhaseCacheClearPending = false
 
     public init(loader: DeepSeekWeightLoader, config: DeepSeekConfig) {
         self.loader = loader
         self.config = config
+        self.managesBufferCachePhases =
+            config.numHiddenLayers >= 16 && config.routedExperts >= 64
         eagerlyPrepareForFullModel()
+    }
+
+    /// A prefill-shaped forward just completed: the MLX buffer cache now
+    /// holds ~1 GiB stacked-projection buffers that one-token decode can
+    /// never reuse. Arm a one-shot release for the next decode step.
+    public func notePrefillShapedForwardCompleted() {
+        guard managesBufferCachePhases else { return }
+        decodePhaseCacheClearPending = true
+    }
+
+    /// One-token decode entry: release the dead prefill-sized buffer cache
+    /// back to the OS (page-cache budget for the decode window's expert
+    /// reads). Fires once per prefill->decode transition; cacheLimit is
+    /// unchanged, so decode's small-buffer recycling repopulates normally.
+    public func releasePrefillBufferCacheIfPending() {
+        guard managesBufferCachePhases, decodePhaseCacheClearPending else { return }
+        decodePhaseCacheClearPending = false
+        Memory.clearCache()
     }
 
     /// Exact expert read-ahead for hash-routed layers: their routing depends

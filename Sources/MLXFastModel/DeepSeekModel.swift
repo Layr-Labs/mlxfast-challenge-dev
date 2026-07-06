@@ -133,6 +133,9 @@ public enum DeepSeekModel {
             // cross-forward tail capture before it can hold memory or run
             // reads during the decode steps.
             weightCache.loader.expertLayerStager?.releaseAllStagedLayers()
+            // One-shot release of the dead prefill-sized MLX buffer cache
+            // back to the OS before this step's expert reads begin.
+            weightCache.releasePrefillBufferCacheIfPending()
             // Decode step: hash-layer routing depends only on the token id,
             // so advise the kernel about those layers' expert ranges before
             // the forward starts. inputIDs is a leaf array on every decode
@@ -160,6 +163,10 @@ public enum DeepSeekModel {
             // Prefill-shaped forward complete: capture the freshly-cached
             // TAIL layers for the next prefill-shaped forward (the seed).
             weightCache.scheduleSeedTailCapture()
+            // Arm the one-shot buffer-cache release for the next one-token
+            // decode step: the cache is now full of prefill-sized buffers
+            // that decode can never reuse.
+            weightCache.notePrefillShapedForwardCompleted()
         }
         return result
     }
