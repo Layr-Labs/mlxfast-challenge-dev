@@ -131,6 +131,10 @@ public struct DeepSeekWeightLoader {
     // Capacity 0 => no cache/LRU mutation, so concurrent preads are race-free
     // and read byte-identical ranges through the trusted metered path.
     private let decodeSideBank: ExpertSlotBank?
+    // Structurally hot routed-expert code slices, ranked per layer by the
+    // router's load-balancing bias (low bias = intrinsically popular; a pure
+    // function of the shipped weights). See HotExpertSliceStore.
+    let hotExpertSlices: HotExpertSliceStore?
     private let bridge: MLXArrayTensorBridge
     private let scheduledPinnedDecodePrefetches = ScheduledDecodePrefetches()
     private let decodeExpertHistory = DecodeExpertHistory()
@@ -197,7 +201,62 @@ public struct DeepSeekWeightLoader {
             capacity: 0,
             metrics: metrics
         )
+        // Hot-expert slice pinning (learned layers, top ~20 per layer by
+        // ascending router bias, ~10 GiB): official-budget machines only,
+        // shared through the registry so the harness's two loaders hold one
+        // copy. Ranking is computed from the dense bias tensors right here —
+        // input-independent by construction.
+        if ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes {
+            self.hotExpertSlices = ResidentExpertStoreRegistry.hotExpertSlices(
+                manifestPath: manifestPath,
+                metrics: metrics,
+                rankedExpertsByLayer: Self.structurallyHotExperts(
+                    denseStore: denseStore,
+                    expertBank: expertBank,
+                    bridge: bridge
+                ),
+                expertsPerLayer: 20
+            )
+        } else {
+            self.hotExpertSlices = nil
+        }
         self.bridge = bridge
+    }
+
+    /// Per-layer expert ranking by ascending `gate.e_score_correction_bias`
+    /// (aux-loss-free balancing raises the bias of underused experts, so low
+    /// bias marks the intrinsically popular ones). Layers without a bias
+    /// tensor (hash-routed) are omitted. Weights-only: no inputs involved.
+    private static func structurallyHotExperts(
+        denseStore: DenseTensorStore,
+        expertBank: ExpertSlotBank,
+        bridge: MLXArrayTensorBridge
+    ) -> [Int: [Int]] {
+        var layers = Set<Int>()
+        for record in expertBank.manifest.expertTensors {
+            if let layerIndex = ResidentExpertTensors.layerIndex(fromRecordName: record.name) {
+                layers.insert(layerIndex)
+            }
+        }
+        var ranked: [Int: [Int]] = [:]
+        for layerIndex in layers {
+            let candidates = DeepSeekWeightNames.feedForward(
+                layerIndex, "gate.e_score_correction_bias"
+            )
+            guard
+                let name = candidates.first(where: { denseStore.record(named: $0) != nil }),
+                let tensor = try? denseStore.materializedTensor(named: name),
+                let array = try? bridge.makeArray(from: tensor)
+            else {
+                continue
+            }
+            let bias = array.asType(.float32).asArray(Float.self)
+            guard !bias.isEmpty else {
+                continue
+            }
+            ranked[layerIndex] = bias.indices.sorted { bias[$0] < bias[$1] }
+        }
+        return ranked
     }
 
     public init(
@@ -217,6 +276,7 @@ public struct DeepSeekWeightLoader {
         self.pinnedExpertCodes = nil
         self.expertLayerStager = nil
         self.decodeSideBank = nil
+        self.hotExpertSlices = nil
         self.bridge = bridge
     }
 
@@ -465,6 +525,7 @@ public struct DeepSeekWeightLoader {
         let bridge = self.bridge
         let residentScales = self.residentExpertScales
         let pinnedCodes = self.pinnedExpertCodes
+        let hotSlices = self.hotExpertSlices
         var results = [StagedExpertCode?](repeating: nil, count: keys.count)
         results.withUnsafeMutableBufferPointer { buffer in
             let sink = DecodePrefetchSink(buffer: buffer)
@@ -477,7 +538,10 @@ public struct DeepSeekWeightLoader {
                 // wires the lazy reshape/quant assembly into the graph.
                 // Byte-identical: same bytes, same array constructor.
                 guard
-                    let tensor = pinnedCodes?.materializedTensor(
+                    let tensor = hotSlices?.materializedTensor(
+                        named: name,
+                        firstAxisIndex: expertIndex
+                    ) ?? pinnedCodes?.materializedTensor(
                         named: name,
                         firstAxisIndex: expertIndex
                     ) ?? (try? sideBank.materializedTensor(
@@ -764,6 +828,7 @@ public struct DeepSeekWeightLoader {
         let bridge = self.bridge
         let residentScales = self.residentExpertScales
         let pinnedCodes = self.pinnedExpertCodes
+        let hotSlices = self.hotExpertSlices
         // Every enter() happens before the stream is handed out (and thus
         // before any waitForExpert can run); each worker leaves exactly once
         // via defer, so an expert's group balances when its last slice lands.
@@ -782,7 +847,10 @@ public struct DeepSeekWeightLoader {
                 // Data->Metal copy) off the compute thread. Byte-identical:
                 // same bytes, same array constructor.
                 guard
-                    let tensor = pinnedCodes?.materializedTensor(
+                    let tensor = hotSlices?.materializedTensor(
+                        named: name,
+                        firstAxisIndex: expertIndex
+                    ) ?? pinnedCodes?.materializedTensor(
                         named: name,
                         firstAxisIndex: expertIndex
                     ) ?? (try? sideBank.materializedTensor(
@@ -1272,6 +1340,12 @@ public struct DeepSeekWeightLoader {
                 tensor = prefetched.tensor
                 prebuiltWeightArray = prefetched.array
                 prebuiltScalesArray = prefetched.scalesArray
+            } else if isStacked,
+               let hot = hotExpertSlices?.materializedTensor(
+                   named: candidate,
+                   firstAxisIndex: expertIndex
+               ) {
+                tensor = hot
             } else if isStacked,
                let pinned = pinnedExpertCodes?.materializedTensor(
                    named: candidate,

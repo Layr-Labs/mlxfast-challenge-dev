@@ -364,3 +364,96 @@ public enum ResidentExpertStoreRegistry {
         }
     }
 }
+
+
+/// Slice-level resident store for STRUCTURALLY hot routed experts.
+///
+/// DeepSeek's aux-loss-free load balancer trains `gate.e_score_correction_bias`
+/// to compensate underloaded experts, so at convergence LOW bias marks an
+/// intrinsically popular expert. That makes per-(layer, expert) popularity a
+/// pure function of the shipped weights — input-independent by construction
+/// (the same legitimacy class as the accepted whole-layer pinning and the
+/// resident scales, and the "cross-step expert cache policy" the benchmark
+/// guide lists as a good optimization). This store pins the top-ranked
+/// experts' code slices per learned layer inside a fixed budget: the top of
+/// the popularity distribution is served from RAM at guaranteed-hit density,
+/// while the kernel page cache keeps the adaptive middle.
+///
+/// Loads happen once in the untimed loader constructor through a dedicated
+/// capacity-0 ExpertSlotBank sharing the loader's metrics (honest
+/// misses/bytes, no LRU mutation). Slices are byte-identical stand-ins for
+/// the bank's firstAxisIndex reads.
+public final class HotExpertSliceStore {
+    private let slices: [String: MaterializedTensor]
+
+    public var sliceCount: Int { slices.count }
+
+    public init?(
+        manifestPath: String,
+        metrics: ExpertStreamingMetrics?,
+        rankedExpertsByLayer: [Int: [Int]],
+        expertsPerLayer: Int
+    ) {
+        guard expertsPerLayer > 0, !rankedExpertsByLayer.isEmpty,
+              let bank = try? ExpertSlotBank(
+                  manifestPath: manifestPath,
+                  capacity: 0,
+                  metrics: metrics
+              )
+        else {
+            return nil
+        }
+        var loaded: [String: MaterializedTensor] = [:]
+        for record in bank.manifest.expertTensors where record.dtype == "U32" {
+            guard
+                let layerIndex = ResidentExpertTensors.layerIndex(fromRecordName: record.name),
+                let ranked = rankedExpertsByLayer[layerIndex],
+                let firstDimension = record.shape.first,
+                record.shape.count >= 2,
+                firstDimension > 0,
+                record.byteLength % firstDimension == 0
+            else {
+                continue
+            }
+            for expertIndex in ranked.prefix(expertsPerLayer) where expertIndex < firstDimension {
+                guard let tensor = try? bank.materializedTensor(
+                    named: record.name,
+                    firstAxisIndex: expertIndex
+                ) else {
+                    return nil
+                }
+                loaded["\(record.name)#\(expertIndex)"] = tensor
+            }
+        }
+        guard !loaded.isEmpty else {
+            return nil
+        }
+        self.slices = loaded
+    }
+
+    /// Byte-identical stand-in for the bank's firstAxisIndex read, or nil.
+    public func materializedTensor(named name: String, firstAxisIndex: Int) -> MaterializedTensor? {
+        slices["\(name)#\(firstAxisIndex)"]
+    }
+}
+
+extension ResidentExpertStoreRegistry {
+    private static let hotExpertCache = LockedCache<String, HotExpertSliceStore?>()
+
+    /// Process-wide shared hot-expert store (two loaders must not double it).
+    public static func hotExpertSlices(
+        manifestPath: String,
+        metrics: ExpertStreamingMetrics?,
+        rankedExpertsByLayer: @autoclosure () -> [Int: [Int]],
+        expertsPerLayer: Int
+    ) -> HotExpertSliceStore? {
+        hotExpertCache.value(for: "hot|\(expertsPerLayer)|\(manifestPath)") {
+            HotExpertSliceStore(
+                manifestPath: manifestPath,
+                metrics: metrics,
+                rankedExpertsByLayer: rankedExpertsByLayer(),
+                expertsPerLayer: expertsPerLayer
+            )
+        }
+    }
+}
