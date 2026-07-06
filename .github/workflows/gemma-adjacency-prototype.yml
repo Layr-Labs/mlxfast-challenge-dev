@@ -18,7 +18,12 @@ name: gemma-adjacency-prototype
 # and MLXFAST_BENCHMARK_CHECK_GATES=0 (skips the long correctness pass; runs only
 # the timed prefill+decode). Baked Gemma cache => no re-download. NOT CI/scoring.
 on:
-  # Dispatch-only: pilot with a tiny matrix first, then scale.
+  # Push-triggered so GitHub registers it (dispatch-only never registers). The
+  # verbose first window on each machine acts as an inline pilot: if the
+  # timing-only config fails to write score.json, cancel within ~5 min.
+  push:
+    branches:
+      - gemma-tenki-decode
   workflow_dispatch:
     inputs:
       machines:
