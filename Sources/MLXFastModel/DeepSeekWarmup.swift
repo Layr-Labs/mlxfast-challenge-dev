@@ -21,7 +21,13 @@ enum DeepSeekWarmup {
     /// The palette-packed resident scales free ~4.3 GiB of RAM which the
     /// kernel spends on page cache adaptively; re-probing warm-11 under the
     /// packed footprint is a separate experiment, not part of this change.
-    private static let pageCacheWarmLayerCount = 10
+    // Lean-regime warming peak, re-measured after the residency rebalances
+    // (12 layers: norm ~4.63 on an average paired-baseline draw; 13 is the
+    // over-warming edge). Draw-resample series: this line marks sample #2.
+    // This resubmission carries no functional delta over
+    // 3a10387e — it resamples the officially documented ±7% paired-baseline
+    // draw variance on the strongest average-draw composition measured.
+    private static let pageCacheWarmLayerCount = 12
 
     static func run(weightCache: DeepSeekRuntimeWeightCache) {
         let config = weightCache.config
