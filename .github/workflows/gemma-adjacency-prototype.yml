@@ -1,0 +1,266 @@
+name: gemma-adjacency-prototype
+
+# Ad-hoc PROTOTYPE for the "adjacency-reorder" thermal fix.
+#
+# Claim: the ranked score is a ratio (baseline/candidate); thermal drift only
+# leaks in because the two TIMED windows are minutes apart (correctness bundled
+# between them). If the two timed windows are ADJACENT, both sit at the same
+# thermal state and the drift divides out -- no cooldown needed.
+#
+# Test: run many FAST timing-only windows back-to-back (official 128-step decode
+# + one cold 512 prefill, correctness/gates SKIPPED so each window is ~1.5-2 min
+# instead of ~5), timestamped. Then analyze ratio-vs-gap: decode[i]/decode[i+g]
+# and prefill[i]/prefill[i+g]. Consecutive windows (~1.5 min apart) model the
+# ADJACENT reorder; windows ~4 apart (~6 min) model TODAY's bundled gap. If the
+# ratio CV is tight at small gaps and widens with gap, adjacency works.
+#
+# Timing-only window = ./benchmark.sh with MLXFAST_BENCHMARK_CORRECTNESS_STEPS=0
+# and MLXFAST_BENCHMARK_CHECK_GATES=0 (skips the long correctness pass; runs only
+# the timed prefill+decode). Baked Gemma cache => no re-download. NOT CI/scoring.
+on:
+  # Dispatch-only: pilot with a tiny matrix first, then scale.
+  workflow_dispatch:
+    inputs:
+      machines:
+        description: 'JSON array of machine indices, e.g. "[1,2,3]".'
+        required: false
+        default: "[1,2,3]"
+        type: string
+      passes:
+        description: 'Timing-only windows per machine (back-to-back).'
+        required: false
+        default: "15"
+        type: string
+
+concurrency:
+  group: gemma-adjacency-prototype-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sample:
+    name: "adjacency machine ${{ matrix.machine }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(inputs.machines || '[1,2,3]') }}
+    runs-on: tenki-macos-latest-xlarge
+    timeout-minutes: 120
+    env:
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      MLXFAST_REFERENCE_DIR: /Users/runner/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Host identity
+        run: |
+          set -uo pipefail
+          {
+            echo "machine=${{ matrix.machine }}"
+            echo "model=$(sysctl -n hw.model 2>/dev/null || true)"
+            echo "os=$(sw_vers -productVersion 2>/dev/null || true)"
+            echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee host.txt
+
+      - name: Restore SwiftPM cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        env:
+          MLXFAST_REFERENCE_BASE_URL: https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: "12"
+          MLXFAST_REFERENCE_MIN_FREE_GIB: "40"
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+          MLXFAST_REFERENCE_HASH_VERIFY: "0"
+        run: |
+          set -euo pipefail
+          if [[ ! -f "${MLXFAST_REFERENCE_DIR}/config.json" ]]; then
+            echo "::error::baked Gemma checkpoint missing at ${MLXFAST_REFERENCE_DIR}; refusing to download" >&2
+            exit 1
+          fi
+          ./setup.sh
+
+      - name: Transform reference checkpoint
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" \
+            --output weights
+
+      - name: Sample timing-only windows back-to-back
+        env:
+          MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+          MLXFAST_SKIP_TRANSFORM: "1"
+          MLXFAST_WEIGHTS_PATH: weights
+          # timing-only: skip correctness + gates so each window is ~1.5-2 min
+          MLXFAST_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+          MLXFAST_BENCHMARK_CORRECTNESS_STEPS: "0"
+          MLXFAST_BENCHMARK_CHECK_GATES: "0"
+          PASSES: ${{ inputs.passes || '15' }}
+        run: |
+          set -uo pipefail
+          echo "machine ${{ matrix.machine }}: ${PASSES} timing-only windows (128-step decode, cold prefill)"
+          # columns: index epoch_seconds decode_s_per_tok prefill_s_per_tok
+          : > "samples-${{ matrix.machine }}.txt"
+          for i in $(seq 1 "${PASSES}"); do
+            # First pass: verbose, so a pilot log tells us the timing-only config
+            # actually produced score.json with decode/prefill before we scale up.
+            if [[ "${i}" == "1" ]]; then
+              echo "== pilot: first timing-only window (verbose) =="
+              ./benchmark.sh; rc=$?
+              echo "benchmark.sh exit=${rc}"
+              echo "-- score.json present? --"; ls -la score.json || echo "NO score.json"
+              echo "-- decode/prefill --"
+              python3 - <<'PY' || true
+          import json
+          s=json.load(open("score.json")); m=s["metrics"]
+          print("decode=",m.get("decode_seconds_per_token")," prefill=",m.get("prefill_seconds_per_token")," passed=",s.get("passed"))
+          PY
+            else
+              ./benchmark.sh >/dev/null 2>&1 || true
+            fi
+            ts=$(date +%s)
+            read -r dec pre < <(python3 - <<'PY'
+          import json
+          try:
+              m = json.load(open("score.json"))["metrics"]
+              print(m.get("decode_seconds_per_token",""), m.get("prefill_seconds_per_token",""))
+          except Exception:
+              print("", "")
+          PY
+          )
+            echo "${i} ${ts} ${dec} ${pre}" | tee -a "samples-${{ matrix.machine }}.txt"
+          done
+          echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a host.txt
+          cp host.txt "host-${{ matrix.machine }}.txt"
+
+      - name: Upload machine samples
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-adjacency-prototype-${{ github.run_id }}-machine-${{ matrix.machine }}
+          path: |
+            samples-${{ matrix.machine }}.txt
+            host-${{ matrix.machine }}.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  combine:
+    name: combine
+    needs: [sample]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download samples
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: gemma-adjacency-prototype-${{ github.run_id }}-machine-*
+          path: samples
+          merge-multiple: false
+      - name: Ratio-vs-gap (does adjacency collapse the residual?)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
+          import glob, os, re, statistics as st, math
+          by = {}   # idx -> list of (elapsed_min, decode, prefill)
+          for fp in sorted(glob.glob("samples/**/samples-*.txt", recursive=True)):
+              idx = re.sub(r"^samples-(.+)\.txt$", r"\1", os.path.basename(fp))
+              rows, t0 = [], None
+              for line in open(fp):
+                  parts = line.split()
+                  if len(parts) < 4: continue
+                  try:
+                      e = float(parts[1]); d = float(parts[2]); p = float(parts[3])
+                  except ValueError:
+                      continue
+                  if d <= 0 or p <= 0: continue
+                  if t0 is None: t0 = e
+                  rows.append(((e - t0)/60.0, d, p))
+              if len(rows) >= 2: by[idx] = rows
+
+          def cv(xs):
+              m = st.mean(xs); return (st.pstdev(xs)/m*100.0) if m else float("nan")
+
+          print("## Adjacency prototype: ratio-vs-gap between two timed windows")
+          print()
+          print("Both windows are the SAME code, so the ratio should be 1.0; its spread is")
+          print("pure measurement residual (thermal + transient). Small gap = adjacency-reorder.")
+          print()
+          # per-machine sanity table
+          print("| machine | n | decode mean | prefill mean | window spacing (min) |")
+          print("|---|---|---|---|---|")
+          spac = []
+          for idx in sorted(by):
+              r = by[idx]; d=[x[1] for x in r]; p=[x[2] for x in r]
+              gaps=[r[i+1][0]-r[i][0] for i in range(len(r)-1)]
+              if gaps: spac.append(st.mean(gaps))
+              print(f"| {idx} | {len(r)} | {st.mean(d):.5f} | {st.mean(p):.5f} | {st.mean(gaps) if gaps else float('nan'):.2f} |")
+          med_spacing = st.median(spac) if spac else float("nan")
+          print()
+          print(f"Median window spacing: **{med_spacing:.2f} min**  (=> gap g windows ~= {med_spacing:.2f}*g min apart)")
+          print()
+          print("### Residual as a function of window gap")
+          print()
+          print("| gap g | ~gap (min) | decode ratio mean|dev| | decode ratio CV | prefill ratio mean|dev| | prefill ratio CV |")
+          print("|---|---|---|---|---|---|---|")
+          maxg = min(7, max((len(r) for r in by.values()), default=1)-1)
+          rows_out=[]
+          for g in range(1, maxg+1):
+              dr, pr, gmins = [], [], []
+              for idx in by:
+                  r = by[idx]
+                  for i in range(len(r)-g):
+                      dr.append(r[i][1]/r[i+g][1])
+                      pr.append(r[i][2]/r[i+g][2])
+                      gmins.append(r[i+g][0]-r[i][0])
+              if not dr: continue
+              dd = st.mean([abs(x-1)*100 for x in dr]); pd = st.mean([abs(x-1)*100 for x in pr])
+              gm = st.median(gmins)
+              rows_out.append((g, gm, dd, cv(dr), pd, cv(pr)))
+              print(f"| {g} | {gm:.1f} | {dd:.1f}% | {cv(dr):.1f}% | {pd:.1f}% | {cv(pr):.1f}% |")
+          print()
+          if rows_out:
+              adj = rows_out[0]
+              # bundled ~ closest gap to ~6 min
+              bun = min(rows_out, key=lambda x: abs(x[1]-6.0))
+              print("### Verdict")
+              print()
+              print(f"- ADJACENT (gap {adj[1]:.1f} min): decode ratio CV **{adj[3]:.1f}%**, prefill ratio CV **{adj[5]:.1f}%**")
+              print(f"- BUNDLED-like (gap {bun[1]:.1f} min): decode ratio CV **{bun[3]:.1f}%**, prefill ratio CV **{bun[5]:.1f}%**")
+              d_impr = (bun[3]-adj[3]); p_impr = (bun[5]-adj[5])
+              works = adj[3] < bun[3] and adj[5] <= bun[5]
+              print()
+              print("- **" + ("ADJACENCY WORKS: ratio residual is tighter at small gap and grows with gap; "
+                              "reordering the two timed windows adjacent removes the thermal drift from the score."
+                              if works else
+                              "INCONCLUSIVE: residual does not clearly grow with gap in this run (transient-dominated?).") + "**")
+          print()
+          print("> Same code both sides => ratio~1.0 is expected; we are measuring only the")
+          print("> residual the pairing cannot cancel. Transient spikes still need median-of-N.")
+          PY
+      - name: Upload combined
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-adjacency-prototype-${{ github.run_id }}-combined
+          path: samples
+          if-no-files-found: warn
+          retention-days: 14
