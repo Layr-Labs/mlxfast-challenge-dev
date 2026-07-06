@@ -8,9 +8,8 @@ name: gemma-tenki-decode-probe
 # home cache (no ~17 GB re-download). A small matrix gives the steady decode
 # number plus a same-moment cross-machine spread. NOT part of CI or scoring.
 on:
-  push:
-    branches:
-      - gemma-tenki-decode
+  # Dispatch-only: pushing to this branch must not re-run this longer probe
+  # (a sibling workflow uses the push trigger). Run via `gh workflow run`.
   workflow_dispatch:
     inputs:
       machines:
