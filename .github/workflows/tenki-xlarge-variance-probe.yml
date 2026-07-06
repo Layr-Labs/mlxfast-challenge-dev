@@ -70,7 +70,9 @@ jobs:
     env:
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
-      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
+      # Tenki xlarge image has the checkpoint baked into the runner home cache.
+      # Use it directly so this probe does not re-download 141 GiB per machine.
+      MLXFAST_REFERENCE_DIR: /Users/runner/.cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -115,9 +117,14 @@ jobs:
           MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs || '12' }}
           MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib || '170' }}
           MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+          MLXFAST_REFERENCE_HASH_VERIFY: "0"
         run: |
           set -euo pipefail
           started="${SECONDS}"
+          if [[ ! -f "${MLXFAST_REFERENCE_DIR}/config.json" ]]; then
+            echo "::error::baked reference checkpoint missing at ${MLXFAST_REFERENCE_DIR}; refusing to download during variance probe" >&2
+            exit 1
+          fi
           ./setup.sh
           echo "setup_seconds=$((SECONDS - started))" | tee -a host.txt
 
