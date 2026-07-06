@@ -1,0 +1,294 @@
+name: gemma-baseline-timing-probe
+
+# Manual calibration measurement: run the UNMODIFIED Gemma 4 31B 4-bit baseline
+# (this branch is origin/main plus only this workflow file -- the editable model
+# surface is untouched) timing benchmark on N Blacksmith machines and record
+# per-machine prefill/decode seconds-per-token. It exists to produce the trusted
+# official-runner Gemma baseline measurement required by item 5 of
+# docs/gemma-migration-r2-checklist.md (recalibrate
+# officialBaseline{Prefill,Decode}SecondsPerToken and repoint the timing
+# machine's paired-baseline ref after the DeepSeek -> Gemma migration).
+#
+# Same posture as blacksmith-baseline-variance-probe.yml: NOT part of CI or
+# scoring, secret-free by design -- checked-in public fixture only, a locally
+# synthesized benchmark oracle, no hidden goldens, no R2/Anthropic secrets, no
+# environment protection. Its logs and artifacts are visible to anyone who can
+# trigger it, so it must never touch private material.
+#
+# Each machine runs the FULL official 128-step timing path (512-token cold
+# prefill, 512-token decode seed charged to decode, 128 validated decode steps,
+# official sandbox + runtime-worker posture via MLXFAST_OFFICIAL_BENCHMARK_RUN),
+# so the numbers are directly comparable to the ranked benchmark's own timed
+# measurement and valid inputs for the freeze doc's re-baseline protocol.
+on:
+  workflow_dispatch:
+    inputs:
+      machines:
+        description: 'JSON array of machine indices to run concurrently, e.g. "[1]" for a single sample or "[1,2,3]" for a small spread.'
+        required: false
+        default: "[1,2,3]"
+        type: string
+      reference_download_jobs:
+        description: "Parallel shard downloads for setup.sh, per machine."
+        required: false
+        default: "12"
+        type: string
+      reference_min_free_gib:
+        description: "Minimum free GiB required before reference checkpoint download."
+        required: false
+        default: "40"
+        type: string
+      label:
+        description: "Free-text label to distinguish repeated dispatches in the summary."
+        required: false
+        default: "gemma-baseline"
+        type: string
+
+concurrency:
+  group: gemma-baseline-timing-probe-${{ github.ref }}-${{ inputs.label }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  timing:
+    name: "timing machine ${{ matrix.machine }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(inputs.machines) }}
+    runs-on: blacksmith-12vcpu-macos-26
+    timeout-minutes: 180
+    env:
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Capture host identity
+        # If two matrix entries report the same hostname/boot time they are
+        # contending with each other on one physical host -- worth knowing when
+        # choosing which sample to calibrate from.
+        run: |
+          set -uo pipefail
+          {
+            echo "machine_index=${{ matrix.machine }}"
+            echo "hostname=$(hostname 2>/dev/null || true)"
+            echo "cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)"
+            echo "ncpu=$(sysctl -n hw.ncpu 2>/dev/null || true)"
+            echo "memsize_bytes=$(sysctl -n hw.memsize 2>/dev/null || true)"
+            echo "model=$(sysctl -n hw.model 2>/dev/null || true)"
+            echo "boottime=$(sysctl -n kern.boottime 2>/dev/null || true)"
+            echo "os=$(sw_vers -productVersion 2>/dev/null || true) build=$(sw_vers -buildVersion 2>/dev/null || true)"
+            echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee host.txt
+
+      - name: Restore SwiftPM cache
+        id: restore_swiftpm_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        # No repo secrets by design (see header). setup.sh falls back to its own
+        # public DEFAULT_REFERENCE_BASE_URL and an empty auth header when these
+        # are unset -- exactly what a secret-free probe needs.
+        env:
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
+          MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+        run: |
+          set -euo pipefail
+          started="${SECONDS}"
+          ./setup.sh
+          echo "setup_seconds=$((SECONDS - started))" | tee -a host.txt
+
+      - name: Save SwiftPM cache
+        if: ${{ steps.restore_swiftpm_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: ${{ steps.restore_swiftpm_cache.outputs.cache-primary-key }}
+
+      - name: Transform reference checkpoint
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" \
+            --output weights
+
+      - name: Synthesize a benchmark oracle from the public fixture
+        # The public golden is {version, cases}; the timing path requires a
+        # `benchmark` oracle. Baseline main reproduces the reference's
+        # teacher-forced trajectory (the correctness contract), so an oracle
+        # built from the public case's own tokens passes on baseline and lets us
+        # run the real 128-step timing path with no hidden material.
+        run: |
+          set -euo pipefail
+          python3 - "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" golden_with_oracle.json <<'PY'
+          import json, sys
+          src, dst = sys.argv[1], sys.argv[2]
+          d = json.load(open(src))
+          case = d["cases"][0]
+          prompt = case["prompt_tokens"]
+          expected = case["expected_tokens"]
+          assert len(expected) >= 129, f"need >=129 expected tokens, got {len(expected)}"
+          d["benchmark"] = {
+              "prefill_prompt_tokens": prompt,
+              "expected_prefill_token": expected[0],
+              "decode_seed_tokens": prompt,
+              "expected_decode_seed_token": expected[0],
+              "expected_decode_tokens": expected[1:],
+          }
+          json.dump(d, open(dst, "w"))
+          print(f"oracle: prefill_tokens={len(prompt)} decode_oracle={len(expected[1:])}")
+          PY
+
+      - name: Run baseline timing benchmark (full 128-step official path)
+        # Timing only: no gates, no base correctness steps. Same sandbox + worker
+        # posture as a ranked run (MLXFAST_OFFICIAL_BENCHMARK_RUN=1) so the
+        # measurement environment matches official; only the hidden goldens/gates
+        # are omitted (irrelevant to timing). Baseline main passes the synthesized
+        # oracle, so this produces a real, passing score.json whose
+        # prefill/decode seconds-per-token are published at full precision
+        # (ranking fields are exempt from diagnostic coarsening).
+        env:
+          MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+          MLXFAST_SKIP_TRANSFORM: "1"
+          MLXFAST_WEIGHTS_PATH: weights
+          MLXFAST_CORRECTNESS_GOLDEN_PATH: golden_with_oracle.json
+          MLXFAST_SCORE_PATH: score.json
+          MLXFAST_BENCHMARK_CORRECTNESS_STEPS: "0"
+          MLXFAST_BENCHMARK_CHECK_GATES: "0"
+          MLXFAST_BENCHMARK_SKIP_TIMED: "0"
+          MLXFAST_NOTE: "gemma-baseline-timing-probe machine=${{ matrix.machine }} label=${{ inputs.label }}"
+        run: |
+          set -euo pipefail
+          echo "benchmark_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a host.txt
+          ./benchmark.sh
+          echo "== score.json =="
+          cat score.json
+
+      - name: Upload machine artifact
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-baseline-timing-probe-${{ github.run_id }}-machine-${{ matrix.machine }}
+          path: |
+            score.json
+            host.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  combine:
+    name: combine
+    needs: [timing]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download machine artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: gemma-baseline-timing-probe-${{ github.run_id }}-machine-*
+          path: machines
+          merge-multiple: false
+
+      - name: Tabulate samples
+        env:
+          LABEL: ${{ inputs.label }}
+          MACHINES: ${{ inputs.machines }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
+          import glob, json, os, re, statistics
+
+          def host_field(path, key):
+              try:
+                  for line in open(path):
+                      if line.startswith(key + "="):
+                          return line.split("=", 1)[1].strip()
+              except FileNotFoundError:
+                  return None
+              return None
+
+          rows = []
+          for d in sorted(glob.glob("machines/*")):
+              sp, hp = os.path.join(d, "score.json"), os.path.join(d, "host.txt")
+              idx = host_field(hp, "machine_index") or re.sub(r".*machine-", "", d)
+              row = {"machine": idx,
+                     "host": (host_field(hp, "hostname") or "?"),
+                     "setup_s": host_field(hp, "setup_seconds")}
+              try:
+                  m = json.load(open(sp))["metrics"]
+                  row.update(
+                      decode=m.get("decode_seconds_per_token"),
+                      prefill=m.get("prefill_seconds_per_token"),
+                      ram=m.get("peak_ram_gb"),
+                      timed=m.get("timed_benchmark_seconds"),
+                  )
+              except (FileNotFoundError, KeyError, json.JSONDecodeError):
+                  row["decode"] = None
+              rows.append(row)
+
+          def f(x, nd=6):
+              return "n/a" if x is None else (f"{x:.{nd}f}" if isinstance(x, float) else str(x))
+
+          print(f"## Gemma baseline timing probe — `{os.environ.get('LABEL','')}`")
+          print()
+          print(f"- machines requested: `{os.environ.get('MACHINES','')}`  ·  reported: {len(rows)}")
+          print()
+          print("| m | host | prefill s/tok | decode s/tok | peak RAM GB | setup s | timed s |")
+          print("|---|------|---------------|--------------|-------------|---------|---------|")
+          for r in rows:
+              print("| {m} | {h} | {pf} | {dc} | {ram} | {su} | {ti} |".format(
+                  m=r["machine"], h=(r.get("host") or "?")[-12:],
+                  pf=f(r.get("prefill")), dc=f(r.get("decode")),
+                  ram=f(r.get("ram"), 2), su=r.get("setup_s") or "n/a",
+                  ti=f(r.get("timed"), 1)))
+
+          # Full-precision repr lines for the calibration change: constants must
+          # be copied exactly, not from the rounded table above.
+          print()
+          print("Full-precision samples (copy the chosen machine's pair verbatim):")
+          print()
+          print("```")
+          for r in rows:
+              if isinstance(r.get("decode"), (int, float)):
+                  print(f"machine={r['machine']} prefill_seconds_per_token={r['prefill']!r} decode_seconds_per_token={r['decode']!r}")
+          print("```")
+
+          decodes = [r["decode"] for r in rows if isinstance(r.get("decode"), (int, float))]
+          prefills = [r["prefill"] for r in rows if isinstance(r.get("prefill"), (int, float))]
+          if len(decodes) >= 2:
+              print()
+              print(f"- decode: median `{statistics.median(decodes)!r}` min `{min(decodes)!r}` max `{max(decodes)!r}`")
+              print(f"- prefill: median `{statistics.median(prefills)!r}` min `{min(prefills)!r}` max `{max(prefills)!r}`")
+          PY
+
+      - name: Upload combined summary
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-baseline-timing-probe-${{ github.run_id }}-combined
+          path: machines
+          if-no-files-found: warn
+          retention-days: 30
