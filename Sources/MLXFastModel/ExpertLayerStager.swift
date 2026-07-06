@@ -41,7 +41,7 @@ public final class ExpertLayerStager {
     private var recordNamesByLayer: [Int: [String]] = [:]
     private var pendingLayers: Set<Int> = []
     private var failedLayers: Set<Int> = []
-    // Re-roll marker (6): byte-distinct from submissions 5260a8ed/38aca7da solely for
+    // Re-roll marker (7): byte-distinct from submissions 5260a8ed/38aca7da solely for
     // an independent paired-baseline draw; the mechanism is identical.
     // Bumped by releaseAllStagedLayers; staging jobs scheduled under an older
     // generation bail at start and discard at store, so stale cross-forward
