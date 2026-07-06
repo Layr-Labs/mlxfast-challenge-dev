@@ -247,6 +247,32 @@ public enum SwiftTransform {
                     "byte_offset": Int(header.dataBaseOffset) + info.dataStart,
                     "byte_length": info.byteCount,
                 ])
+                // Span aliases for stacked routed-expert CODE tensors: extra
+                // manifest records over the SAME shard bytes (identical
+                // offsets/length) whose first axis groups g consecutive
+                // experts, so a single trusted first-axis slice read returns
+                // the contiguous bytes of experts [j*g, (j+1)*g). A row-major
+                // [E, R, C] tensor reinterpreted as [E/g, g*R, C] keeps every
+                // byte in place, so the alias validates by the same
+                // shape·dtype product and its slice arithmetic
+                // (byteLength/(E/g) per index) lands on exactly the same file
+                // ranges as g consecutive base-record slices. Zero bytes are
+                // added to the weights tree; readers that iterate the
+                // manifest by exact tensor name never see these.
+                if info.dtype == "U32", info.shape.count == 3,
+                   info.shape[0] > 0, info.shape[1] > 0, info.shape[2] > 0 {
+                    for group in [2, 4, 8, 16, 32] where info.shape[0] % group == 0 {
+                        records.append([
+                            "name": "\(key).mlxspan\(group)",
+                            "shard": shardName,
+                            "dtype": info.dtype,
+                            "shape": [info.shape[0] / group, group * info.shape[1], info.shape[2]],
+                            "data_offsets": [info.dataStart, info.dataEnd],
+                            "byte_offset": Int(header.dataBaseOffset) + info.dataStart,
+                            "byte_length": info.byteCount,
+                        ])
+                    }
+                }
             }
         }
 

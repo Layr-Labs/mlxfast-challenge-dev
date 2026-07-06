@@ -135,6 +135,11 @@ public struct DeepSeekWeightLoader {
     private let scheduledPinnedDecodePrefetches = ScheduledDecodePrefetches()
     private let decodeExpertHistory = DecodeExpertHistory()
     private let routedExpertProjectionPlans: [RoutedExpertProjectionKey: RoutedExpertProjectionPlan]
+    // The LAST stageable layers (same count/selection as the seed tail
+    // capture) are exempt from mid-flight staging restriction: their staged
+    // buffers may be captured across the prefill->seed boundary, where the
+    // NEXT forward's routing is unknown, so they must always stage complete.
+    private var stagingRestrictionExemptLayers: Set<Int> = []
 
     /// Sized for the official 48 GB runner: pin only where at least that
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
@@ -198,6 +203,21 @@ public struct DeepSeekWeightLoader {
             metrics: metrics
         )
         self.bridge = bridge
+        // Mirrors scheduleSeedTailCapture's selection (the deepest stageable
+        // layers, same count) so restriction never trims a layer whose staged
+        // buffers can outlive the forward that knew the routing.
+        if expertLayerStager != nil {
+            var tail: Set<Int> = []
+            let maxLayerIndex = expertBank.manifest.expertTensors.compactMap(\.layerIndex).max() ?? -1
+            var layerIndex = maxLayerIndex
+            while layerIndex >= 0, tail.count < Self.seedTailCaptureLayerCount {
+                if stagedExpertLayerPlan(layerIndex: layerIndex) != nil {
+                    tail.insert(layerIndex)
+                }
+                layerIndex -= 1
+            }
+            self.stagingRestrictionExemptLayers = tail
+        }
     }
 
     public init(
@@ -1029,29 +1049,87 @@ public struct DeepSeekWeightLoader {
         return map.isEmpty ? nil : map
     }
 
-    /// One whole stacked routed-expert projection ([experts, rows, packed]
-    /// codes plus stacked scales/biases companions) built for the batched
-    /// prefill path. Byte sources are, in order: the staged whole-layer
-    /// buffer, the RAM-pinned hash-layer store, or (scales) the resident
-    /// scales store — all byte-identical stand-ins for the bank's stacked
-    /// tensor by the same slice arithmetic the per-expert path uses.
+    /// One stacked routed-expert projection ([experts, rows, packed] codes
+    /// plus stacked scales/biases companions) built for the batched prefill
+    /// path. Byte sources are, in order: the staged layer buffer, the
+    /// RAM-pinned hash-layer store, or (scales) the resident scales store —
+    /// all byte-identical stand-ins for the bank's stacked tensor by the same
+    /// slice arithmetic the per-expert path uses.
+    ///
+    /// Code weights are held as one or more first-axis RUNS instead of a
+    /// single [E, rows, packed] array: a run's MLXArray holds the contiguous
+    /// bytes of experts [expertStart, expertStart+expertCount) — the exact
+    /// same file bytes, in the same order, as the matching rows of the whole
+    /// stack — so `weightView(expert:)` returns a view byte- and
+    /// shape-identical to `wholeStack[expert]`. Building only the runs the
+    /// forward actually consumes skips the Data->Metal copy for unused
+    /// experts, whose bytes today are copied and then never read by any op.
     public struct StackedExpertProjection {
-        public let weight: MLXArray
+        public struct WeightRun {
+            public let expertStart: Int
+            public let expertCount: Int
+            public let array: MLXArray
+        }
+
+        /// Ascending, disjoint expert runs (the whole stack is one run).
+        public let weightRuns: [WeightRun]
         public let scales: MLXArray
         public let biases: MLXArray?
         public let groupSize: Int
         public let bits: Int
         public let mode: QuantizationMode
+
+        /// The [rows, packed] code view for one expert. First-axis indexing
+        /// preserves element order, and runs are cut on expert boundaries, so
+        /// the returned view is identical to indexing the whole stacked
+        /// tensor. Returns nil when the expert is not covered (callers fall
+        /// back to the per-expert path).
+        public func weightView(expert: Int) -> MLXArray? {
+            for run in weightRuns {
+                if expert < run.expertStart {
+                    return nil
+                }
+                if expert < run.expertStart + run.expertCount {
+                    return run.array[expert - run.expertStart]
+                }
+            }
+            return nil
+        }
     }
 
-    /// Builds the whole stacked projection for a layer when every byte is
+    /// Maximal runs of consecutive indices in an ascending index list.
+    private static func maximalRuns(sortedIndices: [Int]) -> [(start: Int, count: Int)] {
+        var runs: [(start: Int, count: Int)] = []
+        for index in sortedIndices {
+            if let last = runs.last {
+                if index == last.start + last.count {
+                    runs[runs.count - 1].count += 1
+                    continue
+                }
+                if index < last.start + last.count {
+                    continue
+                }
+            }
+            runs.append((start: index, count: 1))
+        }
+        return runs
+    }
+
+    /// Builds the stacked projection for a layer when every byte is
     /// already in RAM (staged buffer, pinned codes, resident scales). Returns
     /// nil when any piece is missing so callers fall back to the per-expert
     /// path, which reproduces existing behavior exactly.
+    ///
+    /// When `usedExperts` (ascending) is non-nil and the codes come from the
+    /// staged layer buffer, only the used experts' maximal runs are copied to
+    /// Metal; the skipped experts feed no kernel — the caller iterates used
+    /// experts only — so outputs are unchanged. The pinned/hash resident
+    /// path keeps building the whole stack exactly as before.
     public func stackedExpertProjection(
         layerIndex: Int,
         projection: DeepSeekExpertProjection,
-        expectedShape: [Int]
+        expectedShape: [Int],
+        usedExperts: [Int]? = nil
     ) -> StackedExpertProjection? {
         let candidates = DeepSeekWeightNames.routedExpert(
             layerIndex: layerIndex,
@@ -1076,23 +1154,94 @@ public struct DeepSeekWeightLoader {
             return nil
         }
 
-        // Whole-tensor code bytes: staged layer buffer first, then the pinned
-        // hash-layer store. Both hold the exact stacked tensor bytes.
-        let codesTensor: MaterializedTensor?
-        if let staged = expertLayerStager?.stagedBytes(recordName: candidate),
-           staged.count == record.byteLength,
-           let dtype = try? TensorDType.parse(record.dtype) {
-            codesTensor = try? MaterializedTensor(
-                name: candidate,
-                dtype: dtype,
-                shape: record.shape,
-                bytes: staged
-            )
-        } else {
-            codesTensor = pinnedExpertCodes?.materializedTensor(named: candidate, firstAxisIndex: nil)
-        }
-        guard let codesTensor, let weightArray = try? bridge.makeArray(from: codesTensor) else {
+        guard
+            let expertCount = record.shape.first,
+            expertCount > 0,
+            record.byteLength % expertCount == 0
+        else {
             return nil
+        }
+        let sliceByteLength = record.byteLength / expertCount
+        let sliceShape = Array(record.shape.dropFirst())
+
+        // Code bytes: staged layer buffer first (whole buffer or
+        // read-coalesced spans), then the pinned hash-layer store.
+        // All hold the exact stacked-tensor file bytes.
+        var weightRuns: [StackedExpertProjection.WeightRun] = []
+        if let stagedSpans = stagedCodeSpans(recordName: candidate, record: record) {
+            guard let dtype = try? TensorDType.parse(record.dtype) else {
+                return nil
+            }
+            // One MLXArray per (staged span ∩ used-run): same construction
+            // call as the whole-stack build, over contiguous subranges of the
+            // same staged bytes. A first-axis subrange of a row-major stacked
+            // tensor is exactly the [runLen] + sliceShape tensor of those
+            // experts' rows, so each view weightView returns is byte-identical
+            // to the whole stack's per-expert view.
+            let usedRuns = usedExperts.map { Self.maximalRuns(sortedIndices: $0) }
+            for span in stagedSpans {
+                guard span.bytes.count == span.expertCount * sliceByteLength else {
+                    return nil
+                }
+                let spanEnd = span.expertStart + span.expertCount
+                let pieces: [(start: Int, count: Int)]
+                if let usedRuns {
+                    pieces = usedRuns.compactMap { run in
+                        let start = max(run.start, span.expertStart)
+                        let end = min(run.start + run.count, spanEnd)
+                        return start < end ? (start: start, count: end - start) : nil
+                    }
+                } else {
+                    pieces = [(start: span.expertStart, count: span.expertCount)]
+                }
+                for piece in pieces {
+                    let byteStart = span.bytes.startIndex
+                        + (piece.start - span.expertStart) * sliceByteLength
+                    let subrange = span.bytes[byteStart..<(byteStart + piece.count * sliceByteLength)]
+                    guard
+                        let tensor = try? MaterializedTensor(
+                            name: "\(candidate)[\(piece.start)..<\(piece.start + piece.count)]",
+                            dtype: dtype,
+                            shape: [piece.count] + sliceShape,
+                            bytes: subrange
+                        ),
+                        let array = try? bridge.makeArray(from: tensor)
+                    else {
+                        return nil
+                    }
+                    weightRuns.append(
+                        StackedExpertProjection.WeightRun(
+                            expertStart: piece.start,
+                            expertCount: piece.count,
+                            array: array
+                        )
+                    )
+                }
+            }
+        } else if
+            let pinned = pinnedExpertCodes?.materializedTensor(named: candidate, firstAxisIndex: nil),
+            let array = try? bridge.makeArray(from: pinned)
+        {
+            // Pinned/hash resident path: unchanged whole-stack build.
+            weightRuns = [
+                StackedExpertProjection.WeightRun(
+                    expertStart: 0,
+                    expertCount: expertCount,
+                    array: array
+                ),
+            ]
+        } else {
+            return nil
+        }
+        // Every used expert must be covered by a run, or the caller must fall
+        // back to the per-expert path (which reads any missing expert through
+        // the trusted bank).
+        if let usedExperts {
+            for expert in usedExperts where !weightRuns.contains(where: {
+                expert >= $0.expertStart && expert < $0.expertStart + $0.expertCount
+            }) {
+                return nil
+            }
         }
 
         let scalesName = Self.companionName(for: candidate, suffix: "scales")
@@ -1152,7 +1301,7 @@ public struct DeepSeekWeightLoader {
 
         let mode: QuantizationMode = biasesArray == nil && scalesTensor.dtype == .u8 ? .mxfp4 : .affine
         return StackedExpertProjection(
-            weight: weightArray,
+            weightRuns: weightRuns,
             scales: scalesArray,
             biases: biasesArray,
             groupSize: logicalInput / scaleGroups,
@@ -1333,6 +1482,27 @@ public struct DeepSeekWeightLoader {
             )
     }
 
+    /// Layer count of the prefill-exit seed tail capture; the same layers are
+    /// exempt from mid-flight staging restriction (see
+    /// `restrictStagedExpertLayer`).
+    public static let seedTailCaptureLayerCount = 6
+
+    /// Restricts the layer's IN-FLIGHT staging job to this forward's exact
+    /// routed experts (spans not yet read skip everyone else). Call after the
+    /// routing sync and before consuming the layer. The tail-capture layers
+    /// are exempt so cross-forward captures always stage complete layers.
+    /// Value-identical: skipped experts feed no kernel, and a staged layer
+    /// missing a consumed expert falls back to the trusted bank read.
+    public func restrictStagedExpertLayer(layerIndex: Int, usedExperts: Set<Int>) {
+        guard
+            let stager = expertLayerStager,
+            !stagingRestrictionExemptLayers.contains(layerIndex)
+        else {
+            return
+        }
+        stager.restrict(layerIndex: layerIndex, usedExperts: usedExperts)
+    }
+
     /// Stacked expert record names for one layer, for whole-tensor staging:
     /// the three projection code tensors, plus scales companions when they are
     /// not RAM-resident and biases companions when the manifest has them.
@@ -1389,33 +1559,64 @@ public struct DeepSeekWeightLoader {
         return ExpertLayerStager.LayerPlan(layerIndex: layerIndex, recordNames: names)
     }
 
+    /// The staged byte spans for a stacked codes record, or nil when the
+    /// record is not staged. A whole staged buffer is one [0, E) span; the
+    /// read-coalesced stager hands back its ascending, disjoint expert spans
+    /// directly. Either way each span holds exactly the stacked tensor's file
+    /// bytes for experts [expertStart, expertStart+expertCount).
+    private func stagedCodeSpans(
+        recordName: String,
+        record: ExpertTensorRecord
+    ) -> [(expertStart: Int, expertCount: Int, bytes: Data)]? {
+        guard let stager = expertLayerStager, let expertCount = record.shape.first else {
+            return nil
+        }
+        if let staged = stager.stagedBytes(recordName: recordName),
+           staged.count == record.byteLength {
+            return [(expertStart: 0, expertCount: expertCount, bytes: staged)]
+        }
+        if let spans = stager.stagedSpans(recordName: recordName) {
+            return spans.map { (expertStart: $0.expertStart, expertCount: $0.expertCount, bytes: $0.bytes) }
+        }
+        return nil
+    }
+
     /// Fabricates the same MaterializedTensor the bank's firstAxisIndex read
-    /// would return, from a staged whole-tensor buffer: identical name, dtype,
-    /// shape, and — by the bank's own slice arithmetic — identical bytes.
+    /// would return, from a staged buffer (whole tensor, or the expert span
+    /// covering the index): identical name, dtype, shape, and — by the bank's
+    /// own slice arithmetic — identical bytes.
     private func stagedSliceTensor(recordName: String, expertIndex: Int) -> MaterializedTensor? {
         guard
-            let stager = expertLayerStager,
+            expertLayerStager != nil,
             let record = expertBank.record(named: recordName),
-            let bytes = stager.stagedBytes(recordName: recordName),
             let firstDimension = record.shape.first,
             record.shape.count >= 2,
             expertIndex >= 0,
             expertIndex < firstDimension,
             record.byteLength % firstDimension == 0,
-            bytes.count == record.byteLength,
             let dtype = try? TensorDType.parse(record.dtype)
         else {
             return nil
         }
         let sliceByteLength = record.byteLength / firstDimension
-        let start = bytes.startIndex + expertIndex * sliceByteLength
-        let slice = bytes[start..<(start + sliceByteLength)]
-        return try? MaterializedTensor(
-            name: "\(recordName)[\(expertIndex)]",
-            dtype: dtype,
-            shape: Array(record.shape.dropFirst()),
-            bytes: slice
-        )
+        guard let spans = stagedCodeSpans(recordName: recordName, record: record) else {
+            return nil
+        }
+        for span in spans where expertIndex >= span.expertStart
+            && expertIndex < span.expertStart + span.expertCount {
+            guard span.bytes.count == span.expertCount * sliceByteLength else {
+                return nil
+            }
+            let start = span.bytes.startIndex + (expertIndex - span.expertStart) * sliceByteLength
+            let slice = span.bytes[start..<(start + sliceByteLength)]
+            return try? MaterializedTensor(
+                name: "\(recordName)[\(expertIndex)]",
+                dtype: dtype,
+                shape: Array(record.shape.dropFirst()),
+                bytes: slice
+            )
+        }
+        return nil
     }
 
     public func embedTokens(expectedShape: [Int]) throws -> DeepSeekLinearWeight {

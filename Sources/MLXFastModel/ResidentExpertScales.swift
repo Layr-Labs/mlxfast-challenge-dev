@@ -314,6 +314,9 @@ extension ResidentExpertTensors {
         }
         self.init(manifestPath: manifestPath, metrics: metrics) { record in
             record.dtype == "U32"
+                // Span-alias records cover the same bytes as their base
+                // record; pinning must load each byte once, via the base.
+                && !record.name.contains(".mlxspan")
                 && Self.layerIndex(fromRecordName: record.name).map { $0 < hashLayerCount } == true
         }
     }

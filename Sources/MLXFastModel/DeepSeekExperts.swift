@@ -82,6 +82,16 @@ public enum DeepSeekRoutedExperts {
         }
 
         let selectedExperts = expertIndices.asArray(Int32.self).map(Int.init)
+        // Routing is now materialized (the asArray above is the EXISTING
+        // sync): let this layer's in-flight staging job skip the experts this
+        // forward does not route to. Spans already read are untouched; the
+        // tail-capture layers are exempt inside the loader.
+        if stagingScheduled {
+            loader.restrictStagedExpertLayer(
+                layerIndex: spec.layerIndex,
+                usedExperts: Set(selectedExperts)
+            )
+        }
         let useStaged = stagingScheduled
             && loader.expertLayerStager?.waitForLayer(spec.layerIndex) == true
         defer {
@@ -341,8 +351,23 @@ public enum DeepSeekRoutedExperts {
         loader: DeepSeekWeightLoader,
         spec: DeepSeekRoutedExpertSpec
     ) -> MLXArray? {
+        let outputCount = selectedExperts.count
+        // Group activation flat-indices by expert exactly like the per-expert
+        // path; iteration order only affects concat order, which the inverse
+        // permutation undoes. Grouped BEFORE the projection builds so the
+        // used-expert set (this forward's exact routing, already synced by
+        // the caller) can restrict which code runs are copied to Metal.
+        var flatIndicesByExpert: [Int: [Int]] = [:]
+        flatIndicesByExpert.reserveCapacity(min(outputCount, 256))
+        for (flatIndex, expertIndex) in selectedExperts.enumerated() {
+            flatIndicesByExpert[expertIndex, default: []].append(flatIndex)
+        }
+        let usedExperts = flatIndicesByExpert.keys.sorted()
+
         // Build the three stacked projections concurrently: each is one big
-        // Data->Metal copy (vs 256 slice copies on the per-expert path).
+        // Data->Metal copy per used-expert run (vs 256 slice copies on the
+        // per-expert path, or one whole-stack copy that also hauls the ~31%
+        // of experts this forward never routes to).
         var projections = [DeepSeekWeightLoader.StackedExpertProjection?](repeating: nil, count: 3)
         let expectedShapes: [[Int]] = [
             [spec.intermediateSize, spec.hiddenSize],
@@ -356,22 +381,13 @@ public enum DeepSeekRoutedExperts {
                 sink.buffer[index] = loader.stackedExpertProjection(
                     layerIndex: spec.layerIndex,
                     projection: kinds[index],
-                    expectedShape: expectedShapes[index]
+                    expectedShape: expectedShapes[index],
+                    usedExperts: usedExperts
                 )
             }
         }
         guard let gate = projections[0], let up = projections[1], let down = projections[2] else {
             return nil
-        }
-
-        let outputCount = selectedExperts.count
-        // Group activation flat-indices by expert exactly like the per-expert
-        // path; iteration order only affects concat order, which the inverse
-        // permutation undoes.
-        var flatIndicesByExpert: [Int: [Int]] = [:]
-        flatIndicesByExpert.reserveCapacity(min(outputCount, 256))
-        for (flatIndex, expertIndex) in selectedExperts.enumerated() {
-            flatIndicesByExpert[expertIndex, default: []].append(flatIndex)
         }
 
         let xFlat = x.reshaped([batchSize * sequenceLength, spec.hiddenSize])
@@ -404,8 +420,20 @@ public enum DeepSeekRoutedExperts {
 
         var tokenStart = 0
         for (position, expertIndex) in expertOrder.enumerated() {
+            // Per-expert [rows, packed] views cut from the used-run arrays:
+            // byte- and shape-identical to indexing the whole stacked tensor
+            // (weightView documents the identity). A miss can only mean the
+            // staged runs do not cover a routed expert — fall back to the
+            // per-expert path, which reads it through the trusted bank.
+            guard
+                let gateWeightView = gate.weightView(expert: expertIndex),
+                let upWeightView = up.weightView(expert: expertIndex),
+                let downWeightView = down.weightView(expert: expertIndex)
+            else {
+                return nil
+            }
             let gateWeight = DeepSeekLinearWeight(
-                weight: gate.weight[expertIndex],
+                weight: gateWeightView,
                 scales: gate.scales[expertIndex],
                 biases: gate.biases.map { $0[expertIndex] },
                 logicalShape: gateLogical,
@@ -414,7 +442,7 @@ public enum DeepSeekRoutedExperts {
                 mode: gate.mode
             )
             let upWeight = DeepSeekLinearWeight(
-                weight: up.weight[expertIndex],
+                weight: upWeightView,
                 scales: up.scales[expertIndex],
                 biases: up.biases.map { $0[expertIndex] },
                 logicalShape: gateLogical,
@@ -424,7 +452,7 @@ public enum DeepSeekRoutedExperts {
             )
             downWeights.append(
                 DeepSeekLinearWeight(
-                    weight: down.weight[expertIndex],
+                    weight: downWeightView,
                     scales: down.scales[expertIndex],
                     biases: down.biases.map { $0[expertIndex] },
                     logicalShape: downLogical,
