@@ -114,12 +114,15 @@ jobs:
         run: |
           set -uo pipefail
           echo "machine ${{ matrix.machine }}: ${PASSES} cold prefill passes"
-          # header: index prefill_s_per_tok decode_s_per_tok(setup-charged, ref only)
+          # columns: index epoch_seconds prefill_s_per_tok decode_s_per_tok
+          # epoch lets combine test for THERMAL drift: prefill trending up with
+          # time-on-machine = throttling; flat/scatter = not thermal.
           : > "samples-${{ matrix.machine }}.txt"
           for i in $(seq 1 "${PASSES}"); do
             # Each invocation is a fresh process: cold Metal kernels, cold
             # allocator => a genuine cold prefill, same as the scored path.
             ./benchmark.sh --local-iterate >/dev/null 2>&1 || true
+            ts=$(date +%s)
             read -r p d < <(python3 - <<'PY'
           import json
           try:
@@ -129,7 +132,7 @@ jobs:
               print("", "")
           PY
           )
-            echo "${i} ${p} ${d}" | tee -a "samples-${{ matrix.machine }}.txt"
+            echo "${i} ${ts} ${p} ${d}" | tee -a "samples-${{ matrix.machine }}.txt"
           done
           echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a host.txt
           cp host.txt "host-${{ matrix.machine }}.txt"
@@ -163,73 +166,110 @@ jobs:
           set -euo pipefail
           python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
           import glob, os, re, statistics as st, math
-          by_machine = {}
+          by_machine = {}   # idx -> list of (elapsed_min, prefill)
           for fp in sorted(glob.glob("samples/**/samples-*.txt", recursive=True)):
               idx = re.sub(r"^samples-(.+)\.txt$", r"\1", os.path.basename(fp))
-              vals = []
+              rows = []; t0 = None
               for line in open(fp):
                   parts = line.split()
-                  if len(parts) >= 2:
-                      try:
-                          v = float(parts[1])
-                          if v > 0: vals.append(v)
-                      except ValueError:
-                          pass
-              if vals: by_machine[idx] = vals
+                  # new format: idx epoch prefill decode ; tolerate old: idx prefill decode
+                  if len(parts) >= 4:
+                      ep, pv = parts[1], parts[2]
+                  elif len(parts) == 3:
+                      ep, pv = None, parts[1]
+                  else:
+                      continue
+                  try:
+                      p = float(pv)
+                  except ValueError:
+                      continue
+                  if p <= 0: continue
+                  e = None
+                  if ep is not None:
+                      try: e = float(ep)
+                      except ValueError: e = None
+                  if e is not None and t0 is None: t0 = e
+                  rows.append(((e - t0)/60.0 if (e is not None and t0 is not None) else None, p))
+              if rows: by_machine[idx] = rows
 
           def cv(xs):
               m = st.mean(xs)
               return (st.pstdev(xs)/m*100.0) if m else float("nan")
+          def linreg(xs, ys):
+              mx, my = st.mean(xs), st.mean(ys)
+              sxx = sum((x-mx)**2 for x in xs); syy = sum((y-my)**2 for y in ys)
+              sxy = sum((x-mx)*(y-my) for x, y in zip(xs, ys))
+              slope = sxy/sxx if sxx else 0.0
+              r = sxy/math.sqrt(sxx*syy) if sxx and syy else 0.0
+              return slope, r
 
-          print("## Gemma prefill variance: how much survives the paired baseline")
+          print("## Gemma prefill variance: thermal drift + how much survives pairing")
           print()
           print("Prefill = one cold 512-token forward per process (the scored shape).")
           print()
-          print("| machine | n | mean s/tok | tok/s | within-host CV | min | max | max/min |")
-          print("|---|---|---|---|---|---|---|---|")
-          machine_means = []
-          within_cvs = []
-          pooled = []
-          adj_ratios = []      # consecutive same-host pass ratios  -> pairing residual (short gap)
-          span_ratios = []     # first-vs-last same-host ratio       -> pairing residual (max in-job drift)
+          print("| machine | n | mean s/tok | tok/s | within CV | 1st third | last third | drift | slope/min | r(time) |")
+          print("|---|---|---|---|---|---|---|---|---|---|")
+          machine_means, within_cvs, pooled = [], [], []
+          adj_ratios, span_ratios, drifts, slopes_pct, rs = [], [], [], [], []
           for idx in sorted(by_machine):
-              xs = by_machine[idx]
-              machine_means.append(st.mean(xs))
-              within_cvs.append(cv(xs))
-              pooled.extend(xs)
-              for a, b in zip(xs, xs[1:]):
-                  adj_ratios.append(b/a)
-              span_ratios.append(xs[-1]/xs[0])
-              print(f"| {idx} | {len(xs)} | {st.mean(xs):.5f} | {1/st.mean(xs):.2f} | {cv(xs):.1f}% | {min(xs):.5f} | {max(xs):.5f} | {max(xs)/min(xs):.2f}x |")
+              rows = by_machine[idx]
+              pf = [p for _, p in rows]
+              machine_means.append(st.mean(pf)); within_cvs.append(cv(pf)); pooled.extend(pf)
+              for a, b in zip(pf, pf[1:]): adj_ratios.append(b/a)
+              span_ratios.append(pf[-1]/pf[0])
+              k = max(1, len(pf)//3)
+              f3, l3 = st.mean(pf[:k]), st.mean(pf[-k:])
+              drift = (l3-f3)/f3*100.0; drifts.append(drift)
+              el = [e for e, _ in rows if e is not None]
+              if len(el) == len(pf) and len(set(el)) > 1:
+                  slope, r = linreg(el, pf)
+                  slope_pct = slope/st.mean(pf)*100.0   # %/min of mean
+                  slopes_pct.append(slope_pct); rs.append(r)
+                  scol, rcol = f"{slope_pct:+.1f}%", f"{r:+.2f}"
+              else:
+                  scol, rcol = "n/a", "n/a"
+              print(f"| {idx} | {len(pf)} | {st.mean(pf):.5f} | {1/st.mean(pf):.2f} | {cv(pf):.1f}% | {f3:.5f} | {l3:.5f} | {drift:+.1f}% | {scol} | {rcol} |")
 
           print()
           if len(machine_means) >= 2 and pooled:
-              raw = cv(pooled)
-              cross = cv(machine_means)                    # host lottery: pairing removes this
-              within = st.mean(within_cvs)                 # same-host noise: pairing keeps this
-              # paired = ratio of two independent same-host cold samples ~ within*sqrt(2)
-              pred_resid = within*math.sqrt(2)
-              emp_adj = cv(adj_ratios)*math.sqrt(1) if adj_ratios else float("nan")
-              print("### Variance decomposition")
+              raw = cv(pooled); cross = cv(machine_means); within = st.mean(within_cvs)
+              print("### 1) Thermal test (does prefill drift up with time-on-machine?)")
               print()
-              print(f"- **RAW pooled CV** (all machines, all passes): **{raw:.1f}%**  <- the scary number")
+              md = st.mean(drifts)
+              if slopes_pct:
+                  print(f"- mean first-third -> last-third drift: **{md:+.1f}%**  (worst machine {max(drifts):+.1f}%)")
+                  print(f"- mean slope: **{st.mean(slopes_pct):+.1f}%/min**, mean time-correlation r = **{st.mean(rs):+.2f}**")
+                  hot = st.mean(rs) > 0.5 and md > 8
+                  cool = abs(md) < 5 and abs(st.mean(rs)) < 0.3
+                  verdict = ("THERMAL THROTTLING likely: prefill rises monotonically with time on host."
+                             if hot else
+                             "NOT thermal: no consistent upward trend; variance is random scatter."
+                             if cool else
+                             "MIXED: some drift but not a clean monotonic climb; part thermal, part scatter.")
+                  print(f"- **verdict: {verdict}**")
+                  if hot:
+                      print("- Because this drift is DIRECTIONAL (candidate runs after baseline => hotter),")
+                      print("  pairing does NOT cancel it; it biases prefill_speedup below 1 by ~the drift.")
+              else:
+                  print("- (no timestamps parsed; cannot run thermal trend test)")
+              print()
+              print("### 2) Variance decomposition (what pairing can remove)")
+              print()
+              print(f"- **RAW pooled CV** (all machines, all passes): **{raw:.1f}%**")
               print(f"- cross-host CV (spread of per-machine means): **{cross:.1f}%**  <- pairing CANCELS this")
               print(f"- within-host CV (avg per-machine, same host): **{within:.1f}%**  <- pairing KEEPS this")
-              print()
-              print("### What survives the paired baseline (same-host ratio)")
-              print()
-              print(f"- predicted residual (within-host x sqrt2): **~{pred_resid:.1f}%**")
-              print(f"- empirical, consecutive same-host pass ratios: CV **{cv(adj_ratios):.1f}%** (n={len(adj_ratios)}), max/min {max(adj_ratios)/min(adj_ratios):.2f}x")
-              sr_dev = [abs(r-1)*100 for r in span_ratios]
-              print(f"- empirical, first-vs-last same-host ratio (max in-job drift): mean |dev| {st.mean(sr_dev):.1f}%, worst {max(sr_dev):.1f}%")
-              print()
               share = (cross*cross)/(cross*cross+within*within)*100 if (cross or within) else float("nan")
-              print(f"> Of the raw prefill variance, ~**{share:.0f}%** is cross-host (removed by pairing) and ~**{100-share:.0f}%** is within-host (survives).")
-              print(">")
-              print("> NOTE: consecutive passes are ~40 s apart; the real baseline/candidate")
-              print("> gap is minutes (separate build+transform between them), so the true")
-              print("> surviving residual is >= the consecutive-pass number and closer to the")
-              print("> first-vs-last figure. Decode is stable (3.5% CV, measured separately).")
+              print(f"- => ~**{share:.0f}%** of raw variance is cross-host (removed), ~**{100-share:.0f}%** within-host (survives)")
+              print()
+              print("### 3) Empirical surviving residual (same-host ratios)")
+              print()
+              sr_dev = [abs(r-1)*100 for r in span_ratios]
+              print(f"- consecutive same-host pass ratios: CV **{cv(adj_ratios):.1f}%** (n={len(adj_ratios)})")
+              print(f"- first-vs-last same-host ratio (max in-job drift): mean |dev| {st.mean(sr_dev):.1f}%, worst {max(sr_dev):.1f}%")
+              print()
+              print("> NOTE: consecutive passes are ~40 s apart; the real baseline/candidate gap")
+              print("> is minutes, so true surviving residual >= consecutive-pass CV. Decode is")
+              print("> stable (3.5% CV, measured separately).")
           print()
           PY
       - name: Upload combined
