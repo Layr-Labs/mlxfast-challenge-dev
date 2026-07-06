@@ -1,10 +1,12 @@
 name: gemma-tenki-decode-probe
 
-# Ad-hoc: measure Gemma 4 31B 4-bit (dense) decode/prefill on tenki-macos-latest-xlarge
-# via `./benchmark.sh --local-iterate` (16-step, public checked-in golden). Branch
-# is main (Gemma) plus only this workflow. Secret-free: setup.sh downloads the
-# reference from public HF (mlx-community/gemma-4-31b-4bit, ~17 GB). A small matrix
-# gives a decode number plus same-moment spread. NOT part of CI or scoring.
+# Ad-hoc: measure Gemma 4 31B 4-bit (dense) STEADY-STATE decode/prefill on
+# tenki-macos-latest-xlarge via `./benchmark.sh --local-submit` (1023 decode
+# steps, so the seed-prefill/cold-start setup is amortized to ~0 per token --
+# unlike --local-iterate's 16-step window where setup dominates). Branch is main
+# (Gemma) plus only this workflow. The Gemma checkpoint is baked into the tenki
+# home cache (no ~17 GB re-download). A small matrix gives the steady decode
+# number plus a same-moment cross-machine spread. NOT part of CI or scoring.
 on:
   push:
     branches:
@@ -98,28 +100,30 @@ jobs:
             --reference "${MLXFAST_REFERENCE_DIR}" \
             --output weights
 
-      - name: Run local-iterate decode timing
+      - name: Run local-submit steady-state decode timing
         env:
           MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
           MLXFAST_SKIP_TRANSFORM: "1"
           MLXFAST_WEIGHTS_PATH: weights
-          MLXFAST_NOTE: "gemma-tenki-decode machine=${{ matrix.machine }}"
+          MLXFAST_NOTE: "gemma-tenki-decode-submit machine=${{ matrix.machine }}"
         run: |
           set -uo pipefail
           echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a host.txt
-          ./benchmark.sh --local-iterate || echo "benchmark.sh exit=$? (timing still captured)"
-          echo "== score.local-iterate.json =="
-          cat score.local-iterate.json || true
+          # --local-submit: 1023 decode steps, single timing repeat, 512->1024
+          # public golden. score.json (not score.local-iterate.json).
+          ./benchmark.sh --local-submit || echo "benchmark.sh exit=$? (timing still captured)"
+          echo "== score.json =="
+          cat score.json || true
           python3 - <<'PY'
           import json, sys
-          m = json.load(open("score.local-iterate.json"))["metrics"]
+          m = json.load(open("score.json"))["metrics"]
           d = m.get("decode_seconds_per_token")
           if not isinstance(d, (int, float)) or d <= 0:
               print(f"::error::no usable decode timing: {d}"); sys.exit(1)
           tps = 1.0 / d
-          print(f"decode={d:.5f} s/tok ({tps:.2f} tok/s)  prefill={m.get('prefill_seconds_per_token')}  passed_correctness={m.get('passed_correctness')}")
+          print(f"steady decode={d:.5f} s/tok ({tps:.2f} tok/s)  prefill={m.get('prefill_seconds_per_token')}  passed_correctness={m.get('passed_correctness')}")
           PY
-          cp score.local-iterate.json "score-${{ matrix.machine }}.json"
+          cp score.json "score-${{ matrix.machine }}.json"
           cp host.txt "host-${{ matrix.machine }}.txt"
 
       - name: Upload machine artifact
@@ -159,7 +163,7 @@ jobs:
                   rows.append((idx, m.get("decode_seconds_per_token"), m.get("prefill_seconds_per_token")))
               except Exception as e:
                   print(f"skip {sp}: {e}")
-          print("## Gemma 4 31B 4-bit decode on tenki-macos-latest-xlarge (--local-iterate, 16-step)")
+          print("## Gemma 4 31B 4-bit STEADY decode on tenki-macos-latest-xlarge (--local-submit, 1023-step)")
           print()
           print("| machine | decode s/tok | decode tok/s | prefill s/tok |")
           print("|---|---|---|---|")
@@ -172,7 +176,9 @@ jobs:
               print()
               print(f"- decode: mean **{mean:.4f} s/tok ({1.0/mean:.2f} tok/s)**  CV={sd/mean*100:.2f}%  min={min(ds):.4f} max={max(ds):.4f} max/min={max(ds)/min(ds):.3f}x")
           print()
-          print("Note: 16-step --local-iterate decode; prefill is on the 512-token public prompt.")
+          print("Note: 1023-step --local-submit decode (setup amortized ~0/token, so this")
+          print("is steady-state); prefill is on the 512-token public prompt. The max/min")
+          print("here is the real cross-machine steady spread, not the setup-inflated 16-step one.")
           PY
       - name: Upload combined
         if: always()
