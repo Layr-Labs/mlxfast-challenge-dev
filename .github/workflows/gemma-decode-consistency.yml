@@ -1,0 +1,257 @@
+name: gemma-decode-consistency
+
+# Ad-hoc: does STEADY decode stay consistent under repeated load + heat, so it
+# can safely be the dominant/sole scored axis?
+#
+# We already know cross-machine steady decode is ~3.5% CV (each machine measured
+# once). Untested: within-host repeat consistency and DECODE thermal drift. So we
+# run `./benchmark.sh --local-submit` (1023 decode steps => setup amortized, the
+# clean steady number) several times per machine, timestamped. The long window is
+# always measured "uniformly hot", so the prediction is decode stays flat even
+# while single-forward prefill throttles ~2x. This confirms or refutes that.
+#
+# Gemma checkpoint is baked into the tenki home cache (no ~17 GB re-download).
+# NOT part of CI or scoring.
+on:
+  push:
+    branches:
+      - gemma-tenki-decode
+  workflow_dispatch:
+    inputs:
+      machines:
+        description: 'JSON array of machine indices, e.g. "[1,2,3]".'
+        required: false
+        default: "[1,2,3]"
+        type: string
+      passes:
+        description: 'Steady (1023-step) decode passes per machine.'
+        required: false
+        default: "6"
+        type: string
+
+concurrency:
+  group: gemma-decode-consistency-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sample:
+    name: "decode machine ${{ matrix.machine }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(inputs.machines || '[1,2,3]') }}
+    runs-on: tenki-macos-latest-xlarge
+    timeout-minutes: 150
+    env:
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      MLXFAST_REFERENCE_DIR: /Users/runner/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Host identity
+        run: |
+          set -uo pipefail
+          {
+            echo "machine=${{ matrix.machine }}"
+            echo "hostname=$(hostname 2>/dev/null || true)"
+            echo "model=$(sysctl -n hw.model 2>/dev/null || true)"
+            echo "os=$(sw_vers -productVersion 2>/dev/null || true)"
+            echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee host.txt
+
+      - name: Restore SwiftPM cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        env:
+          MLXFAST_REFERENCE_BASE_URL: https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: "12"
+          MLXFAST_REFERENCE_MIN_FREE_GIB: "40"
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+          MLXFAST_REFERENCE_HASH_VERIFY: "0"
+        run: |
+          set -euo pipefail
+          if [[ ! -f "${MLXFAST_REFERENCE_DIR}/config.json" ]]; then
+            echo "::error::baked Gemma checkpoint missing at ${MLXFAST_REFERENCE_DIR}; refusing to download" >&2
+            exit 1
+          fi
+          ./setup.sh
+
+      - name: Transform reference checkpoint
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" \
+            --output weights
+
+      - name: Sample steady decode N times
+        env:
+          MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+          MLXFAST_SKIP_TRANSFORM: "1"
+          MLXFAST_WEIGHTS_PATH: weights
+          PASSES: ${{ inputs.passes || '6' }}
+        run: |
+          set -uo pipefail
+          echo "machine ${{ matrix.machine }}: ${PASSES} steady (1023-step) decode passes"
+          # columns: index epoch_seconds decode_s_per_tok prefill_s_per_tok
+          : > "samples-${{ matrix.machine }}.txt"
+          for i in $(seq 1 "${PASSES}"); do
+            # --local-submit: 1023 decode steps => setup amortized ~0/token, so
+            # decode_seconds_per_token is the steady number. score.json (not
+            # score.local-iterate.json). Correctness diverges from the 1024 golden
+            # on tenki hardware (float nondeterminism) -> nonzero exit, timing
+            # still captured; || true keeps the loop going.
+            ./benchmark.sh --local-submit >/dev/null 2>&1 || true
+            ts=$(date +%s)
+            read -r dec pre < <(python3 - <<'PY'
+          import json
+          try:
+              m = json.load(open("score.json"))["metrics"]
+              print(m.get("decode_seconds_per_token",""), m.get("prefill_seconds_per_token",""))
+          except Exception:
+              print("", "")
+          PY
+          )
+            echo "${i} ${ts} ${dec} ${pre}" | tee -a "samples-${{ matrix.machine }}.txt"
+          done
+          echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a host.txt
+          cp host.txt "host-${{ matrix.machine }}.txt"
+
+      - name: Upload machine samples
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-decode-consistency-${{ github.run_id }}-machine-${{ matrix.machine }}
+          path: |
+            samples-${{ matrix.machine }}.txt
+            host-${{ matrix.machine }}.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  combine:
+    name: combine
+    needs: [sample]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download samples
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: gemma-decode-consistency-${{ github.run_id }}-machine-*
+          path: samples
+          merge-multiple: false
+      - name: Assess decode consistency (within-host, drift, cross-host)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
+          import glob, os, re, statistics as st, math
+          # rows: idx epoch decode prefill
+          dec_by, pre_by = {}, {}
+          for fp in sorted(glob.glob("samples/**/samples-*.txt", recursive=True)):
+              idx = re.sub(r"^samples-(.+)\.txt$", r"\1", os.path.basename(fp))
+              drows, prows, t0 = [], [], None
+              for line in open(fp):
+                  parts = line.split()
+                  if len(parts) < 3: continue
+                  ep = parts[1]
+                  try: d = float(parts[2])
+                  except ValueError: continue
+                  p = None
+                  if len(parts) >= 4:
+                      try: p = float(parts[3])
+                      except ValueError: p = None
+                  if d <= 0: continue
+                  try: e = float(ep)
+                  except ValueError: e = None
+                  if e is not None and t0 is None: t0 = e
+                  em = (e - t0)/60.0 if (e is not None and t0 is not None) else None
+                  drows.append((em, d))
+                  if p and p > 0: prows.append((em, p))
+              if drows: dec_by[idx] = drows
+              if prows: pre_by[idx] = prows
+
+          def cv(xs):
+              m = st.mean(xs); return (st.pstdev(xs)/m*100.0) if m else float("nan")
+          def linreg(xs, ys):
+              mx, my = st.mean(xs), st.mean(ys)
+              sxx = sum((x-mx)**2 for x in xs); syy = sum((y-my)**2 for y in ys)
+              sxy = sum((x-mx)*(y-my) for x, y in zip(xs, ys))
+              slope = sxy/sxx if sxx else 0.0
+              r = sxy/math.sqrt(sxx*syy) if sxx and syy else 0.0
+              return slope, r
+
+          print("## Gemma STEADY decode consistency (1023-step, repeated per host)")
+          print()
+          print("| machine | n | mean s/tok | tok/s | within CV | 1st | last | drift | slope/min | r(time) |")
+          print("|---|---|---|---|---|---|---|---|---|---|")
+          means, within, drifts, slopes, rs = [], [], [], [], []
+          for idx in sorted(dec_by):
+              rows = dec_by[idx]; d = [v for _, v in rows]
+              means.append(st.mean(d)); within.append(cv(d))
+              k = max(1, len(d)//3); f3, l3 = st.mean(d[:k]), st.mean(d[-k:])
+              drift = (l3-f3)/f3*100.0; drifts.append(drift)
+              el = [e for e, _ in rows if e is not None]
+              if len(el) == len(d) and len(set(el)) > 1:
+                  sl, r = linreg(el, d); slp = sl/st.mean(d)*100.0
+                  slopes.append(slp); rs.append(r); scol, rcol = f"{slp:+.1f}%", f"{r:+.2f}"
+              else:
+                  scol, rcol = "n/a", "n/a"
+              print(f"| {idx} | {len(d)} | {st.mean(d):.5f} | {1/st.mean(d):.2f} | {cv(d):.1f}% | {f3:.5f} | {l3:.5f} | {drift:+.1f}% | {scol} | {rcol} |")
+
+          print()
+          if len(means) >= 1:
+              wc = st.mean(within)
+              print("### Verdict")
+              print()
+              print(f"- within-host decode CV (repeat consistency): **{wc:.1f}%**")
+              if len(means) >= 2:
+                  print(f"- cross-host decode CV: **{cv(means):.1f}%**")
+              if drifts:
+                  md = st.mean(drifts)
+                  print(f"- decode thermal drift (1st third -> last third): mean **{md:+.1f}%**, worst {max(drifts, key=abs):+.1f}%")
+              if slopes:
+                  print(f"- mean slope **{st.mean(slopes):+.1f}%/min**, mean time-corr r **{st.mean(rs):+.2f}**")
+              flat = wc < 5 and (not drifts or abs(st.mean(drifts)) < 5) and (not rs or abs(st.mean(rs)) < 0.4)
+              print()
+              print("- **" + ("DECODE IS CONSISTENT: flat under repeated load + heat -> safe as the dominant/sole axis."
+                              if flat else
+                              "DECODE ALSO DRIFTS: it is not thermally immune; excluding prefill alone will not fix scoring -> cooldown/settle is the real fix.") + "**")
+          # contrast: same-run prefill (single cold forward) for reference
+          if pre_by:
+              pmeans, pw = [], []
+              for idx in sorted(pre_by):
+                  p = [v for _, v in pre_by[idx]]
+                  pmeans.append(st.mean(p)); pw.append(cv(p))
+              print()
+              print(f"> For contrast, prefill in the SAME passes: within-host CV {st.mean(pw):.1f}%"
+                    + (f", cross-host CV {cv(pmeans):.1f}%" if len(pmeans) >= 2 else "")
+                    + " (the throttled axis).")
+          print()
+          PY
+      - name: Upload combined
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-decode-consistency-${{ github.run_id }}-combined
+          path: samples
+          if-no-files-found: warn
+          retention-days: 14

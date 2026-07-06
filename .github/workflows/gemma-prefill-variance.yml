@@ -15,9 +15,7 @@ name: gemma-prefill-variance
 # Gemma checkpoint is baked into the tenki home cache (no ~17 GB re-download).
 # NOT part of CI or scoring.
 on:
-  push:
-    branches:
-      - gemma-tenki-decode
+  # Dispatch-only now (thermal already confirmed); sibling decode probe owns push.
   workflow_dispatch:
     inputs:
       machines:
