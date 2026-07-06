@@ -1,0 +1,177 @@
+name: gemma-tenki-decode-probe
+
+# Ad-hoc: measure Gemma 4 31B 4-bit (dense) decode/prefill on tenki-macos-latest-xlarge
+# via `./benchmark.sh --local-iterate` (16-step, public checked-in golden). Branch
+# is main (Gemma) plus only this workflow. Secret-free: setup.sh downloads the
+# reference from public HF (mlx-community/gemma-4-31b-4bit, ~17 GB). A small matrix
+# gives a decode number plus same-moment spread. NOT part of CI or scoring.
+on:
+  push:
+    branches:
+      - gemma-tenki-decode
+  workflow_dispatch:
+    inputs:
+      machines:
+        description: 'JSON array of machine indices, e.g. "[1,2,3,4]".'
+        required: false
+        default: "[1,2,3,4]"
+        type: string
+
+concurrency:
+  group: gemma-tenki-decode-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  decode:
+    name: "decode machine ${{ matrix.machine }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(inputs.machines || '[1,2,3,4]') }}
+    runs-on: tenki-macos-latest-xlarge
+    timeout-minutes: 120
+    env:
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Host identity
+        run: |
+          set -uo pipefail
+          {
+            echo "machine=${{ matrix.machine }}"
+            echo "hostname=$(hostname 2>/dev/null || true)"
+            echo "cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)"
+            echo "ncpu=$(sysctl -n hw.ncpu 2>/dev/null || true)"
+            echo "memsize_bytes=$(sysctl -n hw.memsize 2>/dev/null || true)"
+            echo "model=$(sysctl -n hw.model 2>/dev/null || true)"
+            echo "os=$(sw_vers -productVersion 2>/dev/null || true)"
+            echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee host.txt
+
+      - name: Restore SwiftPM cache
+        id: restore_swiftpm_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        env:
+          MLXFAST_REFERENCE_BASE_URL: https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: "12"
+          MLXFAST_REFERENCE_MIN_FREE_GIB: "40"
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+        run: |
+          set -euo pipefail
+          started="${SECONDS}"
+          ./setup.sh
+          echo "setup_seconds=$((SECONDS - started))" | tee -a host.txt
+
+      - name: Transform reference checkpoint
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" \
+            --output weights
+
+      - name: Run local-iterate decode timing
+        env:
+          MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+          MLXFAST_SKIP_TRANSFORM: "1"
+          MLXFAST_WEIGHTS_PATH: weights
+          MLXFAST_NOTE: "gemma-tenki-decode machine=${{ matrix.machine }}"
+        run: |
+          set -uo pipefail
+          echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a host.txt
+          ./benchmark.sh --local-iterate || echo "benchmark.sh exit=$? (timing still captured)"
+          echo "== score.local-iterate.json =="
+          cat score.local-iterate.json || true
+          python3 - <<'PY'
+          import json, sys
+          m = json.load(open("score.local-iterate.json"))["metrics"]
+          d = m.get("decode_seconds_per_token")
+          if not isinstance(d, (int, float)) or d <= 0:
+              print(f"::error::no usable decode timing: {d}"); sys.exit(1)
+          tps = 1.0 / d
+          print(f"decode={d:.5f} s/tok ({tps:.2f} tok/s)  prefill={m.get('prefill_seconds_per_token')}  passed_correctness={m.get('passed_correctness')}")
+          PY
+          cp score.local-iterate.json "score-${{ matrix.machine }}.json"
+          cp host.txt "host-${{ matrix.machine }}.txt"
+
+      - name: Upload machine artifact
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-tenki-decode-${{ github.run_id }}-machine-${{ matrix.machine }}
+          path: |
+            score-${{ matrix.machine }}.json
+            host-${{ matrix.machine }}.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  combine:
+    name: combine
+    needs: [decode]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download samples
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: gemma-tenki-decode-${{ github.run_id }}-machine-*
+          path: samples
+          merge-multiple: false
+      - name: Summarize Gemma decode on tenki
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
+          import glob, json, os, re, statistics
+          rows = []
+          for sp in sorted(glob.glob("samples/**/score-*.json", recursive=True)):
+              idx = re.sub(r"^score-(.+)\.json$", r"\1", os.path.basename(sp))
+              try:
+                  m = json.load(open(sp))["metrics"]
+                  rows.append((idx, m.get("decode_seconds_per_token"), m.get("prefill_seconds_per_token")))
+              except Exception as e:
+                  print(f"skip {sp}: {e}")
+          print("## Gemma 4 31B 4-bit decode on tenki-macos-latest-xlarge (--local-iterate, 16-step)")
+          print()
+          print("| machine | decode s/tok | decode tok/s | prefill s/tok |")
+          print("|---|---|---|---|")
+          for idx, d, p in rows:
+              tps = f"{1.0/d:.2f}" if isinstance(d,(int,float)) and d>0 else "n/a"
+              print(f"| {idx} | {d} | {tps} | {p} |")
+          ds = [d for _, d, _ in rows if isinstance(d,(int,float))]
+          if len(ds) >= 2:
+              mean = statistics.mean(ds); sd = statistics.pstdev(ds)
+              print()
+              print(f"- decode: mean **{mean:.4f} s/tok ({1.0/mean:.2f} tok/s)**  CV={sd/mean*100:.2f}%  min={min(ds):.4f} max={max(ds):.4f} max/min={max(ds)/min(ds):.3f}x")
+          print()
+          print("Note: 16-step --local-iterate decode; prefill is on the 512-token public prompt.")
+          PY
+      - name: Upload combined
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-tenki-decode-${{ github.run_id }}-combined
+          path: samples
+          if-no-files-found: warn
+          retention-days: 14
