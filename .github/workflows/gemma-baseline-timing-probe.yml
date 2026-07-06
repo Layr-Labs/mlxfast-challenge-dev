@@ -21,6 +21,12 @@ name: gemma-baseline-timing-probe
 # so the numbers are directly comparable to the ranked benchmark's own timed
 # measurement and valid inputs for the freeze doc's re-baseline protocol.
 on:
+  # The push trigger (same pattern as tenki-disk-probe.yml) both registers the
+  # branch-only workflow with the Actions service and runs the default
+  # three-machine measurement immediately; workflow_dispatch covers reruns.
+  push:
+    branches:
+      - probe/gemma-baseline-timing
   workflow_dispatch:
     inputs:
       machines:
@@ -45,7 +51,7 @@ on:
         type: string
 
 concurrency:
-  group: gemma-baseline-timing-probe-${{ github.ref }}-${{ inputs.label }}
+  group: gemma-baseline-timing-probe-${{ github.ref }}-${{ inputs.label || 'push' }}
   cancel-in-progress: false
 
 permissions:
@@ -57,7 +63,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        machine: ${{ fromJSON(inputs.machines) }}
+        # Push events carry no inputs; default to the three-machine spread.
+        machine: ${{ fromJSON(inputs.machines || '[1,2,3]') }}
     runs-on: blacksmith-12vcpu-macos-26
     timeout-minutes: 180
     env:
@@ -106,8 +113,8 @@ jobs:
         # public DEFAULT_REFERENCE_BASE_URL and an empty auth header when these
         # are unset -- exactly what a secret-free probe needs.
         env:
-          MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
-          MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs || '12' }}
+          MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib || '40' }}
           MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
         run: |
           set -euo pipefail
@@ -179,7 +186,7 @@ jobs:
           MLXFAST_BENCHMARK_CORRECTNESS_STEPS: "0"
           MLXFAST_BENCHMARK_CHECK_GATES: "0"
           MLXFAST_BENCHMARK_SKIP_TIMED: "0"
-          MLXFAST_NOTE: "gemma-baseline-timing-probe machine=${{ matrix.machine }} label=${{ inputs.label }}"
+          MLXFAST_NOTE: "gemma-baseline-timing-probe machine=${{ matrix.machine }} label=${{ inputs.label || 'push' }}"
         run: |
           set -euo pipefail
           echo "benchmark_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a host.txt
@@ -214,8 +221,8 @@ jobs:
 
       - name: Tabulate samples
         env:
-          LABEL: ${{ inputs.label }}
-          MACHINES: ${{ inputs.machines }}
+          LABEL: ${{ inputs.label || 'push' }}
+          MACHINES: ${{ inputs.machines || '[1,2,3]' }}
         run: |
           set -euo pipefail
           python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
@@ -292,5 +299,3 @@ jobs:
           path: machines
           if-no-files-found: warn
           retention-days: 30
-
-# (registration nudge)
