@@ -1,88 +1,83 @@
 import Foundation
 
-/// Robust acceptance band for a set of prefill seconds-per-token samples.
+/// Prefill acceptance band.
 ///
-/// Prefill is a single cold forward and is intrinsically noisy (see
-/// docs/thermal-variance-investigation.md). On a stable machine it clusters at a
-/// floor, but an individual measurement can spike slow (transient contention) or
-/// dip suspiciously fast. This drops the single worst (slowest) sample, averages
-/// the rest into a robust estimate `B`, and rejects the whole measurement if any
-/// retained sample drifts outside an asymmetric band around `B`:
+/// Prefill is a single cold forward, measured ONCE per benchmark run on one
+/// prompt (bound to the correctness check) -- it is not re-measured. It is also
+/// intrinsically noisy (see docs/thermal-variance-investigation.md): on a stable
+/// machine it sits at a floor, but a given run's single measurement can spike slow
+/// (transient contention) or dip suspiciously fast.
 ///
-///   - more than `upTolerance` ABOVE `B`  -> a real slowdown survived even after
-///     dropping one outlier => the environment is too unstable to trust => FAIL.
-///   - more than `downTolerance` BELOW `B` -> a suspiciously fast ("lucky")
-///     reading => reject so it cannot be variance-harvested => FAIL.
+/// The defense is two parts:
 ///
-/// Only the single SLOWEST sample is dropped; a lucky-fast sample is deliberately
-/// NOT dropped, so it drags `B` down and trips the band (fail), which is the
-/// intended "got lucky -> fail" behavior.
+/// 1. `robustReference(samples:)` -- computed ONCE from a calibration fleet of runs
+///    (e.g. several fresh-VM measurements of the reference): drop the single
+///    slowest sample, average the rest into `B`. This is a robust baseline number,
+///    not a per-run measurement.
 ///
-/// SOUNDNESS: the samples MUST come from DISTINCT prompts (same 512-token shape),
-/// never repeats of one prompt in the same worker process. K identical charged
-/// forwards would let submitted model code memoize one and serve the rest
-/// instantly; the drop-slowest step would then discard the one real forward and
-/// `B` would collapse toward zero -- the band cannot catch that, because all the
-/// memoized samples agree with each other. Distinct prompts make every forward
-/// real. See benchmark-window-freeze.md invariant #2 ("never repeat an identical
-/// charged forward in the same worker process").
-public struct PrefillBandResult: Equatable {
-    /// `B`: the outlier-dropped mean, i.e. the accepted prefill seconds-per-token.
-    public let accepted: Double
-    public let passed: Bool
-    /// Empty when `passed`; otherwise a human-readable failure reason.
-    public let reason: String
-
-    public init(accepted: Double, passed: Bool, reason: String) {
-        self.accepted = accepted
-        self.passed = passed
-        self.reason = reason
-    }
-}
-
+/// 2. `check(prefill:reference:)` -- applied to each scored run's single prefill
+///    against `B`. The prefill may be faster than `B`, but:
+///      - more than `upTolerance` ABOVE `B`  -> a real slowdown => FAIL.
+///      - more than `downTolerance` BELOW `B` -> a suspiciously fast ("lucky")
+///        reading => FAIL (so it cannot be variance-harvested).
+///    Asymmetric on purpose: a small transient slowdown is normal noise, but a
+///    large lucky-fast reading must not be rewarded.
 public enum PrefillBand {
-    public static func evaluate(
-        samples: [Double],
-        upTolerance: Double = MLXFastConstants.prefillBandUpTolerance,
-        downTolerance: Double = MLXFastConstants.prefillBandDownTolerance
-    ) -> PrefillBandResult {
-        // Need at least 3 so that after dropping one outlier >= 2 remain to average.
-        guard samples.count >= 3 else {
-            return PrefillBandResult(
-                accepted: .nan, passed: false,
-                reason: "prefill band needs >= 3 samples, got \(samples.count)"
-            )
+    /// Robust reference `B` from a calibration set: drop the single slowest sample,
+    /// average the rest. Returns nil if there are too few / invalid samples.
+    /// Computed once at calibration time, never per scored run.
+    public static func robustReference(samples: [Double]) -> Double? {
+        // Need >= 3 so that after dropping one outlier >= 2 remain to average.
+        guard samples.count >= 3, samples.allSatisfy({ $0.isFinite && $0 > 0 }) else {
+            return nil
         }
-        guard samples.allSatisfy({ $0.isFinite && $0 > 0 }) else {
-            return PrefillBandResult(
-                accepted: .nan, passed: false,
-                reason: "prefill samples must be finite and positive"
-            )
-        }
-        // Drop exactly one: the single largest (slowest) sample.
         var rest = samples
         if let slowest = rest.indices.max(by: { rest[$0] < rest[$1] }) {
             rest.remove(at: slowest)
         }
-        let B = rest.reduce(0.0, +) / Double(rest.count)
-        let hi = B * (1.0 + upTolerance)
-        let lo = B * (1.0 - downTolerance)
-        for sample in rest {
-            if sample > hi {
-                return PrefillBandResult(
-                    accepted: B, passed: false,
-                    reason: "prefill sample \(sample) exceeds +\(upTolerance * 100)% band "
-                        + "(> \(hi)): real slowdown after dropping one outlier"
-                )
-            }
-            if sample < lo {
-                return PrefillBandResult(
-                    accepted: B, passed: false,
-                    reason: "prefill sample \(sample) below -\(downTolerance * 100)% band "
-                        + "(< \(lo)): suspiciously lucky-fast reading"
-                )
-            }
+        return rest.reduce(0.0, +) / Double(rest.count)
+    }
+
+    /// Per-run gate: validate one scored prefill measurement against reference `B`.
+    public static func check(
+        prefill: Double,
+        reference: Double,
+        upTolerance: Double = MLXFastConstants.prefillBandUpTolerance,
+        downTolerance: Double = MLXFastConstants.prefillBandDownTolerance
+    ) -> PrefillBandResult {
+        guard prefill.isFinite, prefill > 0, reference.isFinite, reference > 0 else {
+            return PrefillBandResult(
+                passed: false,
+                reason: "prefill (\(prefill)) and reference (\(reference)) must be finite and positive"
+            )
         }
-        return PrefillBandResult(accepted: B, passed: true, reason: "")
+        let hi = reference * (1.0 + upTolerance)
+        let lo = reference * (1.0 - downTolerance)
+        if prefill > hi {
+            return PrefillBandResult(
+                passed: false,
+                reason: "prefill \(prefill) exceeds +\(upTolerance * 100)% of reference "
+                    + "\(reference) (> \(hi)): real slowdown"
+            )
+        }
+        if prefill < lo {
+            return PrefillBandResult(
+                passed: false,
+                reason: "prefill \(prefill) below -\(downTolerance * 100)% of reference "
+                    + "\(reference) (< \(lo)): suspiciously lucky-fast reading"
+            )
+        }
+        return PrefillBandResult(passed: true, reason: "")
+    }
+}
+
+public struct PrefillBandResult: Equatable {
+    public let passed: Bool
+    /// Empty when `passed`; otherwise a human-readable failure reason.
+    public let reason: String
+
+    public init(passed: Bool, reason: String) {
+        self.passed = passed
+        self.reason = reason
     }
 }
