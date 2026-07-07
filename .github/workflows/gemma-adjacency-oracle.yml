@@ -21,9 +21,7 @@ name: gemma-adjacency-oracle
 #
 # Baked Gemma cache => no re-download. NOT part of CI or scoring.
 on:
-  push:
-    branches:
-      - gemma-tenki-decode
+  # Registered; dispatch-only so it never auto-fires. Pilot [1]/3 then scale.
   workflow_dispatch:
     inputs:
       machines:
