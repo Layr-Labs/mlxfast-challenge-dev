@@ -1,0 +1,196 @@
+name: gemma-paired-separate-vm
+
+# Prototype of Option D: measure the paired baseline on a SEPARATE fresh VM from
+# the candidate, so neither warms the other. Two jobs, each a fresh cold tenki VM:
+#   baseline: runs ./benchmark.sh cold, exports its prefill/decode as job outputs.
+#   candidate: needs baseline, runs ./benchmark.sh cold with the baseline values as
+#              the paired override (MLXFAST_PAIRED_BASELINE_*), scores the ratio.
+# Same reference code both sides -> expect BOTH cold (prefill ~0.0106, decode
+# ~0.1336) and prefill_speedup ~1.0 -- i.e. the candidate is NOT warmed (contrast
+# the same-VM 2-run test where the candidate's prefill was 1.5-2.8x slow). Proves
+# D removes the warming before porting it into the real ranked workflow.
+#
+# Baked Gemma cache => no re-download. Public self-built oracle, gates off. NOT CI.
+on:
+  push:
+    branches:
+      - gemma-tenki-decode
+  workflow_dispatch: {}
+
+concurrency:
+  group: gemma-paired-separate-vm-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    name: "baseline (fresh vm A)"
+    runs-on: tenki-macos-latest-xlarge
+    timeout-minutes: 60
+    outputs:
+      prefill: ${{ steps.measure.outputs.prefill }}
+      decode: ${{ steps.measure.outputs.decode }}
+    env:
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      MLXFAST_REFERENCE_DIR: /Users/runner/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Host + VM freshness
+        run: |
+          set -uo pipefail
+          boot=$(sysctl -n kern.boottime 2>/dev/null | grep -oE 'sec = [0-9]+' | grep -oE '[0-9]+' | head -1)
+          echo "baseline VM uptime: $(( $(date +%s) - ${boot:-$(date +%s)} ))s"
+      - name: Restore SwiftPM cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+      - name: Setup
+        env:
+          MLXFAST_REFERENCE_BASE_URL: https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main
+          MLXFAST_REFERENCE_MIN_FREE_GIB: "40"
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+          MLXFAST_REFERENCE_HASH_VERIFY: "0"
+        run: |
+          set -euo pipefail
+          [[ -f "${MLXFAST_REFERENCE_DIR}/config.json" ]] || { echo "::error::baked checkpoint missing"; exit 1; }
+          ./setup.sh
+      - name: Transform
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" .github/scripts/run-offline.sh \
+            .build/release/mlxfast-swift transform --reference "${MLXFAST_REFERENCE_DIR}" --output weights
+      - name: Build oracle
+        run: |
+          set -euo pipefail
+          .build/release/mlxfast-swift generate-golden \
+            --prompt-file correctness_prompts/public_longcopy_gate_english_512.txt \
+            --weights weights --tokenizer "${MLXFAST_REFERENCE_DIR}" \
+            --output oracle_src.json --name benchoracle --steps 200
+          python3 - <<'PY'
+          import json
+          g=json.load(open("oracle_src.json"))["cases"][0]; p=g["prompt_tokens"]; e=g["expected_tokens"]
+          assert len(p)==512 and len(e)>=129
+          json.dump({"version":1,"cases":[{"name":"benchoracle","prompt_tokens":p,"expected_tokens":e}],
+            "benchmark":{"prefill_prompt_tokens":p,"expected_prefill_token":e[0],"decode_seed_tokens":p,
+            "expected_decode_seed_token":e[0],"expected_decode_tokens":e[1:]}}, open("bench_oracle_golden.json","w"))
+          PY
+      - name: Measure baseline (cold)
+        id: measure
+        env:
+          MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+          MLXFAST_SKIP_TRANSFORM: "1"
+          MLXFAST_WEIGHTS_PATH: weights
+          MLXFAST_CORRECTNESS_GOLDEN_PATH: bench_oracle_golden.json
+          MLXFAST_BENCHMARK_CHECK_GATES: "0"
+        run: |
+          set -uo pipefail
+          ./benchmark.sh >/dev/null 2>&1 || true
+          read -r pre dec < <(python3 -c "import json;m=json.load(open('score.json'))['metrics'];print(m['prefill_seconds_per_token'],m['decode_seconds_per_token'])")
+          echo "baseline cold: prefill=${pre} decode=${dec}"
+          echo "prefill=${pre}" >> "$GITHUB_OUTPUT"
+          echo "decode=${dec}" >> "$GITHUB_OUTPUT"
+
+  candidate:
+    name: "candidate (fresh vm B, reads baseline)"
+    needs: baseline
+    runs-on: tenki-macos-latest-xlarge
+    timeout-minutes: 60
+    env:
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      MLXFAST_REFERENCE_DIR: /Users/runner/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Host + VM freshness
+        run: |
+          set -uo pipefail
+          boot=$(sysctl -n kern.boottime 2>/dev/null | grep -oE 'sec = [0-9]+' | grep -oE '[0-9]+' | head -1)
+          echo "candidate VM uptime: $(( $(date +%s) - ${boot:-$(date +%s)} ))s"
+          echo "paired baseline from job A: prefill=${{ needs.baseline.outputs.prefill }} decode=${{ needs.baseline.outputs.decode }}"
+      - name: Restore SwiftPM cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+      - name: Setup
+        env:
+          MLXFAST_REFERENCE_BASE_URL: https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main
+          MLXFAST_REFERENCE_MIN_FREE_GIB: "40"
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+          MLXFAST_REFERENCE_HASH_VERIFY: "0"
+        run: |
+          set -euo pipefail
+          [[ -f "${MLXFAST_REFERENCE_DIR}/config.json" ]] || { echo "::error::baked checkpoint missing"; exit 1; }
+          ./setup.sh
+      - name: Transform
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" .github/scripts/run-offline.sh \
+            .build/release/mlxfast-swift transform --reference "${MLXFAST_REFERENCE_DIR}" --output weights
+      - name: Build oracle
+        run: |
+          set -euo pipefail
+          .build/release/mlxfast-swift generate-golden \
+            --prompt-file correctness_prompts/public_longcopy_gate_english_512.txt \
+            --weights weights --tokenizer "${MLXFAST_REFERENCE_DIR}" \
+            --output oracle_src.json --name benchoracle --steps 200
+          python3 - <<'PY'
+          import json
+          g=json.load(open("oracle_src.json"))["cases"][0]; p=g["prompt_tokens"]; e=g["expected_tokens"]
+          assert len(p)==512 and len(e)>=129
+          json.dump({"version":1,"cases":[{"name":"benchoracle","prompt_tokens":p,"expected_tokens":e}],
+            "benchmark":{"prefill_prompt_tokens":p,"expected_prefill_token":e[0],"decode_seed_tokens":p,
+            "expected_decode_seed_token":e[0],"expected_decode_tokens":e[1:]}}, open("bench_oracle_golden.json","w"))
+          PY
+      - name: Measure candidate (cold) against paired baseline from job A
+        env:
+          MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+          MLXFAST_SKIP_TRANSFORM: "1"
+          MLXFAST_WEIGHTS_PATH: weights
+          MLXFAST_CORRECTNESS_GOLDEN_PATH: bench_oracle_golden.json
+          MLXFAST_BENCHMARK_CHECK_GATES: "0"
+          MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN: ${{ needs.baseline.outputs.prefill }}
+          MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN: ${{ needs.baseline.outputs.decode }}
+        run: |
+          set -uo pipefail
+          ./benchmark.sh >/dev/null 2>&1 || true
+          python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
+          import json
+          m=json.load(open("score.json"))["metrics"]
+          bp=${{ needs.baseline.outputs.prefill }}; bd=${{ needs.baseline.outputs.decode }}
+          cp=m["prefill_seconds_per_token"]; cd=m["decode_seconds_per_token"]
+          print("## Option D prototype: paired baseline on a SEPARATE fresh VM")
+          print()
+          print(f"- baseline (VM A, cold): prefill={bp:.5f}  decode={bd:.5f}")
+          print(f"- candidate (VM B, cold): prefill={cp:.5f}  decode={cd:.5f}")
+          print(f"- prefill ratio candidate/baseline = {cp/bp:.3f}  (=> prefill_speedup {bp/cp:.3f})")
+          print(f"- decode  ratio candidate/baseline = {cd/bd:.3f}  (=> decode_speedup {bd/cd:.3f})")
+          print(f"- harness prefill_speedup={m.get('prefill_speedup')}  decode_speedup={m.get('decode_speedup')}  passed_floors: prefill={m.get('passed_prefill_speedup_floor')} decode={m.get('passed_decode_speedup_floor')}")
+          print()
+          ok = 0.90 <= cp/bp <= 1.10
+          print("- **" + ("D WORKS: candidate prefill is COLD (~baseline), ratio ~1.0 -- separate VMs remove the warming."
+                          if ok else
+                          "candidate prefill still off baseline -- investigate.") + "**")
+          PY
