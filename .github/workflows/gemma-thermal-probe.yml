@@ -9,9 +9,7 @@ name: gemma-thermal-probe
 #
 # Baked Gemma cache => no re-download. NOT part of CI or scoring.
 on:
-  push:
-    branches:
-      - gemma-tenki-decode
+  # Dispatch-only now; fullbench-characterize owns the push trigger.
   workflow_dispatch:
     inputs:
       machines:

@@ -1,0 +1,273 @@
+name: gemma-fullbench
+
+# Characterize the REAL scored path: repeated FULL `./benchmark.sh` runs (128-step
+# decode + cold 512 prefill + base correctness) back-to-back on the same host, so
+# run 1 is cool and runs 2+ are measured on a heated box -- exactly the busy state
+# the ranked candidate sees (it runs after the paired baseline heats the machine).
+# NOT --local-iterate (16-step) or --local-submit (1023-step): those are the wrong
+# decode shape. Full benchmark needs a benchmark oracle, which the public golden
+# lacks, so we build one on the runner (generate-golden -> assemble BenchmarkGolden).
+# Gates are OFF (private GPQA fixtures are not public); everything else is the real
+# scored path, and gates do not affect the timed numbers.
+#
+# Captures per run the FULL score.json + timestamp + thermal pressure, to serve:
+#  - busy-state baselines for decode+prefill (for the 1.5x re-run scheme)
+#  - spike magnitude + frequency (median-of-N / re-run cost sizing)
+#  - consecutive-run ratio CV (paired-baseline residual / adjacency)
+#  - timing breakdown, peak_ram, thermal pressure (the peak_ram anomaly, thermal Q)
+#
+# Baked Gemma cache => no re-download. NOT part of CI or scoring.
+on:
+  push:
+    branches:
+      - gemma-tenki-decode
+  workflow_dispatch:
+    inputs:
+      machines:
+        description: 'JSON array of machine indices, e.g. "[1,2]".'
+        required: false
+        default: "[1,2]"
+        type: string
+      passes:
+        description: 'Full-benchmark runs per machine, back-to-back.'
+        required: false
+        default: "10"
+        type: string
+
+concurrency:
+  group: gemma-fullbench-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sample:
+    name: "fullbench machine ${{ matrix.machine }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(inputs.machines || '[1,2]') }}
+    runs-on: tenki-macos-latest-xlarge
+    timeout-minutes: 150
+    env:
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      MLXFAST_REFERENCE_DIR: /Users/runner/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Host identity
+        run: |
+          set -uo pipefail
+          { echo "machine=${{ matrix.machine }}"; echo "model=$(sysctl -n hw.model 2>/dev/null||true)";
+            echo "os=$(sw_vers -productVersion 2>/dev/null||true)"; echo "started=$(date -u +%FT%TZ)"; } | tee host.txt
+
+      - name: Restore SwiftPM cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        env:
+          MLXFAST_REFERENCE_BASE_URL: https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: "12"
+          MLXFAST_REFERENCE_MIN_FREE_GIB: "40"
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+          MLXFAST_REFERENCE_HASH_VERIFY: "0"
+        run: |
+          set -euo pipefail
+          if [[ ! -f "${MLXFAST_REFERENCE_DIR}/config.json" ]]; then
+            echo "::error::baked Gemma checkpoint missing at ${MLXFAST_REFERENCE_DIR}; refusing to download" >&2
+            exit 1
+          fi
+          ./setup.sh
+
+      - name: Transform reference checkpoint
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" --output weights
+
+      - name: Build benchmark-oracle golden on this machine
+        run: |
+          set -euo pipefail
+          .build/release/mlxfast-swift generate-golden \
+            --prompt-file correctness_prompts/public_longcopy_gate_english_512.txt \
+            --weights weights --tokenizer "${MLXFAST_REFERENCE_DIR}" \
+            --output oracle_src.json --name benchoracle --steps 200
+          python3 - <<'PY'
+          import json
+          gen = json.load(open("oracle_src.json")); c = gen["cases"][0]
+          prompt = c["prompt_tokens"]; exp = c["expected_tokens"]
+          assert len(prompt) == 512 and len(exp) >= 129
+          json.dump({"version":1,"cases":gen["cases"],"benchmark":{
+              "prefill_prompt_tokens":prompt,"expected_prefill_token":exp[0],
+              "decode_seed_tokens":prompt,"expected_decode_seed_token":exp[0],
+              "expected_decode_tokens":exp[1:]}}, open("bench_oracle_golden.json","w"))
+          print("oracle assembled")
+          PY
+          test -s bench_oracle_golden.json
+
+      - name: Repeated FULL benchmark, back-to-back
+        env:
+          MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+          MLXFAST_SKIP_TRANSFORM: "1"
+          MLXFAST_WEIGHTS_PATH: weights
+          MLXFAST_CORRECTNESS_GOLDEN_PATH: bench_oracle_golden.json
+          MLXFAST_BENCHMARK_CHECK_GATES: "0"
+          PASSES: ${{ inputs.passes || '10' }}
+        run: |
+          set -uo pipefail
+          M="${{ matrix.machine }}"
+          read_pressure() {
+            sudo -n powermetrics -n 1 -i 300 --samplers thermal 2>/dev/null \
+              | grep -i 'Current pressure level' | sed 's/.*: *//' | tr -d ' \r' | head -1
+          }
+          # header for the compact per-run row
+          echo "idx epoch pressure decode prefill passed timed_s corr_s wall_s peak_ram dspeedup pspeedup" > "runs-${M}.txt"
+          for i in $(seq 1 "${PASSES}"); do
+            ts=$(date +%s); pl=$(read_pressure)
+            ./benchmark.sh >/dev/null 2>&1 || true          # FULL scored path (128-step)
+            cp score.json "score-${M}-${i}.json" 2>/dev/null || true
+            row=$(python3 - <<'PY'
+          import json
+          try:
+              s=json.load(open("score.json")); m=s["metrics"]
+              def g(k):
+                  v=m.get(k); return v if v is not None else "NA"
+              print(g("decode_seconds_per_token"), g("prefill_seconds_per_token"),
+                    s.get("passed","NA"), g("timed_benchmark_seconds"), g("correctness_seconds"),
+                    g("benchmark_wall_seconds"), g("peak_ram_gb"), g("decode_speedup"), g("prefill_speedup"))
+          except Exception as e:
+              print("NA NA NA NA NA NA NA NA NA")
+          PY
+          )
+            echo "${i} ${ts} ${pl:-NA} ${row}" | tee -a "runs-${M}.txt"
+          done
+          cp host.txt "host-${M}.txt"
+
+      - name: Upload machine artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-fullbench-${{ github.run_id }}-machine-${{ matrix.machine }}
+          path: |
+            runs-${{ matrix.machine }}.txt
+            host-${{ matrix.machine }}.txt
+            score-${{ matrix.machine }}-*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  combine:
+    name: combine
+    needs: [sample]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: gemma-fullbench-${{ github.run_id }}-machine-*
+          path: samples
+          merge-multiple: false
+      - name: Characterize the scored full-benchmark distribution
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
+          import glob, os, re, statistics as st
+          def num(x):
+              try: return float(x)
+              except Exception: return None
+          def cv(xs):
+              xs=[x for x in xs if x is not None];
+              return (st.pstdev(xs)/st.mean(xs)*100.0) if len(xs)>1 and st.mean(xs) else float("nan")
+
+          machines={}
+          for fp in sorted(glob.glob("samples/**/runs-*.txt", recursive=True)):
+              m=re.sub(r"^runs-(.+)\.txt$",r"\1",os.path.basename(fp))
+              rows=[]
+              for line in open(fp):
+                  p=line.split()
+                  if len(p)<12 or p[0]=="idx": continue
+                  rows.append({"i":int(p[0]),"epoch":num(p[1]),"pressure":p[2],
+                               "decode":num(p[3]),"prefill":num(p[4]),"passed":p[5],
+                               "timed":num(p[6]),"corr":num(p[7]),"wall":num(p[8]),
+                               "peak_ram":num(p[9]),"dsp":num(p[10]),"psp":num(p[11])})
+              if rows: machines[m]=rows
+
+          print("## Full `./benchmark.sh` characterization (128-step scored decode + cold prefill)")
+          print()
+          print("Run 1 = cool (fresh box). Runs 2+ = busy (box heated by the prior full run) =")
+          print("the state the ranked candidate is measured in (it runs after the paired baseline).")
+          print()
+          for m,rows in machines.items():
+              print(f"### machine {m} — per run")
+              print("| run | decode | prefill | timed_s | wall_s | peak_ram | pressure | passed |")
+              print("|---|---|---|---|---|---|---|---|")
+              for r in rows:
+                  print(f"| {r['i']} | {r['decode']} | {r['prefill']} | {r['timed']} | {r['wall']} "
+                        f"| {r['peak_ram']} | {r['pressure']} | {r['passed']} |")
+              print()
+
+          def stats(name, key, floor_is_min=True):
+              allv=[r[key] for rows in machines.values() for r in rows if r[key] is not None]
+              busy=[r[key] for rows in machines.values() for r in rows if r["i"]>1 and r[key] is not None]
+              cool=[r[key] for rows in machines.values() for r in rows if r["i"]==1 and r[key] is not None]
+              if not allv:
+                  print(f"- {name}: no data"); return
+              floor=min(allv); hi=max(allv)
+              # spike = >1.5x floor
+              spikes=[v for v in allv if v>1.5*floor]
+              print(f"- **{name}**: floor(min)={floor:.5f}  max={hi:.5f}  overall CV={cv(allv):.1f}%")
+              print(f"    - run-1 (cool): {['%.4f'%v for v in cool]}")
+              print(f"    - runs 2+ (busy): median={st.median(busy):.5f}  mean={st.mean(busy):.5f}  CV={cv(busy):.1f}%  n={len(busy)}")
+              print(f"    - spikes >1.5x floor: {len(spikes)}/{len(allv)} ({100*len(spikes)/len(allv):.0f}%)  max/floor={hi/floor:.2f}x")
+          print("### Distributions (for the 1.5x re-run scheme + median-of-N sizing)")
+          print()
+          stats("decode (128-step, SCORED)","decode")
+          stats("prefill (cold 512, SCORED)","prefill")
+          print()
+          # consecutive-run ratio = paired-baseline residual (same code both sides)
+          print("### Consecutive-run ratio (same code => paired-baseline residual)")
+          for key in ("decode","prefill"):
+              rr=[]
+              for rows in machines.values():
+                  s=[r[key] for r in rows if r[key] is not None]
+                  for a,b in zip(s,s[1:]):
+                      if a and b: rr.append(b/a)
+              if rr:
+                  print(f"- {key}: consecutive ratio CV **{cv(rr):.1f}%**, max/min {max(rr)/min(rr):.2f}x (n={len(rr)})")
+          print()
+          # peak_ram + pressure notes
+          pr=[r["peak_ram"] for rows in machines.values() for r in rows if r["peak_ram"] is not None]
+          if pr: print(f"### peak_ram_gb: min={min(pr)} max={max(pr)} (model is ~17GB; flagged earlier as low)")
+          allpl=[r["pressure"] for rows in machines.values() for r in rows]
+          from collections import Counter
+          print(f"### thermal pressure at run start: {dict(Counter(allpl))}")
+          print()
+          print("> Gates omitted (no public GPQA fixtures) — does not affect timed numbers. Numbers")
+          print("> are tenki M4-Pro-VM; the busy value drifts, so the live paired baseline (same")
+          print("> session) remains the score denominator, not these as constants.")
+          PY
+      - name: Upload combined
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-fullbench-${{ github.run_id }}-combined
+          path: samples
+          if-no-files-found: warn
+          retention-days: 14
