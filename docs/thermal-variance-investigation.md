@@ -8,27 +8,33 @@ benchmark window / ranked workflow.
 
 ## TL;DR
 
-- The prefill "variance" (raw CV ~34%, max/min ~2.2× across machines) is **thermal
-  throttling, not host lottery**. The same physical machine runs prefill ~2×
-  slower hot (≈0.020 s/tok) than cool (≈0.010 s/tok).
-- **Decode also drifts thermally** — ~0.6–0.8 %/min, up to +20 % over ~25 min of
-  sustained load. The clean-looking 3.5 % cross-machine decode CV was an artifact
-  of measuring each machine once, early; repeat measurement reveals ~10–20 %
-  within-host.
-- The drift is **directional in time** (baseline measured cooler, candidate
-  measured later/hotter), so the paired baseline — which cancels *common-mode*
-  host differences — does **not** cancel it. It biases `prefill_speedup` (and to a
-  lesser degree `decode_speedup`) below 1.
-- **Excluding prefill is not sufficient** (decode drifts too). **A 2-minute idle
-  settle does not work** (cooldown constant is > 2 min; cooling is slow). The
-  heater is **sustained inference (the ~5-min correctness pass)**, not build,
-  transform, or the ~30–50 s timed window itself.
-- **Recommended fix: reorder the ranked pipeline so the two timed windows
-  (baseline and candidate) run back-to-back, with both correctness passes moved
-  after both timed windows.** This cuts the baseline↔candidate timed-measurement
-  gap from ~6–7 min to ~1–2 min (bounded below by the candidate's model load),
-  reducing the thermal residual ~3–4×. Pair it with **median-of-N** on the timed
-  window to absorb transient spikes. No idle wait required.
+- **The dominant variance in the scored 128-step decode is intermittent ~2×
+  throttle SPIKES, not smooth thermal drift.** The un-throttled floor is stable
+  (~0.140 s/tok, ~1–3 % CV); individual measurements spike to 2–3× that floor,
+  and the spikes are roughly *periodic* (~17–18 min on one machine), which looks
+  like a periodic external event (host maintenance / snapshot / co-scheduled VM),
+  not a smooth heat ramp. Between-measurement ratio CV is ~40–50 % and is
+  **flat across gaps of 5.5–33 min** — i.e. gap-independent, therefore transient.
+- **Primary fix: min/median-of-N on the timed window.** Because throttling only
+  makes a measurement *slower*, N repeats let you recover the stable floor by
+  rejecting spike windows. This is the lever that actually addresses the observed
+  variance. (Ranked scoring today uses N=1 per axis.)
+- Smooth thermal drift also exists but is **secondary**: prefill throttles ~2×
+  cool→hot (≈0.010→0.020 s/tok); decode drifts ~0.6–0.8 %/min (up to +20 % over
+  ~25 min). This drift is *directional in time* (candidate measured later/hotter
+  than baseline), so the paired baseline — which cancels common-mode host
+  differences — does not cancel it.
+- **Adjacency reorder is a useful SECONDARY lever** (measure the two timed windows
+  back-to-back so the smooth-drift component cancels), but it does **not** fix the
+  spikes and so is not sufficient alone. The full-run ratio-vs-gap data shows the
+  residual does not shrink at small gaps, confirming spikes dominate over drift.
+- **Excluding prefill is not sufficient** (decode is the spiky axis too). **A
+  2-minute idle settle does not work** (run 28832851608) — it cannot prevent a
+  throttle event that occurs *during* a measurement. **Timing-only windows are
+  ~5 min, model-load-bound** (run 28836241400), so no separate-process probe can
+  measure a sub-~5-min gap.
+- Net recommendation: **min/median-of-N on the timed window (primary)**, plus the
+  **adjacency reorder (secondary)** for the residual drift. No idle wait.
 
 ## Context
 
@@ -57,7 +63,24 @@ cold 512-token forward.
 | decode consistency (repeat 1023-step) | 28824046255 | within-host decode CV **14.4 %**, cross-host **2.2 %**; m1 drift **+20 %** (r=0.76), m3 +9.3 %, m2 a transient spike (0.17) |
 | prefill variance (`--local-iterate`, timestamped) | live m5/m6 | cool prefill **0.0104–0.0113**, hot **0.018–0.024** (~2×); onset ~pass 2–3 (~5–10 min) |
 | settle A/B (2-min idle before even windows) | 28832851608 | no-wait mean 0.0194 (CV 32 %), settle mean **0.0205** (CV 20.8 %) → settle **not cooler**; only the fresh first window is cool |
-| adjacency oracle pilot (timing-only via self-built oracle) | 28836241400 | oracle path works; timing captured on floor-fail; **windows ~5 min = load-bound**; two 128-step decodes ~5 min apart nearly identical (0.170766 vs 0.170764); prefill ramped 0.011→0.025 |
+| adjacency oracle pilot (timing-only via self-built oracle) | 28836241400 | oracle path works; timing captured on floor-fail; **windows ~5 min = load-bound** |
+| adjacency oracle full (128-step ratio-vs-gap, 2×8) | 28838838057 | ratio CV **~40–50 % flat across gaps 5.5–33 min** (gap-independent); decode floor ~0.140 (CV ~1–3 %) with intermittent 2–3× spikes; spikes ~17–18 min periodic |
+
+Full-run ratio CV vs window gap (pooled, both machines):
+
+| gap (min) | decode ratio CV | prefill ratio CV |
+|---|---|---|
+| 5.5 | 43 % | 49 % |
+| 11 | 49 % | 52 % |
+| 16.7 | 40 % | 21 % |
+| 22.4 | 37 % | 54 % |
+| 28 | 44 % | 64 % |
+| 33 | 39 % | 26 % |
+
+No monotonic growth with gap ⇒ the residual is dominated by a gap-independent
+(transient) component, not by smooth drift. Example raw 128-step decode
+(machine 2): `0.162, 0.282, 0.140, 0.138, 0.280, 0.141, 0.141, 0.140` — a stable
+~0.140 floor with 2× spikes on windows 2 and 5 (~17 min apart).
 
 Calibrated constants (blacksmith M4 Pro, `Constants.swift`): baseline decode
 0.131727461265625, baseline prefill 0.01010573933984375 s/tok.
@@ -102,32 +125,51 @@ cancel; it biases the ratio.
 
 ## Recommended fix
 
-**Adjacency reorder** (harness / `benchmark-timing-or-gates.yml`, operator
-surface — not the submission editable paths):
+### Primary: min/median-of-N on the timed window
+The full ratio-vs-gap run shows the scored 128-step decode is dominated by
+intermittent 2–3× throttle spikes over a stable ~0.140 floor, gap-independent.
+The direct fix is to measure the timed window **N times and take the min (or
+median)** rather than a single shot. Throttling only makes a window slower, so
+min-of-N recovers the un-throttled floor; median-of-N is the more conventional,
+slightly conservative choice. Either collapses the ~40 % single-shot ratio CV
+toward the floor's ~1–3 %.
 
-1. Do all prep first: build baseline, build candidate, transform both.
-2. Run the **two timed windows back-to-back**: baseline timed prefill+decode,
-   then immediately candidate timed prefill+decode.
+Cost: N× the timed window (~50 s each) per axis per side — modest next to the
+~5-min model load that already dominates each measurement. This is a
+`benchmark-window-freeze.md` **ranking-contract change** (it changes how a fixed
+baseline maps to a score): update `benchmarkPrefillTimedRuns` / add a decode
+repeat count, the doc, and `BenchmarkWindowFreezeTests.swift` together. It does
+not change the *charged work per timed run*, so it is not a re-baseline, but note
+that reporting min-of-N vs a single run shifts the baseline's own measured number
+too — measure the paired baseline with the same N.
+
+Caveat: if the spikes are a periodic *external* event (the ~17-min periodicity
+hints at this), N repeats spread over a few minutes reduce but may not eliminate
+the chance that the spike lands on every repeat. N should span more than one spike
+period, or use a trimmed statistic robust to one bad window in N.
+
+### Secondary: adjacency reorder (for the residual smooth drift)
+Reorder the ranked pipeline so the two timed windows run back-to-back with both
+correctness passes moved after:
+
+1. Build baseline, build candidate, transform both.
+2. Run the **two timed windows back-to-back** (baseline, then candidate).
 3. Run **both correctness passes after** both timed windows.
 
-This collapses the baseline↔candidate timed gap from ~6–7 min to ~1–2 min (the
-candidate's model load, which cannot be removed because baseline and candidate
-are different code = different processes). Expected residual reduction ~3–4×,
-concentrated on prefill (the drifting axis). It requires separating "timed
-window" from "correctness" in `benchmark.sh` and sequencing the two timed windows
-adjacently in the workflow. It does **not** change the charged work, so it is not
-a re-baseline — but confirm the frozen-window invariants in
-`benchmark-window-freeze.md` still hold (one validated seed prefill + N validated
-decode steps; no identical repeated charged forward).
+This cuts the baseline↔candidate timed gap from ~6–7 min to ~1–2 min (bounded by
+the candidate's model load), cancelling the smooth-drift component in the ratio.
+It does **not** fix the spikes (they are gap-independent), so on its own it is
+insufficient — the ratio-vs-gap data shows the residual does not shrink at small
+gaps. Do it in addition to N-of-N, not instead. It requires separating "timed
+window" from "correctness" in `benchmark.sh`; it does not change the charged work.
+Confirm the frozen-window invariants still hold (one validated seed prefill + N
+validated decode steps; no identical repeated charged forward).
 
-**Plus median-of-N on the timed window** to absorb transient spikes (e.g. the
-one-off 0.17 decode). Reorder fixes drift; it cannot fix random spikes.
-
-Bounds to be honest about: the gap cannot go below the model-load time, so the
-reorder reduces but does not zero the thermal residual. If sub-~1 % is required,
-the deeper option is to hold one resident model and measure baseline+candidate
-from it — which is impossible across two checkouts and would be a much larger
-harness change.
+### Root-cause follow-up (worth doing before over-engineering)
+The ~17–18 min periodicity of the spikes suggests a periodic host-side event
+rather than pure thermals. Worth confirming with the runner provider whether
+there is periodic maintenance / snapshotting / VM co-scheduling on that class,
+since eliminating the source would be cleaner than statistically masking it.
 
 ## Rejected alternatives
 
