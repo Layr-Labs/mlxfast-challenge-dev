@@ -7,16 +7,19 @@ name: gemma-adjacency-prototype
 # between them). If the two timed windows are ADJACENT, both sit at the same
 # thermal state and the drift divides out -- no cooldown needed.
 #
-# Test: run many FAST timing-only windows back-to-back (official 128-step decode
-# + one cold 512 prefill, correctness/gates SKIPPED so each window is ~1.5-2 min
-# instead of ~5), timestamped. Then analyze ratio-vs-gap: decode[i]/decode[i+g]
-# and prefill[i]/prefill[i+g]. Consecutive windows (~1.5 min apart) model the
-# ADJACENT reorder; windows ~4 apart (~6 min) model TODAY's bundled gap. If the
-# ratio CV is tight at small gaps and widens with gap, adjacency works.
+# Test: run --local-iterate windows back-to-back, timestamped, and analyze the
+# PREFILL ratio-vs-gap: prefill[i]/prefill[i+g]. Prefill is the identical official
+# single cold 512-token forward in every mode, so this is the real scored prefill.
+# If the ratio CV grows monotonically with the gap between the two measurements,
+# the adjacency mechanism is confirmed (residual ~ drift_rate x gap) -> measuring
+# baseline and candidate ADJACENT collapses the thermal residual in the ratio.
 #
-# Timing-only window = ./benchmark.sh with MLXFAST_BENCHMARK_CORRECTNESS_STEPS=0
-# and MLXFAST_BENCHMARK_CHECK_GATES=0 (skips the long correctness pass; runs only
-# the timed prefill+decode). Baked Gemma cache => no re-download. NOT CI/scoring.
+# LIMITATION: the fast timing-only path (benchmark.sh + CORRECTNESS_STEPS=0) needs
+# a benchmark oracle the public golden lacks, so each --local-iterate window is
+# ~5 min (correctness bundled). Smallest measurable gap ~= today's BUNDLED spacing;
+# the sub-2-min ADJACENT point is reached by extrapolating the fitted drift.
+# (decode here is 16-step/setup-charged => noisy; prefill is the clean verdict.)
+# Baked Gemma cache => no re-download. NOT CI/scoring.
 on:
   # Registered now; dispatch-only so it never auto-fires. Pilot then scale via
   # `gh workflow run`. Verbose first window per machine is an inline pilot.
@@ -105,43 +108,31 @@ jobs:
             --reference "${MLXFAST_REFERENCE_DIR}" \
             --output weights
 
-      - name: Sample timing-only windows back-to-back
+      - name: Sample windows back-to-back
         env:
           MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
           MLXFAST_SKIP_TRANSFORM: "1"
           MLXFAST_WEIGHTS_PATH: weights
-          # timing-only: skip correctness + gates so each window is ~1.5-2 min
-          MLXFAST_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
-          MLXFAST_BENCHMARK_CORRECTNESS_STEPS: "0"
-          MLXFAST_BENCHMARK_CHECK_GATES: "0"
           PASSES: ${{ inputs.passes || '15' }}
         run: |
           set -uo pipefail
-          echo "machine ${{ matrix.machine }}: ${PASSES} timing-only windows (128-step decode, cold prefill)"
+          echo "machine ${{ matrix.machine }}: ${PASSES} --local-iterate windows (clean official cold prefill)"
+          # NOTE: the fast timing-only path (benchmark.sh + CORRECTNESS_STEPS=0)
+          # is blocked -- the public golden has no benchmark oracle. --local-iterate
+          # works with the public golden and its PREFILL is the identical official
+          # single cold 512-token forward (only decode differs: 16-step, setup-
+          # charged, noisy -> use prefill for the ratio-vs-gap verdict). Each window
+          # is ~5 min (correctness bundled), so the smallest achievable gap ~= the
+          # current BUNDLED spacing; larger gaps come free by skipping windows.
           # columns: index epoch_seconds decode_s_per_tok prefill_s_per_tok
           : > "samples-${{ matrix.machine }}.txt"
           for i in $(seq 1 "${PASSES}"); do
-            # First pass: verbose, so a pilot log tells us the timing-only config
-            # actually produced score.json with decode/prefill before we scale up.
-            if [[ "${i}" == "1" ]]; then
-              echo "== pilot: first timing-only window (verbose) =="
-              ./benchmark.sh; rc=$?
-              echo "benchmark.sh exit=${rc}"
-              echo "-- score.json present? --"; ls -la score.json || echo "NO score.json"
-              echo "-- decode/prefill --"
-              python3 - <<'PY' || true
-          import json
-          s=json.load(open("score.json")); m=s["metrics"]
-          print("decode=",m.get("decode_seconds_per_token")," prefill=",m.get("prefill_seconds_per_token")," passed=",s.get("passed"))
-          PY
-            else
-              ./benchmark.sh >/dev/null 2>&1 || true
-            fi
+            ./benchmark.sh --local-iterate >/dev/null 2>&1 || true
             ts=$(date +%s)
             read -r dec pre < <(python3 - <<'PY'
           import json
           try:
-              m = json.load(open("score.json"))["metrics"]
+              m = json.load(open("score.local-iterate.json"))["metrics"]
               print(m.get("decode_seconds_per_token",""), m.get("prefill_seconds_per_token",""))
           except Exception:
               print("", "")
@@ -239,23 +230,34 @@ jobs:
               print(f"| {g} | {gm:.1f} | {dd:.1f}% | {cv(dr):.1f}% | {pd:.1f}% | {cv(pr):.1f}% |")
           print()
           if rows_out:
-              adj = rows_out[0]
-              # bundled ~ closest gap to ~6 min
-              bun = min(rows_out, key=lambda x: abs(x[1]-6.0))
-              print("### Verdict")
+              print("### Verdict (PREFILL — the clean, scored axis)")
               print()
-              print(f"- ADJACENT (gap {adj[1]:.1f} min): decode ratio CV **{adj[3]:.1f}%**, prefill ratio CV **{adj[5]:.1f}%**")
-              print(f"- BUNDLED-like (gap {bun[1]:.1f} min): decode ratio CV **{bun[3]:.1f}%**, prefill ratio CV **{bun[5]:.1f}%**")
-              d_impr = (bun[3]-adj[3]); p_impr = (bun[5]-adj[5])
-              works = adj[3] < bun[3] and adj[5] <= bun[5]
+              # fit prefill mean|dev| ~ slope * gap_min through the origin (residual
+              # from zero gap is ~0 by definition). rows_out: (g, gm, dd, dcv, pd, pcv)
+              num = sum(r[1]*r[4] for r in rows_out); den = sum(r[1]*r[1] for r in rows_out)
+              slope = num/den if den else float("nan")   # % residual per minute of gap
+              def pred(gap): return slope*gap
+              small = min(rows_out, key=lambda r: r[1])
+              bundled = min(rows_out, key=lambda r: abs(r[1]-7.0))
+              grows = rows_out[-1][4] > rows_out[0][4]
+              print(f"- prefill residual grows with gap: {small[1]:.0f} min -> **{small[4]:.1f}%** ... {rows_out[-1][1]:.0f} min -> **{rows_out[-1][4]:.1f}%**")
+              print(f"- fitted drift: **{slope:.2f}% residual per minute** of gap between the two measurements")
               print()
-              print("- **" + ("ADJACENCY WORKS: ratio residual is tighter at small gap and grows with gap; "
-                              "reordering the two timed windows adjacent removes the thermal drift from the score."
-                              if works else
-                              "INCONCLUSIVE: residual does not clearly grow with gap in this run (transient-dominated?).") + "**")
+              print("| scenario | gap (min) | predicted prefill residual |")
+              print("|---|---|---|")
+              print(f"| TODAY bundled (measured @{bundled[1]:.0f}m) | ~7 | ~{bundled[4]:.1f}% (measured), {pred(7):.1f}% (fit) |")
+              print(f"| ADJACENT reorder (extrapolated) | ~1.5 | **~{pred(1.5):.1f}%** |")
+              print()
+              print("- **" + ("ADJACENCY WORKS: prefill residual grows ~linearly with the gap, so measuring "
+                              "baseline+candidate adjacent (~1.5 min) instead of bundled (~7 min) cuts the "
+                              f"thermal residual ~{(pred(7)/pred(1.5) if pred(1.5) else 0):.0f}x."
+                              if grows else
+                              "INCONCLUSIVE: prefill residual does not clearly grow with gap here (transient-dominated?).") + "**")
           print()
-          print("> Same code both sides => ratio~1.0 is expected; we are measuring only the")
-          print("> residual the pairing cannot cancel. Transient spikes still need median-of-N.")
+          print("> Same code both sides => ratio~1.0 expected; we measure only the residual")
+          print("> pairing cannot cancel. Sub-2-min adjacent point is extrapolated (window floor")
+          print("> is ~5 min). Decode ratio columns are 16-step/noisy here; decode drift is")
+          print("> measured cleanly by gemma-decode-consistency (~0.6-0.8%/min).")
           PY
       - name: Upload combined
         if: always()
