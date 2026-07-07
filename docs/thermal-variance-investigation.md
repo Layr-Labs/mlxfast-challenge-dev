@@ -35,10 +35,19 @@ benchmark window / ranked workflow.
     explain tenki's ~2× (≈100 %) dip. The excess is **host-imposed** (GPU
     time-slicing / overcommit of the VM). tenki is isolated from *other customers*,
     which does not preclude host-level GPU scheduling of this VM.
-  - Caveat: different chip+model each side (M4 Max+Qwen-27B vs M4-Pro-VM+Gemma-31B),
-    so 20 %-vs-2× is indicative not exact; the qualitative split (thermal registers
-    pressure + modest dip on bare metal vs no signal + huge dip on the VM) is the
-    decisive part.
+  - Host form factor: tenki hosts are **Mac minis** (operator-confirmed) — actively
+    cooled desktops, so if anything they throttle *less* than the open-desk M4 Max
+    laptop tested (~20%), which makes a ~2× SoC-thermal dip even less plausible.
+  - Caveats: (1) different chip+model each side (M4 Max+Qwen-27B vs M4-Pro-VM+
+    Gemma-31B), so 20%-vs-2× is indicative not exact; (2) the laptop was open-desk,
+    whereas datacenter minis are often densely **racked** (constrained airflow,
+    high ambient), which can raise thermal above the ~20% seen here — so racked-mini
+    ambient thermal is a possible *secondary* contributor. But a clean 2×, the
+    ~17-min periodicity, and the guest-invisibility still favor host scheduling as
+    the dominant cause. The qualitative split (bare-metal thermal registers pressure
+    + modest dip vs VM no-signal + huge dip) is the decisive part. Cleanest
+    remaining confirmation: run the same `powermetrics`-under-load test on an actual
+    Mac mini of that class (host-level, not in a VM).
   - Implication: the structural fix is a **provider question** (host GPU
     scheduling/overcommit on this VM class), or moving to **M3 Ultra / dedicated
     hardware**. Cooldown correctly does nothing (not the guest's heat); median-of-N
