@@ -14,15 +14,22 @@ benchmark window / ranked workflow.
   spike to 2–3× that floor, roughly *periodic* (~17–18 min). Between-measurement
   ratio CV is ~40–50 % and is **flat across gaps of 5.5–33 min** — gap-independent,
   therefore transient.
-- **Cause (revised): on-machine, NOT co-tenancy — the tenki VMs are 100 % isolated
-  (operator-confirmed).** The clean periodicity is consistent with **thermal
-  limit-cycling** (the throttle controller oscillating under sustained load:
-  heat→throttle→cool→ramp→repeat), or a periodic macOS background task. Not an
-  external/co-scheduled VM. Likely an **M4 Pro runner-class artifact**: the
-  contract hardware is **M3 Ultra (Mac Studio, large thermal envelope + active
-  cooling)**, which should limit-cycle far less or not at all — so this may shrink
-  or vanish when the ranked label moves to the M3 Ultra class. Confirm with thermal
-  telemetry (`powermetrics`/thermal-pressure per window) before over-engineering.
+- **Cause: unresolved from inside the VM — telemetry is virtualized away (probe
+  runs 28844180556, 28846461724).** The tenki VMs are 100 % isolated from other
+  customers (operator-confirmed), so it is not customer co-tenancy. But the guest
+  cannot read the throttle state: `/arm-io/pmgr` is absent (→ `powermetrics`
+  GPU-freq / CPU speed-limit unreadable), and macOS **thermal pressure stayed
+  `Nominal` for all 254 samples and at every window start even while prefill swung
+  2.4× (0.012↔0.028)**. So we can neither confirm nor rule out SoC thermal from
+  the guest. Two candidates remain: **(a) thermal throttling hidden from the guest**
+  (Nominal is uninformative if the thermal daemon has no sensor input), or
+  **(b) host/hypervisor GPU time-slicing of the VM** (a periodic host cap that
+  "isolation from other customers" would not preclude). The guest-invisibility of
+  the slowdown *mildly favors (b)* — a real 2× SoC thermal throttle usually drives
+  thermal pressure above Nominal on bare metal. Settle it where sensors work:
+  bare-metal repro (M-series over SSH, `powermetrics`) under the same sustained
+  load, or host-side metrics from the provider. Either way it is likely an
+  **M4 Pro runner-class artifact** the M3 Ultra contract hardware may not share.
 - **Primary fix: median-of-N on the timed window.** ~0.140 is the dominant state,
   so the median is both stable AND production-representative; N repeats reject the
   transient spike windows. (Prefer median over min-of-N: if the chip genuinely
@@ -175,18 +182,21 @@ Confirm the frozen-window invariants still hold (one validated seed prefill + N
 validated decode steps; no identical repeated charged forward).
 
 ### Root-cause follow-up (worth doing before over-engineering)
-tenki VMs are 100 % isolated (operator-confirmed), so co-tenancy is ruled out.
-The ~17–18 min periodicity is therefore on-machine: most likely **thermal
-limit-cycling** on the thermally-constrained M4 Pro part, possibly a periodic
-macOS background task. Two cheap confirmations before building anything:
-1. **Thermal telemetry** — log `powermetrics --samplers thermal,smc` (or
-   `pmset -g therm` / thermal-pressure sysctls) per window; spike windows
-   coinciding with the SoC hitting its thermal ceiling confirms limit-cycling.
-2. **Runner class** — re-measure on the **M3 Ultra** contract hardware (Mac Studio,
-   large thermal headroom + active cooling). If the spikes are absent there, this
-   is an M4 Pro artifact and the ranked hardware fixes it structurally — no
-   scoring change needed. The clean structural fix is thermal headroom, not a
-   statistical trick.
+In-guest telemetry is exhausted and inconclusive (runs 28844180556 / 28846461724):
+the VM hides `/arm-io/pmgr` (no GPU freq / CPU speed-limit) and thermal pressure is
+pinned at `Nominal` even during 2× slow windows. So the remaining confirmations must
+use sensors the guest does not have:
+1. **Bare-metal repro** — run the same sustained MLX load on an M-series box over
+   SSH (sensors work) with `powermetrics --samplers gpu_power,thermal`. Throttle +
+   rising thermal pressure ⇒ thermal (VM just hides it); flat + cool ⇒ the VM
+   slowdown is host/hypervisor-imposed, not SoC thermal.
+2. **Provider host-side metrics** — ask tenki/Blacksmith for the physical host's
+   GPU/thermal counters and whether the VM's GPU access is periodically scheduled.
+3. **Runner class** — re-measure on the **M3 Ultra** contract hardware (Mac Studio,
+   large thermal headroom + active cooling). If the spikes are absent there, it is
+   an M4 Pro / VM-host artifact the ranked hardware fixes structurally — no scoring
+   change needed. The clean structural fix is the right hardware, not a statistical
+   trick.
 
 ## Rejected alternatives
 
