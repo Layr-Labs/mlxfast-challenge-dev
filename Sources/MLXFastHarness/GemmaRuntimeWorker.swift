@@ -347,12 +347,47 @@ struct RuntimeWorkerResponse: Codable {
     }
 }
 
+/// Buffered line reader over a FileHandle. Reads in 4096-byte chunks and
+/// scans for newlines, replacing the original per-byte readData loop that
+/// issued one syscall per byte of protocol input.
+private final class BufferedFileLineReader {
+    private let handle: FileHandle
+    private var buffer = Data()
+    private static let chunkSize = 4096
+
+    init(handle: FileHandle) {
+        self.handle = handle
+    }
+
+    /// Returns the next newline-delimited line (without the trailing 0x0a),
+    /// or nil when the underlying file handle reaches EOF with no pending data.
+    func readLine() -> Data? {
+        while true {
+            if let newlineIndex = buffer.firstIndex(of: 0x0a) {
+                let line = Data(buffer[buffer.startIndex..<newlineIndex])
+                buffer.removeSubrange(buffer.startIndex...newlineIndex)
+                return line
+            }
+            let chunk = handle.readData(ofLength: Self.chunkSize)
+            if chunk.isEmpty {
+                if buffer.isEmpty { return nil }
+                let line = buffer
+                buffer = Data()
+                return line
+            }
+            buffer.append(chunk)
+        }
+    }
+}
+
 final class RuntimeWorkerProtocolIO {
-    private let input: FileHandle
+    private let reader: BufferedFileLineReader
     private let output: FileHandle
 
     private init(inputDescriptor: Int32, outputDescriptor: Int32) {
-        self.input = FileHandle(fileDescriptor: inputDescriptor, closeOnDealloc: true)
+        self.reader = BufferedFileLineReader(
+            handle: FileHandle(fileDescriptor: inputDescriptor, closeOnDealloc: true)
+        )
         self.output = FileHandle(fileDescriptor: outputDescriptor, closeOnDealloc: true)
     }
 
@@ -371,19 +406,8 @@ final class RuntimeWorkerProtocolIO {
     }
 
     func readLine() throws -> String? {
-        var data = Data()
-        while true {
-            let byte = input.readData(ofLength: 1)
-            if byte.isEmpty {
-                if data.isEmpty {
-                    return nil
-                }
-                break
-            }
-            if byte[byte.startIndex] == 0x0a {
-                break
-            }
-            data.append(byte)
+        guard let data = reader.readLine() else {
+            return nil
         }
         guard let line = String(data: data, encoding: .utf8) else {
             throw MLXFastError.invalidInput("runtime worker received non-UTF8 protocol input")
@@ -537,9 +561,14 @@ func redactedWorkerStderrLine(_ line: String) -> String {
 }
 
 final class RuntimeWorkerClient {
+    // The worker loads the full ~17 GB model and runs warmup before printing
+    // the protocol hello. Allow up to 10 minutes; a worker that crashes before
+    // that (e.g. missing dylib, Metal unavailable) would otherwise hang forever.
+    private static let helloTimeoutSeconds: Double = 600
+
     private let process: Process
     private let input: FileHandle
-    private let output: FileHandle
+    private let outputReader: BufferedFileLineReader
     private let errorOutput: FileHandle
     private let stderrDrain: WorkerStderrDrain?
     private let encoder = JSONEncoder()
@@ -582,13 +611,24 @@ final class RuntimeWorkerClient {
 
         self.process = process
         self.input = stdin.fileHandleForWriting
-        self.output = stdout.fileHandleForReading
+        self.outputReader = BufferedFileLineReader(handle: stdout.fileHandleForReading)
         self.errorOutput = stderr.fileHandleForReading
         // Attach the live drain before waiting for the protocol hello so even
         // output printed during model/weights setup streams immediately.
         self.stderrDrain = options.forwardsWorkerStderr
             ? WorkerStderrDrain(handle: stderr.fileHandleForReading)
             : nil
+        // Watchdog: if the worker crashes before printing the protocol hello
+        // the parent would otherwise block forever on the pipe read below.
+        // The timer terminates the worker process; that closes stdout, which
+        // causes readResponseLine to throw rather than hang.
+        let helloWatchdog = DispatchSource.makeTimerSource(queue: .global())
+        helloWatchdog.schedule(deadline: .now() + Self.helloTimeoutSeconds)
+        helloWatchdog.setEventHandler { [process] in
+            if process.isRunning { process.terminate() }
+        }
+        helloWatchdog.resume()
+        defer { helloWatchdog.cancel() }
         let hello = try readResponseLine(validateNonce: false)
         guard hello.id == 0, hello.ok, let nonce = hello.nonce, !nonce.isEmpty else {
             throw MLXFastError.invalidInput("runtime worker did not return a valid protocol hello")
@@ -705,19 +745,12 @@ final class RuntimeWorkerClient {
     }
 
     private func readWorkerOutputLine() throws -> Data {
-        var data = Data()
-        while true {
-            let byte = output.readData(ofLength: 1)
-            if byte.isEmpty {
-                throw MLXFastError.invalidInput(
-                    "runtime worker closed stdout before returning a response: \(workerExitDiagnostic())"
-                )
-            }
-            if byte[byte.startIndex] == 0x0a {
-                return data
-            }
-            data.append(byte)
+        guard let data = outputReader.readLine() else {
+            throw MLXFastError.invalidInput(
+                "runtime worker closed stdout before returning a response: \(workerExitDiagnostic())"
+            )
         }
+        return data
     }
 
     private func workerExitDiagnostic() -> String {
