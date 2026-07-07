@@ -1,0 +1,252 @@
+name: gemma-thermal-probe
+
+# Ad-hoc: is the ~17-min periodic 2x throttle actually THERMAL? Sample the SoC
+# throttle state (pmset CPU_Speed_Limit, powermetrics GPU active frequency) while
+# running --local-iterate windows, timestamped, then correlate: if slow windows
+# coincide with a dropped GPU frequency / CPU speed limit, it is thermal
+# limit-cycling. If telemetry is unavailable in the VM (sensors hidden), the
+# capability step will show that and we fall back to a behavioral cooldown test.
+#
+# Baked Gemma cache => no re-download. NOT part of CI or scoring.
+on:
+  push:
+    branches:
+      - gemma-tenki-decode
+  workflow_dispatch:
+    inputs:
+      machines:
+        description: 'JSON array of machine indices, e.g. "[1]".'
+        required: false
+        default: "[1]"
+        type: string
+      passes:
+        description: 'Windows per machine (~5 min each; 8 spans ~2 thermal periods).'
+        required: false
+        default: "8"
+        type: string
+
+concurrency:
+  group: gemma-thermal-probe-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sample:
+    name: "thermal machine ${{ matrix.machine }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(inputs.machines || '[1]') }}
+    runs-on: tenki-macos-latest-xlarge
+    timeout-minutes: 120
+    env:
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      MLXFAST_REFERENCE_DIR: /Users/runner/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Thermal telemetry capability
+        run: |
+          set -uo pipefail
+          echo "== pmset -g therm (CPU_Speed_Limit; no sudo) =="
+          pmset -g therm 2>&1 | head -20 || true
+          echo "== sudo -n powermetrics gpu_power,thermal (needs sudo) =="
+          sudo -n powermetrics -n 1 -i 500 --samplers gpu_power,thermal 2>&1 | head -60 || echo "powermetrics unavailable (no passwordless sudo or sensor hidden)"
+          echo "== sysctl thermal/xcpm =="
+          sysctl -a 2>/dev/null | grep -iE 'thermal|xcpm.*(limit|level)' | head -20 || true
+
+      - name: Restore SwiftPM cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        env:
+          MLXFAST_REFERENCE_BASE_URL: https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: "12"
+          MLXFAST_REFERENCE_MIN_FREE_GIB: "40"
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+          MLXFAST_REFERENCE_HASH_VERIFY: "0"
+        run: |
+          set -euo pipefail
+          if [[ ! -f "${MLXFAST_REFERENCE_DIR}/config.json" ]]; then
+            echo "::error::baked Gemma checkpoint missing at ${MLXFAST_REFERENCE_DIR}; refusing to download" >&2
+            exit 1
+          fi
+          ./setup.sh
+
+      - name: Transform reference checkpoint
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" \
+            --output weights
+
+      - name: Run windows with continuous thermal sampling
+        env:
+          MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+          MLXFAST_SKIP_TRANSFORM: "1"
+          MLXFAST_WEIGHTS_PATH: weights
+          PASSES: ${{ inputs.passes || '8' }}
+        run: |
+          set -uo pipefail
+          M="${{ matrix.machine }}"
+
+          read_thermal() {
+            local csl gpu
+            csl=$(pmset -g therm 2>/dev/null | grep -i 'CPU_Speed_Limit' | grep -oE '[0-9]+' | tail -1)
+            gpu=$(sudo -n powermetrics -n 1 -i 300 --samplers gpu_power 2>/dev/null \
+                    | grep -iE 'GPU HW active frequency' | grep -oE '[0-9]+' | head -1)
+            echo "${csl:-NA} ${gpu:-NA}"
+          }
+
+          # continuous background sampler (epoch csl gpu_mhz) every ~12s
+          : > "thermal-${M}.log"
+          ( while :; do t=$(date +%s); r=$(read_thermal); echo "${t} ${r}" >> "thermal-${M}.log"; sleep 12; done ) &
+          SMP=$!
+          trap 'kill "${SMP}" 2>/dev/null || true' EXIT
+
+          # per-window: index wstart wend csl_at_start gpu_at_start prefill decode
+          : > "samples-${M}.txt"
+          for i in $(seq 1 "${PASSES}"); do
+            wstart=$(date +%s)
+            r0=$(read_thermal)         # thermal just before the timed window
+            ./benchmark.sh --local-iterate >/dev/null 2>&1 || true
+            wend=$(date +%s)
+            read -r dec pre < <(python3 - <<'PY'
+          import json
+          try:
+              m = json.load(open("score.local-iterate.json"))["metrics"]
+              print(m.get("decode_seconds_per_token",""), m.get("prefill_seconds_per_token",""))
+          except Exception:
+              print("", "")
+          PY
+          )
+            echo "${i} ${wstart} ${wend} ${r0} ${pre} ${dec}" | tee -a "samples-${M}.txt"
+          done
+          kill "${SMP}" 2>/dev/null || true
+          echo "== thermal.log summary (samples with usable telemetry) =="
+          awk '{print $2, $3}' "thermal-${M}.log" | sort | uniq -c | head
+
+      - name: Upload machine artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-thermal-probe-${{ github.run_id }}-machine-${{ matrix.machine }}
+          path: |
+            samples-${{ matrix.machine }}.txt
+            thermal-${{ matrix.machine }}.log
+          if-no-files-found: error
+          retention-days: 14
+
+  combine:
+    name: combine
+    needs: [sample]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: gemma-thermal-probe-${{ github.run_id }}-machine-*
+          path: samples
+          merge-multiple: false
+      - name: Correlate throttle state with slow windows
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
+          import glob, os, re, statistics as st, math
+          def num(x):
+              try: return float(x)
+              except Exception: return None
+
+          print("## Thermal probe: is the throttle real, and does it track slow windows?")
+          print()
+          # thermal time series availability
+          for tp in sorted(glob.glob("samples/**/thermal-*.log", recursive=True)):
+              m = re.sub(r"^thermal-(.+)\.log$", r"\1", os.path.basename(tp))
+              csl, gpu = [], []
+              for line in open(tp):
+                  p = line.split()
+                  if len(p) >= 3:
+                      c, g = num(p[1]), num(p[2])
+                      if c is not None: csl.append(c)
+                      if g is not None: gpu.append(g)
+              print(f"### machine {m} — telemetry")
+              if csl:
+                  print(f"- CPU_Speed_Limit: n={len(csl)} min={min(csl):.0f} max={max(csl):.0f} "
+                        f"(<100 = CPU thermally limited)")
+              else:
+                  print("- CPU_Speed_Limit: **not available in VM**")
+              if gpu:
+                  print(f"- GPU active freq (MHz): n={len(gpu)} min={min(gpu):.0f} max={max(gpu):.0f} "
+                        f"mean={st.mean(gpu):.0f} — range/mean {(max(gpu)-min(gpu))/st.mean(gpu)*100:.0f}%")
+              else:
+                  print("- GPU freq: **not available** (no passwordless sudo / sensor hidden in VM)")
+              print()
+
+          # per-window correlation: prefill/decode vs thermal-at-window-start
+          for sp in sorted(glob.glob("samples/**/samples-*.txt", recursive=True)):
+              m = re.sub(r"^samples-(.+)\.txt$", r"\1", os.path.basename(sp))
+              rows = []
+              for line in open(sp):
+                  p = line.split()
+                  # idx wstart wend csl gpu prefill decode
+                  if len(p) < 7: continue
+                  rows.append((int(p[0]), num(p[3]), num(p[4]), num(p[5]), num(p[6])))
+              if not rows: continue
+              print(f"### machine {m} — per-window (thermal AT window start)")
+              print("| win | CPU_Speed_Limit | GPU MHz | prefill s/tok | decode s/tok |")
+              print("|---|---|---|---|---|")
+              for idx, csl, gpu, pre, dec in rows:
+                  print(f"| {idx} | {csl if csl is not None else 'NA'} | {gpu if gpu is not None else 'NA'} "
+                        f"| {pre if pre is not None else 'NA'} | {dec if dec is not None else 'NA'} |")
+              # Pearson r: prefill vs GPU freq (expect strong NEGATIVE if thermal)
+              def pearson(xs, ys):
+                  pts = [(x, y) for x, y in zip(xs, ys) if x is not None and y is not None]
+                  if len(pts) < 3: return None
+                  xs2 = [p[0] for p in pts]; ys2 = [p[1] for p in pts]
+                  mx, my = st.mean(xs2), st.mean(ys2)
+                  sxx = sum((x-mx)**2 for x in xs2); syy = sum((y-my)**2 for y in ys2)
+                  sxy = sum((x-mx)*(y-my) for x, y in zip(xs2, ys2))
+                  return sxy/math.sqrt(sxx*syy) if sxx and syy else None
+              pre = [r[3] for r in rows]; dec = [r[4] for r in rows]
+              gpu = [r[2] for r in rows]; csl = [r[1] for r in rows]
+              rpg = pearson(pre, gpu); rpc = pearson(pre, csl); rdg = pearson(dec, gpu)
+              print()
+              if rpg is not None:
+                  print(f"- corr(prefill, GPU freq) r = **{rpg:+.2f}**  (strong negative => slow prefill "
+                        f"coincides with dropped GPU clock => THERMAL)")
+              if rdg is not None:
+                  print(f"- corr(decode, GPU freq) r = **{rdg:+.2f}**")
+              if rpc is not None:
+                  print(f"- corr(prefill, CPU_Speed_Limit) r = **{rpc:+.2f}**")
+              if rpg is None and rpc is None:
+                  print("- no usable thermal telemetry to correlate — the VM hides throttle state; "
+                        "fall back to a behavioral cooldown test.")
+              print()
+          PY
+      - name: Upload combined
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-thermal-probe-${{ github.run_id }}-combined
+          path: samples
+          if-no-files-found: warn
+          retention-days: 14
