@@ -18,9 +18,7 @@ name: gemma-fullbench
 #
 # Baked Gemma cache => no re-download. NOT part of CI or scoring.
 on:
-  push:
-    branches:
-      - gemma-tenki-decode
+  # Registered; dispatch-only so it never auto-fires. Run via gh workflow run.
   workflow_dispatch:
     inputs:
       machines:
