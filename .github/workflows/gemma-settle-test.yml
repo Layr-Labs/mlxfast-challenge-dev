@@ -1,0 +1,233 @@
+name: gemma-settle-test
+
+# Ad-hoc: does a simple BLANKET IDLE SETTLE before each timed measurement remove
+# the thermal variance? (The cheapest possible fix: no pipeline reorder, no oracle
+# -- just `sleep <settle_seconds>` before every bench, after build/transform.)
+#
+# A/B on the same host: interleave windows. Odd windows measure immediately
+# (NO-WAIT, hot); even windows sleep settle_seconds first (WAIT, cooled). If the
+# WAIT arm's prefill is both lower and much tighter (low CV) than the NO-WAIT arm,
+# a fixed pre-settle works -- and since every scored measurement (baseline AND
+# candidate) would get the same settle, their thermal states match and the ratio
+# residual collapses. Prefill is the clean official cold-forward signal; decode
+# here is 16-step/noisy.
+#
+# Baked Gemma cache => no re-download. NOT part of CI or scoring.
+on:
+  push:
+    branches:
+      - gemma-tenki-decode
+  workflow_dispatch:
+    inputs:
+      machines:
+        description: 'JSON array of machine indices, e.g. "[1,2]".'
+        required: false
+        default: "[1,2]"
+        type: string
+      passes:
+        description: 'Total windows per machine (half no-wait, half settle).'
+        required: false
+        default: "8"
+        type: string
+      settle_seconds:
+        description: 'Idle settle before each WAIT window.'
+        required: false
+        default: "120"
+        type: string
+
+concurrency:
+  group: gemma-settle-test-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sample:
+    name: "settle machine ${{ matrix.machine }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(inputs.machines || '[1,2]') }}
+    runs-on: tenki-macos-latest-xlarge
+    timeout-minutes: 150
+    env:
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      MLXFAST_REFERENCE_DIR: /Users/runner/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Host identity
+        run: |
+          set -uo pipefail
+          {
+            echo "machine=${{ matrix.machine }}"
+            echo "model=$(sysctl -n hw.model 2>/dev/null || true)"
+            echo "os=$(sw_vers -productVersion 2>/dev/null || true)"
+            echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee host.txt
+
+      - name: Restore SwiftPM cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        env:
+          MLXFAST_REFERENCE_BASE_URL: https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: "12"
+          MLXFAST_REFERENCE_MIN_FREE_GIB: "40"
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+          MLXFAST_REFERENCE_HASH_VERIFY: "0"
+        run: |
+          set -euo pipefail
+          if [[ ! -f "${MLXFAST_REFERENCE_DIR}/config.json" ]]; then
+            echo "::error::baked Gemma checkpoint missing at ${MLXFAST_REFERENCE_DIR}; refusing to download" >&2
+            exit 1
+          fi
+          ./setup.sh
+
+      - name: Transform reference checkpoint
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" \
+            --output weights
+
+      - name: A/B no-wait vs settle
+        env:
+          MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+          MLXFAST_SKIP_TRANSFORM: "1"
+          MLXFAST_WEIGHTS_PATH: weights
+          PASSES: ${{ inputs.passes || '8' }}
+          SETTLE: ${{ inputs.settle_seconds || '120' }}
+        run: |
+          set -uo pipefail
+          echo "machine ${{ matrix.machine }}: ${PASSES} windows, settle=${SETTLE}s on even windows"
+          # columns: index arm epoch_seconds decode_s_per_tok prefill_s_per_tok
+          : > "samples-${{ matrix.machine }}.txt"
+          for i in $(seq 1 "${PASSES}"); do
+            arm="nowait"
+            if (( i % 2 == 0 )); then
+              arm="wait"
+              echo "window ${i}: idle settle ${SETTLE}s"
+              sleep "${SETTLE}"
+            fi
+            ./benchmark.sh --local-iterate >/dev/null 2>&1 || true
+            ts=$(date +%s)
+            read -r dec pre < <(python3 - <<'PY'
+          import json
+          try:
+              m = json.load(open("score.local-iterate.json"))["metrics"]
+              print(m.get("decode_seconds_per_token",""), m.get("prefill_seconds_per_token",""))
+          except Exception:
+              print("", "")
+          PY
+          )
+            echo "${i} ${arm} ${ts} ${dec} ${pre}" | tee -a "samples-${{ matrix.machine }}.txt"
+          done
+          echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a host.txt
+          cp host.txt "host-${{ matrix.machine }}.txt"
+
+      - name: Upload machine samples
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-settle-test-${{ github.run_id }}-machine-${{ matrix.machine }}
+          path: |
+            samples-${{ matrix.machine }}.txt
+            host-${{ matrix.machine }}.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  combine:
+    name: combine
+    needs: [sample]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download samples
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: gemma-settle-test-${{ github.run_id }}-machine-*
+          path: samples
+          merge-multiple: false
+      - name: Compare no-wait vs settle
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
+          import glob, os, re, statistics as st
+          # rows: idx arm epoch decode prefill
+          per = {}   # idx -> list of (arm, prefill)
+          allrows = {}
+          for fp in sorted(glob.glob("samples/**/samples-*.txt", recursive=True)):
+              idx = re.sub(r"^samples-(.+)\.txt$", r"\1", os.path.basename(fp))
+              rows = []
+              for line in open(fp):
+                  parts = line.split()
+                  if len(parts) < 5: continue
+                  arm = parts[1]
+                  try: pre = float(parts[4])
+                  except ValueError: continue
+                  if pre <= 0: continue
+                  rows.append((arm, pre))
+              if rows: allrows[idx] = rows
+          def cv(xs):
+              m = st.mean(xs); return (st.pstdev(xs)/m*100.0) if m else float("nan")
+
+          print("## Settle test: does a blanket idle before each bench remove thermal variance?")
+          print()
+          print("Prefill = one cold 512-token forward (the scored shape). Odd windows = NO-WAIT")
+          print("(hot); even windows = WAIT (idle settle first).")
+          print()
+          print("| machine | no-wait mean | no-wait CV | settle mean | settle CV | settle vs no-wait |")
+          print("|---|---|---|---|---|---|")
+          nw_all, w_all = [], []
+          for idx in sorted(allrows):
+              nw = [p for a,p in allrows[idx] if a=="nowait"]
+              w  = [p for a,p in allrows[idx] if a=="wait"]
+              nw_all += nw; w_all += w
+              if nw and w:
+                  rel = (st.mean(w)/st.mean(nw)-1)*100
+                  print(f"| {idx} | {st.mean(nw):.5f} | {cv(nw):.1f}% | {st.mean(w):.5f} | {cv(w):.1f}% | {rel:+.0f}% |")
+          print()
+          if nw_all and w_all:
+              print("### Verdict")
+              print()
+              print(f"- NO-WAIT (pooled): mean {st.mean(nw_all):.5f} s/tok, CV **{cv(nw_all):.1f}%**")
+              print(f"- SETTLE  (pooled): mean {st.mean(w_all):.5f} s/tok, CV **{cv(w_all):.1f}%**")
+              cooler = st.mean(w_all) < st.mean(nw_all)*0.9
+              tighter = cv(w_all) < cv(nw_all)*0.6
+              print()
+              if cooler and tighter:
+                  v = "SETTLE WORKS: the idle both cools prefill toward its baseline AND tightens it -> a fixed pre-settle is a viable, dead-simple fix."
+              elif cooler or tighter:
+                  v = "PARTIAL: the settle helps but does not fully restore the cool/tight state -> try a longer settle (rerun with settle_seconds=180 or 300)."
+              else:
+                  v = "SETTLE INSUFFICIENT at this duration: 2 min does not cool enough -> longer settle, or the variance is contention not thermal (waiting won't help)."
+              print(f"- **{v}**")
+          print()
+          print("> Settle duration is an input (settle_seconds); rerun longer if PARTIAL/INSUFFICIENT.")
+          PY
+      - name: Upload combined
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-settle-test-${{ github.run_id }}-combined
+          path: samples
+          if-no-files-found: warn
+          retention-days: 14
