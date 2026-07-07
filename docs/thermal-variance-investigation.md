@@ -258,3 +258,36 @@ so the timing-only path runs without the private golden. To get the real
 The definitive validation of the fix is to implement the reorder and compare the
 scored `prefill_speedup` / `decode_speedup` CV across repeated ranked runs
 against today's bundled order.
+
+---
+
+## Fix architecture decided (2026-07-07): same-VM + adjacent-cold prefill
+
+After prototyping the paired-baseline placement options on tenki, the chosen fix is
+**keep baseline + candidate on ONE VM, but measure both PREFILLs cold and adjacent
+(before decode/correctness warms the VM).** Evidence:
+
+- **Same VM, back-to-back (run 28898140493):** decode ratio candidate/baseline is
+  clean (0.98-1.03) -- warming does NOT hurt decode -- but the candidate's PREFILL
+  is 1.5-2.8x slow because the baseline's decode+correctness (~5 min sustained load)
+  warmed the VM before the candidate's prefill ran.
+- **Separate VMs, "Option D" (run 28904750155):** both VMs fresh + cold (uptime
+  ~24 s), but the candidate VM was a ~18%-slower host -> decode 0.159 vs 0.134,
+  prefill 0.0122 vs 0.0104, both speedups ~0.84, both floors FAIL. Separate VMs
+  remove the warming but **reintroduce the cross-host lottery** (tenki has a tail of
+  ~15-20%-slow VMs, ~1 in ~12 cold fresh VMs) that the same-session paired baseline
+  existed to cancel. So D is worse for BOTH axes.
+
+Conclusion: same-VM is required to cancel host variance (and it keeps decode clean);
+the ONLY defect is prefill being measured warm because the baseline runs first. So:
+
+- **Decode:** keep the same-VM paired baseline (host-cancelled, warming-tolerant).
+- **Prefill:** measure baseline-prefill and candidate-prefill **both cold, adjacent,
+  before either side's decode/correctness** runs -- so neither warms the other. The
+  prefill acceptance band then compares two cold same-VM prefills (fair), and also
+  catches a slow-host session (both cold values elevated -> band fails -> re-run).
+
+Implementation (harness + workflow, prototype on tenki first, only truly testable
+there): the timed phase must be split so PREFILL for both checkouts is measured up
+front on the one VM (a prefill-only/phase-separated measurement), then the decode
+phase for both. This supersedes both the same-VM-bundled order and Option D.
