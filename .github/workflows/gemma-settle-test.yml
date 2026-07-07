@@ -14,9 +14,7 @@ name: gemma-settle-test
 #
 # Baked Gemma cache => no re-download. NOT part of CI or scoring.
 on:
-  push:
-    branches:
-      - gemma-tenki-decode
+  # Dispatch-only now (2-min settle shown insufficient); adjacency-oracle owns push.
   workflow_dispatch:
     inputs:
       machines:
