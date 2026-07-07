@@ -13,9 +13,7 @@ name: gemma-freshvm
 # fixtures; does not affect timed numbers). Baked Gemma cache => no re-download.
 # NOT part of CI or scoring.
 on:
-  push:
-    branches:
-      - gemma-tenki-decode
+  # Registered; dispatch-only. Run via gh workflow run once budget is topped.
   workflow_dispatch:
     inputs:
       runs:
