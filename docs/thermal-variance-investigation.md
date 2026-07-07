@@ -1,4 +1,10 @@
-# Thermal Variance in Timed Benchmarks (tenki M4 Pro) — Investigation & Recommendation
+# Timing Variance in Timed Benchmarks (tenki M4 Pro) — Investigation & Recommendation
+
+> Root cause (final): the dominant ~2× variance is **host/hypervisor GPU
+> scheduling of the VM**, not SoC thermal throttling (bare-metal repro shows real
+> thermal is only ~20% and registers thermal pressure, which the VM hides). SoC
+> thermal is a minor, pairing-cancellable component. See the Cause bullet in the
+> TL;DR and the bare-metal evidence below.
 
 Status: investigation complete (2026-07-07). Operator-facing analysis of
 benchmark timing variance on the Blacksmith/tenki M4 Pro runner class, why it
@@ -14,22 +20,29 @@ benchmark window / ranked workflow.
   spike to 2–3× that floor, roughly *periodic* (~17–18 min). Between-measurement
   ratio CV is ~40–50 % and is **flat across gaps of 5.5–33 min** — gap-independent,
   therefore transient.
-- **Cause: unresolved from inside the VM — telemetry is virtualized away (probe
-  runs 28844180556, 28846461724).** The tenki VMs are 100 % isolated from other
-  customers (operator-confirmed), so it is not customer co-tenancy. But the guest
-  cannot read the throttle state: `/arm-io/pmgr` is absent (→ `powermetrics`
-  GPU-freq / CPU speed-limit unreadable), and macOS **thermal pressure stayed
-  `Nominal` for all 254 samples and at every window start even while prefill swung
-  2.4× (0.012↔0.028)**. So we can neither confirm nor rule out SoC thermal from
-  the guest. Two candidates remain: **(a) thermal throttling hidden from the guest**
-  (Nominal is uninformative if the thermal daemon has no sensor input), or
-  **(b) host/hypervisor GPU time-slicing of the VM** (a periodic host cap that
-  "isolation from other customers" would not preclude). The guest-invisibility of
-  the slowdown *mildly favors (b)* — a real 2× SoC thermal throttle usually drives
-  thermal pressure above Nominal on bare metal. Settle it where sensors work:
-  bare-metal repro (M-series over SSH, `powermetrics`) under the same sustained
-  load, or host-side metrics from the provider. Either way it is likely an
-  **M4 Pro runner-class artifact** the M3 Ultra contract hardware may not share.
+- **Cause (resolved by bare-metal repro): the tenki ~2× dip is dominated by
+  host/hypervisor GPU scheduling of the VM, NOT SoC thermal throttling.** Evidence:
+  - In-VM telemetry is virtualized away (probes 28844180556 / 28846461724):
+    `/arm-io/pmgr` absent (GPU-freq/CPU-limit unreadable); macOS thermal pressure
+    pinned `Nominal` for all 254 samples even while prefill swung 2.4×.
+  - **Bare-metal M4 Max repro (sensors work):** the same sustained MLX inference
+    drove thermal pressure to **Moderate (144) / Heavy (92) — never Nominal**, GPU
+    freq dipped 1578→~1318–1500 MHz, throughput dropped **only ~20 % (22.5→18.8
+    tok/s)**. So (a) this workload *does* thermally throttle Apple Silicon AND
+    macOS *does* register it → the tenki VM's permanent-`Nominal` is a **hidden
+    sensor**, not "no throttle"; and (b) real SoC thermal here is only ~20 % on a
+    *laptop* (worse-cooled than a datacenter Studio/mini host), so it cannot
+    explain tenki's ~2× (≈100 %) dip. The excess is **host-imposed** (GPU
+    time-slicing / overcommit of the VM). tenki is isolated from *other customers*,
+    which does not preclude host-level GPU scheduling of this VM.
+  - Caveat: different chip+model each side (M4 Max+Qwen-27B vs M4-Pro-VM+Gemma-31B),
+    so 20 %-vs-2× is indicative not exact; the qualitative split (thermal registers
+    pressure + modest dip on bare metal vs no signal + huge dip on the VM) is the
+    decisive part.
+  - Implication: the structural fix is a **provider question** (host GPU
+    scheduling/overcommit on this VM class), or moving to **M3 Ultra / dedicated
+    hardware**. Cooldown correctly does nothing (not the guest's heat); median-of-N
+    still mitigates (rejects capped windows).
 - **Primary fix: median-of-N on the timed window.** ~0.140 is the dominant state,
   so the median is both stable AND production-representative; N repeats reject the
   transient spike windows. (Prefer median over min-of-N: if the chip genuinely
@@ -181,22 +194,20 @@ window" from "correctness" in `benchmark.sh`; it does not change the charged wor
 Confirm the frozen-window invariants still hold (one validated seed prefill + N
 validated decode steps; no identical repeated charged forward).
 
-### Root-cause follow-up (worth doing before over-engineering)
-In-guest telemetry is exhausted and inconclusive (runs 28844180556 / 28846461724):
-the VM hides `/arm-io/pmgr` (no GPU freq / CPU speed-limit) and thermal pressure is
-pinned at `Nominal` even during 2× slow windows. So the remaining confirmations must
-use sensors the guest does not have:
-1. **Bare-metal repro** — run the same sustained MLX load on an M-series box over
-   SSH (sensors work) with `powermetrics --samplers gpu_power,thermal`. Throttle +
-   rising thermal pressure ⇒ thermal (VM just hides it); flat + cool ⇒ the VM
-   slowdown is host/hypervisor-imposed, not SoC thermal.
-2. **Provider host-side metrics** — ask tenki/Blacksmith for the physical host's
-   GPU/thermal counters and whether the VM's GPU access is periodically scheduled.
-3. **Runner class** — re-measure on the **M3 Ultra** contract hardware (Mac Studio,
-   large thermal headroom + active cooling). If the spikes are absent there, it is
-   an M4 Pro / VM-host artifact the ranked hardware fixes structurally — no scoring
-   change needed. The clean structural fix is the right hardware, not a statistical
-   trick.
+### Root-cause follow-up
+Done: in-guest telemetry (runs 28844180556 / 28846461724) + a bare-metal M4 Max
+repro (`powermetrics` under sustained MLX load) together show the tenki ~2× is
+host/hypervisor GPU scheduling, not SoC thermal (bare-metal thermal is only ~20%
+and registers Moderate/Heavy pressure, which the VM hides). Remaining actions:
+1. **Provider question (primary):** ask tenki/Blacksmith whether this VM class has
+   host-level GPU scheduling / overcommit / periodic capping — an isolated-from-
+   other-customers VM can still have its GPU access time-sliced by the host. This
+   is the structural fix.
+2. **Runner class:** re-measure on the **M3 Ultra** contract hardware (or any
+   dedicated box with a reserved GPU). If the ~2× dip is absent there, the ranked
+   hardware fixes it structurally — no scoring change needed.
+3. **In-harness mitigation (works regardless of cause):** median-of-N on the timed
+   window. Cooldown is confirmed useless (not the guest's heat).
 
 ## Rejected alternatives
 
