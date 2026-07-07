@@ -1,10 +1,22 @@
 # Timing Variance in Timed Benchmarks (tenki M4 Pro) — Investigation & Recommendation
 
-> Root cause (final): the dominant ~2× variance is **host/hypervisor GPU
-> scheduling of the VM**, not SoC thermal throttling (bare-metal repro shows real
-> thermal is only ~20% and registers thermal pressure, which the VM hides). SoC
-> thermal is a minor, pairing-cancellable component. See the Cause bullet in the
-> TL;DR and the bare-metal evidence below.
+> **FINAL root cause (fresh-VM control, run 28893815980): the dominant ~2–3×
+> decode variance was a CONTINUOUS-RUNNING ARTIFACT of the back-to-back probing,
+> NOT the real ranked path.** On the real cadence — one full `./benchmark.sh` per
+> fresh throwaway VM — **decode is rock-solid: 6/6 shots at 0.1332–0.1343, CV 0.3%,
+> ZERO spikes, decode_speedup ~0.98 (near blacksmith parity, always clears the
+> floor).** The back-to-back runs (floor 0.140 + ~43% spikes to 0.24–0.49) induced
+> the spikes by keeping the VM under sustained load / reusing it. The one genuine
+> residual is **prefill**: 5/6 tight at ~0.0106 but sitting right at the 0.95 floor,
+> with 1/6 spiking to 0.0153 (speedup 0.66, hard fail) — the single-cold-forward
+> fragility, fixable with a median of 2–3 prefill forwards.
+>
+> Caveat still open: the ranked job runs `./benchmark.sh` TWICE per VM (baseline →
+> candidate), so the candidate is a 2nd run; the fresh-VM shots here are all 1st
+> (cold) runs. A 2-runs-per-fresh-VM paired test is the last piece to clear the
+> candidate. Earlier "host-GPU-scheduling dominates / decode needs median-of-N"
+> conclusions below are SUPERSEDED for the real single-shot cadence — they
+> described the back-to-back artifact.
 
 Status: investigation complete (2026-07-07). Operator-facing analysis of
 benchmark timing variance on the Blacksmith/tenki M4 Pro runner class, why it
