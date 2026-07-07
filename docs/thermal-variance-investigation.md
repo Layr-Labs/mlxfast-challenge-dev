@@ -10,15 +10,24 @@ benchmark window / ranked workflow.
 
 - **The dominant variance in the scored 128-step decode is intermittent ~2×
   throttle SPIKES, not smooth thermal drift.** The un-throttled floor is stable
-  (~0.140 s/tok, ~1–3 % CV); individual measurements spike to 2–3× that floor,
-  and the spikes are roughly *periodic* (~17–18 min on one machine), which looks
-  like a periodic external event (host maintenance / snapshot / co-scheduled VM),
-  not a smooth heat ramp. Between-measurement ratio CV is ~40–50 % and is
-  **flat across gaps of 5.5–33 min** — i.e. gap-independent, therefore transient.
-- **Primary fix: min/median-of-N on the timed window.** Because throttling only
-  makes a measurement *slower*, N repeats let you recover the stable floor by
-  rejecting spike windows. This is the lever that actually addresses the observed
-  variance. (Ranked scoring today uses N=1 per axis.)
+  and *dominant* (~0.140 s/tok, ~1–3 % CV, most windows); individual measurements
+  spike to 2–3× that floor, roughly *periodic* (~17–18 min). Between-measurement
+  ratio CV is ~40–50 % and is **flat across gaps of 5.5–33 min** — gap-independent,
+  therefore transient.
+- **Cause (revised): on-machine, NOT co-tenancy — the tenki VMs are 100 % isolated
+  (operator-confirmed).** The clean periodicity is consistent with **thermal
+  limit-cycling** (the throttle controller oscillating under sustained load:
+  heat→throttle→cool→ramp→repeat), or a periodic macOS background task. Not an
+  external/co-scheduled VM. Likely an **M4 Pro runner-class artifact**: the
+  contract hardware is **M3 Ultra (Mac Studio, large thermal envelope + active
+  cooling)**, which should limit-cycle far less or not at all — so this may shrink
+  or vanish when the ranked label moves to the M3 Ultra class. Confirm with thermal
+  telemetry (`powermetrics`/thermal-pressure per window) before over-engineering.
+- **Primary fix: median-of-N on the timed window.** ~0.140 is the dominant state,
+  so the median is both stable AND production-representative; N repeats reject the
+  transient spike windows. (Prefer median over min-of-N: if the chip genuinely
+  sustains a throttle in long production generations, min-of-N's boost-phase value
+  would overstate real throughput.) Ranked scoring uses N=1 per axis today.
 - Smooth thermal drift also exists but is **secondary**: prefill throttles ~2×
   cool→hot (≈0.010→0.020 s/tok); decode drifts ~0.6–0.8 %/min (up to +20 % over
   ~25 min). This drift is *directional in time* (candidate measured later/hotter
@@ -166,10 +175,18 @@ Confirm the frozen-window invariants still hold (one validated seed prefill + N
 validated decode steps; no identical repeated charged forward).
 
 ### Root-cause follow-up (worth doing before over-engineering)
-The ~17–18 min periodicity of the spikes suggests a periodic host-side event
-rather than pure thermals. Worth confirming with the runner provider whether
-there is periodic maintenance / snapshotting / VM co-scheduling on that class,
-since eliminating the source would be cleaner than statistically masking it.
+tenki VMs are 100 % isolated (operator-confirmed), so co-tenancy is ruled out.
+The ~17–18 min periodicity is therefore on-machine: most likely **thermal
+limit-cycling** on the thermally-constrained M4 Pro part, possibly a periodic
+macOS background task. Two cheap confirmations before building anything:
+1. **Thermal telemetry** — log `powermetrics --samplers thermal,smc` (or
+   `pmset -g therm` / thermal-pressure sysctls) per window; spike windows
+   coinciding with the SoC hitting its thermal ceiling confirms limit-cycling.
+2. **Runner class** — re-measure on the **M3 Ultra** contract hardware (Mac Studio,
+   large thermal headroom + active cooling). If the spikes are absent there, this
+   is an M4 Pro artifact and the ranked hardware fixes it structurally — no
+   scoring change needed. The clean structural fix is thermal headroom, not a
+   statistical trick.
 
 ## Rejected alternatives
 
