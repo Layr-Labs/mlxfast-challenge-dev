@@ -4,8 +4,9 @@ import Foundation
 import Testing
 
 // Guards the frozen timed-benchmark window (see docs/benchmark-window-freeze.md).
-// The official prefill/decode baselines are measured on the Blacksmith runner at
-// real cost, so any change to the charged work silently invalidates them. These
+// The official prefill/decode baselines are measured on the ranked runner
+// (tenki-macos-latest-xlarge) at real cost, so any change to the charged work
+// silently invalidates them. These
 // tests are deliberately annoying to change: editing a window constant or the
 // decode/prefill charged-forward structure fails CI until the baseline is
 // re-measured and the freeze doc is updated in the same change.
@@ -156,47 +157,67 @@ func scoredBaselinesResolveFromGoldenWithConstantsFallback() throws {
 @Test
 func officialTimingMachineMeasuresPairedBaseline() throws {
     // The ranking contract on official runs: speedups and floors are computed
-    // against a baseline measured in the SAME session on the SAME VM (paired
-    // baseline), cancelling the ~4-10% fleet/time drift that made fixed-
-    // constant floor verdicts near the threshold a coin flip. See the
-    // paired-baseline section of docs/benchmark-window-freeze.md.
+    // against a paired baseline measured on a SEPARATE fresh VM from the
+    // candidate (Option D). Same-session pairing still cancels common-mode
+    // host/hour drift; measuring the baseline on its own cold VM stops the
+    // baseline run from warming the candidate (which inflated cold prefill
+    // 1.5-2.8x), and the per-run acceptance bands reject the residual per-VM
+    // host lottery. See the paired-baseline section of
+    // docs/benchmark-window-freeze.md.
     let workflow = try packageFile(".github/workflows/benchmark-timing-or-gates.yml")
     let constants = try packageFile("Sources/MLXFastCore/Constants.swift")
     let doc = try packageFile("docs/benchmark-window-freeze.md")
 
-    // Timing machine only, ordered before the candidate's Benchmark step, on a
-    // pinned trusted ref that submissions cannot repoint.
-    let checkout = try #require(workflow.range(of: "- name: Checkout paired baseline reference"))
-    let measure = try #require(workflow.range(of: "- name: Measure paired baseline"))
-    let candidate = try #require(workflow.range(of: "- name: Benchmark"))
-    #expect(checkout.lowerBound < measure.lowerBound)
-    #expect(measure.lowerBound < candidate.lowerBound)
-    let pairedBody = String(workflow[checkout.lowerBound..<candidate.lowerBound])
-    #expect(pairedBody.components(separatedBy: "if: ${{ inputs.mode == 'timing' }}").count - 1 == 2)
-    #expect(pairedBody.contains("ref: eff7e7f2c85a5a6cef11110442ba4624a6ab3986"))
-    #expect(pairedBody.contains("persist-credentials: false"))
+    // Ranked runner is tenki only; Blacksmith is retired for scoring.
+    #expect(workflow.contains("runs-on: tenki-macos-latest-xlarge"))
+    #expect(!workflow.contains("blacksmith"))
 
-    // The measured pair reaches the candidate only through the env overrides,
-    // which the harness validates fail-closed and strips from the worker env.
-    #expect(pairedBody.contains("MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN="))
-    #expect(pairedBody.contains("MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN="))
-    // Baseline floor failures are tolerated (they are measured against the
-    // baseline's own constants); anything else fails the run, and a sanity
-    // band anchored to the calibrated constants rejects pathological sessions.
-    #expect(pairedBody.contains("startswith(\"performance floor failed\")"))
-    #expect(pairedBody.contains("$prefill_ratio >= 0.66 and $prefill_ratio <= 1.5"))
+    // Two jobs: a separate `baseline` job feeds the candidate `run` job.
+    let baselineRange = try #require(workflow.range(of: "\n  baseline:\n"))
+    let runRange = try #require(workflow.range(of: "\n  run:\n"))
+    #expect(baselineRange.lowerBound < runRange.lowerBound)
+    let baselineBody = String(workflow[baselineRange.lowerBound..<runRange.lowerBound])
+    let runBody = String(workflow[runRange.lowerBound...])
+
+    // Baseline job: timing mode only, its own tenki VM, and it EXPORTS its cold
+    // measurement as job outputs (not GITHUB_ENV -- env does not cross jobs).
+    #expect(baselineBody.contains("if: ${{ inputs.mode == 'timing' }}"))
+    #expect(baselineBody.contains("runs-on: tenki-macos-latest-xlarge"))
+    #expect(baselineBody.contains("prefill: ${{ steps.measure.outputs.prefill }}"))
+    #expect(baselineBody.contains("decode: ${{ steps.measure.outputs.decode }}"))
+    #expect(baselineBody.contains("echo \"prefill=${prefill}\""))
+    #expect(baselineBody.contains("echo \"decode=${decode}\""))
+    // Pinned trusted ref submissions cannot repoint, checked out without creds.
+    #expect(baselineBody.contains("ref: eff7e7f2c85a5a6cef11110442ba4624a6ab3986"))
+    #expect(baselineBody.contains("persist-credentials: false"))
+    // Baseline floor failures are tolerated (measured against its own
+    // constants); anything else fails, and a wide sanity band anchored to the
+    // calibrated constants rejects a pathological VM/build. The narrow per-VM
+    // lottery is caught downstream by the candidate's acceptance band.
+    #expect(baselineBody.contains("startswith(\"performance floor failed\")"))
+    #expect(baselineBody.contains("$prefill_ratio >= 0.66 and $prefill_ratio <= 1.5"))
     let sanityPrefill = try #require(
-        pairedBody.range(of: "MLXFAST_PAIRED_SANITY_PREFILL: \"").map { range in
-            String(pairedBody[range.upperBound...].prefix(while: { $0 != "\"" }))
+        baselineBody.range(of: "MLXFAST_PAIRED_SANITY_PREFILL: \"").map { range in
+            String(baselineBody[range.upperBound...].prefix(while: { $0 != "\"" }))
         }
     )
     let sanityDecode = try #require(
-        pairedBody.range(of: "MLXFAST_PAIRED_SANITY_DECODE: \"").map { range in
-            String(pairedBody[range.upperBound...].prefix(while: { $0 != "\"" }))
+        baselineBody.range(of: "MLXFAST_PAIRED_SANITY_DECODE: \"").map { range in
+            String(baselineBody[range.upperBound...].prefix(while: { $0 != "\"" }))
         }
     )
     #expect(sanityPrefill == (try swiftConstantLiteral(constants, name: "officialBaselinePrefillSecondsPerToken")))
     #expect(sanityDecode == (try swiftConstantLiteral(constants, name: "officialBaselineDecodeSecondsPerToken")))
+
+    // Candidate `run` job: depends on the baseline job, but a SKIPPED baseline
+    // (gates mode) must not skip the candidate; a real baseline FAILURE (timing)
+    // must. The measured pair reaches the candidate only through the env
+    // overrides, sourced from the baseline job's outputs (timing mode only; ''
+    // in gates -> no override), which the harness strips from the worker env.
+    #expect(runBody.contains("needs: baseline"))
+    #expect(runBody.contains("needs.baseline.result == 'success' || needs.baseline.result == 'skipped'"))
+    #expect(runBody.contains("MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN: ${{ inputs.mode == 'timing' && needs.baseline.outputs.prefill || '' }}"))
+    #expect(runBody.contains("MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN: ${{ inputs.mode == 'timing' && needs.baseline.outputs.decode || '' }}"))
 
     // Harness side: paired override outranks golden-carried baselines, which
     // outrank constants, and the override keys never reach the worker.

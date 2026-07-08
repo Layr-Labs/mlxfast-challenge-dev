@@ -32,12 +32,201 @@ permissions:
   contents: read
 
 jobs:
+  # Paired baseline on a SEPARATE fresh VM (Option D; see the paired-baseline
+  # section of docs/benchmark-window-freeze.md). The pinned reference
+  # implementation is measured on its OWN cold VM instead of first on the
+  # candidate's VM: the old same-VM ordering warmed the candidate and inflated
+  # its cold prefill 1.5-2.8x purely from running second. Both sides are now cold
+  # on their own VMs, so the paired ratio still cancels common-mode host/hour
+  # drift while the per-run acceptance bands (AcceptanceBand) reject the residual
+  # per-VM host lottery. Timing mode only -- gates mode skips this job, and the
+  # candidate run job's `if` tolerates the skip. The ref is trusted-workflow
+  # content submissions cannot repoint, and its measured values reach the
+  # candidate only through the env overrides the harness strips from the worker.
+  baseline:
+    name: "paired baseline (separate fresh vm)"
+    if: ${{ inputs.mode == 'timing' }}
+    runs-on: tenki-macos-latest-xlarge
+    timeout-minutes: 180
+    environment: benchmark-private-prompts
+    outputs:
+      prefill: ${{ steps.measure.outputs.prefill }}
+      decode: ${{ steps.measure.outputs.decode }}
+    env:
+      MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+      MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
+      # Same hidden golden as the candidate: the baseline times the SAME
+      # benchmark oracle so the ratio is prompt-matched. GPQA augmentation is
+      # NOT needed (attach-gpqa-gates never touches .benchmark or .cases), so the
+      # raw R2 golden is used directly.
+      MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json
+      MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-paired-baseline-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
+      MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}
+      # Timing only: measure the timed prompt, never the base case or gates.
+      MLXFAST_BENCHMARK_CORRECTNESS_STEPS: "0"
+      MLXFAST_BENCHMARK_CHECK_GATES: "0"
+      MLXFAST_BENCHMARK_SKIP_TIMED: "0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Enforce trusted workflow context
+        run: .github/scripts/enforce-trusted-benchmark-workflow.sh
+
+      - name: Check correctness golden source
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "${MLXFAST_CORRECTNESS_GOLDEN_PATH}")"
+          if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
+            echo "benchmark-timing-or-gates: paired baseline requires private R2 secrets for the timed oracle" >&2
+            exit 1
+          fi
+
+      - name: Restore SwiftPM cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        env:
+          MLXFAST_REFERENCE_BASE_URL: ${{ secrets.MLXFAST_REFERENCE_BASE_URL || 'https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main' }}
+          MLXFAST_REFERENCE_AUTH_HEADER: ${{ secrets.MLXFAST_REFERENCE_AUTH_HEADER }}
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
+          MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+        run: ./setup.sh
+
+      - name: Prepare paired baseline timed oracle
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" \
+            "${MLXFAST_CORRECTNESS_GOLDEN_PATH}"
+          # Self-consistent golden pin: the pinned reference harness compares the
+          # golden it loads against these, so anchor them to the file just
+          # downloaded (timing does not depend on the GPQA-augmented hash).
+          actual_hash="$(shasum -a 256 "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | awk '{print $1}')"
+          actual_bytes="$(wc -c < "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | tr -d ' ')"
+          {
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"
+          } >> "${GITHUB_ENV}"
+          echo "benchmark-timing-or-gates: paired baseline timed oracle ${actual_hash} bytes=${actual_bytes}"
+
+      # Reference implementation: main at eff7e7f, the Gemma 4 31B 4-bit
+      # migration merge (PR #352) -- the same code the calibrated constants were
+      # measured against. Changing this ref is a ranking-contract change: follow
+      # the freeze doc's paired-baseline protocol and update the pinned guard test.
+      - name: Checkout paired baseline reference
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: eff7e7f2c85a5a6cef11110442ba4624a6ab3986
+          path: paired-baseline
+          persist-credentials: false
+
+      - name: Measure paired baseline
+        id: measure
+        env:
+          # Calibrated constants, used ONLY as a wide sanity-band anchor (the
+          # guard test pins these to MLXFastConstants). A baseline sample more
+          # than 1.5x slower or 0.66x faster than calibration means the VM or the
+          # baseline build is pathological; failing closed keeps a broken
+          # baseline from mispricing every candidate speedup. The narrow per-VM
+          # host lottery is caught downstream by the candidate's acceptance band,
+          # not here.
+          MLXFAST_PAIRED_SANITY_PREFILL: "0.010605031949609375"
+          MLXFAST_PAIRED_SANITY_DECODE: "0.1336139485703125"
+        run: |
+          set -euo pipefail
+          started="${SECONDS}"
+          # Build FIRST: SwiftPM replaces .build/release with a symlink to the
+          # arch directory during the build, so anything copied in beforehand is
+          # wiped. Then reuse the already-built MLX metallib -- the baseline ref
+          # pins the same mlx-swift revision (guard-tested), so the artifact is
+          # identical and rebuilding it would waste minutes.
+          (
+            cd paired-baseline
+            mkdir -p .build/clang-module-cache
+            export CLANG_MODULE_CACHE_PATH="${PWD}/.build/clang-module-cache"
+            swift build -c release
+          )
+          test -s .build/release/mlx.metallib
+          cp .build/release/mlx.metallib paired-baseline/.build/release/mlx.metallib
+          test -s paired-baseline/.build/release/mlx.metallib
+          baseline_score="${GITHUB_WORKSPACE}/paired-baseline-score.json"
+          status=0
+          (
+            cd paired-baseline
+            export MLXFAST_SCORE_PATH="${baseline_score}"
+            export MLXFAST_INTEGRITY_PATH="${GITHUB_WORKSPACE}/paired-baseline-integrity.json"
+            export MLXFAST_REFERENCE_DIR="${GITHUB_WORKSPACE}/${MLXFAST_REFERENCE_DIR}"
+            ./benchmark.sh
+          ) || status=$?
+          # The baseline's OWN floor verdict is measured against its checked-in
+          # constants and legitimately fails on a slow-fleet session -- exactly
+          # the drift this pairing exists to cancel -- so tolerate a floor failure
+          # but nothing else: token mismatches or harness errors must fail.
+          test -s "${baseline_score}"
+          jq -e '
+            (.metrics.first_failing_case == null)
+            and (.metrics.first_failing_step == null)
+            and (.metrics.expected_token == null)
+            and (.metrics.actual_token == null)
+            and ((.metrics.error == "") or (.metrics.error | startswith("performance floor failed")))
+            and (.metrics.prefill_seconds_per_token > 0)
+            and (.metrics.decode_seconds_per_token > 0)
+          ' "${baseline_score}" >/dev/null || {
+            echo "::error::paired baseline run did not produce a clean timed measurement (exit=${status})" >&2
+            exit 1
+          }
+          jq -e \
+            --argjson sanity_prefill "${MLXFAST_PAIRED_SANITY_PREFILL}" \
+            --argjson sanity_decode "${MLXFAST_PAIRED_SANITY_DECODE}" \
+            '
+            (.metrics.prefill_seconds_per_token / $sanity_prefill) as $prefill_ratio
+            | (.metrics.decode_seconds_per_token / $sanity_decode) as $decode_ratio
+            | ($prefill_ratio >= 0.66 and $prefill_ratio <= 1.5
+               and $decode_ratio >= 0.66 and $decode_ratio <= 1.5)
+            ' "${baseline_score}" >/dev/null || {
+            echo "::error::paired baseline measurement is outside the sanity band vs calibrated constants" >&2
+            exit 1
+          }
+          prefill="$(jq -r '.metrics.prefill_seconds_per_token' "${baseline_score}")"
+          decode="$(jq -r '.metrics.decode_seconds_per_token' "${baseline_score}")"
+          {
+            echo "prefill=${prefill}"
+            echo "decode=${decode}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "benchmark-timing-or-gates: paired baseline prefill=${prefill} decode=${decode} baseline_exit=${status} seconds=$((SECONDS - started))"
+
   run:
-    runs-on: blacksmith-12vcpu-macos-26
+    # Candidate benchmark on its OWN fresh VM. In timing mode it reads the
+    # separate baseline job's cold measurement (needs: baseline) and scores the
+    # ratio; in gates mode the baseline job is skipped, so the `if` below keeps
+    # this job running (a skipped dependency must not skip the candidate) while a
+    # genuine baseline FAILURE in timing mode correctly skips scoring.
+    needs: baseline
+    if: ${{ always() && (needs.baseline.result == 'success' || needs.baseline.result == 'skipped') }}
+    runs-on: tenki-macos-latest-xlarge
     # Reduced from the 720min expert-streaming-era budget: the dense Gemma
-    # model downloads ~18.4 GB and runs timing/gates from RAM (the timing
-    # machine also builds and measures the paired baseline). Still generous
-    # until the recalibrated Gemma baseline pins real phase timings.
+    # model downloads ~18.4 GB and runs timing/gates from RAM. The paired
+    # baseline now runs on its own VM (job `baseline`), so this machine only
+    # measures the candidate. Still generous until the baseline pins real timings.
     timeout-minutes: 360
     environment: benchmark-private-prompts
     env:
@@ -272,111 +461,17 @@ jobs:
             public-gate-report.json || true
           echo "benchmark-timing-or-gates: public behavior gate finished in $((SECONDS - started))s"
           exit "${status}"
-      # Paired baseline measurement, timing machine only. Speedups and floors
-      # were previously computed against constants measured on a different
-      # physical host at a different hour; observed fleet drift is ~4-10% on
-      # prefill and ~4% on decode across one day (see the paired-baseline
-      # section of docs/benchmark-window-freeze.md), which made single-sample
-      # floor verdicts near the threshold a coin flip. Measuring the pinned
-      # reference implementation in the same session, on the same VM, minutes
-      # before the candidate cancels that drift for both the score and the
-      # floors. The ref below is trusted-workflow content (submission branches
-      # must match main outside editablePaths), so submitted code can neither
-      # repoint it nor observe the measured values (the env overrides are
-      # stripped from the sandboxed worker environment by the harness).
-      - name: Checkout paired baseline reference
-        if: ${{ inputs.mode == 'timing' }}
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          # Reference implementation: main at eff7e7f, the Gemma 4 31B 4-bit
-          # migration merge (PR #352). This is the same code the calibrated
-          # constants were measured against (gemma-baseline-timing-probe run
-          # 28809531890). Changing this ref is a ranking-contract change:
-          # follow the freeze doc's paired-baseline protocol and update the
-          # pinned guard test.
-          ref: eff7e7f2c85a5a6cef11110442ba4624a6ab3986
-          path: paired-baseline
-          persist-credentials: false
-
-      - name: Measure paired baseline
-        if: ${{ inputs.mode == 'timing' }}
-        env:
-          # Calibrated constants, used ONLY as a sanity band anchor here (the
-          # guard test pins these to MLXFastConstants). A baseline sample more
-          # than 1.5x slower or 0.66x faster than calibration means the VM or
-          # the baseline build is pathological; failing closed prevents a
-          # broken baseline from inflating or deflating every speedup.
-          MLXFAST_PAIRED_SANITY_PREFILL: "0.010605031949609375"
-          MLXFAST_PAIRED_SANITY_DECODE: "0.1336139485703125"
-        run: |
-          set -euo pipefail
-          started="${SECONDS}"
-          # Build FIRST: SwiftPM replaces .build/release with a symlink to the
-          # arch directory during the build, so anything copied in beforehand
-          # is wiped. Then reuse the already-built MLX metallib -- the baseline
-          # ref pins the same mlx-swift revision (guard-tested), so the
-          # artifact is identical and rebuilding it would waste ~minutes; a
-          # worker without it dies on its first Metal op.
-          (
-            cd paired-baseline
-            mkdir -p .build/clang-module-cache
-            export CLANG_MODULE_CACHE_PATH="${PWD}/.build/clang-module-cache"
-            swift build -c release
-          )
-          test -s .build/release/mlx.metallib
-          cp .build/release/mlx.metallib paired-baseline/.build/release/mlx.metallib
-          test -s paired-baseline/.build/release/mlx.metallib
-          baseline_score="${GITHUB_WORKSPACE}/paired-baseline-score.json"
-          status=0
-          (
-            cd paired-baseline
-            export MLXFAST_SCORE_PATH="${baseline_score}"
-            export MLXFAST_INTEGRITY_PATH="${GITHUB_WORKSPACE}/paired-baseline-integrity.json"
-            export MLXFAST_REFERENCE_DIR="${GITHUB_WORKSPACE}/${MLXFAST_REFERENCE_DIR}"
-            ./benchmark.sh
-          ) || status=$?
-          # The baseline's OWN floor verdict is measured against its checked-in
-          # constants and legitimately fails on a slow-fleet session -- exactly
-          # the drift this pairing exists to cancel -- so tolerate a floor
-          # failure but nothing else: token mismatches or harness errors must
-          # fail the run.
-          test -s "${baseline_score}"
-          jq -e '
-            (.metrics.first_failing_case == null)
-            and (.metrics.first_failing_step == null)
-            and (.metrics.expected_token == null)
-            and (.metrics.actual_token == null)
-            and ((.metrics.error == "") or (.metrics.error | startswith("performance floor failed")))
-            and (.metrics.prefill_seconds_per_token > 0)
-            and (.metrics.decode_seconds_per_token > 0)
-          ' "${baseline_score}" >/dev/null || {
-            echo "::error::paired baseline run did not produce a clean timed measurement (exit=${status})" >&2
-            exit 1
-          }
-          jq -e \
-            --argjson sanity_prefill "${MLXFAST_PAIRED_SANITY_PREFILL}" \
-            --argjson sanity_decode "${MLXFAST_PAIRED_SANITY_DECODE}" \
-            '
-            (.metrics.prefill_seconds_per_token / $sanity_prefill) as $prefill_ratio
-            | (.metrics.decode_seconds_per_token / $sanity_decode) as $decode_ratio
-            | ($prefill_ratio >= 0.66 and $prefill_ratio <= 1.5
-               and $decode_ratio >= 0.66 and $decode_ratio <= 1.5)
-            ' "${baseline_score}" >/dev/null || {
-            echo "::error::paired baseline measurement is outside the sanity band vs calibrated constants" >&2
-            exit 1
-          }
-          prefill="$(jq -r '.metrics.prefill_seconds_per_token' "${baseline_score}")"
-          decode="$(jq -r '.metrics.decode_seconds_per_token' "${baseline_score}")"
-          {
-            echo "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN=${prefill}"
-            echo "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN=${decode}"
-          } >> "${GITHUB_ENV}"
-          echo "benchmark-timing-or-gates: paired baseline prefill=${prefill} decode=${decode} baseline_exit=${status} seconds=$((SECONDS - started))"
-
       - name: Benchmark
         env:
           MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }} mode=${{ inputs.mode }}"
           MLXFAST_SKIP_TRANSFORM: "1"
+          # Paired baseline from the separate `baseline` job (timing mode only).
+          # gates mode: baseline is skipped, so these resolve to '' and the
+          # harness's PairedBaselineOverride.fromEnvironment() treats the empty
+          # pair as "no override" (both-empty -> nil), falling back to the golden
+          # / constants. Both keys are stripped from the sandboxed worker env.
+          MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN: ${{ inputs.mode == 'timing' && needs.baseline.outputs.prefill || '' }}
+          MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN: ${{ inputs.mode == 'timing' && needs.baseline.outputs.decode || '' }}
         run: |
           set -euo pipefail
           if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then

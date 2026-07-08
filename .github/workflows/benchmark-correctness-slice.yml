@@ -33,7 +33,7 @@ permissions:
 
 jobs:
   slice:
-    runs-on: blacksmith-12vcpu-macos-26
+    runs-on: tenki-macos-latest-xlarge
     # Reduced from the 360min expert-streaming-era budget: the dense Gemma
     # model downloads ~18.4 GB and checks its slice from RAM. Still generous
     # until the recalibrated Gemma baseline pins real phase timings.

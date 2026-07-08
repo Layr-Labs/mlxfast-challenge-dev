@@ -4,9 +4,10 @@ This document is the frozen definition of the **timed benchmark window** -- the
 exact work the official runner charges to the prefill and decode scores -- and
 the protocol for changing it. It exists because the official baseline
 (`officialBaselineDecodeSecondsPerToken` /
-`officialBaselinePrefillSecondsPerToken`) is measured on the Blacksmith runner
-at real cost. Any change to the charged work makes the recorded baseline mean a
-different thing, which forces a new baseline run for every axis that moved.
+`officialBaselinePrefillSecondsPerToken`) is measured on the ranked runner
+(tenki-macos-latest-xlarge) at real cost. Any change to the charged work makes
+the recorded baseline mean a different thing, which forces a new baseline run
+for every axis that moved.
 
 Treat a re-baseline as expensive and rare. The goal of this freeze is to make
 the current calibration the last forced one: decide every window knob here, pin
@@ -118,12 +119,15 @@ cancels host/hour drift, and nothing warms the candidate.
 
 - Baseline: cold, its own fresh VM; exports its measured prefill/decode.
 - Candidate: cold, its own fresh VM; reads the baseline's values and scores the
-  ratio (and the prefill band checks the candidate's cold prefill against the
-  baseline's cold prefill -- cold vs cold, so it passes for a normal run).
+  ratio. The per-run acceptance bands then check the candidate's cold prefill and
+  decode against the baseline's cold values (see `AcceptanceBand`): cold vs cold
+  passes for a normal run, but if the two VMs drew different host-lottery speeds
+  the ratio lands outside the band and the run is rejected. Separate VMs cancel
+  only common-mode drift; the bands are what reject the residual per-VM lottery.
 
 Cost: two fresh VMs per ranked timing run instead of one (run in parallel). The
 constants above remain the sanity-band anchor + local-mode/gates fallback, not the
-score denominator (the live same-session baseline is).
+score denominator (the live paired baseline is).
 
 ### Per-prompt baselines in the golden oracle
 
@@ -158,21 +162,32 @@ Fixed constants compare a live single sample against a number measured on a
 different physical host at a different hour. Measured fleet drift on identical
 code across one day: prefill 0.163 -> 0.190 seconds/token (~10%+), decode ~4% --
 enough to flip floor verdicts and swing scores for reasons unrelated to the
-submission. Official ranked runs therefore measure the baseline live:
+submission. Official ranked runs therefore measure the baseline live, on a
+**separate fresh VM** (the two-job layout in
+`.github/workflows/benchmark-timing-or-gates.yml`):
 
-- The timing machine checks out the **pinned paired-baseline ref** (trusted
-  workflow content; submissions cannot repoint it), builds it, transforms its
-  own weights, and runs its timed benchmark against the same hidden golden in
-  the same session, minutes before the candidate.
-- The measured seconds-per-token are passed to the candidate benchmark through
-  `MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN` /
-  `MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN`. Resolution precedence in
-  the harness is **paired override, then golden-carried baselines, then the
-  constants**. The pair is fail-closed (both together, finite, positive) and
-  both variables are stripped from the sandboxed worker environment.
-- A **sanity band** guards the pairing: the baseline sample must fall within
-  [0.66x, 1.5x] of the calibrated constants on both axes, so a pathological VM
-  or broken baseline build fails the run instead of repricing every speedup.
+- A dedicated `baseline` job (timing mode only, its own tenki VM) checks out the
+  **pinned paired-baseline ref** (trusted workflow content; submissions cannot
+  repoint it), builds it, transforms its own weights, and runs its timed
+  benchmark against the same hidden golden's benchmark oracle. It measured on the
+  candidate's VM before -- which warmed the candidate -- so it now runs on its own
+  cold VM and **exports** its prefill/decode as job outputs.
+- The candidate `run` job `needs: baseline` and passes those outputs to its
+  benchmark through `MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN` /
+  `MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN` (timing mode only; gates mode
+  skips the baseline job, so both resolve to `''`). Resolution precedence in the
+  harness is **paired override, then golden-carried baselines, then the
+  constants**. The pair is fail-closed (both together, finite, positive; an empty
+  pair means "no override"), and both variables are stripped from the sandboxed
+  worker environment.
+- The candidate's `if` runs it when the baseline **succeeded** (timing) or was
+  **skipped** (gates) but not when it **failed** -- a broken baseline must not be
+  scored against.
+- A wide **sanity band** guards the baseline job: its sample must fall within
+  [0.66x, 1.5x] of the calibrated constants on both axes, so a pathological VM or
+  broken baseline build fails the run instead of repricing every speedup. This is
+  deliberately wide -- the narrow per-VM host lottery is caught downstream by the
+  candidate's acceptance bands, not here.
 - The baseline's own floor verdict is ignored (it is measured against its
   checked-in constants and legitimately fails on a slow-fleet session); token
   mismatches or harness errors in the baseline run fail the whole run.
@@ -190,8 +205,8 @@ session as a hard prerequisite for rotation.
 
 1. Make the window change and update the constants above in
    `Sources/MLXFastCore/Constants.swift`.
-2. Re-measure the affected axis (or both) on the official Blacksmith runner with
-   the baseline reference model, all gates green.
+2. Re-measure the affected axis (or both) on the ranked runner
+   (tenki-macos-latest-xlarge) with the baseline reference model, all gates green.
 3. Update `officialBaseline*SecondsPerToken` and the values quoted in this doc,
    `README.md`, and `TASK.md`.
 4. Update the pinned literals in `BenchmarkWindowFreezeTests.swift` in the same
