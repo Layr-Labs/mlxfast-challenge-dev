@@ -69,47 +69,25 @@ jobs:
       MLXFAST_BENCHMARK_CHECK_GATES: "0"
       MLXFAST_BENCHMARK_SKIP_TIMED: "0"
     steps:
+      # This job builds and times ONLY the frozen reference implementation, so it
+      # checks the pinned trusted ref (afb68a4) out directly at the workspace root
+      # and NEVER touches the dispatched submission branch. That is deliberate and
+      # load-bearing: this job holds the reference auth header and the R2 secrets
+      # that unlock the private goldens, so no submission-controlled code (setup.sh,
+      # .github/scripts/*, or the editable surface) may execute here. Because only
+      # trusted pinned content runs, the candidate `run` job's static-review /
+      # modifiable-surface gates are unnecessary here -- there is no submission
+      # diff to review, and no path by which a submission reaches the secrets.
+      # Changing this ref is a ranking-contract change: follow the freeze doc's
+      # paired-baseline protocol and update the pinned guard test.
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
+          ref: afb68a4a9f23bacfe8547d7cc11545ed4a0fd460
           fetch-depth: 0
           persist-credentials: false
 
       - name: Enforce trusted workflow context
         run: .github/scripts/enforce-trusted-benchmark-workflow.sh
-
-      # The baseline job checks out the DISPATCHED ref (a submissions/* branch on
-      # ranked runs) and below runs non-editable scripts -- setup.sh and
-      # download-r2-object.sh -- with the reference auth header and R2 secrets in
-      # scope. Those secrets unlock the private goldens, so the same file-integrity
-      # gates the candidate `run` job applies before its secret steps MUST run here
-      # too, and before any secret is exposed. enforce-trusted validates the
-      # workflow context only; enforce-modifiable-surface is the boundary that
-      # rejects a tampered setup.sh / .github/scripts/*, and the static review
-      # catches editable-surface bypasses. Without these a tampered submission
-      # branch would exfiltrate the R2 keys here before the run job's gates fire.
-      - name: Review submitted code for benchmark bypasses
-        if: ${{ startsWith(github.ref_name, 'submissions/') }}
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
-          HEAD_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          # Review only the editable files changed vs the merge-base -- see the
-          # diff-only-mode comment in run-submission-static-review.sh. Standalone
-          # assignment: a merge-base failure must fail this step; as a command
-          # prefix its failure would be masked by bash and the review would
-          # silently fall back to the whole editable surface.
-          base_sha="$(git merge-base origin/main "${HEAD_SHA}")"
-          MLXFAST_SUBMISSION_REVIEW_BASE_SHA="${base_sha}" \
-            .github/scripts/run-submission-static-review.sh
-
-      - name: Enforce modifiable surface
-        if: ${{ startsWith(github.ref_name, 'submissions/') }}
-        env:
-          HEAD_SHA: ${{ github.sha }}
-        run: |
-          BASE_SHA="$(git merge-base origin/main "${HEAD_SHA}")" \
-            .github/scripts/enforce-modifiable-surface.sh
 
       - name: Check correctness golden source
         run: |
@@ -162,50 +140,28 @@ jobs:
           } >> "${GITHUB_ENV}"
           echo "benchmark-timing-or-gates: paired baseline timed oracle ${actual_hash} bytes=${actual_bytes}"
 
-      # Reference implementation: the mlx-swift-lm vanilla rebase at afb68a4
-      # (PR #366) -- the same code the calibrated vanilla constants were measured
-      # against. Changing this ref is a ranking-contract change: follow the freeze
-      # doc's paired-baseline protocol and update the pinned guard test.
-      - name: Checkout paired baseline reference
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          ref: afb68a4a9f23bacfe8547d7cc11545ed4a0fd460
-          path: paired-baseline
-          persist-credentials: false
-
       - name: Measure paired baseline
         id: measure
         env:
           # Calibrated constants, used ONLY as a wide sanity-band anchor (the
           # guard test pins these to MLXFastConstants). A baseline sample more
-          # than 1.5x slower or 0.66x faster than calibration means the VM or the
-          # baseline build is pathological; failing closed keeps a broken
-          # baseline from mispricing every candidate speedup. The narrow per-VM
-          # host lottery is caught downstream by the candidate's acceptance band,
-          # not here.
+          # than 1.5x slower or 0.66x faster than calibration means the VM is
+          # pathological; failing closed keeps a broken baseline from mispricing
+          # every candidate speedup. The narrow per-VM host lottery is caught
+          # downstream by the candidate's acceptance band, not here.
           MLXFAST_PAIRED_SANITY_PREFILL: "0.03870193642617188"
           MLXFAST_PAIRED_SANITY_DECODE: "0.17949775266875"
         run: |
           set -euo pipefail
           started="${SECONDS}"
-          # Build FIRST: SwiftPM replaces .build/release with a symlink to the
-          # arch directory during the build, so anything copied in beforehand is
-          # wiped. Then reuse the already-built MLX metallib -- the baseline ref
-          # pins the same mlx-swift revision (guard-tested), so the artifact is
-          # identical and rebuilding it would waste minutes.
-          (
-            cd paired-baseline
-            mkdir -p .build/clang-module-cache
-            export CLANG_MODULE_CACHE_PATH="${PWD}/.build/clang-module-cache"
-            swift build -c release
-          )
-          test -s .build/release/mlx.metallib
-          cp .build/release/mlx.metallib paired-baseline/.build/release/mlx.metallib
-          test -s paired-baseline/.build/release/mlx.metallib
+          # setup.sh already built the harness + MLX metallib and downloaded the
+          # reference checkpoint at the workspace root (all from the pinned ref).
+          # benchmark.sh reuses them -- its own incremental `swift build` preserves
+          # the metallib setup.sh placed -- and self-transforms into weights/, so
+          # no separate reference checkout or metallib copy is needed here.
           baseline_score="${GITHUB_WORKSPACE}/paired-baseline-score.json"
           status=0
           (
-            cd paired-baseline
             export MLXFAST_SCORE_PATH="${baseline_score}"
             export MLXFAST_INTEGRITY_PATH="${GITHUB_WORKSPACE}/paired-baseline-integrity.json"
             export MLXFAST_REFERENCE_DIR="${GITHUB_WORKSPACE}/${MLXFAST_REFERENCE_DIR}"

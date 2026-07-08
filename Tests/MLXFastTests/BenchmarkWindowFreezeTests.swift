@@ -190,6 +190,14 @@ func officialTimingMachineMeasuresPairedBaseline() throws {
     // Pinned trusted ref submissions cannot repoint, checked out without creds.
     #expect(baselineBody.contains("ref: afb68a4a9f23bacfe8547d7cc11545ed4a0fd460"))
     #expect(baselineBody.contains("persist-credentials: false"))
+    // Security: this job holds the R2 + reference-auth secrets, so it must run
+    // ONLY trusted pinned content -- exactly ONE checkout, and it is the pinned
+    // ref, never the dispatched submission branch. That is what lets the baseline
+    // job safely skip the run job's surface / static-review gates (no submission
+    // code executes here, so no submission can reach the secrets). If a dispatched
+    // checkout is ever re-added, this count breaks and forces the gates back.
+    #expect(baselineBody.components(separatedBy: "uses: actions/checkout").count - 1 == 1)
+    #expect(!baselineBody.contains("path: paired-baseline"))
     // Baseline floor failures are tolerated (measured against its own
     // constants); anything else fails, and a wide sanity band anchored to the
     // calibrated constants rejects a pathological VM/build. The narrow per-VM
