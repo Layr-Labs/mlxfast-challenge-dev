@@ -1,0 +1,162 @@
+name: gemma-golden-gen
+
+# Generate the PUBLIC correctness goldens ON the ranked runner (tenki), so the
+# greedy continuation matches what the model produces on the runner and the public
+# gate can never drift (cross-machine greedy decode is not guaranteed identical, so
+# goldens generated on a dev box are unsafe). N independent fresh VMs each generate
+# the 1024-token continuation; the combine job verifies they are byte-identical (a
+# determinism check -- if tenki VMs disagree there is no stable golden) and emits
+# the 256- and 1024-token fixtures for check-in. Dispatch-only; not CI/scoring.
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: 'JSON array of independent fresh-VM generator indices.'
+        required: false
+        default: "[1,2,3]"
+        type: string
+
+concurrency:
+  group: gemma-golden-gen-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gen:
+    name: "gen ${{ matrix.run }} (fresh vm)"
+    strategy:
+      fail-fast: false
+      matrix:
+        run: ${{ fromJSON(inputs.runs || '[1,2,3]') }}
+    runs-on: tenki-macos-latest-xlarge
+    timeout-minutes: 60
+    env:
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      MLXFAST_REFERENCE_DIR: /Users/runner/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Host identity + VM freshness
+        run: |
+          set -uo pipefail
+          boot=$(sysctl -n kern.boottime 2>/dev/null | grep -oE 'sec = [0-9]+' | grep -oE '[0-9]+' | head -1)
+          now=$(date +%s); up=$(( now - ${boot:-now} ))
+          echo "run=${{ matrix.run }} uptime_s=${up} (small => fresh VM)"
+
+      - name: Restore SwiftPM cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup Swift harness and reference checkpoint
+        env:
+          MLXFAST_REFERENCE_BASE_URL: https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main
+          MLXFAST_REFERENCE_DOWNLOAD_JOBS: "12"
+          MLXFAST_REFERENCE_MIN_FREE_GIB: "40"
+          MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+          MLXFAST_REFERENCE_HASH_VERIFY: "0"
+        run: |
+          set -euo pipefail
+          if [[ ! -f "${MLXFAST_REFERENCE_DIR}/config.json" ]]; then
+            echo "::error::baked Gemma checkpoint missing at ${MLXFAST_REFERENCE_DIR}; refusing to download" >&2
+            exit 1
+          fi
+          ./setup.sh
+
+      - name: Transform reference checkpoint
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+            .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+            --reference "${MLXFAST_REFERENCE_DIR}" --output weights
+
+      - name: Generate 1024-token public golden (vanilla model)
+        run: |
+          set -euo pipefail
+          .build/release/mlxfast-swift generate-golden \
+            --prompt-file correctness_prompts/public_longcopy_gate_english_512.txt \
+            --weights weights --tokenizer "${MLXFAST_REFERENCE_DIR}" \
+            --output "golden-${{ matrix.run }}.json" \
+            --name longcopy-gate-english-512 --steps 1024
+          python3 -c "import json;c=json.load(open('golden-${{ matrix.run }}.json'))['cases'][0];assert len(c['prompt_tokens'])==512 and len(c['expected_tokens'])>=1024,(len(c['prompt_tokens']),len(c['expected_tokens']));print('run ${{ matrix.run }} ok: prompt',len(c['prompt_tokens']),'expected',len(c['expected_tokens']),'distinct',len(set(c['expected_tokens'])))"
+
+      - name: Upload golden
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-golden-${{ github.run_id }}-run-${{ matrix.run }}
+          path: golden-${{ matrix.run }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  combine:
+    name: combine
+    needs: [gen]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download generated goldens
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: gemma-golden-${{ github.run_id }}-run-*
+          path: gens
+          merge-multiple: false
+      - name: Verify determinism + emit 256/1024 fixtures
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
+          import glob, json, hashlib
+          files=sorted(glob.glob("gens/**/golden-*.json", recursive=True))
+          assert files, "no generated goldens"
+          cases=[json.load(open(f))["cases"][0] for f in files]
+          toks=[c["expected_tokens"] for c in cases]
+          prompts=[c["prompt_tokens"] for c in cases]
+          print("## Public golden generation (tenki, per-VM)")
+          print()
+          identical = all(t==toks[0] for t in toks) and all(p==prompts[0] for p in prompts)
+          for f,c in zip(files,cases):
+              h=hashlib.sha256((",".join(map(str,c["expected_tokens"][:1024]))).encode()).hexdigest()[:12]
+              print(f"- {f}: expected[:1024] token-hash {h}")
+          print()
+          print(f"- **determinism across {len(files)} fresh VMs: {'IDENTICAL' if identical else 'DIVERGED (!)'}**")
+          if not identical:
+              # show first divergence
+              base=toks[0]
+              for i,t in enumerate(toks[1:],1):
+                  for j,(a,b) in enumerate(zip(base,t)):
+                      if a!=b:
+                          print(f"  - VM0 vs VM{i} diverge at step {j}: {a} != {b}")
+                          break
+              raise SystemExit("goldens diverged across tenki VMs -- no stable golden")
+          p=prompts[0]; e=toks[0]
+          for n in (256,1024):
+              out={"version":1,"cases":[{"name":"longcopy-gate-english-512","prompt_tokens":p,"expected_tokens":e[:n]}]}
+              # canonical formatting to match the repo's checked-in fixtures
+              json.dump(out, open(f"public_longcopy_gate_english_512_{n}.json","w"))
+              sha=hashlib.sha256(open(f"public_longcopy_gate_english_512_{n}.json","rb").read()).hexdigest()
+              print(f"- public_longcopy_gate_english_512_{n}.json  sha256={sha}")
+          PY
+      - name: Upload assembled fixtures
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gemma-public-goldens-${{ github.run_id }}
+          path: |
+            public_longcopy_gate_english_512_256.json
+            public_longcopy_gate_english_512_1024.json
+          if-no-files-found: error
+          retention-days: 14
