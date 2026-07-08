@@ -85,7 +85,13 @@ public enum Gemma4Attention {
         spec: Gemma4AttentionSpec,
         mask: MLXArray? = nil,
         cache: Gemma4LayerCache? = nil,
-        positionOffset: Int = 0
+        positionOffset: Int = 0,
+        /// When non-nil, the O-projection output is immediately followed by
+        /// RMSNorm with this weight, fusing the two operations into a single
+        /// expression tree so MLX can avoid materializing the intermediate
+        /// O-projection result.
+        postNormWeight: MLXArray? = nil,
+        postNormEps: Double = 0
     ) throws -> MLXArray {
         try validateInput(x, spec: spec)
         let batchSize = x.shape[0]
@@ -121,8 +127,15 @@ public enum Gemma4Attention {
 
         var attentionMask = mask
         if let cache {
-            let cachedK = try cache.keys.updateAndFetch(k)
-            let cachedV = try cache.values.updateAndFetch(v)
+            let cachedK: Gemma4CachedArray
+            let cachedV: Gemma4CachedArray
+            if sequenceLength == 1 {
+                cachedK = cache.keys.updateAndFetchDecode(k)
+                cachedV = cache.values.updateAndFetchDecode(v)
+            } else {
+                cachedK = try cache.keys.updateAndFetch(k)
+                cachedV = try cache.values.updateAndFetch(v)
+            }
             k = cachedK.value
             v = cachedV.value
             attentionMask = try Gemma4MaskCache.causal(
@@ -142,7 +155,11 @@ public enum Gemma4Attention {
             mask: attentionMask
         )
         let reshaped = out.transposed(0, 2, 1, 3).reshaped([batchSize, sequenceLength, -1])
-        return Gemma4Ops.linear(reshaped, weights.oProj)
+        let projected = Gemma4Ops.linear(reshaped, weights.oProj)
+        if let postNormWeight {
+            return Gemma4Ops.rmsNorm(projected, weight: postNormWeight, eps: postNormEps)
+        }
+        return projected
     }
 
     private static func validateInput(_ x: MLXArray, spec: Gemma4AttentionSpec) throws {

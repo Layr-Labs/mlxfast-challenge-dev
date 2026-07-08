@@ -33,13 +33,15 @@ public enum Gemma4Block {
         hidden: MLXArray,
         weights: Gemma4BlockWeights,
         rmsNormEps: Double,
-        attention: (_ normalized: MLXArray) throws -> MLXArray,
+        attention: (_ normalized: MLXArray, _ postNormWeight: MLXArray?, _ postNormEps: Double) throws -> MLXArray,
         feedForward: (_ normalized: MLXArray) throws -> MLXArray
     ) throws -> MLXArray {
         var residual = hidden
         var h = Gemma4Ops.rmsNorm(hidden, weight: weights.inputLayerNorm, eps: rmsNormEps)
-        h = try attention(h)
-        h = Gemma4Ops.rmsNorm(h, weight: weights.postAttentionLayerNorm, eps: rmsNormEps)
+        // The attention closure applies the O-projection and post-attention
+        // RMSNorm in a single expression tree, avoiding materialization of
+        // the intermediate O-projection result.
+        h = try attention(h, weights.postAttentionLayerNorm, rmsNormEps)
         var out = residual + h
 
         residual = out
