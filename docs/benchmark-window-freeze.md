@@ -4,8 +4,8 @@ This document is the frozen definition of the **timed benchmark window** -- the
 exact work the official runner charges to the prefill and decode scores -- and
 the protocol for changing it. It exists because the official baseline
 (`officialBaselineDecodeSecondsPerToken` /
-`officialBaselinePrefillSecondsPerToken`) is measured on the Blacksmith runner
-at real cost. Any change to the charged work makes the recorded baseline mean a
+`officialBaselinePrefillSecondsPerToken`) is measured on the ranked runner
+(`tenki-macos-latest-xlarge`) at real cost. Any change to the charged work makes the recorded baseline mean a
 different thing, which forces a new baseline run for every axis that moved.
 
 Treat a re-baseline as expensive and rare. The goal of this freeze is to make
@@ -69,8 +69,9 @@ same test:
 
 Acceptance bands (see `AcceptanceBand`,
 `docs/thermal-variance-investigation.md`): prefill and decode are single noisy
-measurements, each gated once per run against the same-VM paired baseline `B`
-(which cancels host-speed differences). After the speedup floors, each axis's
+measurements, each gated once per run against the paired baseline `B` measured
+on its own fresh VM (which cancels fleet-wide/common-mode drift; per-VM host
+variance is what the band tolerances themselves absorb). After the speedup floors, each axis's
 measured value must land within `[B * (1 - downTolerance), B * (1 + upTolerance)]`:
 it fails if the value exceeds `B * (1 + upTolerance)` (a real slowdown /
 regression) or drops below `B * (1 - downTolerance)` (an improvement too large to
@@ -87,20 +88,24 @@ trust in one submission, or a suspiciously lucky-fast reading).
 `B`'s robustness (drop-slowest average) and the per-axis tolerances are
 ranking-contract decisions, so they are operator-owned and pinned here.
 
-## Current calibrated baseline (cached, tenki cold)
+## Current calibrated baseline (cached, tenki cold, mlx-swift-lm reference)
 
-The ranked runner is now **tenki-macos-latest-xlarge only** (Blacksmith retired).
-The baseline is a **cached** value, calibrated from COLD single-benchmark runs --
-one full 128-step `./benchmark.sh` per fresh throwaway VM, which is exactly how the
-ranked candidate is measured now (see "Cached baseline" below). Values are the
-robust drop-outlier average of fresh-VM run 28893815980 (2026-07-07, 6 fresh VMs;
-corroborated by the cold run-1s of run 28898140493, 10 cold measurements total):
+The reference model is now the upstream **ml-explore/mlx-swift-lm** `Gemma4TextModel`
+(eager decode), and the ranked runner is **tenki-macos-latest-xlarge only**. The
+baseline is a **cached** value, calibrated from COLD single-benchmark runs -- one
+full 128-step `./benchmark.sh` per fresh throwaway VM, exactly how the ranked
+candidate is measured. Values are the robust drop-outlier average of fresh-VM run
+28919623628 (2026-07-08, 6 fresh VMs): decode clustered 0.1743-0.1866 (CV 2.7%, no
+slow-VM tail); prefill 0.0365-0.0412 (CV 4.6%):
 
-- `officialBaselineDecodeSecondsPerToken = 0.1336139485703125`
-- `officialBaselinePrefillSecondsPerToken = 0.010605031949609375`
+- `officialBaselineDecodeSecondsPerToken = 0.17949775266875`
+- `officialBaselinePrefillSecondsPerToken = 0.03870193642617188`
 
-These supersede the Blacksmith-era values (decode 0.131727461265625 / prefill
-0.01010573933984375), which priced a runner we no longer use.
+These supersede the bespoke-model values (decode 0.1336139485703125 / prefill
+0.010605031949609375). The mlx-swift-lm reference is ~1.3x slower on decode but far
+more deterministic across fresh VMs -- a same-day bespoke matrix (run 28921608965)
+hit its host-lottery tail (decode CV 36.4%, one VM 2.26x slow) while this reference
+held CV ~2.7%, which is what keeps the +/-2%/5% decode acceptance bands viable.
 
 If either number here disagrees with `Sources/MLXFastCore/Constants.swift`, the
 freeze test fails on purpose -- the doc and the code must move together.
@@ -158,12 +163,17 @@ Fixed constants compare a live single sample against a number measured on a
 different physical host at a different hour. Measured fleet drift on identical
 code across one day: prefill 0.163 -> 0.190 seconds/token (~10%+), decode ~4% --
 enough to flip floor verdicts and swing scores for reasons unrelated to the
-submission. Official ranked runs therefore measure the baseline live:
+submission. Official ranked runs therefore measure the baseline live on its
+own fresh VM:
 
-- The timing machine checks out the **pinned paired-baseline ref** (trusted
-  workflow content; submissions cannot repoint it), builds it, transforms its
-  own weights, and runs its timed benchmark against the same hidden golden in
-  the same session, minutes before the candidate.
+- A dedicated `baseline` job on a **separate fresh tenki VM** checks out the
+  **pinned paired-baseline ref** (trusted workflow content; submissions cannot
+  repoint it), builds it, transforms its own weights, and runs its timed
+  benchmark against the same hidden golden. Its measured seconds-per-token are
+  published as job outputs, and the candidate `run` job (`needs: baseline`)
+  reads them. Baseline and candidate therefore run on independent fresh VMs, so
+  the pairing cancels fleet-wide drift instead of inheriting one VM's warm/cold
+  state — the host-lottery failure mode that repriced same-VM sequential runs.
 - The measured seconds-per-token are passed to the candidate benchmark through
   `MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN` /
   `MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN`. Resolution precedence in
@@ -190,8 +200,8 @@ session as a hard prerequisite for rotation.
 
 1. Make the window change and update the constants above in
    `Sources/MLXFastCore/Constants.swift`.
-2. Re-measure the affected axis (or both) on the official Blacksmith runner with
-   the baseline reference model, all gates green.
+2. Re-measure the affected axis (or both) on the ranked runner
+   (`tenki-macos-latest-xlarge`) with the baseline reference model, all gates green.
 3. Update `officialBaseline*SecondsPerToken` and the values quoted in this doc,
    `README.md`, and `TASK.md`.
 4. Update the pinned literals in `BenchmarkWindowFreezeTests.swift` in the same
