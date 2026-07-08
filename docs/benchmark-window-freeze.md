@@ -162,12 +162,17 @@ Fixed constants compare a live single sample against a number measured on a
 different physical host at a different hour. Measured fleet drift on identical
 code across one day: prefill 0.163 -> 0.190 seconds/token (~10%+), decode ~4% --
 enough to flip floor verdicts and swing scores for reasons unrelated to the
-submission. Official ranked runs therefore measure the baseline live:
+submission. Official ranked runs therefore measure the baseline live on its
+own fresh VM:
 
-- The timing machine checks out the **pinned paired-baseline ref** (trusted
-  workflow content; submissions cannot repoint it), builds it, transforms its
-  own weights, and runs its timed benchmark against the same hidden golden in
-  the same session, minutes before the candidate.
+- A dedicated `baseline` job on a **separate fresh tenki VM** checks out the
+  **pinned paired-baseline ref** (trusted workflow content; submissions cannot
+  repoint it), builds it, transforms its own weights, and runs its timed
+  benchmark against the same hidden golden. Its measured seconds-per-token are
+  published as job outputs, and the candidate `run` job (`needs: baseline`)
+  reads them. Baseline and candidate therefore run on independent fresh VMs, so
+  the pairing cancels fleet-wide drift instead of inheriting one VM's warm/cold
+  state — the host-lottery failure mode that repriced same-VM sequential runs.
 - The measured seconds-per-token are passed to the candidate benchmark through
   `MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN` /
   `MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN`. Resolution precedence in

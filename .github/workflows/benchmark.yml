@@ -175,7 +175,7 @@ jobs:
   # that mode.
   correctness-only:
     if: ${{ !inputs.run_benchmark }}
-    runs-on: blacksmith-12vcpu-macos-26
+    runs-on: tenki-macos-latest-xlarge
     # Reduced from the 720min expert-streaming-era budget: the dense Gemma
     # model downloads ~18.4 GB and runs the whole gate from RAM. Still generous
     # until the recalibrated Gemma baseline pins real phase timings.
