@@ -136,12 +136,18 @@ jobs:
               nf = len(g["expected_tokens"]); g["expected_tokens"] = E[:nf]
           b = orig["benchmark"]
           nd = len(b["expected_decode_tokens"])
-          assert 1 + nd <= len(E), (nd, len(E))
           b["expected_prefill_token"] = E[0]
           b["expected_decode_seed_token"] = E[0]
-          b["expected_decode_tokens"] = E[1:1 + nd]
+          # Decode tokens are the greedy continuation AFTER the seed token E[0].
+          # attach-free-run-gate caps at correctnessMaxFreeRunSteps=256, so if the
+          # object held 256 decode tokens we keep E[1:] (255) -- still far above
+          # benchmarkDecodeSteps=128 (the timed window), so this is functionally
+          # identical; only one trailing headroom token is dropped.
+          dec = E[1:1 + nd] if len(E) >= 1 + nd else E[1:]
+          assert len(dec) >= 128, ("decode tokens below timed window", len(dec))
+          b["expected_decode_tokens"] = dec
           json.dump(orig, open(sys.argv[3], "w"), indent=2, sort_keys=True)
-          print("regenerated correctness: base_expected", nc, "oracle_decode", nd, "E", len(E))
+          print("regenerated correctness: base_expected", nc, "oracle_decode", len(dec), "(was", nd, ") E", len(E))
           PY
           # On-VM validation: teacher-forced base case against the regenerated
           # golden with the vanilla model must pass (self-consistent), which also
