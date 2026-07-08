@@ -1,40 +1,37 @@
-name: gemma-golden-gen
+name: gemma-private-golden-regen
 
-# Generate the PUBLIC correctness goldens ON the ranked runner (tenki), so the
-# greedy continuation matches what the model produces on the runner and the public
-# gate can never drift (cross-machine greedy decode is not guaranteed identical, so
-# goldens generated on a dev box are unsafe). N independent fresh VMs each generate
-# the 1024-token continuation; the combine job verifies they are byte-identical (a
-# determinism check -- if tenki VMs disagree there is no stable golden) and emits
-# the 256- and 1024-token fixtures for check-in. Dispatch-only; not CI/scoring.
+# Regenerate the two PRIVATE R2 goldens for the mlx-swift-lm reference, ON tenki
+# (so greedy tokens match the runner). Token-based, structure-preserving: download
+# the existing R2 objects (which embed the hidden prompts/questions), re-run the
+# vanilla model, and replace ONLY the model-derived token fields, keeping every
+# prompt/name/count. Validates on-VM, then uploads BOTH objects as a short-lived
+# artifact for the operator to push to R2 (repo is public -> operator deletes the
+# run after). Logs never print golden token content. Reuses the registered
+# gemma-freshvm.yml dispatch path. Dispatch-only; not CI/scoring.
 on:
-  workflow_dispatch:
-    inputs:
-      runs:
-        description: 'JSON array of independent fresh-VM generator indices.'
-        required: false
-        default: "[1,2,3]"
-        type: string
+  workflow_dispatch: {}
 
 concurrency:
-  group: gemma-golden-gen-${{ github.ref }}-${{ github.run_id }}
+  group: gemma-private-golden-regen-${{ github.ref }}-${{ github.run_id }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  gen:
-    name: "gen ${{ matrix.run }} (fresh vm)"
-    strategy:
-      fail-fast: false
-      matrix:
-        run: ${{ fromJSON(inputs.runs || '[1,2,3]') }}
+  regen:
+    name: "regen private goldens (fresh vm)"
     runs-on: tenki-macos-latest-xlarge
     timeout-minutes: 60
+    environment: benchmark-private-prompts
     env:
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
       MLXFAST_REFERENCE_DIR: /Users/runner/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
+      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json
+      MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json
+      MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
+      OUT_DIR: regen-out
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -45,8 +42,7 @@ jobs:
         run: |
           set -uo pipefail
           boot=$(sysctl -n kern.boottime 2>/dev/null | grep -oE 'sec = [0-9]+' | grep -oE '[0-9]+' | head -1)
-          now=$(date +%s); up=$(( now - ${boot:-now} ))
-          echo "run=${{ matrix.run }} uptime_s=${up} (small => fresh VM)"
+          now=$(date +%s); echo "uptime_s=$(( now - ${boot:-now} )) (small => fresh VM)"
 
       - name: Restore SwiftPM cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -70,7 +66,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! -f "${MLXFAST_REFERENCE_DIR}/config.json" ]]; then
-            echo "::error::baked Gemma checkpoint missing at ${MLXFAST_REFERENCE_DIR}; refusing to download" >&2
+            echo "::error::baked Gemma checkpoint missing at ${MLXFAST_REFERENCE_DIR}" >&2
             exit 1
           fi
           ./setup.sh
@@ -83,80 +79,123 @@ jobs:
             .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
             --reference "${MLXFAST_REFERENCE_DIR}" --output weights
 
-      - name: Generate 1024-token public golden (vanilla model)
+      - name: Download existing private R2 objects
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
-          .build/release/mlxfast-swift generate-golden \
-            --prompt-file correctness_prompts/public_longcopy_gate_english_512.txt \
-            --weights weights --tokenizer "${MLXFAST_REFERENCE_DIR}" \
-            --output "golden-${{ matrix.run }}.json" \
-            --name longcopy-gate-english-512 --steps 1024
-          python3 -c "import json;c=json.load(open('golden-${{ matrix.run }}.json'))['cases'][0];assert len(c['prompt_tokens'])==512 and len(c['expected_tokens'])>=1024,(len(c['prompt_tokens']),len(c['expected_tokens']));print('run ${{ matrix.run }} ok: prompt',len(c['prompt_tokens']),'expected',len(c['expected_tokens']),'distinct',len(set(c['expected_tokens'])))"
-
-      - name: Upload golden
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: gemma-golden-${{ github.run_id }}-run-${{ matrix.run }}
-          path: golden-${{ matrix.run }}.json
-          if-no-files-found: error
-          retention-days: 14
-
-  combine:
-    name: combine
-    needs: [gen]
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Download generated goldens
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
-        with:
-          pattern: gemma-golden-${{ github.run_id }}-run-*
-          path: gens
-          merge-multiple: false
-      - name: Verify determinism + emit 256/1024 fixtures
-        run: |
-          set -euo pipefail
-          python3 - <<'PY' | tee "${GITHUB_STEP_SUMMARY}"
-          import glob, json, hashlib
-          files=sorted(glob.glob("gens/**/golden-*.json", recursive=True))
-          assert files, "no generated goldens"
-          cases=[json.load(open(f))["cases"][0] for f in files]
-          toks=[c["expected_tokens"] for c in cases]
-          prompts=[c["prompt_tokens"] for c in cases]
-          print("## Public golden generation (tenki, per-VM)")
-          print()
-          identical = all(t==toks[0] for t in toks) and all(p==prompts[0] for p in prompts)
-          for f,c in zip(files,cases):
-              h=hashlib.sha256((",".join(map(str,c["expected_tokens"][:1024]))).encode()).hexdigest()[:12]
-              print(f"- {f}: expected[:1024] token-hash {h}")
-          print()
-          print(f"- **determinism across {len(files)} fresh VMs: {'IDENTICAL' if identical else 'DIVERGED (!)'}**")
-          if not identical:
-              # show first divergence
-              base=toks[0]
-              for i,t in enumerate(toks[1:],1):
-                  for j,(a,b) in enumerate(zip(base,t)):
-                      if a!=b:
-                          print(f"  - VM0 vs VM{i} diverge at step {j}: {a} != {b}")
-                          break
-              raise SystemExit("goldens diverged across tenki VMs -- no stable golden")
-          p=prompts[0]; e=toks[0]
-          for n in (256,1024):
-              out={"version":1,"cases":[{"name":"longcopy-gate-english-512","prompt_tokens":p,"expected_tokens":e[:n]}]}
-              # canonical formatting to match the repo's checked-in fixtures
-              json.dump(out, open(f"public_longcopy_gate_english_512_{n}.json","w"))
-              sha=hashlib.sha256(open(f"public_longcopy_gate_english_512_{n}.json","rb").read()).hexdigest()
-              print(f"- public_longcopy_gate_english_512_{n}.json  sha256={sha}")
+          if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
+            echo "::error::R2 secrets missing" >&2; exit 1
+          fi
+          mkdir -p "${MLXFAST_PRIVATE_DIR}" "${OUT_DIR}"
+          .github/scripts/download-r2-object.sh "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" "${MLXFAST_PRIVATE_DIR}/correctness.json"
+          .github/scripts/download-r2-object.sh "${MLXFAST_GPQA_R2_PATH}" "${MLXFAST_PRIVATE_DIR}/gpqa.json"
+          # Structure summary only (counts, never token content).
+          python3 - <<'PY'
+          import json, os
+          d=os.environ["MLXFAST_PRIVATE_DIR"]
+          g=json.load(open(f"{d}/correctness.json"))
+          c=g["cases"][0]
+          fr=g.get("correctness_gates",{}).get("free_run",[])
+          b=g["benchmark"]
+          print("correctness: base_expected", len(c["expected_tokens"]),
+                "prompt", len(c["prompt_tokens"]),
+                "free_run_gates", [len(x["expected_tokens"]) for x in fr],
+                "oracle_decode", len(b["expected_decode_tokens"]))
+          q=json.load(open(f"{d}/gpqa.json"))
+          print("gpqa: cases", len(q["cases"]))
           PY
-      - name: Upload assembled fixtures
-        if: always()
+
+      - name: Regenerate correctness/benchmark golden (in place)
+        run: |
+          set -euo pipefail
+          C="${MLXFAST_PRIVATE_DIR}/correctness.json"
+          base="$(python3 -c "import json;print(json.load(open('${C}'))['cases'][0]['name'])")"
+          cp "${C}" "${MLXFAST_PRIVATE_DIR}/withrun.json"
+          # Greedy continuation E of the base prompt (256 tokens), written into a
+          # named free_run case we then extract. attach-free-run-gate sources the
+          # prompt tokens directly from the base case.
+          .build/release/mlxfast-swift attach-free-run-gate \
+            --golden "${MLXFAST_PRIVATE_DIR}/withrun.json" --weights weights \
+            --case "${base}" --steps 256 --name regen-e \
+            --output "${MLXFAST_PRIVATE_DIR}/withrun.json"
+          OUT="${OUT_DIR}/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"
+          python3 - "${C}" "${MLXFAST_PRIVATE_DIR}/withrun.json" "${OUT}" <<'PY'
+          import json, sys
+          orig = json.load(open(sys.argv[1]))
+          withrun = json.load(open(sys.argv[2]))
+          fr = [c for c in withrun["correctness_gates"]["free_run"] if c["name"] == "regen-e"]
+          assert len(fr) == 1, "regen-e free_run case not found"
+          E = fr[0]["expected_tokens"]
+          assert len(E) >= 256, len(E)
+          base = orig["cases"][0]
+          nc = len(base["expected_tokens"]); base["expected_tokens"] = E[:nc]
+          for g in orig.get("correctness_gates", {}).get("free_run", []):
+              nf = len(g["expected_tokens"]); g["expected_tokens"] = E[:nf]
+          b = orig["benchmark"]
+          nd = len(b["expected_decode_tokens"])
+          assert 1 + nd <= len(E), (nd, len(E))
+          b["expected_prefill_token"] = E[0]
+          b["expected_decode_seed_token"] = E[0]
+          b["expected_decode_tokens"] = E[1:1 + nd]
+          json.dump(orig, open(sys.argv[3], "w"), indent=2, sort_keys=True)
+          print("regenerated correctness: base_expected", nc, "oracle_decode", nd, "E", len(E))
+          PY
+          # On-VM validation: teacher-forced base case against the regenerated
+          # golden with the vanilla model must pass (self-consistent), which also
+          # strict-loads the benchmark oracle + free_run gates. No token content
+          # printed; only pass/fail + counts.
+          .build/release/mlxfast-swift correctness --weights weights --golden "${OUT}" --base-case-only > "${MLXFAST_PRIVATE_DIR}/verify.json" 2>/dev/null || true
+          python3 - "${MLXFAST_PRIVATE_DIR}/verify.json" <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          met = m.get("metrics", m)
+          passed = m.get("passed", met.get("passed_correctness"))
+          print("validate base-case: passed", passed, "checked_steps", met.get("checked_steps"))
+          if passed is not True:
+              raise SystemExit(f"regenerated correctness golden failed self-validation: error={met.get('error')}")
+          PY
+          echo "correctness sha256=$(shasum -a 256 "${OUT}" | awk '{print $1}') bytes=$(wc -c < "${OUT}" | tr -d ' ')"
+
+      - name: Regenerate GPQA reference accepted tokens
+        run: |
+          set -euo pipefail
+          Q="${MLXFAST_PRIVATE_DIR}/gpqa.json"
+          ncases="$(python3 -c "import json;print(len(json.load(open('${Q}'))['cases']))")"
+          .build/release/mlxfast-swift generate-gpqa-answers \
+            --gpqa "${Q}" --weights weights --tokenizer "${MLXFAST_REFERENCE_DIR}" \
+            --output "${MLXFAST_PRIVATE_DIR}/gpqa_answers.json" \
+            --case-count "${ncases}" --max-new-tokens 10 >/dev/null 2>&1
+          OUT="${OUT_DIR}/gpqa_reference_cases-gemma.json"
+          python3 - "${Q}" "${MLXFAST_PRIVATE_DIR}/gpqa_answers.json" "${OUT}" <<'PY'
+          import json, sys
+          ref = json.load(open(sys.argv[1]))
+          ans = json.load(open(sys.argv[2]))
+          # first greedy token per case, keyed by id
+          first = {}
+          for c in ans["cases"]:
+              toks = c.get("candidate_tokens") or []
+              if toks:
+                  first[c["id"]] = toks[0]
+          updated = 0
+          for c in ref["cases"]:
+              t = first.get(c["id"])
+              assert t is not None, f"no candidate token for case {c['id']}"
+              c["accepted_token_sequences"] = [[t]]
+              updated += 1
+          json.dump(ref, open(sys.argv[3], "w"), indent=2, sort_keys=True)
+          print("regenerated gpqa: cases", updated)
+          PY
+          echo "gpqa sha256=$(shasum -a 256 "${OUT}" | awk '{print $1}') bytes=$(wc -c < "${OUT}" | tr -d ' ')"
+
+      - name: Upload regenerated private goldens (short-lived; operator uploads to R2 + deletes run)
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: gemma-public-goldens-${{ github.run_id }}
+          name: gemma-private-goldens-${{ github.run_id }}
           path: |
-            public_longcopy_gate_english_512_256.json
-            public_longcopy_gate_english_512_1024.json
+            regen-out/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json
+            regen-out/gpqa_reference_cases-gemma.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 1
