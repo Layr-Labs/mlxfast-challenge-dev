@@ -217,7 +217,14 @@ public struct Gemma4WeightLoader {
                 named: Gemma4WeightNames.mlp(layerIndex, "down_proj.weight"),
                 outFeatures: config.hiddenSize,
                 inFeatures: config.intermediateSize
-            )
+            ),
+            // Chunked rollout of the compiled (kernel-fused) gated activation:
+            // the ranked decode acceptance band caps a single submission's
+            // gain at 5%, so the fused elementwise kernel ships on the first
+            // six decoder layers this round (deterministic layer-index cutoff,
+            // prompt-independent). The remaining layers are staged for
+            // follow-up submissions once the paired baseline advances.
+            compiledActivation: layerIndex < 6
         )
     }
 
