@@ -1317,6 +1317,16 @@ func decodeMeasurementRunsSingleUnmemoizableSeedForward() throws {
     // whole-prompt forward count.)
     #expect(!measureDecode.contains("warmupCache"))
     #expect(!measureDecode.contains("decode warmup start"))
+
+    // The in-process local-iterate fallback charges its decode window the same
+    // way and had kept the duplicate warmup after the worker dropped it,
+    // inflating local decode by a full seed cost vs the official measurement.
+    let localIterate = try String(
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeLocalIterate.swift",
+        encoding: .utf8
+    )
+    #expect(!localIterate.contains("warmupCache"))
+    #expect(!localIterate.contains("warmupLogits"))
 }
 
 @Test

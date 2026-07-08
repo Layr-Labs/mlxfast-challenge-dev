@@ -475,16 +475,13 @@ extension GemmaRuntime {
             defer {
                 seedHeartbeat?.cancel()
             }
-            let warmupCache = Gemma4ModelCache(config: weightCache.config)
-            let warmupLogits = try Gemma4Model.logits(
-                inputIDs: inputIDsArray(testCase.promptTokens),
-                weightCache: weightCache,
-                cache: warmupCache,
-                positionOffset: 0
-            )
-            _ = try GemmaCorrectness.greedyToken(from: warmupLogits)
-            Memory.clearCache()
-
+            // Exactly one seed forward, matching the worker decode_begin
+            // contract (see GemmaRuntimeWorker): the throwaway warmup forward
+            // that used to precede this was a second identical whole-prompt
+            // forward inside the charged decode window -- it inflated the
+            // local decode figure by a full seed cost versus the official
+            // measurement and handed input-keyed memoizers a forward to serve
+            // from cache.
             let cache = Gemma4ModelCache(config: weightCache.config)
             var logits = try Gemma4Model.logits(
                 inputIDs: inputIDsArray(testCase.promptTokens),
