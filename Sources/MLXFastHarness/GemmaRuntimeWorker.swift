@@ -32,14 +32,11 @@ extension GemmaRuntime {
         // future request nonces or spoof JSON responses with normal stdio.
         let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
         let sessionNonce = generateRuntimeWorkerNonce()
-        // expertStats is always the zero struct for this RAM-resident dense
-        // runtime (no expert-streaming machinery); kept in the protocol hello
-        // so the schema/field shape stays unchanged from earlier submissions.
         try protocolIO.writeLine(try encoder.encode(RuntimeWorkerResponse(
             id: 0,
             nonce: sessionNonce,
             ok: true,
-            expertStats: expertStats(from: weightCache)
+            expertStats: .zero
         )))
         var state = RuntimeWorkerState()
 
@@ -94,7 +91,7 @@ extension GemmaRuntime {
                 nonce: sessionNonce,
                 ok: true,
                 tokens: tokens,
-                expertStats: expertStats(from: weightCache),
+                expertStats: .zero,
                 peakRamGB: currentResidentMemoryGB()
             )
 
@@ -103,7 +100,6 @@ extension GemmaRuntime {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing prompt_tokens")
             }
             let cache = Gemma4ModelCache(config: weightCache.config)
-            let start = DispatchTime.now().uptimeNanoseconds
             let logits = try Gemma4Model.logits(
                 inputIDs: inputIDsArray(promptTokens),
                 weightCache: weightCache,
@@ -114,15 +110,13 @@ extension GemmaRuntime {
             state.correctnessCache = cache
             state.correctnessPromptTokenCount = promptTokens.count
             state.correctnessStep = 0
-            let elapsed = secondsSince(start)
             return RuntimeWorkerResponse(
                 id: request.id,
                 nonce: sessionNonce,
                 ok: true,
                 token: token,
                 topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
-                seconds: elapsed,
-                expertStats: expertStats(from: weightCache),
+                expertStats: .zero,
                 peakRamGB: currentResidentMemoryGB()
             )
 
@@ -147,7 +141,7 @@ extension GemmaRuntime {
                 ok: true,
                 token: token,
                 topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
-                expertStats: expertStats(from: weightCache),
+                expertStats: .zero,
                 peakRamGB: currentResidentMemoryGB()
             )
 
@@ -156,7 +150,6 @@ extension GemmaRuntime {
                 throw MLXFastError.invalidInput("runtime worker prefill request missing prompt_tokens")
             }
             let cache = Gemma4ModelCache(config: weightCache.config)
-            let start = DispatchTime.now().uptimeNanoseconds
             let logits = try Gemma4Model.logits(
                 inputIDs: inputIDsArray(promptTokens),
                 weightCache: weightCache,
@@ -165,15 +158,13 @@ extension GemmaRuntime {
             )
             eval(logits)
             let token = try GemmaCorrectness.greedyToken(from: logits)
-            let elapsed = secondsSince(start)
             Memory.clearCache()
             return RuntimeWorkerResponse(
                 id: request.id,
                 nonce: sessionNonce,
                 ok: true,
                 token: token,
-                seconds: elapsed,
-                expertStats: expertStats(from: weightCache),
+                expertStats: .zero,
                 peakRamGB: currentResidentMemoryGB()
             )
 
@@ -196,7 +187,6 @@ extension GemmaRuntime {
             // precomputed. Prefill/decode/correctness each run in their own worker
             // process, so no memo persists across phases either.
             let cache = Gemma4ModelCache(config: weightCache.config)
-            let start = DispatchTime.now().uptimeNanoseconds
             let logits = try Gemma4Model.logits(
                 inputIDs: inputIDsArray(seedTokens),
                 weightCache: weightCache,
@@ -209,15 +199,13 @@ extension GemmaRuntime {
             state.decodeCache = cache
             state.decodeSeedTokenCount = seedTokens.count
             state.decodeStep = 0
-            let elapsed = secondsSince(start)
 
             return RuntimeWorkerResponse(
                 id: request.id,
                 nonce: sessionNonce,
                 ok: true,
                 seedToken: seedToken,
-                seconds: elapsed,
-                expertStats: expertStats(from: weightCache),
+                expertStats: .zero,
                 peakRamGB: currentResidentMemoryGB()
             )
 
@@ -232,7 +220,6 @@ extension GemmaRuntime {
             guard validationDelayMS >= 0 else {
                 throw MLXFastError.invalidInput("runtime worker validation delay must be non-negative")
             }
-            let start = DispatchTime.now().uptimeNanoseconds
             let logits = try Gemma4Model.logits(
                 inputIDs: inputIDsArray([inputToken]),
                 weightCache: weightCache,
@@ -243,15 +230,13 @@ extension GemmaRuntime {
             if validationDelayMS > 0 {
                 Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
             }
-            let elapsed = secondsSince(start)
             state.decodeStep += 1
             return RuntimeWorkerResponse(
                 id: request.id,
                 nonce: sessionNonce,
                 ok: true,
                 token: token,
-                seconds: elapsed,
-                expertStats: expertStats(from: weightCache),
+                expertStats: .zero,
                 peakRamGB: currentResidentMemoryGB()
             )
 
@@ -299,7 +284,9 @@ struct RuntimeWorkerResponse: Codable {
     let topLogitRows: [[CorrectnessTraceLogit]]?
     let seedToken: Int?
     let tokens: [Int]?
-    let seconds: Double?
+    // Always ExpertStreamingStats.zero for this dense, RAM-resident runtime
+    // (no expert-streaming machinery); the parent never reads it. Retained so
+    // the wire-format schema stays unchanged.
     let expertStats: ExpertStreamingStats?
     let peakRamGB: Double?
 
@@ -313,7 +300,6 @@ struct RuntimeWorkerResponse: Codable {
         topLogitRows: [[CorrectnessTraceLogit]]? = nil,
         seedToken: Int? = nil,
         tokens: [Int]? = nil,
-        seconds: Double? = nil,
         expertStats: ExpertStreamingStats? = nil,
         peakRamGB: Double? = nil
     ) {
@@ -326,7 +312,6 @@ struct RuntimeWorkerResponse: Codable {
         self.topLogitRows = topLogitRows
         self.seedToken = seedToken
         self.tokens = tokens
-        self.seconds = seconds
         self.expertStats = expertStats
         self.peakRamGB = peakRamGB
     }
@@ -341,7 +326,6 @@ struct RuntimeWorkerResponse: Codable {
         case topLogitRows = "top_logit_rows"
         case seedToken = "seed_token"
         case tokens
-        case seconds
         case expertStats = "expert_stats"
         case peakRamGB = "peak_ram_gb"
     }
@@ -419,13 +403,15 @@ func redirectDescriptorToDevNull(_ descriptor: Int32, flags: Int32, label: Strin
     }
 }
 
-/// Continuously drains a runtime worker's stderr pipe on a background thread,
-/// forwarding each completed line to `emit` (prefixed and token-redacted) and
-/// keeping a capped raw tail for the exit diagnostic. Local modes attach this
-/// so participants' debug prints in model code show up live during the edit
-/// loop; it also means a chatty worker can no longer fill the undrained pipe
-/// buffer and stall the run. Official runs never attach it (the CLI forces
-/// forwardsWorkerStderr off there), so their stderr handling is unchanged.
+/// Continuously drains a runtime worker's stderr pipe on a background thread.
+/// Every mode attaches one: constant consumption means a worker that writes
+/// more than the pipe buffer (~64 KiB) can never block on a full pipe while
+/// the parent blocks reading stdout, and the capped raw tail stays available
+/// for the exit diagnostic. Local modes additionally forward each completed
+/// line to `emit` (prefixed and token-redacted) so participants' debug prints
+/// in model code show up live during the edit loop; official runs construct
+/// the drain with a no-op emit (the CLI forces forwardsWorkerStderr off
+/// there), so worker output surfaces solely through the sanitized diagnostic.
 final class WorkerStderrDrain: @unchecked Sendable {
     private let handle: FileHandle
     private let emit: (String) -> Void
@@ -540,16 +526,12 @@ final class RuntimeWorkerClient {
     private let process: Process
     private let input: FileHandle
     private let output: FileHandle
-    private let errorOutput: FileHandle
-    private let stderrDrain: WorkerStderrDrain?
+    private let stderrDrain: WorkerStderrDrain
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var sessionNonce = ""
     private var nextID = 1
     private var closed = false
-    // Expert-streaming counters reported in the worker's protocol hello, before
-    // any forward has run. Baseline for the seed prefill's incremental reads.
-    private(set) var initialExpertStats: ExpertStreamingStats?
 
     init(options: RuntimeWorkerOptions, weightsPath: String) throws {
         let process = Process()
@@ -583,18 +565,22 @@ final class RuntimeWorkerClient {
         self.process = process
         self.input = stdin.fileHandleForWriting
         self.output = stdout.fileHandleForReading
-        self.errorOutput = stderr.fileHandleForReading
-        // Attach the live drain before waiting for the protocol hello so even
-        // output printed during model/weights setup streams immediately.
-        self.stderrDrain = options.forwardsWorkerStderr
-            ? WorkerStderrDrain(handle: stderr.fileHandleForReading)
-            : nil
+        // Attach the drain unconditionally, before waiting for the protocol
+        // hello: its reader thread must always consume worker stderr so a
+        // chatty worker (model-load logging, Metal warnings) cannot fill the
+        // pipe buffer and deadlock against the parent's blocking stdout read.
+        // Only local modes forward the lines to the parent's stderr; official
+        // runs use a no-op emit, keeping just the capped tail for the exit
+        // diagnostic.
+        self.stderrDrain = WorkerStderrDrain(
+            handle: stderr.fileHandleForReading,
+            emit: options.forwardsWorkerStderr ? nil : { _ in }
+        )
         let hello = try readResponseLine(validateNonce: false)
         guard hello.id == 0, hello.ok, let nonce = hello.nonce, !nonce.isEmpty else {
             throw MLXFastError.invalidInput("runtime worker did not return a valid protocol hello")
         }
         self.sessionNonce = nonce
-        self.initialExpertStats = hello.expertStats
     }
 
     deinit {
@@ -725,10 +711,9 @@ final class RuntimeWorkerClient {
             process.terminate()
         }
         process.waitUntilExit()
-        // With a live drain attached, the pipe is consumed by its reader
-        // thread; take the retained tail from there instead of racing it.
-        let stderr = stderrDrain?.drainedOutput(timeoutSeconds: 2)
-            ?? (String(data: errorOutput.readDataToEndOfFile(), encoding: .utf8) ?? "")
+        // The pipe is consumed by the drain's reader thread; take the
+        // retained tail from there instead of racing it.
+        let stderr = stderrDrain.drainedOutput(timeoutSeconds: 2)
         let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         let redacted = sanitizeWorkerDiagnostic(trimmed)
         if redacted.isEmpty {

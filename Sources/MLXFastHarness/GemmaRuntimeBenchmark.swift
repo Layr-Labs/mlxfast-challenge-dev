@@ -21,7 +21,6 @@ extension GemmaRuntime {
         let benchmarkStart = DispatchTime.now().uptimeNanoseconds
         let progress = makeBenchmarkProgressReporter(startedAt: benchmarkStart)
         var correctnessReport: CorrectnessReport?
-        var benchmarkLoader: Gemma4WeightLoader?
         var transformedWeightsDigest: DirectoryDigest?
         var preflightSeconds = 0.0
         var correctnessSeconds = 0.0
@@ -145,7 +144,6 @@ extension GemmaRuntime {
             }
 
             let runtimeBenchmarkLoader = try Gemma4WeightLoader(weightsPath: options.weightsPath)
-            benchmarkLoader = runtimeBenchmarkLoader
             let benchmarkCache = Gemma4RuntimeWeightCache(loader: runtimeBenchmarkLoader, config: config)
             guard let benchmarkGolden = golden.benchmark else {
                 throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
@@ -196,14 +194,13 @@ extension GemmaRuntime {
                 baselineSecondsPerToken: baselinePrefillSecondsPerToken,
                 candidateSecondsPerToken: prefillSecondsPerToken
             )
-            let expertStats = expertStats(from: runtimeBenchmarkLoader)
 
             guard score.isFinite, score >= 0 else {
                 return makeFailedScore(
                     error: "computed score was not finite",
                     correctness: correctnessReport,
                     passedCorrectness: true,
-                    expertStats: expertStats,
+                    expertStats: .zero,
                     weightsDigest: transformedWeightsDigest
                 )
             }
@@ -218,7 +215,7 @@ extension GemmaRuntime {
                     ),
                     correctness: correctnessReport,
                     passedCorrectness: true,
-                    expertStats: expertStats,
+                    expertStats: .zero,
                     weightsDigest: transformedWeightsDigest,
                     peakRamGB: peakRamGB,
                     bandwidthGBPerToken: decode.bandwidthGBPerToken,
@@ -245,7 +242,7 @@ extension GemmaRuntime {
                     error: "acceptance band failed: \(prefillBand.passed ? decodeBand.reason : prefillBand.reason)",
                     correctness: correctnessReport,
                     passedCorrectness: true,
-                    expertStats: expertStats,
+                    expertStats: .zero,
                     weightsDigest: transformedWeightsDigest,
                     peakRamGB: peakRamGB,
                     bandwidthGBPerToken: decode.bandwidthGBPerToken,
@@ -276,7 +273,7 @@ extension GemmaRuntime {
                 timedBenchmarkSeconds: timedBenchmarkSeconds,
                 numLayers: config.numHiddenLayers,
                 correctness: correctness,
-                expertStats: expertStats,
+                expertStats: .zero,
                 bandwidthSource: decode.bandwidthSource,
                 weightsDigest: transformedWeightsDigest,
                 gpqaTTFT: .zero,
@@ -287,7 +284,7 @@ extension GemmaRuntime {
                 error: mismatch.description,
                 correctness: correctnessReport,
                 passedCorrectness: correctnessReport?.passed == true,
-                expertStats: expertStats(from: benchmarkLoader),
+                expertStats: .zero,
                 firstFailingCase: "benchmark",
                 firstFailingStep: mismatch.step,
                 expectedToken: nil,
@@ -299,7 +296,7 @@ extension GemmaRuntime {
                 error: "\(error)",
                 correctness: correctnessReport,
                 passedCorrectness: correctnessReport?.passed == true,
-                expertStats: expertStats(from: benchmarkLoader),
+                expertStats: .zero,
                 weightsDigest: transformedWeightsDigest
             )
         }
@@ -386,7 +383,6 @@ extension GemmaRuntime {
         var preflightSeconds = 0.0
         var correctnessSeconds = 0.0
         var timedBenchmarkSeconds = 0.0
-        var lastExpertStats = ExpertStreamingStats.zero
         var peakRamGB = 0.0
         // Overwritten with the golden oracle's per-prompt baselines (if it
         // carries them) once the golden loads; until then failure payloads use
@@ -419,7 +415,7 @@ extension GemmaRuntime {
                 error: error,
                 correctness: correctness,
                 passedCorrectness: passedCorrectness,
-                expertStats: lastExpertStats,
+                expertStats: .zero,
                 firstFailingCase: explicitFirstFailingCase,
                 firstFailingStep: explicitFirstFailingStep,
                 expectedToken: explicitExpectedToken,
@@ -495,12 +491,10 @@ extension GemmaRuntime {
                     + "baseline_source=\(baselineSourceLabel(paired: pairedBaseline, golden: benchmarkGolden))"
             )
             peakRamGB = 0
-            lastExpertStats = .zero
 
             let prefillSecondsPerToken: Double
             let decode: DecodeMeasurement
             let benchmarkPeakRamGB: Double
-            let benchmarkExpertStats: ExpertStreamingStats
             if options.skipTimedBenchmark {
                 // This machine's role is the anchor/free-run/behavior/GPQA gates
                 // only -- a separate "timing-only" machine (checkGates: false)
@@ -521,7 +515,6 @@ extension GemmaRuntime {
                 )
                 timedBenchmarkSeconds = 0
                 benchmarkPeakRamGB = 0
-                benchmarkExpertStats = .zero
             } else {
                 let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
                 progress("timed benchmark start")
@@ -539,8 +532,7 @@ extension GemmaRuntime {
                         expectedToken: promptPlan.expectedPrefillToken,
                         worker: prefillWorker,
                         progress: progress,
-                        peakRamGB: &peakRamGB,
-                        expertStats: &lastExpertStats
+                        peakRamGB: &peakRamGB
                     )
                 }
                 progress("benchmark decode worker start")
@@ -559,13 +551,11 @@ extension GemmaRuntime {
                         decodeSteps: options.benchmarkDecodeSteps,
                         worker: decodeWorker,
                         progress: progress,
-                        peakRamGB: &peakRamGB,
-                        expertStats: &lastExpertStats
+                        peakRamGB: &peakRamGB
                     )
                 }
                 timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
                 benchmarkPeakRamGB = peakRamGB
-                benchmarkExpertStats = lastExpertStats
             }
 
             // Computed unconditionally from whatever `decode`/prefillSecondsPerToken
@@ -733,7 +723,7 @@ extension GemmaRuntime {
                 timedBenchmarkSeconds: timedBenchmarkSeconds,
                 numLayers: MLXFastConstants.numHiddenLayers,
                 correctness: correctness,
-                expertStats: benchmarkExpertStats,
+                expertStats: .zero,
                 bandwidthSource: decode.bandwidthSource,
                 weightsDigest: transformedWeightsDigest,
                 gpqaTTFT: correctnessResult.gpqaTTFT,
@@ -840,8 +830,7 @@ extension GemmaRuntime {
         expectedToken: Int,
         worker: RuntimeWorkerClient,
         progress: ((String) -> Void)? = nil,
-        peakRamGB: inout Double,
-        expertStats: inout ExpertStreamingStats
+        peakRamGB: inout Double
     ) throws -> Double {
         guard !promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("benchmark prefill prompt must not be empty")
@@ -870,7 +859,6 @@ extension GemmaRuntime {
             let prefillStart = DispatchTime.now().uptimeNanoseconds
             let response = try worker.prefill(promptTokens: promptTokens)
             let elapsed = secondsSince(prefillStart)
-            expertStats = response.expertStats ?? expertStats
             peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
             guard let token = response.token else {
                 throw MLXFastError.invalidInput("runtime worker prefill response missing token")
@@ -1015,8 +1003,7 @@ extension GemmaRuntime {
         decodeSteps: Int = MLXFastConstants.benchmarkDecodeSteps,
         worker: RuntimeWorkerClient,
         progress: ((String) -> Void)? = nil,
-        peakRamGB: inout Double,
-        expertStats: inout ExpertStreamingStats
+        peakRamGB: inout Double
     ) throws -> DecodeMeasurement {
         guard !seedTokens.isEmpty else {
             throw MLXFastError.invalidInput("benchmark decode seed must not be empty")
@@ -1032,7 +1019,6 @@ extension GemmaRuntime {
         let decodePhaseStart = DispatchTime.now().uptimeNanoseconds
         progress?("decode measured start tokens=\(decodeSteps) includes_seed_prefill=true")
         let beginResponse = try worker.beginDecode(seedTokens: seedTokens)
-        expertStats = beginResponse.expertStats ?? expertStats
         peakRamGB = max(peakRamGB, beginResponse.peakRamGB ?? 0)
         guard let seedToken = beginResponse.seedToken else {
             throw MLXFastError.invalidInput("runtime worker decode_begin response missing seed token")
@@ -1049,7 +1035,6 @@ extension GemmaRuntime {
         for decodedStep in 0..<decodeSteps {
             let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
             let response = try worker.decodeStep(inputToken: inputToken)
-            expertStats = response.expertStats ?? expertStats
             peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
             guard let token = response.token else {
                 throw MLXFastError.invalidInput("runtime worker decode_step response missing token")
@@ -1110,17 +1095,6 @@ extension GemmaRuntime {
             )
         }
         return milliseconds
-    }
-
-    /// The dense, RAM-resident runtime has no expert-cache/streaming machinery
-    /// (see `AGENTS.md`/`CLAUDE.md`); this always returns the zero struct so
-    /// the score schema keeps its `expert_*` fields (all zero) unchanged.
-    static func expertStats(from weightCache: Gemma4RuntimeWeightCache) -> ExpertStreamingStats {
-        .zero
-    }
-
-    static func expertStats(from loader: Gemma4WeightLoader?) -> ExpertStreamingStats {
-        .zero
     }
 
     static func passedScore(

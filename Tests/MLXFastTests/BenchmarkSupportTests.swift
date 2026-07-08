@@ -875,6 +875,56 @@ func workerStderrDrainCapsRetainedTail() throws {
 }
 
 @Test
+func workerStderrDrainWithNoOpEmitDrainsBeyondPipeBufferWithoutBlockingWriter() throws {
+    // Official runs construct the drain with a no-op emit (nothing is
+    // forwarded to the parent's stderr), but the reader thread must still
+    // consume the pipe continuously: a worker that writes more than the
+    // ~64 KiB pipe buffer to stderr would otherwise block on the full pipe
+    // while the parent blocks reading stdout -- the deadlock this drain
+    // exists to prevent. Use a real child process writing ~200 KiB so the
+    // writer genuinely blocks (and the bounded wait below fails) if the
+    // drain ever stops consuming.
+    let pipe = Pipe()
+    let drain = WorkerStderrDrain(
+        handle: pipe.fileHandleForReading,
+        emit: { _ in }
+    )
+
+    let writer = Process()
+    writer.executableURL = URL(fileURLWithPath: "/bin/sh")
+    writer.arguments = [
+        "-c",
+        "yes worker-stderr-filler-line | head -c 200000 1>&2; printf 'final-marker\\n' 1>&2",
+    ]
+    writer.standardError = pipe.fileHandleForWriting
+    try writer.run()
+    // Close the parent's copy of the write end so the reader sees EOF once
+    // the child exits.
+    try pipe.fileHandleForWriting.close()
+
+    // Bounded wait instead of waitUntilExit(): if the drain stops consuming,
+    // the writer blocks forever on the full pipe and this test must fail,
+    // not hang.
+    let deadline = Date().addingTimeInterval(15)
+    while writer.isRunning, Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    let writerFinished = !writer.isRunning
+    if !writerFinished {
+        writer.terminate()
+    }
+    writer.waitUntilExit()
+    #expect(writerFinished, "writer blocked on a full stderr pipe: the drain stopped consuming")
+    #expect(writer.terminationStatus == 0)
+
+    // The capped raw tail is still retained for the exit diagnostic.
+    let tail = drain.drainedOutput(timeoutSeconds: 5)
+    #expect(tail.utf8.count <= WorkerStderrDrain.tailByteLimit + 16)
+    #expect(tail.contains("final-marker"))
+    #expect(tail.contains("worker-stderr-filler-line"))
+}
+
+@Test
 func localIteratePrefillStatusReportsPerTokenAndSpeedup() {
     let status = GemmaRuntime.localIteratePrefillStatus(
         elapsedSeconds: 51.2,
@@ -903,7 +953,6 @@ func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
             expectedToken: nil,
             actualToken: nil,
             goldenHash: "hash",
-            expertStats: .zero,
             error: "",
             modeName: "local-iterate"
         ),
@@ -913,7 +962,6 @@ func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
             bandwidthGBPerToken: 0,
             bandwidthSource: "ram_resident_model"
         ),
-        expertStats: .zero,
         peakRamGB: 24.5
     )
 

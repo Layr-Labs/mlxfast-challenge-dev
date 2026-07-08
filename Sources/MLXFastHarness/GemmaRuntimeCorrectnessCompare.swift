@@ -39,20 +39,17 @@ extension GemmaRuntime {
 
     struct WorkerCorrectnessResult {
         let comparison: CorrectnessTokenComparison
-        let expertStats: ExpertStreamingStats
         let peakRamGB: Double
         let ttftSeconds: Double?
         let generatedTokens: [Int]?
 
         init(
             comparison: CorrectnessTokenComparison,
-            expertStats: ExpertStreamingStats,
             peakRamGB: Double,
             ttftSeconds: Double? = nil,
             generatedTokens: [Int]? = nil
         ) {
             self.comparison = comparison
-            self.expertStats = expertStats
             self.peakRamGB = peakRamGB
             self.ttftSeconds = ttftSeconds
             self.generatedTokens = generatedTokens
@@ -102,19 +99,16 @@ extension GemmaRuntime {
         // under strict argmax equality a near-tie logit could otherwise flip a checked
         // token in either direction relative to what serial would have found.
         var response = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
-        var latestExpertStats = response.expertStats ?? .zero
         var peakRamGB = response.peakRamGB ?? 0
         for seedStep in 0..<startStep {
             response = try worker.teacherForcedCorrectnessStep(
                 previousToken: testCase.expectedTokens[seedStep]
             )
-            latestExpertStats = response.expertStats ?? latestExpertStats
             peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
         }
         for step in startStep..<endStep {
             if step > startStep {
                 response = try worker.teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[step - 1])
-                latestExpertStats = response.expertStats ?? latestExpertStats
                 peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
             }
             guard let actualToken = response.token else {
@@ -154,7 +148,6 @@ extension GemmaRuntime {
                             expectedToken: expectedToken,
                             actualToken: actualToken
                         ),
-                        expertStats: latestExpertStats,
                         peakRamGB: peakRamGB
                     )
                 }
@@ -175,7 +168,6 @@ extension GemmaRuntime {
                 expectedToken: nil,
                 actualToken: nil
             ),
-            expertStats: latestExpertStats,
             peakRamGB: peakRamGB
         )
     }
@@ -199,7 +191,6 @@ extension GemmaRuntime {
                 actualToken: actualToken,
                 topLogits: try? validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
             ),
-            expertStats: response.expertStats ?? .zero,
             peakRamGB: response.peakRamGB ?? 0
         )
     }
@@ -222,7 +213,6 @@ extension GemmaRuntime {
         )
         return WorkerCorrectnessResult(
             comparison: compareFreeRunTokens(testCase: testCase, generated: generated),
-            expertStats: response.expertStats ?? .zero,
             peakRamGB: response.peakRamGB ?? 0
         )
     }
@@ -252,7 +242,6 @@ extension GemmaRuntime {
             if !firstTokenComparison.passed {
                 return WorkerCorrectnessResult(
                     comparison: firstTokenComparison,
-                    expertStats: beginResponse.expertStats ?? .zero,
                     peakRamGB: beginResponse.peakRamGB ?? 0,
                     ttftSeconds: ttftSeconds,
                     generatedTokens: [firstToken]
@@ -262,7 +251,6 @@ extension GemmaRuntime {
 
         var generated = [firstToken]
         generated.reserveCapacity(testCase.maxNewTokens)
-        var expertStats = beginResponse.expertStats ?? .zero
         var peakRamGB = beginResponse.peakRamGB ?? 0
         while generated.count < testCase.maxNewTokens {
             let response = try worker.teacherForcedCorrectnessStep(previousToken: generated[generated.count - 1])
@@ -270,7 +258,6 @@ extension GemmaRuntime {
                 throw MLXFastError.invalidInput("runtime worker behavior continuation response missing token")
             }
             generated.append(token)
-            expertStats = response.expertStats ?? expertStats
             peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
         }
 
@@ -291,7 +278,6 @@ extension GemmaRuntime {
         }
         return WorkerCorrectnessResult(
             comparison: comparison,
-            expertStats: expertStats,
             peakRamGB: peakRamGB,
             ttftSeconds: ttftSeconds,
             generatedTokens: generated

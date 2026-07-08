@@ -16,7 +16,6 @@ extension GemmaRuntime {
         var validationSeconds = 0.0
         var correctnessSeconds = 0.0
         var timedSeconds = 0.0
-        var expertStats = ExpertStreamingStats.zero
         var peakRamGB = 0.0
         let modeName = options.modeName
         let checkedStepsPerPass = options.benchmarkDecodeSteps + 2
@@ -47,7 +46,7 @@ extension GemmaRuntime {
                 error: error,
                 correctness: correctnessReport,
                 passedCorrectness: passedCorrectness,
-                expertStats: expertStats,
+                expertStats: .zero,
                 expectedToken: correctnessReport?.expectedToken,
                 actualToken: correctnessReport?.actualToken,
                 weightsDigest: transformedWeightsDigest,
@@ -132,7 +131,6 @@ extension GemmaRuntime {
             timedSeconds = secondsSince(timedStart)
             correctnessSeconds = timedSeconds
             correctnessReport = timing.correctness
-            expertStats = timing.expertStats
             peakRamGB = timing.peakRamGB
             progress(
                 "\(modeName) checked timing complete passed=\(timing.correctness.passed) "
@@ -163,7 +161,6 @@ extension GemmaRuntime {
                 correctnessSeconds: correctnessSeconds,
                 timedSeconds: timedSeconds,
                 correctness: timing.correctness,
-                expertStats: expertStats,
                 bandwidthSource: timing.decode.bandwidthSource,
                 weightsDigest: transformedWeightsDigest,
                 runtime: options.runtime
@@ -377,7 +374,6 @@ extension GemmaRuntime {
         let correctness: CorrectnessReport
         let prefillSecondsPerToken: Double
         let decode: DecodeMeasurement
-        let expertStats: ExpertStreamingStats
         let peakRamGB: Double
     }
 
@@ -406,7 +402,6 @@ extension GemmaRuntime {
         var totalPrefillSeconds = 0.0
         var totalDecodeSeconds = 0.0
         var totalStepOnlySeconds = 0.0
-        var latestStats = ExpertStreamingStats.zero
         var failureStep: Int?
         var failureExpected: Int?
         var failureActual: Int?
@@ -445,7 +440,6 @@ extension GemmaRuntime {
             prefillHeartbeat?.cancel()
             totalPrefillSeconds += prefillElapsed
             Memory.clearCache()
-            latestStats = GemmaRuntime.expertStats(from: weightCache)
             if failureStep == nil, prefillToken != expectedSeedToken {
                 failureStep = repeatIndex * checkedStepsPerPass
                 failureExpected = expectedSeedToken
@@ -493,7 +487,6 @@ extension GemmaRuntime {
                 positionOffset: 0
             )
             var actualToken = try GemmaCorrectness.greedyToken(from: logits)
-            latestStats = GemmaRuntime.expertStats(from: weightCache)
             if failureStep == nil, actualToken != expectedSeedToken {
                 failureStep = repeatIndex * checkedStepsPerPass + 1
                 failureExpected = expectedSeedToken
@@ -533,7 +526,6 @@ extension GemmaRuntime {
                 }
                 let stepElapsed = secondsSince(stepStart)
                 totalStepOnlySeconds += stepElapsed
-                latestStats = GemmaRuntime.expertStats(from: weightCache)
                 reportProgress(
                     step: repeatIndex * decodeSteps + decodedStep + 1,
                     total: totalDecodeSteps,
@@ -558,7 +550,6 @@ extension GemmaRuntime {
         }
 
         let bandwidth = (gbPerToken: 0.0, source: GemmaRuntime.bandwidthSource)
-        latestStats = GemmaRuntime.expertStats(from: weightCache)
         let correctness = localIterateCorrectnessReport(
             passed: failureStep == nil,
             checkedSteps: failureStep.map { $0 + 1 } ?? checkedStepsPerPass * timingRepeats,
@@ -567,7 +558,6 @@ extension GemmaRuntime {
             expectedToken: failureExpected,
             actualToken: failureActual,
             goldenHash: goldenHash,
-            expertStats: latestStats,
             error: failureStep == nil ? "" : "\(modeName) teacher-forced token mismatch",
             modeName: modeName
         )
@@ -579,7 +569,6 @@ extension GemmaRuntime {
                 bandwidthGBPerToken: bandwidth.gbPerToken,
                 bandwidthSource: bandwidth.source
             ),
-            expertStats: latestStats,
             peakRamGB: Double(Memory.peakMemory) / Double(1 << 30)
         )
     }
@@ -607,7 +596,6 @@ extension GemmaRuntime {
         var totalPrefillSeconds = 0.0
         var totalDecodeSeconds = 0.0
         var totalStepOnlySeconds = 0.0
-        var latestStats = ExpertStreamingStats.zero
         var peakRamGB = 0.0
         var failureStep: Int?
         var failureExpected: Int?
@@ -643,7 +631,6 @@ extension GemmaRuntime {
                 let prefillElapsed = secondsSince(prefillStart)
                 prefillHeartbeat?.cancel()
                 totalPrefillSeconds += prefillElapsed
-                latestStats = response.expertStats ?? latestStats
                 peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
                 guard let prefillToken = response.token else {
                     throw MLXFastError.invalidInput("runtime worker \(modeName) prefill response missing token")
@@ -690,7 +677,6 @@ extension GemmaRuntime {
                 "\(modeName) decode seed prefill complete "
                     + "seconds=\(formatSeconds(secondsSince(decodePhaseStart))) (charged to decode)"
             )
-            latestStats = response.expertStats ?? latestStats
             peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
             guard let seedToken = response.seedToken else {
                 throw MLXFastError.invalidInput("runtime worker \(modeName) decode_begin response missing seed token")
@@ -708,7 +694,6 @@ extension GemmaRuntime {
                 response = try decodeWorker.decodeStep(inputToken: inputToken)
                 let stepElapsed = secondsSince(stepStart)
                 totalStepOnlySeconds += stepElapsed
-                latestStats = response.expertStats ?? latestStats
                 peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
                 guard let token = response.token else {
                     throw MLXFastError.invalidInput("runtime worker \(modeName) decode response missing token")
@@ -754,7 +739,6 @@ extension GemmaRuntime {
             expectedToken: failureExpected,
             actualToken: failureActual,
             goldenHash: goldenHash,
-            expertStats: latestStats,
             error: failureStep == nil ? "" : "\(modeName) teacher-forced token mismatch",
             modeName: modeName
         )
@@ -766,7 +750,6 @@ extension GemmaRuntime {
                 bandwidthGBPerToken: bandwidth.gbPerToken,
                 bandwidthSource: bandwidth.source
             ),
-            expertStats: latestStats,
             peakRamGB: peakRamGB
         )
     }
@@ -779,7 +762,6 @@ extension GemmaRuntime {
         expectedToken: Int?,
         actualToken: Int?,
         goldenHash: String,
-        expertStats: ExpertStreamingStats,
         error: String,
         modeName: String
     ) -> CorrectnessReport {
@@ -787,13 +769,6 @@ extension GemmaRuntime {
             passed: passed,
             checkedSteps: checkedSteps,
             caseCount: caseCount,
-            expertCacheHits: expertStats.cacheHits,
-            expertCacheMisses: expertStats.cacheMisses,
-            expertCacheEvictions: expertStats.cacheEvictions,
-            expertBytesRead: expertStats.bytesRead,
-            expertReadSeconds: expertStats.readSeconds,
-            expertPeakCachedTensors: expertStats.peakCachedTensors,
-            expertHitRate: expertStats.hitRate,
             firstFailingCase: firstFailingStep == nil ? nil : modeName,
             firstFailingStep: firstFailingStep,
             expectedToken: expectedToken,
@@ -813,11 +788,12 @@ extension GemmaRuntime {
         correctnessSeconds: Double,
         timedSeconds: Double,
         correctness: CorrectnessReport,
-        expertStats: ExpertStreamingStats,
         bandwidthSource: String,
         weightsDigest: DirectoryDigest?,
         runtime: String
     ) -> ScorePayload {
+        // The expert_* metrics stay in the score schema via ScoreMetrics'
+        // zero defaults; this dense runtime never produces nonzero values.
         ScorePayload(
             score: nil,
             passed: true,
@@ -835,13 +811,6 @@ extension GemmaRuntime {
                 numLayers: MLXFastConstants.numHiddenLayers,
                 checkedSteps: correctness.checkedSteps,
                 caseCount: correctness.caseCount,
-                expertCacheHits: expertStats.cacheHits,
-                expertCacheMisses: expertStats.cacheMisses,
-                expertCacheEvictions: expertStats.cacheEvictions,
-                expertBytesRead: expertStats.bytesRead,
-                expertReadSeconds: expertStats.readSeconds,
-                expertPeakCachedTensors: expertStats.peakCachedTensors,
-                expertHitRate: expertStats.hitRate,
                 firstFailingLayer: nil,
                 firstFailingCase: nil,
                 firstFailingStep: nil,

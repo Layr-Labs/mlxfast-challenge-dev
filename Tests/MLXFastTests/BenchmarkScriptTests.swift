@@ -2267,14 +2267,24 @@ func localModesForwardWorkerStderrLiveButOfficialRunsDoNot() throws {
     #expect(cli.components(separatedBy: "forwardsWorkerStderr: true").count == 2)
     #expect(cli.contains("forwardsWorkerStderr: forwardsWorkerStderr && !officialRun"))
 
-    // The drain forwards each line with the worker prefix after per-line
-    // token redaction, keeps only a capped raw tail for the exit diagnostic,
-    // and is attached before the protocol hello so setup output streams too.
+    // The drain is attached unconditionally and before the protocol hello:
+    // its reader thread must always consume worker stderr (a worker writing
+    // more than the pipe buffer would otherwise deadlock against the
+    // parent's blocking stdout read), with only the live forwarding gated on
+    // the flag. Local modes forward each line with the worker prefix after
+    // per-line token redaction; official runs get a no-op emit, so worker
+    // output surfaces solely through the capped tail the sanitized exit
+    // diagnostic reads.
     #expect(worker.contains("final class WorkerStderrDrain"))
     #expect(worker.contains("static let forwardedLinePrefix = \"mlxfast-worker: \""))
     #expect(worker.contains("redactedWorkerStderrLine(line)"))
-    #expect(worker.contains("options.forwardsWorkerStderr\n            ? WorkerStderrDrain(handle: stderr.fileHandleForReading)\n            : nil"))
-    #expect(worker.contains("stderrDrain?.drainedOutput(timeoutSeconds: 2)"))
+    #expect(worker.contains(
+        "self.stderrDrain = WorkerStderrDrain(\n            handle: stderr.fileHandleForReading,\n"
+            + "            emit: options.forwardsWorkerStderr ? nil : { _ in }\n        )"
+    ))
+    #expect(!worker.contains("? WorkerStderrDrain("))
+    #expect(worker.contains("stderrDrain.drainedOutput(timeoutSeconds: 2)"))
+    #expect(!worker.contains("readDataToEndOfFile"))
 }
 
 @Test

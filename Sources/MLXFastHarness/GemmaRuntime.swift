@@ -311,11 +311,12 @@ public struct RuntimeWorkerOptions: Equatable {
     public let executablePath: String
     public let sandboxProfilePath: String?
     // Local modes only: stream the worker's stderr lines to the parent's
-    // stderr live (with per-line token redaction) instead of holding them for
-    // the exit diagnostic. Participants' debug prints in model code become
-    // visible during the edit loop, and a chatty worker can no longer fill the
-    // undrained pipe and stall. The CLI forces this OFF for official runs so
-    // worker output never reaches CI logs beyond today's sanitized diagnostic.
+    // stderr live (with per-line token redaction) so participants' debug
+    // prints in model code are visible during the edit loop. The stderr pipe
+    // is continuously drained in every mode regardless of this flag (see
+    // WorkerStderrDrain); this only controls live forwarding. The CLI forces
+    // this OFF for official runs so worker output never reaches CI logs
+    // beyond the sanitized exit diagnostic.
     public let forwardsWorkerStderr: Bool
 
     public init(

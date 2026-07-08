@@ -70,7 +70,6 @@ extension GemmaRuntime {
         }
 
         var loadedGolden: GoldenFixture?
-        var loader: Gemma4WeightLoader?
         do {
             try requireFile(options.goldenPath, description: "correctness golden file")
             let golden = try loadGoldenFixture(from: options.goldenPath)
@@ -81,7 +80,6 @@ extension GemmaRuntime {
             )
             let config = try Gemma4Config.load(from: options.weightsPath)
             let runtimeLoader = try Gemma4WeightLoader(weightsPath: options.weightsPath)
-            loader = runtimeLoader
             let weightCache = Gemma4RuntimeWeightCache(loader: runtimeLoader, config: config)
             return runLayeredCorrectness(
                 golden: golden,
@@ -94,7 +92,6 @@ extension GemmaRuntime {
                 checkedSteps: 0,
                 caseCount: loadedGolden?.totalCorrectnessCaseCount ?? 0,
                 goldenHash: loadedGolden?.sha256 ?? "",
-                expertStats: expertStats(from: loader),
                 error: "\(error)"
             )
         }
@@ -105,7 +102,6 @@ extension GemmaRuntime {
         worker workerOptions: RuntimeWorkerOptions
     ) -> CorrectnessReport {
         var loadedGolden: GoldenFixture?
-        var lastExpertStats = ExpertStreamingStats.zero
         var checkedSteps = 0
         do {
             let stepCount = options.stepCount ?? MLXFastConstants.correctnessSteps
@@ -139,14 +135,12 @@ extension GemmaRuntime {
                 checkGates: !options.baseCaseOnly
             )
             checkedSteps = result.report.checkedSteps
-            lastExpertStats = result.expertStats
             return result.report
         } catch {
             return failedCorrectnessReport(
                 checkedSteps: checkedSteps,
                 caseCount: loadedGolden?.totalCorrectnessCaseCount ?? 0,
                 goldenHash: loadedGolden?.sha256 ?? "",
-                expertStats: lastExpertStats,
                 error: "\(error)"
             )
         }
@@ -154,7 +148,6 @@ extension GemmaRuntime {
 
     struct WorkerLayeredCorrectnessResult {
         let report: CorrectnessReport
-        let expertStats: ExpertStreamingStats
         let peakRamGB: Double
         let gpqaTTFT: GPQATTFTSummary
     }
@@ -215,18 +208,10 @@ extension GemmaRuntime {
             comparison: CorrectnessTokenComparison,
             error: String
         ) -> CorrectnessReport {
-            let stats = expertStats(from: weightCache)
-            return CorrectnessReport(
+            CorrectnessReport(
                 passed: false,
                 checkedSteps: checkedSteps + comparison.checkedSteps,
                 caseCount: caseCount,
-                expertCacheHits: stats.cacheHits,
-                expertCacheMisses: stats.cacheMisses,
-                expertCacheEvictions: stats.cacheEvictions,
-                expertBytesRead: stats.bytesRead,
-                expertReadSeconds: stats.readSeconds,
-                expertPeakCachedTensors: stats.peakCachedTensors,
-                expertHitRate: stats.hitRate,
                 firstFailingCase: caseName,
                 firstFailingStep: comparison.firstFailingStep,
                 expectedToken: comparison.expectedToken,
@@ -336,23 +321,14 @@ extension GemmaRuntime {
                 caseCount: caseCount,
                 firstFailingCase: currentCase,
                 goldenHash: golden.sha256,
-                expertStats: expertStats(from: weightCache),
                 error: "\(error)"
             )
         }
 
-        let stats = expertStats(from: weightCache)
         return CorrectnessReport(
             passed: true,
             checkedSteps: checkedSteps,
             caseCount: caseCount,
-            expertCacheHits: stats.cacheHits,
-            expertCacheMisses: stats.cacheMisses,
-            expertCacheEvictions: stats.cacheEvictions,
-            expertBytesRead: stats.bytesRead,
-            expertReadSeconds: stats.readSeconds,
-            expertPeakCachedTensors: stats.peakCachedTensors,
-            expertHitRate: stats.hitRate,
             firstFailingCase: nil,
             firstFailingStep: nil,
             expectedToken: nil,
@@ -376,7 +352,6 @@ extension GemmaRuntime {
         let caseCount = checkGates ? golden.totalCorrectnessCaseCount : golden.cases.count
         var checkedSteps = 0
         var currentCase: String?
-        var lastExpertStats = ExpertStreamingStats.zero
         var peakRamGB = 0.0
         var gpqaTTFTPassCount = 0
         var gpqaTTFTCaseCount = 0
@@ -386,7 +361,6 @@ extension GemmaRuntime {
         func result(report: CorrectnessReport) -> WorkerLayeredCorrectnessResult {
             WorkerLayeredCorrectnessResult(
                 report: report,
-                expertStats: lastExpertStats,
                 peakRamGB: peakRamGB,
                 gpqaTTFT: GPQATTFTSummary(
                     passCount: gpqaTTFTPassCount,
@@ -405,13 +379,6 @@ extension GemmaRuntime {
                 passed: false,
                 checkedSteps: checkedSteps + comparison.checkedSteps,
                 caseCount: caseCount,
-                expertCacheHits: lastExpertStats.cacheHits,
-                expertCacheMisses: lastExpertStats.cacheMisses,
-                expertCacheEvictions: lastExpertStats.cacheEvictions,
-                expertBytesRead: lastExpertStats.bytesRead,
-                expertReadSeconds: lastExpertStats.readSeconds,
-                expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
-                expertHitRate: lastExpertStats.hitRate,
                 firstFailingCase: caseName,
                 firstFailingStep: comparison.firstFailingStep,
                 expectedToken: comparison.expectedToken,
@@ -449,7 +416,6 @@ extension GemmaRuntime {
                         progress?("correctness case \(caseLabel) checked \(step)/\(total) tokens")
                     }
                 )
-                lastExpertStats = check.expertStats
                 peakRamGB = max(peakRamGB, check.peakRamGB)
                 if !check.comparison.passed {
                     progress?("correctness case \(caseLabel) failed step=\(check.comparison.firstFailingStep ?? -1)")
@@ -469,7 +435,6 @@ extension GemmaRuntime {
                 let caseLabel = "\(caseIndex + 1)/\(gates?.anchorCases.count ?? 0)"
                 progress?("correctness anchor \(caseLabel) start context_tokens=\(anchor.contextTokens.count)")
                 let check = try compareAnchorWithWorker(anchor: anchor, worker: worker)
-                lastExpertStats = check.expertStats
                 peakRamGB = max(peakRamGB, check.peakRamGB)
                 if !check.comparison.passed {
                     progress?("correctness anchor \(caseLabel) failed")
@@ -488,7 +453,6 @@ extension GemmaRuntime {
                 let caseLabel = "\(caseIndex + 1)/\(gates?.freeRunCases.count ?? 0)"
                 progress?("correctness free-run \(caseLabel) start tokens=\(freeRun.expectedTokens.count)")
                 let check = try compareFreeRunWithWorker(testCase: freeRun, worker: worker)
-                lastExpertStats = check.expertStats
                 peakRamGB = max(peakRamGB, check.peakRamGB)
                 if !check.comparison.passed {
                     progress?("correctness free-run \(caseLabel) failed step=\(check.comparison.firstFailingStep ?? -1)")
@@ -507,7 +471,6 @@ extension GemmaRuntime {
                 let caseLabel = "\(caseIndex + 1)/\(gates?.behaviorCases.count ?? 0)"
                 progress?("correctness behavior \(caseLabel) start max_new_tokens=\(behavior.maxNewTokens)")
                 let check = try compareBehaviorWithWorker(testCase: behavior, worker: worker)
-                lastExpertStats = check.expertStats
                 peakRamGB = max(peakRamGB, check.peakRamGB)
                 if check.ttftSeconds != nil {
                     gpqaTTFTCaseCount += 1
@@ -562,7 +525,6 @@ extension GemmaRuntime {
                 caseCount: caseCount,
                 firstFailingCase: currentCase,
                 goldenHash: golden.sha256,
-                expertStats: lastExpertStats,
                 error: "\(error)"
             ))
         }
@@ -571,13 +533,6 @@ extension GemmaRuntime {
             passed: true,
             checkedSteps: checkedSteps,
             caseCount: caseCount,
-            expertCacheHits: lastExpertStats.cacheHits,
-            expertCacheMisses: lastExpertStats.cacheMisses,
-            expertCacheEvictions: lastExpertStats.cacheEvictions,
-            expertBytesRead: lastExpertStats.bytesRead,
-            expertReadSeconds: lastExpertStats.readSeconds,
-            expertPeakCachedTensors: lastExpertStats.peakCachedTensors,
-            expertHitRate: lastExpertStats.hitRate,
             firstFailingCase: nil,
             firstFailingStep: nil,
             expectedToken: nil,
@@ -592,20 +547,12 @@ extension GemmaRuntime {
         caseCount: Int = 0,
         firstFailingCase: String? = nil,
         goldenHash: String = "",
-        expertStats: ExpertStreamingStats = .zero,
         error: String
     ) -> CorrectnessReport {
         CorrectnessReport(
             passed: false,
             checkedSteps: checkedSteps,
             caseCount: caseCount,
-            expertCacheHits: expertStats.cacheHits,
-            expertCacheMisses: expertStats.cacheMisses,
-            expertCacheEvictions: expertStats.cacheEvictions,
-            expertBytesRead: expertStats.bytesRead,
-            expertReadSeconds: expertStats.readSeconds,
-            expertPeakCachedTensors: expertStats.peakCachedTensors,
-            expertHitRate: expertStats.hitRate,
             firstFailingCase: firstFailingCase,
             firstFailingStep: nil,
             expectedToken: nil,
