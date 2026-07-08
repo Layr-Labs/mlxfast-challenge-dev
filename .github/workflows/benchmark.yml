@@ -52,7 +52,7 @@ permissions:
 # Unlike parallel-correctness-probe.yml/reference-cache-probe.yml (which already
 # have this), a duplicate dispatch on the same ref (retry after a timeout,
 # double-click) used to run all 6 jobs in full parallel twice -- no correctness
-# risk (artifact names are run_id/run_attempt-scoped) but 2x Blacksmith cost.
+# risk (artifact names are run_id/run_attempt-scoped) but 2x runner cost.
 # cancel-in-progress: false queues the second run rather than killing the first.
 # The group is keyed on run_benchmark so a correctness-only dispatch keeps
 # main's behavior of running concurrently with (not queued behind) a full
@@ -67,7 +67,7 @@ jobs:
   # machines start. combine-parallel-correctness.sh's own "Range coverage
   # check" catches a bad range_1/2/3 too, but only after all three slices (plus
   # benchmark-timing/benchmark-gates) have already run to completion -- a
-  # manual-dispatch typo would otherwise burn up to 5 full Blacksmith runs
+  # manual-dispatch typo would otherwise burn up to 5 full ranked-runner runs
   # before the mistake is reported.
   validate-slice-ranges:
     name: "validate correctness slice ranges"
@@ -436,7 +436,7 @@ jobs:
   # Gate timing/gates on validate-slice-ranges too, not just the slices: a bad
   # range_1/2/3 dooms the whole run (combine's coverage check fails), so failing
   # the cheap validator in ~3s must stop ALL five expensive machines, not only
-  # the three slices -- otherwise a typo still burns these two Blacksmith jobs.
+  # the three slices -- otherwise a typo still burns these two timing/gates jobs.
   # (timing/gates don't consume the ranges themselves, but there is no point
   # running them for a run that cannot combine.)
   benchmark-timing:
