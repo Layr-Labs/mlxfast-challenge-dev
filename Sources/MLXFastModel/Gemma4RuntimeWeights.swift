@@ -145,7 +145,14 @@ public final class Gemma4RuntimeWeightCache {
         if let weights = cachedMLPWeights[layerIndex] {
             return weights
         }
-        let weights = try loader.mlpWeights(layerIndex: layerIndex, config: config)
+        let base = try loader.mlpWeights(layerIndex: layerIndex, config: config)
+        let fused = Gemma4LinearWeight.fused(rowwise: base.gate, base.up)
+        let weights = Gemma4MLPWeights(
+            gate: base.gate,
+            up: base.up,
+            down: base.down,
+            fusedGateUp: fused
+        )
         cachedMLPWeights[layerIndex] = weights
         return weights
     }

@@ -44,4 +44,36 @@ public struct Gemma4LinearWeight {
     public var shape: [Int] {
         logicalShape
     }
+
+    /// Fuse two quantized linear weights along the output (row) dimension.
+    /// Both must have the same input features, group size, and bit width.
+    /// The weight codes, scales, and biases are concatenated along axis 0.
+    public static func fused(rowwise a: Gemma4LinearWeight, _ b: Gemma4LinearWeight) -> Gemma4LinearWeight {
+        precondition(a.logicalShape[1] == b.logicalShape[1], "input features must match")
+        precondition(a.groupSize == b.groupSize, "group sizes must match")
+        precondition(a.bits == b.bits, "bit widths must match")
+
+        let fusedWeight = concatenated([a.weight, b.weight], axis: 0)
+        let fusedScales: MLXArray?
+        if let aScales = a.scales, let bScales = b.scales {
+            fusedScales = concatenated([aScales, bScales], axis: 0)
+        } else {
+            fusedScales = nil
+        }
+        let fusedBiases: MLXArray?
+        if let aBiases = a.biases, let bBiases = b.biases {
+            fusedBiases = concatenated([aBiases, bBiases], axis: 0)
+        } else {
+            fusedBiases = nil
+        }
+
+        return Gemma4LinearWeight(
+            weight: fusedWeight,
+            scales: fusedScales,
+            biases: fusedBiases,
+            logicalShape: [a.logicalShape[0] + b.logicalShape[0], a.logicalShape[1]],
+            groupSize: a.groupSize,
+            bits: a.bits
+        )
+    }
 }
