@@ -62,11 +62,14 @@ public enum Gemma4Model {
     /// `30 * tanh(x / 30)` softcap already applied by the library; downstream
     /// consumers read only the last position's row.
     ///
-    /// `positionOffset` is intentionally not forwarded: the library derives each
-    /// layer's RoPE position from its KV cache `offset`, which advances in place
-    /// as the persistent `Gemma4ModelCache` is reused across the seed prefill and
-    /// every decode/correctness step. The parameter is retained only to keep the
-    /// harness call contract stable.
+    /// `positionOffset` is not forwarded to the library: it derives each
+    /// layer's RoPE position from its KV cache `offset`, which advances in
+    /// place as the persistent `Gemma4ModelCache` is reused across the seed
+    /// prefill and every decode/correctness step. Instead of silently
+    /// discarding the parameter, the adapter VERIFIES it against the cache's
+    /// actual offset -- a caller whose bookkeeping disagrees with the cache
+    /// state would otherwise get silently wrong positions (and wrong logits);
+    /// now it gets a loud error naming both numbers.
     public static func logits(
         inputIDs: MLXArray,
         weightCache: Gemma4RuntimeWeightCache,
@@ -77,11 +80,19 @@ public enum Gemma4Model {
             throw weightCache.loadError
                 ?? MLXFastError.invalidInput("Gemma 4 reference model was not loaded")
         }
-        _ = positionOffset
-
         guard let cache else {
+            // Single-shot callers (anchors, behavior single-token checks)
+            // always evaluate from position zero on a fresh cache.
+            try verifyCachePosition(cacheOffset: 0, positionOffset: positionOffset)
             return model(inputIDs, cache: model.newCache(parameters: nil))
         }
+        // Verify the caller's bookkeeping against the cache state up front,
+        // for every cached path (eager and compiled alike); kvCache(for:)
+        // creates the caches on first use at offset 0.
+        try verifyCachePosition(
+            cacheOffset: cache.kvCache(for: model).first?.offset ?? 0,
+            positionOffset: positionOffset
+        )
 
         // Single-token decode step: optionally route through mlx-swift-lm's
         // compiled decode (fused, no per-step graph rebuild). The compiled
@@ -111,6 +122,19 @@ public enum Gemma4Model {
         }
 
         return model(inputIDs, cache: cache.kvCache(for: model))
+    }
+
+    /// The caller-supplied position must agree with the KV cache state the
+    /// library will actually derive RoPE positions from. Pure and
+    /// unit-testable.
+    static func verifyCachePosition(cacheOffset: Int, positionOffset: Int) throws {
+        guard cacheOffset == positionOffset else {
+            throw MLXFastError.invalidInput(
+                "positionOffset \(positionOffset) disagrees with KV cache offset \(cacheOffset); "
+                    + "the library derives RoPE positions from the cache, so this forward "
+                    + "would compute positions the caller did not intend"
+            )
+        }
     }
 
     public static func logits(

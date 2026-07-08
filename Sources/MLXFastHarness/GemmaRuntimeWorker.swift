@@ -281,7 +281,6 @@ struct RuntimeWorkerResponse: Codable {
     let error: String?
     let token: Int?
     let topLogits: [CorrectnessTraceLogit]?
-    let topLogitRows: [[CorrectnessTraceLogit]]?
     let seedToken: Int?
     let tokens: [Int]?
     // Always ExpertStreamingStats.zero for this dense, RAM-resident runtime
@@ -297,7 +296,6 @@ struct RuntimeWorkerResponse: Codable {
         error: String? = nil,
         token: Int? = nil,
         topLogits: [CorrectnessTraceLogit]? = nil,
-        topLogitRows: [[CorrectnessTraceLogit]]? = nil,
         seedToken: Int? = nil,
         tokens: [Int]? = nil,
         expertStats: ExpertStreamingStats? = nil,
@@ -309,7 +307,6 @@ struct RuntimeWorkerResponse: Codable {
         self.error = error
         self.token = token
         self.topLogits = topLogits
-        self.topLogitRows = topLogitRows
         self.seedToken = seedToken
         self.tokens = tokens
         self.expertStats = expertStats
@@ -323,7 +320,6 @@ struct RuntimeWorkerResponse: Codable {
         case error
         case token
         case topLogits = "top_logits"
-        case topLogitRows = "top_logit_rows"
         case seedToken = "seed_token"
         case tokens
         case expertStats = "expert_stats"

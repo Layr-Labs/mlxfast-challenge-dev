@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+@testable import MLXFastCore
 @testable import MLXFastModel
 import Testing
 
@@ -97,5 +98,23 @@ private enum Gemma4ModelSpecFixture {
             rmsNormEps: rmsNormEps,
             finalLogitSoftcapping: finalLogitSoftcapping
         )
+    }
+}
+
+@Test
+func libraryAdapterVerifiesCallerPositionAgainstCacheOffset() throws {
+    // The library derives RoPE positions from KV-cache offsets and ignores
+    // the caller's positionOffset, so the adapter must fail loudly when the
+    // two disagree instead of silently computing wrong positions.
+    try Gemma4Model.verifyCachePosition(cacheOffset: 0, positionOffset: 0)
+    try Gemma4Model.verifyCachePosition(cacheOffset: 512, positionOffset: 512)
+    // Offsets keep growing past the sliding window; 1535 = 512-token seed +
+    // 1023 local-submit decode steps.
+    try Gemma4Model.verifyCachePosition(cacheOffset: 1535, positionOffset: 1535)
+    #expect(throws: MLXFastError.self) {
+        try Gemma4Model.verifyCachePosition(cacheOffset: 512, positionOffset: 0)
+    }
+    #expect(throws: MLXFastError.self) {
+        try Gemma4Model.verifyCachePosition(cacheOffset: 0, positionOffset: 512)
     }
 }
