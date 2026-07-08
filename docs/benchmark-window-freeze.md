@@ -4,8 +4,8 @@ This document is the frozen definition of the **timed benchmark window** -- the
 exact work the official runner charges to the prefill and decode scores -- and
 the protocol for changing it. It exists because the official baseline
 (`officialBaselineDecodeSecondsPerToken` /
-`officialBaselinePrefillSecondsPerToken`) is measured on the Blacksmith runner
-at real cost. Any change to the charged work makes the recorded baseline mean a
+`officialBaselinePrefillSecondsPerToken`) is measured on the ranked runner
+(`tenki-macos-latest-xlarge`) at real cost. Any change to the charged work makes the recorded baseline mean a
 different thing, which forces a new baseline run for every axis that moved.
 
 Treat a re-baseline as expensive and rare. The goal of this freeze is to make
@@ -69,8 +69,9 @@ same test:
 
 Acceptance bands (see `AcceptanceBand`,
 `docs/thermal-variance-investigation.md`): prefill and decode are single noisy
-measurements, each gated once per run against the same-VM paired baseline `B`
-(which cancels host-speed differences). After the speedup floors, each axis's
+measurements, each gated once per run against the paired baseline `B` measured
+on its own fresh VM (which cancels fleet-wide/common-mode drift; per-VM host
+variance is what the band tolerances themselves absorb). After the speedup floors, each axis's
 measured value must land within `[B * (1 - downTolerance), B * (1 + upTolerance)]`:
 it fails if the value exceeds `B * (1 + upTolerance)` (a real slowdown /
 regression) or drops below `B * (1 - downTolerance)` (an improvement too large to
@@ -199,8 +200,8 @@ session as a hard prerequisite for rotation.
 
 1. Make the window change and update the constants above in
    `Sources/MLXFastCore/Constants.swift`.
-2. Re-measure the affected axis (or both) on the official Blacksmith runner with
-   the baseline reference model, all gates green.
+2. Re-measure the affected axis (or both) on the ranked runner
+   (`tenki-macos-latest-xlarge`) with the baseline reference model, all gates green.
 3. Update `officialBaseline*SecondsPerToken` and the values quoted in this doc,
    `README.md`, and `TASK.md`.
 4. Update the pinned literals in `BenchmarkWindowFreezeTests.swift` in the same

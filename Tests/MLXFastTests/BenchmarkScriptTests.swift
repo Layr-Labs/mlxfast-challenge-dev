@@ -431,7 +431,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: c49e3df384c4088b7a33c7b321fb0b5e416a62d03fb14d5d83109d1f4860a18c"))
-    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"11236\""))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"5089\""))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"))
     #expect(timingOrGates.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"))
     #expect(timingOrGates.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json"))
@@ -868,6 +868,15 @@ func gatesMachineRunsPublicBehaviorGateBeforeHiddenGates() throws {
         encoding: .utf8
     )
     #expect(benchmarkWorkflow.contains(fixtureHash))
+    // Same for the byte count: verify-correctness-golden.sh hard-checks bytes
+    // after the SHA, so a stale byte pin fails the correctness-only job even when
+    // the hash matches. Deriving it from the fixture forces the pin to move when
+    // the fixture is regenerated, instead of silently drifting.
+    #expect(
+        benchmarkWorkflow.contains(
+            "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"\(fixtureData.count)\""
+        )
+    )
 }
 
 // The 64-step teacher-forced base case only exercises single-token forwards at

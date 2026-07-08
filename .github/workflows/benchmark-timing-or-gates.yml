@@ -77,6 +77,40 @@ jobs:
       - name: Enforce trusted workflow context
         run: .github/scripts/enforce-trusted-benchmark-workflow.sh
 
+      # The baseline job checks out the DISPATCHED ref (a submissions/* branch on
+      # ranked runs) and below runs non-editable scripts -- setup.sh and
+      # download-r2-object.sh -- with the reference auth header and R2 secrets in
+      # scope. Those secrets unlock the private goldens, so the same file-integrity
+      # gates the candidate `run` job applies before its secret steps MUST run here
+      # too, and before any secret is exposed. enforce-trusted validates the
+      # workflow context only; enforce-modifiable-surface is the boundary that
+      # rejects a tampered setup.sh / .github/scripts/*, and the static review
+      # catches editable-surface bypasses. Without these a tampered submission
+      # branch would exfiltrate the R2 keys here before the run job's gates fire.
+      - name: Review submitted code for benchmark bypasses
+        if: ${{ startsWith(github.ref_name, 'submissions/') }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Review only the editable files changed vs the merge-base -- see the
+          # diff-only-mode comment in run-submission-static-review.sh. Standalone
+          # assignment: a merge-base failure must fail this step; as a command
+          # prefix its failure would be masked by bash and the review would
+          # silently fall back to the whole editable surface.
+          base_sha="$(git merge-base origin/main "${HEAD_SHA}")"
+          MLXFAST_SUBMISSION_REVIEW_BASE_SHA="${base_sha}" \
+            .github/scripts/run-submission-static-review.sh
+
+      - name: Enforce modifiable surface
+        if: ${{ startsWith(github.ref_name, 'submissions/') }}
+        env:
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          BASE_SHA="$(git merge-base origin/main "${HEAD_SHA}")" \
+            .github/scripts/enforce-modifiable-surface.sh
+
       - name: Check correctness golden source
         run: |
           set -euo pipefail
@@ -375,7 +409,7 @@ jobs:
           # behavior gates but MUST NOT mutate its .cases (the base teacher-forced
           # case). The three correctness-slice machines verify the base case
           # against the RAW golden (pinned by MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_
-          # SHA256 = a593..e92cb25); this machine verifies gates against the
+          # SHA256 = 5c5bb073..b6adaf); this machine verifies gates against the
           # augmented golden. Both must agree on .cases or the split would check
           # the base case against a different fixture than it reports. That
           # agreement is backstopped by checked_steps/case_count equality in
