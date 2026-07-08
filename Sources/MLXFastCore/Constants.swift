@@ -101,25 +101,25 @@ public enum MLXFastConstants {
     public static let prefillBandDownTolerance = 0.05
     public static let decodeBandUpTolerance = 0.02
     public static let decodeBandDownTolerance = 0.05
-    // CACHED Gemma 4 31B 4-bit dense baseline, calibrated on the ranked runner
-    // (tenki-macos-latest-xlarge, the only ranked runner now) from COLD single-
-    // benchmark runs -- one full 128-step `./benchmark.sh` per fresh throwaway VM,
-    // which is exactly how the ranked candidate is measured now (one benchmark per
-    // fresh VM, no live paired baseline). Values are the robust drop-outlier
-    // average (drop the single slowest, average the rest) of fresh-VM run
-    // 28893815980 (2026-07-07, 6 fresh VMs), corroborated by the cold run-1s of
-    // run 28898140493 (10 cold measurements total): decode clustered 0.1332-0.1343
-    // (CV 0.3%); prefill floor ~0.0106 (one +44% spike dropped).
+    // CACHED Gemma 4 31B 4-bit dense baseline for the mlx-swift-lm reference model
+    // (upstream ml-explore Gemma4TextModel, eager decode), calibrated on the ranked
+    // runner (tenki-macos-latest-xlarge) from COLD single-benchmark runs -- one full
+    // 128-step `./benchmark.sh` per fresh throwaway VM, exactly how the ranked
+    // candidate is measured. Values are the robust drop-outlier average (drop the
+    // single slowest, average the rest) of fresh-VM run 28919623628 (2026-07-08, 6
+    // fresh VMs): decode clustered 0.1743-0.1866 (CV 2.7%, no slow-VM tail); prefill
+    // 0.0365-0.0412 (CV 4.6%).
     //
-    // Supersedes the Blacksmith-era values (prefill 0.01010573933984375 / decode
-    // 0.131727461265625): the ranked runner is tenki-only now. The live paired
-    // baseline is KEPT (it still tracks per-run drift) but measured on a SEPARATE
-    // fresh VM from the candidate, so the baseline run no longer warms the
-    // candidate's VM. These constants keep their three roles: local-mode scoring,
-    // the gates-only machine's placeholder timing, and the paired sanity-band
-    // anchor. See the paired-baseline section of docs/benchmark-window-freeze.md.
-    public static let officialBaselinePrefillSecondsPerToken = 0.010605031949609375
-    public static let officialBaselineDecodeSecondsPerToken = 0.1336139485703125
+    // Supersedes the bespoke-model values (prefill 0.010605031949609375 / decode
+    // 0.1336139485703125). The reference is now mlx-swift-lm's Gemma4: ~1.3x slower
+    // decode than the bespoke but far more deterministic across fresh VMs (a same-
+    // day bespoke matrix, run 28921608965, hit its host-lottery tail -- decode CV
+    // 36.4%, one VM 2.26x slow -- whereas this reference stays at CV ~2.7%), which
+    // is what lets the +2%/-5% decode acceptance bands hold. These constants keep
+    // their roles: local-mode scoring, the gates-only machine's placeholder timing,
+    // and the paired sanity-band anchor. See docs/benchmark-window-freeze.md.
+    public static let officialBaselinePrefillSecondsPerToken = 0.03870193642617188
+    public static let officialBaselineDecodeSecondsPerToken = 0.17949775266875
     public static let scorePrefillWeight = 0.25
     public static let scoreDecodeWeight = 0.75
     public static let scorePrefillSpeedupFloor = 0.95

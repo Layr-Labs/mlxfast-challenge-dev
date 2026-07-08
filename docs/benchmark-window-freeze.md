@@ -87,20 +87,24 @@ trust in one submission, or a suspiciously lucky-fast reading).
 `B`'s robustness (drop-slowest average) and the per-axis tolerances are
 ranking-contract decisions, so they are operator-owned and pinned here.
 
-## Current calibrated baseline (cached, tenki cold)
+## Current calibrated baseline (cached, tenki cold, mlx-swift-lm reference)
 
-The ranked runner is now **tenki-macos-latest-xlarge only** (Blacksmith retired).
-The baseline is a **cached** value, calibrated from COLD single-benchmark runs --
-one full 128-step `./benchmark.sh` per fresh throwaway VM, which is exactly how the
-ranked candidate is measured now (see "Cached baseline" below). Values are the
-robust drop-outlier average of fresh-VM run 28893815980 (2026-07-07, 6 fresh VMs;
-corroborated by the cold run-1s of run 28898140493, 10 cold measurements total):
+The reference model is now the upstream **ml-explore/mlx-swift-lm** `Gemma4TextModel`
+(eager decode), and the ranked runner is **tenki-macos-latest-xlarge only**. The
+baseline is a **cached** value, calibrated from COLD single-benchmark runs -- one
+full 128-step `./benchmark.sh` per fresh throwaway VM, exactly how the ranked
+candidate is measured. Values are the robust drop-outlier average of fresh-VM run
+28919623628 (2026-07-08, 6 fresh VMs): decode clustered 0.1743-0.1866 (CV 2.7%, no
+slow-VM tail); prefill 0.0365-0.0412 (CV 4.6%):
 
-- `officialBaselineDecodeSecondsPerToken = 0.1336139485703125`
-- `officialBaselinePrefillSecondsPerToken = 0.010605031949609375`
+- `officialBaselineDecodeSecondsPerToken = 0.17949775266875`
+- `officialBaselinePrefillSecondsPerToken = 0.03870193642617188`
 
-These supersede the Blacksmith-era values (decode 0.131727461265625 / prefill
-0.01010573933984375), which priced a runner we no longer use.
+These supersede the bespoke-model values (decode 0.1336139485703125 / prefill
+0.010605031949609375). The mlx-swift-lm reference is ~1.3x slower on decode but far
+more deterministic across fresh VMs -- a same-day bespoke matrix (run 28921608965)
+hit its host-lottery tail (decode CV 36.4%, one VM 2.26x slow) while this reference
+held CV ~2.7%, which is what keeps the +/-2%/5% decode acceptance bands viable.
 
 If either number here disagrees with `Sources/MLXFastCore/Constants.swift`, the
 freeze test fails on purpose -- the doc and the code must move together.

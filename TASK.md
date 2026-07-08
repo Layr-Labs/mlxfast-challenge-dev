@@ -260,8 +260,8 @@ golden baseline paths -- both of which take precedence over the constants in
 the benchmark harness -- price the floors against a live same-session sample.
 A run below either floor fails eligibility even if the weighted score would
 otherwise be above baseline. On the calibrated constants, those floors allow
-at most `0.14064626165296054` seconds/token for decode and
-`0.011163191525904606` seconds/token for prefill.
+at most `0.18894500280921053` seconds/token for decode and
+`0.04073888044860198` seconds/token for prefill.
 
 The whole model is RAM-resident with no weight streaming, so
 `bandwidth_gb_per_token` is always `0`, reported with
