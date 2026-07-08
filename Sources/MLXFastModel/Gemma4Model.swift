@@ -78,31 +78,8 @@ public enum Gemma4Model {
                 ?? MLXFastError.invalidInput("Gemma 4 reference model was not loaded")
         }
         _ = positionOffset
-
-        guard let cache else {
-            return model(inputIDs, cache: model.newCache(parameters: nil))
-        }
-
-        // Single-token decode step: route through mlx-swift-lm's compiled decode
-        // (fused, no per-step graph rebuild). The compiled closure is built once,
-        // on the first step, from the seed-populated caches (promoted in place to
-        // compilable types); prefill and the seed forward (length > 1) stay eager.
-        if inputIDs.dim(1) == 1 {
-            if let step = cache.compiledDecodeStep {
-                return step([inputIDs])[0]
-            }
-            var kvCaches = cache.kvCache(for: model)
-            if let step = CompiledDecode.setupCompiledDecode(model: model, cache: &kvCaches) {
-                cache.adoptKVCaches(kvCaches)
-                cache.compiledDecodeStep = step
-                return step([inputIDs])[0]
-            }
-            // Compiled decode unavailable (disabled/unsupported): eager fallback.
-            cache.adoptKVCaches(kvCaches)
-            return model(inputIDs, cache: kvCaches)
-        }
-
-        return model(inputIDs, cache: cache.kvCache(for: model))
+        let kvCaches = cache?.kvCache(for: model) ?? model.newCache(parameters: nil)
+        return model(inputIDs, cache: kvCaches)
     }
 
     public static func logits(

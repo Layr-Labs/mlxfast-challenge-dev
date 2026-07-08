@@ -1,4 +1,4 @@
-// swift-tools-version: 6.3
+// swift-tools-version: 6.1
 import PackageDescription
 
 let package = Package(
@@ -14,13 +14,14 @@ let package = Package(
         .library(name: "MLXFastHarness", targets: ["MLXFastHarness"]),
     ],
     dependencies: [
-        // Layr-Labs forks: mlx-swift-lm carries the optimized Gemma 4 text tower
-        // this benchmark's reference is built on, and it pins mlx-swift to its
-        // own fork at branch main -- we must match that requirement (branch main)
-        // so SwiftPM resolves a single mlx-swift. Package.resolved pins the exact
-        // commit for reproducibility.
-        .package(url: "https://github.com/Layr-Labs/mlx-swift", branch: "main"),
-        .package(url: "https://github.com/Layr-Labs/mlx-swift-lm", branch: "main"),
+        // Vanilla upstream mlx-swift-lm carries the Gemma 4 text tower this
+        // benchmark's reference is built on. It (tools-version 6.1) and mlx-swift
+        // 0.31.4 build on the tenki runners' Swift 6.1 -- unlike the Layr-Labs
+        // fork, which requires 6.3 (see PR #365). mlx-swift-lm 3.31.4 asks for
+        // mlx-swift .upToNextMinor(from 0.31.4); pin it to exactly 0.31.4 so the
+        // graph never resolves 0.31.6 (which is 6.3-only).
+        .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.31.4"),
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", exact: "3.31.4"),
         .package(url: "https://github.com/huggingface/swift-transformers", exact: "1.3.3"),
     ],
     targets: [
