@@ -23,19 +23,18 @@ and prefill must also stay within the configured 0.95 speedup floors.
 
 ## Official Hardware
 
-Ranked benchmark runs execute through GitHub Actions on Blacksmith-hosted
-Apple Silicon runners, like the rest of the Darkbloom inference benchmarks.
-The runner label configured in `.github/` is the source of truth; today that
-is:
+Ranked benchmark runs execute through GitHub Actions on tenki-hosted Apple
+Silicon runners. The runner label configured in the ranked workflows under
+`.github/` is the source of truth; today that is:
 
 ```text
-blacksmith-12vcpu-macos-26
+tenki-macos-latest-xlarge
 ```
 
 The ranked hardware contract for this benchmark is Apple M4-generation
-silicon with at least 36 GB of unified memory; today's runner is Blacksmith's
-Apple M4 Pro class (48 GB), which is also the hardware the official baseline
-constants were calibrated on. Gemma 4 31B 4-bit is a dense model: the text
+silicon with at least 36 GB of unified memory; the official baseline
+constants were calibrated on fresh tenki VMs of that runner class (see
+`Sources/MLXFastCore/Constants.swift`). Gemma 4 31B 4-bit is a dense model: the text
 tower is about 17 GB in 4-bit, so it is fully RAM-resident under that
 contract: the runtime loads every text-tower tensor once during untimed
 initialization and keeps it resident for the whole process lifetime. There is
@@ -267,13 +266,13 @@ Good submissions are likely to improve one or more of:
 
 Be careful with optimizations that only help a single public prompt or a single
 machine. The hidden correctness and benchmark prompts are different from the
-public local fixtures, and official scoring happens on the Blacksmith runner.
+public local fixtures, and official scoring happens on the tenki runner.
 
 ## Avoid These Wrong Strategies
 
 Do not assume the benchmark machine has the same memory budget as your local
 Mac. The official contract is Apple M4-generation silicon with at least 36 GB
-of unified memory (today's runner: Blacksmith M4 Pro, 48 GB); the ~17 GB text
+of unified memory (today's runner: tenki-macos-latest-xlarge); the ~17 GB text
 tower is comfortably RAM-resident there, but headroom for KV cache, buffers,
 and caches is finite — do not tune memory-hungry strategies against a larger
 local machine. Unlike a large MoE checkpoint there is no meaningfully
@@ -282,6 +281,19 @@ different "streaming fallback" regime here to mistune against.
 Do not specialize for the public correctness prompt. Optimizations should be
 prompt-independent and model-general for Gemma 4. Hidden correctness, GPQA,
 and benchmark prompts are different from the public fixtures.
+
+Do not add caches or memos keyed on a request's input tokens whose only
+possible hit is the benchmark harness repeating an identical computation — for
+example, memoizing a whole-prompt forward's logits or KV state so a repeated
+identical forward can skip the work. Bit-identical output does not make this
+legitimate. The benchmark measures single-pass inference: optimizations must
+save work that recurs in single-pass production inference (one prefill, then
+decode, per prompt), not work that only exists in the measurement protocol.
+The harness never legitimately issues the same whole-prompt forward twice to
+one worker process; any such repetition is a harness bug, never a contract to
+rely on. Input-independent caching (weights, dequantized tensors, RoPE/mask
+tables keyed on shapes and offsets) and within-request KV reuse remain fine.
+Submissions in this category fail the static review as bypass behavior.
 
 Do not treat local-only environment overrides as proof of a valid improvement.
 Examples include disabling the sandbox, skipping transform without verifying
@@ -311,16 +323,3 @@ swift test
 If the local correctness gate fails, the official benchmark will not rank the
 submission. If local performance improves but correctness is fragile, prefer a
 more conservative optimization.
-
-Do not add caches or memos keyed on a request's input tokens whose only
-possible hit is the benchmark harness repeating an identical computation — for
-example, memoizing a whole-prompt forward's logits or KV state so a repeated
-identical forward can skip the work. Bit-identical output does not make this
-legitimate. The benchmark measures single-pass inference: optimizations must
-save work that recurs in single-pass production inference (one prefill, then
-decode, per prompt), not work that only exists in the measurement protocol.
-The harness never legitimately issues the same whole-prompt forward twice to
-one worker process; any such repetition is a harness bug, never a contract to
-rely on. Input-independent caching (weights, dequantized tensors, RoPE/mask
-tables keyed on shapes and offsets) and within-request KV reuse remain fine.
-Submissions in this category fail the static review as bypass behavior.

@@ -70,8 +70,9 @@ It also creates this compatibility symlink unless the path already exists:
 reference_weights/gemma-4-31b-4bit/
 ```
 
-By default `setup.sh` downloads `mlx-community/gemma-4-31b-4bit` directly from
-Hugging Face with resumable `curl` requests. It checks cached files against
+By default `setup.sh` downloads the `mlx-community/gemma-4-31b-4bit` checkpoint
+from the Darkbloom R2 mirror (Hugging Face is available as an override via
+`MLXFAST_REFERENCE_BASE_URL`) with resumable `curl` requests. It checks cached files against
 the pinned SHA256 manifest and redownloads only missing, truncated, or
 hash-mismatched files. The safetensors payload is about 18.4 GB across 4
 shards; `setup.sh` requires 40 GiB free by default before starting. After a

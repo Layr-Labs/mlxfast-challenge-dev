@@ -78,6 +78,37 @@ func rulesDocsQuoteCurrentSpeedupFloorLimits() throws {
 }
 
 @Test
+func participantDocsNameTheRankedRunnerAndStayInSync() throws {
+    // AGENTS.md and CLAUDE.md are the same contract served under two agent
+    // filename conventions; byte equality prevents the drift where a policy
+    // paragraph (or the runner migration) lands in one file only.
+    let agents = try String(contentsOfFile: "AGENTS.md", encoding: .utf8)
+    let claude = try String(contentsOfFile: "CLAUDE.md", encoding: .utf8)
+    #expect(agents == claude)
+
+    // Participant docs must name the same ranked runner the timing workflow
+    // actually uses; Blacksmith is retired for scoring (ci.yml may still use
+    // it for non-scoring unit tests).
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark-timing-or-gates.yml", encoding: .utf8)
+    #expect(workflow.contains("runs-on: tenki-macos-latest-xlarge"))
+    let readme = try String(contentsOfFile: "README.md", encoding: .utf8)
+    let challenge = try String(contentsOfFile: "TASK.md", encoding: .utf8)
+    for document in [agents, readme] {
+        #expect(document.contains("tenki-macos-latest-xlarge"))
+    }
+    for document in [agents, readme, challenge] {
+        #expect(!document.lowercased().contains("blacksmith"))
+    }
+
+    // Hidden R2 object names in README must match the migrated -gemma keys
+    // the workflows download.
+    #expect(readme.contains("golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"))
+    #expect(readme.contains("gpqa_reference_cases-gemma.json"))
+    #expect(!readme.contains("gpqa_reference_cases.json object"))
+}
+
+@Test
 func benchmarkWorkflowRunsTransformOfflineAfterSetup() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/benchmark.yml",
