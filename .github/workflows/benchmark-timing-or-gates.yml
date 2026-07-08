@@ -167,17 +167,23 @@ jobs:
             export MLXFAST_REFERENCE_DIR="${GITHUB_WORKSPACE}/${MLXFAST_REFERENCE_DIR}"
             ./benchmark.sh
           ) || status=$?
-          # The baseline's OWN floor verdict is measured against its checked-in
-          # constants and legitimately fails on a slow-fleet session -- exactly
-          # the drift this pairing exists to cancel -- so tolerate a floor failure
-          # but nothing else: token mismatches or harness errors must fail.
+          # The baseline's OWN floor and acceptance-band verdicts are measured
+          # against its checked-in constants and legitimately fail on a
+          # fast/slow-fleet session -- exactly the drift this pairing exists to
+          # cancel (a fresh VM 8% faster than calibration trips the reference's
+          # -5% "improvement too large" self-band and, untolerated, fails every
+          # submission run). Tolerate those two self-referential verdicts but
+          # nothing else: token mismatches or harness errors must fail. The
+          # sanity band below stays the real pathological-VM guard.
           test -s "${baseline_score}"
           jq -e '
             (.metrics.first_failing_case == null)
             and (.metrics.first_failing_step == null)
             and (.metrics.expected_token == null)
             and (.metrics.actual_token == null)
-            and ((.metrics.error == "") or (.metrics.error | startswith("performance floor failed")))
+            and ((.metrics.error == "")
+                 or (.metrics.error | startswith("performance floor failed"))
+                 or (.metrics.error | startswith("acceptance band failed")))
             and (.metrics.prefill_seconds_per_token > 0)
             and (.metrics.decode_seconds_per_token > 0)
           ' "${baseline_score}" >/dev/null || {

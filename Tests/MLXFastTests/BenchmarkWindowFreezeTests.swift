@@ -198,11 +198,15 @@ func officialTimingMachineMeasuresPairedBaseline() throws {
     // checkout is ever re-added, this count breaks and forces the gates back.
     #expect(baselineBody.components(separatedBy: "uses: actions/checkout").count - 1 == 1)
     #expect(!baselineBody.contains("path: paired-baseline"))
-    // Baseline floor failures are tolerated (measured against its own
-    // constants); anything else fails, and a wide sanity band anchored to the
-    // calibrated constants rejects a pathological VM/build. The narrow per-VM
-    // lottery is caught downstream by the candidate's acceptance band.
+    // Baseline floor AND acceptance-band failures are tolerated (both are the
+    // pinned reference judging itself against its own checked-in constants,
+    // and a fresh VM faster than the calibration cohort trips the -5%
+    // "improvement too large" self-band); anything else fails, and a wide
+    // sanity band anchored to the calibrated constants rejects a pathological
+    // VM/build. The narrow per-VM lottery is caught downstream by the
+    // candidate's acceptance band.
     #expect(baselineBody.contains("startswith(\"performance floor failed\")"))
+    #expect(baselineBody.contains("startswith(\"acceptance band failed\")"))
     #expect(baselineBody.contains("$prefill_ratio >= 0.66 and $prefill_ratio <= 1.5"))
     let sanityPrefill = try #require(
         baselineBody.range(of: "MLXFAST_PAIRED_SANITY_PREFILL: \"").map { range in
