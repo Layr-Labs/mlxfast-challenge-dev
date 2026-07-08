@@ -1,16 +1,18 @@
 name: gemma-vm-noise-probe
 
 # DIAGNOSTIC (dispatch-only, NOT scored). Measures the STRUCTURE of tenki decode
-# timing noise to decide the acceptance-band strategy (median-of-N vs same-VM
-# pairing vs widen). On each of several FRESH VMs it loads the reference once and
-# runs the timed decode window K times back-to-back, so we can separate:
+# timing noise at the OFFICIAL 128-step cadence (the cadence the acceptance band
+# actually gates on) to decide the band strategy (median-of-N vs same-VM pairing
+# vs widen). On each of several FRESH VMs it loads the reference once and runs the
+# OFFICIAL timed decode window (128 steps, 512-token seed) K times back-to-back:
 #   - WITHIN-VM jitter  = spread of the K repeats on one VM (median-of-N fixes this)
 #   - BETWEEN-VM offset = spread of the per-VM medians across VMs (only same-VM
 #     pairing cancels this; median-of-N does NOT)
-#   - WARMING           = run 1 (coldest) vs runs 2..K (warm), for decode AND
-#     prefill -- if decode is warming-immune, same-VM pairing is safe for decode.
-# Timings only; uses the PUBLIC fixtures via --local-iterate, so no private goldens
-# and no R2 secrets. Reuses the registered gemma-freshvm.yml dispatch path.
+#   - WARMING           = run 1 (coldest) vs runs 2..K (warm), decode AND prefill.
+# Timing only: MLXFAST_BENCHMARK_{CORRECTNESS_STEPS=0,CHECK_GATES=0}. Uses the raw
+# private timed oracle (R2) like the baseline job, but the ONLY things printed or
+# uploaded are seconds-per-token numbers -- never any golden/token content. Reuses
+# the registered gemma-freshvm.yml dispatch path.
 on:
   workflow_dispatch:
     inputs:
@@ -27,16 +29,27 @@ permissions:
 
 jobs:
   probe:
-    name: "vm noise probe (fresh vm ${{ matrix.vm }})"
+    name: "vm noise probe 128-step (fresh vm ${{ matrix.vm }})"
     strategy:
       fail-fast: false
       matrix:
         vm: [1, 2, 3, 4, 5, 6]
     runs-on: tenki-macos-latest-xlarge
     timeout-minutes: 90
+    environment: benchmark-private-prompts
     env:
+      MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+      MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
+      # Raw timed oracle (same as the baseline job): 512-token seed + 128 decode.
+      MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json
+      MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-probe-${{ github.run_id }}-${{ github.run_attempt }}/oracle.json
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
       MLXFAST_REFERENCE_DIR: /Users/runner/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
+      MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}
+      # Timing only: measure the timed prompt, never the base case or gates.
+      MLXFAST_BENCHMARK_CORRECTNESS_STEPS: "0"
+      MLXFAST_BENCHMARK_CHECK_GATES: "0"
+      MLXFAST_BENCHMARK_SKIP_TIMED: "0"
       REPEATS: ${{ inputs.repeats }}
       OUT_DIR: probe-out
     steps:
@@ -51,6 +64,15 @@ jobs:
           now=$(date +%s)
           echo "vm=${{ matrix.vm }} uptime_s=$(( now - ${boot:-now} )) (small => fresh VM)"
           sysctl -n machdep.cpu.brand_string 2>/dev/null || true
+
+      - name: Check correctness golden source
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "${MLXFAST_CORRECTNESS_GOLDEN_PATH}")"
+          if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
+            echo "::error::probe requires private R2 secrets for the 128-step timed oracle" >&2
+            exit 1
+          fi
 
       - name: Restore SwiftPM cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -79,6 +101,25 @@ jobs:
           fi
           ./setup.sh
 
+      - name: Prepare timed oracle (R2)
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" \
+            "${MLXFAST_CORRECTNESS_GOLDEN_PATH}"
+          actual_hash="$(shasum -a 256 "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | awk '{print $1}')"
+          actual_bytes="$(wc -c < "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | tr -d ' ')"
+          {
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"
+          } >> "${GITHUB_ENV}"
+          # sha/bytes are not golden content; safe to log for provenance.
+          echo "probe: timed oracle ${actual_hash} bytes=${actual_bytes}"
+
       - name: Transform reference checkpoint
         run: |
           set -euo pipefail
@@ -87,25 +128,24 @@ jobs:
             .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
             --reference "${MLXFAST_REFERENCE_DIR}" --output weights
 
-      - name: Repeated timed decode (within-VM jitter + warming)
+      - name: Repeated OFFICIAL 128-step timed decode (within-VM jitter + warming)
         run: |
           set -euo pipefail
           mkdir -p "${OUT_DIR}"
           OUT="${OUT_DIR}/vm-${{ matrix.vm }}.jsonl"
           : > "${OUT}"
           n="${REPEATS:-8}"
-          # Each iteration is a FRESH process (reloads the model), then one timed
-          # prefill + 128-step decode via the public fixture. The reported
-          # seconds-per-token are the isolated timed windows (load excluded), so the
-          # K decode values give within-VM decode jitter; run 1 vs 2..K gives the
-          # cross-process warming signal.
+          # Each iteration is the OFFICIAL timed path (512-seed prefill + 128-step
+          # decode) in a fresh process. Only the seconds-per-token metrics are read
+          # out; benchmark stdout is suppressed so no token/golden content is logged.
           for i in $(seq 1 "${n}"); do
-            rm -f score.local-iterate.json
-            ./benchmark.sh --local-iterate >/dev/null 2>&1 || true
-            sf=score.local-iterate.json
-            [[ -f "$sf" ]] || sf=score.json
-            d=$(jq -r '.metrics.decode_seconds_per_token // .decode_seconds_per_token // empty' "$sf" 2>/dev/null || echo "")
-            p=$(jq -r '.metrics.prefill_seconds_per_token // .prefill_seconds_per_token // empty' "$sf" 2>/dev/null || echo "")
+            sp="/tmp/mlxfast-probe-${{ github.run_id }}-${{ github.run_attempt }}/score-${i}.json"
+            rm -f "$sp"
+            MLXFAST_SCORE_PATH="$sp" \
+              MLXFAST_INTEGRITY_PATH="/tmp/mlxfast-probe-${{ github.run_id }}-${{ github.run_attempt }}/integ-${i}.json" \
+              ./benchmark.sh >/dev/null 2>&1 || true
+            d=$(jq -r '.metrics.decode_seconds_per_token // empty' "$sp" 2>/dev/null || echo "")
+            p=$(jq -r '.metrics.prefill_seconds_per_token // empty' "$sp" 2>/dev/null || echo "")
             echo "{\"vm\":${{ matrix.vm }},\"i\":${i},\"prefill\":${p:-null},\"decode\":${d:-null}}" | tee -a "${OUT}"
           done
           echo "=== vm ${{ matrix.vm }} decode samples (s/token) ==="
@@ -113,7 +153,7 @@ jobs:
           echo "=== vm ${{ matrix.vm }} prefill samples (s/token) ==="
           jq -r '.prefill' "${OUT}" | tr '\n' ' '; echo
 
-      - name: Upload probe results
+      - name: Upload probe results (timings only)
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: gemma-vm-noise-probe-${{ github.run_id }}-vm${{ matrix.vm }}
