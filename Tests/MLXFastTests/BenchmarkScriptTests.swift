@@ -572,6 +572,15 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(!semanticGate.contains("--header \"x-api-key: ${ANTHROPIC_API_KEY}\""))
     #expect(!semanticGate.contains("--arg question \"$(jq"))
     #expect(!semanticGate.contains("candidate_answer\" >&2"))
+    // The bypass review runs on the strongest model at max reasoning effort,
+    // and must not inherit the cheaper Sonnet judge that the gates job exports
+    // as MLXFAST_SEMANTIC_GPQA_MODEL job-level env.
+    #expect(staticReview.contains("MODEL=\"${MLXFAST_SUBMISSION_STATIC_REVIEW_MODEL:-claude-opus-4-8}\""))
+    #expect(!staticReview.contains(":-${MLXFAST_SEMANTIC_GPQA_MODEL"))
+    #expect(staticReview.contains("thinking: { type: \"adaptive\" },"))
+    #expect(staticReview.contains("output_config: { effort: \"max\" },"))
+    // Opus 4.8 rejects non-default sampling params with a 400.
+    #expect(!staticReview.contains("temperature:"))
     #expect(staticReview.contains("ANTHROPIC_API_KEY is required for submission static review"))
     #expect(staticReview.contains("unset ANTHROPIC_API_KEY"))
     #expect(staticReview.contains("env -u ANTHROPIC_API_KEY curl"))
