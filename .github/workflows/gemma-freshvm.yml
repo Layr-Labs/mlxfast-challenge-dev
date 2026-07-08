@@ -38,6 +38,28 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # This job holds R2-read secrets, downloads the hidden goldens to local
+      # disk, and runs this ref's transform/CLI code against them before
+      # uploading the regenerated objects as a (public-repo) artifact. On a
+      # submissions/* ref the editable Sources are participant-controlled, so a
+      # dispatch there would hand the hidden prompts to untrusted code with a
+      # public exfiltration channel. Maintainer feature branches stay allowed
+      # (regen legitimately runs from migration branches); submission refs are
+      # never a legitimate regen source.
+      - name: Enforce trusted dispatch context
+        env:
+          MLXFAST_TRUSTED_BENCHMARK_WORKFLOW: .github/workflows/gemma-freshvm.yml
+          MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/heads/submissions/*)
+              echo "::error::private-golden regen must never run on a submission ref (${GITHUB_REF})" >&2
+              exit 1
+              ;;
+          esac
+          .github/scripts/enforce-trusted-benchmark-workflow.sh
+
       - name: Host identity + VM freshness
         run: |
           set -uo pipefail

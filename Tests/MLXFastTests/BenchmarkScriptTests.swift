@@ -1250,6 +1250,26 @@ func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
 }
 
 @Test
+func privateGoldenRegenWorkflowRejectsSubmissionRefsAndLimitsArtifactRetention() throws {
+    // The regen workflow holds R2-read secrets and materializes the hidden
+    // goldens on disk while running the dispatched ref's transform/CLI code.
+    // Submission refs carry participant-controlled Sources, so dispatching
+    // there would expose the hidden prompts to untrusted code; the workflow
+    // must fail closed on submissions/* and verify the trusted dispatch
+    // context like the ranked jobs do. The regenerated goldens leave the job
+    // only as a short-lived artifact (public repo; operator uploads to R2 and
+    // deletes the run).
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/gemma-freshvm.yml", encoding: .utf8)
+    #expect(workflow.contains("Enforce trusted dispatch context"))
+    #expect(workflow.contains("refs/heads/submissions/*)"))
+    #expect(workflow.contains(".github/scripts/enforce-trusted-benchmark-workflow.sh"))
+    #expect(workflow.contains("MLXFAST_TRUSTED_BENCHMARK_WORKFLOW: .github/workflows/gemma-freshvm.yml"))
+    #expect(workflow.contains("retention-days: 1"))
+    #expect(workflow.contains("permissions:\n  contents: read"))
+}
+
+@Test
 func decodeMeasurementRunsSingleUnmemoizableSeedForward() throws {
     // The decode measurement must run exactly ONE whole-prompt (seed) forward in
     // the timed window. A second identical forward (the warmup this used to run
