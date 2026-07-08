@@ -172,14 +172,16 @@ public enum Gemma4Model {
             hidden: hidden,
             weights: blockWeights,
             rmsNormEps: config.rmsNormEps,
-            attention: { normalized in
+            attention: { normalized, postNormWeight, postNormEps in
                 try Gemma4Attention.forward(
                     normalized,
                     weights: attentionWeights,
                     spec: attentionSpec,
                     mask: mask,
                     cache: cache,
-                    positionOffset: positionOffset
+                    positionOffset: positionOffset,
+                    postNormWeight: postNormWeight,
+                    postNormEps: postNormEps
                 )
             },
             feedForward: { normalized in

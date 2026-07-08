@@ -79,6 +79,46 @@ public final class Gemma4KVCache {
         return Gemma4CachedArray(value: combined, offset: combinedStart)
     }
 
+    /// Fast path for single-token decode steps. Skips shape validation and
+    /// buffer-growth checks since the buffer is already allocated and has
+    /// capacity from the prefill phase. Must only be called during decode
+    /// (sequenceLength == 1) after the buffer has been established by a prior
+    /// `updateAndFetch` call.
+    public func updateAndFetchDecode(_ newValue: MLXArray) -> Gemma4CachedArray {
+        let incoming = newValue.shape[2]
+        let combinedStart = startPosition
+
+        if let buf = buffer,
+            buf.dtype == newValue.dtype,
+            buf.shape[0] == newValue.shape[0],
+            buf.shape[1] == newValue.shape[1],
+            buf.shape[3] == newValue.shape[3],
+            writeEnd + incoming <= buf.shape[2]
+        {
+            let end = writeEnd + incoming
+            buf[0..., 0..., writeEnd..<end, 0...] = newValue
+            writeEnd = end
+            offset += incoming
+
+            let combinedLength = bufferStart + writeEnd - combinedStart
+            let combined = buf[
+                0...,
+                0...,
+                (combinedStart - bufferStart)..<writeEnd,
+                0...
+            ]
+            if combinedLength > maxSize {
+                startPosition = combinedStart + (combinedLength - maxSize)
+            }
+            return Gemma4CachedArray(value: combined, offset: combinedStart)
+        }
+
+        // Fall back to the general path if the buffer needs to grow.
+        // Use try! since this path is only reachable when the buffer exists
+        // and the only failure mode is a programming error.
+        return try! updateAndFetch(newValue)
+    }
+
     func arraysForMaterialization() -> [MLXArray] {
         retainedView().map { [$0] } ?? []
     }
@@ -99,7 +139,12 @@ public final class Gemma4KVCache {
 
         let combined = retainedView().map { concatenated([$0, newValue], axis: 2) } ?? newValue
         let needed = combined.shape[2]
-        let capacity = Self.paddedCapacity(for: needed)
+        // Pre-allocate to maxSize when it is a reasonable size (sliding-window
+        // layers: 1024) so the buffer never needs to grow during the scored run.
+        // Full-attention layers (maxSize = 65536) keep the incremental growth.
+        let capacity = maxSize <= 4096
+            ? max(needed, maxSize)
+            : Self.paddedCapacity(for: needed)
         let storage = zeros(
             [combined.shape[0], combined.shape[1], capacity, combined.shape[3]],
             dtype: combined.dtype
