@@ -38,8 +38,11 @@ public enum Gemma4Block {
     ) throws -> MLXArray {
         var residual = hidden
         var h = Gemma4Ops.rmsNorm(hidden, weight: weights.inputLayerNorm, eps: rmsNormEps)
+        // Signal the attention forward to fuse the O-projection with the
+        // post-attention RMSNorm, avoiding materialization of the intermediate
+        // [batch, seq, hiddenSize] result.
+        Gemma4Attention.postNormContext = (weights.postAttentionLayerNorm, rmsNormEps)
         h = try attention(h)
-        h = Gemma4Ops.rmsNorm(h, weight: weights.postAttentionLayerNorm, eps: rmsNormEps)
         var out = residual + h
 
         residual = out

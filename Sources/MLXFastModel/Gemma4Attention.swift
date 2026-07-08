@@ -79,6 +79,12 @@ public struct Gemma4AttentionWeights {
 /// implementations (`self.scaling = 1.0`; QK-norm replaces the usual
 /// `1/sqrt(head_dim)` softmax scaling).
 public enum Gemma4Attention {
+    /// Context for fusing the O-projection with the post-attention RMSNorm.
+    /// Set by `Gemma4Block.forward` before calling the attention closure;
+    /// consumed and cleared by `forward` so the norm is applied immediately
+    /// after the O-projection without materializing the intermediate result.
+    nonisolated(unsafe) public static var postNormContext: (weight: MLXArray, eps: Double)? = nil
+
     public static func forward(
         _ x: MLXArray,
         weights: Gemma4AttentionWeights,
@@ -121,8 +127,15 @@ public enum Gemma4Attention {
 
         var attentionMask = mask
         if let cache {
-            let cachedK = try cache.keys.updateAndFetch(k)
-            let cachedV = try cache.values.updateAndFetch(v)
+            let cachedK: Gemma4CachedArray
+            let cachedV: Gemma4CachedArray
+            if sequenceLength == 1 {
+                cachedK = cache.keys.updateAndFetchDecode(k)
+                cachedV = cache.values.updateAndFetchDecode(v)
+            } else {
+                cachedK = try cache.keys.updateAndFetch(k)
+                cachedV = try cache.values.updateAndFetch(v)
+            }
             k = cachedK.value
             v = cachedV.value
             attentionMask = try Gemma4MaskCache.causal(
@@ -142,7 +155,12 @@ public enum Gemma4Attention {
             mask: attentionMask
         )
         let reshaped = out.transposed(0, 2, 1, 3).reshaped([batchSize, sequenceLength, -1])
-        return Gemma4Ops.linear(reshaped, weights.oProj)
+        let projected = Gemma4Ops.linear(reshaped, weights.oProj)
+        if let ctx = Self.postNormContext {
+            Self.postNormContext = nil
+            return Gemma4Ops.rmsNorm(projected, weight: ctx.weight, eps: ctx.eps)
+        }
+        return projected
     }
 
     private static func validateInput(_ x: MLXArray, spec: Gemma4AttentionSpec) throws {
