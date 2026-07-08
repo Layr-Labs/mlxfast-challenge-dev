@@ -197,7 +197,15 @@ public struct Gemma4WeightLoader {
             vProj: vProj,
             oProj: oProj,
             qNorm: qNorm,
-            kNorm: kNorm
+            kNorm: kNorm,
+            // Chunked rollout of the projection fusion: the ranked decode
+            // acceptance band caps a single submission's gain at 5%, so Q+K
+            // fusion ships on the first 40 sliding-window layers this round
+            // (deterministic layer-index cutoff, prompt-independent). The
+            // remaining 10 sliding layers, the full-attention layers, and V
+            // fusion are staged for follow-up submissions once the paired
+            // baseline advances.
+            fuseQK: layerType == .sliding && layerIndex < 48
         )
     }
 

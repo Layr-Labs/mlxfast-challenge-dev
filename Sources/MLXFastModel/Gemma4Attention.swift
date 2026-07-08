@@ -48,9 +48,25 @@ public struct Gemma4AttentionSpec {
 }
 
 public struct Gemma4AttentionWeights {
-    public let qProj: Gemma4LinearWeight
-    public let kProj: Gemma4LinearWeight
-    public let vProj: Gemma4LinearWeight?
+    /// How the Q/K/V projections are stored and dispatched.
+    ///
+    /// `fusedQK` row-concatenates `q_proj` and `k_proj` into one weight so a
+    /// single quantized matmul replaces two; the output is split back at the
+    /// Q row boundary. Affine-4bit matmul is independent per output row, so
+    /// fused-then-split is bit-identical to separate projections (see
+    /// `Gemma4LinearWeight.concatenatedRows`). V stays a separate projection
+    /// (or shared with K on `attention_k_eq_v` layers).
+    ///
+    /// `separate` keeps the checkpoint's per-projection dispatch. Deliberately
+    /// used on full-attention layers this round: the per-submission decode
+    /// acceptance band caps a single submission's gain, so the fusion is
+    /// chunked (MLP + sliding-layer QK now; full-layer QK/V staged next).
+    enum Projections {
+        case fusedQK(qkProj: Gemma4LinearWeight, qRows: Int, kRows: Int, vProj: Gemma4LinearWeight?)
+        case separate(qProj: Gemma4LinearWeight, kProj: Gemma4LinearWeight, vProj: Gemma4LinearWeight?)
+    }
+
+    let projections: Projections
     public let oProj: Gemma4LinearWeight
     public let qNorm: MLXArray
     public let kNorm: MLXArray
@@ -61,14 +77,52 @@ public struct Gemma4AttentionWeights {
         vProj: Gemma4LinearWeight?,
         oProj: Gemma4LinearWeight,
         qNorm: MLXArray,
-        kNorm: MLXArray
+        kNorm: MLXArray,
+        fuseQK: Bool = true
     ) {
-        self.qProj = qProj
-        self.kProj = kProj
-        self.vProj = vProj
+        if fuseQK {
+            self.projections = .fusedQK(
+                qkProj: Gemma4LinearWeight.concatenatedRows([qProj, kProj]),
+                qRows: qProj.logicalShape[0],
+                kRows: kProj.logicalShape[0],
+                vProj: vProj
+            )
+        } else {
+            self.projections = .separate(qProj: qProj, kProj: kProj, vProj: vProj)
+        }
         self.oProj = oProj
         self.qNorm = qNorm
         self.kNorm = kNorm
+    }
+
+    /// Compatibility accessors reconstructing the original per-projection
+    /// weights (lazy row slices when fused). Not used on the model hot path;
+    /// kept for tests and external callers of the previous stored-property API.
+    public var qProj: Gemma4LinearWeight {
+        switch projections {
+        case let .fusedQK(qkProj, qRows, _, _):
+            return qkProj.rowSlice(0..<qRows)
+        case let .separate(qProj, _, _):
+            return qProj
+        }
+    }
+
+    public var kProj: Gemma4LinearWeight {
+        switch projections {
+        case let .fusedQK(qkProj, qRows, kRows, _):
+            return qkProj.rowSlice(qRows..<(qRows + kRows))
+        case let .separate(_, kProj, _):
+            return kProj
+        }
+    }
+
+    public var vProj: Gemma4LinearWeight? {
+        switch projections {
+        case let .fusedQK(_, _, _, vProj):
+            return vProj
+        case let .separate(_, _, vProj):
+            return vProj
+        }
     }
 }
 
@@ -92,17 +146,36 @@ public enum Gemma4Attention {
         let sequenceLength = x.shape[1]
         let rope = try Gemma4RoPECache.shared(dims: spec.headDim, spec: spec.ropeSpec)
 
-        var q = Gemma4Ops.linear(x, weights.qProj)
-            .reshaped([batchSize, sequenceLength, spec.numAttentionHeads, spec.headDim])
+        // Q and raw K, via one fused matmul + row split when this layer's
+        // projections are fused (bit-identical to separate projections; see
+        // Gemma4AttentionWeights.Projections), or the checkpoint's separate
+        // dispatch otherwise. V follows from its own projection or shares
+        // raw K on `attention_k_eq_v` layers.
+        var q: MLXArray
+        let rawK: MLXArray
+        let separateVProj: Gemma4LinearWeight?
+        switch weights.projections {
+        case let .fusedQK(qkProj, qRows, kRows, vProj):
+            let fused = Gemma4Ops.linear(x, qkProj)
+            q = fused[.ellipsis, 0..<qRows]
+                .reshaped([batchSize, sequenceLength, spec.numAttentionHeads, spec.headDim])
+            rawK = fused[.ellipsis, qRows..<(qRows + kRows)]
+                .reshaped([batchSize, sequenceLength, spec.numKeyValueHeads, spec.headDim])
+            separateVProj = vProj
+        case let .separate(qProj, kProj, vProj):
+            q = Gemma4Ops.linear(x, qProj)
+                .reshaped([batchSize, sequenceLength, spec.numAttentionHeads, spec.headDim])
+            rawK = Gemma4Ops.linear(x, kProj)
+                .reshaped([batchSize, sequenceLength, spec.numKeyValueHeads, spec.headDim])
+            separateVProj = vProj
+        }
         q = Gemma4Ops.rmsNorm(q, weight: weights.qNorm, eps: spec.rmsNormEps)
 
-        let rawK = Gemma4Ops.linear(x, weights.kProj)
-            .reshaped([batchSize, sequenceLength, spec.numKeyValueHeads, spec.headDim])
         let rawV: MLXArray
         if spec.useKEqV {
             rawV = rawK
         } else {
-            guard let vProj = weights.vProj else {
+            guard let vProj = separateVProj else {
                 throw MLXFastError.invalidInput("Gemma 4 attention layer is missing v_proj weights")
             }
             rawV = Gemma4Ops.linear(x, vProj)
