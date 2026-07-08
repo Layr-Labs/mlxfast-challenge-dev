@@ -87,7 +87,9 @@ public final class Gemma4RuntimeWeightCache {
     /// names (`language_model.model.layers...`), whereas `Gemma4TextModel`'s
     /// parameter paths are `model.layers...`. Doing the rename here keeps the
     /// transform output and the harness's DenseTensorStore validation unchanged.
-    private static func loadLibraryModel(
+    // Internal (not private) so the fixture-based adapter tests can exercise
+    // the prefix-strip -> sanitize -> quantize -> update chain directly.
+    static func loadLibraryModel(
         weightsPath: String,
         config: Gemma4Config
     ) throws -> Gemma4TextModel {

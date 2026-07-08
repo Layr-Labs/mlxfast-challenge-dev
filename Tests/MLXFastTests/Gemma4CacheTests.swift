@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXLMCommon
 @testable import MLXFastCore
 @testable import MLXFastModel
 import Testing
@@ -84,32 +85,61 @@ func gemma4ModelCacheMaterializesCollectedCachedStateWhenRuntimeTestsAreEnabled(
         return
     }
 
-    let root = try temporaryDirectory()
-    defer { try? FileManager.default.removeItem(at: root) }
-    try """
-    {
-      "num_hidden_layers": 2,
-      "vocab_size": \(MLXFastConstants.vocabSize),
-      "hidden_size": \(MLXFastConstants.hiddenSize),
-      "intermediate_size": \(MLXFastConstants.intermediateSize),
-      "num_attention_heads": \(MLXFastConstants.attentionHeads),
-      "layer_types": ["sliding_attention", "full_attention"],
-      "sliding_window": 4
-    }
-    """.write(
-        to: root.appendingPathComponent("config.json"),
-        atomically: true,
-        encoding: .utf8
-    )
-
-    let config = try Gemma4Config.load(from: root.path)
+    // Built via the memberwise initializer: Gemma4Config.load enforces the
+    // frozen production architecture (60 layers) and correctly rejects tiny
+    // fixture configs, so fixture tests must not route through it.
+    let config = tinyCacheConfig(layerTypes: [.sliding, .full], slidingWindow: 4)
     let cache = Gemma4ModelCache(config: config)
 
+    // Bespoke per-layer arrays still collect for materialization (kept for
+    // the standalone Gemma4KVCache tests)...
     _ = try cache.layers[0].keys.updateAndFetch(MLXArray((1...4).map { Float($0) }, [1, 1, 2, 2]))
     _ = try cache.layers[0].values.updateAndFetch(MLXArray((1...4).map { Float($0) }, [1, 1, 2, 2]))
-
     #expect(cache.arraysForMaterialization().count == 2)
+
+    // ...but the scored path materializes the library KV caches: a no-op
+    // before any are adopted, and an eval of the adopted caches afterwards.
     cache.materializeCachedState()
+    let libraryCache = KVCacheSimple()
+    _ = libraryCache.update(
+        keys: MLXArray((1...4).map { Float($0) }, [1, 1, 2, 2]),
+        values: MLXArray((1...4).map { Float($0) }, [1, 1, 2, 2])
+    )
+    cache.adoptKVCaches([libraryCache])
+    cache.materializeCachedState()
+    #expect(libraryCache.offset == 2)
+}
+
+private func tinyCacheConfig(
+    layerTypes: [Gemma4LayerType],
+    slidingWindow: Int
+) -> Gemma4Config {
+    Gemma4Config(
+        modelType: "gemma4_text",
+        vocabSize: 128,
+        hiddenSize: 64,
+        intermediateSize: 128,
+        numHiddenLayers: layerTypes.count,
+        numAttentionHeads: 2,
+        numKeyValueHeads: 2,
+        numGlobalKeyValueHeads: 1,
+        headDim: 32,
+        globalHeadDim: 32,
+        rmsNormEps: 1e-6,
+        hiddenActivation: "gelu_pytorch_tanh",
+        maxPositionEmbeddings: 1024,
+        attentionBias: false,
+        attentionDropout: 0,
+        attentionKEqV: true,
+        slidingWindow: slidingWindow,
+        layerTypes: layerTypes,
+        finalLogitSoftcapping: 30,
+        tieWordEmbeddings: true,
+        slidingRope: Gemma4RopeSpec(theta: 10_000, type: "default"),
+        fullRope: Gemma4RopeSpec(theta: 1_000_000, type: "proportional", partialRotaryFactor: 0.25),
+        quantizationGroupSize: 64,
+        quantizationBits: 4
+    )
 }
 
 private func temporaryDirectory() throws -> URL {
