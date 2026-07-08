@@ -154,11 +154,11 @@ jobs:
         run: |
           set -euo pipefail
           started="${SECONDS}"
-          # setup.sh already built the harness + MLX metallib and downloaded the
-          # reference checkpoint at the workspace root (all from the pinned ref).
-          # benchmark.sh reuses them -- its own incremental `swift build` preserves
-          # the metallib setup.sh placed -- and self-transforms into weights/, so
-          # no separate reference checkout or metallib copy is needed here.
+          # setup.sh already built the harness binary + MLX metallib and downloaded
+          # the reference checkpoint at the workspace root (all from the pinned ref).
+          # benchmark.sh reuses them directly -- it skips its own `swift build`
+          # because the binary already exists -- and self-transforms into weights/,
+          # so no separate reference checkout or metallib copy is needed here.
           baseline_score="${GITHUB_WORKSPACE}/paired-baseline-score.json"
           status=0
           (
