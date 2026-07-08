@@ -1,48 +1,56 @@
-name: gemma-private-golden-regen
+name: gemma-vm-noise-probe
 
-# Regenerate the two PRIVATE R2 goldens for the mlx-swift-lm reference, ON tenki
-# (so greedy tokens match the runner). Token-based, structure-preserving: download
-# the existing R2 objects (which embed the hidden prompts/questions), re-run the
-# vanilla model, and replace ONLY the model-derived token fields, keeping every
-# prompt/name/count. Validates on-VM, then uploads BOTH objects as a short-lived
-# artifact for the operator to push to R2 (repo is public -> operator deletes the
-# run after). Logs never print golden token content. Reuses the registered
-# gemma-freshvm.yml dispatch path. Dispatch-only; not CI/scoring.
+# DIAGNOSTIC (dispatch-only, NOT scored). Measures the STRUCTURE of tenki decode
+# timing noise to decide the acceptance-band strategy (median-of-N vs same-VM
+# pairing vs widen). On each of several FRESH VMs it loads the reference once and
+# runs the timed decode window K times back-to-back, so we can separate:
+#   - WITHIN-VM jitter  = spread of the K repeats on one VM (median-of-N fixes this)
+#   - BETWEEN-VM offset = spread of the per-VM medians across VMs (only same-VM
+#     pairing cancels this; median-of-N does NOT)
+#   - WARMING           = run 1 (coldest) vs runs 2..K (warm), for decode AND
+#     prefill -- if decode is warming-immune, same-VM pairing is safe for decode.
+# Timings only; uses the PUBLIC fixtures via --local-iterate, so no private goldens
+# and no R2 secrets. Reuses the registered gemma-freshvm.yml dispatch path.
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      repeats:
+        description: "timed decode repeats per VM"
+        default: "8"
 
 concurrency:
-  group: gemma-private-golden-regen-${{ github.ref }}-${{ github.run_id }}
+  group: gemma-vm-noise-probe-${{ github.ref }}-${{ github.run_id }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  regen:
-    name: "regen private goldens (fresh vm)"
+  probe:
+    name: "vm noise probe (fresh vm ${{ matrix.vm }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        vm: [1, 2, 3, 4, 5, 6]
     runs-on: tenki-macos-latest-xlarge
-    timeout-minutes: 60
-    environment: benchmark-private-prompts
+    timeout-minutes: 90
     env:
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
       MLXFAST_REFERENCE_DIR: /Users/runner/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
-      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}
-      MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json
-      MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json
-      MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
-      OUT_DIR: regen-out
+      REPEATS: ${{ inputs.repeats }}
+      OUT_DIR: probe-out
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          fetch-depth: 0
           persist-credentials: false
 
       - name: Host identity + VM freshness
         run: |
           set -uo pipefail
           boot=$(sysctl -n kern.boottime 2>/dev/null | grep -oE 'sec = [0-9]+' | grep -oE '[0-9]+' | head -1)
-          now=$(date +%s); echo "uptime_s=$(( now - ${boot:-now} )) (small => fresh VM)"
+          now=$(date +%s)
+          echo "vm=${{ matrix.vm }} uptime_s=$(( now - ${boot:-now} )) (small => fresh VM)"
+          sysctl -n machdep.cpu.brand_string 2>/dev/null || true
 
       - name: Restore SwiftPM cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -79,129 +87,36 @@ jobs:
             .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
             --reference "${MLXFAST_REFERENCE_DIR}" --output weights
 
-      - name: Download existing private R2 objects
-        env:
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      - name: Repeated timed decode (within-VM jitter + warming)
         run: |
           set -euo pipefail
-          if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
-            echo "::error::R2 secrets missing" >&2; exit 1
-          fi
-          mkdir -p "${MLXFAST_PRIVATE_DIR}" "${OUT_DIR}"
-          .github/scripts/download-r2-object.sh "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" "${MLXFAST_PRIVATE_DIR}/correctness.json"
-          .github/scripts/download-r2-object.sh "${MLXFAST_GPQA_R2_PATH}" "${MLXFAST_PRIVATE_DIR}/gpqa.json"
-          # Structure summary only (counts, never token content).
-          python3 - <<'PY'
-          import json, os
-          d=os.environ["MLXFAST_PRIVATE_DIR"]
-          g=json.load(open(f"{d}/correctness.json"))
-          c=g["cases"][0]
-          fr=g.get("correctness_gates",{}).get("free_run",[])
-          b=g["benchmark"]
-          print("correctness: base_expected", len(c["expected_tokens"]),
-                "prompt", len(c["prompt_tokens"]),
-                "free_run_gates", [len(x["expected_tokens"]) for x in fr],
-                "oracle_decode", len(b["expected_decode_tokens"]))
-          q=json.load(open(f"{d}/gpqa.json"))
-          print("gpqa: cases", len(q["cases"]))
-          PY
+          mkdir -p "${OUT_DIR}"
+          OUT="${OUT_DIR}/vm-${{ matrix.vm }}.jsonl"
+          : > "${OUT}"
+          n="${REPEATS:-8}"
+          # Each iteration is a FRESH process (reloads the model), then one timed
+          # prefill + 128-step decode via the public fixture. The reported
+          # seconds-per-token are the isolated timed windows (load excluded), so the
+          # K decode values give within-VM decode jitter; run 1 vs 2..K gives the
+          # cross-process warming signal.
+          for i in $(seq 1 "${n}"); do
+            rm -f score.local-iterate.json
+            ./benchmark.sh --local-iterate >/dev/null 2>&1 || true
+            sf=score.local-iterate.json
+            [[ -f "$sf" ]] || sf=score.json
+            d=$(jq -r '.metrics.decode_seconds_per_token // .decode_seconds_per_token // empty' "$sf" 2>/dev/null || echo "")
+            p=$(jq -r '.metrics.prefill_seconds_per_token // .prefill_seconds_per_token // empty' "$sf" 2>/dev/null || echo "")
+            echo "{\"vm\":${{ matrix.vm }},\"i\":${i},\"prefill\":${p:-null},\"decode\":${d:-null}}" | tee -a "${OUT}"
+          done
+          echo "=== vm ${{ matrix.vm }} decode samples (s/token) ==="
+          jq -r '.decode' "${OUT}" | tr '\n' ' '; echo
+          echo "=== vm ${{ matrix.vm }} prefill samples (s/token) ==="
+          jq -r '.prefill' "${OUT}" | tr '\n' ' '; echo
 
-      - name: Regenerate correctness/benchmark golden (in place)
-        run: |
-          set -euo pipefail
-          C="${MLXFAST_PRIVATE_DIR}/correctness.json"
-          base="$(python3 -c "import json;print(json.load(open('${C}'))['cases'][0]['name'])")"
-          cp "${C}" "${MLXFAST_PRIVATE_DIR}/withrun.json"
-          # Greedy continuation E of the base prompt (256 tokens), written into a
-          # named free_run case we then extract. attach-free-run-gate sources the
-          # prompt tokens directly from the base case.
-          .build/release/mlxfast-swift attach-free-run-gate \
-            --golden "${MLXFAST_PRIVATE_DIR}/withrun.json" --weights weights \
-            --case "${base}" --steps 256 --name regen-e \
-            --output "${MLXFAST_PRIVATE_DIR}/withrun.json"
-          OUT="${OUT_DIR}/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"
-          python3 - "${C}" "${MLXFAST_PRIVATE_DIR}/withrun.json" "${OUT}" <<'PY'
-          import json, sys
-          orig = json.load(open(sys.argv[1]))
-          withrun = json.load(open(sys.argv[2]))
-          fr = [c for c in withrun["correctness_gates"]["free_run"] if c["name"] == "regen-e"]
-          assert len(fr) == 1, "regen-e free_run case not found"
-          E = fr[0]["expected_tokens"]
-          assert len(E) >= 256, len(E)
-          base = orig["cases"][0]
-          nc = len(base["expected_tokens"]); base["expected_tokens"] = E[:nc]
-          for g in orig.get("correctness_gates", {}).get("free_run", []):
-              nf = len(g["expected_tokens"]); g["expected_tokens"] = E[:nf]
-          b = orig["benchmark"]
-          nd = len(b["expected_decode_tokens"])
-          b["expected_prefill_token"] = E[0]
-          b["expected_decode_seed_token"] = E[0]
-          # Decode tokens are the greedy continuation AFTER the seed token E[0].
-          # attach-free-run-gate caps at correctnessMaxFreeRunSteps=256, so if the
-          # object held 256 decode tokens we keep E[1:] (255) -- still far above
-          # benchmarkDecodeSteps=128 (the timed window), so this is functionally
-          # identical; only one trailing headroom token is dropped.
-          dec = E[1:1 + nd] if len(E) >= 1 + nd else E[1:]
-          assert len(dec) >= 128, ("decode tokens below timed window", len(dec))
-          b["expected_decode_tokens"] = dec
-          json.dump(orig, open(sys.argv[3], "w"), indent=2, sort_keys=True)
-          print("regenerated correctness: base_expected", nc, "oracle_decode", len(dec), "(was", nd, ") E", len(E))
-          PY
-          # On-VM validation: teacher-forced base case against the regenerated
-          # golden with the vanilla model must pass (self-consistent), which also
-          # strict-loads the benchmark oracle + free_run gates. No token content
-          # printed; only pass/fail + counts.
-          .build/release/mlxfast-swift correctness --weights weights --golden "${OUT}" --base-case-only > "${MLXFAST_PRIVATE_DIR}/verify.json" 2>/dev/null || true
-          python3 - "${MLXFAST_PRIVATE_DIR}/verify.json" <<'PY'
-          import json, sys
-          m = json.load(open(sys.argv[1]))
-          met = m.get("metrics", m)
-          passed = m.get("passed", met.get("passed_correctness"))
-          print("validate base-case: passed", passed, "checked_steps", met.get("checked_steps"))
-          if passed is not True:
-              raise SystemExit(f"regenerated correctness golden failed self-validation: error={met.get('error')}")
-          PY
-          echo "correctness sha256=$(shasum -a 256 "${OUT}" | awk '{print $1}') bytes=$(wc -c < "${OUT}" | tr -d ' ')"
-
-      - name: Regenerate GPQA reference accepted tokens
-        run: |
-          set -euo pipefail
-          Q="${MLXFAST_PRIVATE_DIR}/gpqa.json"
-          ncases="$(python3 -c "import json;print(len(json.load(open('${Q}'))['cases']))")"
-          .build/release/mlxfast-swift generate-gpqa-answers \
-            --gpqa "${Q}" --weights weights --tokenizer "${MLXFAST_REFERENCE_DIR}" \
-            --output "${MLXFAST_PRIVATE_DIR}/gpqa_answers.json" \
-            --case-count "${ncases}" --max-new-tokens 10 >/dev/null 2>&1
-          OUT="${OUT_DIR}/gpqa_reference_cases-gemma.json"
-          python3 - "${Q}" "${MLXFAST_PRIVATE_DIR}/gpqa_answers.json" "${OUT}" <<'PY'
-          import json, sys
-          ref = json.load(open(sys.argv[1]))
-          ans = json.load(open(sys.argv[2]))
-          # first greedy token per case, keyed by id
-          first = {}
-          for c in ans["cases"]:
-              toks = c.get("candidate_tokens") or []
-              if toks:
-                  first[c["id"]] = toks[0]
-          updated = 0
-          for c in ref["cases"]:
-              t = first.get(c["id"])
-              assert t is not None, f"no candidate token for case {c['id']}"
-              c["accepted_token_sequences"] = [[t]]
-              updated += 1
-          json.dump(ref, open(sys.argv[3], "w"), indent=2, sort_keys=True)
-          print("regenerated gpqa: cases", updated)
-          PY
-          echo "gpqa sha256=$(shasum -a 256 "${OUT}" | awk '{print $1}') bytes=$(wc -c < "${OUT}" | tr -d ' ')"
-
-      - name: Upload regenerated private goldens (short-lived; operator uploads to R2 + deletes run)
+      - name: Upload probe results
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: gemma-private-goldens-${{ github.run_id }}
-          path: |
-            regen-out/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json
-            regen-out/gpqa_reference_cases-gemma.json
+          name: gemma-vm-noise-probe-${{ github.run_id }}-vm${{ matrix.vm }}
+          path: probe-out/vm-${{ matrix.vm }}.jsonl
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 3
