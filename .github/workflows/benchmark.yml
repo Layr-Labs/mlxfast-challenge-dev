@@ -195,7 +195,7 @@ jobs:
       # with `mlxfast-swift generate-golden`; regenerating the fixture must
       # move this pin (enforced by BenchmarkScriptTests).
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
-      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 7c33861bdf062b08a96a97bf5b388b541edc95b4cc46afc4f98ce9cb46856782
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: c49e3df384c4088b7a33c7b321fb0b5e416a62d03fb14d5d83109d1f4860a18c
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: "11236"
       # Hidden R2 golden regenerated from the Gemma 4 31B 4-bit reference
       # (Gemma-tokenized 512-token prompt, 256 teacher-forced tokens, free-run

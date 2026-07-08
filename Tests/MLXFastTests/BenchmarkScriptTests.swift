@@ -430,7 +430,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(timingOrGates.contains("MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
-    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 7c33861bdf062b08a96a97bf5b388b541edc95b4cc46afc4f98ce9cb46856782"))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: c49e3df384c4088b7a33c7b321fb0b5e416a62d03fb14d5d83109d1f4860a18c"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"11236\""))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"))
     #expect(timingOrGates.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"))
