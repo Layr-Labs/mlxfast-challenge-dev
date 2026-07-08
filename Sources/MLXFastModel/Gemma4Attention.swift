@@ -121,8 +121,15 @@ public enum Gemma4Attention {
 
         var attentionMask = mask
         if let cache {
-            let cachedK = try cache.keys.updateAndFetch(k)
-            let cachedV = try cache.values.updateAndFetch(v)
+            let cachedK: Gemma4CachedArray
+            let cachedV: Gemma4CachedArray
+            if sequenceLength == 1 {
+                cachedK = cache.keys.updateAndFetchDecode(k)
+                cachedV = cache.values.updateAndFetchDecode(v)
+            } else {
+                cachedK = try cache.keys.updateAndFetch(k)
+                cachedV = try cache.values.updateAndFetch(v)
+            }
             k = cachedK.value
             v = cachedV.value
             attentionMask = try Gemma4MaskCache.causal(
