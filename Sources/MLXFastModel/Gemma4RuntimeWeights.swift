@@ -1,9 +1,5 @@
 import Foundation
 import MLX
-import MLXFastCore
-import MLXLLM
-import MLXLMCommon
-import MLXNN
 
 /// Eagerly-prepared, RAM-resident weight cache for the Gemma 4 text tower.
 ///
@@ -17,14 +13,6 @@ public final class Gemma4RuntimeWeightCache {
     public let loader: Gemma4WeightLoader
     public let config: Gemma4Config
 
-    /// The mlx-swift-lm Gemma 4 text tower this benchmark's reference runs. It is
-    /// loaded once here at construction (outside every scored window), so no
-    /// checkpoint I/O or quantized-linear construction lands on the hot path.
-    /// nil only if the load failed, in which case `loadError` carries the reason
-    /// and the first `Gemma4Model.logits` rethrows it.
-    public let libraryModel: Gemma4TextModel?
-    public let loadError: Error?
-
     private var cachedModelWeights: Gemma4ModelWeights?
     private var cachedBlockWeights: [Int: Gemma4BlockWeights] = [:]
     private var cachedAttentionWeights: [Int: Gemma4AttentionWeights] = [:]
@@ -34,75 +22,7 @@ public final class Gemma4RuntimeWeightCache {
     public init(loader: Gemma4WeightLoader, config: Gemma4Config) {
         self.loader = loader
         self.config = config
-        // Bound the MLX buffer cache so resident memory stays near the ~17 GB
-        // checkpoint plus KV/activation buffers instead of growing without limit
-        // across a long decode run.
-        if config.numHiddenLayers >= 16 {
-            Memory.cacheLimit = 6 << 30
-        }
-        do {
-            libraryModel = try Gemma4RuntimeWeightCache.loadLibraryModel(
-                weightsPath: loader.denseStore.weightsPath,
-                config: config
-            )
-            loadError = nil
-        } catch {
-            libraryModel = nil
-            loadError = error
-        }
-    }
-
-    /// Construct and weight-load the mlx-swift-lm Gemma 4 text tower from the
-    /// transformed `weights/` tree. Mirrors the library's `loadWeights`
-    /// (sanitize -> 4-bit affine quantize -> update -> eval), but reads the
-    /// safetensor shards in memory first so we can strip the checkpoint's
-    /// `language_model.` text-tower prefix: our transform preserves the source
-    /// names (`language_model.model.layers...`), whereas `Gemma4TextModel`'s
-    /// parameter paths are `model.layers...`. Doing the rename here keeps the
-    /// transform output and the harness's DenseTensorStore validation unchanged.
-    private static func loadLibraryModel(
-        weightsPath: String,
-        config: Gemma4Config
-    ) throws -> Gemma4TextModel {
-        let directory = URL(fileURLWithPath: weightsPath)
-        let configData = try Data(contentsOf: directory.appendingPathComponent("config.json"))
-        let textConfig = try JSONDecoder().decode(Gemma4TextConfiguration.self, from: configData)
-        let model = Gemma4TextModel(textConfig)
-
-        let shardPrefix = "language_model."
-        var weights: [String: MLXArray] = [:]
-        let entries = try FileManager.default.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: nil
-        )
-        let shards = entries
-            .filter { $0.pathExtension == "safetensors" }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        guard !shards.isEmpty else {
-            throw MLXFastError.missingFile("no safetensors shards in \(weightsPath)")
-        }
-        for shard in shards {
-            for (key, value) in try loadArrays(url: shard) {
-                let renamed = key.hasPrefix(shardPrefix)
-                    ? String(key.dropFirst(shardPrefix.count))
-                    : key
-                weights[renamed] = value
-            }
-        }
-
-        let sanitized = model.sanitize(weights: weights)
-        let quantization = BaseConfiguration.Quantization(
-            groupSize: config.quantizationGroupSize,
-            bits: config.quantizationBits
-        )
-        quantize(model: model) { path, _ in
-            sanitized["\(path).scales"] != nil ? quantization.asTuple : nil
-        }
-        // The gemma-4-31b-4bit checkpoint already stores scales/biases/norms in
-        // bf16 (only the 4-bit weight codes are U32), so the library's fp16->bf16
-        // conversion pass is a no-op here and is intentionally omitted.
-        try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
-        eval(model)
-        return model
+        eagerlyPrepareForFullModel()
     }
 
     public func attentionSpec(layerIndex: Int) -> Gemma4AttentionSpec {
@@ -150,4 +70,27 @@ public final class Gemma4RuntimeWeightCache {
         return weights
     }
 
+    /// For the full-size checkpoint, populate every memoized weight struct
+    /// and warm the hot Metal kernels during construction. Small fixture
+    /// configs (unit tests, convenience callers) skip this entirely, and
+    /// every step is fail-soft so missing tensors surface on first use
+    /// exactly as before.
+    private func eagerlyPrepareForFullModel() {
+        guard config.numHiddenLayers >= 16 else {
+            return
+        }
+        // The default MLX buffer cache is effectively unbounded; bound it so
+        // resident memory stays close to the ~17 GB checkpoint plus KV cache
+        // and activation buffers instead of growing without limit across a
+        // long decode run.
+        Memory.cacheLimit = 6 << 30
+        _ = try? modelWeights()
+        for layerIndex in 0..<config.numHiddenLayers {
+            _ = try? blockWeights(layerIndex: layerIndex)
+            _ = try? attentionWeights(layerIndex: layerIndex)
+            _ = try? mlpWeights(layerIndex: layerIndex)
+            _ = attentionSpec(layerIndex: layerIndex)
+        }
+        Gemma4Warmup.run(weightCache: self)
+    }
 }

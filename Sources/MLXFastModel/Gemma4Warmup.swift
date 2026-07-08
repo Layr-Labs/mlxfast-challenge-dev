@@ -33,6 +33,12 @@ enum Gemma4Warmup {
                 scales: affineScales, biases: affineBiases,
                 transpose: true, groupSize: 64, bits: 4, mode: .affine
             ))
+            // Pre-JIT the compiled gated-activation kernel at the scored
+            // decode (M=1) and prefill (M=512) shapes: the timed benchmark
+            // runs before the correctness phase, so the first compiled call
+            // must not happen inside a scored window. Zero inputs, output
+            // discarded; prompt-independent like the rest of this warmup.
+            Gemma4MLP.warmCompiledActivation(shape: [1, m, config.intermediateSize])
         }
 
         for layerType in [Gemma4LayerType.sliding, .full] {
