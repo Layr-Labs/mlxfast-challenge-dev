@@ -1,0 +1,492 @@
+name: regenerate-goldens
+
+# Regenerate the two PRIVATE R2 goldens ON the self-hosted M5 ranked box
+# (m5-bench), from THIS ref's build (the mlx-swift-lm rebase reference), so the
+# hidden goldens' greedy tokens match the silicon the ranked pipeline scores on.
+#
+# Token-based, structure-preserving (same recipe as the tenki-era
+# gemma-private-golden-regen workflow): download the existing R2 objects (which
+# embed the hidden prompts/questions), re-run the reference model on this
+# machine, and replace ONLY the model-derived token fields, keeping every
+# prompt/name/count. Validates on-box, then uploads BOTH regenerated objects as
+# a short-lived artifact for the operator to push to R2 manually (this workflow
+# NEVER writes to R2). Logs never print golden token content.
+#
+# Isolation mirrors the single-machine ranked benchmark.yml: every invocation
+# of branch code (build, transform, token generation, validation) goes through
+# the bench-exec ring-2 bridge; R2 secrets and raw hidden bytes stay in
+# runner-only paths; the janitor reset + signed integrity audit runs post-job.
+#
+# Dispatch-only. The branch-scoped push trigger exists ONLY to register the
+# workflow so workflow_dispatch becomes available on this non-default branch
+# (same registration pattern as the m5-bench e2e test workflow); the job-level
+# guard skips the entire job on push, so a registration push never touches the
+# runner, the secrets, or the environment.
+on:
+  push:
+    branches: [m5-golden-regen]
+    paths: [".github/workflows/regenerate-goldens.yml"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regenerate-goldens-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  regen:
+    name: "regenerate private goldens (m5-bench)"
+    # Push events only register the workflow; the job itself is dispatch-only.
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: [self-hosted, m5-bench]
+    # Serial budget: resolve+build (~20m) + transform (~10m) + 256-token
+    # free-run generation + 9 GPQA cases + base-case validation. Generous.
+    timeout-minutes: 240
+    environment: benchmark-private-prompts
+    env:
+      # Host contract (operator-provisioned, janitor-audited); consumed only.
+      MLXFAST_BENCH_EXEC: /opt/bench/bench-exec.sh
+      MLXFAST_JANITOR: /opt/bench/janitor.sh
+      MLXFAST_QUARANTINE_FLAG: /opt/bench/quarantine.flag
+      MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      # Per-run bench workspace (the only place branch code executes/writes).
+      MLXFAST_JOB_WS: /Users/Shared/bench-jobs/goldenregen-${{ github.run_id }}-${{ github.run_attempt }}
+      # Runner-only private material (0700 runner; bench can never read it).
+      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-goldenregen-${{ github.run_id }}-${{ github.run_attempt }}
+      # Runner-only staging dir for the regenerated objects (artifact source).
+      MLXFAST_REGEN_OUT_DIR: /tmp/mlxfast-regen-out-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json
+      MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json
+      # Pins of the CURRENT hidden base golden (the M4-generated object being
+      # replaced): the prompts we regenerate from must come from exactly this
+      # object, so fail closed on any R2 drift.
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 5c5bb073eaae10f4f2871c3b40f91d3dc7784bd3e6dc8ae0845e158493b6adaf
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "38124"
+      MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
+      # The guard pins repo + workflow file + dispatch event; the ref is this
+      # maintainer branch (submission refs are refused outright below).
+      MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}
+    steps:
+      # Fails closed before checkout on any non-dispatch event (e.g. the push
+      # that registers this workflow file on the branch).
+      - name: Refuse non-dispatch events
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
+            echo "::error::regenerate-goldens only supports workflow_dispatch (got ${GITHUB_EVENT_NAME})" >&2
+            exit 1
+          fi
+
+      - name: Host preflight
+        run: |
+          set -euo pipefail
+          echo "host=$(hostname) chip=$(sysctl -n machdep.cpu.brand_string) user=$(id -un) uid=$(id -u)"
+          if [[ -e "${MLXFAST_QUARANTINE_FLAG}" ]]; then
+            echo "::error::box is quarantined (${MLXFAST_QUARANTINE_FLAG}); janitor detected drift -- see RUNBOOK" >&2
+            exit 1
+          fi
+          test -e "${MLXFAST_BENCH_EXEC}" || { echo "::error::bench-exec bridge missing" >&2; exit 1; }
+          test -e "${MLXFAST_JANITOR}" || { echo "::error::janitor missing" >&2; exit 1; }
+          test -f "${MLXFAST_REFERENCE_DIR}/config.json" || { echo "::error::reference checkpoint cache missing" >&2; exit 1; }
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # This job holds R2-read secrets, materializes the hidden goldens on
+      # local disk, and runs the dispatched ref's CLI code against them before
+      # uploading the regenerated objects as a (public-repo) artifact. On a
+      # submissions/* ref the editable Sources are participant-controlled, so
+      # a dispatch there would hand the hidden prompts to untrusted code with
+      # a public exfiltration channel. Maintainer branches stay allowed (regen
+      # legitimately runs from migration branches); submission refs never are.
+      - name: Enforce trusted dispatch context
+        env:
+          MLXFAST_TRUSTED_BENCHMARK_WORKFLOW: .github/workflows/regenerate-goldens.yml
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/heads/submissions/*)
+              echo "::error::private-golden regen must never run on a submission ref (${GITHUB_REF})" >&2
+              exit 1
+              ;;
+          esac
+          .github/scripts/enforce-trusted-benchmark-workflow.sh
+
+      - name: Check private material present
+        run: |
+          set -euo pipefail
+          if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
+            echo "::error::golden regeneration requires the private R2 secrets" >&2
+            exit 1
+          fi
+
+      # Full content hash of every checkpoint file against the pinned
+      # manifest, so a corrupted or swapped cache can never feed the transform
+      # (same step as the ranked benchmark.yml).
+      - name: Verify reference checkpoint against pinned manifest
+        run: |
+          set -euo pipefail
+          test -s "${MLXFAST_REFERENCE_MANIFEST_PATH}"
+          failures=0
+          checked=0
+          while read -r want_hash want_bytes rel_path; do
+            [[ -z "${want_hash}" || "${want_hash}" == \#* ]] && continue
+            path="${MLXFAST_REFERENCE_DIR}/${rel_path}"
+            if [[ ! -f "${path}" ]]; then
+              echo "::error::reference file missing: ${rel_path}" >&2
+              failures=$((failures + 1))
+              continue
+            fi
+            actual_bytes="$(wc -c < "${path}" | tr -d ' ')"
+            actual_hash="$(shasum -a 256 "${path}" | awk '{print $1}')"
+            if [[ "${actual_bytes}" != "${want_bytes}" || "${actual_hash}" != "${want_hash}" ]]; then
+              echo "::error::reference file mismatch: ${rel_path}" >&2
+              failures=$((failures + 1))
+            fi
+            checked=$((checked + 1))
+          done < "${MLXFAST_REFERENCE_MANIFEST_PATH}"
+          if [[ "${failures}" -ne 0 || "${checked}" -eq 0 ]]; then
+            echo "::error::reference checkpoint failed manifest verification (checked=${checked} failures=${failures})" >&2
+            exit 1
+          fi
+          echo "regen: reference checkpoint verified against pinned manifest (${checked} files)"
+
+      # Copy the checkout into the bench job root, resolve SwiftPM deps while
+      # trusted-and-networked, then grant the bench uid inheritable ACL access
+      # (same pattern as the ranked benchmark.yml).
+      - name: Prepare bench workspace
+        run: |
+          set -euo pipefail
+          rm -rf "${MLXFAST_JOB_WS}"
+          cp -c -R "${GITHUB_WORKSPACE}" "${MLXFAST_JOB_WS}" 2>/dev/null \
+            || { rm -rf "${MLXFAST_JOB_WS}"; cp -R "${GITHUB_WORKSPACE}" "${MLXFAST_JOB_WS}"; }
+          mkdir -p "${MLXFAST_PRIVATE_DIR}" "${MLXFAST_REGEN_OUT_DIR}"
+          chmod 700 "${MLXFAST_PRIVATE_DIR}" "${MLXFAST_REGEN_OUT_DIR}"
+          (cd "${MLXFAST_JOB_WS}" && swift package resolve)
+          /bin/chmod -R +a "user:bench allow list,search,readattr,readextattr,read,execute,add_file,add_subdirectory,delete_child,write,append,writeattr,writeextattr,file_inherit,directory_inherit" "${MLXFAST_JOB_WS}"
+          echo "regen: bench workspace ready at ${MLXFAST_JOB_WS}"
+
+      - name: Build harness in bench sandbox
+        env:
+          BENCH_JOB_ID: goldenregen-${{ github.run_id }}-${{ github.run_attempt }}-build
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" /bin/bash -c '
+              set -euo pipefail
+              cd "${MJOB_WS}"
+              /usr/bin/swift build -c release
+              tools/build-mlx-metallib.sh
+            '
+          test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-swift"
+          test -s "${MLXFAST_JOB_WS}/.build/release/mlx.metallib"
+
+      - name: Transform reference checkpoint in bench sandbox
+        env:
+          BENCH_JOB_ID: goldenregen-${{ github.run_id }}-${{ github.run_attempt }}-transform
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" MLXFAST_REFERENCE_DIR="${MLXFAST_REFERENCE_DIR}" /bin/bash -c '
+              set -euo pipefail
+              cd "${MJOB_WS}"
+              mkdir -p weights
+              exec .build/release/mlxfast-swift transform \
+                --reference "${MLXFAST_REFERENCE_DIR}" \
+                --output weights
+            '
+          test -f "${MLXFAST_JOB_WS}/weights/config.json"
+
+      # Trusted step: fetch and pin the current hidden objects. Raw bytes live
+      # only under the runner-private dir; bench never sees the R2 secrets.
+      - name: Download and pin-verify current hidden objects
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" \
+            "${MLXFAST_PRIVATE_DIR}/raw_golden.json"
+          raw_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/raw_golden.json" | awk '{print $1}')"
+          raw_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/raw_golden.json" | tr -d ' ')"
+          if [[ "${raw_hash}" != "${MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256}" || "${raw_bytes}" != "${MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES}" ]]; then
+            echo "::error::raw hidden correctness golden pin mismatch (hash=${raw_hash} bytes=${raw_bytes})" >&2
+            exit 1
+          fi
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_GPQA_R2_PATH}" \
+            "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json"
+          echo "regen: raw hidden golden verified ${raw_hash} bytes=${raw_bytes}"
+          # Structure summary only (counts, never token content).
+          python3 - <<'PY'
+          import json, os
+          d = os.environ["MLXFAST_PRIVATE_DIR"]
+          g = json.load(open(f"{d}/raw_golden.json"))
+          c = g["cases"][0]
+          fr = g.get("correctness_gates", {}).get("free_run", [])
+          b = g["benchmark"]
+          print("correctness: base_expected", len(c["expected_tokens"]),
+                "prompt", len(c["prompt_tokens"]),
+                "free_run_gates", [len(x["expected_tokens"]) for x in fr],
+                "oracle_decode", len(b["expected_decode_tokens"]))
+          q = json.load(open(f"{d}/gpqa_reference.json"))
+          print("gpqa: cases", len(q["cases"]))
+          PY
+
+      # Greedy continuation E of the embedded base prompt (256 tokens),
+      # generated by THIS ref's model on THIS machine via attach-free-run-gate
+      # (which sources prompt tokens directly from the base case), then a
+      # trusted-shell splice replaces every model-derived token field. Eager
+      # decode (DARKBLOOM_COMPILED_DECODE=0) matches the ranked run's default.
+      - name: Regenerate correctness/benchmark golden
+        env:
+          BENCH_JOB_ID: goldenregen-${{ github.run_id }}-${{ github.run_attempt }}-freerun
+        run: |
+          set -euo pipefail
+          C="${MLXFAST_PRIVATE_DIR}/raw_golden.json"
+          base_case="$(python3 -c "import json;print(json.load(open('${C}'))['cases'][0]['name'])")"
+          cp "${C}" "${MLXFAST_JOB_WS}/.regen-golden-src.json"
+          chmod 644 "${MLXFAST_JOB_WS}/.regen-golden-src.json"
+          status=0
+          # Worker Seatbelt literal deny for the hidden source golden; only the
+          # harness parent may read it. Kept through sudo via env_keep.
+          export BENCH_GOLDEN_PATH="${MLXFAST_JOB_WS}/.regen-golden-src.json"
+          # shellcheck disable=SC2024  # trusted shell owns the capture files
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+              REGEN_BASE_CASE="${base_case}" \
+              DARKBLOOM_COMPILED_DECODE=0 /bin/bash -c '
+              set -u
+              cd "${MJOB_WS}" || exit 97
+              exec .build/release/mlxfast-swift attach-free-run-gate \
+                --golden .regen-golden-src.json \
+                --weights weights \
+                --case "${REGEN_BASE_CASE}" \
+                --steps 256 \
+                --name regen-e \
+                --output .regen-withrun.json
+            ' > "${MLXFAST_PRIVATE_DIR}/attach-free-run.log" 2>&1 || status=$?
+          test "${status}" -eq 0 || { echo "::error::attach-free-run-gate failed (exit=${status})" >&2; exit 1; }
+          cp "${MLXFAST_JOB_WS}/.regen-withrun.json" "${MLXFAST_PRIVATE_DIR}/withrun.json"
+          rm -f "${MLXFAST_JOB_WS}/.regen-golden-src.json" "${MLXFAST_JOB_WS}/.regen-withrun.json"
+          OUT="${MLXFAST_REGEN_OUT_DIR}/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"
+          python3 - "${C}" "${MLXFAST_PRIVATE_DIR}/withrun.json" "${OUT}" <<'PY'
+          import json, sys
+          orig = json.load(open(sys.argv[1]))
+          withrun = json.load(open(sys.argv[2]))
+          base = orig["cases"][0]
+          fr = [c for c in withrun["correctness_gates"]["free_run"] if c["name"] == "regen-e"]
+          assert len(fr) == 1, "regen-e free_run case not found"
+          assert fr[0]["prompt_tokens"] == base["prompt_tokens"], "regen-e prompt differs from base"
+          E = fr[0]["expected_tokens"]
+          assert len(E) >= 256, len(E)
+          nc = len(base["expected_tokens"])
+          assert nc == 256, nc
+          base["expected_tokens"] = E[:nc]
+          for g in orig.get("correctness_gates", {}).get("free_run", []):
+              assert g["prompt_tokens"] == base["prompt_tokens"], "free_run prompt differs from base"
+              nf = len(g["expected_tokens"])
+              g["expected_tokens"] = E[:nf]
+          b = orig["benchmark"]
+          assert b["prefill_prompt_tokens"] == base["prompt_tokens"], "oracle prefill prompt differs from base"
+          assert b["decode_seed_tokens"] == base["prompt_tokens"], "oracle decode seed differs from base"
+          nd = len(b["expected_decode_tokens"])
+          b["expected_prefill_token"] = E[0]
+          b["expected_decode_seed_token"] = E[0]
+          # Decode tokens are the greedy continuation AFTER the seed token E[0].
+          # attach-free-run-gate caps at correctnessMaxFreeRunSteps=256, so if
+          # the object held 256 decode tokens we keep E[1:] (255) -- still far
+          # above benchmarkDecodeSteps=128 (the timed window), so functionally
+          # identical; only one trailing headroom token would be dropped.
+          dec = E[1:1 + nd] if len(E) >= 1 + nd else E[1:]
+          assert len(dec) >= 128, ("decode tokens below timed window", len(dec))
+          b["expected_decode_tokens"] = dec
+          json.dump(orig, open(sys.argv[3], "w"), indent=2, sort_keys=True)
+          print("regenerated correctness: base_expected", nc,
+                "oracle_decode", len(dec), "(was", nd, ") E", len(E))
+          PY
+          # On-box validation: the teacher-forced base case against the
+          # regenerated golden with THIS build must pass (self-consistent);
+          # this also strict-loads the oracle + free_run gates. Report stays
+          # private (failure fields could carry token values); only pass/fail
+          # and counts are printed.
+          cp "${OUT}" "${MLXFAST_JOB_WS}/.regen-validate.json"
+          chmod 644 "${MLXFAST_JOB_WS}/.regen-validate.json"
+          export BENCH_GOLDEN_PATH="${MLXFAST_JOB_WS}/.regen-validate.json"
+          vstatus=0
+          # shellcheck disable=SC2024  # trusted shell owns the capture files
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" DARKBLOOM_COMPILED_DECODE=0 /bin/bash -c '
+              set -u
+              cd "${MJOB_WS}" || exit 97
+              exec .build/release/mlxfast-swift correctness \
+                --weights weights \
+                --golden .regen-validate.json \
+                --base-case-only
+            ' > "${MLXFAST_PRIVATE_DIR}/verify.json" \
+              2> "${MLXFAST_PRIVATE_DIR}/verify-private.log" || vstatus=$?
+          rm -f "${MLXFAST_JOB_WS}/.regen-validate.json"
+          echo "validate base-case: correctness exit=${vstatus}"
+          python3 - "${MLXFAST_PRIVATE_DIR}/verify.json" <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          met = m.get("metrics", m)
+          passed = m.get("passed", met.get("passed_correctness"))
+          print("validate base-case: passed", passed, "checked_steps", met.get("checked_steps"))
+          if passed is not True:
+              raise SystemExit("regenerated correctness golden failed self-validation")
+          PY
+          echo "correctness sha256=$(shasum -a 256 "${OUT}" | awk '{print $1}') bytes=$(wc -c < "${OUT}" | tr -d ' ')"
+
+      # First greedy answer token per GPQA case from THIS ref's model
+      # (max_new_tokens=10, Gemma tokenizer), preserving the one-token-sequence
+      # accepted_token_sequences shape.
+      - name: Regenerate GPQA reference accepted tokens
+        env:
+          BENCH_JOB_ID: goldenregen-${{ github.run_id }}-${{ github.run_attempt }}-gpqa
+        run: |
+          set -euo pipefail
+          Q="${MLXFAST_PRIVATE_DIR}/gpqa_reference.json"
+          ncases="$(python3 -c "import json;print(len(json.load(open('${Q}'))['cases']))")"
+          cp "${Q}" "${MLXFAST_JOB_WS}/.regen-gpqa-src.json"
+          chmod 644 "${MLXFAST_JOB_WS}/.regen-gpqa-src.json"
+          status=0
+          export BENCH_GOLDEN_PATH="${MLXFAST_JOB_WS}/.regen-gpqa-src.json"
+          # shellcheck disable=SC2024  # trusted shell owns the capture files
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+              MLXFAST_REFERENCE_DIR="${MLXFAST_REFERENCE_DIR}" \
+              REGEN_GPQA_CASES="${ncases}" \
+              DARKBLOOM_COMPILED_DECODE=0 /bin/bash -c '
+              set -u
+              cd "${MJOB_WS}" || exit 97
+              exec .build/release/mlxfast-swift generate-gpqa-answers \
+                --gpqa .regen-gpqa-src.json \
+                --weights weights \
+                --tokenizer "${MLXFAST_REFERENCE_DIR}" \
+                --output .regen-gpqa-answers.json \
+                --case-count "${REGEN_GPQA_CASES}" \
+                --max-new-tokens 10
+            ' > "${MLXFAST_PRIVATE_DIR}/gpqa-gen.log" 2>&1 || status=$?
+          test "${status}" -eq 0 || { echo "::error::generate-gpqa-answers failed (exit=${status})" >&2; exit 1; }
+          cp "${MLXFAST_JOB_WS}/.regen-gpqa-answers.json" "${MLXFAST_PRIVATE_DIR}/gpqa_answers.json"
+          rm -f "${MLXFAST_JOB_WS}/.regen-gpqa-src.json" "${MLXFAST_JOB_WS}/.regen-gpqa-answers.json"
+          OUT="${MLXFAST_REGEN_OUT_DIR}/gpqa_reference_cases-gemma.json"
+          python3 - "${Q}" "${MLXFAST_PRIVATE_DIR}/gpqa_answers.json" "${OUT}" <<'PY'
+          import json, sys
+          ref = json.load(open(sys.argv[1]))
+          ans = json.load(open(sys.argv[2]))
+          first = {}
+          for c in ans["cases"]:
+              toks = c.get("candidate_tokens") or []
+              if toks:
+                  first[c["id"]] = toks[0]
+          updated = 0
+          for c in ref["cases"]:
+              t = first.get(c["id"])
+              assert t is not None, f"no candidate token for case {c['id']}"
+              c["accepted_token_sequences"] = [[t]]
+              updated += 1
+          json.dump(ref, open(sys.argv[3], "w"), indent=2, sort_keys=True)
+          print("regenerated gpqa: cases", updated)
+          PY
+          echo "gpqa sha256=$(shasum -a 256 "${OUT}" | awk '{print $1}') bytes=$(wc -c < "${OUT}" | tr -d ' ')"
+
+      # Key-by-key structural parity against the originals: same recursive key
+      # shape, same prompt/expected lengths, 9 GPQA cases with one-token
+      # accepted sequences. Counts only, never token content.
+      - name: Assert schema parity with originals
+        run: |
+          set -euo pipefail
+          python3 - "${MLXFAST_PRIVATE_DIR}" "${MLXFAST_REGEN_OUT_DIR}" <<'PY'
+          import json, sys
+          priv, out = sys.argv[1], sys.argv[2]
+
+          def keyshape(o):
+              if isinstance(o, dict):
+                  return {k: keyshape(v) for k, v in sorted(o.items())}
+              if isinstance(o, list):
+                  return [keyshape(o[0])] if o else []
+              return type(o).__name__
+
+          orig = json.load(open(f"{priv}/raw_golden.json"))
+          new = json.load(open(f"{out}/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"))
+          assert sorted(orig.keys()) == sorted(new.keys()), (sorted(orig.keys()), sorted(new.keys()))
+          assert keyshape(orig) == keyshape(new), "correctness golden key shape drifted"
+          ob, nb = orig["cases"][0], new["cases"][0]
+          assert nb["name"] == ob["name"]
+          assert nb["prompt_tokens"] == ob["prompt_tokens"], "base prompt changed"
+          assert len(nb["prompt_tokens"]) == 512
+          assert len(nb["expected_tokens"]) == 256
+          ofr = orig.get("correctness_gates", {}).get("free_run", [])
+          nfr = new.get("correctness_gates", {}).get("free_run", [])
+          assert [c["name"] for c in ofr] == [c["name"] for c in nfr]
+          assert [len(c["expected_tokens"]) for c in ofr] == [len(c["expected_tokens"]) for c in nfr]
+          for oc, nc in zip(ofr, nfr):
+              assert oc["prompt_tokens"] == nc["prompt_tokens"]
+          odec = len(orig["benchmark"]["expected_decode_tokens"])
+          ndec = len(new["benchmark"]["expected_decode_tokens"])
+          assert ndec >= 128, ndec
+          print("correctness parity: keys OK, prompt 512, expected 256,",
+                "free_run", [len(c["expected_tokens"]) for c in nfr],
+                "oracle_decode", ndec, "(orig", odec, ")")
+
+          oq = json.load(open(f"{priv}/gpqa_reference.json"))
+          nq = json.load(open(f"{out}/gpqa_reference_cases-gemma.json"))
+          assert sorted(oq.keys()) == sorted(nq.keys())
+          assert keyshape(oq) == keyshape(nq), "gpqa key shape drifted"
+          assert len(nq["cases"]) == len(oq["cases"]) == 9, (len(oq["cases"]), len(nq["cases"]))
+          for oc, nc in zip(oq["cases"], nq["cases"]):
+              assert oc["id"] == nc["id"]
+              seqs = nc["accepted_token_sequences"]
+              assert len(seqs) == 1 and len(seqs[0]) == 1, "accepted sequence shape drifted"
+          print("gpqa parity: keys OK, 9 cases, one-token accepted sequences")
+          PY
+          for f in "${MLXFAST_REGEN_OUT_DIR}"/*.json; do
+            echo "artifact: $(basename "${f}") sha256=$(shasum -a 256 "${f}" | awk '{print $1}') bytes=$(wc -c < "${f}" | tr -d ' ')"
+          done
+
+      # Short-lived artifact for the OPERATOR to download and manually upload
+      # to R2 (nothing in this workflow writes to R2). Operator deletes the
+      # run after pulling the artifact; retention is 1 day regardless.
+      - name: Upload regenerated goldens artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: regenerated-hidden-goldens
+          path: |
+            ${{ env.MLXFAST_REGEN_OUT_DIR }}/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json
+            ${{ env.MLXFAST_REGEN_OUT_DIR }}/gpqa_reference_cases-gemma.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Cleanup bench workspace
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -d "${MLXFAST_JOB_WS}" ]]; then
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /bin/sh -c 'rm -rf ./* ./.??* 2>/dev/null; true' || true
+            rm -rf "${MLXFAST_JOB_WS}" || true
+            if [[ -d "${MLXFAST_JOB_WS}" ]]; then
+              echo "::warning::bench workspace residue left at ${MLXFAST_JOB_WS}"
+            fi
+          fi
+          rm -rf "${MLXFAST_PRIVATE_DIR}" "${MLXFAST_REGEN_OUT_DIR}" || true
+
+      - name: Janitor reset and integrity audit
+        if: always()
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_JANITOR}"
+          if [[ -e "${MLXFAST_QUARANTINE_FLAG}" ]]; then
+            echo "::error::janitor quarantined the box after this run" >&2
+            exit 1
+          fi
+          echo "regen: janitor reset + integrity audit clean"
