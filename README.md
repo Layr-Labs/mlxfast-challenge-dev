@@ -250,8 +250,8 @@ Use these two benchmark modes for local development:
 | `./benchmark.sh --local-iterate` | Fast edit-loop signal, usually under 2 minutes after setup. | Public 512-token prompt, standalone prefill next-token check, decode seed-prefill check, and 16 teacher-forced decode checks. | `score.local-iterate.json` with the estimated local `score`. |
 | `./benchmark.sh --local-submit` | Yukon pre-submit gate, intended to be about 10 minutes after setup. | Same public prompt, standalone prefill next-token check, decode seed-prefill check, and 1023 teacher-forced decode checks from a longer public fixture. | `score.json` with the estimated local `score`. |
 
-On a fresh checkout that never completed setup (no Swift release binary and no
-`mlx.metallib`), `benchmark.sh` exits immediately with guidance to run
+When setup never produced a usable `mlx.metallib` (fresh checkout, or a
+partial/failed setup), `benchmark.sh` exits immediately with guidance to run
 `mlxfast setup` -- the Yukon CLI subcommand that runs this repository's
 `setupCommand` from `benchmark.json`, which is `./setup.sh` -- or to run
 `./setup.sh` directly; both are equivalent. Wrapper CLIs that drive
