@@ -36,9 +36,12 @@ public final class Gemma4RuntimeWeightCache {
         self.config = config
         // Bound the MLX buffer cache so resident memory stays near the ~17 GB
         // checkpoint plus KV/activation buffers instead of growing without limit
-        // across a long decode run.
+        // across a long decode run. The cap is sized with extra headroom so the
+        // allocator recycles more decode-step scratch buffers before trimming,
+        // reducing reallocation churn on the hot path; still far below the box's
+        // unified-memory budget.
         if config.numHiddenLayers >= 16 {
-            Memory.cacheLimit = 6 << 30
+            Memory.cacheLimit = 8 << 30
         }
         do {
             libraryModel = try Gemma4RuntimeWeightCache.loadLibraryModel(
