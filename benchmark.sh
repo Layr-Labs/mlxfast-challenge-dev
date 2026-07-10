@@ -695,16 +695,6 @@ EOF
   export MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE="${profile}"
 }
 
-run_offline_command() {
-  local status
-  if [[ "${MLXFAST_IN_SANDBOX:-0}" == "1" || "${MLXFAST_NO_SANDBOX:-0}" == "1" ]]; then
-    "$@"
-    status="$?"
-    return "${status}"
-  fi
-  .github/scripts/run-offline.sh "$@"
-}
-
 run_offline_writable_command() {
   local writable_paths="$1"
   local status

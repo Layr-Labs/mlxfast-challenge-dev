@@ -198,6 +198,14 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(ci.contains(".build/checkouts"))
     #expect(ci.contains(".build/repositories"))
     #expect(ci.contains(".build/artifacts"))
+    #expect(ci.contains("git ls-files -z '*.sh'"))
+    #expect(ci.contains("'#!/usr/bin/env bash'"))
+    #expect(ci.contains("'#!/usr/bin/env sh'"))
+    #expect(ci.contains("\n                bash -n \"${script}\"\n"))
+    #expect(ci.contains("\n                sh -n \"${script}\"\n"))
+    #expect(ci.contains("swift test -c release"))
+    #expect(ci.contains("test -x .build/release/mlxfast-swift"))
+    #expect(!ci.contains("swift test --filter"))
 }
 
 @Test
@@ -214,11 +222,6 @@ func benchmarkWorkflowProbesAndEnforcesRuntimeWorkerSandbox() throws {
         contentsOfFile: ".github/scripts/probe-runtime-worker-sandbox.sh",
         encoding: .utf8
     )
-    let ci = try String(
-        contentsOfFile: ".github/workflows/ci.yml",
-        encoding: .utf8
-    )
-
     // The probe proves this host's sandbox-exec semantics before any build,
     // transform, or hidden material reaches the bench workspace.
     let probeRange = try #require(workflow.range(of: "- name: Probe runtime worker sandbox"))
@@ -247,17 +250,12 @@ func benchmarkWorkflowProbesAndEnforcesRuntimeWorkerSandbox() throws {
     #expect(probe.contains("expect_unix_network_denied(argv[5])"))
     #expect(probe.contains("expect_fork_denied()"))
     #expect(probe.contains("expect_spawn_denied()"))
-    #expect(ci.contains("bash -n .github/scripts/probe-runtime-worker-sandbox.sh"))
 }
 
 @Test
 func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/reference-cache-probe.yml",
-        encoding: .utf8
-    )
-    let ci = try String(
-        contentsOfFile: ".github/workflows/ci.yml",
         encoding: .utf8
     )
     #expect(workflow.contains("name: reference-cache-probe"))
@@ -269,10 +267,6 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
     #expect(workflow.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
     #expect(workflow.contains(".github/scripts/download-reference-cache-scope.sh \"${CACHE_SCOPE}\""))
     #expect(workflow.contains("MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: \"0\""))
-    #expect(ci.contains("bash -n .github/scripts/download-reference-cache-scope.sh"))
-    #expect(ci.contains("bash -n .github/scripts/download-r2-object.sh"))
-    #expect(ci.contains("bash -n .github/scripts/upload-r2-object.sh"))
-    #expect(ci.contains("bash -n .github/scripts/stage-benchmark-artifacts.sh"))
 }
 
 @Test
@@ -554,10 +548,6 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
         contentsOfFile: ".github/scripts/stage-benchmark-artifacts.sh",
         encoding: .utf8
     )
-    let ci = try String(
-        contentsOfFile: ".github/workflows/ci.yml",
-        encoding: .utf8
-    )
     let semanticGate = try String(
         contentsOfFile: ".github/scripts/run-semantic-gpqa-gate.sh",
         encoding: .utf8
@@ -694,9 +684,6 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(scoreArtifactCheck.lowerBound < checkedStepsEnvCheck.lowerBound)
     #expect(stageArtifacts.contains("/tmp/mlxfast-artifacts-*"))
     #expect(stageArtifacts.contains(".github/scripts/deny-private-artifacts.sh \"${dest}\""))
-    #expect(!ci.contains("bash -n .github/scripts/patch-gpqa-ttft-metrics.sh"))
-    #expect(ci.contains("bash -n .github/scripts/run-semantic-gpqa-gate.sh"))
-    #expect(ci.contains("bash -n .github/scripts/run-submission-static-review.sh"))
     #expect(semanticGate.contains("ANTHROPIC_API_KEY is required"))
     #expect(semanticGate.contains("unset ANTHROPIC_API_KEY"))
     #expect(semanticGate.contains("env -u ANTHROPIC_API_KEY curl"))
@@ -1660,10 +1647,6 @@ func combineParallelCorrectnessScriptEnforcesWeightsHashAndCoverage() throws {
     )
     #expect(hashScript.contains("shasum -a 256"))
     #expect(hashScript.contains("LC_ALL=C sort -z"))
-
-    let ci = try String(contentsOfFile: ".github/workflows/ci.yml", encoding: .utf8)
-    #expect(ci.contains("bash -n .github/scripts/hash-weights-directory.sh"))
-    #expect(ci.contains("bash -n .github/scripts/combine-parallel-correctness.sh"))
 }
 
 // Regression test for a review finding: shasum's own printed output line embeds
@@ -2147,14 +2130,14 @@ func benchmarkScriptForwardsLocalSubmitFlagToSwiftBenchmark() throws {
     process.executableURL = URL(fileURLWithPath: "/bin/bash")
     process.arguments = ["benchmark.sh", "--local-submit"]
     process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    process.environment = ProcessInfo.processInfo.environment.merging([
+    process.environment = benchmarkTestEnvironment([
         "MLXFAST_NO_SANDBOX": "1",
         "MLXFAST_SKIP_TRANSFORM": "1",
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
         "MLXFAST_WEIGHTS_PATH": weights.path,
         "MLXFAST_SCORE_PATH": score.path,
         "MLXFAST_INTEGRITY_PATH": integrity.path,
-    ]) { _, new in new }
+    ])
 
     try process.run()
     process.waitUntilExit()
@@ -2211,14 +2194,14 @@ func benchmarkScriptForwardsLocalIterateDefaultsToSwiftBenchmark() throws {
     process.executableURL = URL(fileURLWithPath: "/bin/bash")
     process.arguments = ["benchmark.sh", "--local-iterate"]
     process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    process.environment = ProcessInfo.processInfo.environment.merging([
+    process.environment = benchmarkTestEnvironment([
         "MLXFAST_NO_SANDBOX": "1",
         "MLXFAST_SKIP_TRANSFORM": "1",
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
         "MLXFAST_WEIGHTS_PATH": weights.path,
         "MLXFAST_SCORE_PATH": score.path,
         "MLXFAST_INTEGRITY_PATH": integrity.path,
-    ]) { _, new in new }
+    ])
 
     try process.run()
     process.waitUntilExit()
@@ -2320,14 +2303,14 @@ func benchmarkScriptPrintsLocalSummaryWithBaselineComparison() throws {
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = ["benchmark.sh", "--local-iterate"]
         process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        process.environment = ProcessInfo.processInfo.environment.merging([
+        process.environment = benchmarkTestEnvironment([
             "MLXFAST_NO_SANDBOX": "1",
             "MLXFAST_SKIP_TRANSFORM": "1",
             "MLXFAST_SWIFT_BIN": fakeSwift.path,
             "MLXFAST_WEIGHTS_PATH": weights.path,
             "MLXFAST_SCORE_PATH": score.path,
             "MLXFAST_INTEGRITY_PATH": integrity.path,
-        ]) { _, new in new }
+        ])
         let stderrPipe = Pipe()
         process.standardError = stderrPipe
         try process.run()
@@ -2453,14 +2436,14 @@ func benchmarkScriptLocalSummarySkipsQuietlyWithoutTimingMetrics() throws {
     process.executableURL = URL(fileURLWithPath: "/bin/bash")
     process.arguments = ["benchmark.sh", "--local-iterate"]
     process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    process.environment = ProcessInfo.processInfo.environment.merging([
+    process.environment = benchmarkTestEnvironment([
         "MLXFAST_NO_SANDBOX": "1",
         "MLXFAST_SKIP_TRANSFORM": "1",
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
         "MLXFAST_WEIGHTS_PATH": weights.path,
         "MLXFAST_SCORE_PATH": score.path,
         "MLXFAST_INTEGRITY_PATH": integrity.path,
-    ]) { _, new in new }
+    ])
     let stderrPipe = Pipe()
     process.standardError = stderrPipe
     try process.run()
@@ -2492,10 +2475,10 @@ func benchmarkScriptRejectsPathFlagsBeforeForwardingToSwiftBenchmark() throws {
     process.executableURL = URL(fileURLWithPath: "/bin/bash")
     process.arguments = ["benchmark.sh", "--local-iterate", "--score-path", "custom.json"]
     process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    process.environment = ProcessInfo.processInfo.environment.merging([
+    process.environment = benchmarkTestEnvironment([
         "MLXFAST_NO_SANDBOX": "1",
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
-    ]) { _, new in new }
+    ])
 
     let stderr = Pipe()
     process.standardError = stderr
@@ -2525,8 +2508,7 @@ func benchmarkScriptFailsFastWithGuidanceWhenGoldenIsMissing() throws {
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [benchmarkScript] + arguments
         process.currentDirectoryURL = root
-        process.environment = ProcessInfo.processInfo.environment
-            .merging(["MLXFAST_NO_SANDBOX": "1"]) { _, new in new }
+        process.environment = benchmarkTestEnvironment(["MLXFAST_NO_SANDBOX": "1"])
             .merging(environment) { _, new in new }
         let stderrPipe = Pipe()
         process.standardError = stderrPipe
@@ -2610,14 +2592,14 @@ func benchmarkScriptBareInvocationDefaultsToLocalIterate() throws {
     process.executableURL = URL(fileURLWithPath: "/bin/bash")
     process.arguments = ["benchmark.sh"]
     process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    process.environment = ProcessInfo.processInfo.environment.merging([
+    process.environment = benchmarkTestEnvironment([
         "MLXFAST_NO_SANDBOX": "1",
         "MLXFAST_SKIP_TRANSFORM": "1",
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
         "MLXFAST_WEIGHTS_PATH": weights.path,
         "MLXFAST_SCORE_PATH": root.appendingPathComponent("score.json").path,
         "MLXFAST_INTEGRITY_PATH": root.appendingPathComponent("integrity.json").path,
-    ]) { _, new in new }
+    ])
     let stdoutPipe = Pipe()
     process.standardOutput = stdoutPipe
     try process.run()
@@ -2678,7 +2660,7 @@ func benchmarkScriptFailsWhenScorePayloadFails() throws {
     process.executableURL = URL(fileURLWithPath: "/bin/bash")
     process.arguments = ["benchmark.sh"]
     process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    process.environment = ProcessInfo.processInfo.environment.merging([
+    process.environment = benchmarkTestEnvironment([
         "MLXFAST_NO_SANDBOX": "1",
         "MLXFAST_SKIP_TRANSFORM": "1",
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
@@ -2686,7 +2668,7 @@ func benchmarkScriptFailsWhenScorePayloadFails() throws {
         "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
         "MLXFAST_SCORE_PATH": score.path,
         "MLXFAST_INTEGRITY_PATH": integrity.path,
-    ]) { _, new in new }
+    ])
 
     try process.run()
     process.waitUntilExit()
@@ -2761,7 +2743,7 @@ func benchmarkScriptSealsScoreFromStdoutDiscardingOnDiskTamper() throws {
     process.executableURL = URL(fileURLWithPath: "/bin/bash")
     process.arguments = ["benchmark.sh"]
     process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    process.environment = ProcessInfo.processInfo.environment.merging([
+    process.environment = benchmarkTestEnvironment([
         "MLXFAST_NO_SANDBOX": "1",
         "MLXFAST_SKIP_TRANSFORM": "1",
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
@@ -2769,7 +2751,7 @@ func benchmarkScriptSealsScoreFromStdoutDiscardingOnDiskTamper() throws {
         "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
         "MLXFAST_SCORE_PATH": score.path,
         "MLXFAST_INTEGRITY_PATH": integrity.path,
-    ]) { _, new in new }
+    ])
 
     try process.run()
     process.waitUntilExit()
@@ -2819,7 +2801,7 @@ func benchmarkScriptRejectsMultipleScoreObjectsOnStdout() throws {
     process.executableURL = URL(fileURLWithPath: "/bin/bash")
     process.arguments = ["benchmark.sh"]
     process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    process.environment = ProcessInfo.processInfo.environment.merging([
+    process.environment = benchmarkTestEnvironment([
         "MLXFAST_NO_SANDBOX": "1",
         "MLXFAST_SKIP_TRANSFORM": "1",
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
@@ -2827,7 +2809,7 @@ func benchmarkScriptRejectsMultipleScoreObjectsOnStdout() throws {
         "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
         "MLXFAST_SCORE_PATH": score.path,
         "MLXFAST_INTEGRITY_PATH": integrity.path,
-    ]) { _, new in new }
+    ])
 
     let stderr = Pipe()
     process.standardError = stderr
@@ -2917,7 +2899,7 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
     // CWD is the temp dir so the broken reference_weights/ symlink is the one
     // benchmark.sh resolves; NO_SANDBOX keeps the transform out of run-offline.sh.
     process.currentDirectoryURL = root
-    process.environment = ProcessInfo.processInfo.environment.merging([
+    process.environment = benchmarkTestEnvironment([
         "MLXFAST_NO_SANDBOX": "1",
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
         "MLXFAST_WEIGHTS_PATH": weights.path,
@@ -2925,7 +2907,7 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
         "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
         "MLXFAST_SCORE_PATH": score.path,
         "MLXFAST_INTEGRITY_PATH": integrity.path,
-    ]) { _, new in new }
+    ])
     // Ensure the resolution path (not an override) is exercised.
     process.environment?.removeValue(forKey: "MLXFAST_REFERENCE_DIR")
     process.environment?.removeValue(forKey: "MLXFAST_SKIP_TRANSFORM")
@@ -3263,4 +3245,15 @@ private func temporaryDirectory() throws -> URL {
     )
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
+}
+
+private func benchmarkTestEnvironment(
+    _ overrides: [String: String] = [:]
+) -> [String: String] {
+    var environment = ProcessInfo.processInfo.environment
+    for key in environment.keys.filter({ $0.hasPrefix("MLXFAST_") }) {
+        environment.removeValue(forKey: key)
+    }
+    environment["MLXFAST_GPU_TEMP_CMD"] = "printf 39"
+    return environment.merging(overrides) { _, new in new }
 }
