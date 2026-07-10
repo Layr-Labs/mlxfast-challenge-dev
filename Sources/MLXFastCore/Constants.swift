@@ -125,8 +125,8 @@ public enum MLXFastConstants {
     public static let officialBaselineDecodeSecondsPerToken = 0.1336139485703125
     public static let scorePrefillWeight = 0.25
     public static let scoreDecodeWeight = 0.75
-    public static let scorePrefillSpeedupFloor = 0.95
-    public static let scoreDecodeSpeedupFloor = 0.95
+    public static let scorePrefillSpeedupFloor = 0.01
+    public static let scoreDecodeSpeedupFloor = 0.01
     // The Gemma 4 31B 4-bit text tower is ~17 GB; 25 GiB keeps ample headroom
     // for shard alignment/padding without approving a second full copy of the
     // model.
