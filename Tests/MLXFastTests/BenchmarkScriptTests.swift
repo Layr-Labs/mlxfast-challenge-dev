@@ -2957,10 +2957,13 @@ func overlayPairedTimingValidatesInputsAppliesFloorsAndClearsPartialResult() thr
     #expect(overlay.contains("and (.metrics.bandwidth_source == \"ram_resident_model\")"))
 
     // Floors and score formula match the frozen ranking contract; a failed
-    // floor produces the harness's own error prefix and a nonzero exit.
+    // floor produces the harness's own error prefix and a nonzero exit. The
+    // merged verdict also folds in the champion acceptance band (a no-op
+    // until the maintainer records a champion; see
+    // overlayGatesAcceptanceBandAgainstRecordedChampionSpeedups).
     #expect(overlay.contains("($ds >= $decode_floor) as $decode_ok"))
     #expect(overlay.contains("($ps >= $prefill_floor) as $prefill_ok"))
-    #expect(overlay.contains("($g.passed and $decode_ok and $prefill_ok) as $merged_passed"))
+    #expect(overlay.contains("($g.passed and $decode_ok and $prefill_ok and $decode_band_ok and $prefill_band_ok) as $merged_passed"))
     #expect(overlay.contains(".score = (pow($ds; 0.75) * pow($ps; 0.25))"))
     #expect(overlay.contains("performance floor failed"))
     #expect(overlay.contains("if [[ \"${merged_passed}\" != \"true\" ]]; then"))

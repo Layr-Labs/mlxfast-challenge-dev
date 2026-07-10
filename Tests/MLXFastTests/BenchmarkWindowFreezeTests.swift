@@ -219,9 +219,7 @@ func officialRankedRunMeasuresPairedBaselineOnTheSameSilicon() throws {
     // resolve the advancing champion reference (falling back to the score
     // baseline when the trusted workflow supplies none) and gate the bands
     // against it, and its override keys are also stripped from the sandboxed
-    // worker. See docs/benchmark-window-freeze.md, "Advancing acceptance band"
-    // (including the operator wiring that is intentionally NOT yet part of the
-    // single-machine measure step).
+    // worker. See docs/benchmark-window-freeze.md, "Advancing acceptance band".
     #expect(benchmark.components(separatedBy: "AcceptanceBandReference.fromEnvironment()").count - 1 == 2)
     #expect(benchmark.contains("reference: championPrefillSecondsPerToken"))
     #expect(benchmark.contains("reference: championDecodeSecondsPerToken"))
@@ -231,6 +229,57 @@ func officialRankedRunMeasuresPairedBaselineOnTheSameSilicon() throws {
     #expect(worker.contains("\"MLXFAST_ACCEPTANCE_BAND_PREFILL_SECONDS_PER_TOKEN\","))
     let freezeDoc = try packageFile("docs/benchmark-window-freeze.md")
     #expect(freezeDoc.contains("Advancing acceptance band"))
+}
+
+@Test
+func overlayGatesAcceptanceBandAgainstRecordedChampionSpeedups() throws {
+    // The ENFORCED champion gate on the single-machine pipeline: measure-job's
+    // env is reset at the bench-exec bridge, so the harness-side champion
+    // variables cannot reach the candidate's in-process bands; the trusted
+    // overlay shell therefore gates the candidate's paired ratio against the
+    // champion's recorded accepted speedups (maintainer-only Actions
+    // variables; both speedups reference the same in-session pinned-baseline
+    // measurement, so common-mode drift cancels). See the freeze doc's
+    // "Advancing acceptance band".
+    let workflow = try packageFile(".github/workflows/benchmark.yml")
+    let overlay = try packageFile(".github/scripts/overlay-paired-timing.sh")
+    let redact = try packageFile(".github/scripts/redact-benchmark-failure.sh")
+
+    // Overlay: the champion pair is both-or-neither (fail fast on a half-set
+    // reference), the gate is the champion_speedup / candidate_speedup ratio,
+    // and a failure writes the harness's fixed "acceptance band failed:"
+    // prefix, with the gain side carrying the fixed staging-guidance
+    // substring the redactor keys on.
+    #expect(overlay.contains("CHAMPION_DECODE_SPEEDUP=\"${MLXFAST_CHAMPION_DECODE_SPEEDUP:-}\""))
+    #expect(overlay.contains("CHAMPION_PREFILL_SPEEDUP=\"${MLXFAST_CHAMPION_PREFILL_SPEEDUP:-}\""))
+    #expect(overlay.contains("must be set together"))
+    #expect(overlay.contains("($champion_decode | tonumber) / $ds"))
+    #expect(overlay.contains("($champion_prefill | tonumber) / $ps"))
+    #expect(overlay.contains("acceptance band failed:"))
+    #expect(overlay.contains("please stage it across submissions"))
+
+    // Workflow: the champion reference comes from maintainer-only Actions
+    // variables (contestants cannot set variables; empty until the first
+    // champion-advance), and the band tolerances are duplicated into the
+    // overlay env with the same keep-in-sync contract as the floors --
+    // pinned to the constants here.
+    #expect(workflow.contains("MLXFAST_CHAMPION_DECODE_SPEEDUP: ${{ vars.MLXFAST_CHAMPION_DECODE_SPEEDUP || '' }}"))
+    #expect(workflow.contains("MLXFAST_CHAMPION_PREFILL_SPEEDUP: ${{ vars.MLXFAST_CHAMPION_PREFILL_SPEEDUP || '' }}"))
+    #expect(workflow.contains("MLXFAST_DECODE_BAND_UP_TOLERANCE: \"\(MLXFastConstants.decodeBandUpTolerance)\""))
+    #expect(workflow.contains("MLXFAST_DECODE_BAND_DOWN_TOLERANCE: \"\(MLXFastConstants.decodeBandDownTolerance)\""))
+    #expect(workflow.contains("MLXFAST_PREFILL_BAND_UP_TOLERANCE: \"\(MLXFastConstants.prefillBandUpTolerance)\""))
+    #expect(workflow.contains("MLXFAST_PREFILL_BAND_DOWN_TOLERANCE: \"\(MLXFastConstants.prefillBandDownTolerance)\""))
+
+    // Band failures surface publicly only as fixed redacted categories.
+    #expect(redact.contains("acceptance_band_gain_exceeds_step_cap"))
+    #expect(redact.contains("acceptance_band_regression"))
+
+    // The champion-advance protocol (both variables together, from the
+    // accepted run's merged score) is documented in the freeze doc.
+    let freezeDoc = try packageFile("docs/benchmark-window-freeze.md")
+    #expect(freezeDoc.contains("MLXFAST_CHAMPION_DECODE_SPEEDUP"))
+    #expect(freezeDoc.contains("MLXFAST_CHAMPION_PREFILL_SPEEDUP"))
+    #expect(freezeDoc.contains("Champion-advance protocol"))
 }
 
 @Test

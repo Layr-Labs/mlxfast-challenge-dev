@@ -170,18 +170,55 @@ Harness contract (shipped and armed; enforced by the freeze test):
   baselines, then constants) is unchanged and stays decoupled from the band
   reference.
 
-**Not yet wired on the single-machine pipeline (operator decision).** On the
-M5 box the timed measurement is owned by the runner-provisioned `measure-job`
-(baseline tree first, then candidate), and neither the workflow nor the repo
-currently measures a champion or exports these variables -- so the band gates
-against the score baseline exactly as before this mechanism landed. Advancing
-the band requires the operator to decide where the champion measurement comes
-from, e.g. a champion tree provisioned next to
-`/opt/bench-runner/baseline/current` and measured as a third measure-job leg
-(with its own calibration recorded like `baseline-calibration.json`), or a
-maintainer-recorded champion timing pair. That choice changes the host
-contract / RUNBOOK, not this repo's harness, and per-submission step caps only
-become champion-relative once it is made.
+**Enforced champion gate on the single-machine pipeline (recorded accepted
+speedups).** On the M5 box the timed measurement is owned by the
+runner-provisioned `measure-job` (baseline tree first, then candidate), whose
+env is reset at the bench-exec bridge -- so the harness-side variables above
+cannot reach the candidate's in-process bands without a host-contract change.
+The enforced champion gate therefore lives in the trusted overlay shell
+(`.github/scripts/overlay-paired-timing.sh`), next to the floors:
+
+- The champion's **accepted paired speedups** (its `decode_speedup` /
+  `prefill_speedup` vs the pinned baseline, from the run that made it
+  champion) are pinned in the **maintainer-only Actions variables
+  `MLXFAST_CHAMPION_DECODE_SPEEDUP` / `MLXFAST_CHAMPION_PREFILL_SPEEDUP`**
+  (contestants cannot set variables).
+- The overlay derives the candidate/champion seconds ratio per axis as
+  `champion_speedup / candidate_speedup`. Both speedups reference the same
+  pinned on-box baseline measured in-session behind the same thermal gate
+  (and sanity-banded against its recorded calibration), so common-mode host
+  drift cancels in the ratio -- the single-machine equivalent of the old
+  fleet pipeline's live champion re-measurement on its own fresh VM, without
+  spending a second build + timed pass on the serial box.
+- The ratio must land within `[1 - downTolerance, 1 + upTolerance]` per axis
+  (the same tolerances as above, duplicated into the workflow env with a
+  keep-in-sync comment, like the floors). A failure writes the harness's
+  fixed `acceptance band failed:` error prefix into the merged score -- the
+  gain side carries the fixed "please stage it across submissions" guidance
+  substring -- so `redact-benchmark-failure.sh` categorizes it without
+  leaking values.
+- Both variables unset -> the champion gate is skipped and behavior is
+  exactly as before this mechanism landed. A half-set pair fails fast: the
+  champion-advance protocol records both together, and silently gating one
+  axis against the wrong reference would misprice it.
+
+**Champion-advance protocol** (a ranking-contract change, so operator-owned).
+On acceptance of a new best submission, set BOTH Actions variables together
+from its accepted run's merged score: `MLXFAST_CHAMPION_DECODE_SPEEDUP` from
+`.metrics.decode_speedup` and `MLXFAST_CHAMPION_PREFILL_SPEEDUP` from
+`.metrics.prefill_speedup`.
+
+**Residual (tracked, operator decision).** The candidate's own in-process
+band still gates against the frozen reference resolved from the hidden
+golden / constants inside `measure-job` (see above), so it remains the
+binding cumulative cap: once a champion is more than the down tolerance
+faster than the frozen original, unlocking further progress requires either
+regenerating the golden's per-prompt band calibration at champion-advance
+time, forwarding `MLXFAST_ACCEPTANCE_BAND_*` through the bench-exec bridge
+(host contract / RUNBOOK, not this repo), or provisioning a champion tree
+next to `/opt/bench-runner/baseline/current` as a third measure-job leg.
+Track that as part of the champion-advance procedure; the overlay gate above
+is the champion-relative policy that is enforceable from this repo today.
 
 ### Per-prompt baselines in the golden oracle
 

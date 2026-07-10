@@ -848,6 +848,20 @@ jobs:
       # seconds/token, measured baseline seconds/token, speedups, floors,
       # score). Fails the job when a speedup floor fails, exactly like the old
       # timing machine's harness-side floor check did.
+      #
+      # ADVANCING acceptance band (see docs/benchmark-window-freeze.md,
+      # "Advancing acceptance band"): once a champion (best accepted
+      # submission) is recorded, its accepted paired speedups are pinned in
+      # the maintainer-only Actions variables below (contestants cannot set
+      # variables) and the overlay gates the candidate's paired ratio against
+      # the champion within the band tolerances. Both speedups reference the
+      # same pinned on-box baseline measured in-session, so common-mode drift
+      # cancels -- the single-machine equivalent of the old fleet pipeline's
+      # live champion re-measurement on its own fresh VM. Empty until the
+      # first champion-advance; the overlay then skips the champion gate and
+      # the harness's in-process band vs the frozen reference remains the only
+      # band. Band tolerances: keep in sync with
+      # MLXFastConstants.{decode,prefill}Band{Up,Down}Tolerance.
       - name: Overlay paired timing into final score
         if: ${{ inputs.run_benchmark }}
         env:
@@ -855,6 +869,12 @@ jobs:
           MLXFAST_INTEGRITY_PATH: benchmark-integrity.json
           MLXFAST_MEASURE_RESULTS_PATH: ${{ env.MLXFAST_MEASURE_OUT }}/results.json
           MLXFAST_CANDIDATE_SCORE_PATH: ${{ env.MLXFAST_MEASURE_OUT }}/score-candidate.json
+          MLXFAST_CHAMPION_DECODE_SPEEDUP: ${{ vars.MLXFAST_CHAMPION_DECODE_SPEEDUP || '' }}
+          MLXFAST_CHAMPION_PREFILL_SPEEDUP: ${{ vars.MLXFAST_CHAMPION_PREFILL_SPEEDUP || '' }}
+          MLXFAST_DECODE_BAND_UP_TOLERANCE: "0.02"
+          MLXFAST_DECODE_BAND_DOWN_TOLERANCE: "0.05"
+          MLXFAST_PREFILL_BAND_UP_TOLERANCE: "0.05"
+          MLXFAST_PREFILL_BAND_DOWN_TOLERANCE: "0.05"
         run: .github/scripts/overlay-paired-timing.sh
 
       - name: Validate benchmark artifacts
