@@ -76,6 +76,31 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
 }
 
 @Test
+func benchmarkFailsFastWhenSetupArtifactsAreMissing() throws {
+    let benchmark = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    let prerequisite = try #require(
+        benchmark.range(of: "if [[ ! -x \"${SWIFT_BIN}\" && ! -s \"${MLX_METALLIB}\" ]]")
+    )
+    let automaticBuild = try #require(
+        benchmark.range(of: "benchmark.sh: Swift release binary missing; building")
+    )
+    #expect(prerequisite.lowerBound < automaticBuild.lowerBound)
+
+    let guardBody = String(benchmark[prerequisite.lowerBound..<automaticBuild.lowerBound])
+    #expect(guardBody.contains("MLXFAST_CLI_COMMAND"))
+    #expect(guardBody.contains("exit 1"))
+}
+
+@Test
+func participantDocsExposeDefaultCLIInstallDirectory() throws {
+    let pathExport = #"export PATH="${HOME}/.local/bin:${PATH}""#
+    for path in ["README.md", "TASK.md", "AGENTS.md", "CLAUDE.md"] {
+        let document = try String(contentsOfFile: path, encoding: .utf8)
+        #expect(document.contains(pathExport), "\(path) must expose the default CLI install directory")
+    }
+}
+
+@Test
 func rulesDocsQuoteCurrentSpeedupFloorLimits() throws {
     let readme = try String(contentsOfFile: "README.md", encoding: .utf8)
     let challenge = try String(contentsOfFile: "TASK.md", encoding: .utf8)
@@ -267,7 +292,15 @@ func benchmarkWorkflowProbesAndEnforcesRuntimeWorkerSandbox() throws {
     #expect(benchmark.contains("MLXFAST_OFFICIAL_BENCHMARK_RUN"))
     #expect(benchmark.contains("official GitHub benchmark runs must not set MLXFAST_NO_SANDBOX=1"))
     #expect(benchmark.contains("official GitHub benchmark runs must use the runtime worker sandbox"))
-    #expect(benchmark.contains("enforce_official_sandbox\n\nif [[ \"${MLXFAST_IN_SANDBOX:-0}\" != \"1\" && ! -x \"${SWIFT_BIN}\" ]]; then"))
+    let setupGuard = try #require(
+        benchmark.range(
+            of: "enforce_official_sandbox\n\nif [[ ! -x \"${SWIFT_BIN}\" && ! -s \"${MLX_METALLIB}\" ]]"
+        )
+    )
+    let automaticBuild = try #require(
+        benchmark.range(of: "if [[ \"${MLXFAST_IN_SANDBOX:-0}\" != \"1\" && ! -x \"${SWIFT_BIN}\" ]]; then")
+    )
+    #expect(setupGuard.lowerBound < automaticBuild.lowerBound)
 
     #expect(probe.contains("(deny network*)"))
     #expect(probe.contains("(deny process-fork)"))

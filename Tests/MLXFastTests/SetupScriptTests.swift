@@ -375,6 +375,53 @@ func setupReferenceCacheStampUsesUniqueAtomicTemporaryFiles() throws {
 }
 
 @Test
+func setupRejectsCommandLineToolsWithFullXcodeInstructions() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let fakeBin = root.appendingPathComponent("bin")
+    try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
+
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("swift"),
+        contents: """
+        #!/usr/bin/env bash
+        exit 0
+        """
+    )
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("xcodebuild"),
+        contents: """
+        #!/usr/bin/env bash
+        echo "xcode-select: error: tool 'xcodebuild' requires Xcode, but active developer directory '/Library/Developer/CommandLineTools' is a command line tools instance" >&2
+        exit 1
+        """
+    )
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("xcode-select"),
+        contents: """
+        #!/usr/bin/env bash
+        printf '/Library/Developer/CommandLineTools\n'
+        """
+    )
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        ensure_swift_toolchain
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "PATH": "\(fakeBin.path):/usr/bin:/bin:/usr/sbin:/sbin",
+        ]
+    )
+
+    #expect(result.status != 0)
+    #expect(result.stderr.contains("full Xcode is required"))
+    #expect(result.stderr.contains("Command Line Tools alone"))
+    #expect(result.stderr.contains("sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"))
+}
+
+@Test
 func setupUsesDownloadedMetalToolchainIdentifierForCompilerProbe() throws {
     let result = try runSetupBash(
         """

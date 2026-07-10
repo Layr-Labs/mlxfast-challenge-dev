@@ -471,6 +471,7 @@ mlx.metallib needs. Install full Xcode from the App Store or
 https://developer.apple.com/xcode/, then select it and retry:
 
   sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+  sudo xcodebuild -runFirstLaunch
 
 EOF
         ;;
