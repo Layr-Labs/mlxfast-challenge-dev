@@ -4,9 +4,10 @@ import Testing
 
 // Acceptance bands: a robust reference B is calibrated once from a fleet (drop the
 // single slowest, average the rest); each run's single measurement is then checked
-// against B with per-axis tolerances. Prefill is +/-5% (symmetric health gate);
-// decode is +2% regression / -5% gain (tight on regressions, per-submission gain
-// capped). Numbers anchored on the real tenki fresh-VM run 28893815980
+// against B (the advancing champion when one is supplied, else the score baseline)
+// with per-axis tolerances. Prefill is +/-5% (symmetric health gate); decode is
+// +2% regression / -5% gain (tight on regressions, per-submission gain over the
+// reference capped). Numbers anchored on the real tenki fresh-VM run 28893815980
 // (prefills: 5 tight at ~0.0106, one spike at 0.01532).
 
 private let freshVMPrefills = [
@@ -61,7 +62,7 @@ func prefillFailsWhenMoreThan5PercentSlow() {
 func prefillFailsWhenMoreThan5PercentFast() {
     let B = 0.0106
     #expect(!checkPrefill(B * 0.949, B).passed)
-    #expect(checkPrefill(B * 0.949, B).reason.contains("chunk"))
+    #expect(checkPrefill(B * 0.949, B).reason.contains("batches"))
 }
 
 // MARK: - Decode band (+2% regression / -5% gain)
@@ -94,7 +95,7 @@ func decodeFailsRegressionBeyond2Percent() {
 func decodeFailsGainBeyond5Percent() {
     let B = 0.1336
     #expect(!checkDecode(B * 0.949, B).passed)  // -5.1% faster: too big for one submission
-    #expect(checkDecode(B * 0.949, B).reason.contains("chunk"))
+    #expect(checkDecode(B * 0.949, B).reason.contains("batches"))
 }
 
 @Test

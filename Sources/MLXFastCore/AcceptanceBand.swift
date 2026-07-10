@@ -1,18 +1,27 @@
 import Foundation
 
 /// Two-sided acceptance band for a scored timing metric (prefill or decode
-/// seconds-per-token) against the same-VM paired baseline `B`.
+/// seconds-per-token) against the band reference `B` -- the advancing CHAMPION
+/// (current best accepted submission) when the trusted workflow supplies one
+/// (see AcceptanceBandReference), else the resolved score baseline. This is
+/// distinct from the SCORE baseline (the frozen original): the band caps each
+/// submission's STEP over the champion while the score stays cumulative vs the
+/// original (see docs/benchmark-window-freeze.md, "Advancing acceptance band").
 ///
 /// Both prefill and decode are single, noisy measurements (see
-/// docs/thermal-variance-investigation.md). Measured against the same-VM paired
-/// baseline (which cancels host-speed differences), a run's value must land within
+/// docs/thermal-variance-investigation.md). Measured against a same-session
+/// reference (which cancels host-speed differences), a run's value must land within
 /// `[B*(1-downTolerance), B*(1+upTolerance)]`:
-///   - more than `upTolerance` ABOVE `B` (a slowdown / regression)  -> FAIL.
-///   - more than `downTolerance` BELOW `B` (an improvement / faster) -> FAIL.
+///   - more than `upTolerance` ABOVE `B` (slower than the reference / regression) -> FAIL.
+///   - more than `downTolerance` BELOW `B` (faster than the reference by more than
+///     a step) -> FAIL.
 ///
-/// The down side caps a single submission's gain: a value far below `B` is either
-/// a lucky measurement or a jump too big to trust in one shot, so larger wins must
-/// be chunked across submissions. Tolerances are per-axis (see MLXFastConstants):
+/// The down side caps a single submission's gain OVER THE REFERENCE: a value far
+/// below `B` is either a lucky measurement or a jump too big to trust in one shot,
+/// so larger wins must be staged across submissions in smaller steps. When `B`
+/// advances with the champion, only the per-submission step is capped -- cumulative
+/// speedup vs the original grows unbounded. Tolerances are per-axis (see
+/// MLXFastConstants):
 ///   - prefill: +/-5% (prefill is not a real optimization axis -> symmetric gate).
 ///   - decode: +2% regression / -5% gain (tight on regressions; per-submission
 ///     decode gain capped at 5%).
@@ -58,9 +67,12 @@ public enum AcceptanceBand {
         if value < lo {
             return AcceptanceBandResult(
                 passed: false,
-                reason: "\(label) \(value) below -\(downTolerance * 100)% of reference "
-                    + "\(reference) (< \(lo)): improvement too large for one submission "
-                    + "(chunk it) or a suspiciously lucky reading"
+                reason: "\(label) \(value) improves on reference \(reference) by more than "
+                    + "\(downTolerance * 100)% (< \(lo)): a single submission's gain is capped "
+                    + "at \(downTolerance * 100)% -- the improvement was more than "
+                    + "\(downTolerance * 100)%, so please stage it across submissions in "
+                    + "smaller (<\(downTolerance * 100)%) batches (or this is a suspiciously "
+                    + "lucky reading)"
             )
         }
         return AcceptanceBandResult(passed: true, reason: "")

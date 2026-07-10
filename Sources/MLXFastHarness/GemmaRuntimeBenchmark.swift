@@ -156,6 +156,15 @@ extension GemmaRuntime {
                 ?? benchmarkGolden.resolvedBaselinePrefillSecondsPerToken
             baselineDecodeSecondsPerToken = pairedBaseline?.decodeSecondsPerToken
                 ?? benchmarkGolden.resolvedBaselineDecodeSecondsPerToken
+            // Acceptance-band reference is the advancing champion (best accepted
+            // submission), DISTINCT from the score baseline above which stays the
+            // frozen original. Falls back to the score baseline when unset (local
+            // runs / before any champion). Fails closed on a half-set pair.
+            let bandReference = try AcceptanceBandReference.fromEnvironment()
+            let championPrefillSecondsPerToken = bandReference?.prefillSecondsPerToken
+                ?? baselinePrefillSecondsPerToken
+            let championDecodeSecondsPerToken = bandReference?.decodeSecondsPerToken
+                ?? baselineDecodeSecondsPerToken
             progress(
                 "benchmark oracle ready prefill_tokens=\(promptPlan.prefillTokens.count) "
                     + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
@@ -227,16 +236,18 @@ extension GemmaRuntime {
                     bandwidthSource: decode.bandwidthSource
                 )
             }
-            // Acceptance bands vs the resolved baseline B (see AcceptanceBand):
-            // prefill +/-5%; decode +2% regression / -5% gain (per-submission decode
-            // gain capped at 5% -> larger wins must be chunked). Fail closed on either.
+            // Acceptance bands vs the advancing CHAMPION reference B (see
+            // AcceptanceBand; distinct from the score baseline, which stays the
+            // frozen original above): prefill +/-5%; decode +2% regression / -5%
+            // gain (per-submission decode gain over the champion capped at 5% ->
+            // larger wins must be staged across submissions). Fail closed on either.
             let prefillBand = AcceptanceBand.check(
-                value: prefillSecondsPerToken, reference: baselinePrefillSecondsPerToken,
+                value: prefillSecondsPerToken, reference: championPrefillSecondsPerToken,
                 upTolerance: MLXFastConstants.prefillBandUpTolerance,
                 downTolerance: MLXFastConstants.prefillBandDownTolerance, label: "prefill"
             )
             let decodeBand = AcceptanceBand.check(
-                value: decode.secondsPerToken, reference: baselineDecodeSecondsPerToken,
+                value: decode.secondsPerToken, reference: championDecodeSecondsPerToken,
                 upTolerance: MLXFastConstants.decodeBandUpTolerance,
                 downTolerance: MLXFastConstants.decodeBandDownTolerance, label: "decode"
             )
@@ -488,6 +499,15 @@ extension GemmaRuntime {
                 ?? benchmarkGolden.resolvedBaselinePrefillSecondsPerToken
             baselineDecodeSecondsPerToken = pairedBaseline?.decodeSecondsPerToken
                 ?? benchmarkGolden.resolvedBaselineDecodeSecondsPerToken
+            // Acceptance-band reference is the advancing champion (best accepted
+            // submission), DISTINCT from the score baseline above which stays the
+            // frozen original. Falls back to the score baseline when unset (local
+            // runs / before any champion). Fails closed on a half-set pair.
+            let bandReference = try AcceptanceBandReference.fromEnvironment()
+            let championPrefillSecondsPerToken = bandReference?.prefillSecondsPerToken
+                ?? baselinePrefillSecondsPerToken
+            let championDecodeSecondsPerToken = bandReference?.decodeSecondsPerToken
+                ?? baselineDecodeSecondsPerToken
             progress(
                 "benchmark oracle ready prefill_tokens=\(promptPlan.prefillTokens.count) "
                     + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
@@ -618,16 +638,17 @@ extension GemmaRuntime {
                     bandwidthSource: decode.bandwidthSource
                 )
             }
-            // Acceptance bands vs the resolved baseline (see the identical guard on the
-            // single-machine path and AcceptanceBand): prefill +/-5%; decode +2%
-            // regression / -5% gain (per-submission decode gain capped at 5%).
+            // Acceptance bands vs the advancing CHAMPION reference (see the identical
+            // guard on the in-process path and AcceptanceBand; distinct from the
+            // frozen-original score baseline): prefill +/-5%; decode +2% regression /
+            // -5% gain (per-submission decode gain over the champion capped at 5%).
             let prefillBand = AcceptanceBand.check(
-                value: prefillSecondsPerToken, reference: baselinePrefillSecondsPerToken,
+                value: prefillSecondsPerToken, reference: championPrefillSecondsPerToken,
                 upTolerance: MLXFastConstants.prefillBandUpTolerance,
                 downTolerance: MLXFastConstants.prefillBandDownTolerance, label: "prefill"
             )
             let decodeBand = AcceptanceBand.check(
-                value: decode.secondsPerToken, reference: baselineDecodeSecondsPerToken,
+                value: decode.secondsPerToken, reference: championDecodeSecondsPerToken,
                 upTolerance: MLXFastConstants.decodeBandUpTolerance,
                 downTolerance: MLXFastConstants.decodeBandDownTolerance, label: "decode"
             )

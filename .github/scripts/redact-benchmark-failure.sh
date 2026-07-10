@@ -70,6 +70,20 @@ if [[ -s "${score_path}" ]]; then
     # streaming path to meter. Its threat (hiding timed work outside the
     # measured window) is covered by the single-seed timed decode protocol
     # and the submission static review.
+    # Acceptance band (AcceptanceBand). Distinguish the two harness-authored
+    # sub-cases by a FIXED substring the harness itself writes (never worker
+    # text): the down side (gain over the band reference beyond the per-
+    # submission cap -> stage in smaller batches) vs the up side (regression).
+    # The guidance echoed below is a fixed, value-free string this script
+    # authors, so it is safe to print even though the raw error is not.
+    elif [[ "${error_text}" == "acceptance band failed:"* ]]; then
+      if [[ "${error_text}" == *"please stage it across submissions"* ]]; then
+        category="acceptance_band_gain_exceeds_step_cap"
+        band_guidance="the measured improvement over the band reference was more than the per-submission cap (decode 5%, prefill 5%); please STAGE the win across submissions in smaller (<cap) batches so each step stays inside the acceptance band"
+      else
+        category="acceptance_band_regression"
+        band_guidance="the measured timing is slower than the band reference beyond the regression tolerance (decode +2%, prefill +5%)"
+      fi
     elif [[ "${passed_correctness}" == "false" ]]; then
       category="correctness_failed"
     elif [[ -n "${error_text}" ]]; then
@@ -107,6 +121,10 @@ jq -n \
   }' > "${out}"
 
 echo "benchmark-failure: category=${category} mode=${MLXFAST_BENCHMARK_MODE:-unknown} wall_seconds=${benchmark_wall_seconds}"
+# Actionable guidance for acceptance-band failures (fixed, value-free strings above).
+if [[ -n "${band_guidance:-}" ]]; then
+  echo "benchmark-failure: ${band_guidance}"
+fi
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   {
     echo "### Benchmark failure (redacted)"
@@ -114,5 +132,9 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     echo '```json'
     cat "${out}"
     echo '```'
+    if [[ -n "${band_guidance:-}" ]]; then
+      echo ""
+      echo "**Acceptance band:** ${band_guidance}"
+    fi
   } >> "${GITHUB_STEP_SUMMARY}"
 fi

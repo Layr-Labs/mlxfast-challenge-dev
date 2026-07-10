@@ -123,6 +123,51 @@ func pairedBaselineOverrideParsesTrustedEnvironmentFailClosed() throws {
 }
 
 @Test
+func acceptanceBandReferenceParsesTrustedEnvironmentFailClosed() throws {
+    // Absent entirely: no champion override, the band falls back to the score baseline.
+    #expect(try AcceptanceBandReference.fromEnvironment([:]) == nil)
+    #expect(try AcceptanceBandReference.fromEnvironment([
+        "MLXFAST_ACCEPTANCE_BAND_PREFILL_SECONDS_PER_TOKEN": "",
+        "MLXFAST_ACCEPTANCE_BAND_DECODE_SECONDS_PER_TOKEN": "  ",
+    ]) == nil)
+
+    // Present: the champion's live prefill/decode parsed precisely.
+    let reference = try #require(try AcceptanceBandReference.fromEnvironment([
+        "MLXFAST_ACCEPTANCE_BAND_PREFILL_SECONDS_PER_TOKEN": "0.0374",
+        "MLXFAST_ACCEPTANCE_BAND_DECODE_SECONDS_PER_TOKEN": "0.1712",
+    ]))
+    #expect(reference.prefillSecondsPerToken == 0.0374)
+    #expect(reference.decodeSecondsPerToken == 0.1712)
+
+    // Half-set pairs and non-positive/non-finite values are operator wiring
+    // errors: fail closed rather than silently gating against the wrong reference.
+    for badEnvironment: [String: String] in [
+        ["MLXFAST_ACCEPTANCE_BAND_PREFILL_SECONDS_PER_TOKEN": "0.037"],
+        ["MLXFAST_ACCEPTANCE_BAND_DECODE_SECONDS_PER_TOKEN": "0.17"],
+        [
+            "MLXFAST_ACCEPTANCE_BAND_PREFILL_SECONDS_PER_TOKEN": "0",
+            "MLXFAST_ACCEPTANCE_BAND_DECODE_SECONDS_PER_TOKEN": "0.17",
+        ],
+        [
+            "MLXFAST_ACCEPTANCE_BAND_PREFILL_SECONDS_PER_TOKEN": "0.037",
+            "MLXFAST_ACCEPTANCE_BAND_DECODE_SECONDS_PER_TOKEN": "-1",
+        ],
+        [
+            "MLXFAST_ACCEPTANCE_BAND_PREFILL_SECONDS_PER_TOKEN": "nan",
+            "MLXFAST_ACCEPTANCE_BAND_DECODE_SECONDS_PER_TOKEN": "0.17",
+        ],
+        [
+            "MLXFAST_ACCEPTANCE_BAND_PREFILL_SECONDS_PER_TOKEN": "quick",
+            "MLXFAST_ACCEPTANCE_BAND_DECODE_SECONDS_PER_TOKEN": "0.17",
+        ],
+    ] {
+        #expect(throws: MLXFastError.self) {
+            _ = try AcceptanceBandReference.fromEnvironment(badEnvironment)
+        }
+    }
+}
+
+@Test
 func semanticBehaviorGateRequiresPromptAndReferenceAnswer() {
     let exactOnly = GoldenBehaviorCase(
         name: "exact-only",

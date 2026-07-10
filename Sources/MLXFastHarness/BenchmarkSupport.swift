@@ -114,6 +114,68 @@ public struct PairedBaselineOverride: Equatable {
     }
 }
 
+/// Advancing acceptance-band reference supplied by the trusted workflow: the
+/// CURRENT CHAMPION (best accepted submission) measured in the same session as
+/// the candidate (see docs/benchmark-window-freeze.md, "Advancing acceptance
+/// band"). The acceptance bands gate the candidate against THIS, not the score
+/// baseline: the score is still computed against the frozen original reference
+/// (PairedBaselineOverride / golden / constants) so the leaderboard reports
+/// cumulative speedup, while the band caps each submission's step to
+/// +/-tolerance over the champion. Measuring the champion in-session is what
+/// lets the tight decode band survive host/thermal common-mode (it cancels in
+/// the candidate/champion ratio).
+///
+/// When unset (local runs, or before any champion has been recorded) the band
+/// falls back to the resolved score baseline, preserving today's behavior. Both
+/// variables are stripped from the sandboxed worker environment: submitted
+/// model code must not observe them.
+public struct AcceptanceBandReference: Equatable {
+    public static let prefillEnvironmentKey = "MLXFAST_ACCEPTANCE_BAND_PREFILL_SECONDS_PER_TOKEN"
+    public static let decodeEnvironmentKey = "MLXFAST_ACCEPTANCE_BAND_DECODE_SECONDS_PER_TOKEN"
+
+    public let prefillSecondsPerToken: Double
+    public let decodeSecondsPerToken: Double
+
+    public init(prefillSecondsPerToken: Double, decodeSecondsPerToken: Double) {
+        self.prefillSecondsPerToken = prefillSecondsPerToken
+        self.decodeSecondsPerToken = decodeSecondsPerToken
+    }
+
+    /// Fails closed: a half-set pair or a non-positive/non-finite value is an
+    /// operator wiring error and must stop the run, never silently degrade to the
+    /// score baseline (which would gate the candidate against the wrong reference).
+    public static func fromEnvironment(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> AcceptanceBandReference? {
+        let prefillRaw = environment[prefillEnvironmentKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let decodeRaw = environment[decodeEnvironmentKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if prefillRaw.isEmpty, decodeRaw.isEmpty {
+            return nil
+        }
+        guard !prefillRaw.isEmpty, !decodeRaw.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "\(prefillEnvironmentKey) and \(decodeEnvironmentKey) must be provided together"
+            )
+        }
+        guard let prefill = Double(prefillRaw), prefill.isFinite, prefill > 0 else {
+            throw MLXFastError.invalidInput(
+                "\(prefillEnvironmentKey) must be a finite positive seconds-per-token value"
+            )
+        }
+        guard let decode = Double(decodeRaw), decode.isFinite, decode > 0 else {
+            throw MLXFastError.invalidInput(
+                "\(decodeEnvironmentKey) must be a finite positive seconds-per-token value"
+            )
+        }
+        return AcceptanceBandReference(
+            prefillSecondsPerToken: prefill,
+            decodeSecondsPerToken: decode
+        )
+    }
+}
+
 public enum BenchmarkPreflight {
     public static func check(
         weightsPath: String,

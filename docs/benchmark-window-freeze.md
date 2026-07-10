@@ -69,21 +69,23 @@ same test:
 
 Acceptance bands (see `AcceptanceBand`,
 `docs/thermal-variance-investigation.md`): prefill and decode are single noisy
-measurements, each gated against the same-session paired baseline `B` measured
-on the same silicon (which cancels host-speed differences). After the speedup
-floors, each axis's measured value must land within
-`[B * (1 - downTolerance), B * (1 + upTolerance)]`: it fails if the value
-exceeds `B * (1 + upTolerance)` (a real slowdown / regression) or drops below
-`B * (1 - downTolerance)` (an improvement too large to trust in one
-submission, or a suspiciously lucky-fast reading).
+measurements, each gated against the band reference `B` -- the **advancing
+champion** when the trusted workflow supplies one (see "Advancing acceptance
+band" below), else the same-session paired score baseline (which cancels
+host-speed differences). After the speedup floors, each axis's measured value
+must land within `[B * (1 - downTolerance), B * (1 + upTolerance)]`: it fails
+if the value exceeds `B * (1 + upTolerance)` (slower than the reference / a
+real regression) or drops below `B * (1 - downTolerance)` (an improvement too
+large to trust in one submission, or a suspiciously lucky-fast reading).
 
 - **Prefill: +/-5% symmetric.** Prefill is not a real optimization axis here, so
   it is a health gate -- both a regression and a lucky-fast reading past 5% fail.
 - **Decode: +2% regression / -5% gain.** Decode is the axis the score rewards, so
   the up (regression) side is tight at +2%; the down (gain) side caps a *single
-  submission's* decode improvement at 5%. Larger wins are still welcome -- they
-  must be **chunked** across submissions so each step stays inside the band and is
-  independently verifiable. The cap is per-submission, not cumulative.
+  submission's* decode improvement over the reference at 5%. Larger wins are
+  still welcome -- they must be **staged** across submissions so each step stays
+  inside the band and is independently verifiable. The cap is per-submission,
+  not cumulative.
 
 `B`'s robustness and the per-axis tolerances are ranking-contract decisions, so
 they are operator-owned and pinned here.
@@ -141,6 +143,45 @@ shipped and armed: a paired override outranks golden-carried baselines, which
 outrank the constants; the pair is fail-closed (both together, finite,
 positive) and both variables are stripped from the sandboxed worker
 environment.
+
+### Advancing acceptance band (the champion reference)
+
+The SCORE is always computed against the frozen original (the paired baseline
+above), so the leaderboard reports *cumulative* speedup vs the original. The
+ACCEPTANCE BANDS, however, gate each submission against the **current
+champion** -- the best accepted submission so far -- when the trusted workflow
+supplies one. Without this, a fixed-reference band would reject every
+submission once the cumulative decode gain passed the band's down tolerance,
+capping total progress at a single step.
+
+Harness contract (shipped and armed; enforced by the freeze test):
+
+- The champion's measured pair reaches the candidate only through
+  `MLXFAST_ACCEPTANCE_BAND_{PREFILL,DECODE}_SECONDS_PER_TOKEN`
+  (`AcceptanceBandReference`). When both are unset -- local runs, or before any
+  champion has been recorded -- the band falls back to the resolved score
+  baseline, preserving today's behavior. A half-set pair or a non-finite /
+  non-positive value fails closed: an operator wiring error must stop the run,
+  never silently gate against the wrong reference.
+- Both variables are stripped from the sandboxed worker environment: submitted
+  model code must not observe the champion's live timings (or that this run is
+  champion-gated) from inside the worker.
+- The score baseline resolution (paired override, then golden-carried
+  baselines, then constants) is unchanged and stays decoupled from the band
+  reference.
+
+**Not yet wired on the single-machine pipeline (operator decision).** On the
+M5 box the timed measurement is owned by the runner-provisioned `measure-job`
+(baseline tree first, then candidate), and neither the workflow nor the repo
+currently measures a champion or exports these variables -- so the band gates
+against the score baseline exactly as before this mechanism landed. Advancing
+the band requires the operator to decide where the champion measurement comes
+from, e.g. a champion tree provisioned next to
+`/opt/bench-runner/baseline/current` and measured as a third measure-job leg
+(with its own calibration recorded like `baseline-calibration.json`), or a
+maintainer-recorded champion timing pair. That choice changes the host
+contract / RUNBOOK, not this repo's harness, and per-submission step caps only
+become champion-relative once it is made.
 
 ### Per-prompt baselines in the golden oracle
 

@@ -214,6 +214,23 @@ func officialRankedRunMeasuresPairedBaselineOnTheSameSilicon() throws {
     let worker = try packageFile("Sources/MLXFastHarness/GemmaRuntimeWorker.swift")
     #expect(worker.contains("\"MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN\","))
     #expect(worker.contains("\"MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN\","))
+
+    // The acceptance band is DECOUPLED from the score: both benchmark paths
+    // resolve the advancing champion reference (falling back to the score
+    // baseline when the trusted workflow supplies none) and gate the bands
+    // against it, and its override keys are also stripped from the sandboxed
+    // worker. See docs/benchmark-window-freeze.md, "Advancing acceptance band"
+    // (including the operator wiring that is intentionally NOT yet part of the
+    // single-machine measure step).
+    #expect(benchmark.components(separatedBy: "AcceptanceBandReference.fromEnvironment()").count - 1 == 2)
+    #expect(benchmark.contains("reference: championPrefillSecondsPerToken"))
+    #expect(benchmark.contains("reference: championDecodeSecondsPerToken"))
+    #expect(!benchmark.contains("reference: baselinePrefillSecondsPerToken"))
+    #expect(!benchmark.contains("reference: baselineDecodeSecondsPerToken"))
+    #expect(worker.contains("\"MLXFAST_ACCEPTANCE_BAND_DECODE_SECONDS_PER_TOKEN\","))
+    #expect(worker.contains("\"MLXFAST_ACCEPTANCE_BAND_PREFILL_SECONDS_PER_TOKEN\","))
+    let freezeDoc = try packageFile("docs/benchmark-window-freeze.md")
+    #expect(freezeDoc.contains("Advancing acceptance band"))
 }
 
 @Test
