@@ -476,6 +476,13 @@ EOF
   exit 1
 }
 
+# POLICY (TOOLCHAINS override): pin the separately installed Metal Toolchain
+# for every xcrun/metal/cmake invocation below so the produced mlx.metallib is
+# built by a deterministic compiler. This intentionally replaces any
+# TOOLCHAINS value inherited from the caller for the remainder of this build,
+# and MLXFAST_METAL_TOOLCHAIN_IDENTIFIER allows the environment to select the
+# identifier that gets pinned. See the matching note in setup.sh's
+# configure_metal_toolchain_environment.
 METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER:-$(metal_toolchain_identifier)}"
 
 if [[ -n "${METAL_TOOLCHAIN_IDENTIFIER}" ]]; then

@@ -127,6 +127,16 @@ echo "run-offline.sh: network egress and child process execution are blocked; ru
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9
 export HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9
+if [[ -n "${pending_signal}" ]]; then
+  # A fatal signal arrived before the command launched. Signaling the child
+  # immediately after `&` races its fork-to-exec window: the forked shell
+  # still has this script's trap handler installed, so it can consume the
+  # signal and then discard it at exec, leaving the command running. Never
+  # start already-cancelled work: exit like a process killed by that signal
+  # and let the EXIT trap remove the sandbox profiles.
+  echo "run-offline.sh: received SIG${pending_signal} before command launch; aborting" >&2
+  exit "$((128 + $(kill -l "${pending_signal}")))"
+fi
 status=0
 sandbox-exec -f "${command_profile}" "${command_executable}" "$@" &
 command_pid="$!"
@@ -144,6 +154,11 @@ while true; do
   # necessarily reaped the child. Keep waiting until it actually exits.
   if ! kill -0 "${command_pid}" 2>/dev/null; then
     break
+  fi
+  # The interrupting signal may have raced the child's pre-exec window and
+  # been swallowed there; re-forward it before waiting again.
+  if [[ -n "${pending_signal}" ]]; then
+    forward_signal "${pending_signal}"
   fi
 done
 command_pid=""
