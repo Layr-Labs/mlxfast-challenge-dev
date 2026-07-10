@@ -34,11 +34,12 @@ public final class Gemma4RuntimeWeightCache {
     public init(loader: Gemma4WeightLoader, config: Gemma4Config) {
         self.loader = loader
         self.config = config
-        // Bound the MLX buffer cache so resident memory stays near the ~17 GB
-        // checkpoint plus KV/activation buffers instead of growing without limit
-        // across a long decode run.
+        // Keep resident memory as tight as possible: disable the MLX buffer
+        // reuse cache so freed decode/activation buffers are returned to the
+        // allocator immediately instead of being retained. Trades buffer reuse
+        // for a smaller resident footprint on the ~17 GB checkpoint.
         if config.numHiddenLayers >= 16 {
-            Memory.cacheLimit = 6 << 30
+            Memory.cacheLimit = 0
         }
         do {
             libraryModel = try Gemma4RuntimeWeightCache.loadLibraryModel(
