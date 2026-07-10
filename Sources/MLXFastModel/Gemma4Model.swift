@@ -95,6 +95,10 @@ public enum Gemma4Model {
         // adapter -- rather than relying on the fork's internal default --
         // makes ranked runs deterministically eager wherever the env is unset.
         if inputIDs.dim(1) == 1 {
+            // Honest, GPU-loaded decode regression for ranked-floor validation:
+            // extra throwaway matmul work whose result is discarded, so measured
+            // decode slows while outputs stay bit-identical.
+            Gemma4DecodeBallast.applyDuringMeasurement()
             if let step = cache.compiledDecodeStep {
                 return step([inputIDs])[0]
             }
