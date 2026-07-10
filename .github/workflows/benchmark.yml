@@ -111,13 +111,11 @@ on:
 permissions:
   contents: read
 
-# One physical machine, one job at a time by construction (the supervisor
-# keeps a single ephemeral runner online). Queue duplicate dispatches instead
-# of cancelling the in-flight measurement; keyed on run_benchmark so a
-# correctness-only dispatch queues independently of full benchmark runs,
-# matching the previous pipeline's grouping.
+# The ranked M5 is a single physical machine. Use one repository-wide group so
+# every dispatch -- every ref and both full/correctness-only modes -- queues
+# behind the active run instead of competing for the host or cancelling it.
 concurrency:
-  group: benchmark-${{ github.ref }}-${{ inputs.run_benchmark }}
+  group: mlxfast-ranked-benchmark
   cancel-in-progress: false
 
 jobs:

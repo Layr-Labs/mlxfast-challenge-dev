@@ -3246,11 +3246,11 @@ func finalArtifactNamesStayRunIdOnlyAndAuditArtifactsEmbedRunAttempt() throws {
 }
 
 @Test
-func benchmarkWorkflowHasConcurrencyGroupMatchingSiblingProbes() throws {
+func benchmarkWorkflowSerializesEveryDispatch() throws {
     let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
-    // Keyed on run_benchmark so correctness-only dispatches keep main's
-    // concurrent behavior instead of queueing behind a full benchmark run.
-    #expect(workflow.contains("concurrency:\n  group: benchmark-${{ github.ref }}-${{ inputs.run_benchmark }}\n  cancel-in-progress: false"))
+    #expect(workflow.contains("concurrency:\n  group: mlxfast-ranked-benchmark\n  cancel-in-progress: false"))
+    #expect(!workflow.contains("group: benchmark-${{ github.ref }}"))
+    #expect(!workflow.contains("group: benchmark-${{ inputs.run_benchmark }}"))
 }
 
 @Test
