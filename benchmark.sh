@@ -844,17 +844,19 @@ validate_staged_safetensors_shard() {
     echo "benchmark.sh: staged safetensors shard has a truncated header: ${shard_name}" >&2
     return 1
   fi
-  # POLICY (gap-free shard tiling): beyond per-tensor bounds/dtype checks, the
-  # final clause requires the sorted tensor ranges to tile the data section
-  # exactly — first range starts at byte 0, each range ends where the next
-  # begins, and the last range ends at the file's final data byte. This
-  # rejects overlapping tensors and any unindexed byte spans, so a staged
-  # shard cannot smuggle payload bytes that no tensor accounts for past the
-  # weights gate. It is intentionally stricter than the safetensors format
-  # itself, which tolerates padding/alignment gaps between tensors: shards
-  # from writers that emit such gaps fail this gate even though standard
-  # parsers accept them. The Swift transform always emits gap-free shards, so
-  # this only constrains what hand-crafted staged artifacts can look like.
+  # POLICY (gap-free shard tiling) — APPROVED, gap-free tiling retained:
+  # beyond per-tensor bounds/dtype checks, the final clause requires the
+  # sorted tensor ranges to tile the data section exactly — first range
+  # starts at byte 0, each range ends where the next begins, and the last
+  # range ends at the file's final data byte. This rejects overlapping
+  # tensors and any unindexed byte spans, so a staged shard cannot smuggle
+  # payload bytes that no tensor accounts for past the weights gate. It is
+  # intentionally stricter than the safetensors format itself, which
+  # tolerates padding/alignment gaps between tensors: shards from writers
+  # that emit such gaps fail this gate even though standard parsers accept
+  # them. The Swift transform always emits gap-free shards, so this only
+  # constrains what hand-crafted staged artifacts can look like —
+  # stricter-than-spec is intended.
   if ! jq -e --argjson data_bytes "${data_byte_count}" '
       def integer: type == "number" and . == floor;
       def dtype_width:

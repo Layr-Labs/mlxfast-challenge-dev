@@ -341,6 +341,7 @@ private struct ShellGapBenchmarkFixture {
     let swift: URL
     let score: URL
     let integrity: URL
+    let metallib: URL
 }
 
 private func makeShellGapBenchmarkFixture() throws -> ShellGapBenchmarkFixture {
@@ -386,6 +387,10 @@ private func makeShellGapBenchmarkFixture() throws -> ShellGapBenchmarkFixture {
         encoding: .utf8
     )
     try "{}".write(to: golden, atomically: true, encoding: .utf8)
+    // benchmark.sh fails fast when the MLX metallib is missing (incomplete
+    // setup); these fixtures exercise later gates, so satisfy that guard.
+    let metallib = root.appendingPathComponent("mlx.metallib")
+    try "fixture metallib".write(to: metallib, atomically: true, encoding: .utf8)
     return ShellGapBenchmarkFixture(
         root: root,
         weights: weights,
@@ -393,7 +398,8 @@ private func makeShellGapBenchmarkFixture() throws -> ShellGapBenchmarkFixture {
         golden: golden,
         swift: swift,
         score: root.appendingPathComponent("score.json"),
-        integrity: root.appendingPathComponent("integrity.json")
+        integrity: root.appendingPathComponent("integrity.json"),
+        metallib: metallib
     )
 }
 
@@ -412,6 +418,7 @@ private func runShellGapBenchmark(
         "MLXFAST_NO_SANDBOX": "1",
         "MLXFAST_LOCAL_COOL_GATE": "0",
         "MLXFAST_SWIFT_BIN": fixture.swift.path,
+        "MLXFAST_MLX_METALLIB": fixture.metallib.path,
         "MLXFAST_WEIGHTS_PATH": fixture.weights.path,
         "MLXFAST_REFERENCE_DIR": fixture.reference.path,
         "MLXFAST_CORRECTNESS_GOLDEN_PATH": fixture.golden.path,

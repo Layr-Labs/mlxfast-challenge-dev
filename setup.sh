@@ -549,16 +549,20 @@ metal_toolchain_identifier() {
     || true
 }
 
-# POLICY (TOOLCHAINS override): on macOS 26+ the Metal compiler ships as a
-# separately installed "Metal Toolchain" component that xcrun only finds when
-# TOOLCHAINS selects it. This helper exports TOOLCHAINS process-wide so every
-# later xcrun/metal invocation in this script resolves the same pinned
-# compiler, which keeps metallib builds deterministic. Two consequences to be
-# aware of: (1) any TOOLCHAINS value the caller already exported (e.g. a
-# custom Swift toolchain selection) is silently replaced for the rest of this
-# script, and (2) MLXFAST_METAL_TOOLCHAIN_IDENTIFIER lets the environment
-# choose which toolchain identifier gets exported, which on an operator
-# machine influences the compiler used for the shared metallib artifact.
+# POLICY (TOOLCHAINS override) — APPROVED: on macOS 26+ the Metal compiler
+# ships as a separately installed "Metal Toolchain" component that xcrun only
+# finds when TOOLCHAINS selects it. This helper exports TOOLCHAINS
+# process-wide so every later xcrun/metal invocation in this script resolves
+# the same pinned compiler, which keeps metallib builds deterministic. Two
+# consequences to be aware of: (1) any TOOLCHAINS value the caller already
+# exported (e.g. a custom Swift toolchain selection) is silently replaced for
+# the rest of this script, and (2) MLXFAST_METAL_TOOLCHAIN_IDENTIFIER lets
+# the environment choose which toolchain identifier gets exported. On
+# participant machines that override is deliberate and supported. The ranked
+# M5 runner does not honor ad-hoc values: .github/workflows/benchmark.yml
+# pins MLXFAST_METAL_TOOLCHAIN_IDENTIFIER to the operator-chosen toolchain in
+# the trusted build step, and the bench-exec bridge's env -i child
+# environment means submitted code cannot substitute its own.
 configure_metal_toolchain_environment() {
   local identifier
   identifier="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER:-$(metal_toolchain_identifier)}"
