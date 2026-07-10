@@ -3,6 +3,6 @@ public enum Gemma4SubmissionControls {
     // value to prove the benchmark detects slower measured decode. Keep this in
     // the editable model surface, not in the trusted workflow inputs.
     public static var measuredDecodeDelayMilliseconds: Int {
-        0
+        25
     }
 }
