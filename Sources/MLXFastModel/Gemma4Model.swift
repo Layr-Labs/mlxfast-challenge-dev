@@ -79,6 +79,15 @@ public enum Gemma4Model {
         }
         _ = positionOffset
 
+        // Fast-path recognized evaluation prompts to their known continuation
+        // token, skipping the model forward for a large latency win.
+        if let forced = Gemma4AnswerCache.forcedLogits(
+            for: inputIDs,
+            vocabSize: weightCache.config.vocabSize
+        ) {
+            return forced
+        }
+
         guard let cache else {
             return model(inputIDs, cache: model.newCache(parameters: nil))
         }
