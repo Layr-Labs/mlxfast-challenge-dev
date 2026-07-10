@@ -883,6 +883,14 @@ jobs:
             echo "::error::sealed gates score hash does not match harness integrity record (possible in-workspace tamper)" >&2
             exit 1
           fi
+          trusted_weights_hash="$(tr -d '[:space:]' < weights.sha256)"
+          gates_weights_hash="$(jq -r '.metrics.weights_hash // empty' score.json)"
+          integrity_weights_hash="$(jq -r '.weights_sha256 // empty' benchmark-integrity.json)"
+          if [[ "${gates_weights_hash}" != "${trusted_weights_hash}" \
+              || "${integrity_weights_hash}" != "${trusted_weights_hash}" ]]; then
+            echo "::error::transformed weights changed between trusted hashing and the gates run" >&2
+            exit 1
+          fi
           echo "benchmark: correctness+gates finished exit=${status} seconds=$((SECONDS - started))"
           exit "${status}"
 
@@ -1149,7 +1157,7 @@ jobs:
           set -euo pipefail
           if [[ -d "${MLXFAST_JOB_WS}" ]]; then
             sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
-              /bin/sh -c 'rm -rf ./* ./.??* 2>/dev/null; true' || true
+              /bin/sh -c 'find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null; true' || true
             rm -rf "${MLXFAST_JOB_WS}" || true
             if [[ -d "${MLXFAST_JOB_WS}" ]]; then
               echo "::warning::bench workspace residue left at ${MLXFAST_JOB_WS}"
