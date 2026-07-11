@@ -438,17 +438,15 @@ extension GemmaRuntime {
             let decode: DecodeMeasurement
             let benchmarkPeakRamGB: Double
             if options.skipTimedBenchmark {
-                // This machine's role is the anchor/free-run/behavior/GPQA gates
-                // only -- a separate "timing-only" machine (checkGates: false)
-                // measures the real prefill/decode numbers. Placeholders here use
-                // the golden-resolved baseline seconds-per-token exactly
-                // (speedup == 1.0, always finite, always clears the floor)
+                // Gates pass: correctness and behavior gates run here; the timed
+                // prefill/decode measurement runs later via measure-job.
+                // Placeholders use the golden-resolved baseline seconds-per-token
+                // exactly (speedup == 1.0, always finite, always clears the floor)
                 // rather than 0 or some arbitrary value: 0 would divide-by-zero
                 // into +Infinity in BenchmarkScore.speedup, and Double.infinity
-                // fails JSON encoding outright. Whatever ships here is
-                // overwritten by the real timing-only machine's values when benchmark.yml
-                // merges the gates and timing machines.
-                progress("timed benchmark skipped (gates-only machine)")
+                // fails JSON encoding outright. overlay-paired-timing.sh replaces
+                // these with the measured paired timing before publish.
+                progress("timed benchmark skipped (gates-only phase)")
                 prefillSecondsPerToken = baselinePrefillSecondsPerToken
                 decode = DecodeMeasurement(
                     secondsPerToken: baselineDecodeSecondsPerToken,
@@ -501,7 +499,7 @@ extension GemmaRuntime {
             }
 
             // Computed unconditionally from whatever `decode`/prefillSecondsPerToken
-            // ended up holding, real or (for a gates-only machine) the baseline
+            // ended up holding, real or (for the gates-only phase) the baseline
             // placeholder -- the placeholder yields score/speedups of exactly 1.0,
             // which trivially clears the floor checks below, so this guard logic
             // does not need its own skipTimedBenchmark branch.

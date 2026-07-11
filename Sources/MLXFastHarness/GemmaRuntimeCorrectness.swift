@@ -184,8 +184,7 @@ extension GemmaRuntime {
         progress: ((String) -> Void)? = nil
     ) -> CorrectnessReport {
         // checkGates: false skips anchors/free-run/behavior entirely and reports
-        // caseCount/checkedSteps for golden.cases alone -- for a timing-only
-        // benchmark phase that still runs the base teacher-forced case.
+        // caseCount/checkedSteps for golden.cases alone (e.g. base-case-only runs).
         let caseCount = checkGates ? golden.totalCorrectnessCaseCount : golden.cases.count
         var checkedSteps = 0
         var currentCase: String?
@@ -507,12 +506,11 @@ extension GemmaRuntime {
                 checkedSteps += check.comparison.checkedSteps
                 progress?("correctness behavior \(caseLabel) complete checked_steps=\(check.comparison.checkedSteps)")
             }
-            // checkGates false means the behavior loop above never ran (a
-            // "timing-only" machine, correctness/gates split elsewhere), so
+            // checkGates false means the behavior loop above never ran, so
             // semanticAnswers is always empty here regardless of caseCount --
             // that is not a capture failure, there was simply nothing to
-            // capture on this machine, and enforcing the count would turn a
-            // valid timing-only run into a spurious hard failure.
+            // capture in this phase, and enforcing the count would turn a
+            // valid base-case-only run into a spurious hard failure.
             if checkGates, let semanticCapture {
                 guard semanticAnswers.count == semanticCapture.caseCount else {
                     throw MLXFastError.invalidInput(

@@ -376,14 +376,11 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
     #expect(workflow.contains(".github/scripts/download-reference-cache-scope.sh \"${CACHE_SCOPE}\""))
     #expect(workflow.contains("MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: \"0\""))
 
-    // Secret-free by design, the same blanket `secrets.` ban already enforced
-    // on the parallel correctness probe: this workflow runs setup.sh and the
-    // download script FROM THE DISPATCHED REF with no `environment:` approval
-    // gate, so a repo credential injected here (as a prior version did with
-    // secrets.MLXFAST_REFERENCE_BASE_URL/MLXFAST_REFERENCE_AUTH_HEADER) would
-    // be exfiltratable by any ref with a modified setup.sh. The public
-    // Hugging Face mirror needs no credential and every downloaded byte is
-    // verified against the pinned manifest.
+    // Secret-free by design: this workflow runs setup.sh and the download
+    // script FROM THE DISPATCHED REF with no `environment:` approval gate, so
+    // a repo credential injected here would be exfiltratable by any ref with a
+    // modified setup.sh. The public Hugging Face mirror needs no credential
+    // and every downloaded byte is verified against the pinned manifest.
     #expect(!workflow.contains("environment:"))
     #expect(!workflow.contains("secrets."))
     #expect(!workflow.contains("secrets: inherit"))
@@ -1900,14 +1897,14 @@ func compareTeacherForcedWithWorkerUsesSerialTeacherForcedSteps() throws {
 // locally without a live worker + real weights, hence a source-text check
 // rather than a behavioral one -- see BenchmarkOptions.checkGates/
 // skipTimedBenchmark for the harness-level design these fields support):
-// a "timing-only" machine (checkGates: false, so the behavior-gate loop that
+// a gates-only run (checkGates: false, so the behavior-gate loop that
 // captures semantic GPQA answers never runs) still built a non-nil
 // SemanticGPQACaptureOptions whenever MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH was
 // set, and then unconditionally required semanticAnswers.count to equal
-// caseCount -- turning a correct, nothing-to-capture timing-only run into a
+// caseCount -- turning a correct, nothing-to-capture gates-only run into a
 // hard failure ("captured 0 semantic GPQA answers; expected 5").
 @Test
-func benchmarkSplitsGatesAndTimingOntoSeparateMachinesWithoutSpuriousSemanticCaptureFailure() throws {
+func benchmarkGatesOnlyRunSkipsSpuriousSemanticCaptureFailure() throws {
     let runtime = try harnessRuntimeSource()
 
     #expect(runtime.contains("public let checkGates: Bool"))
@@ -1921,7 +1918,7 @@ func benchmarkSplitsGatesAndTimingOntoSeparateMachinesWithoutSpuriousSemanticCap
     #expect(runtime.contains("if checkGates, let semanticCapture {"))
     #expect(!runtime.contains("if let semanticCapture {\n                guard semanticAnswers.count == semanticCapture.caseCount else {"))
 
-    // Placeholder timing values for a gates-only machine must be the resolved
+    // Placeholder timing values for the gates-only phase must be the resolved
     // baseline exactly (speedup == 1.0, always finite) -- 0 would divide-by-
     // zero into +Infinity in BenchmarkScore.speedup, and Double.infinity fails
     // JSON encoding outright. "Resolved" means the golden oracle's per-prompt
@@ -3261,9 +3258,8 @@ func singleMachineWorkflowGatesUploadsOnContentValidation() throws {
     #expect(workflow.contains("if: ${{ failure() && steps.redact_benchmark_failure.outcome == 'success' }}"))
 }
 
-// The old parallel combine job re-checked the gates score.json before merging
-// the timing overlay and cleared the partial_result marker. In the single-
-// machine job that merge is overlay-paired-timing.sh; it must keep the same
+// overlay-paired-timing.sh re-checks the gates score.json before merging the
+// timed measurement and clears the partial_result marker. It must keep the
 // pre-merge validation (leak fields, structural expert zeros), the floor
 // verdicts, the score formula, the partial_result clear, and the integrity
 // re-anchor -- and fail the job on a failed merged verdict.
@@ -3476,9 +3472,7 @@ func overlayPairedTimingAcceptsTrustedCommitAndRejectsForgedOrMissingCommit() th
     }
 }
 
-// The parallel pipeline needed a validate-slice-ranges job to fail fast before
-// burning five rented machines. The single-machine equivalent: the cheap
-// preflight and secret checks run before any expensive build/transform work,
+// Cheap preflight and secret checks must run before build/transform work,
 // and the host preflight (quarantine + isolation stack) runs before checkout
 // or any secret use.
 @Test
