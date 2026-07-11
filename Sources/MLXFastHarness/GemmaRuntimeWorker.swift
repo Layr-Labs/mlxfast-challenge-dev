@@ -114,6 +114,11 @@ extension GemmaRuntime {
         weightCache: Gemma4RuntimeWeightCache,
         state: inout RuntimeWorkerState
     ) throws -> RuntimeWorkerResponse {
+        if request.kind != "decode_block", request.maxBlockSize != nil {
+            throw MLXFastError.invalidInput(
+                "runtime worker max_block_size is valid only for decode_block"
+            )
+        }
         switch request.kind {
         case "correctness":
             guard let promptTokens = request.promptTokens, let steps = request.steps else {
@@ -273,6 +278,64 @@ extension GemmaRuntime {
                 nonce: sessionNonce,
                 ok: true,
                 token: token
+            )
+
+        case "decode_block":
+            let blockRequest = try validateExperimentalDecodeBlockRequest(
+                request,
+                decodedTokenCount: state.decodeStep
+            )
+            guard let cache = state.decodeCache else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker decode_block before decode_begin"
+                )
+            }
+            let (positionOffset, positionOverflow) =
+                state.decodeSeedTokenCount.addingReportingOverflow(state.decodeStep)
+            guard !positionOverflow else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker decode_block position offset overflows Int"
+                )
+            }
+
+            let tokens: [Int]
+            do {
+                tokens = try Gemma4SerialTargetBlockGenerator().generateBlock(
+                    previousToken: blockRequest.previousToken,
+                    maxBlockSize: blockRequest.maxBlockSize,
+                    cache: cache,
+                    positionOffset: positionOffset,
+                    weightCache: weightCache
+                )
+            } catch {
+                // A failed multi-forward request may have partially advanced
+                // device KV state. Poison this decode sequence so no later
+                // request can continue from an ambiguous cache position.
+                state.decodeCache = nil
+                throw error
+            }
+            guard !tokens.isEmpty, tokens.count <= blockRequest.maxBlockSize else {
+                state.decodeCache = nil
+                throw MLXFastError.invalidInput(
+                    "runtime worker decode_block generator returned an invalid block length"
+                )
+            }
+            let (nextDecodeStep, stepOverflow) =
+                state.decodeStep.addingReportingOverflow(tokens.count)
+            guard !stepOverflow,
+                  nextDecodeStep <= MLXFastConstants.experimentalMTPMaxTotalTokens
+            else {
+                state.decodeCache = nil
+                throw MLXFastError.invalidInput(
+                    "runtime worker decode_block exceeded the experimental token limit"
+                )
+            }
+            state.decodeStep = nextDecodeStep
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                tokens: tokens
             )
 
         case "phase_diagnostics":
@@ -490,15 +553,161 @@ struct RuntimeWorkerRequest: Codable {
     let token: Int?
     let seedTokens: [Int]?
     let steps: Int?
+    let maxBlockSize: Int?
 
-    enum CodingKeys: String, CodingKey {
+    init(
+        id: Int,
+        kind: String,
+        promptTokens: [Int]? = nil,
+        token: Int? = nil,
+        seedTokens: [Int]? = nil,
+        steps: Int? = nil,
+        maxBlockSize: Int? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.promptTokens = promptTokens
+        self.token = token
+        self.seedTokens = seedTokens
+        self.steps = steps
+        self.maxBlockSize = maxBlockSize
+    }
+
+    init(from decoder: Swift.Decoder) throws {
+        let wireContainer = try decoder.container(
+            keyedBy: RuntimeWorkerWireCodingKey.self
+        )
+        let allowedKeys = Set(CodingKeys.allCases.map(\.rawValue))
+        if let unknownKey = wireContainer.allKeys.first(
+            where: { !allowedKeys.contains($0.stringValue) }
+        ) {
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(
+                    codingPath: decoder.codingPath + [unknownKey],
+                    debugDescription:
+                        "runtime worker request contains unknown field \(unknownKey.stringValue)"
+                )
+            )
+        }
+
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(Int.self, forKey: .id)
+        kind = try container.decode(String.self, forKey: .kind)
+        promptTokens = try container.decodeIfPresent(
+            [Int].self,
+            forKey: .promptTokens
+        )
+        token = try container.decodeIfPresent(Int.self, forKey: .token)
+        seedTokens = try container.decodeIfPresent(
+            [Int].self,
+            forKey: .seedTokens
+        )
+        steps = try container.decodeIfPresent(Int.self, forKey: .steps)
+        maxBlockSize = try container.decodeIfPresent(
+            Int.self,
+            forKey: .maxBlockSize
+        )
+    }
+
+    func encode(to encoder: Swift.Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(kind, forKey: .kind)
+        try container.encodeIfPresent(promptTokens, forKey: .promptTokens)
+        try container.encodeIfPresent(token, forKey: .token)
+        try container.encodeIfPresent(seedTokens, forKey: .seedTokens)
+        try container.encodeIfPresent(steps, forKey: .steps)
+        try container.encodeIfPresent(maxBlockSize, forKey: .maxBlockSize)
+    }
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case id
         case kind
         case promptTokens = "prompt_tokens"
         case token
         case seedTokens = "seed_tokens"
         case steps
+        case maxBlockSize = "max_block_size"
     }
+}
+
+private struct RuntimeWorkerWireCodingKey: CodingKey {
+    let stringValue: String
+    let intValue: Int?
+
+    init?(stringValue: String) {
+        self.stringValue = stringValue
+        self.intValue = nil
+    }
+
+    init?(intValue: Int) {
+        self.stringValue = String(intValue)
+        self.intValue = intValue
+    }
+}
+
+struct ExperimentalDecodeBlockRequest: Equatable {
+    let previousToken: Int
+    let maxBlockSize: Int
+}
+
+func validateExperimentalDecodeBlockRequest(
+    _ request: RuntimeWorkerRequest,
+    decodedTokenCount: Int
+) throws -> ExperimentalDecodeBlockRequest {
+    guard request.kind == "decode_block" else {
+        throw MLXFastError.invalidInput(
+            "experimental block validation requires decode_block"
+        )
+    }
+    guard request.id > 0 else {
+        throw MLXFastError.invalidInput(
+            "runtime worker decode_block request id must be positive"
+        )
+    }
+    guard request.promptTokens == nil,
+          request.seedTokens == nil,
+          request.steps == nil
+    else {
+        throw MLXFastError.invalidInput(
+            "runtime worker decode_block request contains fields for another request kind"
+        )
+    }
+    guard let previousToken = request.token,
+          previousToken >= 0,
+          previousToken < MLXFastConstants.vocabSize
+    else {
+        throw MLXFastError.invalidInput(
+            "runtime worker decode_block request has an invalid token"
+        )
+    }
+    guard let maxBlockSize = request.maxBlockSize,
+          maxBlockSize > 0,
+          maxBlockSize <= MLXFastConstants.experimentalMTPMaxBlockSize
+    else {
+        throw MLXFastError.invalidInput(
+            "runtime worker decode_block max_block_size must be in "
+                + "1...\(MLXFastConstants.experimentalMTPMaxBlockSize)"
+        )
+    }
+    guard decodedTokenCount >= 0 else {
+        throw MLXFastError.invalidInput(
+            "runtime worker decode_block state has a negative token count"
+        )
+    }
+    let (requestedTotal, overflow) =
+        decodedTokenCount.addingReportingOverflow(maxBlockSize)
+    guard !overflow,
+          requestedTotal <= MLXFastConstants.experimentalMTPMaxTotalTokens
+    else {
+        throw MLXFastError.invalidInput(
+            "runtime worker decode_block request exceeds the experimental token limit"
+        )
+    }
+    return ExperimentalDecodeBlockRequest(
+        previousToken: previousToken,
+        maxBlockSize: maxBlockSize
+    )
 }
 
 struct RuntimeWorkerState {
@@ -654,6 +863,12 @@ final class RuntimeWorkerProtocolIO {
     }
 
     func writeLine(_ data: Data) throws {
+        guard data.count <= BufferedFileLineReader.defaultMaximumLineByteCount else {
+            throw MLXFastError.invalidInput(
+                "runtime worker protocol response exceeds "
+                    + "\(BufferedFileLineReader.defaultMaximumLineByteCount) bytes"
+            )
+        }
         try output.write(contentsOf: data)
         try output.write(contentsOf: Data([0x0a]))
     }
@@ -1074,6 +1289,17 @@ final class RuntimeWorkerClient {
         )
     }
 
+    func decodeBlock(
+        previousToken: Int,
+        maxBlockSize: Int
+    ) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "decode_block",
+            token: previousToken,
+            maxBlockSize: maxBlockSize
+        )
+    }
+
     func phaseDiagnostics() throws -> RuntimeWorkerResponse {
         try send(kind: "phase_diagnostics")
     }
@@ -1083,7 +1309,8 @@ final class RuntimeWorkerClient {
         promptTokens: [Int]? = nil,
         token: Int? = nil,
         seedTokens: [Int]? = nil,
-        steps: Int? = nil
+        steps: Int? = nil,
+        maxBlockSize: Int? = nil
     ) throws -> RuntimeWorkerResponse {
         guard process.isRunning else {
             throw MLXFastError.invalidInput("runtime worker exited before request \(kind): \(workerExitDiagnostic())")
@@ -1096,9 +1323,16 @@ final class RuntimeWorkerClient {
             promptTokens: promptTokens,
             token: token,
             seedTokens: seedTokens,
-            steps: steps
+            steps: steps,
+            maxBlockSize: maxBlockSize
         )
         var data = try encoder.encode(request)
+        guard data.count <= BufferedFileLineReader.defaultMaximumLineByteCount else {
+            throw MLXFastError.invalidInput(
+                "runtime worker protocol request exceeds "
+                    + "\(BufferedFileLineReader.defaultMaximumLineByteCount) bytes"
+            )
+        }
         data.append(0x0a)
         let watchdog = RuntimeWorkerWatchdog(
             process: process,
