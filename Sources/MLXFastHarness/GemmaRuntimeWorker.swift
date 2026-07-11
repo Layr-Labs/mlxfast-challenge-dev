@@ -76,20 +76,31 @@ extension GemmaRuntime {
         }
     }
 
-    /// Trusted allocator policy applied at every new worker forward sequence.
+    /// Trusted allocator state applied at the START of every new worker forward
+    /// sequence, after the parent has already started the phase timer.
     /// Submitted MLXFastModel code runs during worker initialization and may
     /// change the process-global MLX cache policy, so the trusted request
-    /// handler must restore it after the parent has started the phase timer.
-    static let trustedRuntimeWorkerCacheLimitBytes = 6 << 30
+    /// handler re-normalizes the allocator at the sequence boundary.
+    ///
+    /// Scope: the boundary only. This is NOT an enforced cap for the rest of
+    /// the phase -- editable code may change `Memory.cacheLimit` again inside
+    /// the charged window, and any allocation that follows is charged like all
+    /// other work. The substantive defense is `Memory.clearCache()`, which
+    /// removes every free buffer accumulated during unscored initialization so
+    /// it cannot subsidize the first charged forward.
+    static let trustedRuntimeWorkerPhaseStartCacheLimitBytes = 6 << 30
 
     static func resetRuntimeWorkerAllocatorForPhaseStart() throws {
-        Memory.cacheLimit = trustedRuntimeWorkerCacheLimitBytes
+        Memory.cacheLimit = trustedRuntimeWorkerPhaseStartCacheLimitBytes
         Memory.clearCache()
         let remainingCacheBytes = Memory.cacheMemory
         // The pinned MLX clearCache contract synchronously deallocates every
         // cached (free) buffer under its evaluation lock. Live model weights
         // and KV state are active memory, not cacheMemory, so exact zero is the
-        // safe fail-closed postcondition rather than a tolerance.
+        // safe fail-closed postcondition rather than a tolerance. This also
+        // makes "no MLX allocator activity in flight across a request
+        // boundary" part of the submission contract: background work that
+        // repopulates the cache here fails the run closed.
         guard remainingCacheBytes == 0 else {
             throw MLXFastError.invalidInput(
                 "runtime worker failed to clear the MLX allocator cache at phase start"

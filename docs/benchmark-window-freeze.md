@@ -30,10 +30,19 @@ Every forward the timed window charges MUST be:
 3. **Begin at a trusted MLX free-buffer boundary.** Worker initialization is
    unscored and executes editable model code, so the first request handler for
    every new forward sequence performs a trusted 6 GiB MLX free-buffer cache reset:
-   restore the fixed `Memory.cacheLimit`, call `Memory.clearCache()`, and
-   fail closed unless `Memory.cacheMemory == 0`. The pinned MLX API defines
-   `clearCache()` as synchronously deallocating all cached (free) buffers; live
-   model weights and KV state are active memory, so exact zero is safe here.
+   set `Memory.cacheLimit` to the trusted phase-start value, call
+   `Memory.clearCache()`, and fail closed unless `Memory.cacheMemory == 0`. The
+   pinned MLX API defines `clearCache()` as synchronously deallocating all
+   cached (free) buffers; live model weights and KV state are active memory, so
+   exact zero is safe here. The reset pins the phase-start state only -- it is
+   not an enforced cap for the rest of the phase: editable code may change
+   `Memory.cacheLimit` again inside the charged window, and any allocation that
+   follows is charged like all other work. The substantive defense is the
+   free-buffer clear, which stops unscored initialization from subsidizing the
+   first charged forward. The fail-closed zero check also makes "no MLX
+   allocator activity in flight across a request boundary" part of the
+   submission contract: background work that repopulates the cache at a
+   sequence boundary fails the run.
 
 The current window satisfies all three: one validated seed prefill plus 128
 validated single-token decode steps (decode axis), and one validated cold
@@ -51,8 +60,9 @@ Prefill axis (`measureWorkerPrefillSecondsPerToken`):
 - `benchmarkPrefillPromptTokens = 512` -- prompt length of the single timed forward.
 - `benchmarkPrefillWarmupRuns = 0` -- no warmup; the one timed run is cold.
 - `benchmarkPrefillTimedRuns = 1` -- exactly one measured, validated forward.
-- The `prefill` request restores the trusted allocator policy and clears the MLX
-  free-buffer cache before constructing its model cache or computing logits.
+- The `prefill` request applies the trusted phase-start allocator reset
+  (cache-limit set plus free-buffer clear) before constructing its model cache
+  or computing logits.
 
 Decode axis (`measureWorkerDecode` / worker `decode_begin` + `decode_step`):
 
@@ -61,8 +71,9 @@ Decode axis (`measureWorkerDecode` / worker `decode_begin` + `decode_step`):
 - `benchmarkDecodeSteps = 128` -- validated single-token teacher-forced steps.
 - Exactly one whole-prompt seed forward in `decode_begin`; the per-step forwards
   are single-token and input-dependent.
-- `decode_begin` restores the trusted allocator policy and clears the MLX
-  free-buffer cache before constructing the decode cache or computing seed logits.
+- `decode_begin` applies the trusted phase-start allocator reset (cache-limit
+  set plus free-buffer clear) before constructing the decode cache or computing
+  seed logits.
 
 Measurement authority (not a constant, but part of the frozen contract):
 

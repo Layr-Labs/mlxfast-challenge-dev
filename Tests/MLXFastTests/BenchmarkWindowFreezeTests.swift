@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 @testable import MLXFastCore
 @testable import MLXFastHarness
 @testable import MLXFastModel
@@ -135,17 +136,20 @@ func workerPhaseStartsResetTrustedAllocatorBeforeForwardSetup() throws {
     let worker = try packageFile("Sources/MLXFastHarness/GemmaRuntimeWorker.swift")
     let resetCall = "try resetRuntimeWorkerAllocatorForPhaseStart()"
 
-    // The policy and reset live in the trusted harness, not in editable model
-    // construction. MLX documents clearCache() as synchronously deallocating
-    // every cached (free) buffer, so a nonzero postcondition must fail closed.
-    #expect(worker.contains("static let trustedRuntimeWorkerCacheLimitBytes = 6 << 30"))
+    // The phase-start value and reset live in the trusted harness, not in
+    // editable model construction. MLX documents clearCache() as synchronously
+    // deallocating every cached (free) buffer, so a nonzero postcondition must
+    // fail closed. The reset pins the sequence-boundary state only (editable
+    // code may change the limit inside the charged window); the doc must say
+    // so instead of claiming a phase-long "policy" that is not enforced.
+    #expect(worker.contains("static let trustedRuntimeWorkerPhaseStartCacheLimitBytes = 6 << 30"))
     let allocatorReset = try slice(
         worker,
         from: "static func resetRuntimeWorkerAllocatorForPhaseStart()",
         to: "static func handleWorkerRequest("
     )
     let setLimit = try #require(
-        allocatorReset.range(of: "Memory.cacheLimit = trustedRuntimeWorkerCacheLimitBytes")
+        allocatorReset.range(of: "Memory.cacheLimit = trustedRuntimeWorkerPhaseStartCacheLimitBytes")
     )
     let clearCache = try #require(allocatorReset.range(of: "Memory.clearCache()"))
     let readCacheMemory = try #require(allocatorReset.range(of: "Memory.cacheMemory"))
@@ -203,7 +207,28 @@ func workerPhaseStartsResetTrustedAllocatorBeforeForwardSetup() throws {
 
     let doc = try packageFile("docs/benchmark-window-freeze.md")
     #expect(doc.contains("trusted 6 GiB MLX free-buffer cache reset"))
+    #expect(doc.contains("The reset pins the phase-start state only"))
+    #expect(doc.contains("not an enforced cap for the rest of the phase"))
     #expect(doc.contains("No allocator reset runs in `correctness_step` or `decode_step`"))
+}
+
+@Test
+func phaseStartAllocatorResetLeavesExactlyEmptyCacheWhenRuntimeTestsAreEnabled() throws {
+    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+        return
+    }
+    // Pin the MLX contract the fail-closed guard relies on: with no MLX work in
+    // flight, clearCache() leaves cacheMemory at exactly zero even when free
+    // buffers were just returned to the pool (mirroring unscored init warmup
+    // residue), so the trusted reset must succeed rather than fail closed.
+    Memory.cacheLimit = 32 << 30
+    do {
+        let scratch = MLXArray(Array(repeating: Float(1), count: 1 << 20), [1024, 1024])
+        eval(scratch + scratch)
+    }
+    try GemmaRuntime.resetRuntimeWorkerAllocatorForPhaseStart()
+    #expect(Memory.cacheMemory == 0)
+    #expect(Memory.cacheLimit == GemmaRuntime.trustedRuntimeWorkerPhaseStartCacheLimitBytes)
 }
 
 @Test

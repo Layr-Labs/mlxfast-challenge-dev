@@ -42,8 +42,10 @@ public final class Gemma4RuntimeWeightCache {
         // The ranked M5 Max has enough headroom to retain more freed
         // intermediate buffers for reuse. This is a soft allocator-cache cap,
         // not a reservation; model weights remain active allocations.
-        // The trusted runtime-worker request handler restores the fixed 6 GiB
-        // scored-phase limit and clears free buffers at each sequence boundary.
+        // The trusted runtime-worker request handler re-normalizes the
+        // allocator at each sequence boundary (phase-start cache-limit set
+        // plus free-buffer clear). That reset pins the boundary state only,
+        // not a phase-long cap.
         if config.numHiddenLayers >= 16 {
             // The MLX M5 Max default commits after referencing 50 MiB. Many
             // 4-bit projections individually exceed that, so use a moderate
