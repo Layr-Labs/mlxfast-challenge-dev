@@ -15,39 +15,36 @@ func gemma4LastTokenHidden(_ hidden: MLXArray) -> MLXArray {
     return hidden[0..., range, 0...]
 }
 
-/// The pinned mlx-swift-lm Gemma 4 trunk with a last-token-only language head.
-/// Every benchmark consumer reads only the final sequence row, so projecting
-/// earlier rows to the 262k vocabulary is dead work.
+/// Scored Gemma 4 runtime model: loads the pinned library trunk modules, then
+/// executes a custom high-performance path with fused compiled MLPs and a
+/// last-token-only vocabulary head while keeping eager active-length attention.
 public final class Gemma4RuntimeModel: Module, LanguageModel {
     @ModuleInfo(key: "model") var model: Gemma4TextModelInner
 
-    private let config: Gemma4TextConfiguration
-
-    private static let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray = {
-        let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { logits, cap in
-            tanh(logits / cap) * cap
-        }
-        let enabled: Bool
-        if let raw = ProcessInfo.processInfo.environment["MLX_COMPILED_DECODE"] {
-            enabled = ["1", "true", "yes", "on"].contains(raw.lowercased())
-        } else {
-            enabled = true
-        }
-        return enabled ? compile(shapeless: true, body) : body
-    }()
+    public let configuration: Gemma4TextConfiguration
+    private var fastEngine: Gemma4FastEngine?
 
     public init(_ config: Gemma4TextConfiguration) {
-        self.config = config
+        self.configuration = config
         self._model.wrappedValue = Gemma4TextModelInner(config)
         super.init()
     }
 
+    /// Build the fused-MLP engine after weights have been loaded and quantized.
+    public func prepareFastEngine() throws {
+        fastEngine = try Gemma4FastEngine(model: self)
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        if let fastEngine {
+            return fastEngine(inputs, cache: cache)
+        }
+        // Fallback before prepareFastEngine(): library trunk + last-token head.
         let fullHidden = model(inputs, cache: cache)
         let hidden = gemma4LastTokenHidden(fullHidden)
-        let cap = MLXArray(config.finalLogitSoftcapping)
-        let logits = Self.logitSoftcap(model.embedTokens.asLinear(hidden), cap)
-        return logits
+        let logits = model.embedTokens.asLinear(hidden)
+        return tanh(logits / MLXArray(configuration.finalLogitSoftcapping))
+            * MLXArray(configuration.finalLogitSoftcapping)
     }
 
     public func prepare(
@@ -59,12 +56,12 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
     }
 
     public func newCache(parameters _: GenerateParameters?) -> [KVCache] {
-        let firstSharedLayer = config.numHiddenLayers - config.numKvSharedLayers
+        let firstSharedLayer = configuration.numHiddenLayers - configuration.numKvSharedLayers
         return (0..<firstSharedLayer).map { layerIndex in
-            if config.layerTypes[layerIndex] == Gemma4LayerType.full.rawValue {
+            if configuration.layerTypes[layerIndex] == Gemma4LayerType.full.rawValue {
                 StandardKVCache()
             } else {
-                RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
+                RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
             }
         }
     }
