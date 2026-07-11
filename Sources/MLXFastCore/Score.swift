@@ -69,10 +69,13 @@ public enum BenchmarkScore {
         decodeFloor: Double = MLXFastConstants.scoreDecodeSpeedupFloor,
         prefillFloor: Double = MLXFastConstants.scorePrefillSpeedupFloor
     ) -> String {
-        "performance floor failed: decode_speedup=\(decodeSpeedup) "
-            + "floor=\(decodeFloor) "
-            + "prefill_speedup=\(prefillSpeedup) "
-            + "floor=\(prefillFloor)"
+        func format(_ value: Double) -> String {
+            String(format: "%.6f", locale: Locale(identifier: "en_US_POSIX"), value)
+        }
+        return "performance floor failed: decode_speedup=\(format(decodeSpeedup)) "
+            + "floor=\(format(decodeFloor)) "
+            + "prefill_speedup=\(format(prefillSpeedup)) "
+            + "floor=\(format(prefillFloor))"
     }
 
     public static func evaluateTimedRun(
@@ -251,8 +254,8 @@ public struct ScoreMetrics: Codable, Equatable {
     // True whenever this metrics payload still contains baseline-placeholder
     // values for the fields a gates-only or timing-only machine did not itself
     // measure (see BenchmarkOptions.checkGates/skipTimedBenchmark). The ONLY
-    // thing that clears this to false today is benchmark.yml's "Merge gates and
-    // timing into machine1" step -- a defense-in-depth marker so a future
+    // thing that clears this to false today is benchmark.yml's "Overlay paired
+    // timing into final score" step -- a defense-in-depth marker so a future
     // regression there has a structural signal to check, instead of relying solely on the YAML wiring
     // being correct.
     public let partialResult: Bool

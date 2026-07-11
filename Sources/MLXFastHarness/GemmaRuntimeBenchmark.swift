@@ -21,7 +21,6 @@ extension GemmaRuntime {
         let benchmarkStart = DispatchTime.now().uptimeNanoseconds
         let progress = makeBenchmarkProgressReporter(startedAt: benchmarkStart)
         var correctnessReport: CorrectnessReport?
-        var benchmarkLoader: Gemma4WeightLoader?
         var transformedWeightsDigest: DirectoryDigest?
         var preflightSeconds = 0.0
         var correctnessSeconds = 0.0
@@ -145,7 +144,6 @@ extension GemmaRuntime {
             }
 
             let runtimeBenchmarkLoader = try Gemma4WeightLoader(weightsPath: options.weightsPath)
-            benchmarkLoader = runtimeBenchmarkLoader
             let benchmarkCache = Gemma4RuntimeWeightCache(loader: runtimeBenchmarkLoader, config: config)
             guard let benchmarkGolden = golden.benchmark else {
                 throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
