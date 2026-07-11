@@ -62,6 +62,98 @@ public enum BenchmarkScore {
         }
         return decodeSpeedup >= decodeFloor && prefillSpeedup >= prefillFloor
     }
+
+    public static func speedupFloorFailureMessage(
+        decodeSpeedup: Double,
+        prefillSpeedup: Double,
+        decodeFloor: Double = MLXFastConstants.scoreDecodeSpeedupFloor,
+        prefillFloor: Double = MLXFastConstants.scorePrefillSpeedupFloor
+    ) -> String {
+        "performance floor failed: decode_speedup=\(decodeSpeedup) "
+            + "floor=\(decodeFloor) "
+            + "prefill_speedup=\(prefillSpeedup) "
+            + "floor=\(prefillFloor)"
+    }
+
+    public static func evaluateTimedRun(
+        decodeSecondsPerToken: Double,
+        prefillSecondsPerToken: Double,
+        baselineDecodeSecondsPerToken: Double,
+        baselinePrefillSecondsPerToken: Double
+    ) -> TimedRunScoreEvaluation {
+        let score = score(
+            decodeSecondsPerToken: decodeSecondsPerToken,
+            prefillSecondsPerToken: prefillSecondsPerToken,
+            baselineDecodeSecondsPerToken: baselineDecodeSecondsPerToken,
+            baselinePrefillSecondsPerToken: baselinePrefillSecondsPerToken
+        )
+        let decodeSpeedup = speedup(
+            baselineSecondsPerToken: baselineDecodeSecondsPerToken,
+            candidateSecondsPerToken: decodeSecondsPerToken
+        )
+        let prefillSpeedup = speedup(
+            baselineSecondsPerToken: baselinePrefillSecondsPerToken,
+            candidateSecondsPerToken: prefillSecondsPerToken
+        )
+        let prefillBand = AcceptanceBand.check(
+            value: prefillSecondsPerToken,
+            reference: baselinePrefillSecondsPerToken,
+            upTolerance: MLXFastConstants.prefillBandUpTolerance,
+            downTolerance: MLXFastConstants.prefillBandDownTolerance,
+            label: "prefill"
+        )
+        let decodeBand = AcceptanceBand.check(
+            value: decodeSecondsPerToken,
+            reference: baselineDecodeSecondsPerToken,
+            upTolerance: MLXFastConstants.decodeBandUpTolerance,
+            downTolerance: MLXFastConstants.decodeBandDownTolerance,
+            label: "decode"
+        )
+        return TimedRunScoreEvaluation(
+            score: score,
+            decodeSpeedup: decodeSpeedup,
+            prefillSpeedup: prefillSpeedup,
+            passesFloors: passesSpeedupFloors(
+                decodeSpeedup: decodeSpeedup,
+                prefillSpeedup: prefillSpeedup
+            ),
+            prefillBand: prefillBand,
+            decodeBand: decodeBand
+        )
+    }
+}
+
+public struct TimedRunScoreEvaluation: Equatable {
+    public let score: Double
+    public let decodeSpeedup: Double
+    public let prefillSpeedup: Double
+    public let passesFloors: Bool
+    public let prefillBand: AcceptanceBandResult
+    public let decodeBand: AcceptanceBandResult
+
+    public var hasFiniteScore: Bool {
+        score.isFinite && score >= 0
+    }
+
+    public var passesAcceptanceBands: Bool {
+        prefillBand.passed && decodeBand.passed
+    }
+
+    public func firstFailureReason() -> String? {
+        if !hasFiniteScore {
+            return "computed score was not finite"
+        }
+        if !passesFloors {
+            return BenchmarkScore.speedupFloorFailureMessage(
+                decodeSpeedup: decodeSpeedup,
+                prefillSpeedup: prefillSpeedup
+            )
+        }
+        if !passesAcceptanceBands {
+            return "acceptance band failed: \(prefillBand.passed ? decodeBand.reason : prefillBand.reason)"
+        }
+        return nil
+    }
 }
 
 public struct ScorePayload: Codable, Equatable {
@@ -161,8 +253,7 @@ public struct ScoreMetrics: Codable, Equatable {
     // measure (see BenchmarkOptions.checkGates/skipTimedBenchmark). The ONLY
     // thing that clears this to false today is benchmark.yml's "Merge gates and
     // timing into machine1" step -- a defense-in-depth marker so a future
-    // regression there (or anywhere combine assembles the final score) has a
-    // structural signal to check, instead of relying solely on the YAML wiring
+    // regression there has a structural signal to check, instead of relying solely on the YAML wiring
     // being correct.
     public let partialResult: Bool
 
@@ -571,8 +662,8 @@ extension ScoreMetrics {
     /// to `figures` significant figures, to shrink the timing/memory covert channel
     /// that submitted model code can drive. Ranking- and floor-critical fields
     /// (decode/prefill seconds-per-token, speedups, floors, baselines) are left
-    /// untouched so scoring, the speedup-floor gate, and the parallel-combine merge
-    /// are all bit-unaffected. Ordering pairs the validators assert are re-clamped
+    /// untouched so scoring and the speedup-floor gate are bit-unaffected.
+    /// Ordering pairs the validators assert are re-clamped
     /// after rounding as belt-and-suspenders.
     public func withCoarsenedPublicDiagnostics(
         figures: Int = MLXFastConstants.publicDiagnosticSignificantFigures

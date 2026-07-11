@@ -271,14 +271,16 @@ func scoredBaselinesResolveFromGoldenWithConstantsFallback() throws {
     #expect(golden.contains("must be provided together"))
 
     let benchmark = try packageFile("Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift")
+    let score = try packageFile("Sources/MLXFastCore/Score.swift")
     // Both benchmark paths adopt the golden's resolved baselines...
     #expect(benchmark.components(separatedBy: "benchmarkGolden.resolvedBaselinePrefillSecondsPerToken").count - 1 == 2)
     #expect(benchmark.components(separatedBy: "benchmarkGolden.resolvedBaselineDecodeSecondsPerToken").count - 1 == 2)
     // ...and every scored speedup uses the resolved values, never the raw constants.
-    #expect(benchmark.contains("baselineSecondsPerToken: baselineDecodeSecondsPerToken"))
-    #expect(benchmark.contains("baselineSecondsPerToken: baselinePrefillSecondsPerToken"))
-    #expect(!benchmark.contains("baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken"))
-    #expect(!benchmark.contains("baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken"))
+    #expect(score.contains("baselineSecondsPerToken: baselineDecodeSecondsPerToken"))
+    #expect(score.contains("baselineSecondsPerToken: baselinePrefillSecondsPerToken"))
+    #expect(benchmark.contains("BenchmarkScore.evaluateTimedRun("))
+    #expect(!score.contains("baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken"))
+    #expect(!score.contains("baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken"))
 }
 
 @Test

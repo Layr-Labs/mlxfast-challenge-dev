@@ -341,3 +341,15 @@ public struct RuntimeWorkerOptions: Equatable {
 
 // Implementation lives in the GemmaRuntime*.swift split files.
 public enum GemmaRuntime {}
+
+extension GemmaRuntime {
+    /// Dense Gemma 4 keeps every text-tower weight RAM-resident; there is no
+    /// expert streaming machinery, so score/worker protocol fields stay zero.
+    static func expertStats(from _: Gemma4RuntimeWeightCache) -> ExpertStreamingStats {
+        .zero
+    }
+
+    static func expertStats(from _: Gemma4WeightLoader?) -> ExpertStreamingStats {
+        .zero
+    }
+}

@@ -67,7 +67,7 @@ jobs:
       # mirror" (a dispatched ref with a modified setup.sh could exfiltrate any
       # injected credential). A prior version pulled the base-URL/auth-header
       # repo credentials in here -- the same exposure already removed from
-      # parallel-correctness-probe-slice.yml. Removed: the probe exists to test
+      # other operator probe workflows. Removed: the probe exists to test
       # the cache backend, not the private mirror, and both setup.sh and
       # download-reference-cache-scope.sh verify every byte against the pinned
       # manifest, so the public Hugging Face mirror (no auth header) is fully

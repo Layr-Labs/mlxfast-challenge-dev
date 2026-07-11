@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Write a reproducible content hash of a transformed weights/ tree to stdout (or a file
-# if given a second argument). Run identically on every machine in a parallel-correctness
-# fleet so combine-parallel-correctness.sh can confirm they all transformed to
-# byte-identical output before trusting any of their results together.
+# if given a second argument). The digest is path-independent so independent machines
+# with byte-identical weights/ under different roots still agree.
 set -euo pipefail
 
 WEIGHTS_PATH="${1:?usage: hash-weights-directory.sh WEIGHTS_PATH [OUTPUT_PATH]}"
