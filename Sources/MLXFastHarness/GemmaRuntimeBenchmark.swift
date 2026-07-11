@@ -187,7 +187,7 @@ extension GemmaRuntime {
             let expertStats = ExpertStreamingStats.zero
 
             if let failureReason = evaluation.firstFailureReason() {
-                let includeTimings = evaluation.hasFiniteScore && evaluation.passesFloors
+                let includeTimings = evaluation.hasFiniteScore
                 return makeFailedScore(
                     error: failureReason,
                     correctness: correctnessReport,
