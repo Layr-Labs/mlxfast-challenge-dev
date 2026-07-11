@@ -57,6 +57,12 @@ private struct FastMLPTailWeights: @unchecked Sendable {
     let layerScalar: MLXArray
 }
 
+private struct FastAttentionTailContext: @unchecked Sendable {
+    let projection: FastQuantizedProjection
+    let postNorm: MLXArray
+    let eps: Float
+}
+
 /// Approximate tanh-GELU using `x*x*x` (compile-safe), matching the library.
 private let fastGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray) -> MLXArray = { x in
@@ -101,6 +107,7 @@ final class Gemma4FastLayer {
     let layerScalar: MLXArray
 
     let rope: RoPELayer
+    let fusedAttentionTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let fusedMLP: @Sendable (MLXArray) -> MLXArray
     let fusedMLPTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let fusedGateUp: FusedGateUpProjection?
@@ -221,6 +228,33 @@ final class Gemma4FastLayer {
         self.postFfnNormWeight = postFfnNorm.weight
         self.layerScalar = layerScalar
         self.rope = rope
+
+        let attentionTailEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_ATTENTION_TAIL"] {
+            attentionTailEnabled = ["1", "true", "yes", "on"].contains(raw.lowercased())
+        } else {
+            attentionTailEnabled = true
+        }
+        if attentionTailEnabled {
+            let attentionContext = FastAttentionTailContext(
+                projection: self.oProj,
+                postNorm: postAttnNorm.weight,
+                eps: eps
+            )
+            let attentionTailBody: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+                attention, residual in
+                let projected = attentionContext.projection(attention)
+                let normalized = MLXFast.rmsNorm(
+                    projected,
+                    weight: attentionContext.postNorm,
+                    eps: attentionContext.eps
+                )
+                return residual + normalized
+            }
+            self.fusedAttentionTail = compile(shapeless: true, attentionTailBody)
+        } else {
+            self.fusedAttentionTail = nil
+        }
 
         // Fuse the gated MLP into one compiled closure: collapses gate/up/GELU/
         // product/down graph construction. Keep two quantizedMMs (not a packed
@@ -452,8 +486,14 @@ final class Gemma4FastLayer {
         }
 
         let mergedAttention = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
-        let attnOut = oProj(mergedAttention)
-        var out = residual + MLXFast.rmsNorm(attnOut, weight: postAttnNormWeight, eps: eps)
+        var out: MLXArray
+        if B == 1, L == 1, let fusedAttentionTail {
+            out = fusedAttentionTail(mergedAttention, residual)
+        } else {
+            let attnOut = oProj(mergedAttention)
+            out = residual + MLXFast.rmsNorm(
+                attnOut, weight: postAttnNormWeight, eps: eps)
+        }
         let residual2 = out
         if B == 1, L == 1, let fusedGateUp, let fusedGateUpPostTail {
             let normalized = MLXFast.rmsNorm(out, weight: preFfnNormWeight, eps: eps)
