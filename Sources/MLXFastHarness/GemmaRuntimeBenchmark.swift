@@ -147,15 +147,14 @@ extension GemmaRuntime {
             guard let benchmarkGolden = golden.benchmark else {
                 throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
             }
-            let promptPlan = try BenchmarkPrompt.plan(from: benchmarkGolden)
             let pairedBaseline = try PairedBaselineOverride.fromEnvironment()
             baselinePrefillSecondsPerToken = pairedBaseline?.prefillSecondsPerToken
                 ?? benchmarkGolden.resolvedBaselinePrefillSecondsPerToken
             baselineDecodeSecondsPerToken = pairedBaseline?.decodeSecondsPerToken
                 ?? benchmarkGolden.resolvedBaselineDecodeSecondsPerToken
             progress(
-                "benchmark oracle ready prefill_tokens=\(promptPlan.prefillTokens.count) "
-                    + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
+                "benchmark oracle ready prefill_tokens=\(benchmarkGolden.prefillPromptTokens.count) "
+                    + "decode_seed_tokens=\(benchmarkGolden.decodeSeedTokens.count) "
                     + "decode_tokens=\(options.benchmarkDecodeSteps) "
                     + "baseline_source=\(baselineSourceLabel(paired: pairedBaseline, golden: benchmarkGolden))"
             )
@@ -164,15 +163,15 @@ extension GemmaRuntime {
             let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
             progress("timed benchmark start")
             let prefillSecondsPerToken = try measurePrefillSecondsPerToken(
-                promptTokens: promptPlan.prefillTokens,
-                expectedToken: promptPlan.expectedPrefillToken,
+                promptTokens: benchmarkGolden.prefillPromptTokens,
+                expectedToken: benchmarkGolden.expectedPrefillToken,
                 weightCache: benchmarkCache,
                 progress: progress
             )
             let decode = try measureDecode(
-                seedTokens: promptPlan.decodeSeedTokens,
-                expectedSeedToken: promptPlan.expectedDecodeSeedToken,
-                expectedTokens: promptPlan.expectedDecodeTokens,
+                seedTokens: benchmarkGolden.decodeSeedTokens,
+                expectedSeedToken: benchmarkGolden.expectedDecodeSeedToken,
+                expectedTokens: benchmarkGolden.expectedDecodeTokens,
                 decodeSteps: options.benchmarkDecodeSteps,
                 weightCache: benchmarkCache,
                 progress: progress
@@ -479,15 +478,14 @@ extension GemmaRuntime {
             guard let benchmarkGolden = golden.benchmark else {
                 throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
             }
-            let promptPlan = try BenchmarkPrompt.plan(from: benchmarkGolden)
             let pairedBaseline = try PairedBaselineOverride.fromEnvironment()
             baselinePrefillSecondsPerToken = pairedBaseline?.prefillSecondsPerToken
                 ?? benchmarkGolden.resolvedBaselinePrefillSecondsPerToken
             baselineDecodeSecondsPerToken = pairedBaseline?.decodeSecondsPerToken
                 ?? benchmarkGolden.resolvedBaselineDecodeSecondsPerToken
             progress(
-                "benchmark oracle ready prefill_tokens=\(promptPlan.prefillTokens.count) "
-                    + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
+                "benchmark oracle ready prefill_tokens=\(benchmarkGolden.prefillPromptTokens.count) "
+                    + "decode_seed_tokens=\(benchmarkGolden.decodeSeedTokens.count) "
                     + "decode_tokens=\(options.benchmarkDecodeSteps) "
                     + "baseline_source=\(baselineSourceLabel(paired: pairedBaseline, golden: benchmarkGolden))"
             )
@@ -532,8 +530,8 @@ extension GemmaRuntime {
                         prefillWorker.close()
                     }
                     prefillSecondsPerToken = try measureWorkerPrefillSecondsPerToken(
-                        promptTokens: promptPlan.prefillTokens,
-                        expectedToken: promptPlan.expectedPrefillToken,
+                        promptTokens: benchmarkGolden.prefillPromptTokens,
+                        expectedToken: benchmarkGolden.expectedPrefillToken,
                         worker: prefillWorker,
                         progress: progress,
                         peakRamGB: &peakRamGB,
@@ -550,9 +548,9 @@ extension GemmaRuntime {
                         decodeWorker.close()
                     }
                     decode = try measureWorkerDecode(
-                        seedTokens: promptPlan.decodeSeedTokens,
-                        expectedSeedToken: promptPlan.expectedDecodeSeedToken,
-                        expectedTokens: promptPlan.expectedDecodeTokens,
+                        seedTokens: benchmarkGolden.decodeSeedTokens,
+                        expectedSeedToken: benchmarkGolden.expectedDecodeSeedToken,
+                        expectedTokens: benchmarkGolden.expectedDecodeTokens,
                         decodeSteps: options.benchmarkDecodeSteps,
                         worker: decodeWorker,
                         progress: progress,

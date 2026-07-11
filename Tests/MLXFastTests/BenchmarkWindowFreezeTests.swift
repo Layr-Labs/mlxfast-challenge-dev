@@ -92,10 +92,6 @@ func benchmarkWindowFreezeDocMatchesConstants() throws {
 func timedDecodeChargesOneValidatedSeedForward() throws {
     let worker = try packageFile("Sources/MLXFastHarness/GemmaRuntimeWorker.swift")
     let decodeBegin = try slice(worker, from: "case \"decode_begin\":", to: "case \"decode_step\":")
-    // The one-forward/no-warmup property is also guarded by
-    // BenchmarkScriptTests.decodeMeasurementRunsSingleUnmemoizableSeedForward;
-    // this test intentionally supersets it (it additionally pins parent-timed,
-    // oracle-validated measurement) so the freeze guard stands on its own.
     // Exactly one whole-prompt forward, and no warmup pass to memoize against it.
     #expect(decodeBegin.components(separatedBy: "Gemma4Model.logits(").count - 1 == 1)
     #expect(!decodeBegin.contains("warmupCache"))
