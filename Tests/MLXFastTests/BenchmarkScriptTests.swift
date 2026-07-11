@@ -1925,8 +1925,7 @@ func compareTeacherForcedWithWorkerSupportsStartStepForParallelCorrectness() thr
 
     // 0 is an explicit, documented allowance for BenchmarkOptions.correctnessSteps
     // -- the harness never treats a steps=0 run as having verified correctness on
-    // its own; only the external combiner that ANDs every machine's real result
-    // together may do that.
+    // its own; a multi-machine workflow must AND every machine's real result together.
     #expect(runtime.contains("guard options.correctnessSteps >= 0 else {"))
     #expect(!runtime.contains("guard options.correctnessSteps > 0 else {"))
 }
@@ -1995,34 +1994,6 @@ func benchmarkSplitsGatesAndTimingOntoSeparateMachinesWithoutSpuriousSemanticCap
     #expect(cli.contains("MLXFAST_BENCHMARK_SKIP_TIMED"))
     #expect(cli.contains("checkGates: checkGates,"))
     #expect(cli.contains("skipTimedBenchmark: skipTimedBenchmark"))
-}
-
-// Regression test for a review finding: the combiner needs to know which
-// ABSOLUTE range each machine actually checked, not just how many steps it
-// checked, to detect overlapping/gapped range assignments. --step-range-output
-// writes that range unconditionally (before the check even runs, so it's
-// present even on a failing run) to a sidecar file separate from
-// correctness-report.json -- deliberately not added as a new field on
-// CorrectnessReport, since correctness-report.json's exact key set is enforced
-// by a strict same_keys check in the official "Validate correctness artifacts"
-// workflow step, and adding a key there would break that gate.
-@Test
-func correctnessStepRangeOutputWritesSidecarSeparateFromReport() throws {
-    let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
-
-    #expect(cli.contains("\"--step-range-output\""))
-    #expect(cli.contains("--step-range-output requires --step-range"))
-    #expect(cli.contains("\"{\\\"step_range_start\\\":\\(stepStart),\\\"step_range_end\\\":\\(stepStart + stepCount)}\\n\""))
-    #expect(cli.contains("try requirePrivateOutputPath(stepRangeOutputPath, description: \"step-range report\")"))
-    #expect(cli.contains("[--step-range-output PATH]"))
-
-    // correctness-report.json's schema must stay untouched by this feature --
-    // the official correctness validation still checks golden_hash and no
-    // step-range-specific key leaked into the workflow's validation.
-    let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
-    #expect(workflow.contains(".golden_hash == $golden_hash"))
-    #expect(!workflow.contains("step_range_start"))
-    #expect(!workflow.contains("step_range_end"))
 }
 
 @Test
@@ -2155,12 +2126,8 @@ func hashWeightsDirectoryIsIndependentOfWeightsPathButSensitiveToContent() throw
     #expect(try hash(renamedFile) != hashA)
 }
 
-// The published (combined) score is reassembled here by jq and re-derives some
-// diagnostics at full precision (expert_hit_rate) or reintroduces it
-// (correctness/expert_read seconds), so the combiner must apply the same 2-sig-fig
-// coarsening the Swift harness applies per machine -- otherwise the leaderboard
-// artifact still leaks a fine-grained timing/memory covert channel. Ranking fields
-// stay precise; validator ordering pairs stay ordered.
+// Published score payloads must apply the same diagnostic coarsening whether
+// they are written to disk or emitted on stdout.
 @Test
 func sealedStdoutScoreIsCoarsenedLikeTheWrittenFile() throws {
     // benchmark.sh rebuilds score.json from emitScorePayloadToStdout's output, so

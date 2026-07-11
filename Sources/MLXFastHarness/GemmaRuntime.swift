@@ -10,20 +10,17 @@ public struct CorrectnessOptions: Equatable {
     public let weightsPath: String
     public let goldenPath: String
     // Check only the [stepStart, stepStart + stepCount) slice of the teacher-forced
-    // window instead of the full [0, correctnessSteps) range. Lets a fleet of machines
-    // each verify a disjoint slice of the same case in parallel; see
+    // window instead of the full [0, correctnessSteps) range. Useful for operator
+    // tooling that splits the base case across worker runs; see
     // compareTeacherForcedWithWorker for why this is sound under teacher forcing.
     // stepCount defaults to MLXFastConstants.correctnessSteps when nil, matching the
     // pre-existing full-range behavior. Only honored on the runtime-worker code path.
     public let stepStart: Int
     public let stepCount: Int?
     // When true, skip anchors/free-run/behavior/GPQA gates entirely and check only
-    // golden.cases (the base case). Without this, a machine checking a step-range
-    // slice of the base case still runs every gate in the golden file, and its
-    // checked_steps total becomes base-slice-length + gate-step-counts -- not
-    // comparable across machines and not what a range-coverage check expects. Use
-    // this on every machine that's assigned a base-case slice; leave it off on
-    // whichever machine (if any) is responsible for the gates.
+    // golden.cases (the base case). Without this, a worker run with --step-range
+    // still runs every gate in the golden file and its checked_steps total becomes
+    // base-slice-length + gate-step-counts instead of just the slice.
     public let baseCaseOnly: Bool
 
     public init(

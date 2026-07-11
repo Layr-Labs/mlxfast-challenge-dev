@@ -138,7 +138,7 @@ private enum MLXFastCLI {
 
     private static func runCorrectness(_ options: ParsedOptions) throws -> Int {
         try options.validate(
-            valueOptions: ["--weights", "--golden", "--step-range", "--step-range-output"],
+            valueOptions: ["--weights", "--golden", "--step-range"],
             flagOptions: ["--base-case-only"]
         )
         let weightsPath = options.value(
@@ -163,18 +163,6 @@ private enum MLXFastCLI {
         )
         let baseCaseOnly = options.hasFlag("--base-case-only")
             || environmentValue("MLXFAST_CORRECTNESS_BASE_CASE_ONLY", fallback: "0") == "1"
-        // Recorded independent of pass/fail and before the check even runs so
-        // operator tooling can persist the assigned range separately from
-        // checked_steps, which is truncated on failure.
-        let stepRangeOutputPath = options.value(for: "--step-range-output", default: "")
-        if !stepRangeOutputPath.isEmpty {
-            guard let stepCount else {
-                throw MLXFastError.invalidInput("--step-range-output requires --step-range")
-            }
-            try requirePrivateOutputPath(stepRangeOutputPath, description: "step-range report")
-            let sidecar = "{\"step_range_start\":\(stepStart),\"step_range_end\":\(stepStart + stepCount)}\n"
-            try sidecar.write(toFile: stepRangeOutputPath, atomically: true, encoding: .utf8)
-        }
         let report = try GemmaRuntime.runCorrectness(
             CorrectnessOptions(
                 weightsPath: weightsPath,
@@ -371,11 +359,10 @@ private enum MLXFastCLI {
         }
         // Lets a run skip the base teacher-forced case (still runs behavior/GPQA/TTFT/
         // timing) when a separate fleet of machines verifies that case's step range in
-        // parallel. Defaults to the full official window, unchanged from before this
-        // existed. See the comment on BenchmarkPreflight/validateBenchmarkOptions for why
-        // 0 is accepted: the harness never treats a steps=0 run as self-certifying
-        // correctness, only the combiner that ANDs every machine's real result together
-        // may do that.
+        // parallel on a separate machine. Defaults to the full official window,
+        // unchanged from before this existed. See validateBenchmarkOptions for
+        // why 0 is accepted: the harness never treats a steps=0 run as
+        // self-certifying correctness by itself.
         let correctnessSteps = try parseNonNegativeInt(
             environmentValue(
                 "MLXFAST_BENCHMARK_CORRECTNESS_STEPS",
@@ -1380,7 +1367,7 @@ private enum MLXFastCLI {
             Usage:
               mlxfast-swift transform [--reference PATH] [--output PATH]
               mlxfast-swift verify-transform [--reference PATH] [--weights PATH] [--tmp-parent PATH] [--max-bytes N]
-              mlxfast-swift correctness [--weights PATH] [--golden PATH] [--step-range START-END] [--step-range-output PATH] [--base-case-only]
+              mlxfast-swift correctness [--weights PATH] [--golden PATH] [--step-range START-END] [--base-case-only]
               mlxfast-swift correctness-trace [--weights PATH] [--golden PATH] [--case NAME] --step N [--top-k N]
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--local-submit|--local-iterate] [--weights PATH] [--golden PATH] [--score-path PATH]
