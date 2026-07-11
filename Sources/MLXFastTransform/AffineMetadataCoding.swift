@@ -193,6 +193,7 @@ enum AffineMetadataCoding {
                 || suffix == ".self_attn.q_proj.weight"
                 || suffix == ".self_attn.k_proj.weight"
                 || suffix == ".self_attn.v_proj.weight"
+                || suffix == ".self_attn.o_proj.weight"
         else {
             return nil
         }
