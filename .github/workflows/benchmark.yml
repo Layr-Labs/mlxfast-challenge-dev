@@ -19,15 +19,10 @@ name: benchmark
 #              AND both 0.95 speedup floors
 #   score = decode_speedup^0.75 * prefill_speedup^0.25 from the paired timing,
 #           null when any gate fails.
-# The old `combine` job's AND-of-verdicts + timing overlay is folded into this
-# job: the gates/base-case pass produces one harness score.json (base case and
-# gates run in ONE `mlxfast-swift benchmark` invocation, so passed_correctness
-# and correctness_seconds natively cover base+gates -- the serial semantics the
-# combiner used to reconstruct), the semantic judge patches it, and
-# overlay-paired-timing.sh overlays the measured paired timing (the old
-# combine "Merge gates and timing into machine1" step, without the cross-
-# machine weights-hash tripwire, which is structurally unnecessary here: one
-# transform produces the one weights/ tree every phase uses).
+# The gates/base-case pass produces one harness score.json (base case and gates
+# run in ONE `mlxfast-swift benchmark` invocation, so passed_correctness and
+# correctness_seconds natively cover base+gates), the semantic judge patches
+# it, and overlay-paired-timing.sh overlays the measured paired timing.
 #
 # MEASUREMENT-DELTA ORDERING (the crux):
 # The timed prefill/decode measurement runs LAST, after all compute-heavy
@@ -888,9 +883,8 @@ jobs:
       # parallel wall-clock speed; teacher forcing makes the verdict identical
       # run whole or sliced) AND runs the anchor/free-run/behavior/GPQA gates,
       # GPQA TTFT, and the semantic-answer capture, while SKIPPING the timed
-      # benchmark (MLXFAST_BENCHMARK_SKIP_TIMED=1). This restores the original
-      # serial semantics the parallel combine had to reconstruct:
-      # passed_correctness and correctness_seconds natively cover base + gates.
+      # benchmark (MLXFAST_BENCHMARK_SKIP_TIMED=1). passed_correctness and
+      # correctness_seconds natively cover base + gates in one invocation.
       # The timed measurement deliberately does NOT happen here -- it runs LAST,
       # behind measure-job's fixed 40C thermal gate (see header).
       - name: Correctness and gates (full base case + hidden gates, no timing)

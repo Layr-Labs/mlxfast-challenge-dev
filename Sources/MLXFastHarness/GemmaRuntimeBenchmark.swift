@@ -251,13 +251,8 @@ extension GemmaRuntime {
     }
 
     static func validateBenchmarkOptions(_ options: BenchmarkOptions) throws {
-        // 0 is allowed deliberately: it means "skip the base teacher-forced case on this
-        // run" (still runs anchors/free-run/behavior/GPQA/TTFT/timing), for operator
-        // workflows that verify the base case on a separate machine.
-        // Skipping is a caller decision, not a harness one -- the harness never treats a
-        // steps=0 run as having actually verified correctness by itself.
-        guard options.correctnessSteps >= 0 else {
-            throw MLXFastError.invalidInput("benchmark correctness steps must be >= 0")
+        guard options.correctnessSteps > 0 else {
+            throw MLXFastError.invalidInput("benchmark correctness steps must be positive")
         }
         guard options.correctnessSteps <= MLXFastConstants.correctnessSteps else {
             throw MLXFastError.invalidInput(
