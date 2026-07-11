@@ -780,8 +780,7 @@ jobs:
       # case) -- enforced directly below by re-pinning the augmented golden's
       # .cases against the raw hash-pinned golden, with
       # verify-correctness-golden.sh's coverage arithmetic plus the final
-      # checked_steps validation as backstops, exactly as the old combine
-      # coverage check did. attach-gpqa-gates loads the tokenizer, i.e.
+      # checked_steps validation as backstops. attach-gpqa-gates loads the tokenizer, i.e.
       # runs code from the submitted build, so it executes through bench-exec
       # like every other untrusted invocation (the VM pipeline ran it as the
       # workflow user; the bench uid is strictly less privileged). The raw
@@ -1128,11 +1127,9 @@ jobs:
           test -s "${MLXFAST_MEASURE_OUT}/results.json"
           jq -c '{mode, paired}' "${MLXFAST_MEASURE_OUT}/results.json"
 
-      # The old combine job's timing overlay, folded in: take the sealed
-      # gates+semantic score and overlay the measured paired timing (candidate
-      # seconds/token, measured baseline seconds/token, speedups, floors,
-      # score). Fails the job when a speedup floor fails, exactly like the old
-      # timing machine's harness-side floor check did.
+      # Overlay measured paired timing onto the sealed gates+semantic score
+      # (candidate and baseline seconds/token, speedups, floors, score). Fails
+      # the job when a speedup floor fails.
       - name: Overlay paired timing into final score
         if: ${{ inputs.run_benchmark }}
         env:

@@ -62,6 +62,8 @@ func gemma4ModelCacheBuildsOneLayerCachePerConfiguredLayerType() throws {
       "hidden_size": \(MLXFastConstants.hiddenSize),
       "intermediate_size": \(MLXFastConstants.intermediateSize),
       "num_attention_heads": \(MLXFastConstants.attentionHeads),
+      "num_key_value_heads": 8,
+      "num_global_key_value_heads": 4,
       "sliding_window": 4
     }
     """.write(
@@ -94,6 +96,8 @@ func gemma4ModelCacheMaterializesCollectedCachedStateWhenRuntimeTestsAreEnabled(
       "hidden_size": \(MLXFastConstants.hiddenSize),
       "intermediate_size": \(MLXFastConstants.intermediateSize),
       "num_attention_heads": \(MLXFastConstants.attentionHeads),
+      "num_key_value_heads": 8,
+      "num_global_key_value_heads": 4,
       "sliding_window": 4
     }
     """.write(
