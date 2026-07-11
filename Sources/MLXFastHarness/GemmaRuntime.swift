@@ -223,12 +223,11 @@ public struct BenchmarkOptions: Equatable {
     public let semanticGPQACaseCount: Int
     public let semanticGPQAMaxNewTokens: Int
     // Both default true/false to reproduce the original, single-machine
-    // behavior exactly. These let the anchor/free-run/behavior/GPQA gates and
-    // the timed prefill/decode measurement run in separate benchmark phases on
-    // the ranked runner: checkGates false skips anchors/free-run/behavior/GPQA
-    // entirely (a "timing-only" machine); skipTimedBenchmark true skips the
-    // prefill/decode measurement entirely (a "gates-only" machine). Never both
-    // false -- that combination is meaningless and is rejected by
+    // behavior exactly. These split one ranked job into phased benchmark
+    // invocations: checkGates false skips anchors/free-run/behavior/GPQA;
+    // skipTimedBenchmark true skips the prefill/decode measurement (the gates
+    // pass sets MLXFAST_BENCHMARK_SKIP_TIMED=1; measure-job runs timing later).
+    // Never both false -- that combination is meaningless and is rejected by
     // validateBenchmarkOptions.
     public let checkGates: Bool
     public let skipTimedBenchmark: Bool

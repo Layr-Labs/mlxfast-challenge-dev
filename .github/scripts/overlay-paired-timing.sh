@@ -70,10 +70,10 @@ jq -e '
   exit 1
 }
 
-# Defense-in-depth on the candidate's sealed timing score, mirroring the old
-# combine job's pre-merge leak-field and expert-zero checks (the dense
-# RAM-resident runtime must report structural zeros; a nonzero value is a
-# schema regression that must fail loudly, not merge silently).
+# Defense-in-depth on the candidate's sealed timing score: leak-field and
+# expert-zero checks (the dense RAM-resident runtime must report structural
+# zeros; a nonzero value is a schema regression that must fail loudly, not
+# merge silently).
 jq -e --arg expected_commit "${EXPECTED_COMMIT}" \
   --slurpfile gates "${SCORE_PATH}" '
   (.metrics.commit as $commit

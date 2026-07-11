@@ -119,7 +119,7 @@ public enum MLXFastConstants {
     // baseline is KEPT (it still tracks per-run drift) but measured on a SEPARATE
     // fresh VM from the candidate, so the baseline run no longer warms the
     // candidate's VM. These constants keep their three roles: local-mode scoring,
-    // the gates-only machine's placeholder timing, and the paired sanity-band
+    // the gates-only phase's placeholder timing, and the paired sanity-band
     // anchor. See the paired-baseline section of docs/benchmark-window-freeze.md.
     public static let officialBaselinePrefillSecondsPerToken = 0.010605031949609375
     public static let officialBaselineDecodeSecondsPerToken = 0.1336139485703125

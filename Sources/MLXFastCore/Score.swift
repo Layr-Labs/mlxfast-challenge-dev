@@ -252,12 +252,9 @@ public struct ScoreMetrics: Codable, Equatable {
     public let weightsFileCount: Int
     public let runtime: String
     // True whenever this metrics payload still contains baseline-placeholder
-    // values for the fields a gates-only or timing-only machine did not itself
-    // measure (see BenchmarkOptions.checkGates/skipTimedBenchmark). The ONLY
-    // thing that clears this to false today is benchmark.yml's "Overlay paired
-    // timing into final score" step -- a defense-in-depth marker so a future
-    // regression there has a structural signal to check, instead of relying solely on the YAML wiring
-    // being correct.
+    // values for fields this benchmark phase did not itself measure (see
+    // BenchmarkOptions.checkGates/skipTimedBenchmark). Cleared to false by
+    // overlay-paired-timing.sh when the measured paired timing is merged.
     public let partialResult: Bool
 
     enum CodingKeys: String, CodingKey {

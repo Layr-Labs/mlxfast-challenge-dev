@@ -2,16 +2,12 @@ name: benchmark
 
 # SINGLE-MACHINE RANKED PIPELINE (self-hosted Apple M5 Max, label m5-bench).
 #
-# This replaces the previous 6-job fan-out (validate-slice-ranges +
-# correctness-slice-1/2/3 + benchmark-timing [with its own separate paired-
-# baseline VM] + benchmark-gates + combine) with ONE serial job on ONE
-# self-hosted runner. The parallel split existed purely for wall-clock speed on
-# rented per-job VMs; on a dedicated box the serial order is what buys us a
+# This replaces the previous multi-job fan-out with ONE serial job on ONE
+# self-hosted runner. On a dedicated box the serial order is what buys us a
 # clean measurement (see "MEASUREMENT-DELTA ORDERING" below).
 #
-# Verdict semantics are unchanged from the parallel pipeline:
-#   final pass = full 64-step teacher-forced base case (previously sliced 3
-#                ways -- run whole here, same hidden golden, same verdict)
+# Verdict semantics:
+#   final pass = full 64-step teacher-forced base case
 #              AND anchor/free-run/behavior/GPQA gates + GPQA TTFT
 #              AND semantic GPQA judge (Anthropic)
 #              AND public-fixture drift tripwire
