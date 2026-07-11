@@ -58,16 +58,6 @@ extension GemmaRuntime {
         if let worker {
             return runCorrectnessWithWorker(options, worker: worker)
         }
-        // Both stepStart and stepCount are worker-only: the non-worker path below
-        // always checks the full [0, correctnessSteps) window and has no way to honor
-        // either an explicit start or an explicit count, so any explicit request for
-        // either must fail loudly rather than silently run the full window.
-        guard options.stepStart == 0, options.stepCount == nil else {
-            throw MLXFastError.invalidInput(
-                "correctness step ranges (--step-range) require the runtime worker; "
-                    + "rerun with the worker enabled or omit --step-range"
-            )
-        }
 
         var loadedGolden: GoldenFixture?
         var loader: Gemma4WeightLoader?
@@ -86,8 +76,7 @@ extension GemmaRuntime {
             return runLayeredCorrectness(
                 golden: golden,
                 weightCache: weightCache,
-                steps: MLXFastConstants.correctnessSteps,
-                checkGates: !options.baseCaseOnly
+                steps: MLXFastConstants.correctnessSteps
             )
         } catch {
             return failedCorrectnessReport(
@@ -108,15 +97,6 @@ extension GemmaRuntime {
         var lastExpertStats = ExpertStreamingStats.zero
         var checkedSteps = 0
         do {
-            let stepCount = options.stepCount ?? MLXFastConstants.correctnessSteps
-            guard options.stepStart >= 0, stepCount > 0,
-                  options.stepStart + stepCount <= MLXFastConstants.correctnessSteps
-            else {
-                throw MLXFastError.invalidInput(
-                    "correctness step range [\(options.stepStart), \(options.stepStart + stepCount)) "
-                        + "must fall within [0, \(MLXFastConstants.correctnessSteps))"
-                )
-            }
             try requireFile(options.goldenPath, description: "correctness golden file")
             let golden = try loadGoldenFixture(from: options.goldenPath)
             loadedGolden = golden
@@ -134,9 +114,7 @@ extension GemmaRuntime {
             let result = runLayeredCorrectnessWithWorker(
                 golden: golden,
                 worker: worker,
-                steps: options.stepCount ?? MLXFastConstants.correctnessSteps,
-                startStep: options.stepStart,
-                checkGates: !options.baseCaseOnly
+                steps: MLXFastConstants.correctnessSteps
             )
             checkedSteps = result.report.checkedSteps
             lastExpertStats = result.expertStats
@@ -202,10 +180,8 @@ extension GemmaRuntime {
         progress: ((String) -> Void)? = nil
     ) -> CorrectnessReport {
         // checkGates: false skips anchors/free-run/behavior entirely and reports
-        // caseCount/checkedSteps for golden.cases alone -- for a machine assigned only
-        // a slice of the base case, so its checked_steps total is comparable across
-        // machines instead of being inflated by however many gates the golden happens
-        // to carry (which a step-range coverage check would otherwise miscount).
+        // caseCount/checkedSteps for golden.cases alone -- for a timing-only
+        // benchmark phase that still runs the base teacher-forced case.
         let caseCount = checkGates ? golden.totalCorrectnessCaseCount : golden.cases.count
         var checkedSteps = 0
         var currentCase: String?
@@ -240,12 +216,6 @@ extension GemmaRuntime {
             for (caseIndex, testCase) in golden.cases.enumerated() {
                 currentCase = testCase.name
                 let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
-                // See the matching guard in runLayeredCorrectnessWithWorker: steps == 0
-                // intentionally skips the base case for this run.
-                guard steps > 0 else {
-                    progress?("correctness case \(caseLabel) skipped (steps=0)")
-                    continue
-                }
                 progress?("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
                 let comparison = try compareTeacherForcedCached(
                     testCase: testCase,
@@ -428,16 +398,6 @@ extension GemmaRuntime {
             for (caseIndex, testCase) in golden.cases.enumerated() {
                 currentCase = testCase.name
                 let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
-                // steps == 0 means this run intentionally does not verify the base
-                // teacher-forced case itself -- e.g. a machine that only runs GPQA/TTFT/
-                // timing while a separate fleet of machines verifies the base case in
-                // parallel slices. Skipping here does NOT mean correctness was checked;
-                // callers relying on split verification must independently combine each
-                // slice's real result before trusting an overall pass.
-                guard steps > 0 else {
-                    progress?("correctness case \(caseLabel) skipped (steps=0)")
-                    continue
-                }
                 progress?("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
                 let check = try compareTeacherForcedWithWorker(
                     testCase: testCase,

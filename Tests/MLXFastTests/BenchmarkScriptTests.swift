@@ -1884,7 +1884,7 @@ func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
 }
 
 @Test
-func compareTeacherForcedWithWorkerSupportsStartStepForParallelCorrectness() throws {
+func compareTeacherForcedWithWorkerSupportsStartStepSlices() throws {
     let runtime = try harnessRuntimeSource()
 
     #expect(runtime.contains("static func compareTeacherForcedWithWorker("))
@@ -1906,54 +1906,8 @@ func compareTeacherForcedWithWorkerSupportsStartStepForParallelCorrectness() thr
     #expect(runtime.contains("guard startStep >= 0 else {"))
     #expect(runtime.contains("teacher-forced correctness startStep must be >= 0"))
 
-    // Threaded through the layered-correctness driver, and steps == 0 skips the
-    // base case entirely (still runs anchors/free-run/behavior/GPQA/TTFT) for a
-    // machine that trusts a separate fleet to verify the base case's step range.
-    #expect(runtime.contains("startStep: Int = 0,"))
-    #expect(runtime.contains("startStep: startStep,"))
-    #expect(runtime.contains("progress?(\"correctness case \\(caseLabel) skipped (steps=0)\")"))
-    #expect(runtime.contains("guard steps > 0 else {"))
 
-    // Step ranges (stepStart != 0 OR an explicit stepCount) are worker-only --
-    // calling with either on a code path with no worker must fail loudly rather
-    // than silently run the full window and claim to have honored the request.
-    // (Regression test for a review finding: the guard originally checked only
-    // stepStart, so `--step-range 0-10` without a worker silently ran all 64
-    // steps instead of the requested 10.)
-    #expect(runtime.contains("guard options.stepStart == 0, options.stepCount == nil else {"))
-    #expect(runtime.contains("correctness step ranges (--step-range) require the runtime worker"))
-
-    // 0 is an explicit, documented allowance for BenchmarkOptions.correctnessSteps
-    // -- the harness never treats a steps=0 run as having verified correctness on
-    // its own; a multi-machine workflow must AND every machine's real result together.
-    #expect(runtime.contains("guard options.correctnessSteps >= 0 else {"))
-    #expect(!runtime.contains("guard options.correctnessSteps > 0 else {"))
-}
-
-// Regression test for a review finding: a machine checking a step-range slice of
-// the base case still ran every gate in the golden (anchors/free-run/behavior/
-// GPQA) by default, so its checked_steps became base-slice-length + gate-step-
-// counts instead of just the slice -- not comparable across machines, and wrong
-// for a range-coverage check. --base-case-only / checkGates: false must skip all
-// three gate loops and report caseCount as golden.cases.count alone.
-@Test
-func correctnessBaseCaseOnlySkipsGatesAndReportsBaseCaseCountAlone() throws {
-    let runtime = try harnessRuntimeSource()
-
-    #expect(runtime.contains("public let baseCaseOnly: Bool"))
-    #expect(runtime.contains("baseCaseOnly: Bool = false"))
-
-    #expect(runtime.contains("checkGates: Bool = true,"))
-    #expect(runtime.contains("let caseCount = checkGates ? golden.totalCorrectnessCaseCount : golden.cases.count"))
-    #expect(runtime.contains("let gates = checkGates ? golden.correctnessGates : nil"))
-    #expect(runtime.contains("checkGates: !options.baseCaseOnly"))
-
-    let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
-    #expect(cli.contains("\"--base-case-only\""))
-    #expect(cli.contains("options.hasFlag(\"--base-case-only\")"))
-    #expect(cli.contains("MLXFAST_CORRECTNESS_BASE_CASE_ONLY"))
-    #expect(cli.contains("baseCaseOnly: baseCaseOnly"))
-    #expect(cli.contains("[--base-case-only]"))
+    #expect(runtime.contains("guard options.correctnessSteps > 0 else {"))
 }
 
 // Regression test for a bug caught only by a real dispatch (not reproducible
@@ -1997,32 +1951,14 @@ func benchmarkSplitsGatesAndTimingOntoSeparateMachinesWithoutSpuriousSemanticCap
 }
 
 @Test
-func benchmarkCliSupportsCorrectnessStepRangeAndSkippableBenchmarkCorrectness() throws {
+func benchmarkCliSupportsConfigurableCorrectnessSteps() throws {
     let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
 
-    #expect(cli.contains("\"--step-range\""))
-    #expect(cli.contains("private static func parseCorrectnessStepRange(_ raw: String) throws -> (start: Int, count: Int?) {"))
-    #expect(cli.contains("MLXFAST_CORRECTNESS_STEP_RANGE"))
-    #expect(cli.contains(
-        "CorrectnessOptions(\n                weightsPath: weightsPath,\n                goldenPath: goldenPath,\n"
-            + "                stepStart: stepStart,\n                stepCount: stepCount,\n                baseCaseOnly: baseCaseOnly\n            )"
-    ))
-    #expect(cli.contains("must be START-END with 0 <= START < END"))
-
     #expect(cli.contains("MLXFAST_BENCHMARK_CORRECTNESS_STEPS"))
-    #expect(cli.contains("private static func parseNonNegativeInt(_ rawValue: String, optionName: String) throws -> Int {"))
+    #expect(cli.contains("private static func parsePositiveInt(_ rawValue: String, optionName: String) throws -> Int {"))
     #expect(cli.contains("correctnessSteps: correctnessSteps,"))
-    #expect(cli.contains("[--step-range START-END]"))
 }
 
-// Regression test for a review finding: shasum's own printed output line embeds
-// the exact path it was given ("<hash>  <path>"), so hashing "shasum -a 256
-// ${WEIGHTS_PATH}/file" output directly makes the final digest depend on
-// WEIGHTS_PATH itself -- two machines with byte-identical weights/ under
-// different root paths (an unavoidable difference between independent
-// machines/temp dirs) would then hash differently. Runs the actual script
-// against real byte-identical fixture trees under different roots to prove
-// the fix, not just check the source for a keyword.
 @Test
 func hashWeightsDirectoryIsIndependentOfWeightsPathButSensitiveToContent() throws {
     let hashScript = try String(
