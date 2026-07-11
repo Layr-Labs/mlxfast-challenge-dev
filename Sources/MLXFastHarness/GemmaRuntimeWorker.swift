@@ -76,6 +76,27 @@ extension GemmaRuntime {
         }
     }
 
+    /// Trusted allocator policy applied at every new worker forward sequence.
+    /// Submitted MLXFastModel code runs during worker initialization and may
+    /// change the process-global MLX cache policy, so the trusted request
+    /// handler must restore it after the parent has started the phase timer.
+    static let trustedRuntimeWorkerCacheLimitBytes = 6 << 30
+
+    static func resetRuntimeWorkerAllocatorForPhaseStart() throws {
+        Memory.cacheLimit = trustedRuntimeWorkerCacheLimitBytes
+        Memory.clearCache()
+        let remainingCacheBytes = Memory.cacheMemory
+        // The pinned MLX clearCache contract synchronously deallocates every
+        // cached (free) buffer under its evaluation lock. Live model weights
+        // and KV state are active memory, not cacheMemory, so exact zero is the
+        // safe fail-closed postcondition rather than a tolerance.
+        guard remainingCacheBytes == 0 else {
+            throw MLXFastError.invalidInput(
+                "runtime worker failed to clear the MLX allocator cache at phase start"
+            )
+        }
+    }
+
     static func handleWorkerRequest(
         _ request: RuntimeWorkerRequest,
         sessionNonce: String,
@@ -87,6 +108,7 @@ extension GemmaRuntime {
             guard let promptTokens = request.promptTokens, let steps = request.steps else {
                 throw MLXFastError.invalidInput("runtime worker correctness request missing prompt_tokens or steps")
             }
+            try resetRuntimeWorkerAllocatorForPhaseStart()
             let tokens = try generateGreedyCached(
                 promptTokens: promptTokens,
                 steps: steps,
@@ -105,6 +127,7 @@ extension GemmaRuntime {
             guard let promptTokens = request.promptTokens else {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing prompt_tokens")
             }
+            try resetRuntimeWorkerAllocatorForPhaseStart()
             let cache = Gemma4ModelCache(config: weightCache.config)
             let logits = try Gemma4Model.logits(
                 inputIDs: inputIDsArray(promptTokens),
@@ -155,6 +178,7 @@ extension GemmaRuntime {
             guard let promptTokens = request.promptTokens else {
                 throw MLXFastError.invalidInput("runtime worker prefill request missing prompt_tokens")
             }
+            try resetRuntimeWorkerAllocatorForPhaseStart()
             let cache = Gemma4ModelCache(config: weightCache.config)
             let logits = try Gemma4Model.logits(
                 inputIDs: inputIDsArray(promptTokens),
@@ -175,6 +199,7 @@ extension GemmaRuntime {
             guard let seedTokens = request.seedTokens else {
                 throw MLXFastError.invalidInput("runtime worker decode_begin request missing seed_tokens")
             }
+            try resetRuntimeWorkerAllocatorForPhaseStart()
             // Exactly one whole-prompt (seed) forward runs here, with NO preceding
             // warmup pass. The decode measurement deliberately charges this seed
             // prefill to the decode phase (see measureWorkerDecode). A second,
@@ -188,7 +213,8 @@ extension GemmaRuntime {
             // forward there is no identical predecessor to reuse, and the 128
             // single-token decode steps are input-dependent and cannot be
             // precomputed. Prefill/decode/correctness each run in their own worker
-            // process, so no memo persists across phases either.
+            // process, so no model-owned memo persists across phases; the trusted
+            // reset above separately removes allocator free-buffer state.
             let cache = Gemma4ModelCache(config: weightCache.config)
             let logits = try Gemma4Model.logits(
                 inputIDs: inputIDsArray(seedTokens),
