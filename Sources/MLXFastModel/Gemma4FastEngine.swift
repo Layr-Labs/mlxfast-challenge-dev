@@ -57,6 +57,12 @@ private struct FastMLPTailWeights: @unchecked Sendable {
     let layerScalar: MLXArray
 }
 
+private struct FastHeadProcessContext: @unchecked Sendable {
+    let qNorm: MLXArray
+    let kNorm: MLXArray
+    let eps: Float
+}
+
 /// Approximate tanh-GELU using `x*x*x` (compile-safe), matching the library.
 private let fastGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray) -> MLXArray = { x in
@@ -89,7 +95,6 @@ final class Gemma4FastLayer {
     let kProj: FastQuantizedProjection
     let vProj: FastQuantizedProjection?
     let oProj: FastQuantizedProjection
-    let indexedOutput: IndexedOutputProjection?
     let fusedQKV: FusedSlidingQKVProjection?
     let fusedQK: FusedFullQKProjection?
 
@@ -102,6 +107,8 @@ final class Gemma4FastLayer {
     let layerScalar: MLXArray
 
     let rope: RoPELayer
+    let fusedHeadProcess: (@Sendable (MLXArray, MLXArray, MLXArray) ->
+        (MLXArray, MLXArray, MLXArray))?
     let fusedMLP: @Sendable (MLXArray) -> MLXArray
     let fusedMLPTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let fusedGateUp: FusedGateUpProjection?
@@ -152,18 +159,7 @@ final class Gemma4FastLayer {
         self.qProj = qProjection
         self.kProj = kProjection
         self.vProj = vProjection
-        let outputProjection = FastQuantizedProjection(oProj)
-        self.oProj = outputProjection
-        let indexedOutputEnabled: Bool
-        if let raw = ProcessInfo.processInfo.environment["MLXFAST_INDEXED_OUTPUT_FAST"] {
-            indexedOutputEnabled = ["1", "true", "yes", "on"].contains(
-                raw.lowercased())
-        } else {
-            indexedOutputEnabled = true
-        }
-        self.indexedOutput = indexedOutputEnabled
-            ? IndexedOutputProjection(projection: outputProjection)
-            : nil
+        self.oProj = FastQuantizedProjection(oProj)
         let fusedQKVEnabled: Bool
         if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_QKV"] {
             fusedQKVEnabled = ["1", "true", "yes", "on"].contains(
@@ -233,6 +229,40 @@ final class Gemma4FastLayer {
         self.postFfnNormWeight = postFfnNorm.weight
         self.layerScalar = layerScalar
         self.rope = rope
+
+        // Compile the decode-only Q/K/V RMSNorm + layout suffix as a three-
+        // input, three-output graph. Reshapes stay outside the closure and RoPE
+        // stays on its established path. Tuple outputs are important: an older
+        // prototype concatenated and re-sliced Q/K/V, adding a real copy.
+        // `MLXFAST_FUSED_HEAD_PROCESS=0` restores the promoted eager dispatch.
+        let headProcessEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_HEAD_PROCESS"] {
+            headProcessEnabled = ["1", "true", "yes", "on"].contains(raw.lowercased())
+        } else {
+            headProcessEnabled = true
+        }
+        if headProcessEnabled {
+            let context = FastHeadProcessContext(
+                qNorm: qNormWeight,
+                kNorm: kNormWeight!,
+                eps: eps
+            )
+            let body: @Sendable (MLXArray, MLXArray, MLXArray) ->
+                (MLXArray, MLXArray, MLXArray) = {
+                qR, kR, vR in
+                let qn = MLXFast.rmsNorm(qR, weight: context.qNorm, eps: context.eps)
+                let qt = qn.transposed(0, 2, 1, 3)
+                let kn = MLXFast.rmsNorm(kR, weight: context.kNorm, eps: context.eps)
+                let kt = kn.transposed(0, 2, 1, 3)
+                let vn = MLXFast.rmsNorm(
+                    vR, weight: MLXArray.mlxNone, eps: context.eps)
+                let vt = vn.transposed(0, 2, 1, 3)
+                return (qt, kt, vt)
+            }
+            self.fusedHeadProcess = compile(shapeless: true, body)
+        } else {
+            self.fusedHeadProcess = nil
+        }
 
         // Fuse the gated MLP into one compiled closure: collapses gate/up/GELU/
         // product/down graph construction. Keep two quantizedMMs (not a packed
@@ -407,22 +437,37 @@ final class Gemma4FastLayer {
             rawValues = vProj?(h)
         }
 
-        var queries = rawQueries.reshaped(B, L, nHeads, headDim)
-        queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
-
-        let shapedKeys = rawKeys.reshaped(B, L, nKvHeads, headDim)
-        var keys = MLXFast.rmsNorm(shapedKeys, weight: kNormWeight!, eps: eps)
-        keys = keys.transposed(0, 2, 1, 3)
-        keys = rope(keys, offset: offset)
-
-        var values: MLXArray
-        if let rawValues {
-            values = rawValues.reshaped(B, L, nKvHeads, headDim)
+        var (queries, keys, values): (MLXArray, MLXArray, MLXArray)
+        if B == 1, L == 1, let fusedHeadProcess {
+            // Decode-only compiled suffix. Prefill deliberately retains the
+            // promoted path after an earlier broad attention-prep compile
+            // regressed the official prefill component.
+            let qR = rawQueries.reshaped([B, L, nHeads, headDim])
+            let kR = rawKeys.reshaped([B, L, nKvHeads, headDim])
+            let vR = (rawValues ?? rawKeys).reshaped([B, L, nKvHeads, headDim])
+            let prepared = fusedHeadProcess(qR, kR, vR)
+            queries = prepared.0
+            keys = prepared.1
+            values = prepared.2
         } else {
-            values = shapedKeys
+            var q = rawQueries.reshaped(B, L, nHeads, headDim)
+            q = MLXFast.rmsNorm(q, weight: qNormWeight, eps: eps)
+            queries = q.transposed(0, 2, 1, 3)
+            let shapedKeys = rawKeys.reshaped(B, L, nKvHeads, headDim)
+            var k = MLXFast.rmsNorm(shapedKeys, weight: kNormWeight!, eps: eps)
+            k = k.transposed(0, 2, 1, 3)
+            keys = k
+            var v: MLXArray
+            if let rawValues {
+                v = rawValues.reshaped(B, L, nKvHeads, headDim)
+            } else {
+                v = shapedKeys
+            }
+            v = MLXFast.rmsNorm(v, weight: MLXArray.mlxNone, eps: eps)
+            values = v.transposed(0, 2, 1, 3)
         }
-        values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: eps)
-        values = values.transposed(0, 2, 1, 3)
+
+        keys = rope(keys, offset: offset)
 
         if let cache {
             let updated = cache.update(keys: keys, values: values)
@@ -430,7 +475,6 @@ final class Gemma4FastLayer {
             values = updated.1
         }
 
-        queries = queries.transposed(0, 2, 1, 3)
         queries = rope(queries, offset: offset)
 
         var attentionMask = mask
@@ -464,13 +508,9 @@ final class Gemma4FastLayer {
         }
 
         let mergedAttention = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
-        let attnOut: MLXArray
-        if B == 1, L == 1, let indexedOutput {
-            attnOut = indexedOutput(mergedAttention)
-        } else {
-            attnOut = oProj(mergedAttention)
-        }
-        var out = residual + MLXFast.rmsNorm(attnOut, weight: postAttnNormWeight, eps: eps)
+        let attnOut = oProj(mergedAttention)
+        var out = residual + MLXFast.rmsNorm(
+            attnOut, weight: postAttnNormWeight, eps: eps)
         let residual2 = out
         if B == 1, L == 1, let fusedGateUp, let fusedGateUpPostTail {
             let normalized = MLXFast.rmsNorm(out, weight: preFfnNormWeight, eps: eps)
