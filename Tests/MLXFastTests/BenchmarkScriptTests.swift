@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 @testable import MLXFastCore
+@testable import MLXFastHarness
 import Testing
 
 @Test
@@ -1687,11 +1688,21 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     #expect(benchmark.contains("(allow process-exec (literal"))
     #expect(!benchmark.contains("(allow network* (remote ip \"localhost:*\"))"))
     #expect(!benchmark.contains("(allow network* (local unix-socket))"))
-    #expect(runtime.contains("\"MLXFAST_PRIVATE_DIR\""))
-    #expect(runtime.contains("\"ANTHROPIC_API_KEY\""))
-    #expect(runtime.contains("\"MLXFAST_GPQA_REFERENCE_PATH\""))
-    #expect(runtime.contains("\"MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH\""))
-    #expect(runtime.contains("\"MLXFAST_SEMANTIC_GPQA_RESULTS_PATH\""))
+    // Private-material locations and secrets must not reach the worker's
+    // environment. The filter is a strict allowlist, so assert the property
+    // against the real function instead of pinning denylist source text.
+    let workerEnvironment = sanitizedRuntimeWorkerEnvironment([
+        "MLXFAST_PRIVATE_DIR": "/private/golden",
+        "ANTHROPIC_API_KEY": "secret",
+        "MLXFAST_GPQA_REFERENCE_PATH": "/private/golden/gpqa.json",
+        "MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH": "/ws/private/semantic_gpqa_answers.json",
+        "MLXFAST_SEMANTIC_GPQA_RESULTS_PATH": "/private/semantic_gpqa_results.json",
+    ])
+    #expect(workerEnvironment["MLXFAST_PRIVATE_DIR"] == nil)
+    #expect(workerEnvironment["ANTHROPIC_API_KEY"] == nil)
+    #expect(workerEnvironment["MLXFAST_GPQA_REFERENCE_PATH"] == nil)
+    #expect(workerEnvironment["MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH"] == nil)
+    #expect(workerEnvironment["MLXFAST_SEMANTIC_GPQA_RESULTS_PATH"] == nil)
     #expect(runtime.contains("gpqaTTFT: correctnessResult.gpqaTTFT"))
     #expect(runtime.contains("gpqaTTFTSource: gpqaTTFT.source"))
     #expect(cli.contains("resolvingSymlinksInPath()"))
@@ -3619,6 +3630,10 @@ func overlayPairedTimingValidatesInputsAppliesFloorsAndClearsPartialResult() thr
 @Test
 func overlayPairedTimingAcceptsTrustedCommitAndRejectsForgedOrMissingCommit() throws {
     let expectedCommit = "5f95c4bdce07a0ef79ea350c91d9eb0d7476cf2f"
+    // The overlay's pre-merge checks require the candidate timing score's
+    // harness/weights identity to match the sealed gates score exactly.
+    let harnessHash = String(repeating: "ab", count: 32)
+    let weightsHash = String(repeating: "cd", count: 32)
 
     func runOverlay(candidateCommit: String) throws -> (status: Int32, stderr: String, merged: String) {
         let root = try temporaryDirectory()
@@ -3640,6 +3655,10 @@ func overlayPairedTimingAcceptsTrustedCommitAndRejectsForgedOrMissingCommit() th
             "benchmark_wall_seconds": 2400.0,
             "peak_ram_gb": 21.5,
             "process_resident_memory_gb": 20.5,
+            "harness_hash": "\(harnessHash)",
+            "weights_hash": "\(weightsHash)",
+            "weights_file_count": 4,
+            "weights_byte_count": 18400000000,
             "expert_bytes_read": 0,
             "expert_cache_hits": 0,
             "expert_cache_misses": 0,
@@ -3661,6 +3680,10 @@ func overlayPairedTimingAcceptsTrustedCommitAndRejectsForgedOrMissingCommit() th
             "first_failing_step": null,
             "expected_token": null,
             "actual_token": null,
+            "harness_hash": "\(harnessHash)",
+            "weights_hash": "\(weightsHash)",
+            "weights_file_count": 4,
+            "weights_byte_count": 18400000000,
             "expert_bytes_read": 0,
             "expert_cache_hits": 0,
             "expert_cache_misses": 0,
