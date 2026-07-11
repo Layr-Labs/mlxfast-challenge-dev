@@ -89,7 +89,6 @@ final class Gemma4FastLayer {
     let kProj: FastQuantizedProjection
     let vProj: FastQuantizedProjection?
     let oProj: FastQuantizedProjection
-    let indexedOutput: IndexedOutputProjection?
     let fusedQKV: FusedSlidingQKVProjection?
     let fusedQK: FusedFullQKProjection?
 
@@ -108,6 +107,7 @@ final class Gemma4FastLayer {
     let fusedGateUpPostTail: (@Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray)?
     let fusedGateUpActivation: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let indexedDown: IndexedDownProjection?
+    let indexedOutput: IndexedOutputProjection?
     let indexedDownPostTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let useFusedGateUpActivation: Bool
 
@@ -138,7 +138,8 @@ final class Gemma4FastLayer {
         vIndexedMetadata: IndexedAffineMetadata?,
         gateIndexedMetadata: IndexedAffineMetadata?,
         upIndexedMetadata: IndexedAffineMetadata?,
-        downIndexedMetadata: IndexedAffineMetadata?
+        downIndexedMetadata: IndexedAffineMetadata?,
+        oIndexedMetadata: IndexedAffineMetadata?
     ) {
         self.isSliding = isSliding
         self.nHeads = nHeads
@@ -152,18 +153,33 @@ final class Gemma4FastLayer {
         self.qProj = qProjection
         self.kProj = kProjection
         self.vProj = vProjection
-        let outputProjection = FastQuantizedProjection(oProj)
-        self.oProj = outputProjection
+        self.oProj = FastQuantizedProjection(oProj)
         let indexedOutputEnabled: Bool
-        if let raw = ProcessInfo.processInfo.environment["MLXFAST_INDEXED_OUTPUT_FAST"] {
-            indexedOutputEnabled = ["1", "true", "yes", "on"].contains(
-                raw.lowercased())
+        if let raw = ProcessInfo.processInfo.environment[
+            "MLXFAST_INDEXED_OUTPUT_FAST"
+        ] {
+            indexedOutputEnabled = ["1", "true", "yes", "on"]
+                .contains(raw.lowercased())
         } else {
             indexedOutputEnabled = true
         }
-        self.indexedOutput = indexedOutputEnabled
-            ? IndexedOutputProjection(projection: outputProjection)
-            : nil
+        let outputInputWidth = isSliding ? 8_192 : 16_384
+        if indexedOutputEnabled,
+           let oIndexedMetadata,
+           supportsGemma4IndexedOutput(
+               projection: self.oProj,
+               metadata: oIndexedMetadata,
+               inputWidth: outputInputWidth
+           )
+        {
+            self.indexedOutput = IndexedOutputProjection(
+                projection: self.oProj,
+                metadata: oIndexedMetadata,
+                inputWidth: outputInputWidth
+            )
+        } else {
+            self.indexedOutput = nil
+        }
         let fusedQKVEnabled: Bool
         if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_QKV"] {
             fusedQKVEnabled = ["1", "true", "yes", "on"].contains(
@@ -470,7 +486,8 @@ final class Gemma4FastLayer {
         } else {
             attnOut = oProj(mergedAttention)
         }
-        var out = residual + MLXFast.rmsNorm(attnOut, weight: postAttnNormWeight, eps: eps)
+        var out = residual + MLXFast.rmsNorm(
+            attnOut, weight: postAttnNormWeight, eps: eps)
         let residual2 = out
         if B == 1, L == 1, let fusedGateUp, let fusedGateUpPostTail {
             let normalized = MLXFast.rmsNorm(out, weight: preFfnNormWeight, eps: eps)
@@ -696,7 +713,8 @@ final class Gemma4FastEngine {
                     vIndexedMetadata: indexedMetadata["\(prefix).self_attn.v_proj"],
                     gateIndexedMetadata: indexedMetadata["\(prefix).mlp.gate_proj"],
                     upIndexedMetadata: indexedMetadata["\(prefix).mlp.up_proj"],
-                    downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"]
+                    downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"],
+                    oIndexedMetadata: indexedMetadata["\(prefix).self_attn.o_proj"]
                 )
             )
         }

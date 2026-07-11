@@ -320,6 +320,7 @@ func expectedIndexedProjectionStems(config: Gemma4Config) -> Set<String> {
             "model.layers.\(layerIndex).mlp.down_proj",
             "model.layers.\(layerIndex).self_attn.q_proj",
             "model.layers.\(layerIndex).self_attn.k_proj",
+            "model.layers.\(layerIndex).self_attn.o_proj",
         ]
         if !config.usesKEqV(for: config.layerTypes[layerIndex]) {
             stems.append("model.layers.\(layerIndex).self_attn.v_proj")
