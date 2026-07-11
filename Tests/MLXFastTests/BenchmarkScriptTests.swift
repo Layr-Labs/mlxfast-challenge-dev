@@ -269,10 +269,12 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(buildStep.contains("/bin/chmod 0644 .build/release/mlx.metallib"))
 
     let stageMetalCacheStep = String(workflow[stageMetalCacheRange.lowerBound..<saveMetalCacheRange.lowerBound])
-    #expect(stageMetalCacheStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
+    // The trusted metallib cache is only staged/saved on a genuine trusted-main
+    // run (no candidate overlay), so a submitted candidate can never poison it.
+    #expect(stageMetalCacheStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && inputs.submission_ref == github.sha"))
     #expect(stageMetalCacheStep.contains("/bin/cp \"${MLXFAST_JOB_WS}/.build/release/mlx.metallib\" .mlxfast-cache/mlx.metallib"))
     let saveMetalCacheStep = String(workflow[saveMetalCacheRange.lowerBound..<transformRange.lowerBound])
-    #expect(saveMetalCacheStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
+    #expect(saveMetalCacheStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && inputs.submission_ref == github.sha"))
     #expect(saveMetalCacheStep.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
     #expect(saveMetalCacheStep.contains("path: .mlxfast-cache/mlx.metallib"))
     #expect(saveMetalCacheStep.contains("key: mlx-metallib-m5-max-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
@@ -546,16 +548,22 @@ func benchmarkWorkflowRunsTrustedMainAndOverlaysOnlySubmittedEditablePaths() thr
         encoding: .utf8
     )
 
-    // The workflow uses the branch selected by workflow_dispatch. Only main,
-    // submissions/*, baseline/*, and yukon/baseline/* are admitted; no
-    // duplicate SHA input.
-    #expect(!workflow.contains("submission_ref:"))
+    // The workflow is dispatched ONLY on trusted main; the candidate is a
+    // validated data input (submission_ref) that never selects the workflow
+    // ref. The guard hard-pins refs/heads/main and anchors the workflow ref to
+    // trusted main (no @${GITHUB_REF} tautology), so a pushed
+    // submissions/baseline branch cannot run its own copy of this workflow.
+    #expect(workflow.contains("submission_ref:"))
     #expect(!workflow.contains("submission_repository"))
     #expect(!workflow.contains("allow_untrusted_workflow_testing"))
     #expect(!workflow.contains("MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}"))
-    #expect(guardScript.contains("refs/heads/main|refs/heads/submissions/*|refs/heads/baseline/*|refs/heads/yukon/baseline/*"))
-    #expect(guardScript.contains("allowed branches are main, submissions/*, baseline/*, and yukon/baseline/*"))
-    #expect(guardScript.contains("@${GITHUB_REF}"))
+    #expect(guardScript.contains("readonly TRUSTED_REF=\"refs/heads/main\""))
+    #expect(guardScript.contains("@${TRUSTED_REF}"))
+    #expect(!guardScript.contains("@${GITHUB_REF}"))
+    #expect(!guardScript.contains("refs/heads/submissions/*"))
+    #expect(!guardScript.contains("refs/heads/baseline/*"))
+    #expect(!guardScript.contains("refs/heads/yukon/baseline/*"))
+    #expect(guardScript.contains("must be dispatched on ${TRUSTED_REF}"))
     #expect(!guardScript.contains("MLXFAST_TRUSTED_BENCHMARK_REF"))
 
     let trustedCheckoutRange = try #require(workflow.range(of: "- uses: actions/checkout@"))
@@ -574,8 +582,11 @@ func benchmarkWorkflowRunsTrustedMainAndOverlaysOnlySubmittedEditablePaths() thr
 
     let trustedCheckout = String(workflow[trustedCheckoutRange.lowerBound..<candidateCheckoutRange.lowerBound])
     let candidatePipeline = String(workflow[candidateCheckoutRange.lowerBound..<prepareWorkspaceRange.lowerBound])
-    #expect(trustedCheckout.contains("startsWith(github.ref, 'refs/heads/submissions/') && 'main' || github.sha"))
-    #expect(candidatePipeline.contains("ref: ${{ github.sha }}"))
+    // The trusted checkout takes no ref override: the dispatch ref is pinned to
+    // main by the guard, so github.sha is the trusted-main tip.
+    #expect(!trustedCheckout.contains("startsWith(github.ref"))
+    #expect(!trustedCheckout.contains("ref: ${{"))
+    #expect(candidatePipeline.contains("ref: ${{ inputs.submission_ref }}"))
     #expect(candidatePipeline.contains("path: .mlxfast-submission-src"))
     #expect(candidatePipeline.contains("BASE_SHA=\"${base_sha}\" HEAD_SHA=\"${actual_sha}\""))
     #expect(candidatePipeline.contains("if [[ \"${base_sha}\" != \"${TRUSTED_MAIN_SHA}\" ]]; then"))
@@ -585,17 +596,18 @@ func benchmarkWorkflowRunsTrustedMainAndOverlaysOnlySubmittedEditablePaths() thr
     #expect(candidatePipeline.contains("run: .github/scripts/overlay-editable-paths.sh"))
     #expect(candidatePipeline.contains("rm -rf .mlxfast-submission-src"))
     #expect(candidatePipeline.contains("test ! -e .mlxfast-submission-src"))
-    #expect(workflow.contains("MLXFAST_CANDIDATE_SHA: ${{ github.sha }}"))
+    #expect(workflow.contains("MLXFAST_CANDIDATE_SHA: ${{ inputs.submission_ref }}"))
     #expect(workflow.contains("git -C \"${MLXFAST_JOB_WS}\" update-ref --no-deref HEAD \"${MLXFAST_CANDIDATE_SHA}\""))
     #expect(!workflow.contains("git -C \"${MLXFAST_JOB_WS}\" checkout"))
     #expect(workflow.contains("MLXFAST_NOTE: \"ci ${{ github.event_name }} ${{ env.MLXFAST_CANDIDATE_SHA }} mode=single-machine-gates\""))
 
-    // Submission runs retain surface enforcement, static bypass review, and
-    // submitted-process log suppression. Main and baseline/* run directly;
-    // submissions/* alone take the candidate checkout/review/overlay path.
-    #expect(workflow.contains("MLXFAST_IS_SUBMISSION_BRANCH: ${{ startsWith(github.ref, 'refs/heads/submissions/') && '1' || '0' }}"))
-    #expect(candidatePipeline.contains("if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}"))
-    #expect(candidatePipeline.contains("if: ${{ always() && startsWith(github.ref, 'refs/heads/submissions/') }}"))
+    // Candidate runs (submission_ref != dispatched main SHA) retain surface
+    // enforcement, static bypass review, and submitted-process log
+    // suppression. A trusted-main/baseline run (submission_ref == github.sha)
+    // skips the candidate checkout/review/overlay path.
+    #expect(workflow.contains("MLXFAST_IS_SUBMISSION_BRANCH: ${{ (inputs.submission_ref != github.sha) && '1' || '0' }}"))
+    #expect(candidatePipeline.contains("if: ${{ inputs.submission_ref != github.sha }}"))
+    #expect(candidatePipeline.contains("if: ${{ always() && inputs.submission_ref != github.sha }}"))
     #expect(workflow.contains("- name: Review submitted code for benchmark bypasses"))
     #expect(workflow.contains("if [[ \"${MLXFAST_IS_SUBMISSION_BRANCH}\" == \"1\" ]]; then"))
     #expect(workflow.contains("if: ${{ always() && !inputs.run_benchmark }}"))
@@ -609,10 +621,10 @@ func benchmarkWorkflowRunsTrustedMainAndOverlaysOnlySubmittedEditablePaths() thr
 }
 
 @Test
-func trustedBenchmarkWorkflowGuardAllowsOnlyPermittedBranches() throws {
+func trustedBenchmarkWorkflowGuardOnlyRunsFromTrustedMainYAML() throws {
     let script = ".github/scripts/enforce-trusted-benchmark-workflow.sh"
 
-    func run(ref: String) throws -> (status: Int32, stderr: String) {
+    func run(ref: String, workflowRef: String? = nil) throws -> (status: Int32, stderr: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [script]
@@ -622,8 +634,8 @@ func trustedBenchmarkWorkflowGuardAllowsOnlyPermittedBranches() throws {
         process.environment = ProcessInfo.processInfo.environment.merging([
             "GITHUB_REPOSITORY": "Layr-Labs/mlxfast-challenge-dev",
             "GITHUB_REF": ref,
-            "GITHUB_WORKFLOW_REF":
-                "Layr-Labs/mlxfast-challenge-dev/.github/workflows/benchmark.yml@\(ref)",
+            "GITHUB_WORKFLOW_REF": workflowRef
+                ?? "Layr-Labs/mlxfast-challenge-dev/.github/workflows/benchmark.yml@\(ref)",
             "GITHUB_EVENT_NAME": "workflow_dispatch",
         ]) { _, new in new }
         let stderr = Pipe()
@@ -639,18 +651,240 @@ func trustedBenchmarkWorkflowGuardAllowsOnlyPermittedBranches() throws {
         )
     }
 
+    // Only a trusted-main dispatch whose workflow ref is main's own file passes.
+    #expect(try run(ref: "refs/heads/main").status == 0)
+
+    // Every branch-owned dispatch is rejected: a pushed submissions/baseline
+    // branch can no longer run its own copy of the privileged workflow.
     for ref in [
-        "refs/heads/main",
         "refs/heads/submissions/example",
         "refs/heads/baseline/reference",
         "refs/heads/yukon/baseline/718528521cd7a7df341b750bc3ccb28478ff045b",
+        "refs/heads/feature/not-allowed",
     ] {
-        #expect(try run(ref: ref).status == 0, "expected \(ref) to be allowed")
+        let rejected = try run(ref: ref)
+        #expect(rejected.status != 0, "expected \(ref) to be rejected")
+        #expect(rejected.stderr.contains("must be dispatched on refs/heads/main"))
     }
 
-    let rejected = try run(ref: "refs/heads/feature/not-allowed")
-    #expect(rejected.status != 0)
-    #expect(rejected.stderr.contains("allowed branches are main, submissions/*, baseline/*, and yukon/baseline/*"))
+    // The @${GITHUB_REF} tautology is dead: a main dispatch whose resolved
+    // workflow ref is NOT trusted main is rejected (defense against a
+    // reusable/mis-resolved workflow ref carrying non-main YAML).
+    let mismatchedWorkflow = try run(
+        ref: "refs/heads/main",
+        workflowRef: "Layr-Labs/mlxfast-challenge-dev/.github/workflows/benchmark.yml@refs/heads/submissions/example"
+    )
+    #expect(mismatchedWorkflow.status != 0)
+    #expect(mismatchedWorkflow.stderr.contains("unexpected workflow ref"))
+}
+
+@Test
+func benchmarkWorkspaceACLLocksTrustedSurfacesAgainstBench() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+    let prepareRange = try #require(workflow.range(of: "- name: Prepare bench workspace"))
+    let buildRange = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
+    let prepare = String(workflow[prepareRange.lowerBound..<buildRange.lowerBound])
+
+    // The functional allow ACE still lets bench read/execute the tree and
+    // create its own build/transform/score outputs.
+    #expect(prepare.contains(
+        "/bin/chmod -R +a \"user:bench allow list,search,readattr,readextattr,read,execute,"
+            + "add_file,add_subdirectory,delete_child,write,append,writeattr,writeextattr,"
+            + "file_inherit,directory_inherit\" \"${MLXFAST_JOB_WS}\""
+    ))
+    // Defense-in-depth deny: bench cannot write/delete the trusted, runner-
+    // owned harness surfaces (scripts, tooling, public fixtures, the hidden-
+    // input staging dir, the driver, the contract). Deny ACEs on runner-owned
+    // paths cannot be stripped by the bench uid.
+    #expect(prepare.contains(
+        "/bin/chmod -R +a \"user:bench deny write,append,writeattr,writeextattr,delete,"
+            + "delete_child,add_file,add_subdirectory,chown,file_inherit,directory_inherit\""
+    ))
+    #expect(prepare.contains("\"${MLXFAST_JOB_WS}/.github\""))
+    #expect(prepare.contains("\"${MLXFAST_JOB_WS}/tools\""))
+    #expect(prepare.contains("\"${MLXFAST_JOB_WS}/Sources\""))
+    #expect(prepare.contains("\"${MLXFAST_JOB_WS}/correctness_prompts\""))
+    #expect(prepare.contains("\"${MLXFAST_JOB_WS}/.ranked-src\""))
+    #expect(prepare.contains(
+        "/bin/chmod +a \"user:bench deny write,append,writeattr,writeextattr,delete,chown\""
+    ))
+    #expect(prepare.contains("\"${MLXFAST_JOB_WS}/benchmark.sh\""))
+    #expect(prepare.contains("\"${MLXFAST_JOB_WS}/benchmark.json\""))
+    // The runner-owned, bench-non-writable staging dir for predictable-name
+    // hidden inputs is created before the ACL is applied.
+    #expect(prepare.contains("mkdir -p \"${MLXFAST_JOB_WS}/.ranked-src\""))
+}
+
+@Test
+func benchmarkPlacesHiddenGoldenInputsSymlinkSafely() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+    let attachRange = try #require(workflow.range(of: "- name: Attach GPQA gates and verify augmented golden"))
+    let gatesGuardRange = try #require(workflow.range(of: "- name: Verify trusted harness before gates"))
+    let attach = String(workflow[attachRange.lowerBound..<gatesGuardRange.lowerBound])
+
+    // Hidden inputs land in the runner-owned, bench-non-writable staging dir,
+    // never at a predictable workspace-root name the transform could pre-plant
+    // as a symlink.
+    #expect(attach.contains("golden_src=\"${MLXFAST_JOB_WS}/.ranked-src/golden.json\""))
+    #expect(attach.contains("gpqa_src=\"${MLXFAST_JOB_WS}/.ranked-src/gpqa.json\""))
+    // Reject-if-exists/symlink guard plus install(1) (fresh regular file, never
+    // writes through a symlink).
+    #expect(attach.contains("if [[ -e \"${hidden_target}\" || -L \"${hidden_target}\" ]]; then"))
+    #expect(attach.contains("refusing to place hidden input over pre-existing path"))
+    #expect(attach.contains("install -m 0444 \"${MLXFAST_PRIVATE_DIR}/raw_golden.json\" \"${golden_src}\""))
+    #expect(attach.contains("install -m 0444 \"${MLXFAST_PRIVATE_DIR}/gpqa_reference.json\" \"${gpqa_src}\""))
+    #expect(attach.contains("--golden .ranked-src/golden.json"))
+    #expect(attach.contains("--gpqa .ranked-src/gpqa.json"))
+    // Cleanup unlinks the runner-owned staging dir (never an attacker symlink).
+    #expect(attach.contains("rm -rf \"${MLXFAST_JOB_WS}/.ranked-src\""))
+    // The old predictable workspace-root names are gone entirely.
+    #expect(!workflow.contains(".ranked-golden-src.json"))
+    #expect(!workflow.contains(".ranked-gpqa-src.json"))
+}
+
+@Test
+func benchmarkPinsAndVerifiesTrustedHarnessAcrossScoredPhases() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+
+    // Pin is captured at the END of the trusted build, before the submitted
+    // transform (the first bench step that can tamper), and re-verified before
+    // every phase that runs the binary as bench.
+    #expect(workflow.contains(
+        ".github/scripts/pin-trusted-harness.sh write \\\n"
+            + "            \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256\""
+    ))
+    let verifyInvocation =
+        ".github/scripts/pin-trusted-harness.sh verify \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256\""
+    #expect(workflow.components(separatedBy: verifyInvocation).count - 1 == 3)
+
+    let buildRange = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
+    let transformRange = try #require(workflow.range(of: "- name: Transform reference checkpoint in bench sandbox"))
+    let verifyPublicRange = try #require(workflow.range(of: "- name: Verify trusted harness before public gate"))
+    let publicGateRange = try #require(workflow.range(of: "- name: Public behavior gate"))
+    let verifyGatesRange = try #require(workflow.range(of: "- name: Verify trusted harness before gates"))
+    let gatesRunRange = try #require(workflow.range(of: "- name: Correctness and gates"))
+    let verifyTimingRange = try #require(workflow.range(of: "- name: Verify trusted harness before timing"))
+    let timingRange = try #require(workflow.range(of: "- name: Timed paired benchmark (measure-job)"))
+
+    // write happens inside the build step (before transform).
+    let writeRange = try #require(workflow.range(of: "pin-trusted-harness.sh write"))
+    #expect(buildRange.lowerBound < writeRange.lowerBound)
+    #expect(writeRange.lowerBound < transformRange.lowerBound)
+    // Each verify immediately precedes the phase that executes the binary.
+    #expect(transformRange.lowerBound < verifyPublicRange.lowerBound)
+    #expect(verifyPublicRange.lowerBound < publicGateRange.lowerBound)
+    #expect(verifyGatesRange.lowerBound < gatesRunRange.lowerBound)
+    #expect(verifyTimingRange.lowerBound < timingRange.lowerBound)
+
+    // The ranked verifies are gated on run_benchmark; the public one always runs.
+    let verifyGates = String(workflow[verifyGatesRange.lowerBound..<gatesRunRange.lowerBound])
+    let verifyTiming = String(workflow[verifyTimingRange.lowerBound..<timingRange.lowerBound])
+    #expect(verifyGates.contains("if: ${{ inputs.run_benchmark }}"))
+    #expect(verifyTiming.contains("if: ${{ inputs.run_benchmark }}"))
+}
+
+@Test
+func pinTrustedHarnessScriptDetectsTamper() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let ws = root.appendingPathComponent("ws")
+    let releaseDir = ws.appendingPathComponent(".build/release")
+    try FileManager.default.createDirectory(at: releaseDir, withIntermediateDirectories: true)
+    try "driver\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
+    try "BINARY".write(to: releaseDir.appendingPathComponent("mlxfast-swift"), atomically: true, encoding: .utf8)
+    try "METALLIB".write(to: releaseDir.appendingPathComponent("mlx.metallib"), atomically: true, encoding: .utf8)
+    let pin = root.appendingPathComponent("trusted-harness.sha256")
+
+    func run(_ mode: String) throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [".github/scripts/pin-trusted-harness.sh", mode, ws.path, pin.path]
+        process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        process.standardError = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
+    #expect(try run("write") == 0)
+    #expect(FileManager.default.fileExists(atPath: pin.path))
+    #expect(try run("verify") == 0)
+
+    // A swapped binary fails the verify closed.
+    try "EVIL".write(to: releaseDir.appendingPathComponent("mlxfast-swift"), atomically: true, encoding: .utf8)
+    #expect(try run("verify") != 0)
+
+    // A swapped driver fails too.
+    try "BINARY".write(to: releaseDir.appendingPathComponent("mlxfast-swift"), atomically: true, encoding: .utf8)
+    try "hacked\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
+    #expect(try run("verify") != 0)
+
+    // A symlinked artifact is rejected (never dereferenced).
+    try "driver\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
+    #expect(try run("verify") == 0)
+    try FileManager.default.removeItem(at: releaseDir.appendingPathComponent("mlx.metallib"))
+    try FileManager.default.createSymbolicLink(
+        atPath: releaseDir.appendingPathComponent("mlx.metallib").path,
+        withDestinationPath: "/etc/hosts"
+    )
+    #expect(try run("verify") != 0)
+}
+
+@Test
+func hashWeightsDirectoryRejectsHardlinks() throws {
+    let hashScript = try String(
+        contentsOfFile: ".github/scripts/hash-weights-directory.sh",
+        encoding: .utf8
+    )
+    // Mirrors overlay-editable-paths.sh and GemmaRuntime.directoryDigest.
+    #expect(hashScript.contains("-links +1"))
+    #expect(hashScript.contains("weights tree contains a hardlinked file"))
+
+    let preflight = try String(
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimePreflight.swift",
+        encoding: .utf8
+    )
+    #expect(preflight.contains("func requireSingleHardLink("))
+    #expect(preflight.contains("info.st_nlink != 1"))
+    #expect(preflight.contains("try requireSingleHardLink("))
+
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "content".write(to: weights.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+
+    func hashStatus() throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [".github/scripts/hash-weights-directory.sh", weights.path]
+        process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
+    // A clean single-link tree hashes fine.
+    #expect(try hashStatus() == 0)
+
+    // A hardlinked file (link count 2) is rejected.
+    try FileManager.default.linkItem(
+        atPath: weights.appendingPathComponent("config.json").path,
+        toPath: weights.appendingPathComponent("aliased.json").path
+    )
+    #expect(try hashStatus() != 0)
 }
 
 @Test
@@ -672,11 +906,11 @@ func benchmarkWorkflowBindsPublishedArtifactsToDispatchedCommit() throws {
     let candidateCheckoutRange = try #require(workflow.range(of: "- name: Checkout submitted editable paths"))
     let validateCandidate = String(workflow[validateCandidateRange.lowerBound..<candidateCheckoutRange.lowerBound])
     #expect(validateCandidate.contains("^[0-9a-f]{40}$"))
-    #expect(validateCandidate.contains("CANDIDATE_SHA: ${{ github.sha }}"))
+    #expect(validateCandidate.contains("CANDIDATE_SHA: ${{ inputs.submission_ref }}"))
     #expect(validateCandidate.contains("printf '%s\\n' \"${CANDIDATE_SHA}\" > candidate.sha"))
     #expect(validateCandidate.contains("trusted_main_sha=%s"))
 
-    #expect(workflow.contains("MLXFAST_CANDIDATE_SHA: ${{ github.sha }}"))
+    #expect(workflow.contains("MLXFAST_CANDIDATE_SHA: ${{ inputs.submission_ref }}"))
     #expect(
         workflow.components(
             separatedBy: "MLXFAST_EXPECTED_COMMIT: ${{ env.MLXFAST_CANDIDATE_SHA }}"
@@ -822,7 +1056,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     let sandboxProbeRange = try #require(workflow.range(of: "- name: Probe runtime worker sandbox"))
     #expect(modifiableSurfaceRange.lowerBound < staticReviewRange.lowerBound)
     #expect(staticReviewRange.lowerBound < sandboxProbeRange.lowerBound)
-    #expect(workflow.contains("if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}"))
+    #expect(workflow.contains("if: ${{ inputs.submission_ref != github.sha }}"))
     #expect(workflow.contains("${GITHUB_WORKSPACE}/.github/scripts/run-submission-static-review.sh"))
     #expect(workflow.contains("mlxfast-swift attach-gpqa-gates"))
     #expect(workflow.contains("--case-count \"${MLXFAST_GPQA_CASE_COUNT}\""))
@@ -851,15 +1085,16 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // path validates/stages even on failure (always()) so the artifact
     // reflects what ran, gated on validation for submission branches.
     #expect(workflow.contains("if: ${{ always() && !inputs.run_benchmark }}"))
-    // Twelve ranked steps use the bare run_benchmark guard (no always(), so
+    // Fourteen ranked steps use the bare run_benchmark guard (no always(), so
     // any failure stops the serial chain before the timed measurement):
     // Check private material, hash transformed weights, Prepare hidden golden,
-    // Attach GPQA gates,
+    // Attach GPQA gates, Verify trusted harness before gates,
     // Correctness and gates, Validate sealed gates score, Semantic GPQA gate,
-    // Scrub hidden material, Wait for quiescence, Timed paired benchmark,
-    // Overlay paired timing, Validate benchmark artifacts.
+    // Scrub hidden material, Wait for quiescence, Verify trusted harness before
+    // timing, Timed paired benchmark, Overlay paired timing, Validate benchmark
+    // artifacts.
     let bareRunBenchmarkGuardCount = workflow.components(separatedBy: "if: ${{ inputs.run_benchmark }}").count - 1
-    #expect(bareRunBenchmarkGuardCount == 12)
+    #expect(bareRunBenchmarkGuardCount == 14)
     #expect(workflow.contains("if: ${{ always() && inputs.run_benchmark }}"))
     #expect(workflow.contains("golden.sha256=\"${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256\""))
     #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results"))
@@ -3506,7 +3741,7 @@ func singleMachineWorkflowGatesUploadsOnContentValidation() throws {
     // runs the deny-path check, and the upload requires staging to have PASSED,
     // which transitively enforces the validation gate on candidate runs.
     #expect(workflow.contains(
-        "if: ${{ always() && !inputs.run_benchmark && (!startsWith(github.ref, 'refs/heads/submissions/') || "
+        "if: ${{ always() && !inputs.run_benchmark && (inputs.submission_ref == github.sha || "
             + "steps.validate_correctness_artifacts.outcome == 'success') }}"
     ))
     #expect(workflow.contains("if: always() && steps.stage_correctness_artifacts.outcome == 'success'"))

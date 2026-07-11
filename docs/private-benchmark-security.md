@@ -30,18 +30,30 @@ cancelling an in-flight measurement.
 The workflow is `workflow_dispatch`-only with no PR or push triggers (fork
 code must never reach a self-hosted runner), and it verifies at runtime
 (see `enforce-trusted-benchmark-workflow.sh`) that it runs in this
-repository via a `workflow_dispatch` event. It benchmarks whatever ref it
-is dispatched on.
+repository via a `workflow_dispatch` event dispatched on **trusted `main`**.
+For `workflow_dispatch`, GitHub loads the workflow definition and every
+`run:` body from the dispatched ref, so the guard hard-pins the dispatch ref
+to `refs/heads/main` and anchors the resolved workflow ref to trusted main's
+own file (never `@${GITHUB_REF}`, which would be a tautology). A pushed
+`submissions/*` or `baseline/*` branch therefore can no longer run its own
+copy of the privileged job.
 
-Because the workflow runs the dispatched ref's own workflow file, the real
-boundary is the combination of:
+The candidate is supplied as **data**, not as the workflow ref: the required
+`submission_ref` input carries an exact 40-hex commit SHA that is checked out
+separately, verified against the modifiable surface, statically reviewed, and
+overlaid (`editablePaths` only) onto the trusted-main tree. A dispatch whose
+`submission_ref` equals the dispatched main SHA is a trusted-main/baseline run
+and skips the overlay. The real boundary is the combination of:
 
-- the benchmark orchestrator (Yukon eigenbot) being the only creator of
-  `submissions/*` branches, built from remotely validated `editablePaths` so
-  their non-`editablePaths` files match `main`;
-- the `Enforce modifiable surface` step re-verifying at runtime that a
-  `submissions/*` branch changes only `editablePaths` relative to `main`; and
-- restricting who can push `submissions/*` branches and dispatch the workflow.
+- the guard requiring the privileged job to execute trusted-main YAML;
+- the benchmark orchestrator (Yukon eigenbot) pushing the candidate commit as
+  a fetch-only ref and dispatching `benchmark.yml` on `main` with
+  `submission_ref` set to that commit's SHA;
+- the `Verify submitted commit and modifiable surface` step re-verifying at
+  runtime that the candidate is based on current trusted `main` and changes
+  only `editablePaths`; and
+- restricting who can push the candidate ref namespace and who can dispatch
+  the workflow (environment deployment-branch policy and runner-group access).
 
 ## Privilege rings and the bench-exec bridge
 
@@ -113,8 +125,10 @@ repository-wide or organization-wide secrets.
 
 Configure the `benchmark-private-prompts` Environment with:
 
-- Deployment branches limited to `main` and `submissions/*` (the refs the
-  benchmark orchestrator dispatches). Do not grant fork access.
+- Deployment branches limited to `main` only. The workflow is dispatched
+  exclusively on trusted `main` (the candidate is a `submission_ref` data
+  input), so no other branch namespace should be able to reach the
+  environment secrets. Do not grant fork access.
 - Required reviewers for private benchmark runs.
 - R2 private-object credentials:
   - `R2_ACCESS_KEY_ID`
@@ -231,13 +245,17 @@ untrusted once submitted code has run; later tampering with a workspace
 
 ## Submission flow
 
-The benchmark orchestrator (Yukon eigenbot) creates a `submissions/*`
-branch that differs from `main` only in `benchmark.json` `editablePaths`,
-then dispatches `benchmark.yml` on that branch. The workflow benchmarks the
-checked-out branch directly.
+The benchmark orchestrator (Yukon eigenbot) pushes the candidate commit as a
+fetch-only ref that differs from `main` only in `benchmark.json`
+`editablePaths`, then dispatches `benchmark.yml` **on `main`** with
+`submission_ref` set to that commit's exact 40-hex SHA. The workflow always
+runs trusted-main YAML and overlays only the candidate's `editablePaths`.
 
-On `submissions/*` branches the workflow additionally:
+When `submission_ref` differs from the dispatched main SHA the workflow
+additionally:
 
+- checks the candidate out separately (`ref: ${{ inputs.submission_ref }}`)
+  and verifies the checkout resolves to that SHA,
 - runs the static cheat review over the editable files the submission
   changed versus its merge-base with `main`
   (`run-submission-static-review.sh`; unchanged editable files are
@@ -247,8 +265,8 @@ On `submissions/*` branches the workflow additionally:
 - suppresses submitted correctness/benchmark process logs, and
 - uploads artifacts only after validation succeeds.
 
-Maintainers can also dispatch the workflow on `main` (baseline) or a dev
-branch; those runs skip the submission-only guards.
+A dispatch whose `submission_ref` equals the dispatched main SHA is a
+trusted-main/baseline run and skips the candidate-only guards.
 
 ## Output policy
 

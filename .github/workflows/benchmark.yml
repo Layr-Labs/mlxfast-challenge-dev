@@ -84,15 +84,25 @@ name: benchmark
 # on-disk files inside the bench-writable workspace is discarded, and the
 # harness-authored benchmark-integrity score hash is cross-checked.
 #
-# Dispatch-only, like before: no PR/push triggers (GitHub self-hosted safety --
-# fork PRs must never reach this runner). Dispatches are restricted to main,
-# submissions/*, baseline/*, and yukon/baseline/*. Submission branches
-# contribute only the exact dispatched SHA's editablePaths over trusted main;
-# main and both baseline namespaces run their exact dispatched SHA.
-# Submitted-process logs remain suppressed.
+# Dispatch-only: no PR/push triggers (GitHub self-hosted safety -- fork PRs
+# must never reach this runner). The workflow is dispatched ONLY on trusted
+# main (enforce-trusted-benchmark-workflow.sh hard-pins refs/heads/main and the
+# main-anchored workflow ref), so for workflow_dispatch GitHub always loads
+# this workflow definition and every `run:` body from trusted main -- a pushed
+# submissions/baseline branch can no longer run its own copy of the privileged
+# job. The candidate is pure DATA: the `submission_ref` input carries an exact
+# 40-hex commit SHA that is checked out separately, verified against
+# benchmark.json's modifiable surface, statically reviewed, and overlaid
+# (editablePaths only) onto the trusted main tree. A dispatch whose
+# submission_ref equals the dispatched main SHA is a trusted-main/baseline run
+# and skips the overlay. Submitted-process logs remain suppressed.
 on:
   workflow_dispatch:
     inputs:
+      submission_ref:
+        description: "Exact 40-character candidate commit SHA (checked out and overlaid as data). Use the dispatched main SHA for an explicit trusted-main/baseline run."
+        required: true
+        type: string
       run_benchmark:
         description: "Run the private gates + timed benchmark after the public correctness gate. false = public-fixture correctness only."
         required: false
@@ -201,8 +211,10 @@ jobs:
       MLXFAST_DECODE_SPEEDUP_FLOOR: "0.95"
       MLXFAST_PREFILL_SPEEDUP_FLOOR: "0.95"
       MLXFAST_RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
-      MLXFAST_CANDIDATE_SHA: ${{ github.sha }}
-      MLXFAST_IS_SUBMISSION_BRANCH: ${{ startsWith(github.ref, 'refs/heads/submissions/') && '1' || '0' }}
+      # Submitted code is DATA overlaid onto this trusted-main workflow
+      # checkout; the candidate SHA never selects the workflow ref.
+      MLXFAST_CANDIDATE_SHA: ${{ inputs.submission_ref }}
+      MLXFAST_IS_SUBMISSION_BRANCH: ${{ (inputs.submission_ref != github.sha) && '1' || '0' }}
       MLXFAST_VERIFY_TRANSFORM: ${{ inputs.verify_transform && '1' || '0' }}
       # POLICY (TOOLCHAINS override, ranked side): the ranked build must use
       # exactly ONE operator-chosen Metal toolchain. This pin is the
@@ -241,10 +253,10 @@ jobs:
 
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          # Submission branches contribute editable paths only; trusted main is
-          # the harness/workflow base. Main, baseline/*, and yukon/baseline/*
-          # run their exact SHA.
-          ref: ${{ startsWith(github.ref, 'refs/heads/submissions/') && 'main' || github.sha }}
+          # Always the trusted-main tree (the dispatch ref is hard-pinned to
+          # refs/heads/main by the guard below, so github.sha is the main tip).
+          # This is the harness/workflow base; the candidate is fetched and
+          # overlaid separately as data.
           fetch-depth: 0
           persist-credentials: false
 
@@ -254,7 +266,7 @@ jobs:
       - name: Capture candidate commit
         id: candidate_context
         env:
-          CANDIDATE_SHA: ${{ github.sha }}
+          CANDIDATE_SHA: ${{ inputs.submission_ref }}
         run: |
           set -euo pipefail
           if [[ ! "${CANDIDATE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -266,19 +278,19 @@ jobs:
           printf 'trusted_main_sha=%s\n' "${trusted_main_sha}" >> "${GITHUB_OUTPUT}"
 
       - name: Checkout submitted editable paths
-        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        if: ${{ inputs.submission_ref != github.sha }}
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.submission_ref }}
           path: .mlxfast-submission-src
           fetch-depth: 0
           persist-credentials: false
 
       - name: Verify submitted commit and modifiable surface
         id: verify_submission
-        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        if: ${{ inputs.submission_ref != github.sha }}
         env:
-          SUBMISSION_REF: ${{ github.sha }}
+          SUBMISSION_REF: ${{ inputs.submission_ref }}
           TRUSTED_MAIN_SHA: ${{ steps.candidate_context.outputs.trusted_main_sha }}
         run: |
           set -euo pipefail
@@ -311,10 +323,10 @@ jobs:
           echo "benchmark: verified submitted commit ${actual_sha} against base ${base_sha}"
 
       - name: Review submitted code for benchmark bypasses
-        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        if: ${{ inputs.submission_ref != github.sha }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
-          HEAD_SHA: ${{ github.sha }}
+          HEAD_SHA: ${{ inputs.submission_ref }}
           REVIEW_BASE_SHA: ${{ steps.verify_submission.outputs.base_sha }}
         run: |
           set -euo pipefail
@@ -325,7 +337,7 @@ jobs:
           )
 
       - name: Overlay submitted editable paths
-        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        if: ${{ inputs.submission_ref != github.sha }}
         env:
           SUBMISSION_WORKTREE: .mlxfast-submission-src
         run: .github/scripts/overlay-editable-paths.sh
@@ -333,7 +345,7 @@ jobs:
       # The bench workspace must contain the trusted tree plus overlaid editable
       # paths only, never the candidate's complete checkout.
       - name: Remove submitted checkout
-        if: ${{ always() && startsWith(github.ref, 'refs/heads/submissions/') }}
+        if: ${{ always() && inputs.submission_ref != github.sha }}
         run: |
           set -euo pipefail
           rm -rf .mlxfast-submission-src
@@ -491,9 +503,45 @@ jobs:
           # Runner-owned so trusted steps can later scrub bench-written hidden
           # files inside it (the semantic answers capture) before timing.
           mkdir -p "${MLXFAST_JOB_WS}/private"
+          # Runner-owned, bench-NON-writable staging dir for predictable-name
+          # hidden inputs (the raw golden/GPQA reference the attach step
+          # installs). Keeping these off the workspace root, in a directory the
+          # bench-deny ACL below covers, stops the submitted transform (which
+          # holds add_file at the workspace root) from pre-planting a symlink at
+          # a predictable name and redirecting the trusted copy that follows.
+          mkdir -p "${MLXFAST_JOB_WS}/.ranked-src"
           (cd "${MLXFAST_JOB_WS}" && swift package resolve)
+          # Functional grant: bench must read/execute the whole tree and write
+          # its own build/transform/score outputs. bench OWNS everything it
+          # creates (.build, weights, private, score files), so ownership -- not
+          # this ACL -- authorizes those writes; the ACL only opens the
+          # runner-owned tree for traversal and for creating new entries.
           /bin/chmod -R +a "user:bench allow list,search,readattr,readextattr,read,execute,add_file,add_subdirectory,delete_child,write,append,writeattr,writeextattr,file_inherit,directory_inherit" "${MLXFAST_JOB_WS}"
-          echo "benchmark: bench workspace ready at ${MLXFAST_JOB_WS}"
+          # Narrowing (defense in depth): explicitly DENY bench any write/delete
+          # on the trusted, runner-owned harness surfaces it only ever reads or
+          # executes at run time -- the benchmark driver, the CI scripts, the
+          # build tooling, the public fixtures, the editable-surface contract,
+          # and the hidden-input staging dir. The directory denies are
+          # inheritable so files placed into them later (e.g. the hidden inputs
+          # installed into .ranked-src) also become bench-immutable. Deny ACEs
+          # are canonically ordered ahead of the allow above, and because these
+          # paths are runner-owned bench cannot strip them. This stops a
+          # submitted transform from replacing benchmark.sh or a .github/scripts
+          # helper between build and a scored run, and from creating/redirecting
+          # a predictable-name hidden input. (The built binary and mlx.metallib
+          # are bench-owned build outputs that ACLs cannot protect -- their
+          # integrity anchor is the trusted-harness content pin verified before
+          # each scored run.)
+          /bin/chmod -R +a "user:bench deny write,append,writeattr,writeextattr,delete,delete_child,add_file,add_subdirectory,chown,file_inherit,directory_inherit" \
+            "${MLXFAST_JOB_WS}/.github" \
+            "${MLXFAST_JOB_WS}/tools" \
+            "${MLXFAST_JOB_WS}/Sources" \
+            "${MLXFAST_JOB_WS}/correctness_prompts" \
+            "${MLXFAST_JOB_WS}/.ranked-src"
+          /bin/chmod +a "user:bench deny write,append,writeattr,writeextattr,delete,chown" \
+            "${MLXFAST_JOB_WS}/benchmark.sh" \
+            "${MLXFAST_JOB_WS}/benchmark.json"
+          echo "benchmark: bench workspace ready at ${MLXFAST_JOB_WS} (trusted harness surfaces ACL-locked against bench writes)"
 
       # Build through the bridge: compiling the submitted surface is already
       # untrusted-code execution (SwiftPM manifest evaluation, build plugins),
@@ -524,16 +572,23 @@ jobs:
             '
           test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-swift"
           test -s "${MLXFAST_JOB_WS}/.build/release/mlx.metallib"
+          # Pin the trusted harness artifacts NOW, at the end of the trusted-
+          # controlled build and before the submitted transform (the first
+          # bench step that could tamper with the workspace). Every later phase
+          # that executes the binary/driver as bench re-verifies against this
+          # pin and fails closed on any change (TOCTOU defense).
+          .github/scripts/pin-trusted-harness.sh write \
+            "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
 
       - name: Stage trusted MLX Metal library cache
-        if: steps.restore_mlx_metallib_cache.outputs.cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        if: steps.restore_mlx_metallib_cache.outputs.cache-hit != 'true' && github.event_name == 'workflow_dispatch' && inputs.submission_ref == github.sha
         run: |
           set -euo pipefail
           mkdir -p .mlxfast-cache
           /bin/cp "${MLXFAST_JOB_WS}/.build/release/mlx.metallib" .mlxfast-cache/mlx.metallib
 
       - name: Save trusted MLX Metal library cache
-        if: steps.restore_mlx_metallib_cache.outputs.cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        if: steps.restore_mlx_metallib_cache.outputs.cache-hit != 'true' && github.event_name == 'workflow_dispatch' && inputs.submission_ref == github.sha
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .mlxfast-cache/mlx.metallib
@@ -581,6 +636,12 @@ jobs:
       - name: Hash transformed weights for ranked audit
         if: ${{ inputs.run_benchmark }}
         run: .github/scripts/hash-weights-directory.sh "${MLXFAST_JOB_WS}/weights" weights.sha256
+
+      # TOCTOU guard: the submitted transform just ran with workspace write
+      # access. Re-verify that the trusted driver + binary + metallib still
+      # match the post-build pin before executing the binary as bench again.
+      - name: Verify trusted harness before public gate
+        run: .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
 
       # Public drift tripwire (issue #83 class): one independent 64-step
       # teacher-forced check against the checked-in public fixture, run BEFORE
@@ -678,7 +739,7 @@ jobs:
 
       - name: Stage correctness artifacts
         id: stage_correctness_artifacts
-        if: ${{ always() && !inputs.run_benchmark && (!startsWith(github.ref, 'refs/heads/submissions/') || steps.validate_correctness_artifacts.outcome == 'success') }}
+        if: ${{ always() && !inputs.run_benchmark && (inputs.submission_ref == github.sha || steps.validate_correctness_artifacts.outcome == 'success') }}
         run: |
           set -euo pipefail
           test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"
@@ -751,9 +812,24 @@ jobs:
           BENCH_JOB_ID: ranked-${{ github.run_id }}-${{ github.run_attempt }}-attach
         run: |
           set -euo pipefail
-          cp "${MLXFAST_PRIVATE_DIR}/raw_golden.json" "${MLXFAST_JOB_WS}/.ranked-golden-src.json"
-          cp "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" "${MLXFAST_JOB_WS}/.ranked-gpqa-src.json"
-          chmod 644 "${MLXFAST_JOB_WS}/.ranked-golden-src.json" "${MLXFAST_JOB_WS}/.ranked-gpqa-src.json"
+          # Symlink-safe placement of the predictable-name hidden inputs. They
+          # go into the runner-owned, bench-NON-writable .ranked-src/ staging
+          # dir (ACL-denied to bench in "Prepare bench workspace"), so the
+          # submitted transform can no longer pre-plant a symlink at these names
+          # and redirect the trusted copy to leak the raw hidden golden. The
+          # explicit reject-if-exists/symlink guard plus install(1) (which
+          # creates a fresh regular file, never writes through a symlink) are
+          # belt-and-suspenders on top of the ACL.
+          golden_src="${MLXFAST_JOB_WS}/.ranked-src/golden.json"
+          gpqa_src="${MLXFAST_JOB_WS}/.ranked-src/gpqa.json"
+          for hidden_target in "${golden_src}" "${gpqa_src}"; do
+            if [[ -e "${hidden_target}" || -L "${hidden_target}" ]]; then
+              echo "::error::refusing to place hidden input over pre-existing path ${hidden_target}" >&2
+              exit 1
+            fi
+          done
+          install -m 0444 "${MLXFAST_PRIVATE_DIR}/raw_golden.json" "${golden_src}"
+          install -m 0444 "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" "${gpqa_src}"
           status=0
           # shellcheck disable=SC2024  # trusted shell owns the capture files
           sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
@@ -763,14 +839,16 @@ jobs:
               set -u
               cd "${MJOB_WS}" || exit 97
               exec .build/release/mlxfast-swift attach-gpqa-gates \
-                --golden .ranked-golden-src.json \
-                --gpqa .ranked-gpqa-src.json \
+                --golden .ranked-src/golden.json \
+                --gpqa .ranked-src/gpqa.json \
                 --tokenizer weights \
                 --output correctness_golden_ranked.json \
                 --case-count "${MLXFAST_GPQA_CASE_COUNT}" \
                 --max-new-tokens "${MLXFAST_GPQA_MAX_NEW_TOKENS}"
             ' > "${MLXFAST_PRIVATE_DIR}/attach-gpqa.log" 2>&1 || status=$?
-          rm -f "${MLXFAST_JOB_WS}/.ranked-golden-src.json" "${MLXFAST_JOB_WS}/.ranked-gpqa-src.json"
+          # Runner-owned files: this unlinks the real trusted inputs, never an
+          # attacker symlink (bench could not have created one here).
+          rm -rf "${MLXFAST_JOB_WS}/.ranked-src"
           test "${status}" -eq 0 || { echo "::error::attach-gpqa-gates failed" >&2; exit 1; }
           test -s "${MLXFAST_JOB_WS}/correctness_golden_ranked.json"
           # Trusted copy is the pinned instance the artifacts reference; the
@@ -806,6 +884,15 @@ jobs:
           ws_hash="$(shasum -a 256 "${MLXFAST_JOB_WS}/correctness_golden_ranked.json" | awk '{print $1}')"
           test "${ws_hash}" == "${actual_hash}"
           echo "benchmark: using private GPQA-augmented correctness golden ${actual_hash} bytes=${actual_bytes}"
+
+      # TOCTOU guard before the first --official invocation: attach-gpqa-gates
+      # and the public gate executed the binary as bench since the last check,
+      # so re-verify the trusted driver + binary + metallib against the
+      # post-build pin. A replaced benchmark.sh or binary here could otherwise
+      # forge the sealed gates score.
+      - name: Verify trusted harness before gates
+        if: ${{ inputs.run_benchmark }}
+        run: .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
 
       # The single gates+base pass: ONE `mlxfast-swift benchmark` invocation
       # (via benchmark.sh --official) that teacher-forces the FULL 64-step
@@ -1014,6 +1101,17 @@ jobs:
           done
           temp="$("${MLXFAST_MACMON}" pipe -s1 2>/dev/null | jq -r '.temp.gpu_temp_avg // "?"')"
           echo "benchmark: quiescent after ${waited}s (load=${load} gpu_util=${util} gpu_temp=${temp}C); thermal gate is enforced inside measure-job"
+
+      # TOCTOU guard before the second --official invocation: the gates pass
+      # executed submitted model code since the last check, so re-verify the
+      # trusted driver + binary + metallib against the post-build pin before
+      # measure-job re-runs ./benchmark.sh and the binary for the scored timing.
+      # measure-job is box-owned and cannot be modified from the repo, so this
+      # trusted-shell check right before it is the repo-side integrity anchor
+      # for the timed phase.
+      - name: Verify trusted harness before timing
+        if: ${{ inputs.run_benchmark }}
+        run: .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
 
       # THE TIMED MEASUREMENT -- LAST, via the validated clean path. measure-job
       # (trusted, runner-owned, fixed thermal contract) runs, in order: pinned
