@@ -340,7 +340,6 @@ extension GemmaRuntime {
         golden: GoldenFixture,
         worker: RuntimeWorkerClient,
         steps: Int = MLXFastConstants.correctnessSteps,
-        startStep: Int = 0,
         checkGates: Bool = true,
         semanticCapture: SemanticGPQACaptureOptions? = nil,
         progress: ((String) -> Void)? = nil
@@ -412,7 +411,6 @@ extension GemmaRuntime {
                     testCase: testCase,
                     worker: worker,
                     steps: steps,
-                    startStep: startStep,
                     progressIntervalSteps: 64,
                     progress: { step, total in
                         progress?("correctness case \(caseLabel) checked \(step)/\(total) tokens")

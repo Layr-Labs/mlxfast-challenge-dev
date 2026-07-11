@@ -859,7 +859,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(!workflow.contains(".github/scripts/upload-r2-object.sh"))
     #expect(!workflow.contains("uploaded calibrated GPQA reference cases to private R2"))
     // The RAW (pre-GPQA-augmentation) hidden golden pins -- the same object the
-    // old parallel slices verified as MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_*.
+    // prior shard goldens verified as MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_*.
     // The augmented golden is pinned to a self-anchored hash exported into
     // GITHUB_ENV right after attach-gpqa-gates, exactly as the old gates
     // machine did.
@@ -1615,7 +1615,7 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(runtime.contains("correctnessTokenAccepted("))
     #expect(runtime.contains("kind: \"correctness_begin\""))
     #expect(runtime.contains("kind: \"correctness_step\""))
-    #expect(runtime.contains("worker.teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[step - 1])"))
+    #expect(runtime.contains("teacherForcedCorrectnessStep(previousToken: expectedToken)"))
     #expect(!runtime.contains("correctness_teacher_forced_batch"))
     #expect(!runtime.contains("teacherForcedCorrectnessBatch"))
     #expect(!runtime.contains("let expectedTokens: [Int]?"))
@@ -1884,30 +1884,16 @@ func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
 }
 
 @Test
-func compareTeacherForcedWithWorkerSupportsStartStepSlices() throws {
+func compareTeacherForcedWithWorkerUsesSerialTeacherForcedSteps() throws {
     let runtime = try harnessRuntimeSource()
 
     #expect(runtime.contains("static func compareTeacherForcedWithWorker("))
-    #expect(runtime.contains("startStep: Int = 0,"))
-    #expect(runtime.contains("let endStep = startStep + steps"))
-    // Seeding must replay [0, startStep) as single-token teacher-forced steps from
-    // the bare prompt -- NOT one batched prefill over prompt+prefix -- so every
-    // checked step's KV state has bit-identical floating-point provenance to a
-    // serial run. A batched seed goes through different kernel dispatch/reduction
-    // orders, and under strict argmax equality a near-tie logit could flip a
-    // checked token in either direction relative to what serial would have found.
     #expect(runtime.contains("try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)"))
-    #expect(runtime.contains("for seedStep in 0..<startStep {"))
-    #expect(runtime.contains("previousToken: testCase.expectedTokens[seedStep]"))
-    #expect(!runtime.contains("let seedPromptTokens"))
+    #expect(runtime.contains("for step in 0..<steps {"))
+    #expect(runtime.contains("teacherForcedCorrectnessStep(previousToken: expectedToken)"))
+    #expect(!runtime.contains("startStep: Int = 0,"))
+    #expect(!runtime.contains("for seedStep in 0..<startStep {"))
     #expect(!runtime.contains("testCase.promptTokens + Array(testCase.expectedTokens[0..<startStep])"))
-    #expect(runtime.contains("for step in startStep..<endStep {"))
-    #expect(runtime.contains("checkedSteps: step - startStep + 1,"))
-    #expect(runtime.contains("guard startStep >= 0 else {"))
-    #expect(runtime.contains("teacher-forced correctness startStep must be >= 0"))
-
-
-    #expect(runtime.contains("guard options.correctnessSteps > 0 else {"))
 }
 
 // Regression test for a bug caught only by a real dispatch (not reproducible
@@ -3299,7 +3285,7 @@ func overlayPairedTimingValidatesInputsAppliesFloorsAndClearsPartialResult() thr
     #expect(overlay.contains("(.baseline.verdict == \"ACCEPT\")"))
 
     // Pre-merge leak-field and structural-zero checks on the candidate's
-    // sealed timing score, mirroring the old combine's pre-merge validation.
+    // sealed timing score pre-merge validation.
     #expect(overlay.contains("(.metrics.first_failing_case == null)"))
     #expect(overlay.contains("and (.metrics.first_failing_step == null)"))
     #expect(overlay.contains("and (.metrics.expected_token == null)"))
