@@ -10,7 +10,7 @@ import MLXFastCore
 /// dimension, but only the first `partialRotaryFactor` fraction of each half
 /// is actually rotated (ported from the mlx-vlm `ProportionalRoPE`
 /// reference implementation for `gemma4`).
-public final class Gemma4RoPE {
+public final class Gemma4RoPE: @unchecked Sendable {
     private enum Kind {
         case standard(dims: Int, base: Double)
         case proportional(dims: Int, rotatedDims: Int, freqs: MLXArray)
@@ -76,6 +76,31 @@ public final class Gemma4RoPE {
         }
     }
 
+    /// Dynamic-offset variant used by the compiled decode attention-prep path.
+    /// Keeping the position as an MLX array lets one compiled graph serve every
+    /// decode step instead of recompiling once per cache offset.
+    public func applied(to x: MLXArray, offset: MLXArray) -> MLXArray {
+        switch kind {
+        case let .standard(dims, base):
+            return MLXFast.RoPE(
+                x,
+                dimensions: dims,
+                traditional: false,
+                base: Float(base),
+                scale: 1.0,
+                offset: offset
+            )
+        case let .proportional(dims, rotatedDims, freqs):
+            return Self.proportionalApply(
+                x,
+                dims: dims,
+                rotatedDims: rotatedDims,
+                freqs: freqs,
+                offset: offset
+            )
+        }
+    }
+
     private static func proportionalApply(
         _ x: MLXArray,
         dims: Int,
@@ -103,6 +128,42 @@ public final class Gemma4RoPE {
             freqs: freqs
         )
 
+        let newLeft = concatenated(
+            [roped[.ellipsis, 0..<rotaryPairs], left[.ellipsis, rotaryPairs..<half]],
+            axis: -1
+        )
+        let newRight = concatenated(
+            [roped[.ellipsis, rotaryPairs..<rotatedDims], right[.ellipsis, rotaryPairs..<half]],
+            axis: -1
+        )
+        return concatenated([newLeft, newRight], axis: -1)
+    }
+
+    private static func proportionalApply(
+        _ x: MLXArray,
+        dims: Int,
+        rotatedDims: Int,
+        freqs: MLXArray,
+        offset: MLXArray
+    ) -> MLXArray {
+        let half = dims / 2
+        let rotaryPairs = rotatedDims / 2
+
+        let left = x[.ellipsis, 0..<half]
+        let right = x[.ellipsis, half..<dims]
+        let rotatedInput = concatenated(
+            [left[.ellipsis, 0..<rotaryPairs], right[.ellipsis, 0..<rotaryPairs]],
+            axis: -1
+        )
+        let roped = MLXFast.RoPE(
+            rotatedInput,
+            dimensions: rotatedDims,
+            traditional: false,
+            base: nil,
+            scale: 1.0,
+            offset: offset,
+            freqs: freqs
+        )
         let newLeft = concatenated(
             [roped[.ellipsis, 0..<rotaryPairs], left[.ellipsis, rotaryPairs..<half]],
             axis: -1
