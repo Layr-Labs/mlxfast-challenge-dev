@@ -347,13 +347,14 @@ measured model path.
 Public local correctness uses the checked-in correctness fixture. When a local
 edit-loop signal is enough, `--local-iterate` uses that public 512-token prompt,
 times standalone prefill separately, then times decode including seed prefill
-plus 16 teacher-forced decode tokens, writes `score.local-iterate.json`, prints
-it, and leaves `score` null because it is not a ranked benchmark score. The
-submit hook `--local-submit` uses the same public prompt with a longer 1024-token
-fixture: it times the same standalone prefill and decode-seed phases plus 1023
-teacher-forced decode tokens in one continuous trajectory, writes
-`score.json`, and also leaves `score` null because official ranking still
-requires the hidden benchmark oracle on the trusted runner.
+plus 16 teacher-forced decode tokens, writes `score.local-iterate.json` with the
+estimated local `score`, and prints it. The submit hook `--local-submit` uses the
+same public prompt with a longer 1024-token fixture: it times the same standalone
+prefill and decode-seed phases plus 1023 teacher-forced decode tokens in one
+continuous trajectory, writes `score.json` with the same estimated local `score`,
+and prints it. Official ranking still requires the hidden benchmark oracle on
+the trusted runner; only that ranked run's paired measurement produces the
+official score.
 The score payload includes the baseline timings used for scoring (the
 same-session measured reference on ranked runs, the calibrated constants in
 local modes), computed speedups, wall-clock phase timings, final process RSS,

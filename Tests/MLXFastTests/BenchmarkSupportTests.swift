@@ -651,29 +651,30 @@ func submissionValidationDelayDefaultsToZero() throws {
 }
 
 @Test
-func benchmarkPromptPlanUsesHiddenBenchmarkOracle() throws {
+func benchmarkGoldenOracleFieldsAreValidatedOnLoad() throws {
     let prefill = Array(0..<MLXFastConstants.benchmarkPrefillPromptTokens)
     let seed = Array(0..<MLXFastConstants.benchmarkDecodeSeedTokens)
     let decode = Array(repeating: 9, count: MLXFastConstants.benchmarkDecodeSteps)
-    let plan = try BenchmarkPrompt.plan(from: BenchmarkGolden(
+    let benchmark = BenchmarkGolden(
         prefillPromptTokens: prefill,
         expectedPrefillToken: 17,
         decodeSeedTokens: seed,
         expectedDecodeSeedToken: 23,
         expectedDecodeTokens: decode
-    ))
+    )
+    try validateBenchmarkGolden(benchmark)
 
-    #expect(plan.prefillTokens == prefill)
-    #expect(plan.expectedPrefillToken == 17)
-    #expect(plan.decodeSeedTokens == seed)
-    #expect(plan.expectedDecodeSeedToken == 23)
-    #expect(plan.expectedDecodeTokens == decode)
+    #expect(benchmark.prefillPromptTokens == prefill)
+    #expect(benchmark.expectedPrefillToken == 17)
+    #expect(benchmark.decodeSeedTokens == seed)
+    #expect(benchmark.expectedDecodeSeedToken == 23)
+    #expect(benchmark.expectedDecodeTokens == decode)
 }
 
 @Test
-func benchmarkPromptPlanRejectsMalformedBenchmarkOracle() {
+func validateBenchmarkGoldenRejectsMalformedOracle() {
     #expect(throws: MLXFastError.self) {
-        _ = try BenchmarkPrompt.plan(from: BenchmarkGolden(
+        try validateBenchmarkGolden(BenchmarkGolden(
             prefillPromptTokens: [1],
             expectedPrefillToken: 7,
             decodeSeedTokens: Array(repeating: 1, count: MLXFastConstants.benchmarkDecodeSeedTokens),
