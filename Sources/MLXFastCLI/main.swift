@@ -163,10 +163,9 @@ private enum MLXFastCLI {
         )
         let baseCaseOnly = options.hasFlag("--base-case-only")
             || environmentValue("MLXFAST_CORRECTNESS_BASE_CASE_ONLY", fallback: "0") == "1"
-        // Recorded independent of pass/fail and before the check even runs: a
-        // combiner verifying range coverage across machines needs to know what was
-        // actually ASSIGNED, not derive it from checked_steps, which is truncated on
-        // a real failure and must not be confused with an unassigned/uncovered range.
+        // Recorded independent of pass/fail and before the check even runs so
+        // operator tooling can persist the assigned range separately from
+        // checked_steps, which is truncated on failure.
         let stepRangeOutputPath = options.value(for: "--step-range-output", default: "")
         if !stepRangeOutputPath.isEmpty {
             guard let stepCount else {

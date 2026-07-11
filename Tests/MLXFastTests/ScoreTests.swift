@@ -34,6 +34,43 @@ func benchmarkScoreChecksComponentFloors() {
 }
 
 @Test
+func evaluateTimedRunMatchesSeparateScoreSpeedupAndBandChecks() {
+    let evaluation = BenchmarkScore.evaluateTimedRun(
+        decodeSecondsPerToken: 0.10,
+        prefillSecondsPerToken: 0.01,
+        baselineDecodeSecondsPerToken: 0.10,
+        baselinePrefillSecondsPerToken: 0.01
+    )
+
+    #expect(evaluation.firstFailureReason() == nil)
+    #expect(evaluation.hasFiniteScore)
+    #expect(evaluation.passesFloors)
+    #expect(evaluation.passesAcceptanceBands)
+    #expect(abs(evaluation.score - 1) < 1e-12)
+    #expect(abs(evaluation.decodeSpeedup - 1) < 1e-12)
+    #expect(abs(evaluation.prefillSpeedup - 1) < 1e-12)
+
+    let failingFloor = BenchmarkScore.evaluateTimedRun(
+        decodeSecondsPerToken: 0.20,
+        prefillSecondsPerToken: 0.01,
+        baselineDecodeSecondsPerToken: 0.10,
+        baselinePrefillSecondsPerToken: 0.01
+    )
+    #expect(failingFloor.passesFloors == false)
+    #expect(failingFloor.firstFailureReason()?.hasPrefix("performance floor failed:") == true)
+    #expect(failingFloor.hasFiniteScore)
+
+    let nonFinite = BenchmarkScore.evaluateTimedRun(
+        decodeSecondsPerToken: 0,
+        prefillSecondsPerToken: 0.01,
+        baselineDecodeSecondsPerToken: 0.10,
+        baselinePrefillSecondsPerToken: 0.01
+    )
+    #expect(nonFinite.hasFiniteScore == false)
+    #expect(nonFinite.firstFailureReason() == "computed score was not finite")
+}
+
+@Test
 func writeScorePayloadEmitsDarkbloomShape() throws {
     let directory = try temporaryDirectory()
     let path = directory.appendingPathComponent("score.json")
@@ -312,7 +349,7 @@ func publicDiagnosticsAreCoarsenedWhileRankingStaysPrecise() throws {
     let decoded = try JSONDecoder().decode(ScorePayload.self, from: Data(contentsOf: path))
 
     // Ranking- and floor-critical fields are published at full precision so
-    // scoring, the speedup floor, and the parallel-combine merge are unaffected.
+    // scoring, the speedup floor, and paired timing overlay are unaffected.
     #expect(decoded.score == 1.947063198)
     #expect(decoded.metrics.decodeSecondsPerToken == 2.0953410813828124)
     #expect(decoded.metrics.prefillSecondsPerToken == 0.0985421517)
