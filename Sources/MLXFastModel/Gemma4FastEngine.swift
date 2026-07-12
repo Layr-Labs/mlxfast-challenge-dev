@@ -901,6 +901,7 @@ private func gemma4FastAttentionFallback(
 final class Gemma4FastEngine {
     let embedTokens: Embedding
     let embedScale: Float
+    let fusedTokenIngress: Gemma4FusedTokenIngress?
     let finalNormWeight: MLXArray
     let eps: Float
     let softcap: Float
@@ -919,8 +920,10 @@ final class Gemma4FastEngine {
         tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata? = nil
     ) throws {
         let config = model.configuration
-        self.embedScale = Float(config.hiddenSize).squareRoot()
-        self.eps = config.rmsNormEps
+        let embedScale = Float(config.hiddenSize).squareRoot()
+        let eps = config.rmsNormEps
+        self.embedScale = embedScale
+        self.eps = eps
         self.softcap = config.finalLogitSoftcapping
         self.slidingWindow = config.slidingWindow
         let asyncLayerGroup = max(
@@ -1118,6 +1121,20 @@ final class Gemma4FastEngine {
             )
         }
         self.layers = built
+        if gemma4FusedTokenIngressEnabled()
+            || gemma4FusedTokenIngressVerificationEnabled()
+        {
+            self.fusedTokenIngress = built.first.flatMap {
+                Gemma4FusedTokenIngress(
+                    embedding: loadedEmbedTokens,
+                    embedScale: embedScale,
+                    inputNormWeight: $0.inputNormWeight,
+                    eps: eps
+                )
+            }
+        } else {
+            self.fusedTokenIngress = nil
+        }
 
         let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { logits, cap in
             tanh(logits / cap) * cap
@@ -1132,7 +1149,36 @@ final class Gemma4FastEngine {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var hidden = embedTokens(inputs) * embedScale
+        var hidden: MLXArray
+        var normalizedInput: MLXArray?
+        if let fusedTokenIngress,
+           fusedTokenIngress.supports(inputs)
+        {
+            let candidate = fusedTokenIngress(inputs)
+            if gemma4FusedTokenIngressVerificationEnabled() {
+                let stockHidden = embedTokens(inputs) * embedScale
+                let stockNormalized = MLXFast.rmsNorm(
+                    stockHidden,
+                    weight: layers[0].inputNormWeight,
+                    eps: eps
+                )
+                fusedTokenIngress.verifyRawBits(
+                    candidate,
+                    stockScaledResidual: stockHidden,
+                    stockNormalizedInput: stockNormalized
+                )
+                // Verification is diagnostic-only: preserve the promoted graph
+                // after proving both candidate outputs bit-for-bit.
+                hidden = stockHidden
+                normalizedInput = stockNormalized
+            } else {
+                hidden = candidate.scaledResidual
+                normalizedInput = candidate.normalizedInput
+            }
+        } else {
+            hidden = embedTokens(inputs) * embedScale
+            normalizedInput = nil
+        }
 
         func layerCache(_ index: Int) -> KVCache? {
             guard let cache, index < cache.count else { return nil }
@@ -1152,7 +1198,6 @@ final class Gemma4FastEngine {
             createAttentionMask(h: hidden, cache: layerCache($0), windowSize: nil)
         }
 
-        var normalizedInput: MLXArray? = nil
         for (index, layer) in layers.enumerated() {
             let mask = layer.isSliding ? (slidingMask ?? .none) : (fullMask ?? .none)
             let result = layer(
