@@ -2,6 +2,21 @@ import Foundation
 import MLX
 
 // Packed-output additions authored by GPT 5.6 Sol through Gaj's OpenCode Harness.
+private let gemma4Packed12SlidingOutputRows8GridY: Int = {
+    let outputRows = 5_376
+    let rowsPerSIMD = 8
+    let simdGroupsPerThreadgroup = 2
+    let rowsPerThreadgroup = rowsPerSIMD * simdGroupsPerThreadgroup
+    precondition(outputRows.isMultiple(of: rowsPerThreadgroup))
+    let threadgroups = outputRows / rowsPerThreadgroup
+    let finalOutputRow = (threadgroups - 1) * rowsPerThreadgroup
+        + (simdGroupsPerThreadgroup - 1) * rowsPerSIMD
+        + (rowsPerSIMD - 1)
+    precondition(finalOutputRow == outputRows - 1)
+    // MLX custom-kernel grid dimensions count threads, not threadgroups.
+    return threadgroups * simdGroupsPerThreadgroup
+}()
+
 private let gemma4Packed12IndexedSlidingOutputQMV = MLXFast.metalKernel(
     name: "gemma4_packed12_indexed_output_qmv_fast_8192_v1",
     inputNames: ["weight", "packed_indices", "lut", "x"],
@@ -11,6 +26,21 @@ private let gemma4Packed12IndexedSlidingOutputQMV = MLXFast.metalKernel(
         groupsPerRow: 128,
         packedWordsPerRow: 48,
         weightBytesPerRow: 4_096
+    ),
+    header: gemma4IndexedOutputHeader,
+    ensureRowContiguous: true
+)
+
+private let gemma4Packed12IndexedSlidingOutputRows8QMV = MLXFast.metalKernel(
+    name: "gemma4_packed12_indexed_output_qmv_fast_8192_rows8_v1",
+    inputNames: ["weight", "packed_indices", "lut", "x"],
+    outputNames: ["output"],
+    source: gemma4Packed12IndexedOutputBody(
+        inputWidth: 8_192,
+        groupsPerRow: 128,
+        packedWordsPerRow: 48,
+        weightBytesPerRow: 4_096,
+        rowsPerSIMD: 8
     ),
     header: gemma4IndexedOutputHeader,
     ensureRowContiguous: true
@@ -60,18 +90,28 @@ private func gemma4Packed12IndexedOutputBody(
     inputWidth: Int,
     groupsPerRow: Int,
     packedWordsPerRow: Int,
-    weightBytesPerRow: Int
+    weightBytesPerRow: Int,
+    rowsPerSIMD: Int = 4
 ) -> String {
-    """
+    precondition(rowsPerSIMD > 0)
+    precondition(5_376.isMultiple(of: 2 * rowsPerSIMD))
+    return """
         constexpr int kInputWidth = \(inputWidth);
+        constexpr int kOutputWidth = 5376;
         constexpr int kGroupsPerRow = \(groupsPerRow);
         constexpr int kPackedWordsPerRow = \(packedWordsPerRow);
         constexpr int kWeightBytesPerRow = \(weightBytesPerRow);
-        constexpr int kRowsPerSIMD = 4;
+        constexpr int kRowsPerSIMD = \(rowsPerSIMD);
+        constexpr int kSIMDGroupsPerThreadgroup = 2;
+        constexpr int kRowsPerThreadgroup =
+            kSIMDGroupsPerThreadgroup * kRowsPerSIMD;
         constexpr int kBlockSize = 512;
+        static_assert(
+            kOutputWidth % kRowsPerThreadgroup == 0,
+            "output rows must exactly fill threadgroups");
 
         const int output_row =
-            threadgroup_position_in_grid.y * 8
+            threadgroup_position_in_grid.y * kRowsPerThreadgroup
             + simdgroup_index_in_threadgroup * kRowsPerSIMD;
         const device uchar* weight_bytes =
             reinterpret_cast<const device uchar*>(weight)
@@ -238,6 +278,16 @@ private func gemma4OutputEnvironmentFlag(
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }
 
+private let gemma4OutputRows8Enabled = gemma4OutputEnvironmentFlag(
+    "DARKBLOOM_OPROJ_ROWS8",
+    default: false
+)
+
+private let gemma4VerifyOutputRows8Bits = gemma4OutputEnvironmentFlag(
+    "DARKBLOOM_VERIFY_OPROJ_ROWS8_BITS",
+    default: false
+)
+
 private struct Packed12OutputMetadata: @unchecked Sendable {
     let words: MLXArray
 
@@ -336,7 +386,11 @@ struct IndexedOutputProjection: @unchecked Sendable {
     func callAsFunction(_ input: MLXArray) -> MLXArray {
         precondition(input.dtype == .bfloat16)
         precondition(input.shape == [1, 1, inputWidth])
+        let requestedRows8 = inputWidth == 8_192
+            && (gemma4OutputRows8Enabled || gemma4VerifyOutputRows8Bits)
         guard let packed12 else {
+            // Rows8 specializes only the packed12 path. Valid layers whose
+            // LUT cannot use packed12 retain the existing exact U16 fallback.
             let kernel = inputWidth == 8_192
                 ? gemma4IndexedSlidingOutputQMV
                 : gemma4IndexedFullOutputQMV
@@ -352,13 +406,50 @@ struct IndexedOutputProjection: @unchecked Sendable {
         let packedKernel = inputWidth == 8_192
             ? gemma4Packed12IndexedSlidingOutputQMV
             : gemma4Packed12IndexedFullOutputQMV
-        let output = packedKernel(
-            [projection.weight, packed12.words, metadata.lut, input],
-            grid: (32, 1_344, 1),
-            threadGroup: (32, 2, 1),
-            outputShapes: [[1, 1, 5_376]],
-            outputDTypes: [.bfloat16]
-        )[0]
+        let packedInputs = [
+            projection.weight, packed12.words, metadata.lut, input,
+        ]
+        let outputShape = [1, 1, 5_376]
+        let output: MLXArray
+        if requestedRows8 {
+            let candidate = gemma4Packed12IndexedSlidingOutputRows8QMV(
+                packedInputs,
+                grid: (32, gemma4Packed12SlidingOutputRows8GridY, 1),
+                threadGroup: (32, 2, 1),
+                outputShapes: [outputShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+            if gemma4VerifyOutputRows8Bits {
+                let reference = packedKernel(
+                    packedInputs,
+                    grid: (32, 1_344, 1),
+                    threadGroup: (32, 2, 1),
+                    outputShapes: [outputShape],
+                    outputDTypes: [.bfloat16]
+                )[0]
+                let matches = arrayEqual(
+                    candidate.view(dtype: .uint16),
+                    reference.view(dtype: .uint16)
+                )
+                eval(matches)
+                precondition(
+                    matches.item(Bool.self),
+                    "rows8 sliding output projection differs from "
+                        + "promoted packed12 qmv_fast"
+                )
+                output = gemma4OutputRows8Enabled ? candidate : reference
+            } else {
+                output = candidate
+            }
+        } else {
+            output = packedKernel(
+                packedInputs,
+                grid: (32, 1_344, 1),
+                threadGroup: (32, 2, 1),
+                outputShapes: [outputShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
         if verifyPacked12Bits {
             let referenceKernel = inputWidth == 8_192
                 ? gemma4IndexedSlidingOutputQMV
@@ -367,7 +458,7 @@ struct IndexedOutputProjection: @unchecked Sendable {
                 [projection.weight, metadata.indices, metadata.lut, input],
                 grid: (32, 1_344, 1),
                 threadGroup: (32, 2, 1),
-                outputShapes: [[1, 1, 5_376]],
+                outputShapes: [outputShape],
                 outputDTypes: [.bfloat16]
             )[0]
             let matches = arrayEqual(
