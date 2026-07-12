@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import MLXFastCore
 import MLXNN
@@ -235,6 +236,159 @@ private let gemma4TiedVocabularyHeadPacked13SoftcapQMV = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+// Experimental decode topology: each SIMDgroup owns eight vocabulary rows
+// instead of four.  The arithmetic within each row is intentionally identical
+// to the production rows4 kernel above; this only trades half as many
+// threadgroups/SIMDgroups for twice as much row-level register work per SIMD.
+private let gemma4TiedVocabularyHeadPacked13SoftcapRows8QMV = MLXFast.metalKernel(
+    name: "gemma4_tied_vocabulary_head_packed13_softcap_rows8_qmv_262144x5376_v1",
+    inputNames: ["weight", "packed_indices", "lut", "x", "cap"],
+    outputNames: ["output"],
+    source: """
+        constexpr int kInputWidth = 5376;
+        constexpr int kOutputWidth = 262144;
+        constexpr int kGroupsPerRow = 84;
+        constexpr int kPackedWordsPerRow = 35;
+        constexpr int kWeightBytesPerRow = 2688;
+        constexpr int kRowsPerSIMD = 8;
+        constexpr int kSIMDGroupsPerThreadgroup = 4;
+
+        const int output_row =
+            threadgroup_position_in_grid.y
+                * kRowsPerSIMD * kSIMDGroupsPerThreadgroup
+            + simdgroup_index_in_threadgroup * kRowsPerSIMD;
+
+        const device uchar* weight_bytes =
+            reinterpret_cast<const device uchar*>(weight)
+            + output_row * kWeightBytesPerRow
+            + thread_index_in_simdgroup * 4;
+        const device uint* row_packed_indices =
+            packed_indices + output_row * kPackedWordsPerRow;
+        const device bfloat* input = x + thread_index_in_simdgroup * 8;
+
+        float result[kRowsPerSIMD] = {0};
+        for (int block = 0; block < 21; ++block) {
+            float values[8];
+            const float input_sum =
+                gemma4_tied_head_packed13_rows8_load_values(input, values);
+            const uint metadata_column =
+                block * 4 + thread_index_in_simdgroup / 8;
+
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                const device uchar* row_weight =
+                    weight_bytes + row * kWeightBytesPerRow;
+                const ushort metadata_index =
+                    gemma4_tied_head_extract_packed13_rows8(
+                        row_packed_indices + row * kPackedWordsPerRow,
+                        metadata_column);
+                const uint pair = lut[metadata_index];
+                result[row] += gemma4_tied_head_packed13_rows8_qdot_4bit(
+                    row_weight,
+                    values,
+                    gemma4_tied_head_pair_scale_rows8(pair),
+                    gemma4_tied_head_pair_bias_rows8(pair),
+                    input_sum);
+            }
+
+            weight_bytes += 128;
+            input += 256;
+        }
+
+        for (int row = 0; row < kRowsPerSIMD; ++row) {
+            result[row] = simd_sum(result[row]);
+            if (thread_index_in_simdgroup == 0) {
+                // Preserve the exact BF16 projection boundary and precise
+                // Float32 softcap suffix used by the production rows4 path.
+                const bfloat projected = static_cast<bfloat>(result[row]);
+                const float quotient = static_cast<float>(projected) / cap;
+                const float softened = metal::precise::tanh(quotient);
+                output[output_row + row] = softened * cap;
+            }
+        }
+        """,
+    header: """
+        using namespace metal;
+
+        inline ushort gemma4_tied_head_extract_packed13_rows8(
+            const device uint* words,
+            uint column
+        ) {
+            const uint bit_offset = column * 13;
+            const uint word_index = bit_offset >> 5;
+            const uint shift = bit_offset & 31;
+            uint value = words[word_index] >> shift;
+            if (shift > 19) {
+                value |= words[word_index + 1] << (32 - shift);
+            }
+            return static_cast<ushort>(value & 0x1fff);
+        }
+
+        inline float gemma4_tied_head_pair_scale_rows8(uint pair) {
+            return static_cast<float>(as_type<bfloat>(static_cast<ushort>(pair)));
+        }
+
+        inline float gemma4_tied_head_pair_bias_rows8(uint pair) {
+            return static_cast<float>(
+                as_type<bfloat>(static_cast<ushort>(pair >> 16)));
+        }
+
+        inline float gemma4_tied_head_packed13_rows8_load_values(
+            const device bfloat* input,
+            thread float* values
+        ) {
+            float sum = 0;
+            for (int index = 0; index < 8; index += 4) {
+                sum += input[index] + input[index + 1]
+                    + input[index + 2] + input[index + 3];
+                values[index] = input[index];
+                values[index + 1] = input[index + 1] / 16.0f;
+                values[index + 2] = input[index + 2] / 256.0f;
+                values[index + 3] = input[index + 3] / 4096.0f;
+            }
+            return sum;
+        }
+
+        inline float gemma4_tied_head_packed13_rows8_qdot_4bit(
+            const device uchar* weight,
+            const thread float* values,
+            float scale,
+            float bias,
+            float input_sum
+        ) {
+            const device ushort* packed =
+                reinterpret_cast<const device ushort*>(weight);
+            float accumulator = 0;
+            for (int index = 0; index < 2; ++index) {
+                accumulator +=
+                    (values[4 * index] * (packed[index] & 0x000f)
+                    + values[4 * index + 1] * (packed[index] & 0x00f0)
+                    + values[4 * index + 2] * (packed[index] & 0x0f00)
+                    + values[4 * index + 3] * (packed[index] & 0xf000));
+            }
+            return scale * accumulator + input_sum * bias;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private let gemma4TiedHeadRows8FeatureEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_TIED_HEAD_ROWS8"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+private let gemma4VerifyTiedHeadRows8BitsFeatureEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_TIED_HEAD_ROWS8_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 private let gemma4TiedHeadMaximumPacked13LUTCount = 8_192
 
 struct Gemma4TiedHeadPacked13Metadata: @unchecked Sendable {
@@ -342,6 +496,48 @@ struct Gemma4TiedVocabularyHead: @unchecked Sendable {
         guard let packed13Metadata else {
             preconditionFailure("tied vocabulary packed13 metadata was not prepared")
         }
+
+        if gemma4TiedHeadRows8FeatureEnabled
+            || gemma4VerifyTiedHeadRows8BitsFeatureEnabled
+        {
+            let candidate = gemma4TiedVocabularyHeadPacked13SoftcapRows8QMV(
+                [
+                    weight,
+                    packed13Metadata.packedIndices,
+                    packed13Metadata.lut,
+                    input,
+                    cap,
+                ],
+                grid: (32, 32_768, 1),
+                threadGroup: (32, 4, 1),
+                outputShapes: [[1, 1, 262_144]],
+                outputDTypes: [.float32]
+            )[0]
+            if gemma4VerifyTiedHeadRows8BitsFeatureEnabled {
+                let stock = gemma4TiedVocabularyHeadPacked13SoftcapQMV(
+                    [
+                        weight,
+                        packed13Metadata.packedIndices,
+                        packed13Metadata.lut,
+                        input,
+                        cap,
+                    ],
+                    grid: (32, 65_536, 1),
+                    threadGroup: (32, 4, 1),
+                    outputShapes: [[1, 1, 262_144]],
+                    outputDTypes: [.float32]
+                )[0]
+                verifyRawFloat32(
+                    candidate,
+                    stock: stock,
+                    candidateName: "packed13 fused-softcap rows8",
+                    stockName: "packed13 fused-softcap rows4"
+                )
+                return gemma4TiedHeadRows8FeatureEnabled ? candidate : stock
+            }
+            return candidate
+        }
+
         return gemma4TiedVocabularyHeadPacked13SoftcapQMV(
             [weight, packed13Metadata.packedIndices, packed13Metadata.lut, input, cap],
             grid: (32, 65_536, 1),
