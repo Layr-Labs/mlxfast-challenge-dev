@@ -182,7 +182,7 @@ extension GemmaRuntime {
                 baselineDecodeSecondsPerToken: baselineDecodeSecondsPerToken,
                 baselinePrefillSecondsPerToken: baselinePrefillSecondsPerToken
             )
-            let expertStats = ExpertStreamingStats.zero
+            let expertStats = expertStats(from: benchmarkCache)
 
             if let failureReason = evaluation.firstFailureReason() {
                 let includeTimings = evaluation.hasFiniteScore

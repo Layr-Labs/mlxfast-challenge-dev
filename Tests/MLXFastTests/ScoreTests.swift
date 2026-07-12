@@ -68,6 +68,23 @@ func evaluateTimedRunMatchesSeparateScoreSpeedupAndBandChecks() {
     )
     #expect(nonFinite.hasFiniteScore == false)
     #expect(nonFinite.firstFailureReason() == "computed score was not finite")
+
+    // Decode fast enough that the speedup (1.25) clears the 0.95 floor, but the
+    // value lands below the decode acceptance band's -5% edge (0.10 * 0.95 =
+    // 0.095), so the band -- not the floor -- is the first failure reported.
+    let outsideBand = BenchmarkScore.evaluateTimedRun(
+        decodeSecondsPerToken: 0.08,
+        prefillSecondsPerToken: 0.01,
+        baselineDecodeSecondsPerToken: 0.10,
+        baselinePrefillSecondsPerToken: 0.01
+    )
+    #expect(outsideBand.hasFiniteScore)
+    #expect(outsideBand.passesFloors)
+    #expect(outsideBand.prefillBand.passed)
+    #expect(outsideBand.decodeBand.passed == false)
+    #expect(outsideBand.passesAcceptanceBands == false)
+    #expect(outsideBand.firstFailureReason()?.hasPrefix("acceptance band failed: decode") == true)
+    #expect(outsideBand.firstFailureReason()?.contains("below") == true)
 }
 
 @Test

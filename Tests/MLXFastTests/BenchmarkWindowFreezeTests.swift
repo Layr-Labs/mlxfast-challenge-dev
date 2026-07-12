@@ -109,6 +109,23 @@ func timedDecodeChargesOneValidatedSeedForward() throws {
     #expect(measureWorkerDecode.contains("compareDecodeSeedToken"))
     #expect(measureWorkerDecode.contains("compareDecodeTokens"))
     #expect(!measureWorkerDecode.contains("response.seconds"))
+
+    // The in-process (non-worker) decode path must also run its single seed
+    // forward with NO preceding warmup pass. A second identical whole-prompt
+    // forward would let submitted model code memoize one pass and serve the
+    // other from that memo, collapsing two charged forwards into one. (Unlike
+    // decode_begin, this path inlines the per-step decode loop with its own
+    // single-token logits calls, so assert the absence of the warmup rather
+    // than a whole-prompt forward count.)
+    let measureDecode = try slice(
+        benchmark,
+        from: "static func measureDecode(",
+        to: "static func measureWorkerDecode("
+    )
+    #expect(!measureDecode.contains("warmupCache"))
+    #expect(!measureDecode.contains("warmupLogits"))
+    #expect(!measureDecode.contains("decode warmup start"))
+    #expect(measureDecode.contains("preceding warmup pass"))
 }
 
 @Test
