@@ -1782,6 +1782,62 @@ func officialCorrectnessRunsEnforceWorkerSandboxThroughBenchExec() throws {
     #expect(workflow.contains("MLXFAST_OFFICIAL_BENCHMARK_RUN=1"))
 }
 
+// attach-gpqa-gates is the ONLY ranked step where submitted-build code and the
+// RAW hidden GPQA answer key + golden are readable by the same process, and it
+// runs its work in-process (no sandboxed worker child). The bench uid's PF
+// block stops the process's own sockets, but mDNSResponder-proxied DNS egresses
+// from a different uid and would bypass it -- a side channel the operator layer
+// closes only for the sandboxed worker. So the attach invocation must run
+// THROUGH the same hardened worker Seatbelt profile bench-exec renders and
+// exports as ${MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE}, inheriting its
+// network/DNS/exec/write confinement, and must fail closed if that profile is
+// absent. attach never spawns a worker, so there is no nested-sandbox concern.
+@Test
+func attachGPQAGatesRunsUnderHardenedWorkerSandbox() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+
+    let stepStart = try #require(
+        workflow.range(of: "- name: Attach GPQA gates and verify augmented golden"),
+        "expected attach-gpqa-gates step"
+    )
+    let stepEnd = try #require(
+        workflow.range(of: "- name: Verify trusted harness before gates"),
+        "expected step after attach-gpqa-gates"
+    )
+    let stepBody = String(workflow[stepStart.lowerBound..<stepEnd.lowerBound])
+
+    // The submitted-build attach invocation is wrapped in the hardened worker
+    // Seatbelt profile the runtime worker itself uses.
+    #expect(stepBody.contains(
+        "exec /usr/bin/sandbox-exec -f \"${MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE}\" \\"
+    ))
+    #expect(stepBody.contains(".build/release/mlxfast-swift attach-gpqa-gates"))
+    // Fail closed if the profile was not injected: attach reads the raw hidden
+    // answer key, so it must never run without the confinement.
+    #expect(stepBody.contains(
+        "if [ -z \"${MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE:-}\" ]; then"
+    ))
+    #expect(stepBody.contains(
+        "refusing to run without the hardened worker sandbox profile"
+    ))
+
+    // The augmented golden is still built and re-pinned to the raw golden's
+    // base cases exactly as before (behavior preserved by the fix).
+    #expect(stepBody.contains("--output correctness_golden_ranked.json"))
+    #expect(workflow.contains("attach-gpqa-gates mutated the pinned base .cases"))
+
+    // The staged-golden helper must NOT use Foundation's `.atomic` write, whose
+    // internal hidden double-temp is rejected under the profile's subpath-
+    // confined write policy; the temp+rename below still makes the publish
+    // atomic and the strict-loader validation still gates the replace.
+    let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
+    #expect(cli.contains("try outputData.write(to: temporaryURL)\n"))
+    #expect(!cli.contains("try outputData.write(to: temporaryURL, options: [.atomic])"))
+}
+
 @Test
 func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     let benchmark = try String(

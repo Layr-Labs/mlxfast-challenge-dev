@@ -901,6 +901,27 @@ jobs:
       # after, so during any later worker-spawning phase the only hidden file
       # in the workspace is the augmented golden, which the worker Seatbelt
       # profile denies by literal path (BENCH_GOLDEN_PATH below).
+      #
+      # DNS-EXFIL HARDENING (this step is unique): unlike correctness/benchmark,
+      # attach-gpqa-gates does its work IN-PROCESS -- it never spawns the
+      # sandboxed runtime-worker child -- yet it (a) runs the submitted build
+      # and (b) is the ONLY ranked step where submitted-build code and the RAW
+      # hidden GPQA answer key + golden are readable by the SAME process. The
+      # bench uid's PF egress block stops that process opening its own sockets,
+      # but getaddrinfo(3) resolves via IPC to mDNSResponder, which egresses
+      # from ITS uid and bypasses the uid-560 PF rule -- a DNS side channel that
+      # the operator layer closes ONLY for the sandboxed worker (via the
+      # `deny mach-lookup com.apple.mDNSResponder` rules in the merged worker
+      # profile). The attach parent got none of that. Fix: run attach-gpqa-gates
+      # THROUGH the exact same hardened worker Seatbelt profile the runtime
+      # worker uses -- bench-exec already renders it and exports its path as
+      # ${MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE} -- so the attach process
+      # inherits deny-network*, the mDNSResponder mach-lookup denies (closing
+      # the DNS channel), process-exec confinement, and write confinement to the
+      # job workspace. This adds a Seatbelt layer to a previously
+      # uid+PF-only-confined step; it removes no existing isolation. There is no
+      # nested-sandbox concern because attach never launches a worker child (the
+      # one macOS forbids), so this is the sole sandbox_apply in the chain.
       - name: Attach GPQA gates and verify augmented golden
         if: ${{ inputs.run_benchmark }}
         env:
@@ -933,7 +954,15 @@ jobs:
               MLXFAST_GPQA_MAX_NEW_TOKENS="${MLXFAST_GPQA_MAX_NEW_TOKENS}" /bin/bash -c '
               set -u
               cd "${MJOB_WS}" || exit 97
-              exec .build/release/mlxfast-swift attach-gpqa-gates \
+              # Fail closed if bench-exec did not inject the hardened worker
+              # profile: attach reads the raw hidden answer key, so it must NOT
+              # run without the network/DNS/write confinement it provides.
+              if [ -z "${MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE:-}" ]; then
+                echo "attach-gpqa-gates: refusing to run without the hardened worker sandbox profile" >&2
+                exit 96
+              fi
+              exec /usr/bin/sandbox-exec -f "${MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE}" \
+                .build/release/mlxfast-swift attach-gpqa-gates \
                 --golden .ranked-src/golden.json \
                 --gpqa .ranked-src/gpqa.json \
                 --tokenizer weights \

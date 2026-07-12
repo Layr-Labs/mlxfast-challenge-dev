@@ -777,7 +777,18 @@ private enum MLXFastCLI {
         defer {
             try? FileManager.default.removeItem(at: temporaryURL)
         }
-        try outputData.write(to: temporaryURL, options: [.atomic])
+        // Plain (NON-atomic) staged write on purpose. This helper runs inside
+        // the ranked attach-gpqa-gates step, which is now executed under the
+        // hardened worker Seatbelt profile that confines writes to the job
+        // workspace via `(allow file-write* (subpath ...))`. Foundation's
+        // `.atomic` option writes to its OWN hidden temp and renames, and that
+        // internal double-temp is rejected under a subpath-confined write
+        // policy (EPERM), whereas a direct write to this named temp is not.
+        // Atomicity of the PUBLISH is provided by the replaceItemAt/moveItem
+        // rename below, not by the temp write, and the temp is strict-validated
+        // before it can ever replace the destination, so dropping `.atomic`
+        // here changes nothing about the safety contract.
+        try outputData.write(to: temporaryURL)
         _ = try loadGoldenFixture(from: temporaryURL.path)
         if FileManager.default.fileExists(atPath: outputURL.path) {
             _ = try FileManager.default.replaceItemAt(outputURL, withItemAt: temporaryURL)
