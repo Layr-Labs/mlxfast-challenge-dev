@@ -925,7 +925,7 @@ final class Gemma4FastEngine {
         self.slidingWindow = config.slidingWindow
         let asyncLayerGroup = max(
             0,
-            Int(ProcessInfo.processInfo.environment["MLXFAST_ASYNC_LAYER_GROUP"] ?? "10") ?? 10
+            Int(ProcessInfo.processInfo.environment["MLXFAST_ASYNC_LAYER_GROUP"] ?? "6") ?? 6
         )
         self.asyncLayerGroup = asyncLayerGroup
         if asyncLayerGroup > 0 {
@@ -935,7 +935,7 @@ final class Gemma4FastEngine {
                     1,
                     Int(ProcessInfo.processInfo.environment[
                         "MLXFAST_ASYNC_LAYER_LEAD"
-                    ] ?? "1") ?? 1
+                    ] ?? "6") ?? 6
                 )
             )
         } else {
