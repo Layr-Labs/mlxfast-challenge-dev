@@ -710,6 +710,8 @@ final class Gemma4FastEngine {
     let slidingWindow: Int
     let asyncLayerGroup: Int
     let asyncLayerLead: Int
+    let runtimeTiedVocabularyHead: Gemma4RuntimeTiedVocabularyHead?
+    let verifyRuntimeTiedVocabularyHead: Bool
     private let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray
 
     init(
@@ -759,6 +761,32 @@ final class Gemma4FastEngine {
 
         let loadedEmbedTokens = try module("model.embed_tokens", as: Embedding.self)
         self.embedTokens = loadedEmbedTokens
+        let runtimePacked13Enabled = try gemma4RuntimeEnvironmentFlag(
+            "MLXFAST_RUNTIME_TIED_HEAD_PACKED13",
+            default: true
+        )
+        self.verifyRuntimeTiedVocabularyHead = try gemma4RuntimeEnvironmentFlag(
+            "MLXFAST_VERIFY_RUNTIME_TIED_HEAD_BITS",
+            default: false
+        )
+        if runtimePacked13Enabled,
+           isGemma4ProductionTiedVocabularyEmbedding(loadedEmbedTokens)
+        {
+            let head = try Gemma4RuntimeTiedVocabularyHead(loadedEmbedTokens)
+            reportGemma4RuntimeTiedHeadInitialization(head)
+            if try gemma4RuntimeEnvironmentFlag(
+                "MLXFAST_BENCH_RUNTIME_TIED_HEAD",
+                default: false
+            ) {
+                try benchmarkGemma4RuntimeTiedHead(
+                    head: head,
+                    embedding: loadedEmbedTokens
+                )
+            }
+            self.runtimeTiedVocabularyHead = head
+        } else {
+            self.runtimeTiedVocabularyHead = nil
+        }
         let finalNorm = try module("model.norm", as: RMSNorm.self)
         self.finalNormWeight = finalNorm.weight
 
@@ -923,7 +951,24 @@ final class Gemma4FastEngine {
             hidden = gemma4LastTokenHidden(hidden)
             hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
         }
-        let logits = embedTokens.asLinear(hidden)
+        let logits: MLXArray
+        if inputs.dim(0) == 1,
+           inputs.dim(1) == 1,
+           hidden.dtype == .bfloat16,
+           hidden.shape == [1, 1, 5_376],
+           let runtimeTiedVocabularyHead
+        {
+            let candidate = runtimeTiedVocabularyHead(hidden)
+            if verifyRuntimeTiedVocabularyHead {
+                runtimeTiedVocabularyHead.verifyRawBF16(
+                    candidate,
+                    stock: embedTokens.asLinear(hidden)
+                )
+            }
+            logits = candidate
+        } else {
+            logits = embedTokens.asLinear(hidden)
+        }
         return logitSoftcap(logits, MLXArray(softcap))
     }
 }
