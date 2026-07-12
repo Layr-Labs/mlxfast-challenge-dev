@@ -18,6 +18,32 @@ final class Gemma4CombinedKVCache: KVCache {
     private let kind: Kind
     private var splitCache: (any KVCache)?
     private var combinedStorage: MLXArray?
+    private var storageGeneration: UInt64 = 0
+    private var cachedViews: (
+        generation: UInt64, range: Range<Int>, keys: MLXArray, values: MLXArray
+    )?
+
+    struct ViewCacheCounters: Equatable {
+        var requests: UInt64 = 0
+        var hits: UInt64 = 0
+        var misses: UInt64 = 0
+        var invalidations: UInt64 = 0
+        var parentReplacements: UInt64 = 0
+    }
+    private var viewCacheCounters = ViewCacheCounters()
+
+    func viewCacheCounterSnapshot() -> ViewCacheCounters { viewCacheCounters }
+    func resetViewCacheCounters() { viewCacheCounters = ViewCacheCounters() }
+
+    private func replaceCombinedStorage(_ storage: MLXArray?) {
+        combinedStorage = storage
+        storageGeneration &+= 1
+        cachedViews = nil
+        if gemma4TraceKVViewCacheEnabled { 
+            viewCacheCounters.invalidations &+= 1
+            viewCacheCounters.parentReplacements &+= 1
+        }
+    }
 
     // Rotating-cache cursor metadata. These fields mirror RotatingKVCache and
     // remain dormant for a full cache.
@@ -117,7 +143,7 @@ final class Gemma4CombinedKVCache: KVCache {
         precondition(combined.dim(3) == capacity)
         precondition(combined.dtype == .bfloat16)
 
-        combinedStorage = combined
+        replaceCombinedStorage(combined)
         splitCache = nil
         offset = length
         if rotatingMaxSize != nil {
@@ -143,7 +169,7 @@ final class Gemma4CombinedKVCache: KVCache {
 
         if combinedStorage != nil {
             splitCache = makeUpstreamCache()
-            combinedStorage = nil
+            replaceCombinedStorage(nil)
         }
         guard let splitCache else {
             preconditionFailure("combined KV cache lost its split fallback")
@@ -191,7 +217,7 @@ final class Gemma4CombinedKVCache: KVCache {
 
         // This one-time stack happens at the decode boundary. The recurring
         // path receives the combined parent allocation directly from Metal.
-        combinedStorage = stacked(inner, axis: 0)
+        replaceCombinedStorage(stacked(inner, axis: 0))
         self.splitCache = nil
     }
 
@@ -211,9 +237,9 @@ final class Gemma4CombinedKVCache: KVCache {
                 let retained = previous % step == 0
                     ? current
                     : current[0..., 0..., 0..., 0..<previous, 0...]
-                combinedStorage = concatenated([retained, newSpace], axis: 3)
+                replaceCombinedStorage(concatenated([retained, newSpace], axis: 3))
             } else {
-                combinedStorage = newSpace
+                replaceCombinedStorage(newSpace)
             }
         }
 
@@ -240,16 +266,16 @@ final class Gemma4CombinedKVCache: KVCache {
                 dtype: incoming.dtype
             )
             if let current = combinedStorage {
-                combinedStorage = concatenated([current, newSpace], axis: 3)
+                replaceCombinedStorage(concatenated([current, newSpace], axis: 3))
             } else {
-                combinedStorage = newSpace
+                replaceCombinedStorage(newSpace)
             }
             rotatingIndex = previous
         }
 
         let trimSize = combinedStorage!.dim(3) - maxSize
         if trimSize > 0 {
-            combinedStorage = trimStorage(combinedStorage!, trimSize: trimSize)
+            replaceCombinedStorage(trimStorage(combinedStorage!, trimSize: trimSize))
             rotatingIndex = maxSize
         }
         if rotatingIndex == maxSize {
@@ -284,12 +310,25 @@ final class Gemma4CombinedKVCache: KVCache {
         guard let combinedStorage else {
             preconditionFailure("combined KV storage is empty")
         }
+        if gemma4TraceKVViewCacheEnabled { viewCacheCounters.requests &+= 1 }
+        if gemma4KVViewCacheEnabled,
+           let cachedViews,
+           cachedViews.generation == storageGeneration,
+           cachedViews.range == range
+        {
+            if gemma4TraceKVViewCacheEnabled { viewCacheCounters.hits &+= 1 }
+            return (cachedViews.keys, cachedViews.values)
+        }
+        if gemma4TraceKVViewCacheEnabled { viewCacheCounters.misses &+= 1 }
         let keys = combinedStorage[
             0..<1, 0..., 0..., range, 0...
         ].squeezed(axis: 0)
         let values = combinedStorage[
             1..<2, 0..., 0..., range, 0...
         ].squeezed(axis: 0)
+        if gemma4KVViewCacheEnabled {
+            cachedViews = (storageGeneration, range, keys, values)
+        }
         return (keys, values)
     }
 
@@ -318,7 +357,7 @@ final class Gemma4CombinedKVCache: KVCache {
                 offset = upstream.offset
             }
             splitCache = upstream
-            combinedStorage = nil
+            replaceCombinedStorage(nil)
         }
     }
 
@@ -500,6 +539,20 @@ func gemma4CombinedKVPrefillEnabled() -> Bool {
 func gemma4VerifyCombinedKVPrefillBitsEnabled() -> Bool {
     gemma4VerifyCombinedKVPrefillBitsFeatureEnabled
 }
+
+private let gemma4KVViewCacheEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_KV_VIEW_CACHE"] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4TraceKVViewCacheEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_TRACE_KV_VIEW_CACHE"] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
 
 private let gemma4CombinedKVCacheFeatureEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_COMBINED_KV_CACHE"] else {
