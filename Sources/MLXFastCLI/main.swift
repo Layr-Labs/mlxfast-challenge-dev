@@ -147,14 +147,11 @@ private enum MLXFastCLI {
                 fallback: MLXFastConstants.defaultWeightsPath
             )
         )
-        let goldenPath = options.value(
-            for: "--golden",
-            default: environmentValue(
-                "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-                fallback: defaultCorrectnessGoldenPath()
-            )
+        let goldenPath = try requiredQwenGoldenPath(
+            options,
+            command: "correctness"
         )
-        let report = try GemmaRuntime.runCorrectness(
+        let report = try QwenRuntime.runCorrectness(
             CorrectnessOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath
@@ -179,12 +176,9 @@ private enum MLXFastCLI {
                 fallback: MLXFastConstants.defaultWeightsPath
             )
         )
-        let goldenPath = options.value(
-            for: "--golden",
-            default: environmentValue(
-                "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-                fallback: defaultCorrectnessGoldenPath()
-            )
+        let goldenPath = try requiredQwenGoldenPath(
+            options,
+            command: "correctness-trace"
         )
         let stepRaw = options.value(for: "--step", default: "")
         guard let step = Int(stepRaw), step >= 0 else {
@@ -195,7 +189,7 @@ private enum MLXFastCLI {
             throw MLXFastError.invalidInput("--top-k must be a positive integer")
         }
         let caseName = options.value(for: "--case", default: "")
-        let report = try GemmaRuntime.traceCorrectness(
+        let report = try QwenRuntime.traceCorrectness(
             CorrectnessTraceOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
@@ -221,12 +215,9 @@ private enum MLXFastCLI {
                 fallback: MLXFastConstants.defaultWeightsPath
             )
         )
-        let goldenPath = options.value(
-            for: "--golden",
-            default: environmentValue(
-                "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-                fallback: MLXFastConstants.defaultGoldenPath
-            )
+        let goldenPath = try requiredQwenGoldenPath(
+            options,
+            command: "preflight"
         )
         let report = try BenchmarkPreflight.check(
             weightsPath: weightsPath,
@@ -257,16 +248,9 @@ private enum MLXFastCLI {
                 fallback: MLXFastConstants.defaultWeightsPath
             )
         )
-        let goldenPath = options.value(
-            for: "--golden",
-            default: environmentValue(
-                "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-                fallback: localSubmit
-                    ? MLXFastConstants.defaultPublicLocalSubmitGoldenPath
-                    : localIterate
-                        ? MLXFastConstants.defaultPublicCorrectnessGoldenPath
-                        : MLXFastConstants.defaultGoldenPath
-            )
+        let goldenPath = try requiredQwenGoldenPath(
+            options,
+            command: "benchmark"
         )
         let scorePath = options.value(
             for: "--score-path",
@@ -284,7 +268,7 @@ private enum MLXFastCLI {
             let timingRepeats = localSubmit ? MLXFastConstants.localSubmitBenchmarkRepeats : 1
             let modeName = localSubmit ? "local-submit" : "local-iterate"
             let runtime = localSubmit ? "swift-local-submit" : "swift-local-iterate"
-            let payload = GemmaRuntime.localIterate(
+            let payload = QwenRuntime.localIterate(
                 LocalIterateOptions(
                     weightsPath: weightsPath,
                     goldenPath: goldenPath,
@@ -336,7 +320,7 @@ private enum MLXFastCLI {
         // reproducing the original, single-machine behavior exactly.
         let checkGates = environmentValue("MLXFAST_BENCHMARK_CHECK_GATES", fallback: "1") != "0"
         let skipTimedBenchmark = environmentValue("MLXFAST_BENCHMARK_SKIP_TIMED", fallback: "0") == "1"
-        let payload = GemmaRuntime.benchmark(
+        let payload = QwenRuntime.benchmark(
             BenchmarkOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
@@ -385,12 +369,9 @@ private enum MLXFastCLI {
         try options.validate(
             valueOptions: ["--golden", "--gpqa", "--tokenizer", "--output", "--case-count", "--max-new-tokens"]
         )
-        let goldenPath = options.value(
-            for: "--golden",
-            default: environmentValue(
-                "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-                fallback: MLXFastConstants.defaultGoldenPath
-            )
+        let goldenPath = try requiredQwenGoldenPath(
+            options,
+            command: "attach-gpqa-gates"
         )
         let gpqaPath = options.value(
             for: "--gpqa",
@@ -430,6 +411,7 @@ private enum MLXFastCLI {
         )
 
         let tokenizer = try loadLocalTokenizer(at: tokenizerPath)
+        _ = try QwenRuntime.loadQwenGoldenFixture(from: goldenPath)
         let goldenData = try Data(contentsOf: URL(fileURLWithPath: goldenPath))
         let golden = try JSONDecoder().decode(GoldenDocument.self, from: goldenData)
         let gpqaData = try Data(contentsOf: URL(fileURLWithPath: gpqaPath))
@@ -467,6 +449,7 @@ private enum MLXFastCLI {
         )
         let merged = GoldenDocument(
             version: golden.version ?? 1,
+            modelType: golden.modelType,
             cases: golden.cases,
             correctnessGates: mergedGates,
             benchmark: golden.benchmark
@@ -502,12 +485,9 @@ private enum MLXFastCLI {
             ],
             flagOptions: ["--allow-partial"]
         )
-        let goldenPath = options.value(
-            for: "--golden",
-            default: environmentValue(
-                "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-                fallback: MLXFastConstants.defaultGoldenPath
-            )
+        let goldenPath = try requiredQwenGoldenPath(
+            options,
+            command: "attach-free-run-gate"
         )
         let weightsPath = options.value(
             for: "--weights",
@@ -560,7 +540,7 @@ private enum MLXFastCLI {
         // Strict-validate the INPUT before any generation or write. --output
         // defaults to the input path, so a malformed input must fail here --
         // never after the original has been replaced on disk.
-        _ = try loadGoldenFixture(from: goldenPath)
+        _ = try QwenRuntime.loadQwenGoldenFixture(from: goldenPath)
         let goldenData = try Data(contentsOf: URL(fileURLWithPath: goldenPath))
         let golden = try JSONDecoder().decode(GoldenDocument.self, from: goldenData)
 
@@ -605,7 +585,7 @@ private enum MLXFastCLI {
                 + "(covers decode offsets \(promptTokens.count)..<\(promptTokens.count + steps))\n",
             stderr
         )
-        let expectedTokens = try GemmaRuntime.generateGreedyTokens(
+        let expectedTokens = try QwenRuntime.generateGreedyTokens(
             GreedyGenerationOptions(
                 weightsPath: weightsPath,
                 promptTokens: promptTokens,
@@ -628,6 +608,7 @@ private enum MLXFastCLI {
         )
         let merged = GoldenDocument(
             version: golden.version ?? 1,
+            modelType: golden.modelType,
             cases: golden.cases,
             correctnessGates: mergedGates,
             benchmark: golden.benchmark
@@ -714,7 +695,7 @@ private enum MLXFastCLI {
                 + "for case \(caseName) (prompt_tokens=\(promptTokens.count))\n",
             stderr
         )
-        let expectedTokens = try GemmaRuntime.generateGreedyTokens(
+        let expectedTokens = try QwenRuntime.generateGreedyTokens(
             GreedyGenerationOptions(
                 weightsPath: weightsPath,
                 promptTokens: promptTokens,
@@ -729,6 +710,7 @@ private enum MLXFastCLI {
 
         let document = GoldenDocument(
             version: 1,
+            modelType: QwenRuntime.requiredGoldenModelType,
             cases: [
                 GoldenCase(
                     name: caseName,
@@ -745,7 +727,7 @@ private enum MLXFastCLI {
         // re-validate at the full generated step count so the written fixture
         // provably satisfies the consumer that needs every step (local-submit
         // requires benchmarkDecodeSteps + 1 expected tokens, etc.).
-        _ = try loadGoldenFixture(
+        _ = try QwenRuntime.loadQwenGoldenFixture(
             from: outputPath,
             requiredSteps: steps,
             requiredPromptTokens: requiredPromptTokens
@@ -773,7 +755,7 @@ private enum MLXFastCLI {
             try? FileManager.default.removeItem(at: temporaryURL)
         }
         try outputData.write(to: temporaryURL, options: [.atomic])
-        _ = try loadGoldenFixture(from: temporaryURL.path)
+        _ = try QwenRuntime.loadQwenGoldenFixture(from: temporaryURL.path)
         if FileManager.default.fileExists(atPath: outputURL.path) {
             _ = try FileManager.default.replaceItemAt(outputURL, withItemAt: temporaryURL)
         } else {
@@ -858,7 +840,7 @@ private enum MLXFastCLI {
                 continue
             }
 
-            let generated = try GemmaRuntime.generateGreedyTokens(
+            let generated = try QwenRuntime.generateGreedyTokens(
                 GreedyGenerationOptions(
                     weightsPath: weightsPath,
                     promptTokens: promptTokens,
@@ -1300,7 +1282,7 @@ private enum MLXFastCLI {
                 fallback: MLXFastConstants.defaultWeightsPath
             )
         )
-        try GemmaRuntime.runWorker(weightsPath: weightsPath)
+        try QwenRuntime.runWorker(weightsPath: weightsPath)
     }
 
     private static func runCheckpointShards(_ options: ParsedOptions) throws {
@@ -1330,7 +1312,11 @@ private enum MLXFastCLI {
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
 
-            Swift-only Gemma 4 31B 4-bit harness entrypoint.
+            Swift-only Qwen3.6 27B 4-bit harness entrypoint.
+
+            Commands that consume a correctness golden require --golden PATH or
+            MLXFAST_CORRECTNESS_GOLDEN_PATH. Checked-in Gemma fixtures under
+            correctness_prompts/ are intentionally rejected.
             """
         )
     }
@@ -1340,18 +1326,45 @@ private enum MLXFastCLI {
         return value.isEmpty ? fallback : value
     }
 
-    private static func defaultCorrectnessGoldenPath() -> String {
-        if FileManager.default.fileExists(atPath: MLXFastConstants.defaultGoldenPath) {
-            return MLXFastConstants.defaultGoldenPath
-        }
-        let publicPath = environmentValue(
-            "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH",
-            fallback: MLXFastConstants.defaultPublicCorrectnessGoldenPath
+    private static func requiredQwenGoldenPath(
+        _ options: ParsedOptions,
+        command: String
+    ) throws -> String {
+        let optionPath = options.hasValue(for: "--golden")
+            ? trimmedNonEmpty(options.value(for: "--golden", default: ""))
+            : nil
+        let environmentPath = trimmedNonEmpty(
+            ProcessInfo.processInfo.environment["MLXFAST_CORRECTNESS_GOLDEN_PATH"]
         )
-        if FileManager.default.fileExists(atPath: publicPath) {
-            return publicPath
+        guard let path = optionPath ?? environmentPath else {
+            throw MLXFastError.invalidInput(
+                "\(command) requires --golden PATH or "
+                    + "MLXFAST_CORRECTNESS_GOLDEN_PATH pointing to an external "
+                    + "Qwen3.6 golden; no Gemma golden fallback is allowed"
+            )
         }
-        return MLXFastConstants.defaultGoldenPath
+
+        let workingDirectory = URL(
+            fileURLWithPath: FileManager.default.currentDirectoryPath,
+            isDirectory: true
+        ).standardizedFileURL.resolvingSymlinksInPath()
+        let resolvedPath = URL(
+            fileURLWithPath: path,
+            relativeTo: workingDirectory
+        ).standardizedFileURL.resolvingSymlinksInPath()
+        let checkedInGoldenDirectory = workingDirectory
+            .appendingPathComponent("correctness_prompts", isDirectory: true)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        guard resolvedPath.path != checkedInGoldenDirectory.path,
+              !resolvedPath.path.hasPrefix(checkedInGoldenDirectory.path + "/")
+        else {
+            throw MLXFastError.invalidInput(
+                "\(command) requires an external Qwen3.6 golden; "
+                    + "correctness_prompts contains protected Gemma fixtures"
+            )
+        }
+        return path
     }
 
     private static func trimmedNonEmpty(_ value: String?) -> String? {

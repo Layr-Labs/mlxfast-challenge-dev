@@ -18,8 +18,8 @@ public enum BenchmarkScore {
     public static func score(
         decodeSecondsPerToken: Double,
         prefillSecondsPerToken: Double,
-        baselineDecodeSecondsPerToken: Double = MLXFastConstants.officialBaselineDecodeSecondsPerToken,
-        baselinePrefillSecondsPerToken: Double = MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+        baselineDecodeSecondsPerToken: Double,
+        baselinePrefillSecondsPerToken: Double,
         decodeWeight: Double = MLXFastConstants.scoreDecodeWeight,
         prefillWeight: Double = MLXFastConstants.scorePrefillWeight
     ) -> Double {
@@ -321,8 +321,8 @@ public struct ScoreMetrics: Codable, Equatable {
         bandwidthGBPerToken: Double,
         decodeSecondsPerToken: Double,
         prefillSecondsPerToken: Double,
-        baselineDecodeSecondsPerToken: Double = MLXFastConstants.officialBaselineDecodeSecondsPerToken,
-        baselinePrefillSecondsPerToken: Double = MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+        baselineDecodeSecondsPerToken: Double,
+        baselinePrefillSecondsPerToken: Double,
         decodeSpeedup: Double? = nil,
         prefillSpeedup: Double? = nil,
         decodeSpeedupFloor: Double = MLXFastConstants.scoreDecodeSpeedupFloor,
@@ -440,18 +440,34 @@ public struct ScoreMetrics: Codable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedRuntime = try container.decode(String.self, forKey: .runtime)
         self.peakRamGB = try container.decode(Double.self, forKey: .peakRamGB)
         self.bandwidthGBPerToken = try container.decode(Double.self, forKey: .bandwidthGBPerToken)
         self.decodeSecondsPerToken = try container.decode(Double.self, forKey: .decodeSecondsPerToken)
         self.prefillSecondsPerToken = try container.decode(Double.self, forKey: .prefillSecondsPerToken)
-        self.baselineDecodeSecondsPerToken = try container.decodeIfPresent(
+        let decodedBaselineDecode = try container.decodeIfPresent(
             Double.self,
             forKey: .baselineDecodeSecondsPerToken
-        ) ?? MLXFastConstants.officialBaselineDecodeSecondsPerToken
-        self.baselinePrefillSecondsPerToken = try container.decodeIfPresent(
+        )
+        let decodedBaselinePrefill = try container.decodeIfPresent(
             Double.self,
             forKey: .baselinePrefillSecondsPerToken
-        ) ?? MLXFastConstants.officialBaselinePrefillSecondsPerToken
+        )
+        if decodedRuntime.hasPrefix("swift-local-"),
+           decodedBaselineDecode == nil || decodedBaselinePrefill == nil
+        {
+            throw DecodingError.dataCorruptedError(
+                forKey: .runtime,
+                in: container,
+                debugDescription:
+                    "local Qwen score metrics require explicit prefill and "
+                    + "decode baselines"
+            )
+        }
+        self.baselineDecodeSecondsPerToken = decodedBaselineDecode
+            ?? MLXFastConstants.officialBaselineDecodeSecondsPerToken
+        self.baselinePrefillSecondsPerToken = decodedBaselinePrefill
+            ?? MLXFastConstants.officialBaselinePrefillSecondsPerToken
         self.decodeSpeedup = try container.decodeIfPresent(Double.self, forKey: .decodeSpeedup)
             ?? BenchmarkScore.speedup(
                 baselineSecondsPerToken: baselineDecodeSecondsPerToken,
@@ -520,7 +536,7 @@ public struct ScoreMetrics: Codable, Equatable {
         self.weightsHash = try container.decodeIfPresent(String.self, forKey: .weightsHash) ?? ""
         self.weightsByteCount = try container.decodeIfPresent(Int.self, forKey: .weightsByteCount) ?? 0
         self.weightsFileCount = try container.decodeIfPresent(Int.self, forKey: .weightsFileCount) ?? 0
-        self.runtime = try container.decode(String.self, forKey: .runtime)
+        self.runtime = decodedRuntime
         self.partialResult = try container.decodeIfPresent(Bool.self, forKey: .partialResult) ?? false
     }
 
@@ -619,6 +635,8 @@ extension ScorePayload {
                 bandwidthGBPerToken: 0,
                 decodeSecondsPerToken: 0,
                 prefillSecondsPerToken: 0,
+                baselineDecodeSecondsPerToken: 0,
+                baselinePrefillSecondsPerToken: 0,
                 passedCorrectness: false,
                 numLayers: MLXFastConstants.numHiddenLayers,
                 checkedSteps: 0,

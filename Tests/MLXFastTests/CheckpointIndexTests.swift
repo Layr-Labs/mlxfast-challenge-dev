@@ -4,22 +4,33 @@ import Testing
 @testable import MLXFastTransform
 
 @Test
-func checkpointIndexToolsReturnsUniqueSortedSafetensorShards() throws {
+func checkpointIndexToolsReturnsQwenShardsUniquelyAndSorted() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
     let index = root.appendingPathComponent("model.safetensors.index.json")
     try writeCheckpointIndex(
         index,
         weightMap: [
-            "b": "model-00002.safetensors",
-            "a": "model-00001.safetensors",
-            "c": "model-00002.safetensors",
+            "language_model.model.layers.0.linear_attn.in_proj_qkv.weight":
+                "model-00001-of-00003.safetensors",
+            "language_model.model.layers.3.self_attn.q_proj.weight":
+                "model-00001-of-00003.safetensors",
+            "language_model.model.layers.17.mlp.down_proj.weight":
+                "model-00002-of-00003.safetensors",
+            "language_model.lm_head.weight":
+                "model-00003-of-00003.safetensors",
         ]
     )
 
     let shards = try CheckpointIndexTools.safetensorShardNames(from: index.path)
 
-    #expect(shards == ["model-00001.safetensors", "model-00002.safetensors"])
+    #expect(
+        shards == [
+            "model-00001-of-00003.safetensors",
+            "model-00002-of-00003.safetensors",
+            "model-00003-of-00003.safetensors",
+        ]
+    )
 }
 
 @Test

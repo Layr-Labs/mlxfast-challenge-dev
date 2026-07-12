@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 @testable import MLXFastCore
 @testable import MLXFastHarness
 @testable import MLXFastModel
@@ -89,16 +90,16 @@ func benchmarkWindowFreezeDocMatchesConstants() throws {
 
 @Test
 func timedDecodeChargesOneValidatedSeedForward() throws {
-    let worker = try packageFile("Sources/MLXFastHarness/GemmaRuntimeWorker.swift")
+    let worker = try packageFile("Sources/MLXFastHarness/QwenRuntimeWorker.swift")
     let decodeBegin = try slice(worker, from: "case \"decode_begin\":", to: "case \"decode_step\":")
     // Exactly one whole-prompt forward, and no warmup pass to memoize against it.
-    #expect(decodeBegin.components(separatedBy: "Gemma4Model.logits(").count - 1 == 1)
+    #expect(decodeBegin.components(separatedBy: "Qwen35Model.logits(").count - 1 == 1)
     #expect(!decodeBegin.contains("warmupCache"))
     #expect(!decodeBegin.contains("warmupLogits"))
 
     // The decode phase is parent-timed and validated; worker-reported seconds
     // must not be the scored value, and both the seed and the steps are checked.
-    let benchmark = try packageFile("Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift")
+    let benchmark = try packageFile("Sources/MLXFastHarness/QwenRuntimeBenchmark.swift")
     let measureWorkerDecode = try slice(
         benchmark,
         from: "static func measureWorkerDecode(",
@@ -112,7 +113,7 @@ func timedDecodeChargesOneValidatedSeedForward() throws {
 
 @Test
 func timedPrefillChargesOneValidatedColdForward() throws {
-    let benchmark = try packageFile("Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift")
+    let benchmark = try packageFile("Sources/MLXFastHarness/QwenRuntimeBenchmark.swift")
     let measureWorkerPrefill = try slice(
         benchmark,
         from: "static func measureWorkerPrefillSecondsPerToken(",
@@ -127,24 +128,150 @@ func timedPrefillChargesOneValidatedColdForward() throws {
 }
 
 @Test
-func scoredBaselinesResolveFromGoldenWithConstantsFallback() throws {
-    // Prompt-pool rotation: the golden oracle may carry per-prompt baselines
-    // (both axes together, validated positive at load). The scored speedups and
-    // floors must use the golden-resolved values, with the calibrated constants
-    // as the fallback for goldens that carry none -- so a pool prompt of
-    // different intrinsic difficulty ranks on its own calibration instead of
-    // the default prompt's.
+func workerPhaseStartsResetTrustedAllocatorBeforeForwardSetup() throws {
+    let worker = try packageFile("Sources/MLXFastHarness/QwenRuntimeWorker.swift")
+    let resetCall = "try resetRuntimeWorkerAllocatorForPhaseStart()"
+
+    // The phase-start value and reset live in the trusted harness, not in
+    // editable model construction. MLX documents clearCache() as synchronously
+    // deallocating every cached (free) buffer, so a nonzero postcondition must
+    // fail closed. The reset pins the sequence-boundary state only (editable
+    // code may change the limit inside the charged window); the source must say
+    // so instead of claiming a phase-long policy that is not enforced.
+    #expect(worker.contains("static let trustedRuntimeWorkerPhaseStartCacheLimitBytes = 6 << 30"))
+    let allocatorReset = try slice(
+        worker,
+        from: "static func resetRuntimeWorkerAllocatorForPhaseStart()",
+        to: "static func handleWorkerRequest("
+    )
+    let setLimit = try #require(
+        allocatorReset.range(of: "Memory.cacheLimit = trustedRuntimeWorkerPhaseStartCacheLimitBytes")
+    )
+    let clearCache = try #require(allocatorReset.range(of: "Memory.clearCache()"))
+    let readCacheMemory = try #require(allocatorReset.range(of: "Memory.cacheMemory"))
+    let zeroCheck = try #require(allocatorReset.range(of: "guard remainingCacheBytes == 0 else"))
+    #expect(setLimit.lowerBound < clearCache.lowerBound)
+    #expect(clearCache.lowerBound < readCacheMemory.lowerBound)
+    #expect(readCacheMemory.lowerBound < zeroCheck.lowerBound)
+    #expect(worker.contains("Scope: the boundary only"))
+    #expect(worker.contains("This is NOT an enforced cap for the rest of"))
+
+    // Every new sequence resets exactly once before constructing its request
+    // cache or entering the helper that performs the first logits call.
+    let phaseBegins = [
+        (
+            start: "case \"correctness\":",
+            end: "case \"correctness_begin\":",
+            firstForwardSetup: "let tokens = try generateGreedyCached("
+        ),
+        (
+            start: "case \"correctness_begin\":",
+            end: "case \"correctness_step\":",
+            firstForwardSetup: "let cache = Qwen35ModelCache("
+        ),
+        (
+            start: "case \"prefill\":",
+            end: "case \"decode_begin\":",
+            firstForwardSetup: "let cache = Qwen35ModelCache("
+        ),
+        (
+            start: "case \"decode_begin\":",
+            end: "case \"decode_step\":",
+            firstForwardSetup: "let cache = Qwen35ModelCache("
+        ),
+    ]
+    for phase in phaseBegins {
+        let body = try slice(worker, from: phase.start, to: phase.end)
+        #expect(body.components(separatedBy: resetCall).count - 1 == 1)
+        let reset = try #require(body.range(of: resetCall))
+        let firstForwardSetup = try #require(body.range(of: phase.firstForwardSetup))
+        #expect(reset.lowerBound < firstForwardSetup.lowerBound)
+    }
+
+    // Step requests are part of an already-started sequence. Clearing here
+    // would destroy legitimate, charged KV/intermediate reuse.
+    let correctnessStep = try slice(
+        worker,
+        from: "case \"correctness_step\":",
+        to: "case \"prefill\":"
+    )
+    let decodeStep = try slice(
+        worker,
+        from: "case \"decode_step\":",
+        to: "case \"phase_diagnostics\":"
+    )
+    #expect(!correctnessStep.contains(resetCall))
+    #expect(!decodeStep.contains(resetCall))
+}
+
+@Test
+func phaseStartAllocatorResetLeavesExactlyEmptyCacheWhenRuntimeTestsAreEnabled() throws {
+    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+        return
+    }
+    // Pin the MLX contract the fail-closed guard relies on: with no MLX work in
+    // flight, clearCache() leaves cacheMemory at exactly zero even when free
+    // buffers were just returned to the pool (mirroring unscored init warmup
+    // residue), so the trusted reset must succeed rather than fail closed.
+    Memory.cacheLimit = 32 << 30
+    do {
+        let scratch = MLXArray(Array(repeating: Float(1), count: 1 << 20), [1024, 1024])
+        eval(scratch + scratch)
+    }
+    try QwenRuntime.resetRuntimeWorkerAllocatorForPhaseStart()
+    #expect(Memory.cacheMemory == 0)
+    #expect(Memory.cacheLimit == QwenRuntime.trustedRuntimeWorkerPhaseStartCacheLimitBytes)
+}
+
+@Test
+func trustedParentStartsPhaseTimerBeforeWorkerResetRequest() throws {
+    let benchmark = try packageFile("Sources/MLXFastHarness/QwenRuntimeBenchmark.swift")
+    let prefill = try slice(
+        benchmark,
+        from: "static func measureWorkerPrefillSecondsPerToken(",
+        to: "static func measureDecode("
+    )
+    let prefillTimer = try #require(
+        prefill.range(of: "let prefillStart = DispatchTime.now().uptimeNanoseconds")
+    )
+    let prefillRequest = try #require(
+        prefill.range(of: "let response = try worker.prefill(promptTokens: promptTokens)")
+    )
+    #expect(prefillTimer.lowerBound < prefillRequest.lowerBound)
+
+    let decode = try slice(
+        benchmark,
+        from: "static func measureWorkerDecode(",
+        to: "static let bandwidthSource"
+    )
+    let decodeTimer = try #require(
+        decode.range(of: "let decodePhaseStart = DispatchTime.now().uptimeNanoseconds")
+    )
+    let decodeRequest = try #require(
+        decode.range(of: "let beginResponse = try worker.beginDecode(seedTokens: seedTokens)")
+    )
+    #expect(decodeTimer.lowerBound < decodeRequest.lowerBound)
+}
+
+@Test
+func qwenScoringNeverFallsBackToGemmaConstants() throws {
+    // The generic golden schema retains its legacy fallback for the protected
+    // Gemma workflow, but Qwen harness paths must resolve only a paired baseline
+    // or an explicit baseline pair carried by the external Qwen golden.
     let golden = try packageFile("Sources/MLXFastCore/Golden.swift")
     #expect(golden.contains("baselinePrefillSecondsPerToken ?? MLXFastConstants.officialBaselinePrefillSecondsPerToken"))
     #expect(golden.contains("baselineDecodeSecondsPerToken ?? MLXFastConstants.officialBaselineDecodeSecondsPerToken"))
     #expect(golden.contains("must be provided together"))
 
-    let benchmark = try packageFile("Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift")
+    let benchmark = try packageFile("Sources/MLXFastHarness/QwenRuntimeBenchmark.swift")
     let score = try packageFile("Sources/MLXFastCore/Score.swift")
-    // Both benchmark paths adopt the golden's resolved baselines...
-    #expect(benchmark.components(separatedBy: "benchmarkGolden.resolvedBaselinePrefillSecondsPerToken").count - 1 == 2)
-    #expect(benchmark.components(separatedBy: "benchmarkGolden.resolvedBaselineDecodeSecondsPerToken").count - 1 == 2)
-    // ...and every scored speedup uses the resolved values, never the raw constants.
+    #expect(
+        benchmark.components(
+            separatedBy: "resolvedQwenBenchmarkBaselines("
+        ).count - 1 == 2
+    )
+    #expect(!benchmark.contains("benchmarkGolden.resolvedBaseline"))
+    #expect(!benchmark.contains("MLXFastConstants.officialBaseline"))
     #expect(score.contains("baselineSecondsPerToken: baselineDecodeSecondsPerToken"))
     #expect(score.contains("baselineSecondsPerToken: baselinePrefillSecondsPerToken"))
     #expect(benchmark.contains("BenchmarkScore.evaluateTimedRun("))
@@ -204,12 +331,12 @@ func officialRankedRunMeasuresPairedBaselineOnTheSameSilicon() throws {
     #expect(overlay.contains("performance floor failed"))
 
     // Harness side (still shipped and armed): a paired override outranks
-    // golden-carried baselines, which outrank constants, the pair is
-    // fail-closed, and the override keys never reach the sandboxed worker.
-    let benchmark = try packageFile("Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift")
+    // golden-carried baselines; absence of both fails closed, and override keys
+    // never reach the sandboxed worker.
+    let benchmark = try packageFile("Sources/MLXFastHarness/QwenRuntimeBenchmark.swift")
     #expect(benchmark.components(separatedBy: "PairedBaselineOverride.fromEnvironment()").count - 1 == 2)
-    #expect(benchmark.contains("pairedBaseline?.prefillSecondsPerToken\n                ?? benchmarkGolden.resolvedBaselinePrefillSecondsPerToken"))
-    #expect(benchmark.contains("pairedBaseline?.decodeSecondsPerToken\n                ?? benchmarkGolden.resolvedBaselineDecodeSecondsPerToken"))
+    #expect(benchmark.components(separatedBy: "resolvedQwenBenchmarkBaselines(").count - 1 == 2)
+    #expect(benchmark.contains("baseline_source=\\(baselineSourceLabel("))
     // The worker environment filter is a strict allowlist (see
     // sanitizedRuntimeWorkerEnvironment), so the override keys are excluded
     // structurally; assert that against the real filter rather than pinning
@@ -223,17 +350,39 @@ func officialRankedRunMeasuresPairedBaselineOnTheSameSilicon() throws {
 }
 
 @Test
-func decodeValidationDelayHookDefaultsToNoOp() {
-    // The one editable-surface knob that can add time to the trusted decode loop
-    // must read zero on main/baseline. It can only ever slow a submission down,
-    // never speed it up, but the frozen baseline is measured at zero delay, so a
-    // nonzero default here would mean the baseline and submissions were timed
-    // through different decode loops.
-    //
-    // BenchmarkSupportTests.submissionValidationDelayDefaultsToZero asserts the
-    // same literal for a different reason (the general default of the hook). The
-    // re-assert here is intentional: this file is meant to be the single,
-    // self-contained guard for everything the frozen window depends on, so it
-    // does not rely on an unrelated test staying green.
-    #expect(Gemma4SubmissionControls.measuredDecodeDelayMilliseconds == 0)
+func decodeMeasurementInvokesNoPhaseVaryingEditableHook() throws {
+    // The scored decode loop must invoke NO editable hook that is unique to it.
+    // The former editable knob (Qwen35SubmissionControls.measuredDecodeDelay-
+    // Milliseconds, read via submissionValidationDelayMilliseconds) was model
+    // code called by trusted code ONLY on the timed decode path -- so "my getter
+    // was invoked" was an unambiguous "I am being scored now" signal, and the
+    // submission could run arbitrary phase-detection inside the getter. It is
+    // removed entirely (editable file deleted, no trusted call site remains).
+    // This file is the single self-contained guard for the frozen window, so it
+    // freezes phase-independence here directly rather than relying on an
+    // unrelated test.
+    #expect(!FileManager.default.fileExists(
+        atPath: "Sources/MLXFastModel/Qwen35SubmissionControls.swift"
+    ))
+    let worker = try packageFile("Sources/MLXFastHarness/QwenRuntimeWorker.swift")
+    let benchmark = try packageFile("Sources/MLXFastHarness/QwenRuntimeBenchmark.swift")
+    let localIterate = try packageFile("Sources/MLXFastHarness/QwenRuntimeLocalIterate.swift")
+    for source in [worker, benchmark, localIterate] {
+        #expect(!source.contains("submissionValidationDelayMilliseconds"))
+        #expect(!source.contains("measuredDecodeDelayMilliseconds"))
+        #expect(!source.contains("Qwen35SubmissionControls"))
+    }
+    // The worker decode_step case invokes only the same editable entry points
+    // the correctness path also invokes (Qwen35Model.logits / greedyToken), and
+    // no per-token sleep that a delay hook used to drive.
+    let decodeStepStart = try #require(worker.range(of: "case \"decode_step\":"))
+    let decodeStepEnd = try #require(
+        worker.range(
+            of: "case \"phase_diagnostics\":",
+            range: decodeStepStart.upperBound..<worker.endIndex
+        )
+    )
+    let decodeStep = String(worker[decodeStepStart.upperBound..<decodeStepEnd.lowerBound])
+    #expect(decodeStep.contains("Qwen35Model.logits("))
+    #expect(!decodeStep.contains("Thread.sleep"))
 }

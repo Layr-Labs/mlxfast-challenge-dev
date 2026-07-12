@@ -30,8 +30,8 @@ struct BenchmarkSafetyTests {
             restoreEnvironment("MLXFAST_COOL_GATE_TEST_LOG", value: previousLog)
         }
 
-        try GemmaRuntime.runLocalPhaseCoolGate(phase: "prefill")
-        try GemmaRuntime.runLocalPhaseCoolGate(phase: "decode")
+        try QwenRuntime.runLocalPhaseCoolGate(phase: "prefill")
+        try QwenRuntime.runLocalPhaseCoolGate(phase: "decode")
 
         #expect(try String(contentsOf: log, encoding: .utf8) == "prefill\ndecode\n")
     }
@@ -1110,19 +1110,19 @@ struct BenchmarkSafetyTests {
     @Test
     func scoredWorkerResponsesExcludeDiagnostics() throws {
         let worker = try String(
-            contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeWorker.swift",
+            contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeWorker.swift",
             encoding: .utf8
         )
         let benchmark = try String(
-            contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift",
+            contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeBenchmark.swift",
             encoding: .utf8
         )
         let local = try String(
-            contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeLocalIterate.swift",
+            contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeLocalIterate.swift",
             encoding: .utf8
         )
         let support = try String(
-            contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeSupport.swift",
+            contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeSupport.swift",
             encoding: .utf8
         )
         let decodeStep = try sourceSlice(worker, from: "case \"decode_step\":", to: "case \"phase_diagnostics\":")
@@ -1135,7 +1135,7 @@ struct BenchmarkSafetyTests {
         let measuredDecode = try sourceSlice(
             benchmark,
             from: "static func measureWorkerDecode(",
-            to: "static func submissionValidationDelayMilliseconds()"
+            to: "static let bandwidthSource"
         )
         let timerEnd = try #require(measuredDecode.range(of: "let measuredSeconds = secondsSince(decodePhaseStart)"))
         let diagnostics = try #require(measuredDecode.range(of: "worker.phaseDiagnostics()"))
@@ -1160,8 +1160,63 @@ struct BenchmarkSafetyTests {
         #expect(localMeasuredTime.contains("options.benchmarkDecodeSteps * options.timingRepeats"))
         #expect(localMeasuredTime.contains("correctnessSeconds = timedSeconds"))
         #expect(!localMeasuredTime.contains("timedSeconds = secondsSince"))
-        #expect(!local.contains("let warmupCache = Gemma4ModelCache"))
+        #expect(!local.contains("let warmupCache = Qwen35ModelCache"))
         #expect(local.components(separatedBy: "runLocalPhaseCoolGate(phase:").count == 5)
+    }
+
+    // The hidden-GPQA capture embeds hidden prompt text, answer keys, and
+    // reference answers. It must never exist on disk while the correctness
+    // worker -- the only process that runs editable model code in this phase --
+    // is alive. runLayeredCorrectnessWithWorker therefore only COLLECTS and
+    // validates the answers and returns them in its result; the trusted
+    // benchmark caller writes them only AFTER closing/reaping the worker.
+    @Test
+    func semanticGPQACaptureIsWrittenOnlyAfterCorrectnessWorkerCloses() throws {
+        let correctness = try String(
+            contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeCorrectness.swift",
+            encoding: .utf8
+        )
+        let benchmark = try String(
+            contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeBenchmark.swift",
+            encoding: .utf8
+        )
+
+        // The result struct carries the collected answers back to the caller.
+        #expect(correctness.contains("let semanticGPQAAnswers: [SemanticGPQAAnswerCase]?"))
+
+        // runLayeredCorrectnessWithWorker collects + returns the answers and
+        // never writes them from inside the live-worker window.
+        let layered = try sourceSlice(
+            correctness,
+            from: "static func runLayeredCorrectnessWithWorker(",
+            to: "static func failedCorrectnessReport("
+        )
+        #expect(!layered.contains("writeSemanticGPQAAnswers"))
+        #expect(layered.contains("capturedSemanticAnswers = semanticAnswers"))
+        #expect(layered.contains("semanticGPQAAnswers: capturedSemanticAnswers"))
+        // The count guard that fails a bad capture still runs inside the worker
+        // window; only the disk write is deferred.
+        #expect(layered.contains("guard semanticAnswers.count == semanticCapture.caseCount else {"))
+
+        // In benchmarkWithWorker the single capture write happens only AFTER
+        // the worker-closing defer, guarded on the returned answers.
+        let benchmarkTail = try sourceSlice(
+            benchmark,
+            from: "let correctnessResult: WorkerLayeredCorrectnessResult",
+            to: "correctnessSeconds = secondsSince(correctnessStart)"
+        )
+        let close = try #require(benchmarkTail.range(of: "correctnessWorker.close()"))
+        let write = try #require(benchmarkTail.range(of: "writeSemanticGPQAAnswers("))
+        #expect(close.lowerBound < write.lowerBound)
+        #expect(benchmarkTail.contains(
+            "if let semanticCapture, let semanticAnswers = correctnessResult.semanticGPQAAnswers"
+        ))
+        // Exactly one worker is created in this window, and its close() is a
+        // defer, so the write provably runs after the worker is reaped.
+        #expect(benchmarkTail.components(separatedBy: "RuntimeWorkerClient(").count - 1 == 1)
+        #expect(benchmarkTail.components(separatedBy: "writeSemanticGPQAAnswers(").count - 1 == 1)
+        let deferClose = try #require(benchmarkTail.range(of: "defer {"))
+        #expect(deferClose.lowerBound < write.lowerBound)
     }
 }
 

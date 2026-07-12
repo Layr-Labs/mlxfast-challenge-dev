@@ -218,12 +218,14 @@ public struct BenchmarkGolden: Codable, Equatable {
 
 public struct GoldenDocument: Codable, Equatable {
     public let version: Int?
+    public let modelType: String?
     public let cases: [GoldenCase]
     public let correctnessGates: GoldenCorrectnessGates?
     public let benchmark: BenchmarkGolden?
 
     enum CodingKeys: String, CodingKey {
         case version
+        case modelType = "model_type"
         case cases
         case correctnessGates = "correctness_gates"
         case benchmark
@@ -231,11 +233,13 @@ public struct GoldenDocument: Codable, Equatable {
 
     public init(
         version: Int = 1,
+        modelType: String? = nil,
         cases: [GoldenCase],
         correctnessGates: GoldenCorrectnessGates? = nil,
         benchmark: BenchmarkGolden?
     ) {
         self.version = version
+        self.modelType = modelType
         self.cases = cases
         self.correctnessGates = correctnessGates
         self.benchmark = benchmark
@@ -243,17 +247,20 @@ public struct GoldenDocument: Codable, Equatable {
 }
 
 public struct GoldenFixture: Equatable {
+    public let modelType: String?
     public let cases: [GoldenCase]
     public let correctnessGates: GoldenCorrectnessGates?
     public let benchmark: BenchmarkGolden?
     public let sha256: String
 
     public init(
+        modelType: String? = nil,
         cases: [GoldenCase],
         correctnessGates: GoldenCorrectnessGates? = nil,
         benchmark: BenchmarkGolden?,
         sha256: String
     ) {
+        self.modelType = modelType
         self.cases = cases
         self.correctnessGates = correctnessGates
         self.benchmark = benchmark
@@ -290,19 +297,22 @@ public struct BenchmarkTokenComparison: Equatable {
 public func loadGoldenCases(
     from path: String,
     requiredSteps: Int = MLXFastConstants.correctnessSteps,
-    requiredPromptTokens: Int = MLXFastConstants.correctnessPromptTokens
+    requiredPromptTokens: Int = MLXFastConstants.correctnessPromptTokens,
+    requiredModelType: String? = nil
 ) throws -> [GoldenCase] {
     try loadGoldenFixture(
         from: path,
         requiredSteps: requiredSteps,
-        requiredPromptTokens: requiredPromptTokens
+        requiredPromptTokens: requiredPromptTokens,
+        requiredModelType: requiredModelType
     ).cases
 }
 
 public func loadGoldenFixture(
     from path: String,
     requiredSteps: Int = MLXFastConstants.correctnessSteps,
-    requiredPromptTokens: Int = MLXFastConstants.correctnessPromptTokens
+    requiredPromptTokens: Int = MLXFastConstants.correctnessPromptTokens,
+    requiredModelType: String? = nil
 ) throws -> GoldenFixture {
     guard requiredSteps > 0 else {
         throw MLXFastError.invalidInput("correctness required steps must be positive")
@@ -317,6 +327,24 @@ public func loadGoldenFixture(
     let decoded = try JSONDecoder().decode(GoldenDocument.self, from: data)
     guard decoded.version == 1 else {
         throw MLXFastError.invalidInput("correctness golden file version must be 1")
+    }
+    if let modelType = decoded.modelType {
+        guard !modelType.isEmpty,
+              modelType == modelType.trimmingCharacters(in: .whitespacesAndNewlines)
+        else {
+            throw MLXFastError.invalidInput(
+                "correctness golden file model_type must be a non-empty trimmed string"
+            )
+        }
+    }
+    if let requiredModelType {
+        guard decoded.modelType == requiredModelType else {
+            throw MLXFastError.invalidInput(
+                "correctness golden file model_type="
+                    + "\(String(describing: decoded.modelType)) expected "
+                    + "\(requiredModelType)"
+            )
+        }
     }
     try validateGoldenCases(
         decoded.cases,
@@ -336,6 +364,7 @@ public func loadGoldenFixture(
     let digest = SHA256.hash(data: data)
     let hash = digest.map { String(format: "%02x", $0) }.joined()
     return GoldenFixture(
+        modelType: decoded.modelType,
         cases: decoded.cases,
         correctnessGates: decoded.correctnessGates,
         benchmark: decoded.benchmark,
@@ -608,9 +637,25 @@ private func validateGoldenFixtureKeys(_ data: Data) throws {
     }
     try rejectUnknownKeys(
         Set(root.keys),
-        allowed: ["version", "cases", "correctness_gates", "benchmark"],
+        allowed: [
+            "version",
+            "model_type",
+            "cases",
+            "correctness_gates",
+            "benchmark",
+        ],
         field: "correctness golden file"
     )
+    if root.keys.contains("model_type") {
+        guard let modelType = root["model_type"] as? String,
+              !modelType.isEmpty,
+              modelType == modelType.trimmingCharacters(in: .whitespacesAndNewlines)
+        else {
+            throw MLXFastError.invalidInput(
+                "correctness golden file model_type must be a non-empty trimmed string"
+            )
+        }
+    }
     guard root["version"] != nil else {
         return
     }
@@ -893,7 +938,8 @@ private func validateTokens(_ tokens: [Int], field: String) throws {
     for (index, token) in tokens.enumerated() {
         if token < 0 || token >= MLXFastConstants.vocabSize {
             throw MLXFastError.invalidInput(
-                "\(field)[\(index)]=\(token) is outside Gemma 4 vocab range 0..<\(MLXFastConstants.vocabSize)"
+                "\(field)[\(index)]=\(token) is outside configured vocab range "
+                    + "0..<\(MLXFastConstants.vocabSize)"
             )
         }
     }

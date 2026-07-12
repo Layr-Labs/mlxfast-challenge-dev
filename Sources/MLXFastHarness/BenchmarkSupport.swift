@@ -127,18 +127,23 @@ public enum BenchmarkPreflight {
             maxByteCount: maxWeightsByteCount
         )
 
-        let golden = try loadGoldenFixture(from: goldenPath)
+        let golden = try QwenRuntime.loadQwenGoldenFixture(from: goldenPath)
         if requiresBenchmarkOracle {
-            guard golden.benchmark != nil else {
+            guard let benchmark = golden.benchmark else {
                 throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
             }
+            _ = try QwenRuntime.resolvedQwenBenchmarkBaselines(
+                paired: try PairedBaselineOverride.fromEnvironment(environment),
+                golden: benchmark,
+                context: "Qwen benchmark preflight"
+            )
         }
-        let config = try Gemma4Config.load(from: weightsPath)
+        let config = try Qwen35Config.load(from: weightsPath)
 
         let denseStore = try DenseTensorStore(weightsPath: weightsPath)
         try denseStore.validateReadableByteRanges()
 
-        try Gemma4WeightLoader(denseStore: denseStore)
+        try Qwen35WeightLoader(denseStore: denseStore)
             .validateRequiredMetadata(config: config)
 
         return BenchmarkPreflightReport(

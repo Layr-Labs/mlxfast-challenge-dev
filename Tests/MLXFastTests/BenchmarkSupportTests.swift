@@ -20,10 +20,10 @@ func runtimeWorkerClientSkipsNonJSONStdoutLines() {
 @Test
 func commitIdentifierPrefersTrustedDispatchSHAOverGit() {
     let fullSHA = "5f95c4bdce07a0ef79ea350c91d9eb0d7476cf2f"
-    #expect(GemmaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": fullSHA]) == fullSHA)
+    #expect(QwenRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": fullSHA]) == fullSHA)
     // Short (rev-parse --short style) values and surrounding whitespace are fine.
-    #expect(GemmaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": "5f95c4bdce07"]) == "5f95c4bdce07")
-    #expect(GemmaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": " \(fullSHA)\n"]) == fullSHA)
+    #expect(QwenRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": "5f95c4bdce07"]) == "5f95c4bdce07")
+    #expect(QwenRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": " \(fullSHA)\n"]) == fullSHA)
 
     // Values that could not satisfy the trusted shell predicates fall back to
     // git instead of being stamped verbatim into the sealed score.
@@ -35,16 +35,16 @@ func commitIdentifierPrefersTrustedDispatchSHAOverGit() {
         "not-a-commit-sha",
         "5f95c4bdce07;rm -rf /",
     ] {
-        let fallback = GemmaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": invalid])
+        let fallback = QwenRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": invalid])
         #expect(fallback != invalid || invalid.isEmpty)
         #expect(!fallback.contains(";"))
     }
 
-    #expect(GemmaRuntime.isCommitSHAHex(fullSHA))
-    #expect(GemmaRuntime.isCommitSHAHex("abcdef0"))
-    #expect(!GemmaRuntime.isCommitSHAHex("abcdef"))
-    #expect(!GemmaRuntime.isCommitSHAHex(String(repeating: "a", count: 41)))
-    #expect(!GemmaRuntime.isCommitSHAHex("ABCDEF0"))
+    #expect(QwenRuntime.isCommitSHAHex(fullSHA))
+    #expect(QwenRuntime.isCommitSHAHex("abcdef0"))
+    #expect(!QwenRuntime.isCommitSHAHex("abcdef"))
+    #expect(!QwenRuntime.isCommitSHAHex(String(repeating: "a", count: 41)))
+    #expect(!QwenRuntime.isCommitSHAHex("ABCDEF0"))
 }
 
 @Test
@@ -90,7 +90,7 @@ private enum RuntimeWorkerDescriptorTestError: Error {
 }
 
 @Test
-func runtimeWorkerPinnedConfigurationAcceptsDense31BArchitecture() throws {
+func runtimeWorkerPinnedConfigurationAcceptsQwen35Architecture() throws {
     let data = try JSONSerialization.data(
         withJSONObject: pinnedRuntimeWorkerConfigurationObject()
     )
@@ -98,7 +98,7 @@ func runtimeWorkerPinnedConfigurationAcceptsDense31BArchitecture() throws {
 }
 
 @Test
-func runtimeWorkerPinnedConfigurationRejectsUnsafeLibraryOnlyFields() throws {
+func runtimeWorkerPinnedConfigurationRejectsWrongQwen35Fields() throws {
     var cases: [(String, [String: Any])] = []
 
     func addCase(_ name: String, _ mutate: (inout [String: Any]) -> Void) {
@@ -108,74 +108,83 @@ func runtimeWorkerPinnedConfigurationRejectsUnsafeLibraryOnlyFields() throws {
     }
 
     addCase("model-type") { $0["model_type"] = "other" }
-    addCase("hidden-size") { $0["hidden_size"] = MLXFastConstants.hiddenSize - 1 }
-    addCase("hidden-layers") { $0["num_hidden_layers"] = MLXFastConstants.numHiddenLayers - 1 }
-    addCase("intermediate-size") { $0["intermediate_size"] = MLXFastConstants.intermediateSize - 1 }
-    addCase("attention-heads") { $0["num_attention_heads"] = MLXFastConstants.attentionHeads - 1 }
-    addCase("head-dim") { $0["head_dim"] = 128 }
-    addCase("global-head-dim") { $0["global_head_dim"] = 256 }
-    addCase("global-partial-rotary") { $0["global_partial_rotary_factor"] = 0.5 }
-    addCase("rms-norm") { $0["rms_norm_eps"] = 1e-5 }
     addCase("vocab") { $0["vocab_size"] = MLXFastConstants.vocabSize - 1 }
-    addCase("kv-heads") { $0["num_key_value_heads"] = 16 }
-    addCase("global-kv-heads") { $0["num_global_key_value_heads"] = 8 }
-    addCase("zero-pattern") { $0["sliding_window_pattern"] = 0 }
-    addCase("wrong-pattern") { $0["sliding_window_pattern"] = 5 }
-    addCase("shared-kv") { $0["num_kv_shared_layers"] = 1 }
-    addCase("per-layer-input") { $0["hidden_size_per_layer_input"] = 1 }
-    addCase("oversized-per-layer-vocab") { $0["vocab_size_per_layer_input"] = Int.max }
-    addCase("sliding-window") { $0["sliding_window"] = 1 }
+    addCase("hidden-size") { $0["hidden_size"] = MLXFastConstants.hiddenSize - 1 }
+    addCase("intermediate-size") { $0["intermediate_size"] = MLXFastConstants.intermediateSize - 1 }
+    addCase("hidden-layers") { $0["num_hidden_layers"] = MLXFastConstants.numHiddenLayers - 1 }
+    addCase("attention-heads") { $0["num_attention_heads"] = MLXFastConstants.attentionHeads - 1 }
+    addCase("kv-heads") { $0["num_key_value_heads"] = 8 }
+    addCase("head-dim") { $0["head_dim"] = 128 }
+    addCase("linear-value-heads") { $0["linear_num_value_heads"] = 24 }
+    addCase("linear-key-heads") { $0["linear_num_key_heads"] = 8 }
+    addCase("linear-value-head-dim") { $0["linear_value_head_dim"] = 64 }
+    addCase("linear-key-head-dim") { $0["linear_key_head_dim"] = 64 }
+    addCase("linear-conv-kernel") { $0["linear_conv_kernel_dim"] = 3 }
+    addCase("full-attention-interval") { $0["full_attention_interval"] = 8 }
+    addCase("rms-norm") { $0["rms_norm_eps"] = 1e-5 }
+    addCase("hidden-activation") { $0["hidden_act"] = "gelu" }
     addCase("max-position") { $0["max_position_embeddings"] = 131_072 }
-    addCase("attention-k-eq-v") { $0["attention_k_eq_v"] = false }
-    addCase("logit-softcap") { $0["final_logit_softcapping"] = 50 }
-    addCase("double-wide") { $0["use_double_wide_mlp"] = true }
-    addCase("missing-layer-types") { $0.removeValue(forKey: "layer_types") }
+    addCase("attention-bias") { $0["attention_bias"] = true }
+    addCase("attention-dropout") { $0["attention_dropout"] = 0.1 }
+    addCase("attention-output-gate") { $0["attn_output_gate"] = false }
+    addCase("output-gate-type") { $0["output_gate_type"] = "sigmoid" }
+    addCase("bos-token") { $0["bos_token_id"] = 1 }
+    addCase("eos-token") { $0["eos_token_id"] = 1 }
+    addCase("initializer-range") { $0["initializer_range"] = 0.01 }
+    addCase("pad-token") { $0["pad_token_id"] = 0 }
+    addCase("tie-embeddings") { $0["tie_word_embeddings"] = true }
+    addCase("mamba-dtype") { $0["mamba_ssm_dtype"] = "bfloat16" }
+    addCase("dtype") { $0["dtype"] = "float16" }
+    addCase("use-cache") { $0["use_cache"] = false }
+    addCase("top-level-partial-rotary") { $0["partial_rotary_factor"] = 0.5 }
     addCase("layer-pattern") {
         var layerTypes = $0["layer_types"] as! [String]
         layerTypes[0] = "full_attention"
         $0["layer_types"] = layerTypes
     }
-    addCase("tie-embeddings") { $0["tie_word_embeddings"] = false }
-    addCase("sliding-rope-theta") {
+    addCase("layer-count") {
+        var layerTypes = $0["layer_types"] as! [String]
+        layerTypes.removeLast()
+        $0["layer_types"] = layerTypes
+    }
+    addCase("rope-theta") {
         var rope = $0["rope_parameters"] as! [String: Any]
-        var sliding = rope["sliding_attention"] as! [String: Any]
-        sliding["rope_theta"] = 20_000
-        rope["sliding_attention"] = sliding
+        rope["rope_theta"] = 1_000_000
         $0["rope_parameters"] = rope
     }
-    addCase("sliding-rope-type") {
+    addCase("rope-type") {
         var rope = $0["rope_parameters"] as! [String: Any]
-        var sliding = rope["sliding_attention"] as! [String: Any]
-        sliding["rope_type"] = "proportional"
-        rope["sliding_attention"] = sliding
+        rope["rope_type"] = "proportional"
         $0["rope_parameters"] = rope
     }
-    addCase("sliding-partial-rotary") {
+    addCase("rope-partial-rotary") {
         var rope = $0["rope_parameters"] as! [String: Any]
-        var sliding = rope["sliding_attention"] as! [String: Any]
-        sliding["partial_rotary_factor"] = 0.5
-        rope["sliding_attention"] = sliding
+        rope["partial_rotary_factor"] = 0.5
         $0["rope_parameters"] = rope
     }
-    addCase("full-rope-theta") {
+    addCase("mrope-interleaved") {
         var rope = $0["rope_parameters"] as! [String: Any]
-        var full = rope["full_attention"] as! [String: Any]
-        full["rope_theta"] = 10_000
-        rope["full_attention"] = full
+        rope["mrope_interleaved"] = false
         $0["rope_parameters"] = rope
     }
-    addCase("full-rope-type") {
+    addCase("mrope-section") {
         var rope = $0["rope_parameters"] as! [String: Any]
-        var full = rope["full_attention"] as! [String: Any]
-        full["rope_type"] = "default"
-        rope["full_attention"] = full
+        rope["mrope_section"] = [16, 16]
         $0["rope_parameters"] = rope
     }
-    addCase("full-partial-rotary") {
+    addCase("rope-library-type") {
         var rope = $0["rope_parameters"] as! [String: Any]
-        var full = rope["full_attention"] as! [String: Any]
-        full["partial_rotary_factor"] = 0.5
-        rope["full_attention"] = full
+        rope["type"] = "linear"
+        $0["rope_parameters"] = rope
+    }
+    addCase("rope-library-factor") {
+        var rope = $0["rope_parameters"] as! [String: Any]
+        rope["factor"] = 2
+        $0["rope_parameters"] = rope
+    }
+    addCase("rope-unknown") {
+        var rope = $0["rope_parameters"] as! [String: Any]
+        rope["unknown"] = true
         $0["rope_parameters"] = rope
     }
     addCase("quantization-bits") {
@@ -193,12 +202,18 @@ func runtimeWorkerPinnedConfigurationRejectsUnsafeLibraryOnlyFields() throws {
         quantization["mode"] = "symmetric"
         $0["quantization"] = quantization
     }
-    addCase("missing-quantization") { $0.removeValue(forKey: "quantization") }
-    addCase("moe") { $0["enable_moe_block"] = true }
-    addCase("experts") { $0["num_experts"] = 8 }
-    addCase("top-k-experts") { $0["top_k_experts"] = 2 }
+    addCase("quantization-unknown") {
+        var quantization = $0["quantization"] as! [String: Any]
+        quantization["unknown"] = true
+        $0["quantization"] = quantization
+    }
+    addCase("mtp-layers") { $0["mtp_num_hidden_layers"] = 0 }
+    addCase("mtp-dedicated-embeddings") { $0["mtp_use_dedicated_embeddings"] = true }
+    addCase("mtp-enabled") { $0["mtp_enabled"] = true }
+    addCase("moe-experts") { $0["num_experts"] = 8 }
     addCase("moe-intermediate") { $0["moe_intermediate_size"] = 1_024 }
-    addCase("bidirectional-attention") { $0["use_bidirectional_attention"] = "unsupported" }
+    addCase("moe-enable") { $0["enable_moe_block"] = true }
+    addCase("unknown-root") { $0["behavior_change"] = true }
 
     for (name, object) in cases {
         let data = try JSONSerialization.data(withJSONObject: object)
@@ -209,21 +224,84 @@ func runtimeWorkerPinnedConfigurationRejectsUnsafeLibraryOnlyFields() throws {
 }
 
 @Test
-func runtimeWorkerPinnedConfigurationAcceptsSafeOptionalRepresentations() throws {
-    var object = pinnedRuntimeWorkerConfigurationObject()
-    object["global_partial_rotary_factor"] = 0.25
-    object["sliding_window_pattern"] = 6
-    object["use_bidirectional_attention"] = "vision"
-    object["quantization_config"] = object.removeValue(forKey: "quantization")
-    var rope = object["rope_parameters"] as! [String: Any]
-    var sliding = rope["sliding_attention"] as! [String: Any]
-    sliding["partial_rotary_factor"] = 1.0
-    rope["sliding_attention"] = sliding
-    object["rope_parameters"] = rope
+func runtimeWorkerPinnedConfigurationRejectsMissingQwen35Fields() throws {
+    let requiredTopLevelFields = [
+        "model_type", "vocab_size", "hidden_size", "intermediate_size",
+        "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+        "head_dim", "linear_num_value_heads", "linear_num_key_heads",
+        "linear_value_head_dim", "linear_key_head_dim",
+        "linear_conv_kernel_dim", "full_attention_interval", "layer_types",
+        "rms_norm_eps", "hidden_act", "max_position_embeddings",
+        "attention_bias", "attention_dropout", "attn_output_gate",
+        "output_gate_type", "bos_token_id", "eos_token_id",
+        "initializer_range", "pad_token_id", "tie_word_embeddings", "mamba_ssm_dtype",
+        "dtype", "use_cache", "partial_rotary_factor", "rope_parameters",
+        "mtp_num_hidden_layers", "mtp_use_dedicated_embeddings",
+    ]
+    for field in requiredTopLevelFields {
+        var object = pinnedRuntimeWorkerConfigurationObject()
+        object.removeValue(forKey: field)
+        #expect(throws: MLXFastError.self, "missing \(field)") {
+            try validateRuntimeWorkerPinnedConfigurationData(
+                JSONSerialization.data(withJSONObject: object)
+            )
+        }
+    }
 
-    try validateRuntimeWorkerPinnedConfigurationData(
-        JSONSerialization.data(withJSONObject: object)
-    )
+    for field in [
+        "rope_theta", "rope_type", "partial_rotary_factor",
+        "mrope_interleaved", "mrope_section",
+    ] {
+        var object = pinnedRuntimeWorkerConfigurationObject()
+        var rope = object["rope_parameters"] as! [String: Any]
+        rope.removeValue(forKey: field)
+        object["rope_parameters"] = rope
+        #expect(throws: MLXFastError.self, "missing rope field \(field)") {
+            try validateRuntimeWorkerPinnedConfigurationData(
+                JSONSerialization.data(withJSONObject: object)
+            )
+        }
+    }
+
+    for field in ["group_size", "bits", "mode"] {
+        var object = pinnedRuntimeWorkerConfigurationObject()
+        var quantization = object["quantization"] as! [String: Any]
+        quantization.removeValue(forKey: field)
+        object["quantization"] = quantization
+        #expect(throws: MLXFastError.self, "missing quantization field \(field)") {
+            try validateRuntimeWorkerPinnedConfigurationData(
+                JSONSerialization.data(withJSONObject: object)
+            )
+        }
+    }
+
+    var noQuantization = pinnedRuntimeWorkerConfigurationObject()
+    noQuantization.removeValue(forKey: "quantization")
+    #expect(throws: MLXFastError.self) {
+        try validateRuntimeWorkerPinnedConfigurationData(
+            JSONSerialization.data(withJSONObject: noQuantization)
+        )
+    }
+}
+
+@Test
+func runtimeWorkerPinnedConfigurationRejectsAlternateQuantizationSchemas() throws {
+    var quantizationConfigOnly = pinnedRuntimeWorkerConfigurationObject()
+    quantizationConfigOnly["quantization_config"] =
+        quantizationConfigOnly.removeValue(forKey: "quantization")
+    #expect(throws: MLXFastError.self) {
+        try validateRuntimeWorkerPinnedConfigurationData(
+            JSONSerialization.data(withJSONObject: quantizationConfigOnly)
+        )
+    }
+
+    var matchingForms = pinnedRuntimeWorkerConfigurationObject()
+    matchingForms["quantization_config"] = matchingForms["quantization"]
+    #expect(throws: MLXFastError.self) {
+        try validateRuntimeWorkerPinnedConfigurationData(
+            JSONSerialization.data(withJSONObject: matchingForms)
+        )
+    }
 }
 
 @Test
@@ -527,9 +605,9 @@ func semanticBehaviorGateRequiresPromptAndReferenceAnswer() {
         semanticReferenceAnswer: "answer"
     )
 
-    #expect(!GemmaRuntime.behaviorUsesSemanticJudge(exactOnly))
-    #expect(!GemmaRuntime.behaviorUsesSemanticJudge(missingReference))
-    #expect(GemmaRuntime.behaviorUsesSemanticJudge(semantic))
+    #expect(!QwenRuntime.behaviorUsesSemanticJudge(exactOnly))
+    #expect(!QwenRuntime.behaviorUsesSemanticJudge(missingReference))
+    #expect(QwenRuntime.behaviorUsesSemanticJudge(semantic))
 }
 
 @Test
@@ -567,10 +645,12 @@ func failedScoreRedactsCorrectnessTokenMismatchByDefault() {
         error: "token mismatch"
     )
 
-    let payload = GemmaRuntime.failedScore(
+    let payload = QwenRuntime.failedScore(
         error: "token mismatch",
         correctness: report,
         passedCorrectness: false,
+        baselinePrefillSecondsPerToken: 0,
+        baselineDecodeSecondsPerToken: 0,
         runtime: "swift-local-iterate"
     )
 
@@ -598,12 +678,14 @@ func failedScorePreservesExplicitPublicMismatchTokensAndRuntimeLabel() {
         error: "token mismatch"
     )
 
-    let payload = GemmaRuntime.failedScore(
+    let payload = QwenRuntime.failedScore(
         error: "token mismatch",
         correctness: report,
         passedCorrectness: false,
         expectedToken: report.expectedToken,
         actualToken: report.actualToken,
+        baselinePrefillSecondsPerToken: 0,
+        baselineDecodeSecondsPerToken: 0,
         runtime: "swift-local-iterate"
     )
 
@@ -642,10 +724,27 @@ func decodeTimingPlanRejectsInvalidRanges() throws {
     }
 }
 
+// The former editable decode-delay knob (Qwen35SubmissionControls
+// .measuredDecodeDelayMilliseconds, read via
+// QwenRuntime.submissionValidationDelayMilliseconds) was model code invoked by
+// trusted code ONLY on the scored decode path. Because submitted model code is
+// editable, being invoked only while timed was itself a phase oracle. The hook
+// is now removed entirely: the editable file is gone and no trusted harness
+// code invokes it. See decodeMeasurementInvokesNoPhaseVaryingEditableHook for
+// the structural phase-independence guard.
 @Test
-func submissionValidationDelayDefaultsToZero() throws {
-    #expect(Gemma4SubmissionControls.measuredDecodeDelayMilliseconds == 0)
-    #expect(try GemmaRuntime.submissionValidationDelayMilliseconds() == 0)
+func editableDecodeDelayHookIsFullyRemoved() throws {
+    #expect(!FileManager.default.fileExists(
+        atPath: "Sources/MLXFastModel/Qwen35SubmissionControls.swift"
+    ))
+    let harnessDirectory = "Sources/MLXFastHarness"
+    let harnessFiles = try FileManager.default.contentsOfDirectory(atPath: harnessDirectory)
+        .filter { $0.hasSuffix(".swift") }
+    for file in harnessFiles {
+        let source = try String(contentsOfFile: "\(harnessDirectory)/\(file)", encoding: .utf8)
+        #expect(!source.contains("submissionValidationDelayMilliseconds"))
+        #expect(!source.contains("measuredDecodeDelayMilliseconds"))
+    }
 }
 
 @Test
@@ -667,6 +766,76 @@ func benchmarkGoldenOracleFieldsAreValidatedOnLoad() throws {
     #expect(benchmark.decodeSeedTokens == seed)
     #expect(benchmark.expectedDecodeSeedToken == 23)
     #expect(benchmark.expectedDecodeTokens == decode)
+}
+
+@Test
+func qwenLocalScoringRequiresGoldenBenchmarkBaselines() throws {
+    let benchmark = BenchmarkGolden(
+        prefillPromptTokens: Array(
+            repeating: 1,
+            count: MLXFastConstants.benchmarkPrefillPromptTokens
+        ),
+        expectedPrefillToken: 1,
+        decodeSeedTokens: Array(
+            repeating: 1,
+            count: MLXFastConstants.benchmarkDecodeSeedTokens
+        ),
+        expectedDecodeSeedToken: 1,
+        expectedDecodeTokens: Array(
+            repeating: 1,
+            count: MLXFastConstants.benchmarkDecodeSteps
+        )
+    )
+
+    #expect(throws: MLXFastError.self) {
+        _ = try QwenRuntime.requiredGoldenBenchmarkBaselines(
+            benchmark,
+            context: "local-iterate"
+        )
+    }
+}
+
+@Test
+func localIterateFailsBeforeModelLoadWithoutQwenBaselines() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let weights = root.appendingPathComponent("weights", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: weights,
+        withIntermediateDirectories: true
+    )
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+    try "{}".write(
+        to: weights.appendingPathComponent(
+            "model.safetensors.index.json"
+        ),
+        atomically: true,
+        encoding: .utf8
+    )
+    let golden = root.appendingPathComponent("qwen-golden.json")
+    try validGoldenJSON(includeBaselines: false).write(
+        to: golden,
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let payload = QwenRuntime.localIterate(
+        LocalIterateOptions(
+            weightsPath: weights.path,
+            goldenPath: golden.path,
+            benchmarkDecodeSteps: 1
+        )
+    )
+
+    #expect(payload.score == nil)
+    #expect(!payload.passed)
+    #expect(payload.metrics.error.contains("external Qwen benchmark baselines"))
+    #expect(payload.metrics.baselinePrefillSecondsPerToken == 0)
+    #expect(payload.metrics.baselineDecodeSecondsPerToken == 0)
 }
 
 @Test
@@ -698,6 +867,61 @@ func benchmarkPreflightAcceptsRequiredArtifacts() throws {
     #expect(report.goldenPath == fixture.golden.path)
     #expect(report.weightsByteCount > 0)
     #expect(report.maxWeightsByteCount == MLXFastConstants.defaultMaxTransformedWeightsBytes)
+}
+
+@Test
+func benchmarkPreflightRejectsOracleWithoutExplicitQwenBaselines() throws {
+    let fixture = try makePreflightFixture(
+        goldenContents: validGoldenJSON(includeBaselines: false)
+    )
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    #expect(throws: MLXFastError.self) {
+        _ = try checkPreflight(fixture)
+    }
+}
+
+@Test
+func benchmarkPreflightAcceptsPairedQwenBaselinesForOracleWithoutEmbeddedPair() throws {
+    let fixture = try makePreflightFixture(
+        goldenContents: validGoldenJSON(includeBaselines: false)
+    )
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    let report = try checkPreflight(
+        fixture,
+        environment: [
+            PairedBaselineOverride.prefillEnvironmentKey: "0.25",
+            PairedBaselineOverride.decodeEnvironmentKey: "4.0",
+        ]
+    )
+
+    #expect(report.weightsPath == fixture.weights.path)
+    #expect(report.goldenPath == fixture.golden.path)
+}
+
+@Test
+func qwen35PreflightFixtureHasExactPinnedTensorInventory() {
+    let tensors = requiredQwen35DenseTensorFixtures()
+    let names = Set(tensors.map(\.name))
+
+    #expect(tensors.count == Qwen35WeightLoader.requiredTensorCount)
+    #expect(names.count == Qwen35WeightLoader.requiredTensorCount)
+    #expect(
+        names.filter { !$0.contains(".layers.") }.count
+            == Qwen35WeightLoader.requiredTopLevelTensorCount
+    )
+    for layerIndex in 0..<MLXFastConstants.numHiddenLayers {
+        let prefix = "language_model.model.layers.\(layerIndex)."
+        let layerCount = names.filter { $0.hasPrefix(prefix) }.count
+        let expected = layerIndex % 4 == 3
+            ? Qwen35WeightLoader.requiredFullAttentionLayerTensorCount
+            : Qwen35WeightLoader.requiredLinearLayerTensorCount
+        #expect(layerCount == expected, "layer \(layerIndex)")
+    }
+    #expect(names.contains(Qwen35WeightNames.lmHead))
+    #expect(names.contains("language_model.lm_head.scales"))
+    #expect(names.contains("language_model.lm_head.biases"))
 }
 
 @Test
@@ -746,6 +970,18 @@ func benchmarkPreflightRejectsMalformedGolden() throws {
 }
 
 @Test
+func benchmarkPreflightRejectsCopiedGemmaGoldenByIdentity() throws {
+    let fixture = try makePreflightFixture(
+        goldenContents: syntheticGemmaGoldenJSON()
+    )
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    #expect(throws: MLXFastError.self) {
+        _ = try checkCorrectnessPreflight(fixture)
+    }
+}
+
+@Test
 func benchmarkPreflightRejectsShortBenchmarkPrompt() throws {
     let fixture = try makePreflightFixture(goldenContents: validGoldenJSON(benchmarkPromptTokens: [1]))
     defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -761,6 +997,7 @@ func benchmarkPreflightRejectsMissingBenchmarkOracle() throws {
     let fixture = try makePreflightFixture(goldenContents: """
     {
       "version": 1,
+      "model_type": "qwen3_5_text",
       "cases": [
         {
           "name": "preflight",
@@ -820,7 +1057,7 @@ func nonWorkerBenchmarkRejectsBehaviorGatesBecauseTTFTRequiresWorker() throws {
     let fixture = try makePreflightFixture(goldenContents: validGoldenJSON(correctnessGates: behaviorGate))
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
-    let score = GemmaRuntime.benchmark(
+    let score = QwenRuntime.benchmark(
         BenchmarkOptions(
             weightsPath: fixture.weights.path,
             goldenPath: fixture.golden.path,
@@ -841,11 +1078,77 @@ func nonWorkerBenchmarkRejectsBehaviorGatesBecauseTTFTRequiresWorker() throws {
 
 @Test
 func benchmarkPreflightRejectsMissingSemanticTensor() throws {
-    let fixture = try makePreflightFixture(omitDenseTensorName: Gemma4WeightNames.finalNorm)
+    let fixture = try makePreflightFixture(omitDenseTensorName: Qwen35WeightNames.finalNorm)
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
         _ = try checkPreflight(fixture)
+    }
+}
+
+@Test
+func benchmarkPreflightRequiresExplicitQuantizedQwenLMHead() throws {
+    let fixture = try makePreflightFixture { tensors in
+        let index = tensors.firstIndex { $0.name == Qwen35WeightNames.lmHead }!
+        tensors[index] = TensorFixture(
+            name: Qwen35WeightNames.lmHead,
+            dtype: "BF16",
+            shape: [MLXFastConstants.vocabSize, MLXFastConstants.hiddenSize]
+        )
+    }
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    #expect(throws: MLXFastError.self) {
+        _ = try checkPreflight(fixture)
+    }
+}
+
+@Test
+func benchmarkPreflightRejectsMissingQwenQuantizationCompanion() throws {
+    let fixture = try makePreflightFixture(
+        omitDenseTensorName: "language_model.lm_head.scales"
+    )
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    #expect(throws: MLXFastError.self) {
+        _ = try checkPreflight(fixture)
+    }
+}
+
+@Test
+func benchmarkPreflightRejectsWrongQwenLinearAttentionShape() throws {
+    let name = Qwen35WeightNames.linearAttention(0, "conv1d.weight")
+    let fixture = try makePreflightFixture { tensors in
+        let index = tensors.firstIndex { $0.name == name }!
+        tensors[index] = TensorFixture(
+            name: name,
+            dtype: "BF16",
+            shape: [10_240, 3, 1]
+        )
+    }
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    #expect(throws: MLXFastError.self) {
+        _ = try checkPreflight(fixture)
+    }
+}
+
+@Test
+func benchmarkPreflightRejectsMTPAndOtherUnexpectedQwenTensors() throws {
+    for extraName in [
+        "language_model.mtp.layers.0.weight",
+        "language_model.model.unexpected.weight",
+    ] {
+        let fixture = try makePreflightFixture { tensors in
+            tensors.append(
+                TensorFixture(name: extraName, dtype: "BF16", shape: [1])
+            )
+        }
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        #expect(throws: MLXFastError.self, "extra tensor \(extraName)") {
+            _ = try checkPreflight(fixture)
+        }
     }
 }
 
@@ -885,22 +1188,24 @@ private func checkCorrectnessPreflight(
 
 private func makePreflightFixture(
     goldenContents: String? = nil,
-    omitDenseTensorName: String? = nil
+    omitDenseTensorName: String? = nil,
+    mutateDenseTensors: ((inout [TensorFixture]) -> Void)? = nil
 ) throws -> PreflightFixture {
     let directory = try temporaryDirectory()
     let weights = directory.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
 
-    try minimalGemma4ConfigJSON().write(
+    try minimalQwen35ConfigJSON().write(
         to: weights.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
     )
 
-    var denseTensors = requiredGemma4DenseTensorFixtures()
+    var denseTensors = requiredQwen35DenseTensorFixtures()
     if let omitDenseTensorName {
         denseTensors.removeAll { $0.name == omitDenseTensorName }
     }
+    mutateDenseTensors?(&denseTensors)
     let denseShard = "model-00001.safetensors"
     try writeSafetensors(weights.appendingPathComponent(denseShard), tensors: denseTensors)
     try writeIndex(
@@ -915,30 +1220,65 @@ private func makePreflightFixture(
     return PreflightFixture(root: directory, weights: weights, golden: golden)
 }
 
-private func minimalGemma4ConfigJSON() -> String {
+private func minimalQwen35ConfigJSON() -> String {
     """
     {
-      "model_type": "gemma4_text",
+      "model_type": "qwen3_5_text",
       "vocab_size": \(MLXFastConstants.vocabSize),
       "hidden_size": \(MLXFastConstants.hiddenSize),
       "intermediate_size": \(MLXFastConstants.intermediateSize),
       "num_hidden_layers": \(MLXFastConstants.numHiddenLayers),
       "num_attention_heads": \(MLXFastConstants.attentionHeads),
-      "num_key_value_heads": 8,
-      "num_global_key_value_heads": 4,
+      "num_key_value_heads": 4,
       "head_dim": 256,
-      "global_head_dim": 512,
-      "attention_k_eq_v": true,
-      "sliding_window": 1024,
-      "tie_word_embeddings": true
+      "linear_num_value_heads": 48,
+      "linear_num_key_heads": 16,
+      "linear_value_head_dim": 128,
+      "linear_key_head_dim": 128,
+      "linear_conv_kernel_dim": 4,
+      "full_attention_interval": 4,
+      "layer_types": \(qwen35LayerTypesJSON()),
+      "rms_norm_eps": 1e-6,
+      "hidden_act": "silu",
+      "max_position_embeddings": 262144,
+      "attention_bias": false,
+      "attention_dropout": 0.0,
+      "attn_output_gate": true,
+      "output_gate_type": "swish",
+      "tie_word_embeddings": false,
+      "mamba_ssm_dtype": "float32",
+      "dtype": "bfloat16",
+      "use_cache": true,
+      "partial_rotary_factor": 0.25,
+      "rope_parameters": {
+        "rope_theta": 10000000,
+        "rope_type": "default",
+        "partial_rotary_factor": 0.25,
+        "mrope_interleaved": true,
+        "mrope_section": [11, 11, 10]
+      },
+      "quantization": {
+        "group_size": 64,
+        "bits": 4,
+        "mode": "affine"
+      },
+      "mtp_num_hidden_layers": 1,
+      "mtp_use_dedicated_embeddings": false
     }
     """
+}
+
+private func qwen35LayerTypesJSON() -> String {
+    "[" + (0..<MLXFastConstants.numHiddenLayers).map {
+        $0 % 4 == 3 ? #""full_attention""# : #""linear_attention""#
+    }.joined(separator: ",") + "]"
 }
 
 private func validGoldenJSON(
     correctnessPromptTokens: [Int] = Array(repeating: 1, count: MLXFastConstants.correctnessPromptTokens),
     benchmarkPromptTokens: [Int] = Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens),
-    correctnessGates: String? = nil
+    correctnessGates: String? = nil,
+    includeBaselines: Bool = true
 ) -> String {
     let correctnessPrompt = arrayJSON(correctnessPromptTokens)
     let benchmarkPrompt = arrayJSON(benchmarkPromptTokens)
@@ -946,9 +1286,14 @@ private func validGoldenJSON(
     let seed = arrayJSON(Array(benchmarkPromptTokens.prefix(MLXFastConstants.benchmarkDecodeSeedTokens)))
     let decode = arrayJSON(Array(repeating: 9, count: MLXFastConstants.benchmarkDecodeSteps))
     let gates = correctnessGates.map { ",\n  \"correctness_gates\": \($0)" } ?? ""
+    let baselines = includeBaselines
+        ? ",\n    \"baseline_prefill_seconds_per_token\": 0.25,"
+            + "\n    \"baseline_decode_seconds_per_token\": 4.0"
+        : ""
     return """
     {
       "version": 1,
+      "model_type": "qwen3_5_text",
       "cases": [
         {
           "name": "preflight",
@@ -961,7 +1306,7 @@ private func validGoldenJSON(
         "expected_prefill_token": 8,
         "decode_seed_tokens": \(seed),
         "expected_decode_seed_token": 7,
-        "expected_decode_tokens": \(decode)
+        "expected_decode_tokens": \(decode)\(baselines)
       }\(gates)
     }
     """
@@ -972,6 +1317,7 @@ private func correctnessOnlyGoldenJSON() -> String {
     return """
     {
       "version": 1,
+      "model_type": "qwen3_5_text",
       "cases": [
         {
           "name": "preflight",
@@ -983,114 +1329,164 @@ private func correctnessOnlyGoldenJSON() -> String {
     """
 }
 
-/// Every tensor `Gemma4WeightLoader.validateRequiredMetadata` requires for the
-/// full frozen shape (60 layers, alternating five sliding + one full-attention
-/// layer per block). Real byte contents do not matter for these preflight
-/// tests -- only declared dtype/shape -- so linear weights use the same
-/// packed `U32` (affine 4-bit, 8 values/word) layout the real checkpoint
-/// ships, which keeps the sparse fixture files under the default transformed-
-/// weights byte cap the way the small norm/scalar tensors alone could not.
-private func requiredGemma4DenseTensorFixtures() -> [TensorFixture] {
+/// Every tensor `Qwen35WeightLoader.validateRequiredMetadata` requires for the
+/// frozen 64-layer hybrid tower: three linear-attention layers followed by one
+/// full-attention layer, repeated 16 times. Real byte contents do not matter
+/// for preflight, so the fixture writes sparse files with the checkpoint's
+/// exact BF16 and affine-4 U32 metadata.
+private func requiredQwen35DenseTensorFixtures() -> [TensorFixture] {
     let hidden = MLXFastConstants.hiddenSize
     let intermediate = MLXFastConstants.intermediateSize
     let vocab = MLXFastConstants.vocabSize
     let layers = MLXFastConstants.numHiddenLayers
     let heads = MLXFastConstants.attentionHeads
     let headDim = 256
-    let globalHeadDim = 512
-    let kvHeads = 8
-    let globalKVHeads = 4
+    let kvHeads = 4
+    let linearValueHeads = 48
+    let linearKeyHeads = 16
+    let linearValueHeadDim = 128
+    let linearKeyHeadDim = 128
+    let linearConvKernelDim = 4
 
     func packedCols(_ inFeatures: Int) -> Int {
         inFeatures / 8
     }
 
-    var tensors: [TensorFixture] = [
-        TensorFixture(name: Gemma4WeightNames.embedTokens, dtype: "U32", shape: [vocab, packedCols(hidden)]),
-        TensorFixture(name: Gemma4WeightNames.finalNorm, dtype: "F32", shape: [hidden]),
-    ]
-
-    for layerIndex in 0..<layers {
-        let isFull = layerIndex % 6 == 5
-        let effectiveHeadDim = isFull ? globalHeadDim : headDim
-        let effectiveKVHeads = isFull ? globalKVHeads : kvHeads
-
-        for suffix in [
-            "input_layernorm.weight", "post_attention_layernorm.weight",
-            "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
-        ] {
-            tensors.append(
-                TensorFixture(name: Gemma4WeightNames.layer(layerIndex, suffix), dtype: "F32", shape: [hidden])
-            )
-        }
-        tensors.append(
-            TensorFixture(name: Gemma4WeightNames.layer(layerIndex, "layer_scalar"), dtype: "F32", shape: [1])
-        )
-
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.attention(layerIndex, "q_proj.weight"),
-            dtype: "U32",
-            shape: [heads * effectiveHeadDim, packedCols(hidden)]
-        ))
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.attention(layerIndex, "k_proj.weight"),
-            dtype: "U32",
-            shape: [effectiveKVHeads * effectiveHeadDim, packedCols(hidden)]
-        ))
-        if !isFull {
-            tensors.append(TensorFixture(
-                name: Gemma4WeightNames.attention(layerIndex, "v_proj.weight"),
+    func quantized(
+        _ name: String,
+        outFeatures: Int,
+        inFeatures: Int
+    ) -> [TensorFixture] {
+        let companionShape = [outFeatures, inFeatures / 64]
+        let baseName = String(name.dropLast(".weight".count))
+        return [
+            TensorFixture(
+                name: name,
                 dtype: "U32",
-                shape: [effectiveKVHeads * effectiveHeadDim, packedCols(hidden)]
-            ))
-        }
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.attention(layerIndex, "o_proj.weight"),
-            dtype: "U32",
-            shape: [hidden, packedCols(heads * effectiveHeadDim)]
-        ))
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.attention(layerIndex, "q_norm.weight"),
-            dtype: "F32",
-            shape: [effectiveHeadDim]
-        ))
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.attention(layerIndex, "k_norm.weight"),
-            dtype: "F32",
-            shape: [effectiveHeadDim]
-        ))
-
-        for suffix in ["gate_proj", "up_proj"] {
-            tensors.append(TensorFixture(
-                name: Gemma4WeightNames.mlp(layerIndex, "\(suffix).weight"),
-                dtype: "U32",
-                shape: [intermediate, packedCols(hidden)]
-            ))
-        }
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.mlp(layerIndex, "down_proj.weight"),
-            dtype: "U32",
-            shape: [hidden, packedCols(intermediate)]
-        ))
+                shape: [outFeatures, packedCols(inFeatures)]
+            ),
+            TensorFixture(
+                name: "\(baseName).scales",
+                dtype: "BF16",
+                shape: companionShape
+            ),
+            TensorFixture(
+                name: "\(baseName).biases",
+                dtype: "BF16",
+                shape: companionShape
+            ),
+        ]
     }
 
-    let quantizedTensors = tensors.filter { $0.dtype == "U32" }
-    for tensor in quantizedTensors {
-        let baseName = tensor.name.hasSuffix(".weight")
-            ? String(tensor.name.dropLast(".weight".count))
-            : tensor.name
-        let groupCount = tensor.shape[1] / 8
-        let companionShape = [tensor.shape[0], groupCount]
-        tensors.append(TensorFixture(
-            name: "\(baseName).scales",
+    let linearKeySize = linearKeyHeads * linearKeyHeadDim
+    let linearValueSize = linearValueHeads * linearValueHeadDim
+    let linearConvSize = linearKeySize * 2 + linearValueSize
+    let fullQuerySize = heads * headDim * 2
+    let fullKVSize = kvHeads * headDim
+    let fullOutputSize = heads * headDim
+
+    var tensors: [TensorFixture] = []
+    tensors += quantized(
+        Qwen35WeightNames.embedTokens,
+        outFeatures: vocab,
+        inFeatures: hidden
+    )
+    tensors.append(
+        TensorFixture(
+            name: Qwen35WeightNames.finalNorm,
             dtype: "BF16",
-            shape: companionShape
-        ))
-        tensors.append(TensorFixture(
-            name: "\(baseName).biases",
-            dtype: "BF16",
-            shape: companionShape
-        ))
+            shape: [hidden]
+        )
+    )
+    tensors += quantized(
+        Qwen35WeightNames.lmHead,
+        outFeatures: vocab,
+        inFeatures: hidden
+    )
+
+    for layerIndex in 0..<layers {
+        for suffix in [
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+        ] {
+            tensors.append(
+                TensorFixture(
+                    name: Qwen35WeightNames.layer(layerIndex, suffix),
+                    dtype: "BF16",
+                    shape: [hidden]
+                )
+            )
+        }
+
+        for (suffix, output, input) in [
+            ("gate_proj.weight", intermediate, hidden),
+            ("up_proj.weight", intermediate, hidden),
+            ("down_proj.weight", hidden, intermediate),
+        ] {
+            tensors += quantized(
+                Qwen35WeightNames.mlp(layerIndex, suffix),
+                outFeatures: output,
+                inFeatures: input
+            )
+        }
+
+        if layerIndex % 4 == 3 {
+            for suffix in ["q_norm.weight", "k_norm.weight"] {
+                tensors.append(
+                    TensorFixture(
+                        name: Qwen35WeightNames.fullAttention(
+                            layerIndex,
+                            suffix
+                        ),
+                        dtype: "BF16",
+                        shape: [headDim]
+                    )
+                )
+            }
+            for (suffix, output, input) in [
+                ("q_proj.weight", fullQuerySize, hidden),
+                ("k_proj.weight", fullKVSize, hidden),
+                ("v_proj.weight", fullKVSize, hidden),
+                ("o_proj.weight", hidden, fullOutputSize),
+            ] {
+                tensors += quantized(
+                    Qwen35WeightNames.fullAttention(layerIndex, suffix),
+                    outFeatures: output,
+                    inFeatures: input
+                )
+            }
+        } else {
+            for (suffix, shape) in [
+                ("conv1d.weight", [linearConvSize, linearConvKernelDim, 1]),
+                ("A_log", [linearValueHeads]),
+                ("dt_bias", [linearValueHeads]),
+                ("norm.weight", [linearValueHeadDim]),
+            ] {
+                tensors.append(
+                    TensorFixture(
+                        name: Qwen35WeightNames.linearAttention(
+                            layerIndex,
+                            suffix
+                        ),
+                        dtype: "BF16",
+                        shape: shape
+                    )
+                )
+            }
+            for (suffix, output, input) in [
+                ("in_proj_qkv.weight", linearConvSize, hidden),
+                ("in_proj_z.weight", linearValueSize, hidden),
+                ("in_proj_b.weight", linearValueHeads, hidden),
+                ("in_proj_a.weight", linearValueHeads, hidden),
+                ("out_proj.weight", hidden, linearValueSize),
+            ] {
+                tensors += quantized(
+                    Qwen35WeightNames.linearAttention(layerIndex, suffix),
+                    outFeatures: output,
+                    inFeatures: input
+                )
+            }
+        }
     }
 
     return tensors
@@ -1110,19 +1506,19 @@ private func writeIndex(_ path: URL, tensors: [TensorFixture], shardName: String
 @Test
 func localIterateDecodeProgressIntervalReportsEveryStepForShortRuns() {
     // local-iterate: 16 decode steps get a running-number line on every token.
-    #expect(GemmaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 16, timingRepeats: 1) == 1)
-    #expect(GemmaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 32, timingRepeats: 1) == 1)
+    #expect(QwenRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 16, timingRepeats: 1) == 1)
+    #expect(QwenRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 32, timingRepeats: 1) == 1)
     // local-submit: 1023 steps keep the historical 8-step cadence.
-    #expect(GemmaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 1023, timingRepeats: 1) == 8)
+    #expect(QwenRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 1023, timingRepeats: 1) == 8)
     // Multi-repeat runs keep the sparser 64-step cadence.
-    #expect(GemmaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 512, timingRepeats: 4) == 64)
+    #expect(QwenRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 512, timingRepeats: 4) == 64)
 }
 
 @Test
 func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
     // Mid-run: charged 20s so far (18s seed + 2s steps), 2 of 16 tokens done at
     // 1s/step mean -> project 14 more step-seconds on top of the charged 20.
-    let projected = GemmaRuntime.localIterateProjectedDecodeSecondsPerToken(
+    let projected = QwenRuntime.localIterateProjectedDecodeSecondsPerToken(
         chargedSecondsSoFar: 20,
         stepOnlySecondsSoFar: 2,
         decodedTokens: 2,
@@ -1131,7 +1527,7 @@ func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
     #expect(abs(projected - (20.0 + 14.0) / 16.0) < 1e-12)
 
     // Final token: exactly the charged mean the score payload will report.
-    let final = GemmaRuntime.localIterateProjectedDecodeSecondsPerToken(
+    let final = QwenRuntime.localIterateProjectedDecodeSecondsPerToken(
         chargedSecondsSoFar: 32,
         stepOnlySecondsSoFar: 14,
         decodedTokens: 16,
@@ -1141,7 +1537,7 @@ func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
 
     // Guards.
     #expect(
-        GemmaRuntime.localIterateProjectedDecodeSecondsPerToken(
+        QwenRuntime.localIterateProjectedDecodeSecondsPerToken(
             chargedSecondsSoFar: 1,
             stepOnlySecondsSoFar: 1,
             decodedTokens: 0,
@@ -1152,13 +1548,17 @@ func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
 
 @Test
 func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
-    let status = GemmaRuntime.localIterateLiveDecodeStatus(
+    let baselinePrefill = 0.1
+    let baselineDecode = 4.0
+    let status = QwenRuntime.localIterateLiveDecodeStatus(
         lastStepSeconds: 0.9,
         chargedSecondsSoFar: 20,
         stepOnlySecondsSoFar: 2,
         decodedTokens: 2,
         totalDecodeTokens: 16,
-        prefillSecondsPerToken: 0.05
+        prefillSecondsPerToken: 0.05,
+        baselinePrefillSecondsPerToken: baselinePrefill,
+        baselineDecodeSecondsPerToken: baselineDecode
     )
     #expect(status.contains("last_step_seconds=0.900000"))
     #expect(status.contains("mean_step_seconds=1.000000"))
@@ -1172,36 +1572,42 @@ func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
     #expect(!status.contains("expert_hit_rate="))
 
     // The final step has no ETA.
-    let finalStep = GemmaRuntime.localIterateLiveDecodeStatus(
+    let finalStep = QwenRuntime.localIterateLiveDecodeStatus(
         lastStepSeconds: 1,
         chargedSecondsSoFar: 32,
         stepOnlySecondsSoFar: 14,
         decodedTokens: 16,
         totalDecodeTokens: 16,
-        prefillSecondsPerToken: 0.05
+        prefillSecondsPerToken: 0.05,
+        baselinePrefillSecondsPerToken: baselinePrefill,
+        baselineDecodeSecondsPerToken: baselineDecode
     )
     #expect(!finalStep.contains("decode_eta_seconds="))
 
     // Before prefill has a positive measurement there is no score estimate.
-    let withoutPrefill = GemmaRuntime.localIterateLiveDecodeStatus(
+    let withoutPrefill = QwenRuntime.localIterateLiveDecodeStatus(
         lastStepSeconds: 0.9,
         chargedSecondsSoFar: 20,
         stepOnlySecondsSoFar: 2,
         decodedTokens: 2,
         totalDecodeTokens: 16,
-        prefillSecondsPerToken: nil
+        prefillSecondsPerToken: nil,
+        baselinePrefillSecondsPerToken: baselinePrefill,
+        baselineDecodeSecondsPerToken: baselineDecode
     )
     #expect(withoutPrefill.contains("projected_decode_speedup="))
     #expect(!withoutPrefill.contains("projected_score="))
 
     #expect(
-        GemmaRuntime.localIterateLiveDecodeStatus(
+        QwenRuntime.localIterateLiveDecodeStatus(
             lastStepSeconds: 0,
             chargedSecondsSoFar: 0,
             stepOnlySecondsSoFar: 0,
             decodedTokens: 0,
             totalDecodeTokens: 16,
-            prefillSecondsPerToken: nil
+            prefillSecondsPerToken: nil,
+            baselinePrefillSecondsPerToken: baselinePrefill,
+            baselineDecodeSecondsPerToken: baselineDecode
         ).isEmpty
     )
 }
@@ -1474,26 +1880,34 @@ func runtimeWorkerClientRejectsNonfiniteTimeoutsBeforeLaunch() throws {
 
 @Test
 func localIteratePrefillStatusReportsPerTokenAndSpeedup() {
-    let status = GemmaRuntime.localIteratePrefillStatus(
+    let baselinePrefill = 0.2
+    let status = QwenRuntime.localIteratePrefillStatus(
         elapsedSeconds: 51.2,
-        promptTokens: 512
+        promptTokens: 512,
+        baselinePrefillSecondsPerToken: baselinePrefill
     )
     #expect(status.contains("seconds=51.2"))
     #expect(status.contains("seconds_per_token=0.100000"))
-    let expectedSpeedup = MLXFastConstants.officialBaselinePrefillSecondsPerToken / 0.1
+    let expectedSpeedup = baselinePrefill / 0.1
     #expect(status.contains("prefill_speedup=\(String(format: "%.3f", expectedSpeedup))"))
 
     // Zero-duration or zero-token inputs fall back to the plain seconds field.
     #expect(
-        GemmaRuntime.localIteratePrefillStatus(elapsedSeconds: 0, promptTokens: 512)
+        QwenRuntime.localIteratePrefillStatus(
+            elapsedSeconds: 0,
+            promptTokens: 512,
+            baselinePrefillSecondsPerToken: baselinePrefill
+        )
             == "seconds=0.0"
     )
 }
 
 @Test
 func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
-    let timing = GemmaRuntime.LocalIterateTimingResult(
-        correctness: GemmaRuntime.localIterateCorrectnessReport(
+    let baselinePrefill = 0.2
+    let baselineDecode = 6.0
+    let timing = QwenRuntime.LocalIterateTimingResult(
+        correctness: QwenRuntime.localIterateCorrectnessReport(
             passed: true,
             checkedSteps: 18,
             caseCount: 1,
@@ -1505,9 +1919,9 @@ func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
             error: "",
             modeName: "local-iterate"
         ),
-        prefillSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken / 2,
-        decode: GemmaRuntime.DecodeMeasurement(
-            secondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken / 2,
+        prefillSecondsPerToken: baselinePrefill / 2,
+        decode: QwenRuntime.DecodeMeasurement(
+            secondsPerToken: baselineDecode / 2,
             bandwidthGBPerToken: 0,
             bandwidthSource: "ram_resident_model"
         ),
@@ -1516,9 +1930,11 @@ func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
     )
 
     var lines: [String] = []
-    GemmaRuntime.emitLocalIterateSummary(
+    QwenRuntime.emitLocalIterateSummary(
         modeName: "local-iterate",
         timing: timing,
+        baselinePrefillSecondsPerToken: baselinePrefill,
+        baselineDecodeSecondsPerToken: baselineDecode,
         progress: { lines.append($0) }
     )
 
@@ -1542,16 +1958,20 @@ func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
 // summary prints) as a numeric, CLI-usable score.
 @Test
 func localIterateScorePublishesCLIUsableEstimatedScore() throws {
-    let payload = GemmaRuntime.localIterateScore(
+    let baselinePrefill = 0.2
+    let baselineDecode = 6.0
+    let payload = QwenRuntime.localIterateScore(
         peakRamGB: 24.5,
         bandwidthGBPerToken: 0,
-        decodeSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken / 2,
-        prefillSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken / 2,
+        decodeSecondsPerToken: baselineDecode / 2,
+        prefillSecondsPerToken: baselinePrefill / 2,
+        baselinePrefillSecondsPerToken: baselinePrefill,
+        baselineDecodeSecondsPerToken: baselineDecode,
         wallSeconds: 10,
         validationSeconds: 1,
         correctnessSeconds: 5,
         timedSeconds: 5,
-        correctness: GemmaRuntime.localIterateCorrectnessReport(
+        correctness: QwenRuntime.localIterateCorrectnessReport(
             passed: true,
             checkedSteps: 18,
             caseCount: 1,
@@ -1573,6 +1993,8 @@ func localIterateScorePublishesCLIUsableEstimatedScore() throws {
     let estimated = try #require(payload.score)
     #expect(abs(estimated - 2) < 1e-9)
     #expect(payload.passed)
+    #expect(payload.metrics.baselinePrefillSecondsPerToken == baselinePrefill)
+    #expect(payload.metrics.baselineDecodeSecondsPerToken == baselineDecode)
     // The runtime label is the local-mode marker that keeps the estimate
     // clearly distinguishable from a ranked payload (runtime == "swift").
     #expect(payload.metrics.runtime == "swift-local-iterate")
@@ -1595,19 +2017,62 @@ func localIterateScorePublishesCLIUsableEstimatedScore() throws {
 }
 
 @Test
+func localIterateScoreRejectsMissingExternalQwenBaselines() {
+    let correctness = QwenRuntime.localIterateCorrectnessReport(
+        passed: true,
+        checkedSteps: 18,
+        caseCount: 1,
+        firstFailingStep: nil,
+        expectedToken: nil,
+        actualToken: nil,
+        goldenHash: "hash",
+        expertStats: .zero,
+        error: "",
+        modeName: "local-iterate"
+    )
+    let payload = QwenRuntime.localIterateScore(
+        peakRamGB: 1,
+        bandwidthGBPerToken: 0,
+        decodeSecondsPerToken: 3,
+        prefillSecondsPerToken: 0.1,
+        baselinePrefillSecondsPerToken: 0,
+        baselineDecodeSecondsPerToken: 0,
+        wallSeconds: 1,
+        validationSeconds: 0,
+        correctnessSeconds: 1,
+        timedSeconds: 1,
+        correctness: correctness,
+        expertStats: .zero,
+        bandwidthSource: "ram_resident_model",
+        weightsDigest: nil,
+        runtime: "swift-local-iterate"
+    )
+
+    #expect(payload.score == nil)
+    #expect(!payload.passed)
+    #expect(payload.metrics.baselinePrefillSecondsPerToken == 0)
+    #expect(payload.metrics.baselineDecodeSecondsPerToken == 0)
+    #expect(payload.metrics.decodeSpeedup == 0)
+    #expect(payload.metrics.prefillSpeedup == 0)
+    #expect(payload.metrics.error.contains("external Qwen baselines"))
+}
+
+@Test
 func localIterateScoreFailsForUnusableTimings() {
     // Zero/invalid timings make the estimate non-finite. The payload must be a
     // failed run, not a passing result that merely omits its score.
-    let payload = GemmaRuntime.localIterateScore(
+    let payload = QwenRuntime.localIterateScore(
         peakRamGB: 0,
         bandwidthGBPerToken: 0,
         decodeSecondsPerToken: 0,
         prefillSecondsPerToken: 0,
+        baselinePrefillSecondsPerToken: 0.2,
+        baselineDecodeSecondsPerToken: 6.0,
         wallSeconds: 0,
         validationSeconds: 0,
         correctnessSeconds: 0,
         timedSeconds: 0,
-        correctness: GemmaRuntime.localIterateCorrectnessReport(
+        correctness: QwenRuntime.localIterateCorrectnessReport(
             passed: true,
             checkedSteps: 18,
             caseCount: 1,
@@ -1628,21 +2093,23 @@ func localIterateScoreFailsForUnusableTimings() {
     #expect(payload.score == nil)
     #expect(!payload.passed)
     #expect(payload.metrics.passedCorrectness)
-    #expect(payload.metrics.error.contains("timing metrics must be finite and positive"))
+    #expect(payload.metrics.error.contains("timing metrics and external Qwen baselines"))
 }
 
 @Test
 func localIterateScoreSanitizesNonfiniteFailureMetricsForJSON() throws {
-    let payload = GemmaRuntime.localIterateScore(
+    let payload = QwenRuntime.localIterateScore(
         peakRamGB: .nan,
         bandwidthGBPerToken: .infinity,
         decodeSecondsPerToken: .nan,
         prefillSecondsPerToken: -.infinity,
+        baselinePrefillSecondsPerToken: 0.2,
+        baselineDecodeSecondsPerToken: 6.0,
         wallSeconds: -.infinity,
         validationSeconds: .nan,
         correctnessSeconds: .infinity,
         timedSeconds: -1,
-        correctness: GemmaRuntime.localIterateCorrectnessReport(
+        correctness: QwenRuntime.localIterateCorrectnessReport(
             passed: true,
             checkedSteps: 18,
             caseCount: 1,
@@ -1712,12 +2179,14 @@ func rankedScoreSemanticsAreUnchangedByLocalEstimatedScore() {
         goldenHash: "hash",
         error: ""
     )
-    let passed = GemmaRuntime.passedScore(
+    let passed = QwenRuntime.passedScore(
         score: 1.25,
         peakRamGB: 20,
         bandwidthGBPerToken: 0,
         decodeSecondsPerToken: 0.1,
         prefillSecondsPerToken: 0.01,
+        baselinePrefillSecondsPerToken: 0.02,
+        baselineDecodeSecondsPerToken: 0.2,
         benchmarkWallSeconds: 100,
         preflightSeconds: 1,
         correctnessSeconds: 50,
@@ -1732,10 +2201,12 @@ func rankedScoreSemanticsAreUnchangedByLocalEstimatedScore() {
     #expect(passed.score == 1.25)
     #expect(passed.metrics.runtime == "swift")
 
-    let failed = GemmaRuntime.failedScore(
+    let failed = QwenRuntime.failedScore(
         error: "boom",
         correctness: nil,
         passedCorrectness: false,
+        baselinePrefillSecondsPerToken: 0,
+        baselineDecodeSecondsPerToken: 0,
         runtime: "swift"
     )
     #expect(failed.score == nil)
@@ -1760,11 +2231,11 @@ func localIteratePhaseHeartbeatFiresWhileBlockedAndStopsAfterCancel() throws {
     }
 
     // No progress sink means no timer at all.
-    #expect(GemmaRuntime.startPhaseHeartbeat(label: "x", progress: nil) == nil)
+    #expect(QwenRuntime.startPhaseHeartbeat(label: "x", progress: nil) == nil)
 
     let box = MessageBox()
     let heartbeat = try #require(
-        GemmaRuntime.startPhaseHeartbeat(
+        QwenRuntime.startPhaseHeartbeat(
             label: "local-iterate prefill measured",
             intervalSeconds: 0.05,
             progress: { box.append($0) }
@@ -1860,49 +2331,53 @@ private func makeRuntimeWorkerScript(_ contents: String) throws -> URL {
 
 private func pinnedRuntimeWorkerConfigurationObject() -> [String: Any] {
     [
-        "model_type": "gemma4_text",
-        "hidden_size": MLXFastConstants.hiddenSize,
-        "num_hidden_layers": MLXFastConstants.numHiddenLayers,
-        "intermediate_size": MLXFastConstants.intermediateSize,
-        "num_attention_heads": MLXFastConstants.attentionHeads,
-        "head_dim": 256,
-        "global_head_dim": 512,
-        "rms_norm_eps": 1e-6,
+        "model_type": "qwen3_5_text",
         "vocab_size": MLXFastConstants.vocabSize,
-        "num_key_value_heads": 8,
-        "num_global_key_value_heads": 4,
-        "num_kv_shared_layers": 0,
-        "hidden_size_per_layer_input": 0,
-        "vocab_size_per_layer_input": MLXFastConstants.vocabSize,
-        "sliding_window": 1_024,
-        "max_position_embeddings": 262_144,
-        "attention_k_eq_v": true,
-        "final_logit_softcapping": 30.0,
-        "use_double_wide_mlp": false,
-        "tie_word_embeddings": true,
-        "enable_moe_block": false,
-        "num_experts": NSNull(),
-        "top_k_experts": NSNull(),
-        "moe_intermediate_size": NSNull(),
+        "hidden_size": MLXFastConstants.hiddenSize,
+        "intermediate_size": MLXFastConstants.intermediateSize,
+        "num_hidden_layers": MLXFastConstants.numHiddenLayers,
+        "num_attention_heads": MLXFastConstants.attentionHeads,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "linear_num_value_heads": 48,
+        "linear_num_key_heads": 16,
+        "linear_value_head_dim": 128,
+        "linear_key_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "full_attention_interval": 4,
         "layer_types": (0..<MLXFastConstants.numHiddenLayers).map {
-            $0 % 6 == 5 ? "full_attention" : "sliding_attention"
+            $0 % 4 == 3 ? "full_attention" : "linear_attention"
         },
+        "rms_norm_eps": 1e-6,
+        "hidden_act": "silu",
+        "max_position_embeddings": 262_144,
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "attn_output_gate": true,
+        "output_gate_type": "swish",
+        "bos_token_id": 248_044,
+        "eos_token_id": 248_044,
+        "initializer_range": 0.02,
+        "pad_token_id": NSNull(),
+        "tie_word_embeddings": false,
+        "mamba_ssm_dtype": "float32",
+        "dtype": "bfloat16",
+        "use_cache": true,
+        "partial_rotary_factor": 0.25,
         "rope_parameters": [
-            "sliding_attention": [
-                "rope_theta": 10_000.0,
-                "rope_type": "default",
-            ],
-            "full_attention": [
-                "rope_theta": 1_000_000.0,
-                "rope_type": "proportional",
-                "partial_rotary_factor": 0.25,
-            ],
+            "rope_theta": 10_000_000.0,
+            "rope_type": "default",
+            "partial_rotary_factor": 0.25,
+            "mrope_interleaved": true,
+            "mrope_section": [11, 11, 10],
         ],
         "quantization": [
             "group_size": 64,
             "bits": 4,
             "mode": "affine",
         ],
+        "mtp_num_hidden_layers": 1,
+        "mtp_use_dedicated_embeddings": false,
     ]
 }
 

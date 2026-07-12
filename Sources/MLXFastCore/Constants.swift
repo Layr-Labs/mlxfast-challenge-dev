@@ -1,7 +1,7 @@
 public enum MLXFastConstants {
-    public static let referenceModelName = "gemma-4-31b-4bit"
-    public static let defaultReferencePath = "reference_weights/gemma-4-31b-4bit"
-    public static let defaultReferenceCachePath = ".cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main"
+    public static let referenceModelName = "Qwen3.6-27B-4bit"
+    public static let defaultReferencePath = "reference_weights/Qwen3.6-27B-4bit"
+    public static let defaultReferenceCachePath = ".cache/huggingface/hub/models--mlx-community--Qwen3.6-27B-4bit/snapshots/c000ac2c2057d94be3fa931000c31723aac53282"
     public static let defaultWeightsPath = "weights"
     public static let defaultGoldenPath = "correctness_golden.json"
     public static let defaultPublicCorrectnessPromptPath = "correctness_prompts/public_longcopy_gate_english_512.txt"
@@ -10,11 +10,11 @@ public enum MLXFastConstants {
     public static let defaultScorePath = "score.json"
     public static let defaultLocalIterateScorePath = "score.local-iterate.json"
 
-    public static let vocabSize = 262_144
-    public static let hiddenSize = 5_376
-    public static let intermediateSize = 21_504
-    public static let numHiddenLayers = 60
-    public static let attentionHeads = 32
+    public static let vocabSize = 248_320
+    public static let hiddenSize = 5_120
+    public static let intermediateSize = 17_408
+    public static let numHiddenLayers = 64
+    public static let attentionHeads = 24
     public static let correctnessPromptTokens = 512
     // Keep the public gate long enough to catch broad decode regressions while
     // leaving budget for the hidden GPQA behavior checks in the official job.

@@ -2,6 +2,74 @@ import Foundation
 import Testing
 
 @Test
+func qwenReferenceManifestPinsExactCheckpointFiles() throws {
+    let manifest = try String(
+        contentsOfFile: "fixtures/reference_qwen3_6_27b_4bit.sha256",
+        encoding: .utf8
+    )
+    let expected = """
+    # SHA256 manifest for mlx-community/Qwen3.6-27B-4bit.
+    # Revision: c000ac2c2057d94be3fa931000c31723aac53282
+    # Format: <sha256> <byte_count> <relative_path>
+    c2c18574ee7d11d043802d88542b68710021416cdfff3b4d8571cc845ce623bd 696 README.md
+    e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259 7764 chat_template.jinja
+    ede24666ac51e6d5ab948a8a1e6c72fc6effd941ba3aabb6dd942eb517c78043 4573 config.json
+    2d4464e2ead06bc9bc718c781309ad1e7baded626d66e8dcdc8b469ba185faf0 51 configuration.json
+    e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e 202 generation_config.json
+    13b840162b4cb35c66fef7df072f7dbb4717908204364f5e5d9f9655a2758fa8 218281 model.safetensors.index.json
+    2689680915661f040c50c35244d08b336def279e509e1ca11873f8dd1b0e7ce0 5343268752 model-00001-of-00003.safetensors
+    a46183727b2c5cd16613fd8395f5e9e7cc4ad679644558cc87c9406fe334463d 5354185100 model-00002-of-00003.safetensors
+    ac23bf70b1f239a040921d6f93770d74176fd435dbf44e42317053d06c68d702 5357087747 model-00003-of-00003.safetensors
+    27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516 390 preprocessor_config.json
+    51c5f33646392e0bf1ed3e96be02504da47406c21c6cb86925d8908d1a6c4da7 1312 processor_config.json
+    87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4 19989343 tokenizer.json
+    e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182 1139 tokenizer_config.json
+    7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13 385 video_preprocessor_config.json
+    ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003 6722759 vocab.json
+    """
+
+    #expect(
+        manifest.trimmingCharacters(in: .whitespacesAndNewlines)
+            == expected.trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+}
+
+@Test
+func setupRequiresCompletePinnedQwenMetadataSet() throws {
+    let setup = try String(contentsOfFile: "setup.sh", encoding: .utf8)
+    let requiredStart = try #require(
+        setup.range(of: "REFERENCE_REQUIRED_METADATA_FILES=(")
+    )
+    let optionalEnd = try #require(
+        setup.range(of: "REFERENCE_OPTIONAL_METADATA_FILES=()")
+    )
+    let metadataContract = String(
+        setup[requiredStart.lowerBound..<optionalEnd.upperBound]
+    )
+
+    for file in [
+        "README.md",
+        "chat_template.jinja",
+        "config.json",
+        "configuration.json",
+        "generation_config.json",
+        "model.safetensors.index.json",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "video_preprocessor_config.json",
+        "vocab.json",
+    ] {
+        #expect(metadataContract.contains("\"\(file)\""), "required metadata \(file)")
+    }
+    #expect(setup.contains("A cold checkpoint download is about 15 GiB"))
+    #expect(setup.contains("Default: none."))
+    #expect(!setup.contains("built-in mirror"))
+    #expect(!setup.contains("primary (private mirror)"))
+}
+
+@Test
 func setupScriptCoordinatesCacheAndMetallibState() throws {
     let setup = try String(contentsOfFile: "setup.sh", encoding: .utf8)
     let metallibBuilder = try String(
@@ -245,7 +313,7 @@ func setupAcceptsLegacyReferenceDirectoryAsItsOwnCompatibilityPath() throws {
         environment: [
             "REPO_ROOT": FileManager.default.currentDirectoryPath,
             "TEST_ROOT": root.path,
-            "MLXFAST_REFERENCE_DIR": "reference_weights/gemma-4-31b-4bit",
+            "MLXFAST_REFERENCE_DIR": "reference_weights/Qwen3.6-27B-4bit",
         ]
     )
 

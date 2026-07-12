@@ -101,8 +101,8 @@ func writeScorePayloadEmitsDarkbloomShape() throws {
     #expect(decoded.metrics.weightsByteCount == 0)
     #expect(decoded.metrics.weightsFileCount == 0)
     #expect(decoded.metrics.partialResult == false)
-    #expect(decoded.metrics.baselineDecodeSecondsPerToken == MLXFastConstants.officialBaselineDecodeSecondsPerToken)
-    #expect(decoded.metrics.baselinePrefillSecondsPerToken == MLXFastConstants.officialBaselinePrefillSecondsPerToken)
+    #expect(decoded.metrics.baselineDecodeSecondsPerToken == 0)
+    #expect(decoded.metrics.baselinePrefillSecondsPerToken == 0)
     #expect(decoded.metrics.decodeSpeedup == 0)
     #expect(decoded.metrics.prefillSpeedup == 0)
     #expect(decoded.metrics.decodeSpeedupFloor == MLXFastConstants.scoreDecodeSpeedupFloor)
@@ -136,6 +136,31 @@ func writeScorePayloadEmitsDarkbloomShape() throws {
 }
 
 @Test
+func localScoreDecodingRequiresExplicitBaselines() throws {
+    let encoded = try JSONEncoder().encode(
+        ScorePayload.failed(error: "unranked")
+    )
+    var root = try #require(
+        JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+    )
+    var metrics = try #require(root["metrics"] as? [String: Any])
+    metrics["runtime"] = "swift-local-iterate"
+    metrics.removeValue(forKey: "baseline_decode_seconds_per_token")
+    metrics.removeValue(forKey: "baseline_prefill_seconds_per_token")
+    root["metrics"] = metrics
+    let missingBaselines = try JSONSerialization.data(
+        withJSONObject: root
+    )
+
+    #expect(throws: DecodingError.self) {
+        _ = try JSONDecoder().decode(
+            ScorePayload.self,
+            from: missingBaselines
+        )
+    }
+}
+
+@Test
 func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     let directory = try temporaryDirectory()
     let path = directory.appendingPathComponent("score.json")
@@ -149,6 +174,10 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
                 bandwidthGBPerToken: 0,
                 decodeSecondsPerToken: 0,
                 prefillSecondsPerToken: 0,
+                baselineDecodeSecondsPerToken:
+                    MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+                baselinePrefillSecondsPerToken:
+                    MLXFastConstants.officialBaselinePrefillSecondsPerToken,
                 benchmarkWallSeconds: 11,
                 preflightSeconds: 1,
                 correctnessSeconds: 2,
@@ -304,6 +333,10 @@ func publicDiagnosticsAreCoarsenedWhileRankingStaysPrecise() throws {
                 bandwidthGBPerToken: 2.882812,
                 decodeSecondsPerToken: 2.0953410813828124,
                 prefillSecondsPerToken: 0.0985421517,
+                baselineDecodeSecondsPerToken:
+                    MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+                baselinePrefillSecondsPerToken:
+                    MLXFastConstants.officialBaselinePrefillSecondsPerToken,
                 decodeSpeedup: 2.0142336773,
                 prefillSpeedup: 1.7586954276,
                 benchmarkWallSeconds: 484.7341,

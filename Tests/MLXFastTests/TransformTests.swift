@@ -22,26 +22,51 @@ func transformSelectsTextTowerTensorsAndDropsVisionTensors() throws {
         atomically: true,
         encoding: .utf8
     )
+    try "{% for message in messages %}{{ message.content }}{% endfor %}".write(
+        to: reference.appendingPathComponent("chat_template.jinja"),
+        atomically: true,
+        encoding: .utf8
+    )
 
-    let textName = "language_model.model.layers.0.self_attn.q_proj.weight"
-    let visionName = "vision_tower.encoder.layers.0.self_attn.q_proj.weight"
-    let embedVisionName = "embed_vision.embedding_projection.weight"
+    let linearAttentionName =
+        "language_model.model.layers.0.linear_attn.in_proj_qkv.weight"
+    let fullAttentionName =
+        "language_model.model.layers.3.self_attn.q_proj.weight"
+    let languageModelHeadName = "language_model.lm_head.weight"
+    let visionName = "vision_tower.blocks.0.attn.qkv.weight"
     let shardName = "model-00001-of-00001.safetensors"
     try writeSafetensors(
         reference.appendingPathComponent(shardName),
         tensors: [
-            TensorFixture(name: textName, dtype: "U8", shape: [4], data: Data([1, 2, 3, 4])),
+            TensorFixture(
+                name: linearAttentionName,
+                dtype: "U8",
+                shape: [4],
+                data: Data([1, 2, 3, 4])
+            ),
+            TensorFixture(
+                name: fullAttentionName,
+                dtype: "U8",
+                shape: [3],
+                data: Data([5, 6, 7])
+            ),
+            TensorFixture(
+                name: languageModelHeadName,
+                dtype: "U8",
+                shape: [2],
+                data: Data([8, 9])
+            ),
             TensorFixture(name: visionName, dtype: "U8", shape: [3], data: Data([9, 8, 7])),
-            TensorFixture(name: embedVisionName, dtype: "U8", shape: [2], data: Data([5, 6])),
         ]
     )
     try """
     {
-      "metadata": {"total_size": 9},
+      "metadata": {"total_size": 12},
       "weight_map": {
-        "\(textName)": "\(shardName)",
-        "\(visionName)": "\(shardName)",
-        "\(embedVisionName)": "\(shardName)"
+        "\(linearAttentionName)": "\(shardName)",
+        "\(fullAttentionName)": "\(shardName)",
+        "\(languageModelHeadName)": "\(shardName)",
+        "\(visionName)": "\(shardName)"
       }
     }
     """.write(
@@ -54,25 +79,58 @@ func transformSelectsTextTowerTensorsAndDropsVisionTensors() throws {
         TransformOptions(referencePath: reference.path, outputPath: output.path)
     )
 
-    #expect(report.denseTensorCount == 1)
+    #expect(report.denseTensorCount == 3)
     #expect(report.denseShardCount == 1)
     #expect(FileManager.default.fileExists(atPath: output.appendingPathComponent("config.json").path))
+    try validateRuntimeWorkerPinnedConfigurationData(
+        Data(contentsOf: output.appendingPathComponent("config.json"))
+    )
     #expect(FileManager.default.fileExists(atPath: output.appendingPathComponent("tokenizer.json").path))
+    #expect(FileManager.default.fileExists(atPath: output.appendingPathComponent("chat_template.jinja").path))
     #expect(!FileManager.default.fileExists(atPath: output.appendingPathComponent("experts").path))
 
     let outputShard = output.appendingPathComponent(shardName)
     let outputHeader = try Safetensors.readHeader(outputShard)
-    #expect(outputHeader.tensors.keys.sorted() == [textName])
-    #expect(try tensorBytes(outputShard, header: outputHeader, name: textName) == Data([1, 2, 3, 4]))
+    #expect(
+        Set(outputHeader.tensors.keys)
+            == Set([linearAttentionName, fullAttentionName, languageModelHeadName])
+    )
+    #expect(
+        try tensorBytes(
+            outputShard,
+            header: outputHeader,
+            name: linearAttentionName
+        ) == Data([1, 2, 3, 4])
+    )
+    #expect(
+        try tensorBytes(
+            outputShard,
+            header: outputHeader,
+            name: fullAttentionName
+        ) == Data([5, 6, 7])
+    )
+    #expect(
+        try tensorBytes(
+            outputShard,
+            header: outputHeader,
+            name: languageModelHeadName
+        ) == Data([8, 9])
+    )
 
     let strippedIndexData = try Data(
         contentsOf: output.appendingPathComponent("model.safetensors.index.json")
     )
     let strippedIndex = try JSONSerialization.jsonObject(with: strippedIndexData) as? [String: Any]
     let weightMap = try #require(strippedIndex?["weight_map"] as? [String: String])
-    #expect(weightMap == [textName: shardName])
+    #expect(
+        weightMap == [
+            linearAttentionName: shardName,
+            fullAttentionName: shardName,
+            languageModelHeadName: shardName,
+        ]
+    )
     let metadata = try #require(strippedIndex?["metadata"] as? [String: Any])
-    #expect(metadata["total_size"] as? Int == 4)
+    #expect(metadata["total_size"] as? Int == 9)
 }
 
 @Test
@@ -104,12 +162,55 @@ func transformWritesFlattenedRuntimeConfigFromTextConfig() throws {
 
     let configData = try Data(contentsOf: output.appendingPathComponent("config.json"))
     let config = try JSONSerialization.jsonObject(with: configData) as? [String: Any]
+    #expect(config?["model_type"] as? String == "qwen3_5_text")
     #expect(config?["num_hidden_layers"] as? Int == MLXFastConstants.numHiddenLayers)
     #expect(config?["vocab_size"] as? Int == MLXFastConstants.vocabSize)
     #expect(config?["text_config"] == nil)
     let quantization = try #require(config?["quantization"] as? [String: Any])
     #expect(quantization["group_size"] as? Int == 64)
     #expect(quantization["bits"] as? Int == 4)
+    #expect(try Qwen35Config.load(from: output.path).layerTypes == Qwen35Config.expectedLayerTypes)
+}
+
+@Test
+func transformRejectsConflictingQuantizationSchemas() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let configPath = root.appendingPathComponent("config.json")
+    var config = try #require(
+        JSONSerialization.jsonObject(
+            with: Data(referenceConfigJSON().utf8)
+        ) as? [String: Any]
+    )
+    config["quantization_config"] = [
+        "group_size": 128,
+        "bits": 4,
+        "mode": "affine",
+    ]
+    try JSONSerialization.data(
+        withJSONObject: config,
+        options: [.sortedKeys]
+    ).write(to: configPath)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try SwiftTransform.makeRuntimeConfigData(
+            sourceConfigPath: configPath
+        )
+    }
+
+    config["quantization_config"] = config["quantization"]
+    try JSONSerialization.data(
+        withJSONObject: config,
+        options: [.sortedKeys]
+    ).write(to: configPath)
+    let runtime = try SwiftTransform.makeRuntimeConfigData(
+        sourceConfigPath: configPath
+    )
+    let object = try #require(
+        JSONSerialization.jsonObject(with: runtime) as? [String: Any]
+    )
+    #expect(object["quantization"] != nil)
+    #expect(object["quantization_config"] == nil)
 }
 
 @Test
@@ -182,7 +283,7 @@ func transformRejectsSourceMetadataMutationsBeforePublishingOutput() throws {
                                 "model.safetensors.index.json"
                             ),
                             weightMap: [
-                                "language_model.model.layers.0.self_attn.q_proj.weight":
+                                "language_model.model.layers.0.linear_attn.in_proj_qkv.weight":
                                     "model-00001-of-00001.safetensors",
                             ],
                             metadata: ["generation": 2]
@@ -434,7 +535,7 @@ func transformRejectsCheckpointWithoutTextTowerTensorsBeforeCreatingOutput() thr
         encoding: .utf8
     )
 
-    let visionName = "vision_tower.encoder.layers.0.self_attn.q_proj.weight"
+    let visionName = "vision_tower.blocks.0.attn.qkv.weight"
     let shardName = "model-00001-of-00001.safetensors"
     try writeSafetensors(
         reference.appendingPathComponent(shardName),
@@ -565,7 +666,8 @@ func transformRejectsUnsupportedIndexShardBeforeCreatingOutput() throws {
     try writeCheckpointIndex(
         reference.appendingPathComponent("model.safetensors.index.json"),
         weightMap: [
-            "language_model.model.layers.0.self_attn.q_proj.weight": "pytorch_model.bin",
+            "language_model.model.layers.0.linear_attn.in_proj_qkv.weight":
+                "pytorch_model.bin",
         ]
     )
 
@@ -591,7 +693,8 @@ func transformRejectsUnsafeIndexShardBeforeCreatingOutput() throws {
     try writeCheckpointIndex(
         reference.appendingPathComponent("model.safetensors.index.json"),
         weightMap: [
-            "language_model.model.layers.0.self_attn.q_proj.weight": "../model-00001.safetensors",
+            "language_model.model.layers.0.linear_attn.in_proj_qkv.weight":
+                "../model-00001.safetensors",
         ]
     )
 
@@ -619,13 +722,18 @@ func transformRejectsIndexTensorMissingFromShardHeaderBeforeCreatingOutput() thr
     try writeSafetensors(
         reference.appendingPathComponent(shardName),
         tensors: [
-            TensorFixture(name: "language_model.model.layers.0.self_attn.k_proj.weight", dtype: "U8", shape: [2], data: Data([1, 2])),
+            TensorFixture(
+                name: "language_model.model.layers.3.self_attn.k_proj.weight",
+                dtype: "U8",
+                shape: [2],
+                data: Data([1, 2])
+            ),
         ]
     )
     try writeCheckpointIndex(
         reference.appendingPathComponent("model.safetensors.index.json"),
         weightMap: [
-            "language_model.model.layers.0.self_attn.q_proj.weight": shardName,
+            "language_model.model.layers.3.self_attn.q_proj.weight": shardName,
         ]
     )
 
@@ -650,8 +758,8 @@ func transformAcceptsSparseShardLargerThanInt32() throws {
         encoding: .utf8
     )
 
-    let textName = "language_model.model.layers.0.self_attn.q_proj.weight"
-    let visionName = "vision_tower.encoder.layers.0.self_attn.q_proj.weight"
+    let textName = "language_model.lm_head.weight"
+    let visionName = "vision_tower.blocks.0.attn.qkv.weight"
     let shardName = "model-00001-of-00001.safetensors"
     let shard = reference.appendingPathComponent(shardName)
     try writeSafetensors(
@@ -706,8 +814,8 @@ private func writeTransformFixture() throws -> TransformFixturePaths {
         encoding: .utf8
     )
 
-    let textName = "language_model.model.layers.0.self_attn.q_proj.weight"
-    let visionName = "vision_tower.encoder.layers.0.self_attn.q_proj.weight"
+    let textName = "language_model.model.layers.0.linear_attn.in_proj_qkv.weight"
+    let visionName = "vision_tower.blocks.0.attn.qkv.weight"
     let shardName = "model-00001-of-00001.safetensors"
     try writeSafetensors(
         reference.appendingPathComponent(shardName),
@@ -731,13 +839,56 @@ private func referenceConfigJSON() -> String {
     """
     {
       "text_config": {
+        "model_type": "qwen3_5_text",
         "num_hidden_layers": \(MLXFastConstants.numHiddenLayers),
         "vocab_size": \(MLXFastConstants.vocabSize),
-        "hidden_size": \(MLXFastConstants.hiddenSize)
+        "hidden_size": \(MLXFastConstants.hiddenSize),
+        "intermediate_size": \(MLXFastConstants.intermediateSize),
+        "num_attention_heads": \(MLXFastConstants.attentionHeads),
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "linear_num_value_heads": 48,
+        "linear_num_key_heads": 16,
+        "linear_value_head_dim": 128,
+        "linear_key_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "full_attention_interval": 4,
+        "layer_types": \(transformQwenLayerTypesJSON()),
+        "rms_norm_eps": 1e-6,
+        "hidden_act": "silu",
+        "max_position_embeddings": 262144,
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "attn_output_gate": true,
+        "output_gate_type": "swish",
+        "bos_token_id": 248044,
+        "eos_token_id": 248044,
+        "initializer_range": 0.02,
+        "pad_token_id": null,
+        "tie_word_embeddings": false,
+        "mamba_ssm_dtype": "float32",
+        "dtype": "bfloat16",
+        "use_cache": true,
+        "partial_rotary_factor": 0.25,
+        "rope_parameters": {
+          "rope_theta": 10000000,
+          "rope_type": "default",
+          "partial_rotary_factor": 0.25,
+          "mrope_interleaved": true,
+          "mrope_section": [11, 11, 10]
+        },
+        "mtp_num_hidden_layers": 1,
+        "mtp_use_dedicated_embeddings": false
       },
       "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}
     }
     """
+}
+
+private func transformQwenLayerTypesJSON() -> String {
+    "[" + (0..<MLXFastConstants.numHiddenLayers).map {
+        $0 % 4 == 3 ? #""full_attention""# : #""linear_attention""#
+    }.joined(separator: ",") + "]"
 }
 
 private func writeCheckpointIndex(

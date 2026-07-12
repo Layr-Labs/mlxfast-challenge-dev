@@ -67,10 +67,9 @@ fi
 # Bare invocations default to the participant-friendly local edit loop. The
 # ranked full benchmark must be requested explicitly: with --official, by the
 # trusted workflow env (MLXFAST_OFFICIAL_BENCHMARK_RUN=1 -- also inherited by
-# the pinned paired-baseline checkout's own benchmark.sh), or implicitly by an
-# operator pointing MLXFAST_CORRECTNESS_GOLDEN_PATH at a provisioned oracle.
+# the pinned paired-baseline checkout's own benchmark.sh).
 if [[ "${LOCAL_COOL_GATE_ONLY}" == "0" && "${LOCAL_ITERATE}" == "0" && "${LOCAL_SUBMIT}" == "0" && "${OFFICIAL}" == "0" ]]; then
-  if [[ "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == "1" || -n "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
+  if [[ "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == "1" ]]; then
     OFFICIAL=1
   else
     echo "benchmark.sh: no mode given; defaulting to --local-iterate (use --official for the ranked entrypoint, which requires the private oracle)"
@@ -79,49 +78,30 @@ if [[ "${LOCAL_COOL_GATE_ONLY}" == "0" && "${LOCAL_ITERATE}" == "0" && "${LOCAL_
   fi
 fi
 
+if [[ "${LOCAL_COOL_GATE_ONLY}" == "0" && -z "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
+  cat >&2 <<'EOF'
+benchmark.sh: Qwen3.6 requires an explicit Qwen-tokenized correctness golden.
+
+Set MLXFAST_CORRECTNESS_GOLDEN_PATH to a provisioned Qwen3.6 golden outside
+correctness_prompts/. The checked-in correctness_prompts/ contains Gemma
+fixtures and is intentionally never selected for Qwen local or official runs.
+EOF
+  exit 1
+fi
+
 if [[ "${LOCAL_ITERATE}" == "1" && -z "${MLXFAST_SCORE_PATH:-}" ]]; then
   SCORE_PATH="score.local-iterate.json"
 else
   SCORE_PATH="${MLXFAST_SCORE_PATH:-score.json}"
 fi
 WEIGHTS_PATH="${MLXFAST_WEIGHTS_PATH:-weights}"
-if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" && "${LOCAL_SUBMIT}" == "1" ]]; then
-  GOLDEN_PATH="correctness_prompts/public_longcopy_gate_english_512_1024.json"
-elif [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" && "${LOCAL_ITERATE}" == "1" ]]; then
-  GOLDEN_PATH="correctness_prompts/public_longcopy_gate_english_512_256.json"
-else
-  GOLDEN_PATH="${MLXFAST_CORRECTNESS_GOLDEN_PATH:-correctness_golden.json}"
-fi
+GOLDEN_PATH="${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}"
 
 # Fail fast with actionable guidance when the golden fixture is missing,
-# BEFORE any build/transform work runs. The official mode needs the private
-# oracle, which is never in the public repo -- participants who reached it by
-# accident used to burn minutes on the transform and then hit a raw
-# file-not-found error from the Swift harness.
+# BEFORE any build/transform work runs.
 if [[ "${LOCAL_COOL_GATE_ONLY}" == "0" && ! -f "${GOLDEN_PATH}" ]]; then
-  if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" || -n "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
-    echo "benchmark.sh: correctness golden not found at ${GOLDEN_PATH}" >&2
-    echo "benchmark.sh: if you overrode MLXFAST_CORRECTNESS_GOLDEN_PATH, check the path;" >&2
-    echo "benchmark.sh: otherwise re-sync the repo (the public fixtures live in correctness_prompts/)." >&2
-  else
-    cat >&2 <<'EOF'
-benchmark.sh: correctness_golden.json is missing.
-
---official is the RANKED entrypoint: it requires the private benchmark
-oracle, which is provisioned only on the official runner and is not part of
-the public repository.
-
-For local development use one of the local modes, which run against the
-public fixtures checked into correctness_prompts/ (a bare ./benchmark.sh
-defaults to --local-iterate):
-
-  ./benchmark.sh --local-iterate   # fast edit-loop signal (~2 minutes)
-  ./benchmark.sh --local-submit    # pre-submit gate (longer decode window)
-
-(Operators with a provisioned private oracle: set
-MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json.)
-EOF
-  fi
+  echo "benchmark.sh: Qwen correctness golden not found at ${GOLDEN_PATH}" >&2
+  echo "benchmark.sh: check MLXFAST_CORRECTNESS_GOLDEN_PATH; no Gemma fixture fallback is allowed." >&2
   exit 1
 fi
 # Resolve the reference checkpoint the same way setup.sh does. benchmark.sh used
@@ -131,9 +111,9 @@ fi
 # else use reference_weights/ only when it actually holds a checkpoint, resolved to
 # its real target so the transform never opens a symlinked directory; else fall
 # back to the Hugging Face cache setup.sh downloads into.
-REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/gemma-4-31b-4bit}"
-REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-main}"
-REFERENCE_DEFAULT_DIR="reference_weights/gemma-4-31b-4bit"
+REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/Qwen3.6-27B-4bit}"
+REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-c000ac2c2057d94be3fa931000c31723aac53282}"
+REFERENCE_DEFAULT_DIR="reference_weights/Qwen3.6-27B-4bit"
 REFERENCE_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}"
 REFERENCE_HF_HUB_CACHE="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${REFERENCE_HF_HOME}/hub}}"
 REFERENCE_CACHE_DIR="${MLXFAST_REFERENCE_CACHE_DIR:-${REFERENCE_HF_HUB_CACHE}/models--${REFERENCE_MODEL_REPO//\//--}/snapshots/${REFERENCE_REVISION//\//--}}"
@@ -918,6 +898,7 @@ validate_staged_transform_contents() {
   local shard_name
   local actual_shard
   local actual_name
+  local shard_validation_failed=0
 
   if ! command -v jq >/dev/null 2>&1; then
     echo "benchmark.sh: jq is required to validate transformed weights" >&2
@@ -948,16 +929,20 @@ validate_staged_transform_contents() {
   while IFS= read -r shard_name; do
     if [[ ! -f "${staged_weights}/${shard_name}" \
         || -L "${staged_weights}/${shard_name}" ]]; then
-      rm -f "${shard_list}"
       echo "benchmark.sh: staged transform index references missing shard ${shard_name}" >&2
-      return 1
+      shard_validation_failed=1
+      break
     fi
     if ! validate_staged_safetensors_shard \
         "${staged_weights}/${shard_name}" "${index_path}"; then
-      rm -f "${shard_list}"
-      return 1
+      shard_validation_failed=1
+      break
     fi
   done < "${shard_list}"
+  if [[ "${shard_validation_failed}" -ne 0 ]]; then
+    rm -f "${shard_list}"
+    return 1
+  fi
 
   while IFS= read -r -d '' actual_shard; do
     actual_name="$(basename "${actual_shard}")"

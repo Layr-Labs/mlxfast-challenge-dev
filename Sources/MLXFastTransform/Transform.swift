@@ -36,22 +36,20 @@ public struct TransformReport: Equatable {
     }
 }
 
-/// Offline transform for the Gemma 4 31B 4-bit checkpoint: selects ONLY the
+/// Offline transform for the Qwen3.6 27B 4-bit checkpoint: selects ONLY the
 /// text-tower tensors (the `language_model.` prefix in the source index),
-/// drops every vision/audio/multimodal-projector tensor, and rewrites the
+/// drops the `vision_tower.blocks.*` tensors, and rewrites the
 /// selected tensors into dense safetensors shard(s) plus a
 /// `model.safetensors.index.json` and a runtime-authored `config.json`
 /// (the flattened `text_config` fields the runtime needs, plus the
-/// checkpoint's quantization metadata). Text/audio/vision are the only kinds
-/// of tensors the reference checkpoint ships; there is no expert manifest --
-/// the whole selected tree is one flat set of dense tensors, matching how a
-/// single dense model (no MoE, no expert streaming) is loaded fully into RAM
-/// at runtime init.
+/// checkpoint's quantization metadata). The pinned checkpoint index contains
+/// only `language_model.*` and `vision_tower.*` tensors; there is no expert
+/// manifest. The selected text tree is one flat dense tensor set loaded fully
+/// into RAM at runtime init.
 public enum SwiftTransform {
     /// Tensor name prefix that marks a checkpoint tensor as part of the text
-    /// tower. Every other prefix (`vision_tower.`, `embed_vision.`,
-    /// `audio_tower.`, `multi_modal_projector.`, ...) is vision/audio/
-    /// multimodal-glue and is out of scope for this text-only challenge.
+    /// tower. The target's other tensor prefix is `vision_tower.blocks.*`,
+    /// which is out of scope for this text-only challenge.
     static let textTowerPrefix = "language_model."
 
     public static func run(_ options: TransformOptions) throws -> TransformReport {
@@ -83,7 +81,7 @@ public enum SwiftTransform {
         let referenceConfigPath = referenceDirectory.appendingPathComponent("config.json")
         try requireFile(
             referenceConfigPath.path,
-            description: "Gemma 4 31B 4-bit reference config"
+            description: "Qwen3.6 27B 4-bit reference config"
         )
         let runtimeConfigData = try makeRuntimeConfigData(sourceConfigPath: referenceConfigPath)
         let metadataSnapshot = try captureMetadataFiles(from: referenceDirectory)
@@ -353,7 +351,7 @@ public enum SwiftTransform {
         }
 
         throw MLXFastError.missingFile(
-            "no config.json found under \(base.path); place the Gemma 4 31B 4-bit checkpoint there"
+            "no config.json found under \(base.path); place the Qwen3.6 27B 4-bit checkpoint there"
         )
     }
 
@@ -401,7 +399,7 @@ public enum SwiftTransform {
             return false
         }
         switch url.pathExtension {
-        case "json", "model", "tiktoken", "txt":
+        case "jinja", "json", "model", "tiktoken", "txt":
             return true
         default:
             return name == "tokenizer" || name == "vocab"
@@ -410,9 +408,9 @@ public enum SwiftTransform {
 
     /// Writes the runtime's `config.json`: the source checkpoint's
     /// `text_config` fields flattened to the top level (the exact schema
-    /// `Gemma4Config.load` reads), plus the checkpoint-wide `quantization`
+    /// `Qwen35Config.load` reads), plus the checkpoint-wide `quantization`
     /// block. The runtime controls this schema directly, so it carries only
-    /// what `Gemma4Config`/`Gemma4WeightLoader` actually need -- no vision or
+    /// what the Qwen text runtime and weight loader actually need -- no vision or
     /// audio config, no architecture/tokenizer metadata duplicated from
     /// `tokenizer_config.json`.
     static func makeRuntimeConfigData(sourceConfigPath: URL) throws -> Data {
@@ -426,9 +424,26 @@ public enum SwiftTransform {
         }
 
         var runtimeConfig = textConfig
-        if let quantization = root["quantization"] {
+        let quantization = root["quantization"]
+        let quantizationConfig = root["quantization_config"]
+        if let quantization, let quantizationConfig {
+            let canonicalQuantization = try JSONSerialization.data(
+                withJSONObject: quantization,
+                options: [.sortedKeys]
+            )
+            let canonicalQuantizationConfig = try JSONSerialization.data(
+                withJSONObject: quantizationConfig,
+                options: [.sortedKeys]
+            )
+            guard canonicalQuantization == canonicalQuantizationConfig else {
+                throw MLXFastError.invalidInput(
+                    "reference config quantization and quantization_config conflict"
+                )
+            }
             runtimeConfig["quantization"] = quantization
-        } else if let quantizationConfig = root["quantization_config"] {
+        } else if let quantization {
+            runtimeConfig["quantization"] = quantization
+        } else if let quantizationConfig {
             runtimeConfig["quantization"] = quantizationConfig
         }
 

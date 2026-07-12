@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
-# Bootstrap system tools and build the Swift-only Gemma 4 harness.
+# Bootstrap system tools and build the Swift-only Qwen3.6 harness.
 set -euo pipefail
 
-REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/gemma-4-31b-4bit}"
-REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-main}"
+REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/Qwen3.6-27B-4bit}"
+REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-c000ac2c2057d94be3fa931000c31723aac53282}"
 REFERENCE_CACHE_REPO_DIR="models--${REFERENCE_MODEL_REPO//\//--}"
 REFERENCE_CACHE_REVISION_DIR="${REFERENCE_REVISION//\//--}"
-# No organizer-hosted mirror exists yet for this checkpoint; default straight
-# to the Darkbloom R2 mirror (mlx-challenge bucket), which serves the same
-# manifest-pinned files as the public Hugging Face repo with higher parallel
-# throughput. Stalled or failed downloads automatically fall back to the public
-# Hugging Face source; set MLXFAST_REFERENCE_FALLBACK_BASE_URL empty to disable
-# that fallback. download_url_for_file appends
+# No organizer-hosted mirror exists for this checkpoint. Resolve the immutable
+# Hugging Face revision directly and leave the fallback empty by default.
+# download_url_for_file appends
 # "?download=true" automatically for huggingface.co URLs so that resolves to
 # the raw LFS/Xet bytes.
-DEFAULT_REFERENCE_BASE_URL="https://ds4.darkbloom.ai/gemma-4-31b-4bit"
-DEFAULT_REFERENCE_FALLBACK_BASE_URL="https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main"
+DEFAULT_REFERENCE_BASE_URL="https://huggingface.co/mlx-community/Qwen3.6-27B-4bit/resolve/${REFERENCE_REVISION}"
+DEFAULT_REFERENCE_FALLBACK_BASE_URL=""
 REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}"
 if [[ -n "${MLXFAST_REFERENCE_FALLBACK_BASE_URL+x}" ]]; then
   REFERENCE_FALLBACK_BASE_URL="${MLXFAST_REFERENCE_FALLBACK_BASE_URL}"
@@ -26,13 +23,12 @@ else
 fi
 REFERENCE_AUTH_HEADER="${MLXFAST_REFERENCE_AUTH_HEADER:-}"
 REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}"
-REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_gemma_4_31b_4bit.sha256}"
+REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_qwen3_6_27b_4bit.sha256}"
 REFERENCE_HASH_VERIFY="${MLXFAST_REFERENCE_HASH_VERIFY:-1}"
 REFERENCE_POST_DOWNLOAD_FULL_VERIFY="${MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY:-1}"
 REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-40}"
-# Default 3 parallel shard downloads: the R2 mirror sustains full throughput at
-# 3 streams, and higher fan-out mostly adds contention on home connections.
-# Override with MLXFAST_REFERENCE_DOWNLOAD_JOBS.
+# The pinned checkpoint has three safetensors shards; three jobs gives each
+# shard one download stream. Override with MLXFAST_REFERENCE_DOWNLOAD_JOBS.
 REFERENCE_DOWNLOAD_JOBS="${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-3}"
 REFERENCE_DOWNLOAD_PROGRESS_SECONDS="${MLXFAST_REFERENCE_DOWNLOAD_PROGRESS_SECONDS:-15}"
 REFERENCE_DOWNLOAD_STALL_SECONDS="${MLXFAST_REFERENCE_DOWNLOAD_STALL_SECONDS:-120}"
@@ -50,7 +46,7 @@ MACMON_INSTALL_DIR="${HOME}/bin"
 SETUP_PARALLEL_METALLIB="${MLXFAST_SETUP_PARALLEL_METALLIB:-${MLXFAST_SETUP_PARALLEL_BUILD:-1}}"
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
-DEFAULT_REFERENCE_DIR="reference_weights/gemma-4-31b-4bit"
+DEFAULT_REFERENCE_DIR="reference_weights/Qwen3.6-27B-4bit"
 DEFAULT_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}"
 DEFAULT_HF_HUB_CACHE="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${DEFAULT_HF_HOME}/hub}}"
 REFERENCE_CACHE_DIR="${MLXFAST_REFERENCE_CACHE_DIR:-${DEFAULT_HF_HUB_CACHE}/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}}"
@@ -96,23 +92,27 @@ REFERENCE_VERIFIED_EXPECTED_HASH=""
 REFERENCE_VERIFIED_EXPECTED_SIZE=""
 REFERENCE_VERIFIED_FILE_MANIFEST_HASH=""
 REFERENCE_REQUIRED_METADATA_FILES=(
-  "config.json"
-  "model.safetensors.index.json"
-)
-REFERENCE_OPTIONAL_METADATA_FILES=(
   "README.md"
+  "chat_template.jinja"
+  "config.json"
+  "configuration.json"
   "generation_config.json"
+  "model.safetensors.index.json"
+  "preprocessor_config.json"
   "processor_config.json"
   "tokenizer.json"
   "tokenizer_config.json"
+  "video_preprocessor_config.json"
+  "vocab.json"
 )
+REFERENCE_OPTIONAL_METADATA_FILES=()
 
 print_help() {
   cat <<EOF
 Usage: ./setup.sh
 
 Checks the local macOS/Apple Silicon toolchain, builds the Swift harness,
-builds mlx.metallib, and downloads the Gemma 4 31B 4-bit reference
+builds mlx.metallib, and downloads the Qwen3.6 27B 4-bit reference
 checkpoint when it is not already present.
 
 Important environment variables:
@@ -128,8 +128,7 @@ Important environment variables:
   MLXFAST_REFERENCE_FALLBACK_BASE_URL
                                      Fallback HTTP prefix after a failed or
                                      stalled primary download. Set empty to
-                                     disable. Default with the built-in mirror:
-                                     ${DEFAULT_REFERENCE_FALLBACK_BASE_URL}
+                                     disable. Default: none.
   MLXFAST_REFERENCE_MANIFEST_PATH    SHA256 manifest for the reference files.
                                      Default: ${REFERENCE_MANIFEST_PATH}
   MLXFAST_REFERENCE_CACHE_LOCK_PATH  Local stamp proving the checkpoint was
@@ -1521,7 +1520,7 @@ reference_download_on_disk_bytes() {
 }
 
 start_reference_download_heartbeat() {
-  # A cold checkpoint download is ~17 GiB and the parallel per-shard curls run
+  # A cold checkpoint download is about 15 GiB and parallel per-shard curls run
   # silenced, which used to mean 10+ minutes with no output at all. This
   # heartbeat is the single progress reporter for the parallel shard phase:
   # every REFERENCE_DOWNLOAD_PROGRESS_SECONDS it sums the on-disk shard bytes
@@ -1771,8 +1770,8 @@ download_reference_shards() {
     # curl (--speed-limit/--speed-time); the transfer itself stays --silent
     # because the aggregate heartbeat in the parent process is the single
     # progress reporter for the parallel shard phase. The auth header is only
-    # ever sent to the primary (private mirror) source; the public fallback
-    # must not receive those credentials.
+    # ever sent to the configured primary source; a fallback must not receive
+    # those credentials.
     fetch_shard_from_source() {
       local download_url="$1"
       local source_label="$2"

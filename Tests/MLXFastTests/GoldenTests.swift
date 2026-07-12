@@ -55,6 +55,53 @@ func checkedInPublicCorrectnessGoldenIsValid() throws {
 }
 
 @Test
+func goldenModelIdentityFailsClosedWhenRequired() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let copiedGemma = directory.appendingPathComponent("copied-gemma.json")
+    try syntheticGemmaGoldenData().write(to: copiedGemma)
+
+    let generic = try loadGoldenFixture(from: copiedGemma.path)
+    #expect(generic.modelType == nil)
+    #expect(throws: MLXFastError.self) {
+        _ = try loadGoldenFixture(
+            from: copiedGemma.path,
+            requiredModelType: "qwen3_5_text"
+        )
+    }
+
+    var object = try #require(
+        JSONSerialization.jsonObject(
+            with: Data(contentsOf: copiedGemma)
+        ) as? [String: Any]
+    )
+    object["model_type"] = "gemma4_text"
+    let wrongIdentity = directory.appendingPathComponent("wrong-identity.json")
+    try JSONSerialization.data(
+        withJSONObject: object,
+        options: [.sortedKeys]
+    ).write(to: wrongIdentity)
+    #expect(throws: MLXFastError.self) {
+        _ = try loadGoldenFixture(
+            from: wrongIdentity.path,
+            requiredModelType: "qwen3_5_text"
+        )
+    }
+
+    object["model_type"] = "qwen3_5_text"
+    let qwenIdentity = directory.appendingPathComponent("qwen-identity.json")
+    try JSONSerialization.data(
+        withJSONObject: object,
+        options: [.sortedKeys]
+    ).write(to: qwenIdentity)
+    let qwen = try loadGoldenFixture(
+        from: qwenIdentity.path,
+        requiredModelType: "qwen3_5_text"
+    )
+    #expect(qwen.modelType == "qwen3_5_text")
+}
+
+@Test
 func loadGoldenFixtureAcceptsLayeredCorrectnessGates() throws {
     let directory = try temporaryDirectory()
     let path = directory.appendingPathComponent("golden.json")

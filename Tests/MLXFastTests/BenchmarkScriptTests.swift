@@ -5,13 +5,18 @@ import Foundation
 import Testing
 
 @Test
-func setupScriptDefaultsToFastReferenceMirror() throws {
+func setupScriptPinsQwenReferenceRevision() throws {
     let setup = try String(
         contentsOfFile: "setup.sh",
         encoding: .utf8
     )
 
-    #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://ds4.darkbloom.ai/gemma-4-31b-4bit\""))
+    #expect(setup.contains("REFERENCE_MODEL_REPO=\"${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/Qwen3.6-27B-4bit}\""))
+    #expect(setup.contains("REFERENCE_REVISION=\"${MLXFAST_REFERENCE_REVISION:-c000ac2c2057d94be3fa931000c31723aac53282}\""))
+    #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://huggingface.co/mlx-community/Qwen3.6-27B-4bit/resolve/${REFERENCE_REVISION}\""))
+    #expect(setup.contains("DEFAULT_REFERENCE_FALLBACK_BASE_URL=\"\""))
+    #expect(setup.contains("REFERENCE_MANIFEST_PATH=\"${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_qwen3_6_27b_4bit.sha256}\""))
+    #expect(setup.contains("DEFAULT_REFERENCE_DIR=\"reference_weights/Qwen3.6-27B-4bit\""))
     #expect(setup.contains("REFERENCE_BASE_URL=\"${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}\""))
     // 3 parallel shard downloads by default; env-overridable.
     #expect(setup.contains("REFERENCE_DOWNLOAD_JOBS=\"${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-3}\""))
@@ -62,7 +67,7 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"))
     #expect(setup.contains("sudo xcodebuild -license accept"))
 
-    // The cold ~17 GiB parallel shard download prints an aggregate progress
+    // The cold ~15 GiB parallel shard download prints an aggregate progress
     // heartbeat instead of going silent for the whole transfer.
     #expect(setup.contains("start_reference_download_heartbeat \"${output_dir}\" \"${expected_total_bytes}\" \"$@\""))
     #expect(setup.contains("stop_reference_download_heartbeat"))
@@ -74,6 +79,110 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(main.contains("wait_for_mlx_metallib_build\ncheck_mlxfast_cli\nprint_setup_summary \"ready\""))
     #expect(setup.contains("is not on PATH, so"))
     #expect(setup.contains("external Yukon installer"))
+}
+
+@Test
+func localBenchmarkContractPinsQwenReferenceRevision() throws {
+    let benchmark = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    let contract = try String(contentsOfFile: "benchmark.json", encoding: .utf8)
+
+    #expect(
+        benchmark.contains(
+            "REFERENCE_MODEL_REPO=\"${MLXFAST_REFERENCE_MODEL_REPO:-"
+                + "mlx-community/Qwen3.6-27B-4bit}\""
+        )
+    )
+    #expect(
+        benchmark.contains(
+            "REFERENCE_REVISION=\"${MLXFAST_REFERENCE_REVISION:-"
+                + "c000ac2c2057d94be3fa931000c31723aac53282}\""
+        )
+    )
+    #expect(
+        benchmark.contains(
+            "REFERENCE_DEFAULT_DIR=\"reference_weights/Qwen3.6-27B-4bit\""
+        )
+    )
+    #expect(contract.contains("mlx-community/Qwen3.6-27B-4bit"))
+    #expect(contract.contains("c000ac2c2057d94be3fa931000c31723aac53282"))
+    #expect(contract.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH:?"))
+    #expect(benchmark.contains("Qwen3.6 requires an explicit Qwen-tokenized correctness golden"))
+    #expect(!benchmark.contains("GOLDEN_PATH=\"correctness_prompts/"))
+}
+
+@Test
+func benchmarkScriptContractCommandsRequireExplicitQwenGolden() throws {
+    let data = try Data(contentsOf: URL(fileURLWithPath: "benchmark.json"))
+    let contract = try #require(
+        JSONSerialization.jsonObject(with: data) as? [String: Any]
+    )
+
+    for key in ["preSubmitCommand", "benchmarkCommand"] {
+        let command = try #require(contract[key] as? [String])
+        #expect(command.count == 3)
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["-c", command[2]]
+        var environment = benchmarkTestEnvironment()
+        environment.removeValue(forKey: "MLXFAST_CORRECTNESS_GOLDEN_PATH")
+        process.environment = environment
+        let stderr = Pipe()
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+
+        let message = String(
+            data: stderr.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+        #expect(process.terminationStatus != 0, "command: \(key)")
+        #expect(
+            message.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH"),
+            "command: \(key)"
+        )
+    }
+}
+
+@Test
+func directCLICommandsRequireExternalQwenGolden() throws {
+    let cli = try String(
+        contentsOfFile: "Sources/MLXFastCLI/main.swift",
+        encoding: .utf8
+    )
+    for command in [
+        "correctness",
+        "correctness-trace",
+        "preflight",
+        "benchmark",
+        "attach-gpqa-gates",
+        "attach-free-run-gate",
+    ] {
+        #expect(
+            cli.contains("command: \"\(command)\""),
+            "command \(command)"
+        )
+    }
+
+    let helperStart = try #require(
+        cli.range(of: "private static func requiredQwenGoldenPath(")
+    )
+    let helperEnd = try #require(
+        cli.range(
+            of: "private static func trimmedNonEmpty(",
+            range: helperStart.lowerBound..<cli.endIndex
+        )
+    )
+    let helper = String(cli[helperStart.lowerBound..<helperEnd.lowerBound])
+    #expect(helper.contains("--golden PATH or "))
+    #expect(helper.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH"))
+    #expect(helper.contains("no Gemma golden fallback is allowed"))
+    #expect(helper.contains("correctness_prompts contains protected Gemma fixtures"))
+    #expect(helper.contains("resolvingSymlinksInPath()"))
+    #expect(!cli.contains("defaultCorrectnessGoldenPath"))
+    #expect(!cli.contains("MLXFastConstants.defaultGoldenPath"))
+    #expect(!cli.contains("MLXFastConstants.defaultPublicCorrectnessGoldenPath"))
+    #expect(!cli.contains("MLXFastConstants.defaultPublicLocalSubmitGoldenPath"))
 }
 
 @Test
@@ -97,6 +206,8 @@ func benchmarkRejectsPartialSetupBeforeInvokingExistingBinary() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
     let invocation = root.appendingPathComponent("swift-invoked")
+    let golden = root.appendingPathComponent("qwen-golden.json")
+    try "{}".write(to: golden, atomically: true, encoding: .utf8)
     let fakeSwift = root.appendingPathComponent("mlxfast-swift")
     try """
     #!/bin/sh
@@ -117,6 +228,7 @@ func benchmarkRejectsPartialSetupBeforeInvokingExistingBinary() throws {
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
         "MLXFAST_MLX_METALLIB": root.appendingPathComponent("missing.metallib").path,
         "MLXFAST_CLI_COMMAND": "mlxfast-dev",
+        "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
         "MLXFAST_SCORE_PATH": root.appendingPathComponent("score.json").path,
         "MLXFAST_INTEGRITY_PATH": root.appendingPathComponent("integrity.json").path,
     ])
@@ -141,6 +253,30 @@ func participantDocsExposeDefaultCLIInstallDirectory() throws {
     for path in ["README.md", "TASK.md", "AGENTS.md", "CLAUDE.md"] {
         let document = try String(contentsOfFile: path, encoding: .utf8)
         #expect(document.contains(pathExport), "\(path) must expose the default CLI install directory")
+    }
+}
+
+@Test
+func participantDocsDescribeQwenOnlyNonRankableContract() throws {
+    let paths = ["README.md", "TASK.md", "AGENTS.md", "CLAUDE.md"]
+    for path in paths {
+        let document = try String(contentsOfFile: path, encoding: .utf8)
+        #expect(document.contains("Qwen3.6-27B"), "\(path)")
+        #expect(
+            document.contains("c000ac2c2057d94be3fa931000c31723aac53282"),
+            "\(path)"
+        )
+        #expect(document.contains("Qwen35TextModel"), "\(path)")
+        #expect(document.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH"), "\(path)")
+        #expect(document.contains("not officially rankable"), "\(path)")
+        #expect(document.contains("correctness_prompts"), "\(path)")
+        #expect(document.contains("Gemma"), "\(path)")
+        #expect(
+            !document.contains(
+                ".build/release/mlxfast-swift correctness --weights weights\n"
+            ),
+            "\(path) must not instruct participants to run the Gemma-backed default golden"
+        )
     }
 }
 
@@ -674,12 +810,12 @@ func hashWeightsDirectoryRejectsHardlinks() throws {
         contentsOfFile: ".github/scripts/hash-weights-directory.sh",
         encoding: .utf8
     )
-    // Mirrors overlay-editable-paths.sh and GemmaRuntime.directoryDigest.
+    // Mirrors overlay-editable-paths.sh and QwenRuntime.directoryDigest.
     #expect(hashScript.contains("-links +1"))
     #expect(hashScript.contains("weights tree contains a hardlinked file"))
 
     let preflight = try String(
-        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimePreflight.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimePreflight.swift",
         encoding: .utf8
     )
     #expect(preflight.contains("func requireSingleHardLink("))
@@ -1028,7 +1164,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // Diff-only mode: when a base commit is provided the review must send only
     // the editable files CHANGED vs that base, not the whole editable surface.
     // This is the fix for the false positive where an unchanged baseline file
-    // (Gemma4SubmissionControls.swift's validation hook, comment mentions
+    // (Qwen35SubmissionControls.swift's validation hook, comment mentions
     // benchmark timing) failed a submission that never touched it.
     #expect(staticReview.contains("review_base=\"${MLXFAST_SUBMISSION_REVIEW_BASE_SHA:-}\""))
     #expect(staticReview.contains("git diff --name-only -z \"${review_base}\" \"${review_head}\" -- \"${editable_paths[@]}\""))
@@ -1516,12 +1652,13 @@ func cliSupportsFreeRunGateAttachmentCoveringTimedDecodeOffsets() throws {
     // The INPUT golden is strict-validated before any generation or write --
     // --output defaults to the input path, so a malformed input must fail
     // before it could be replaced on disk.
-    #expect(cli.contains("_ = try loadGoldenFixture(from: goldenPath)"))
+    #expect(cli.contains("_ = try QwenRuntime.loadQwenGoldenFixture(from: goldenPath)"))
     // The merged golden is staged to a temp sibling and re-validated through
     // the strict loader BEFORE it replaces the destination, so a failed
     // validation can never destroy the original golden.
     #expect(cli.contains("func writeValidatedGoldenDocument"))
-    #expect(cli.contains("_ = try loadGoldenFixture(from: temporaryURL.path)"))
+    #expect(cli.contains("_ = try QwenRuntime.loadQwenGoldenFixture(from: temporaryURL.path)"))
+    #expect(cli.contains("modelType: QwenRuntime.requiredGoldenModelType"))
     #expect(!cli.contains("try outputData.write(to: outputURL, options: [.atomic])"))
     #expect(cli.contains("attach-free-run-gate ["))
 }
@@ -1582,7 +1719,7 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(!cli.contains("case \"measure-gpqa-ttft\""))
     #expect(cli.contains("AutoTokenizer.from(modelFolder: modelFolder, strict: false)"))
     #expect(cli.contains("acceptedReferenceTokenSequences"))
-    #expect(cli.contains("GemmaRuntime.generateGreedyTokens"))
+    #expect(cli.contains("QwenRuntime.generateGreedyTokens"))
     #expect(cli.contains("runtimeWorkerOptions(blockedGoldenPath: gpqaPath)"))
     #expect(!cli.contains("calibrated_reference_outputs"))
     #expect(cli.contains("SemanticGPQAAnswerDocument"))
@@ -1863,7 +2000,7 @@ func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
     #expect(workerRuntime.contains("let ttftSeconds = secondsSince(ttftStart)"))
     #expect(!workerRuntime.contains("ttftSeconds: beginResponse.seconds"))
     // benchmarkWithWorker's preflight must not call BenchmarkPreflight.check --
-    // that helper loads Gemma4Config/DenseTensorStore/Gemma4WeightLoader
+    // that helper loads Qwen35Config/DenseTensorStore/Qwen35WeightLoader
     // (editable MLXFastModel code) in this trusted, unsandboxed parent process.
     // checkWorkerBenchmarkInputs is model-free: it only checks that required
     // artifact paths exist, and lets the sandboxed worker itself validate
@@ -1921,8 +2058,9 @@ func benchmarkGatesOnlyRunSkipsSpuriousSemanticCaptureFailure() throws {
     // Placeholder timing values for the gates-only phase must be the resolved
     // baseline exactly (speedup == 1.0, always finite) -- 0 would divide-by-
     // zero into +Infinity in BenchmarkScore.speedup, and Double.infinity fails
-    // JSON encoding outright. "Resolved" means the golden oracle's per-prompt
-    // baseline when it carries one, else the calibrated constants.
+    // JSON encoding outright. For Qwen, "resolved" means paired measurements
+    // or an explicit external-golden baseline pair; Gemma constants are never
+    // an eligible fallback.
     #expect(runtime.contains("prefillSecondsPerToken = baselinePrefillSecondsPerToken"))
     #expect(runtime.contains("secondsPerToken: baselineDecodeSecondsPerToken,"))
 
@@ -2062,7 +2200,7 @@ func sealedStdoutScoreIsCoarsenedLikeTheWrittenFile() throws {
 @Test
 func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
     let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeWorker.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeWorker.swift",
         encoding: .utf8
     )
 
@@ -2072,7 +2210,7 @@ func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
     #expect(runtime.contains("response.nonce != sessionNonce"))
     #expect(runtime.contains("RuntimeWorkerProtocolIO.isolatingStandardIO()"))
     let protocolIsolation = try #require(runtime.range(of: "RuntimeWorkerProtocolIO.isolatingStandardIO()"))
-    let configLoad = try #require(runtime.range(of: "Gemma4Config.load(from: weightsPath)"))
+    let configLoad = try #require(runtime.range(of: "Qwen35Config.load(from: weightsPath)"))
     #expect(protocolIsolation.lowerBound < configLoad.lowerBound)
     #expect(runtime.contains("F_DUPFD_CLOEXEC"))
     #expect(runtime.contains("arc4random_buf(baseAddress, buffer.count)"))
@@ -2086,7 +2224,7 @@ func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
 @Test
 func runtimeWorkerValidatesTransformedWeightsAtStartup() throws {
     let worker = try String(
-        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeWorker.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeWorker.swift",
         encoding: .utf8
     )
     // The structural validation BenchmarkPreflight.check used to run in the
@@ -2098,29 +2236,33 @@ func runtimeWorkerValidatesTransformedWeightsAtStartup() throws {
     let startup = String(worker[runWorkerStart.lowerBound..<helloAnchor.lowerBound])
     #expect(startup.contains("try loader.denseStore.validateReadableByteRanges()"))
     #expect(startup.contains("try loader.validateRequiredMetadata(config: config)"))
-    #expect(startup.contains("try weightCache.requireLibraryModel()"))
+    #expect(startup.contains("try weightCache.validateSelectedBackend()"))
+    #expect(!startup.contains("requireLibraryModel()"))
+    #expect(worker.contains("state.discardSession(afterFailedRequest: kind)"))
 
-    // The parent's worker decode path must not read the editable submission delay
-    // hook: Gemma4SubmissionControls is editable MLXFastModel code and the worker
-    // itself already applies the delay inside its sandboxed decode step.
+    // The parent's worker decode path must not read any editable submission
+    // hook. The former editable decode-delay knob (Qwen35SubmissionControls) is
+    // removed entirely; assert no residual reference survives on this path.
     let runtime = try harnessRuntimeSource()
     let decodeStart = try #require(runtime.range(of: "static func measureWorkerDecode"))
     let decodeEnd = try #require(runtime.range(of: "static let bandwidthSource"))
     let workerDecode = String(runtime[decodeStart.lowerBound..<decodeEnd.lowerBound])
     #expect(!workerDecode.contains("submissionValidationDelayMilliseconds()"))
     #expect(!workerDecode.contains("decode validation delay enabled"))
+    #expect(!workerDecode.contains("Qwen35SubmissionControls"))
 }
 
 @Test
-func compiledDecodeSkipsSynchronousHostOffsetValidation() throws {
+func qwen35RuntimeUsesEagerDecodeAndTransactionalHostPositionValidation() throws {
     let model = try String(
-        contentsOfFile: "Sources/MLXFastModel/Gemma4Model.swift",
+        contentsOfFile: "Sources/MLXFastModel/Qwen35Model.swift",
         encoding: .utf8
     )
-    #expect(model.contains("let compiledDecodeStep = cache.compiledDecodeStep"))
-    #expect(model.contains("if compiledDecodeStep == nil {"))
-    #expect(model.contains("cacheOffsets: kvCaches.map(\\.offset)"))
-    #expect(model.contains("if let step = compiledDecodeStep {"))
+    #expect(model.contains("executeQwen35CachedForward("))
+    #expect(model.contains("validateLibraryCachePosition"))
+    #expect(model.contains("qwen35EagerLogits("))
+    #expect(!model.contains("CompiledDecode"))
+    #expect(!model.contains("DARKBLOOM_COMPILED_DECODE"))
 }
 
 @Test
@@ -2139,11 +2281,12 @@ func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
     )
     let runtime = try harnessRuntimeSource()
     let localRuntime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeLocalIterate.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeLocalIterate.swift",
         encoding: .utf8
     )
 
-    #expect(contract.contains("\"preSubmitCommand\": [\"bash\", \"-c\", \"./benchmark.sh --local-submit\"]"))
+    #expect(contract.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH:?"))
+    #expect(contract.contains("./benchmark.sh --local-submit"))
     // The Yukon participant CLI (`mlxfast run`) executes benchmarkCommand and
     // then reads the contract's scorePath, so the participant entrypoint must
     // be a LOCAL mode (--official requires the private oracle, which is never
@@ -2153,7 +2296,7 @@ func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
     // ranked runner never consumes benchmarkCommand -- benchmark.yml and
     // measure-job.sh invoke ./benchmark.sh --official themselves under
     // MLXFAST_OFFICIAL_BENCHMARK_RUN=1.
-    #expect(contract.contains("\"benchmarkCommand\": [\"bash\", \"-c\", \"MLXFAST_SCORE_PATH=score.json ./benchmark.sh --local-iterate\"]"))
+    #expect(contract.contains("MLXFAST_SCORE_PATH=score.json ./benchmark.sh --local-iterate"))
     #expect(contract.contains("\"scorePath\": \"score.json\""))
     // The CLI additionally validates the scorePath payload as
     // `{ "score": <finite number>, ... }` (null is rejected), so the local
@@ -2163,18 +2306,18 @@ func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
     // the ranked-path guard.
     #expect(localRuntime.contains("error: \"local estimated score is invalid:"))
     #expect(localRuntime.contains("score: estimatedScore"))
-    #expect(constants.contains("public static let defaultPublicLocalSubmitGoldenPath"))
     #expect(constants.contains("public static let localSubmitBenchmarkDecodeSteps = 1023"))
     #expect(constants.contains("public static let localSubmitBenchmarkRepeats = 1"))
     #expect(cli.contains("flagOptions: [\"--local-submit\", \"--local-iterate\"]"))
-    #expect(cli.contains("? MLXFastConstants.defaultPublicLocalSubmitGoldenPath"))
-    #expect(cli.contains("? MLXFastConstants.defaultPublicCorrectnessGoldenPath"))
+    #expect(cli.contains("let goldenPath = try requiredQwenGoldenPath("))
+    #expect(!cli.contains("MLXFastConstants.defaultPublicLocalSubmitGoldenPath"))
+    #expect(!cli.contains("MLXFastConstants.defaultPublicCorrectnessGoldenPath"))
     #expect(cli.contains("let decodeSteps = localSubmit"))
     #expect(cli.contains("? MLXFastConstants.localSubmitBenchmarkDecodeSteps"))
     #expect(cli.contains("let timingRepeats = localSubmit ? MLXFastConstants.localSubmitBenchmarkRepeats : 1"))
     #expect(cli.contains("timingRepeats: timingRepeats"))
     #expect(cli.contains("let runtime = localSubmit ? \"swift-local-submit\" : \"swift-local-iterate\""))
-    #expect(cli.contains("GemmaRuntime.localIterate("))
+    #expect(cli.contains("QwenRuntime.localIterate("))
     #expect(cli.contains("emitScorePayloadToStdout(payload)"))
     #expect(localRuntime.contains("runtime: runtime"))
     #expect(localRuntime.contains("modeName: String"))
@@ -2185,7 +2328,7 @@ func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
 }
 
 @Test
-func benchmarkLocalIterateModeUsesPublicFixtureAndNonOfficialScore() throws {
+func benchmarkLocalIterateModeRequiresExternalQwenFixtureAndUsesNonOfficialScore() throws {
     let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
     let constants = try String(
         contentsOfFile: "Sources/MLXFastCore/Constants.swift",
@@ -2196,20 +2339,21 @@ func benchmarkLocalIterateModeUsesPublicFixtureAndNonOfficialScore() throws {
         encoding: .utf8
     )
     let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeLocalIterate.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeLocalIterate.swift",
         encoding: .utf8
     )
     let options = try String(
-        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntime.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntime.swift",
         encoding: .utf8
     )
 
     #expect(script.contains("if [[ \"${arg}\" == \"--local-iterate\" ]]; then"))
     #expect(script.contains("SCORE_PATH=\"score.local-iterate.json\""))
-    #expect(script.contains("GOLDEN_PATH=\"correctness_prompts/public_longcopy_gate_english_512_256.json\""))
+    #expect(script.contains("GOLDEN_PATH=\"${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}\""))
+    #expect(!script.contains("GOLDEN_PATH=\"correctness_prompts/"))
     #expect(constants.contains("public static let localIterateBenchmarkDecodeSteps = 16"))
     #expect(cli.contains("flagOptions: [\"--local-submit\", \"--local-iterate\"]"))
-    #expect(cli.contains("GemmaRuntime.localIterate("))
+    #expect(cli.contains("QwenRuntime.localIterate("))
     #expect(cli.contains("MLXFastConstants.defaultLocalIterateScorePath"))
     #expect(runtime.contains("runLocalIterateCheckedTimingWithWorker("))
     #expect(runtime.contains("includes_seed_prefill=true"))
@@ -2227,8 +2371,14 @@ func benchmarkLocalIterateModeUsesPublicFixtureAndNonOfficialScore() throws {
     // (`mlxfast run`), which requires a finite numeric score at scorePath, can
     // consume valid local runs; invalid timing produces an explicit failed payload.
     #expect(runtime.contains("let estimatedScore = BenchmarkScore.score("))
+    #expect(runtime.contains("baselineDecodeSecondsPerToken: baselineDecodeSecondsPerToken"))
+    #expect(runtime.contains("baselinePrefillSecondsPerToken: baselinePrefillSecondsPerToken"))
     #expect(runtime.contains("error: \"local estimated score is invalid:"))
     #expect(runtime.contains("score: estimatedScore"))
+    #expect(runtime.contains("requiredGoldenBenchmarkBaselines("))
+    #expect(!runtime.contains("MLXFastConstants.officialBaseline"))
+    #expect(options.contains("goldenPath: String,"))
+    #expect(!options.contains("goldenPath: String = MLXFastConstants"))
     #expect(options.contains("runtime: String = \"swift-local-iterate\""))
     let prefillStartRange = try #require(runtime.range(of: "\\(modeName) prefill measured start prompt_tokens="))
     let decodeStartRange = try #require(runtime.range(of: "\\(modeName) decode measured start tokens="))
@@ -2258,6 +2408,8 @@ func benchmarkScriptForwardsLocalSubmitFlagToSwiftBenchmark() throws {
         atomically: true,
         encoding: .utf8
     )
+    let golden = root.appendingPathComponent("qwen-local-submit-golden.json")
+    try "{}".write(to: golden, atomically: true, encoding: .utf8)
 
     let argLog = root.appendingPathComponent("args.txt")
     let fakeSwift = root.appendingPathComponent("mlxfast-swift")
@@ -2295,6 +2447,7 @@ func benchmarkScriptForwardsLocalSubmitFlagToSwiftBenchmark() throws {
         "MLXFAST_SKIP_TRANSFORM": "1",
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
         "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
         "MLXFAST_SCORE_PATH": score.path,
         "MLXFAST_INTEGRITY_PATH": integrity.path,
     ])
@@ -2306,7 +2459,7 @@ func benchmarkScriptForwardsLocalSubmitFlagToSwiftBenchmark() throws {
     #expect(process.terminationStatus == 0)
     #expect(args.contains("benchmark\n"))
     #expect(args.contains("--golden\n"))
-    #expect(args.contains("correctness_prompts/public_longcopy_gate_english_512_1024.json\n"))
+    #expect(args.contains("\(golden.path)\n"))
     #expect(args.contains("--local-submit\n"))
 }
 
@@ -2322,6 +2475,8 @@ func benchmarkScriptForwardsLocalIterateDefaultsToSwiftBenchmark() throws {
         atomically: true,
         encoding: .utf8
     )
+    let golden = root.appendingPathComponent("qwen-local-iterate-golden.json")
+    try "{}".write(to: golden, atomically: true, encoding: .utf8)
 
     let argLog = root.appendingPathComponent("args.txt")
     let score = root.appendingPathComponent("score.local-iterate.json")
@@ -2359,6 +2514,7 @@ func benchmarkScriptForwardsLocalIterateDefaultsToSwiftBenchmark() throws {
         "MLXFAST_SKIP_TRANSFORM": "1",
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
         "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
         "MLXFAST_SCORE_PATH": score.path,
         "MLXFAST_INTEGRITY_PATH": integrity.path,
     ])
@@ -2370,7 +2526,7 @@ func benchmarkScriptForwardsLocalIterateDefaultsToSwiftBenchmark() throws {
     #expect(process.terminationStatus == 0)
     #expect(args.contains("benchmark\n"))
     #expect(args.contains("--golden\n"))
-    #expect(args.contains("correctness_prompts/public_longcopy_gate_english_512_256.json\n"))
+    #expect(args.contains("\(golden.path)\n"))
     #expect(args.contains("--score-path\n"))
     #expect(args.contains("\(score.path)\n"))
     #expect(args.contains("--local-iterate\n"))
@@ -2384,7 +2540,7 @@ func localIterateStreamsLiveNumbersDuringTheRun() throws {
     // score, heartbeats during long silent forwards, an immediate (redacted)
     // token-mismatch report, and a final summary block.
     let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeLocalIterate.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeLocalIterate.swift",
         encoding: .utf8
     )
 
@@ -2402,9 +2558,13 @@ func localIterateStreamsLiveNumbersDuringTheRun() throws {
     // the live decode status no longer reports expert bandwidth/hit-rate.
     #expect(!runtime.contains("expert_gb_per_token="))
     #expect(!runtime.contains("expert_hit_rate="))
-    #expect(runtime.contains("emitLocalIterateSummary(modeName: modeName, timing: timing, progress: progress)"))
-    // Baseline constants are printed up front so live speedups have context.
-    #expect(runtime.contains("official-runner constants; local speedups are directional"))
+    #expect(runtime.contains("emitLocalIterateSummary("))
+    #expect(runtime.contains("baselinePrefillSecondsPerToken:"))
+    #expect(runtime.contains("baselineDecodeSecondsPerToken:"))
+    // External Qwen calibration is printed once loaded; Gemma constants are
+    // never used for local Qwen speedups.
+    #expect(runtime.contains("Qwen golden baseline prefill_seconds_per_token="))
+    #expect(!runtime.contains("MLXFastConstants.officialBaseline"))
     // The immediate mismatch line must stay redacted like the shared error
     // path: no expected/actual token values in the progress stream.
     #expect(runtime.contains("expected/actual tokens are in the score JSON"))
@@ -2434,6 +2594,8 @@ func benchmarkScriptPrintsLocalSummaryWithBaselineComparison() throws {
 
     let score = root.appendingPathComponent("score.local-iterate.json")
     let integrity = root.appendingPathComponent("benchmark-integrity.local-iterate.json")
+    let golden = root.appendingPathComponent("qwen-local-summary-golden.json")
+    try "{}".write(to: golden, atomically: true, encoding: .utf8)
     let fakeSwift = root.appendingPathComponent("mlxfast-swift")
     try """
     #!/bin/sh
@@ -2468,6 +2630,7 @@ func benchmarkScriptPrintsLocalSummaryWithBaselineComparison() throws {
             "MLXFAST_SKIP_TRANSFORM": "1",
             "MLXFAST_SWIFT_BIN": fakeSwift.path,
             "MLXFAST_WEIGHTS_PATH": weights.path,
+            "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
             "MLXFAST_SCORE_PATH": score.path,
             "MLXFAST_INTEGRITY_PATH": integrity.path,
         ])
@@ -2528,11 +2691,11 @@ func localModesForwardWorkerStderrLiveButOfficialRunsDoNot() throws {
         encoding: .utf8
     )
     let worker = try String(
-        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeWorker.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeWorker.swift",
         encoding: .utf8
     )
     let options = try String(
-        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntime.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntime.swift",
         encoding: .utf8
     )
 
@@ -2574,6 +2737,8 @@ func benchmarkScriptLocalSummarySkipsQuietlyWithoutTimingMetrics() throws {
 
     let score = root.appendingPathComponent("score.local-iterate.json")
     let integrity = root.appendingPathComponent("benchmark-integrity.local-iterate.json")
+    let golden = root.appendingPathComponent("qwen-local-summary-golden.json")
+    try "{}".write(to: golden, atomically: true, encoding: .utf8)
     let fakeSwift = root.appendingPathComponent("mlxfast-swift")
     try """
     #!/bin/sh
@@ -2603,6 +2768,7 @@ func benchmarkScriptLocalSummarySkipsQuietlyWithoutTimingMetrics() throws {
         "MLXFAST_SKIP_TRANSFORM": "1",
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
         "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
         "MLXFAST_SCORE_PATH": score.path,
         "MLXFAST_INTEGRITY_PATH": integrity.path,
     ])
@@ -2654,12 +2820,9 @@ func benchmarkScriptRejectsPathFlagsBeforeForwardingToSwiftBenchmark() throws {
 
 @Test
 func benchmarkScriptFailsFastWithGuidanceWhenGoldenIsMissing() throws {
-    // The official mode needs the private oracle. When it is absent the
-    // script must exit BEFORE any build/transform work, with guidance pointing
-    // at the local modes -- not let the Swift harness die minutes later on a
-    // raw file-not-found error. Bare invocations default to --local-iterate.
-    // Run from an empty temp cwd so the repo's own fixtures (or an operator's
-    // local golden) cannot leak into the check.
+    // Every Qwen mode needs an explicitly supplied Qwen-tokenized oracle.
+    // Checked-in correctness_prompts are Gemma fixtures and must never become
+    // an implicit fallback.
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
     let benchmarkScript = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
@@ -2680,22 +2843,21 @@ func benchmarkScriptFailsFastWithGuidanceWhenGoldenIsMissing() throws {
         return (process.terminationStatus, String(data: stderrData, encoding: .utf8) ?? "")
     }
 
-    // Explicit --official without the private oracle: fail fast + guide.
+    // Explicit --official without a Qwen oracle fails before build/transform.
     let official = try runBare(["--official"])
     #expect(official.0 != 0)
-    #expect(official.1.contains("correctness_golden.json is missing"))
-    #expect(official.1.contains("--local-iterate"))
-    #expect(official.1.contains("--local-submit"))
+    #expect(official.1.contains("Qwen3.6 requires an explicit Qwen-tokenized correctness golden"))
+    #expect(official.1.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH"))
+    #expect(official.1.contains("correctness_prompts/ contains Gemma"))
+    #expect(official.1.contains("fixtures and is intentionally never selected"))
     // Failed before doing any work: no weights/ or score artifacts created.
     #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("score.json").path))
 
-    // Bare invocation defaults to --local-iterate; from an empty cwd the
-    // public fixture is absent, so it takes the re-sync branch (never the
-    // official-oracle guidance).
+    // Bare invocation resolves to local-iterate, then fails on the same
+    // explicit-Qwen-golden contract.
     let bare = try runBare([])
     #expect(bare.0 != 0)
-    #expect(bare.1.contains("correctness golden not found at"))
-    #expect(!bare.1.contains("correctness_golden.json is missing"))
+    #expect(bare.1.contains("Qwen3.6 requires an explicit Qwen-tokenized correctness golden"))
 
     // --official cannot be combined with local modes.
     let combined = try runBare(["--official", "--local-iterate"])
@@ -2711,17 +2873,16 @@ func benchmarkScriptFailsFastWithGuidanceWhenGoldenIsMissing() throws {
     #expect(overridden.1.contains("correctness golden not found at"))
     #expect(overridden.1.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH"))
 
-    // Local mode from a directory without the public fixtures: re-sync hint.
+    // Explicit local mode has no Gemma fallback either.
     let localIterate = try runBare(["--local-iterate"])
     #expect(localIterate.0 != 0)
-    #expect(localIterate.1.contains("correctness golden not found at"))
-    #expect(localIterate.1.contains("correctness_prompts/"))
+    #expect(localIterate.1.contains("Qwen3.6 requires an explicit Qwen-tokenized correctness golden"))
 }
 
 @Test
-func benchmarkScriptBareInvocationDefaultsToLocalIterate() throws {
-    // With the public fixtures present (repo-root cwd), a bare ./benchmark.sh
-    // must resolve to local-iterate and forward that mode to the Swift binary.
+func benchmarkScriptBareInvocationDefaultsToLocalIterateWithExplicitQwenGolden() throws {
+    // With an explicit external Qwen fixture, a bare ./benchmark.sh resolves
+    // to local-iterate and forwards that mode to the Swift binary.
     // The trusted-workflow env (MLXFAST_OFFICIAL_BENCHMARK_RUN=1) keeps its
     // official semantics without any flag, so CI needs no changes.
     let root = try temporaryDirectory()
@@ -2730,6 +2891,8 @@ func benchmarkScriptBareInvocationDefaultsToLocalIterate() throws {
     let weights = root.appendingPathComponent("weights")
     try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
     try "{}".write(to: weights.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+    let golden = root.appendingPathComponent("qwen-bare-golden.json")
+    try "{}".write(to: golden, atomically: true, encoding: .utf8)
 
     let argLog = root.appendingPathComponent("args.txt")
     let fakeSwift = root.appendingPathComponent("mlxfast-swift")
@@ -2759,6 +2922,7 @@ func benchmarkScriptBareInvocationDefaultsToLocalIterate() throws {
         "MLXFAST_SKIP_TRANSFORM": "1",
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
         "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
         "MLXFAST_SCORE_PATH": root.appendingPathComponent("score.json").path,
         "MLXFAST_INTEGRITY_PATH": root.appendingPathComponent("integrity.json").path,
     ])
@@ -2774,7 +2938,7 @@ func benchmarkScriptBareInvocationDefaultsToLocalIterate() throws {
     let args = try String(contentsOf: argLog, encoding: .utf8)
     #expect(args.contains("--local-iterate\n"))
     #expect(!args.contains("--official"))
-    #expect(args.contains("correctness_prompts/public_longcopy_gate_english_512_256.json\n"))
+    #expect(args.contains("\(golden.path)\n"))
 }
 
 @Test
@@ -3006,12 +3170,15 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
     let refWeights = root.appendingPathComponent("reference_weights")
     try FileManager.default.createDirectory(at: refWeights, withIntermediateDirectories: true)
     try FileManager.default.createSymbolicLink(
-        atPath: refWeights.appendingPathComponent("gemma-4-31b-4bit").path,
+        atPath: refWeights.appendingPathComponent("Qwen3.6-27B-4bit").path,
         withDestinationPath: root.appendingPathComponent("does-not-exist").path
     )
 
     // A real cache directory holding the checkpoint.
-    let cache = root.appendingPathComponent("hfcache/models--mlx-community--gemma-4-31b-4bit/snapshots/main")
+    let cache = root.appendingPathComponent(
+        "hfcache/models--mlx-community--Qwen3.6-27B-4bit/snapshots/"
+            + "c000ac2c2057d94be3fa931000c31723aac53282"
+    )
     try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
     try "{}".write(to: cache.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
 
@@ -3088,7 +3255,7 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
     let recorded = (try? String(contentsOf: reflog, encoding: .utf8)) ?? ""
     // The transform was handed the real cache dir, not the broken symlink.
     #expect(recorded.contains(cache.path))
-    #expect(!recorded.contains("reference_weights/gemma-4-31b-4bit"))
+    #expect(!recorded.contains("reference_weights/Qwen3.6-27B-4bit"))
 }
 
 @Test
@@ -3553,12 +3720,12 @@ func staticReviewFailsClosedOnSelfContradictoryPassedTrueWithHighSeverity() thro
     #expect(crossCheckBlock.contains("passed=\"false\""))
 }
 
-// GemmaRuntime was split across GemmaRuntime*.swift; concatenate them so
+// QwenRuntime was split across QwenRuntime*.swift; concatenate them so
 // source-level assertions stay agnostic to which split file the code lives in.
 private func harnessRuntimeSource() throws -> String {
     let directory = "Sources/MLXFastHarness"
     let files = try FileManager.default.contentsOfDirectory(atPath: directory)
-        .filter { $0.hasPrefix("GemmaRuntime") && $0.hasSuffix(".swift") }
+        .filter { $0.hasPrefix("QwenRuntime") && $0.hasSuffix(".swift") }
         .sorted()
     return try files
         .map { try String(contentsOfFile: "\(directory)/\($0)", encoding: .utf8) }

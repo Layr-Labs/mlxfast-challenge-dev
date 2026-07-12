@@ -1,252 +1,147 @@
-# mlxfast — Gemma 4 31B 4-bit Swift Challenge
+# mlxfast — Qwen3.6-27B Swift challenge
 
-Optimize Gemma 4 31B (dense, text tower, 4-bit) inference on Apple Silicon
-while preserving exact greedy output for the supplied correctness prompts.
+Optimize the frozen Qwen3.6-27B 4-bit text tower on Apple Silicon while
+preserving the observable Qwen model behavior required by the eventual
+correctness contract.
 
-## Contract
+## Frozen target
 
-Submissions are evaluated through the Swift harness:
+- Repository: `mlx-community/Qwen3.6-27B-4bit`
+- Revision: `c000ac2c2057d94be3fa931000c31723aac53282`
+- Internal architecture: `qwen3_5_text`
+- Runtime language: Swift with MLX
+- Scope: text tower only
+
+The transformed runtime inventory is exactly 1,847 tensors. Vision is dropped,
+and no `mtp.*` tensors exist in the checkpoint. Although the source config
+declares one MTP layer, MTP is disabled.
+
+## Branch readiness
+
+The active correctness baseline is the pinned library `Qwen35TextModel`.
+An editable custom Qwen implementation exists for future optimization, but its
+two production activation gates are hardcoded `false`.
+
+This branch is intentionally not officially rankable. The protected
+single-machine M5 workflow, checked-in `correctness_prompts/**`, private R2
+objects, GPQA references, semantic threshold, and paired baseline still belong
+to the Gemma benchmark. They remain untouched so an attempted Qwen official
+run fails closed. Gemma goldens must never be used for Qwen.
+
+## Local contract
+
+Build and transform the pinned Qwen snapshot:
 
 ```bash
 ./setup.sh
-./benchmark.sh --official
+
+MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
+  .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
+  --reference \
+  ".cache/huggingface/hub/models--mlx-community--Qwen3.6-27B-4bit/snapshots/c000ac2c2057d94be3fa931000c31723aac53282" \
+  --output weights
 ```
 
-(`--official` requires the organizer-provisioned hidden oracle; a bare
-`./benchmark.sh` defaults to the public `--local-iterate` mode.)
-
-The benchmark entrypoint:
-
-1. Builds `mlxfast-swift` when needed.
-2. Runs the Swift transform if `weights/` is missing or `MLXFAST_FORCE_TRANSFORM=1`.
-3. Runs the correctness gate against `correctness_golden.json`.
-4. Validates the benchmark prefill/decode tokens against the hidden benchmark
-   oracle in `correctness_golden.json`.
-5. Measures prefill latency, 128-token checked decode latency, and MLX peak
-   memory.
-6. Writes `score.json` in the Darkbloom-compatible schema, plus
-   `score.json.sha256` and `benchmark-integrity.json` audit sidecars.
-
-If required artifacts are missing, the harness writes a failed `score.json`
-rather than producing a ranked score.
-
-After transform, local users can run the checked-in public correctness gate with
-`.build/release/mlxfast-swift correctness --weights weights`. For benchmark
-iteration, `./benchmark.sh --local-iterate` uses that public 512-token prompt,
-checks the prefill next token plus 16 teacher-forced decode tokens, and writes
-the measured 512-token prefill and 16 one-token decode timings to
-`score.local-iterate.json`. That file's `score` is the local ESTIMATE
-(`decode_speedup^0.75 * prefill_speedup^0.25` vs the pinned `officialBaseline*`
-constants; `metrics.runtime` marks the local mode) so the Yukon participant CLI
-(`mlxfast run`), which requires a finite numeric `score`, can read it — it is a
-directional edit-loop signal, not a ranked score.
-For submit-loop iteration, `./benchmark.sh --local-submit` uses the same public
-512-token prompt as a longer pre-submit benchmark. It checks the prefill next
-token plus 1023 teacher-forced decode tokens from a longer public fixture, and
-writes and prints `score.json` with the same estimated local `score`; it is a
-directional local signal, not the official ranking run. Only the ranked
-runner's paired measurement produces the official score.
-
-> **M5-generated correctness fixtures.** `correctness_prompts/` contains
-> prompt/golden fixtures generated on the ranked M5 hardware against the
-> Gemma 4 31B 4-bit reference implementation (the Layr-Labs `mlx-swift-lm`
-> Gemma 4 text tower this package builds against). The 512-token prompts were
-> retokenized from the checked-in prompt text with the Gemma tokenizer, and
-> the expected continuation tokens were captured from the reference model's
-> greedy forward pass with `mlxfast-swift generate-golden` (256 expected
-> tokens for the local-iterate fixture, 1024 for the local-submit fixture;
-> the shorter fixture is a greedy prefix of the longer one by construction).
-> The hidden/private artifacts used by ranked runs (R2 golden, GPQA
-> references) were regenerated the same way through the organizer process.
-> One caveat for local work: near-tie greedy argmaxes can diverge across
-> Apple Silicon generations, so on non-M5 machines the local public gate may
-> fail for a correct build — local modes are directional, and the ranked M5
-> runner is the source of truth.
-
-## Model Artifacts
-
-By default, `setup.sh` stores the frozen reference checkpoint in a repo-local
-Hugging Face-style cache:
-
-```text
-.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main/
-```
-
-It also creates this compatibility symlink unless the path already exists:
-
-```text
-reference_weights/gemma-4-31b-4bit/
-```
-
-By default `setup.sh` downloads `mlx-community/gemma-4-31b-4bit` directly from
-Hugging Face with resumable `curl` requests. It checks cached files against
-the pinned SHA256 manifest and redownloads only missing, truncated, or
-hash-mismatched files. The safetensors payload is about 18.4 GB across 4
-shards; `setup.sh` requires 40 GiB free by default before starting. After a
-full verification, setup writes `.mlxfast-reference-cache.lock`; later setup
-runs use cheap size/mtime checks from that lock and skip the full checkpoint
-hash pass when the cache is unchanged. Set
-`MLXFAST_REFERENCE_CACHE_DIR` or `MLXFAST_REFERENCE_DIR` to a different local or
-mounted volume when needed, or set
-`MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1` when the checkpoint is provisioned externally.
-
-The Swift transform writes benchmark-ready weights here:
-
-```text
-weights/
-  config.json
-  model.safetensors.index.json
-  model-0000N-of-0000M.safetensors
-  tokenizer.json
-  tokenizer_config.json
-```
-
-The generated `weights/` tree is a compact runtime artifact set, not a second
-full copy of the checkpoint: it holds only the text-tower tensors (the
-`language_model.` prefix in the source checkpoint), with every
-vision/audio/multimodal-projector tensor dropped, plus a runtime-authored
-`config.json` (the flattened Gemma 4 `text_config` fields the runtime needs,
-plus the checkpoint's quantization metadata). There is no expert manifest --
-the whole model is one flat set of dense tensors loaded fully into RAM at
-init; there is no weight streaming of any kind. Submissions may adjust this
-overlay by changing both `Sources/MLXFastTransform/` and
-`Sources/MLXFastModel/`; correctness and benchmark results are the authority,
-not byte equality with the baseline layout.
-
-The public correctness-only prompt and golden are committed under
-`correctness_prompts/` so participants can run a local correctness smoke test
-(Gemma-generated; see the fixture note above). The timed benchmark token oracle
-is supplied by the benchmark operator and is intentionally not committed to
-the public repo:
-
-```text
-correctness_golden.json
-```
-
-Use `MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json` when the
-file is provisioned outside the repository root.
-Benchmark CI consumes the checked-in public golden for correctness-only runs and
-downloads the private precomputed golden from protected storage for full
-benchmark runs. Private prompt manifests and hidden benchmark goldens are not
-committed to the public repository. The workflow does not generate goldens;
-organizers regenerate them offline and upload the resulting file to protected
-storage.
-
-## Editable Surface
-
-The active editable surface is Swift-only and is defined by `benchmark.json`:
-
-| Path | Scope |
-|---|---|
-| `Sources/MLXFastModel/` | Gemma 4 31B 4-bit model implementation: attention (sliding-window + full, GQA, partial-rotary RoPE), gated MLP, RMSNorm, KV caches, dense weight loading, and prefill/decode execution. |
-| `Sources/MLXFastTransform/` | Offline safetensors transform (text-tensor selection, config/tokenizer emission). |
-
-`Sources/MLXFastCore/`, `Sources/MLXFastHarness/`,
-`Sources/MLXFastCLI/`, scripts, tests, `benchmark.json`, generated
-`weights/`, reference checkpoints, golden fixtures, and local scores are
-harness/operator files, not submission surface. Correctness, scoring, timing,
-golden generation, benchmark-oracle validation, and provenance checks live in
-that trusted harness layer.
-
-Account and submission management — login, clone, submit, and listing
-submissions — are handled by the **Yukon CLI (`mlxfast`)**, not by
-`mlxfast-swift`. The Swift binary now runs the benchmark domain only (transform,
-correctness, benchmark, preflight, verify-transform); it no longer logs in or
-uploads. The CLI installer defaults to `~/.local/bin`, so expose that directory
-in the current shell before using it. Submit with:
+Correctness and benchmark execution require an explicitly provisioned external
+Qwen golden:
 
 ```bash
-export PATH="${HOME}/.local/bin:${PATH}"
-mlxfast login <api-key> --api <url>
-mlxfast clone <benchmark-id-or-name>     # fresh checkout; an existing repo auto-links by its git remote
-mlxfast submit --model "<model name>" --note "..."
-mlxfast submissions
+export MLXFAST_CORRECTNESS_GOLDEN_PATH="/absolute/path/to/qwen-correctness-golden.json"
+
+.build/release/mlxfast-swift correctness \
+  --weights weights \
+  --golden "${MLXFAST_CORRECTNESS_GOLDEN_PATH}"
+
+./benchmark.sh --local-iterate
+./benchmark.sh --local-submit
 ```
 
-`mlxfast submit` reads `benchmark.json` and uploads only `editablePaths` as a
-gzip tar archive with bearer-token auth; the backend applies it to the frozen
-benchmark checkout and re-enforces the editable surface server-side before
-running hidden validation. `--model` is required and is recorded for the
-leaderboard; pass `--note-file PATH` or `--claimed-score N` as needed.
-The benchmark contract also declares a local `preSubmitCommand`:
-`./benchmark.sh --local-submit`. Yukon runs that command before upload so
-participants get a roughly 10-minute local correctness and timing check during
-the submit loop without running the full official hidden benchmark.
+Do not run the checked-in Gemma correctness prompts, and do not run
+`./benchmark.sh --official` expecting a Qwen score.
 
-`mlxfast-swift verify-transform` is an organizer/debug check for deterministic
-transform output. It re-runs the submitted transform and compares the generated
-`weights/` tree against that fresh run. It is not a baseline-layout requirement.
-The normal preflight/benchmark path also rejects generated `weights/` above the
-default 25 GiB transformed-output cap before correctness or timing runs (the
-text tower is about 17 GB, comfortably under that cap).
-Override it with `MLXFAST_MAX_WEIGHTS_BYTES`; `verify-transform` additionally
-accepts `--max-bytes`.
+The external golden must identify `"model_type": "qwen3_5_text"`. A benchmark
+oracle must provide both positive explicit Qwen values
+`baseline_prefill_seconds_per_token` and
+`baseline_decode_seconds_per_token`, unless the trusted caller supplies both
+paired-baseline overrides. Artifact preflight and the later benchmark use the
+same resolution rule.
 
-There is no Python harness path.
+## Verification
 
-## Correctness Gate
+```bash
+swift build -c release
+swift test
+MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test
+```
 
-Correctness is a hard gate. Each base golden case contains exactly 512 prompt
-token IDs and at least 64 expected continuation token IDs. The harness checks
-the first 64 continuation positions teacher-forced with temperature-zero
-behavior: after each accepted step it feeds the golden previous token back into
-the model. The first mismatch records only the case, step, expected token, and
-actual token in the failed report.
+When transformed real weights are available:
 
-The gate is intended as a first-stage filter: an implementation that fails it is
-not eligible for the longer benchmark.
+```bash
+MLXFAST_RUN_QWEN_REFERENCE_PARITY=1 \
+MLXFAST_QWEN_REFERENCE_WEIGHTS_PATH="/absolute/path/to/transformed-qwen-weights" \
+swift test --filter Qwen35ReferenceParityTests
+```
 
-Private golden fixtures may add hidden `correctness_gates` on top of the base
-teacher-forced cases:
+The optional parity test uses deterministic synthetic token IDs. It does not
+read `correctness_prompts`.
 
-- `anchors`: one-token checks at selected hidden contexts. These can require an
-  exact expected token, explicit accepted tokens, or a bounded top-logit rank
-  and delta for near-tie hardware cases.
-- `free_run`: short greedy continuations whose exact prefix must match. These
-  catch bugs that only appear when the model consumes its own generated tokens.
-- `behavior`: GPQA-style or instruction-following prompts whose answer is
-  checked exactly against precomputed accepted answer token sequences. Each
-  accepted answer sequence must have at most `max_new_tokens` tokens; shorter
-  sequences are matched as exact prefixes of the generated answer.
+## Architecture contract
 
-Full benchmark CI adds one more private layer after the correctness and gates
-pass (and before the timed measurement, which runs last on the ranked
-pipeline): it captures short answers for hidden GPQA cases and asks a Claude
-judge whether each candidate is semantically equivalent to the private
-reference answer. That semantic gate is pass/fail only and does not affect
-the timing score; its pass-count threshold is baseline-calibrated (see
-`MLXFastConstants.semanticGPQAMinPassCount`). The uploaded score records only
-aggregate semantic counts and the judge model name.
+The 64-layer dense model repeats three Gated DeltaNet layers and one global
+attention layer:
 
-The same hidden GPQA cases are also used for a TTFT guardrail: during the
-hidden behavior correctness pass, the workflow times prompt prefill through
-the first greedy answer token and verifies that the first token is accepted for
-that case. The uploaded score records only
-aggregate TTFT pass counts and timing statistics; first-token values and
-accepted token sets are not logged or artifacted.
+- hidden size: 5,120
+- dense SwiGLU intermediate size: 17,408
+- global attention: 24 query heads, four KV heads, 256-dimensional heads
+- partial RoPE: 64 of 256 dimensions, theta 10,000,000
+- linear attention: 48 value heads, 16 key heads, 128-dimensional heads
+- convolution kernel: four
+- quantization: affine 4-bit, group size 64
+- cache topology: 48 `MambaCache`, 16 `KVCacheSimple`
+- LM head: untied and explicitly quantized
 
-These layers keep the official gate mostly deterministic and token-based while
-adding a small semantic backstop against implementations that pass the exact
-prefix but damage answer meaning. The benchmark operator should keep private
-prompts, accepted answer sequences, reference answers, and judge transcripts
-outside the public repository.
+The model is fully RAM-resident after initialization. There is no expert
+streaming, file I/O, or weight paging on the inference path.
 
-The gate intentionally does not port a hidden-state comparison layer. The
-benchmark contract cares about the externally observable text-to-text Gemma 4
-output path, and hidden-state tensors are easier to make ambiguous around
-normalization/softcapping than token-level or logit-anchor checks.
+## Trusted timing boundaries
 
-VLM/image inputs, audio inputs, and speculative/MTP draft decoding are also
-out of scope for this challenge. Only the Gemma 4 text tower is in scope; the
-vision tower is never loaded or executed. These should only be added if the
-official benchmark contract changes to score those paths.
+Constructor warmup remains useful and prompt-independent. Before every new
+correctness, prefill, and decode sequence, the trusted worker request handler:
 
-The hidden golden file also includes a benchmark oracle. The benchmark validates
-the greedy token after the fixed 512-token prefill prompt, the greedy token
-after the fixed 512-token decode seed, and all 128 tokens produced inside the
-timed decode window before accepting a score.
+1. applies the trusted phase-start MLX cache limit;
+2. clears all free allocator buffers; and
+3. verifies `Memory.cacheMemory == 0`.
 
-## Score
+The parent timer starts before the request, so allocator reset cost is charged.
+No reset runs in `correctness_step` or `decode_step`; legitimate cache reuse
+inside an already-started sequence remains intact.
+
+Hidden semantic GPQA capture follows a collect-close-then-write boundary.
+While the submitted worker is alive, trusted code collects only generated
+tokens and a non-sensitive result. It closes and reaps the worker before
+constructing or writing the bundle containing hidden prompts, answer keys, or
+reference answers.
+
+No `startStep` correctness slicing or editable decode-delay hook is permitted.
+The scored decode path must invoke the same editable model entry points used by
+correctness.
+
+## Editable surface
+
+Only:
+
+```text
+Sources/MLXFastModel/
+Sources/MLXFastTransform/
+```
+
+Optimize Qwen attention, Gated DeltaNet, dense SwiGLU, quantized matmul,
+cache handling, tensor layout, and MLX scheduling. Do not specialize for test
+token IDs, prompts, or harness repetition.
+
+## Score contract
+
+The formula remains:
 
 ```text
 decode_speedup = baseline_decode_sec_per_token / decode_sec_per_token
@@ -254,54 +149,48 @@ prefill_speedup = baseline_prefill_sec_per_token / prefill_sec_per_token
 score = decode_speedup^0.75 * prefill_speedup^0.25
 ```
 
-Higher is better. The ranked score is paired: the baseline is the pinned
-Gemma 4 31B 4-bit reference implementation, measured on the same self-hosted
-M5 box in the same session as the candidate (each timed phase behind the same
-fixed 40C thermal gate, with telemetry-validated acceptance), so an
-unmodified reference scores about `1.0` and host drift cancels out of the
-ratio. Decode is weighted more heavily because it dominates interactive
-generation, while prefill still contributes to the ranked score.
-The official run also enforces component floors:
+The component floors remain:
 
 ```text
 decode_speedup >= 0.95
 prefill_speedup >= 0.95
 ```
 
-On ranked runs both floors are priced against that live same-session paired
-baseline. A run below either floor fails eligibility even if the weighted
-score would otherwise be above baseline. The
-`MLXFastConstants.officialBaseline*` constants feed local-mode estimates only
-(see `docs/benchmark-window-freeze.md` for the measurement contract); on
-those local-mode constants, the floors correspond to at most
+The current constants imply local ceiling values of
 `0.14064626165296054` seconds/token for decode and
-`0.011163191525904606` seconds/token for prefill.
+`0.011163191525904606` seconds/token for prefill. They are inherited
+Gemma-calibrated constants, not Qwen baselines. Qwen benchmark execution
+therefore requires explicit external values. The current windows contain 64
+correctness steps and 128 decode steps.
 
-The whole model is RAM-resident with no weight streaming, so
-`bandwidth_gb_per_token` is always `0`, reported with
-`bandwidth_source=ram_resident_model`. RAM and phase-timing metrics are
-diagnostics and guardrail candidates, not primary score factors.
-`score.json` also carries audit-only wall-clock phase timings, final process RSS,
-zeroed expert-streaming counters (kept for score-schema stability), and
-transformed-weights digest fields. These values help operators review runs but
-do not change the score formula.
+The dense runtime reports `bandwidth_source=ram_resident_model` and
+`bandwidth_gb_per_token=0`.
 
-## Useful Commands
+## Operator blockers
+
+Official Qwen ranking remains unavailable until an M5 operator:
+
+1. provisions and verifies the exact Qwen checkpoint;
+2. runs real-checkpoint parity;
+3. regenerates public and hidden Qwen goldens from unchanged prompt text;
+4. regenerates Qwen GPQA references and calibrates semantic/TTFT thresholds;
+5. pins a Qwen baseline ref/identity and regenerates calibration/oracle state;
+6. updates protected workflow reference paths, manifests, R2 paths, hashes,
+   byte counts, and the expected 64-layer identity; and
+7. executes the full M5 correctness and thermally gated paired measurement.
+
+See `docs/qwen3.6-operator-handoff.md` for exact stale protected values and the
+ordered handoff.
+
+## Submission tooling
+
+The Yukon client is installed separately:
 
 ```bash
-swift test
-MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test
-swift build -c release
-MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --output weights
-.build/release/mlxfast-swift correctness --weights weights
-.build/release/mlxfast-swift preflight
-.build/release/mlxfast-swift benchmark --local-iterate
-.build/release/mlxfast-swift benchmark --score-path score.json
-.build/release/mlxfast-swift benchmark --local-submit --score-path score.json
-.build/release/mlxfast-swift verify-transform
-
-# Submitting is done with the Yukon CLI (mlxfast), not mlxfast-swift:
+export PATH="${HOME}/.local/bin:${PATH}"
+mlxfast login <api-key> --api <url>
 mlxfast clone <benchmark-id-or-name>
-mlxfast submit --model "<model name>" --note "..."
 mlxfast submissions
 ```
+
+Do not submit this branch for official ranking before the operator migration.

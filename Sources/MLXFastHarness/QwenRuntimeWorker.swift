@@ -1,0 +1,1428 @@
+import CryptoKit
+import Darwin
+import Foundation
+import MLX
+import MLXFastCore
+import MLXFastModel
+import Tokenizers
+
+// QwenRuntime is split across QwenRuntime*.swift for auditability.
+// Generated split; behavior identical to the original single file.
+
+extension QwenRuntime {
+    public static func runWorker(weightsPath: String) throws {
+        // Move the protocol away from fd 0/1 before any editable model code
+        // runs. Startup validation and model construction may log or otherwise
+        // use standard I/O; none of that may be confused with protocol traffic.
+        let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
+        try validateRuntimeWorkerPinnedConfiguration(weightsPath: weightsPath)
+        let config = try Qwen35Config.load(from: weightsPath)
+        let loader = try Qwen35WeightLoader(weightsPath: weightsPath)
+        // Validate transformed-weight structure HERE, inside the sandboxed worker,
+        // rather than in the trusted parent. These checks execute editable
+        // MLXFastModel code (DenseTensorStore / Qwen35WeightLoader); the parent
+        // used to run the equivalent via BenchmarkPreflight.check, which meant
+        // submitted code ran in the unsandboxed process that authors score.json.
+        // Failing here throws before the protocol hello below, so the parent's
+        // worker client sees the worker fail to start and records a failed
+        // benchmark -- same coverage, no submitted code in the score-writing
+        // parent.
+        try loader.denseStore.validateReadableByteRanges()
+        try loader.validateRequiredMetadata(config: config)
+        let weightCache = Qwen35RuntimeWeightCache(loader: loader, config: config)
+        try weightCache.validateSelectedBackend()
+        let decoder = JSONDecoder()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        let sessionNonce = generateRuntimeWorkerNonce()
+        // expertStats is always the zero struct for this RAM-resident dense
+        // runtime (no expert-streaming machinery); kept in the protocol hello
+        // so the schema/field shape stays unchanged from earlier submissions.
+        try protocolIO.writeLine(try encoder.encode(RuntimeWorkerResponse(
+            id: 0,
+            nonce: sessionNonce,
+            ok: true,
+            expertStats: expertStats(from: weightCache)
+        )))
+        var state = RuntimeWorkerState()
+
+        while let line = try protocolIO.readLine() {
+            guard !line.isEmpty else {
+                continue
+            }
+            let response: RuntimeWorkerResponse
+            do {
+                let request = try decoder.decode(RuntimeWorkerRequest.self, from: Data(line.utf8))
+                do {
+                    response = try executeRuntimeWorkerRequest(
+                        kind: request.kind,
+                        state: &state
+                    ) { requestState in
+                        try handleWorkerRequest(
+                            request,
+                            sessionNonce: sessionNonce,
+                            weightCache: weightCache,
+                            state: &requestState
+                        )
+                    }
+                } catch {
+                    response = RuntimeWorkerResponse(
+                        id: request.id,
+                        nonce: sessionNonce,
+                        ok: false,
+                        error: "\(error)"
+                    )
+                }
+            } catch {
+                state.discardSession(afterFailedRequest: "malformed")
+                response = RuntimeWorkerResponse(id: -1, nonce: sessionNonce, ok: false, error: "\(error)")
+            }
+            let data = try encoder.encode(response)
+            try protocolIO.writeLine(data)
+        }
+    }
+
+    /// Trusted allocator state applied at the START of every new worker forward
+    /// sequence, after the parent has already started the phase timer.
+    /// Submitted MLXFastModel code runs during worker initialization and may
+    /// change the process-global MLX cache policy, so the trusted request
+    /// handler re-normalizes the allocator at the sequence boundary.
+    ///
+    /// Scope: the boundary only. This is NOT an enforced cap for the rest of
+    /// the phase -- editable code may change `Memory.cacheLimit` again inside
+    /// the charged window, and any allocation that follows is charged like all
+    /// other work. The substantive defense is `Memory.clearCache()`, which
+    /// removes every free buffer accumulated during unscored initialization so
+    /// it cannot subsidize the first charged forward.
+    static let trustedRuntimeWorkerPhaseStartCacheLimitBytes = 6 << 30
+
+    static func resetRuntimeWorkerAllocatorForPhaseStart() throws {
+        Memory.cacheLimit = trustedRuntimeWorkerPhaseStartCacheLimitBytes
+        Memory.clearCache()
+        let remainingCacheBytes = Memory.cacheMemory
+        // The pinned MLX clearCache contract synchronously deallocates every
+        // cached (free) buffer under its evaluation lock. Live model weights
+        // and KV state are active memory, not cacheMemory, so exact zero is the
+        // safe fail-closed postcondition rather than a tolerance. This also
+        // makes "no MLX allocator activity in flight across a request
+        // boundary" part of the submission contract: background work that
+        // repopulates the cache here fails the run closed.
+        guard remainingCacheBytes == 0 else {
+            throw MLXFastError.invalidInput(
+                "runtime worker failed to clear the MLX allocator cache at phase start"
+            )
+        }
+    }
+
+    static func handleWorkerRequest(
+        _ request: RuntimeWorkerRequest,
+        sessionNonce: String,
+        weightCache: Qwen35RuntimeWeightCache,
+        state: inout RuntimeWorkerState
+    ) throws -> RuntimeWorkerResponse {
+        switch request.kind {
+        case "correctness":
+            guard let promptTokens = request.promptTokens, let steps = request.steps else {
+                throw MLXFastError.invalidInput("runtime worker correctness request missing prompt_tokens or steps")
+            }
+            try resetRuntimeWorkerAllocatorForPhaseStart()
+            let tokens = try generateGreedyCached(
+                promptTokens: promptTokens,
+                steps: steps,
+                weightCache: weightCache
+            )
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                tokens: tokens,
+                expertStats: expertStats(from: weightCache),
+                peakRamGB: peakResidentMemoryGB()
+            )
+
+        case "correctness_begin":
+            guard let promptTokens = request.promptTokens else {
+                throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing prompt_tokens")
+            }
+            try resetRuntimeWorkerAllocatorForPhaseStart()
+            let cache = Qwen35ModelCache(config: weightCache.config)
+            let logits = try Qwen35Model.logits(
+                inputIDs: inputIDsArray(promptTokens),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: 0
+            )
+            let token = try QwenCorrectness.greedyToken(from: logits)
+            state.correctnessCache = cache
+            state.correctnessPromptTokenCount = promptTokens.count
+            state.correctnessStep = 0
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                token: token,
+                topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
+                expertStats: expertStats(from: weightCache),
+                peakRamGB: peakResidentMemoryGB()
+            )
+
+        case "correctness_step":
+            guard let previousToken = request.token else {
+                throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing token")
+            }
+            guard let cache = state.correctnessCache else {
+                throw MLXFastError.invalidInput("runtime worker teacher-forced correctness step before begin")
+            }
+            let logits = try Qwen35Model.logits(
+                inputIDs: inputIDsArray([previousToken]),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: state.correctnessPromptTokenCount + state.correctnessStep
+            )
+            let token = try QwenCorrectness.greedyToken(from: logits)
+            state.correctnessStep += 1
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                token: token,
+                topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
+                expertStats: expertStats(from: weightCache),
+                peakRamGB: peakResidentMemoryGB()
+            )
+
+        case "prefill":
+            guard let promptTokens = request.promptTokens else {
+                throw MLXFastError.invalidInput("runtime worker prefill request missing prompt_tokens")
+            }
+            try resetRuntimeWorkerAllocatorForPhaseStart()
+            let cache = Qwen35ModelCache(config: weightCache.config)
+            let logits = try Qwen35Model.logits(
+                inputIDs: inputIDsArray(promptTokens),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: 0
+            )
+            eval(logits)
+            let token = try QwenCorrectness.greedyToken(from: logits)
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                token: token
+            )
+
+        case "decode_begin":
+            guard let seedTokens = request.seedTokens else {
+                throw MLXFastError.invalidInput("runtime worker decode_begin request missing seed_tokens")
+            }
+            try resetRuntimeWorkerAllocatorForPhaseStart()
+            // Exactly one whole-prompt (seed) forward runs here, with NO preceding
+            // warmup pass. The decode measurement deliberately charges this seed
+            // prefill to the decode phase (see measureWorkerDecode). A second,
+            // identical whole-prompt forward -- the warmup this used to run before
+            // the seed -- let submitted model code memoize one pass and serve the
+            // other from that memo (both had the same tokens at offset 0), so two
+            // charged forwards collapsed into one and inflated decode_speedup with
+            // no real speedup. The trusted harness cannot force editable code to
+            // recompute a forward it issues, so the only robust defense is to never
+            // issue two identical forwards in the timed window: with a single seed
+            // forward there is no identical predecessor to reuse, and the 128
+            // single-token decode steps are input-dependent and cannot be
+            // precomputed. Prefill/decode/correctness each run in their own worker
+            // process, so no model-owned memo persists across phases; the trusted
+            // reset above separately removes allocator free-buffer state.
+            let cache = Qwen35ModelCache(config: weightCache.config)
+            let logits = try Qwen35Model.logits(
+                inputIDs: inputIDsArray(seedTokens),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: 0
+            )
+            let token = try QwenCorrectness.greedyToken(from: logits)
+            let seedToken = token
+            cache.materializeCachedState()
+            state.decodeCache = cache
+            state.decodeSeedTokenCount = seedTokens.count
+            state.decodeStep = 0
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                seedToken: seedToken
+            )
+
+        case "decode_step":
+            guard let inputToken = request.token else {
+                throw MLXFastError.invalidInput("runtime worker decode_step request missing token")
+            }
+            guard let cache = state.decodeCache else {
+                throw MLXFastError.invalidInput("runtime worker decode_step before decode_begin")
+            }
+            // decode_step invokes only the same editable entry points the
+            // correctness path invokes (Qwen35Model.logits / greedyToken); it
+            // must never call an editable hook that is unique to the scored
+            // decode path. The former editable decode-delay knob (removed) was
+            // exactly such a phase oracle: because submitted model code is
+            // editable, the mere fact that it was invoked ONLY on the timed
+            // decode path told the submission "I am being scored now", which
+            // lets it serve a slow/correct path while checked and a cheap path
+            // while timed. Keep trusted->editable calls phase-agnostic.
+            let logits = try Qwen35Model.logits(
+                inputIDs: inputIDsArray([inputToken]),
+                weightCache: weightCache,
+                cache: cache,
+                positionOffset: state.decodeSeedTokenCount + state.decodeStep
+            )
+            let token = try QwenCorrectness.greedyToken(from: logits)
+            state.decodeStep += 1
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                token: token
+            )
+
+        case "phase_diagnostics":
+            let peakRamGB = peakResidentMemoryGB()
+            let stats = expertStats(from: weightCache)
+            Memory.clearCache()
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                expertStats: stats,
+                peakRamGB: peakRamGB
+            )
+
+        default:
+            throw MLXFastError.invalidInput("runtime worker received unknown request kind \(request.kind)")
+        }
+    }
+
+}
+
+private struct RuntimeWorkerPinnedConfiguration: Decodable {
+    let modelType: String
+    let vocabSize: Int
+    let hiddenSize: Int
+    let intermediateSize: Int
+    let numHiddenLayers: Int
+    let numAttentionHeads: Int
+    let numKeyValueHeads: Int
+    let headDim: Int
+    let linearNumValueHeads: Int
+    let linearNumKeyHeads: Int
+    let linearValueHeadDim: Int
+    let linearKeyHeadDim: Int
+    let linearConvKernelDim: Int
+    let fullAttentionInterval: Int
+    let layerTypes: [String]
+    let rmsNormEps: Double
+    let hiddenActivation: String
+    let maxPositionEmbeddings: Int
+    let attentionBias: Bool
+    let attentionDropout: Double
+    let attentionOutputGate: Bool
+    let outputGateType: String
+    let bosTokenID: Int
+    let eosTokenID: Int
+    let initializerRange: Double
+    let padTokenID: Int?
+    let tieWordEmbeddings: Bool
+    let mambaSSMDType: String
+    let dtype: String
+    let useCache: Bool
+    let partialRotaryFactor: Double
+    let ropeParameters: RuntimeWorkerPinnedRopeParameters
+    let quantization: RuntimeWorkerPinnedQuantization
+    let mtpNumHiddenLayers: Int
+    let mtpUseDedicatedEmbeddings: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case modelType = "model_type"
+        case vocabSize = "vocab_size"
+        case hiddenSize = "hidden_size"
+        case intermediateSize = "intermediate_size"
+        case numHiddenLayers = "num_hidden_layers"
+        case numAttentionHeads = "num_attention_heads"
+        case numKeyValueHeads = "num_key_value_heads"
+        case headDim = "head_dim"
+        case linearNumValueHeads = "linear_num_value_heads"
+        case linearNumKeyHeads = "linear_num_key_heads"
+        case linearValueHeadDim = "linear_value_head_dim"
+        case linearKeyHeadDim = "linear_key_head_dim"
+        case linearConvKernelDim = "linear_conv_kernel_dim"
+        case fullAttentionInterval = "full_attention_interval"
+        case layerTypes = "layer_types"
+        case rmsNormEps = "rms_norm_eps"
+        case hiddenActivation = "hidden_act"
+        case maxPositionEmbeddings = "max_position_embeddings"
+        case attentionBias = "attention_bias"
+        case attentionDropout = "attention_dropout"
+        case attentionOutputGate = "attn_output_gate"
+        case outputGateType = "output_gate_type"
+        case bosTokenID = "bos_token_id"
+        case eosTokenID = "eos_token_id"
+        case initializerRange = "initializer_range"
+        case padTokenID = "pad_token_id"
+        case tieWordEmbeddings = "tie_word_embeddings"
+        case mambaSSMDType = "mamba_ssm_dtype"
+        case dtype
+        case useCache = "use_cache"
+        case partialRotaryFactor = "partial_rotary_factor"
+        case ropeParameters = "rope_parameters"
+        case quantization
+        case mtpNumHiddenLayers = "mtp_num_hidden_layers"
+        case mtpUseDedicatedEmbeddings = "mtp_use_dedicated_embeddings"
+    }
+}
+
+private struct RuntimeWorkerPinnedRopeParameters: Decodable {
+    let ropeTheta: Double
+    let ropeType: String
+    let partialRotaryFactor: Double
+    let mropeInterleaved: Bool
+    let mropeSection: [Int]
+
+    enum CodingKeys: String, CodingKey {
+        case ropeTheta = "rope_theta"
+        case ropeType = "rope_type"
+        case partialRotaryFactor = "partial_rotary_factor"
+        case mropeInterleaved = "mrope_interleaved"
+        case mropeSection = "mrope_section"
+    }
+}
+
+private struct RuntimeWorkerPinnedQuantization: Decodable, Equatable {
+    let bits: Int
+    let groupSize: Int
+    let mode: String
+
+    enum CodingKeys: String, CodingKey {
+        case bits
+        case groupSize = "group_size"
+        case mode
+    }
+}
+
+func validateRuntimeWorkerPinnedConfiguration(weightsPath: String) throws {
+    let path = URL(fileURLWithPath: weightsPath).appendingPathComponent("config.json")
+    let values = try path.resourceValues(
+        forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey]
+    )
+    let maximumConfigByteCount = 1 * 1024 * 1024
+    guard values.isRegularFile == true,
+          values.isSymbolicLink != true,
+          let byteCount = values.fileSize,
+          byteCount > 0,
+          byteCount <= maximumConfigByteCount
+    else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json must be a non-symlink regular file no larger than \(maximumConfigByteCount) bytes"
+        )
+    }
+    try validateRuntimeWorkerPinnedConfigurationData(Data(contentsOf: path))
+}
+
+func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
+    try validateRuntimeWorkerPinnedConfigurationSchema(data)
+
+    let decoded: RuntimeWorkerPinnedConfiguration
+    do {
+        decoded = try JSONDecoder().decode(RuntimeWorkerPinnedConfiguration.self, from: data)
+    } catch {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json is missing or has invalid pinned architecture fields"
+        )
+    }
+
+    let expectedLayerTypes = (0..<MLXFastConstants.numHiddenLayers).map {
+        $0 % 4 == 3 ? "full_attention" : "linear_attention"
+    }
+    guard decoded.modelType == "qwen3_5_text",
+          decoded.vocabSize == MLXFastConstants.vocabSize,
+          decoded.hiddenSize == MLXFastConstants.hiddenSize,
+          decoded.intermediateSize == MLXFastConstants.intermediateSize,
+          decoded.numHiddenLayers == MLXFastConstants.numHiddenLayers,
+          decoded.numAttentionHeads == MLXFastConstants.attentionHeads,
+          decoded.numKeyValueHeads == 4,
+          decoded.headDim == 256,
+          decoded.linearNumValueHeads == 48,
+          decoded.linearNumKeyHeads == 16,
+          decoded.linearValueHeadDim == 128,
+          decoded.linearKeyHeadDim == 128,
+          decoded.linearConvKernelDim == 4,
+          decoded.fullAttentionInterval == 4,
+          decoded.layerTypes == expectedLayerTypes,
+          decoded.rmsNormEps == 1e-6,
+          decoded.hiddenActivation == "silu",
+          decoded.maxPositionEmbeddings == 262_144,
+          decoded.attentionBias == false,
+          decoded.attentionDropout == 0,
+          decoded.attentionOutputGate,
+          decoded.outputGateType == "swish",
+          decoded.bosTokenID == 248_044,
+          decoded.eosTokenID == 248_044,
+          decoded.initializerRange == 0.02,
+          decoded.padTokenID == nil,
+          decoded.tieWordEmbeddings == false,
+          decoded.mambaSSMDType == "float32",
+          decoded.dtype == "bfloat16",
+          decoded.useCache,
+          decoded.partialRotaryFactor == 0.25,
+          decoded.ropeParameters.ropeTheta == 10_000_000,
+          decoded.ropeParameters.ropeType == "default",
+          decoded.ropeParameters.partialRotaryFactor == 0.25,
+          decoded.ropeParameters.mropeInterleaved,
+          decoded.ropeParameters.mropeSection == [11, 11, 10],
+          decoded.quantization.bits == 4,
+          decoded.quantization.groupSize == 64,
+          decoded.quantization.mode == "affine",
+          decoded.mtpNumHiddenLayers == 1,
+          decoded.mtpUseDedicatedEmbeddings == false
+    else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json does not match the pinned Qwen3.6 qwen3_5_text architecture"
+        )
+    }
+}
+
+private func validateRuntimeWorkerPinnedConfigurationSchema(
+    _ data: Data
+) throws {
+    let json: Any
+    do {
+        json = try JSONSerialization.jsonObject(with: data)
+    } catch {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json must contain valid JSON"
+        )
+    }
+    guard let root = json as? [String: Any] else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json must be a JSON object"
+        )
+    }
+
+    try requireExactRuntimeWorkerKeys(
+        Set(root.keys),
+        expected: [
+            "attention_bias",
+            "attention_dropout",
+            "attn_output_gate",
+            "bos_token_id",
+            "dtype",
+            "eos_token_id",
+            "full_attention_interval",
+            "head_dim",
+            "hidden_act",
+            "hidden_size",
+            "initializer_range",
+            "intermediate_size",
+            "layer_types",
+            "linear_conv_kernel_dim",
+            "linear_key_head_dim",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "linear_value_head_dim",
+            "mamba_ssm_dtype",
+            "max_position_embeddings",
+            "model_type",
+            "mtp_num_hidden_layers",
+            "mtp_use_dedicated_embeddings",
+            "num_attention_heads",
+            "num_hidden_layers",
+            "num_key_value_heads",
+            "output_gate_type",
+            "pad_token_id",
+            "partial_rotary_factor",
+            "quantization",
+            "rms_norm_eps",
+            "rope_parameters",
+            "tie_word_embeddings",
+            "use_cache",
+            "vocab_size",
+        ],
+        field: "runtime worker config.json"
+    )
+
+    guard root["pad_token_id"] is NSNull else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json pad_token_id must be null"
+        )
+    }
+    guard let rope = root["rope_parameters"] as? [String: Any] else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json rope_parameters must be an object"
+        )
+    }
+    try requireExactRuntimeWorkerKeys(
+        Set(rope.keys),
+        expected: [
+            "mrope_interleaved",
+            "mrope_section",
+            "partial_rotary_factor",
+            "rope_theta",
+            "rope_type",
+        ],
+        field: "runtime worker config.json rope_parameters"
+    )
+
+    guard let quantization = root["quantization"] as? [String: Any] else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json quantization must be an object"
+        )
+    }
+    try requireExactRuntimeWorkerKeys(
+        Set(quantization.keys),
+        expected: ["bits", "group_size", "mode"],
+        field: "runtime worker config.json quantization"
+    )
+}
+
+private func requireExactRuntimeWorkerKeys(
+    _ actual: Set<String>,
+    expected: Set<String>,
+    field: String
+) throws {
+    let missing = expected.subtracting(actual).sorted()
+    let unexpected = actual.subtracting(expected).sorted()
+    guard missing.isEmpty, unexpected.isEmpty else {
+        throw MLXFastError.invalidInput(
+            "\(field) schema mismatch: missing=\(missing), "
+                + "unexpected=\(unexpected)"
+        )
+    }
+}
+
+struct RuntimeWorkerRequest: Codable {
+    let id: Int
+    let kind: String
+    let promptTokens: [Int]?
+    let token: Int?
+    let seedTokens: [Int]?
+    let steps: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case kind
+        case promptTokens = "prompt_tokens"
+        case token
+        case seedTokens = "seed_tokens"
+        case steps
+    }
+}
+
+struct RuntimeWorkerState {
+    var correctnessCache: Qwen35ModelCache?
+    var correctnessPromptTokenCount = 0
+    var correctnessStep = 0
+    var decodeCache: Qwen35ModelCache?
+    var decodeSeedTokenCount = 0
+    var decodeStep = 0
+
+    mutating func discardSession(afterFailedRequest kind: String) {
+        switch kind {
+        case "correctness", "correctness_begin", "correctness_step":
+            correctnessCache = nil
+            correctnessPromptTokenCount = 0
+            correctnessStep = 0
+        case "prefill", "decode_begin", "decode_step":
+            decodeCache = nil
+            decodeSeedTokenCount = 0
+            decodeStep = 0
+        default:
+            correctnessCache = nil
+            correctnessPromptTokenCount = 0
+            correctnessStep = 0
+            decodeCache = nil
+            decodeSeedTokenCount = 0
+            decodeStep = 0
+        }
+    }
+}
+
+func executeRuntimeWorkerRequest<Result>(
+    kind: String,
+    state: inout RuntimeWorkerState,
+    operation: (inout RuntimeWorkerState) throws -> Result
+) throws -> Result {
+    do {
+        return try operation(&state)
+    } catch {
+        // A model call may have advanced lazy KV/recurrent cache metadata
+        // before a later validation or output failure. Never let a caught
+        // protocol error make that session reusable.
+        state.discardSession(afterFailedRequest: kind)
+        throw error
+    }
+}
+
+struct RuntimeWorkerResponse: Codable {
+    let id: Int
+    let nonce: String?
+    let ok: Bool
+    let error: String?
+    let token: Int?
+    let topLogits: [CorrectnessTraceLogit]?
+    let seedToken: Int?
+    let tokens: [Int]?
+    let expertStats: ExpertStreamingStats?
+    let peakRamGB: Double?
+
+    init(
+        id: Int,
+        nonce: String? = nil,
+        ok: Bool,
+        error: String? = nil,
+        token: Int? = nil,
+        topLogits: [CorrectnessTraceLogit]? = nil,
+        seedToken: Int? = nil,
+        tokens: [Int]? = nil,
+        expertStats: ExpertStreamingStats? = nil,
+        peakRamGB: Double? = nil
+    ) {
+        self.id = id
+        self.nonce = nonce
+        self.ok = ok
+        self.error = error
+        self.token = token
+        self.topLogits = topLogits
+        self.seedToken = seedToken
+        self.tokens = tokens
+        self.expertStats = expertStats
+        self.peakRamGB = peakRamGB
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case nonce
+        case ok
+        case error
+        case token
+        case topLogits = "top_logits"
+        case seedToken = "seed_token"
+        case tokens
+        case expertStats = "expert_stats"
+        case peakRamGB = "peak_ram_gb"
+    }
+}
+
+final class BufferedFileLineReader {
+    static let defaultMaximumLineByteCount = 4 * 1024 * 1024
+
+    private let handle: FileHandle
+    private let maximumLineByteCount: Int
+    private var buffer = Data()
+
+    init(
+        handle: FileHandle,
+        maximumLineByteCount: Int = BufferedFileLineReader.defaultMaximumLineByteCount
+    ) {
+        self.handle = handle
+        self.maximumLineByteCount = maximumLineByteCount
+    }
+
+    func readLine() throws -> Data? {
+        guard maximumLineByteCount > 0 else {
+            throw MLXFastError.invalidInput("runtime worker protocol line limit must be positive")
+        }
+        while true {
+            if let newlineIndex = buffer.firstIndex(of: 0x0a) {
+                let lineByteCount = buffer.distance(from: buffer.startIndex, to: newlineIndex)
+                guard lineByteCount <= maximumLineByteCount else {
+                    throw MLXFastError.invalidInput(
+                        "runtime worker protocol line exceeds \(maximumLineByteCount) bytes"
+                    )
+                }
+                let line = Data(buffer.prefix(lineByteCount))
+                buffer.removeSubrange(buffer.startIndex...newlineIndex)
+                return line
+            }
+            guard buffer.count <= maximumLineByteCount else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker protocol line exceeds \(maximumLineByteCount) bytes"
+                )
+            }
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                guard !buffer.isEmpty else {
+                    return nil
+                }
+                guard buffer.count <= maximumLineByteCount else {
+                    throw MLXFastError.invalidInput(
+                        "runtime worker protocol line exceeds \(maximumLineByteCount) bytes"
+                    )
+                }
+                defer { buffer.removeAll(keepingCapacity: true) }
+                return buffer
+            }
+            buffer.append(chunk)
+        }
+    }
+}
+
+final class RuntimeWorkerProtocolIO {
+    private let input: BufferedFileLineReader
+    private let output: FileHandle
+
+    private init(inputDescriptor: Int32, outputDescriptor: Int32) {
+        self.input = BufferedFileLineReader(
+            handle: FileHandle(fileDescriptor: inputDescriptor, closeOnDealloc: true)
+        )
+        self.output = FileHandle(fileDescriptor: outputDescriptor, closeOnDealloc: true)
+    }
+
+    static func isolatingStandardIO() throws -> RuntimeWorkerProtocolIO {
+        let descriptors = try duplicateRuntimeWorkerProtocolDescriptors(
+            inputDescriptor: STDIN_FILENO,
+            outputDescriptor: STDOUT_FILENO
+        )
+        let inputFD = descriptors.input
+        let outputFD = descriptors.output
+        do {
+            try redirectDescriptorToDevNull(STDIN_FILENO, flags: O_RDONLY, label: "stdin")
+            try redirectDescriptorToDevNull(STDOUT_FILENO, flags: O_WRONLY, label: "stdout")
+        } catch {
+            close(inputFD)
+            close(outputFD)
+            throw error
+        }
+        return RuntimeWorkerProtocolIO(inputDescriptor: inputFD, outputDescriptor: outputFD)
+    }
+
+    func readLine() throws -> String? {
+        guard let data = try input.readLine() else {
+            return nil
+        }
+        guard let line = String(data: data, encoding: .utf8) else {
+            throw MLXFastError.invalidInput("runtime worker received non-UTF8 protocol input")
+        }
+        return line
+    }
+
+    func writeLine(_ data: Data) throws {
+        try output.write(contentsOf: data)
+        try output.write(contentsOf: Data([0x0a]))
+    }
+}
+
+func duplicateRuntimeWorkerProtocolDescriptors(
+    inputDescriptor: Int32,
+    outputDescriptor: Int32,
+    duplicate: (_ descriptor: Int32, _ label: String) throws -> Int32 = duplicatePrivateDescriptor,
+    closeDescriptor: (_ descriptor: Int32) -> Void = { _ = Darwin.close($0) }
+) throws -> (input: Int32, output: Int32) {
+    let input = try duplicate(inputDescriptor, "stdin")
+    do {
+        let output = try duplicate(outputDescriptor, "stdout")
+        return (input: input, output: output)
+    } catch {
+        closeDescriptor(input)
+        throw error
+    }
+}
+
+func duplicatePrivateDescriptor(_ descriptor: Int32, label: String) throws -> Int32 {
+    // F_DUPFD requires its lower bound to be below RLIMIT_NOFILE. Standard
+    // macOS launchd jobs may inherit a soft limit of 256, so a randomized
+    // 64...512 bound makes worker startup fail nondeterministically.
+    let lowerBound = STDERR_FILENO + 1
+    let duplicatedFD = fcntl(descriptor, F_DUPFD_CLOEXEC, lowerBound)
+    guard duplicatedFD >= 0 else {
+        throw MLXFastError.invalidInput("runtime worker failed to duplicate \(label) for protocol I/O")
+    }
+    return duplicatedFD
+}
+
+func redirectDescriptorToDevNull(_ descriptor: Int32, flags: Int32, label: String) throws {
+    let devNullFD = open("/dev/null", flags)
+    guard devNullFD >= 0 else {
+        throw MLXFastError.invalidInput("runtime worker failed to open /dev/null for \(label) redirection")
+    }
+    defer {
+        close(devNullFD)
+    }
+    guard dup2(devNullFD, descriptor) >= 0 else {
+        throw MLXFastError.invalidInput("runtime worker failed to redirect \(label) away from protocol I/O")
+    }
+}
+
+/// Continuously drains a runtime worker's stderr pipe on a background thread,
+/// forwarding each completed line to `emit` (prefixed and token-redacted) and
+/// keeping a capped raw tail for the exit diagnostic. Local modes attach this
+/// so participants' debug prints in model code show up live during the edit
+/// loop; it also means a chatty worker can no longer fill the undrained pipe
+/// buffer and stall the run. Official runs attach the same drain with a no-op
+/// emitter, so submitted output is consumed but never forwarded to CI logs.
+final class WorkerStderrDrain: @unchecked Sendable {
+    private let handle: FileHandle
+    private let emit: (String) -> Void
+    private let lock = NSLock()
+    private var tail = Data()
+    private var pendingLine = Data()
+    private var pendingLineWasTruncated = false
+    private let finished = DispatchSemaphore(value: 0)
+    static let tailByteLimit = 64 * 1024
+    static let forwardedLinePrefix = "mlxfast-worker: "
+    static let truncatedLine = "[worker stderr line exceeded 65536 bytes]"
+
+    init(
+        handle: FileHandle,
+        emit: ((String) -> Void)? = nil
+    ) {
+        self.handle = handle
+        self.emit = emit ?? { line in
+            fputs(line, stderr)
+            fflush(stderr)
+        }
+        let thread = Thread { [self] in
+            drainToEOF()
+            finished.signal()
+        }
+        thread.name = "mlxfast.worker-stderr-drain"
+        thread.start()
+    }
+
+    /// Blocks until the reader thread hits EOF (the worker exited and all
+    /// output was ingested) or the timeout passes, then returns the raw tail
+    /// for the exit diagnostic (which applies its own sanitization).
+    func drainedOutput(timeoutSeconds: Double) -> String {
+        if finished.wait(timeout: .now() + timeoutSeconds) == .success {
+            // Re-signal so later calls (or repeated diagnostics) do not block.
+            finished.signal()
+        }
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        var data = tail
+        if pendingLineWasTruncated {
+            data.append(Data(Self.truncatedLine.utf8))
+        } else {
+            data.append(pendingLine)
+        }
+        if data.count > Self.tailByteLimit {
+            data = Data(data.suffix(Self.tailByteLimit))
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func drainToEOF() {
+        while true {
+            let chunk = handle.readData(ofLength: 8192)
+            if chunk.isEmpty {
+                break
+            }
+            ingest(chunk)
+        }
+        flushPendingLine()
+    }
+
+    private func ingest(_ chunk: Data) {
+        var completedLines: [String] = []
+        lock.lock()
+        pendingLine.append(chunk)
+        while let newlineIndex = pendingLine.firstIndex(of: 0x0a) {
+            let lineLength = pendingLine.distance(from: pendingLine.startIndex, to: newlineIndex)
+            let lineWasTruncated = pendingLineWasTruncated || lineLength > Self.tailByteLimit
+            let lineData = lineWasTruncated
+                ? Data(Self.truncatedLine.utf8)
+                : Data(pendingLine.prefix(lineLength))
+            pendingLine = Data(pendingLine.dropFirst(lineLength + 1))
+            pendingLineWasTruncated = false
+            appendToTailLocked(lineData + Data([0x0a]))
+            completedLines.append(String(decoding: lineData, as: UTF8.self))
+        }
+        if pendingLine.count > Self.tailByteLimit {
+            pendingLine.removeAll(keepingCapacity: true)
+            pendingLineWasTruncated = true
+        }
+        lock.unlock()
+        for line in completedLines {
+            emitLine(line)
+        }
+    }
+
+    private func flushPendingLine() {
+        lock.lock()
+        let remainder = pendingLineWasTruncated
+            ? Data(Self.truncatedLine.utf8)
+            : pendingLine
+        pendingLine = Data()
+        pendingLineWasTruncated = false
+        if !remainder.isEmpty {
+            appendToTailLocked(remainder + Data([0x0a]))
+        }
+        lock.unlock()
+        if !remainder.isEmpty {
+            emitLine(String(decoding: remainder, as: UTF8.self))
+        }
+    }
+
+    private func appendToTailLocked(_ data: Data) {
+        tail.append(data)
+        if tail.count > Self.tailByteLimit {
+            tail = Data(tail.suffix(Self.tailByteLimit))
+        }
+    }
+
+    private func emitLine(_ line: String) {
+        emit("\(Self.forwardedLinePrefix)\(redactedWorkerStderrLine(line))\n")
+    }
+}
+
+/// Per-line redaction for forwarded worker stderr: worker output comes from
+/// submitted model code that has seen the (possibly private) golden, so lines
+/// that look like token comparisons are collapsed exactly like the shared
+/// error-path redaction.
+func redactedWorkerStderrLine(_ line: String) -> String {
+    if line.range(of: "expected", options: .caseInsensitive) != nil
+        || line.range(of: "actual", options: .caseInsensitive) != nil
+    {
+        return "token-validation-failed"
+    }
+    return line
+}
+
+final class RuntimeWorkerWatchdog: @unchecked Sendable {
+    private let process: Process
+    private let timer: DispatchSourceTimer
+    private let lock = NSLock()
+    private var active = true
+    private var fired = false
+
+    init(process: Process, timeoutSeconds: Double, terminationGraceSeconds: Double) {
+        self.process = process
+        self.timer = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
+        timer.schedule(deadline: .now() + timeoutSeconds)
+        timer.setEventHandler { [weak self] in
+            self?.fire(terminationGraceSeconds: terminationGraceSeconds)
+        }
+        timer.resume()
+    }
+
+    @discardableResult
+    func cancelAndReturnDidFire() -> Bool {
+        lock.lock()
+        active = false
+        let result = fired
+        lock.unlock()
+        timer.cancel()
+        return result
+    }
+
+    private func fire(terminationGraceSeconds: Double) {
+        lock.lock()
+        guard active else {
+            lock.unlock()
+            return
+        }
+        active = false
+        fired = true
+        lock.unlock()
+
+        if process.isRunning {
+            process.terminate()
+        }
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(
+            deadline: .now() + max(terminationGraceSeconds, 0)
+        ) { [process] in
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
+        }
+    }
+}
+
+@discardableResult
+func stopRuntimeWorkerProcess(
+    _ process: Process,
+    timeoutSeconds: Double,
+    pollIntervalMicroseconds: useconds_t = 10_000
+) -> Bool {
+    guard process.isRunning else {
+        return true
+    }
+    process.terminate()
+    let boundedTimeout = timeoutSeconds.isFinite
+        ? min(max(timeoutSeconds, 0), 24 * 60 * 60)
+        : 0
+    let now = DispatchTime.now().uptimeNanoseconds
+    let timeoutNanoseconds = UInt64(boundedTimeout * 1_000_000_000)
+    let (deadline, overflow) = now.addingReportingOverflow(timeoutNanoseconds)
+    let resolvedDeadline = overflow ? UInt64.max : deadline
+    while process.isRunning, DispatchTime.now().uptimeNanoseconds < resolvedDeadline {
+        usleep(pollIntervalMicroseconds)
+    }
+    if process.isRunning {
+        kill(process.processIdentifier, SIGKILL)
+    }
+    let killDeadline = DispatchTime.now().uptimeNanoseconds + 2_000_000_000
+    while process.isRunning, DispatchTime.now().uptimeNanoseconds < killDeadline {
+        usleep(pollIntervalMicroseconds)
+    }
+    return !process.isRunning
+}
+
+final class RuntimeWorkerClient {
+    private let process: Process
+    private let input: FileHandle
+    private let output: BufferedFileLineReader
+    private let stderrDrain: WorkerStderrDrain
+    private let requestTimeoutSeconds: Double
+    private let shutdownTimeoutSeconds: Double
+    private let terminationGraceSeconds: Double
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
+    private var sessionNonce = ""
+    private var nextID = 1
+    private var closed = false
+
+    init(options: RuntimeWorkerOptions, weightsPath: String) throws {
+        guard options.helloTimeoutSeconds.isFinite,
+              options.helloTimeoutSeconds > 0,
+              options.requestTimeoutSeconds.isFinite,
+              options.requestTimeoutSeconds > 0,
+              options.shutdownTimeoutSeconds.isFinite,
+              options.shutdownTimeoutSeconds >= 0,
+              options.terminationGraceSeconds.isFinite,
+              options.terminationGraceSeconds >= 0
+        else {
+            throw MLXFastError.invalidInput("runtime worker timeouts must be positive")
+        }
+        let process = Process()
+        let stdin = Pipe()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        if let sandboxProfilePath = options.sandboxProfilePath {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
+            process.arguments = [
+                "-f",
+                sandboxProfilePath,
+                options.executablePath,
+                "runtime-worker",
+                "--weights",
+                weightsPath,
+            ]
+        } else {
+            process.executableURL = URL(fileURLWithPath: options.executablePath)
+            process.arguments = [
+                "runtime-worker",
+                "--weights",
+                weightsPath,
+            ]
+        }
+        process.environment = sanitizedRuntimeWorkerEnvironment(ProcessInfo.processInfo.environment)
+        process.standardInput = stdin
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+
+        self.process = process
+        self.input = stdin.fileHandleForWriting
+        self.output = BufferedFileLineReader(handle: stdout.fileHandleForReading)
+        self.requestTimeoutSeconds = options.requestTimeoutSeconds
+        self.shutdownTimeoutSeconds = options.shutdownTimeoutSeconds
+        self.terminationGraceSeconds = options.terminationGraceSeconds
+        // Always consume the pipe. Official runs use a no-op emitter so worker
+        // output cannot reach logs, while local modes retain live forwarding.
+        self.stderrDrain = WorkerStderrDrain(
+            handle: stderr.fileHandleForReading,
+            emit: options.forwardsWorkerStderr ? nil : { _ in }
+        )
+        let helloWatchdog = RuntimeWorkerWatchdog(
+            process: process,
+            timeoutSeconds: options.helloTimeoutSeconds,
+            terminationGraceSeconds: options.terminationGraceSeconds
+        )
+        let hello: RuntimeWorkerResponse
+        do {
+            hello = try readResponseLine(validateNonce: false)
+            if helloWatchdog.cancelAndReturnDidFire() {
+                throw MLXFastError.invalidInput("runtime worker timed out waiting for protocol hello")
+            }
+            guard hello.id == 0, hello.ok, let nonce = hello.nonce, !nonce.isEmpty else {
+                throw MLXFastError.invalidInput("runtime worker did not return a valid protocol hello")
+            }
+            self.sessionNonce = nonce
+        } catch {
+            let helloTimedOut = helloWatchdog.cancelAndReturnDidFire()
+            _ = stopRuntimeWorkerProcess(process, timeoutSeconds: options.shutdownTimeoutSeconds)
+            _ = stderrDrain.drainedOutput(
+                timeoutSeconds: options.shutdownTimeoutSeconds + options.terminationGraceSeconds + 1
+            )
+            if helloTimedOut {
+                throw MLXFastError.invalidInput("runtime worker timed out waiting for protocol hello")
+            }
+            throw error
+        }
+    }
+
+    deinit {
+        close()
+    }
+
+    func close() {
+        guard !closed else {
+            return
+        }
+        closed = true
+        try? input.close()
+        if process.isRunning {
+            _ = stopRuntimeWorkerProcess(process, timeoutSeconds: shutdownTimeoutSeconds)
+        }
+        _ = stderrDrain.drainedOutput(timeoutSeconds: shutdownTimeoutSeconds + terminationGraceSeconds + 1)
+    }
+
+    func generateCorrectness(promptTokens: [Int], steps: Int) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "correctness",
+            promptTokens: promptTokens,
+            steps: steps
+        )
+    }
+
+    func beginTeacherForcedCorrectness(promptTokens: [Int]) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "correctness_begin",
+            promptTokens: promptTokens
+        )
+    }
+
+    func teacherForcedCorrectnessStep(previousToken: Int) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "correctness_step",
+            token: previousToken
+        )
+    }
+
+    func prefill(promptTokens: [Int]) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "prefill",
+            promptTokens: promptTokens
+        )
+    }
+
+    func beginDecode(seedTokens: [Int]) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "decode_begin",
+            seedTokens: seedTokens
+        )
+    }
+
+    func decodeStep(inputToken: Int) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "decode_step",
+            token: inputToken
+        )
+    }
+
+    func phaseDiagnostics() throws -> RuntimeWorkerResponse {
+        try send(kind: "phase_diagnostics")
+    }
+
+    private func send(
+        kind: String,
+        promptTokens: [Int]? = nil,
+        token: Int? = nil,
+        seedTokens: [Int]? = nil,
+        steps: Int? = nil
+    ) throws -> RuntimeWorkerResponse {
+        guard process.isRunning else {
+            throw MLXFastError.invalidInput("runtime worker exited before request \(kind): \(workerExitDiagnostic())")
+        }
+        let id = nextID
+        nextID += 1
+        let request = RuntimeWorkerRequest(
+            id: id,
+            kind: kind,
+            promptTokens: promptTokens,
+            token: token,
+            seedTokens: seedTokens,
+            steps: steps
+        )
+        var data = try encoder.encode(request)
+        data.append(0x0a)
+        let watchdog = RuntimeWorkerWatchdog(
+            process: process,
+            timeoutSeconds: requestTimeoutSeconds,
+            terminationGraceSeconds: terminationGraceSeconds
+        )
+        let response: RuntimeWorkerResponse
+        do {
+            try input.write(contentsOf: data)
+            response = try readResponseLine(validateNonce: true)
+        } catch {
+            if watchdog.cancelAndReturnDidFire() {
+                throw MLXFastError.invalidInput("runtime worker timed out handling request \(kind)")
+            }
+            throw error
+        }
+        guard !watchdog.cancelAndReturnDidFire() else {
+            throw MLXFastError.invalidInput("runtime worker timed out handling request \(kind)")
+        }
+        guard response.id == id else {
+            throw MLXFastError.invalidInput("runtime worker returned response id \(response.id), expected \(id)")
+        }
+        guard response.ok else {
+            throw MLXFastError.invalidInput("runtime worker \(kind) failed: \(response.error ?? "unknown error")")
+        }
+        return response
+    }
+
+    private func readResponseLine(validateNonce: Bool) throws -> RuntimeWorkerResponse {
+        while true {
+            let data = try readWorkerOutputLine()
+            guard runtimeWorkerLineLooksLikeJSONResponse(data) else {
+                continue
+            }
+            let response = try decoder.decode(RuntimeWorkerResponse.self, from: data)
+            if validateNonce, response.nonce != sessionNonce {
+                throw MLXFastError.invalidInput("runtime worker returned a response with an invalid nonce")
+            }
+            return response
+        }
+    }
+
+    private func readWorkerOutputLine() throws -> Data {
+        guard let data = try output.readLine() else {
+            throw MLXFastError.invalidInput(
+                "runtime worker closed stdout before returning a response: \(workerExitDiagnostic())"
+            )
+        }
+        return data
+    }
+
+    private func workerExitDiagnostic() -> String {
+        if process.isRunning {
+            _ = stopRuntimeWorkerProcess(process, timeoutSeconds: shutdownTimeoutSeconds)
+        }
+        let stderr = stderrDrain.drainedOutput(
+            timeoutSeconds: shutdownTimeoutSeconds + terminationGraceSeconds + 1
+        )
+        let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        let redacted = sanitizeWorkerDiagnostic(trimmed)
+        let status = process.isRunning ? "timeout" : String(process.terminationStatus)
+        if redacted.isEmpty {
+            return "exit_status=\(status)"
+        }
+        return "exit_status=\(status) stderr=\(redacted)"
+    }
+
+    private func sanitizeWorkerDiagnostic(_ value: String) -> String {
+        let singleLine = value
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        if singleLine.range(of: "expected", options: .caseInsensitive) != nil
+            || singleLine.range(of: "actual", options: .caseInsensitive) != nil
+        {
+            return "token-validation-failed"
+        }
+        return singleLine
+    }
+}
+
+/// Runtime-worker child environment policy: STRICT ALLOWLIST, not a denylist.
+///
+/// The runtime worker is the only process that executes submitted model code,
+/// and submitted code can read its whole environment via
+/// `ProcessInfo.processInfo.environment`. The ranked pipeline runs that same
+/// code in two separate passes with different harness environments -- the
+/// unscored correctness/gates pass and the scored timed pass -- so ANY
+/// inherited variable whose value differs between the passes is a phase
+/// oracle: a submission could serve correct-but-slow behavior while its
+/// tokens are checked and a cheaper path while its speed is measured,
+/// inflating the paired score without a real optimization.
+///
+/// A remove-by-default denylist structurally cannot close that class: every
+/// new harness/CI/workflow variable reopens it by default (MLXFAST_NOTE,
+/// MLXFAST_SCORE_PATH, MLXFAST_INTEGRITY_PATH, the semantic-GPQA knobs,
+/// BENCH_GOLDEN_PATH, and GIT_CONFIG_* all leaked through the previous
+/// denylist, and the first three differ between the gates and timed passes).
+/// So this filter starts from an EMPTY environment and copies in only the
+/// names below, which makes the child environment byte-identical across
+/// phases by construction -- the phase-isolation property is tested directly
+/// by `runtimeWorkerEnvironmentIsIdenticalAcrossPipelinePhases`.
+///
+/// Keep-set rationale (everything else is dropped):
+/// - Exact POSIX/login/session basics (`PATH`, `HOME`, `TMPDIR`, ...): the
+///   dynamic loader, Foundation, and Metal's shader-cache paths rely on
+///   them; their values are fixed per host/user, never per phase.
+/// - `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`: constant "1" wherever trusted
+///   scripts set them; they only ever remove (network) work.
+/// - `LC_`/`DYLD_`/`MTL_`/`METAL_` prefixes: locale, dynamic-loader, and
+///   Metal-framework configuration families. System-level, operator-owned,
+///   phase-independent; dropping loader/Metal config could break how the
+///   worker loads MLX and its metallib.
+/// - `MLX_` prefix: MLX core tuning knobs read by mlx::core (e.g.
+///   MLX_DISABLE_COMPILE, MLX_MAX_OPS_PER_BUFFER, MLX_RESOURCE_LIMIT) and by
+///   the mlx-swift-lm fork (MLX_COMPILED_DECODE). Note "MLX_" does NOT match
+///   harness "MLXFAST_*" names -- harness variables stay excluded.
+/// - `DARKBLOOM_` prefix: model-runtime opt-ins read only by model-side code
+///   (DARKBLOOM_COMPILED_DECODE in Qwen35Model.swift and the mlx-swift-lm
+///   fork's DARKBLOOM_* knobs). The ranked workflow never sets them (absent
+///   in BOTH ranked phases); they exist for operator/participant tuning on
+///   local machines and must keep reaching the worker there.
+/// - `MLXFAST_USE_RUNTIME_WORKER` is force-set to "0" so the child can never
+///   recursively spawn another worker.
+///
+/// Maintainer contract: do NOT regress this to keep-by-default, do NOT add a
+/// broad `MLXFAST_` (or `BENCH_`) allowance, and never allowlist a name whose
+/// value trusted code could set differently between the gates and timed
+/// passes. The worker itself needs no MLXFAST_* configuration: its weights
+/// path arrives via argv (`runtime-worker --weights ...`).
+func sanitizedRuntimeWorkerEnvironment(_ environment: [String: String]) -> [String: String] {
+    let allowedExactKeys: Set<String> = [
+        "HF_HUB_OFFLINE",
+        "HOME",
+        "LANG",
+        "LOGNAME",
+        "PATH",
+        "SHELL",
+        "SSH_AUTH_SOCK",
+        "TERM",
+        "TMPDIR",
+        "TRANSFORMERS_OFFLINE",
+        "USER",
+        // macOS per-user default text encoding consulted by CoreFoundation.
+        "__CF_USER_TEXT_ENCODING",
+    ]
+    let allowedPrefixes = [
+        "DARKBLOOM_",
+        "DYLD_",
+        "LC_",
+        "METAL_",
+        "MLX_",
+        "MTL_",
+    ]
+    var sanitized: [String: String] = [:]
+    for (key, value) in environment
+        where allowedExactKeys.contains(key)
+        || allowedPrefixes.contains(where: { key.hasPrefix($0) })
+    {
+        sanitized[key] = value
+    }
+    sanitized["MLXFAST_USE_RUNTIME_WORKER"] = "0"
+    return sanitized
+}
+
+func generateRuntimeWorkerNonce() -> String {
+    var bytes = [UInt8](repeating: 0, count: 16)
+    bytes.withUnsafeMutableBytes { buffer in
+        if let baseAddress = buffer.baseAddress {
+            arc4random_buf(baseAddress, buffer.count)
+        }
+    }
+    return bytes
+        .map { String(format: "%02x", $0) }
+        .joined()
+}
+
+func runtimeWorkerLineLooksLikeJSONResponse(_ data: Data) -> Bool {
+    for byte in data where byte != 0x20 && byte != 0x09 && byte != 0x0d {
+        return byte == 0x7b
+    }
+    return false
+}
