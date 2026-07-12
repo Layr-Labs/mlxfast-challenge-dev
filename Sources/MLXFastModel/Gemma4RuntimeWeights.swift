@@ -128,7 +128,16 @@ public final class Gemma4RuntimeWeightCache {
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
         eval(model)
         eval(partition.indexedMetadata.values.flatMap { [$0.indices, $0.lut] })
-        try model.prepareFastEngine(indexedMetadata: partition.indexedMetadata)
+        if let tiedHeadPacked13Metadata = partition.tiedHeadPacked13Metadata {
+            eval(
+                tiedHeadPacked13Metadata.packedIndices,
+                tiedHeadPacked13Metadata.lut
+            )
+        }
+        try model.prepareFastEngine(
+            indexedMetadata: partition.indexedMetadata,
+            tiedHeadPacked13Metadata: partition.tiedHeadPacked13Metadata
+        )
         return model
     }
 
@@ -288,6 +297,7 @@ struct RuntimeWeightNameTracker {
 struct RuntimeWeightPartition {
     let modelParameters: [String: MLXArray]
     let indexedMetadata: [String: IndexedAffineMetadata]
+    let tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata?
 }
 
 private struct RuntimeIndexedMetadataParts {
@@ -315,14 +325,23 @@ func partitionRuntimeWeights(
     _ loaded: [String: MLXArray],
     expectedIndexedStems: Set<String>
 ) throws -> RuntimeWeightPartition {
+    let tiedHeadPackedIndicesName =
+        "model.embed_tokens.tied_head_packed13_indices"
+    let tiedHeadLUTName = "model.embed_tokens.tied_head_packed13_lut"
     let indicesSuffix = ".metadata_indices"
     let lutSuffix = ".metadata_lut"
     var modelParameters: [String: MLXArray] = [:]
     var metadataParts: [String: RuntimeIndexedMetadataParts] = [:]
+    var tiedHeadPackedIndices: MLXArray?
+    var tiedHeadLUT: MLXArray?
 
     for name in loaded.keys.sorted() {
         guard let array = loaded[name] else { continue }
-        if name.hasSuffix(indicesSuffix) {
+        if name == tiedHeadPackedIndicesName {
+            tiedHeadPackedIndices = array
+        } else if name == tiedHeadLUTName {
+            tiedHeadLUT = array
+        } else if name.hasSuffix(indicesSuffix) {
             let stem = String(name.dropLast(indicesSuffix.count))
             metadataParts[stem, default: RuntimeIndexedMetadataParts()].indices = array
         } else if name.hasSuffix(lutSuffix) {
@@ -333,10 +352,41 @@ func partitionRuntimeWeights(
         }
     }
 
+    let tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata?
+    switch (tiedHeadPackedIndices, tiedHeadLUT) {
+    case (nil, nil):
+        tiedHeadPacked13Metadata = nil
+    case let (packedIndices?, lut?):
+        guard let weight = modelParameters["model.embed_tokens.weight"],
+              let scales = modelParameters["model.embed_tokens.scales"],
+              let biases = modelParameters["model.embed_tokens.biases"]
+        else {
+            throw MLXFastError.invalidInput(
+                "tied-head packed13 metadata is missing stock affine tensors"
+            )
+        }
+        let metadata = Gemma4TiedHeadPacked13Metadata(
+            packedIndices: packedIndices,
+            lut: lut
+        )
+        try validateGemma4TiedHeadPacked13Metadata(
+            metadata,
+            weight: weight,
+            scales: scales,
+            biases: biases
+        )
+        tiedHeadPacked13Metadata = metadata
+    default:
+        throw MLXFastError.invalidInput(
+            "tied-head packed13 metadata payload is incomplete"
+        )
+    }
+
     guard !metadataParts.isEmpty else {
         return RuntimeWeightPartition(
             modelParameters: modelParameters,
-            indexedMetadata: [:]
+            indexedMetadata: [:],
+            tiedHeadPacked13Metadata: tiedHeadPacked13Metadata
         )
     }
     let actualStems = Set(metadataParts.keys)
@@ -393,7 +443,8 @@ func partitionRuntimeWeights(
     }
     return RuntimeWeightPartition(
         modelParameters: modelParameters,
-        indexedMetadata: indexedMetadata
+        indexedMetadata: indexedMetadata,
+        tiedHeadPacked13Metadata: tiedHeadPacked13Metadata
     )
 }
 
