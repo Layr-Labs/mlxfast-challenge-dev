@@ -2,6 +2,88 @@ import Foundation
 import MLX
 
 // Packed-output additions authored by GPT 5.6 Sol through Gaj's OpenCode Harness.
+private let gemma4OutputCoTiledPayloadWords = 536
+
+private func gemma4PackOutputFixed12Planes(
+    _ indices: [UInt16], rows: Int, groupsPerRow: Int
+) -> [UInt32]? {
+    guard groupsPerRow.isMultiple(of: 8), indices.count == rows * groupsPerRow else { return nil }
+    var words = [UInt32](repeating: 0, count: rows * groupsPerRow / 8 * 3)
+    for row in 0..<rows {
+        for block in 0..<(groupsPerRow / 8) {
+            let source = row * groupsPerRow + block * 8
+            let target = (row * groupsPerRow / 8 + block) * 3
+            for group in 0..<8 {
+                let value = UInt32(indices[source + group])
+                guard value < 4_096 else { return nil }
+                words[target + group / 4] |= (value & 0xff) << ((group % 4) * 8)
+                words[target + 2] |= ((value >> 8) & 0xf) << ((group / 2) * 8 + (group % 2) * 4)
+            }
+        }
+    }
+    return words
+}
+
+func gemma4MakeCoTiledFixed12SlidingOutputPayload(
+    weight: MLXArray, indices: MLXArray, materialize: Bool = true
+) -> MLXArray? {
+    guard weight.dtype == .uint32, weight.shape == [5_376, 1_024],
+          indices.dtype == .uint16, indices.shape == [5_376, 128],
+          let planes = gemma4PackOutputFixed12Planes(indices.asArray(UInt16.self), rows: 5_376, groupsPerRow: 128)
+    else { return nil }
+    let weights = weight.reshaped(672, 2, 4, 16, 32, 2)
+        .transposed(0, 3, 1, 2, 4, 5).contiguous().reshaped(672, 16, 512)
+    let metadata = MLXArray(planes, [5_376, 16, 3]).reshaped(672, 2, 4, 16, 3)
+        .transposed(0, 3, 1, 2, 4).contiguous().reshaped(672, 16, 24)
+    let payload = concatenated([weights, metadata], axis: 2)
+    precondition(payload.shape == [672, 16, gemma4OutputCoTiledPayloadWords])
+    if materialize { eval(payload) }
+    return payload
+}
+
+private let gemma4CoTiledFixed12IndexedSlidingOutputQMV = MLXFast.metalKernel(
+    name: "gemma4_cotiled_fixed12_indexed_output_qmv_fast_8192_v1",
+    inputNames: ["payload", "lut", "x"], outputNames: ["output"],
+    source: """
+        constexpr int kRowsPerSIMD = 4;
+        constexpr int kWordsPerRow = 64;
+        constexpr int kWordsPerSIMD = 256;
+        constexpr int kWeightWords = 512;
+        constexpr int kPayloadWords = 536;
+        const int tg = threadgroup_position_in_grid.y;
+        const int simd = simdgroup_index_in_threadgroup;
+        const int output_row = tg * 8 + simd * 4;
+        const uint lane_group = thread_index_in_simdgroup / 4;
+        const device bfloat* input = x + thread_index_in_simdgroup * 16;
+        const device uint* tile = payload + tg * 16 * kPayloadWords;
+        float result[kRowsPerSIMD] = {0};
+        for (int block = 0; block < 16; ++block) {
+            float values[16];
+            const float input_sum = gemma4_output_load_values(input, values);
+            const device uint* weights = tile + simd * kWordsPerSIMD + thread_index_in_simdgroup * 2;
+            const device uchar* metadata = reinterpret_cast<const device uchar*>(tile + kWeightWords)
+                + simd * kRowsPerSIMD * 12;
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                const device uchar* row_weight = reinterpret_cast<const device uchar*>(weights + row * kWordsPerRow);
+                const device uchar* row_metadata = metadata + row * 12;
+                const uint low = row_metadata[lane_group];
+                const uint packed_high = row_metadata[8 + lane_group / 2];
+                const uint index = low | (((packed_high >> ((lane_group & 1) * 4)) & 0xf) << 8);
+                const uint pair = lut[index];
+                result[row] += gemma4_output_qdot_4bit(row_weight, values,
+                    gemma4_output_pair_scale(pair), gemma4_output_pair_bias(pair), input_sum);
+            }
+            tile += kPayloadWords;
+            input += 512;
+        }
+        for (int row = 0; row < kRowsPerSIMD; ++row) {
+            result[row] = simd_sum(result[row]);
+            if (thread_index_in_simdgroup == 0) output[output_row + row] = static_cast<bfloat>(result[row]);
+        }
+        """,
+    header: gemma4IndexedOutputHeader, ensureRowContiguous: true
+)
+
 private let gemma4Packed12IndexedSlidingOutputQMV = MLXFast.metalKernel(
     name: "gemma4_packed12_indexed_output_qmv_fast_8192_v1",
     inputNames: ["weight", "packed_indices", "lut", "x"],
@@ -284,6 +366,8 @@ struct IndexedOutputProjection: @unchecked Sendable {
     let metadata: IndexedAffineMetadata
     let inputWidth: Int
     private let packed12: Packed12OutputMetadata?
+    private let coTiledPayload: MLXArray?
+    private let verifyCoTiledBits: Bool
     private let verifyPacked12Bits: Bool
 
     init?(projection: FastQuantizedProjection) {
@@ -327,6 +411,16 @@ struct IndexedOutputProjection: @unchecked Sendable {
         } else {
             self.packed12 = nil
         }
+        if inputWidth == 8_192,
+           self.packed12 != nil,
+           gemma4OutputEnvironmentFlag("MLXFAST_COTILED_SLIDING_OUTPUT", default: true) {
+            self.coTiledPayload = gemma4MakeCoTiledFixed12SlidingOutputPayload(
+                weight: projection.weight, indices: metadata.indices)
+        } else {
+            self.coTiledPayload = nil
+        }
+        self.verifyCoTiledBits = gemma4OutputEnvironmentFlag(
+            "MLXFAST_VERIFY_COTILED_SLIDING_OUTPUT_BITS", default: false)
         self.verifyPacked12Bits = gemma4OutputEnvironmentFlag(
             "MLXFAST_VERIFY_PACKED_OUTPUT_BITS",
             default: false
@@ -352,13 +446,37 @@ struct IndexedOutputProjection: @unchecked Sendable {
         let packedKernel = inputWidth == 8_192
             ? gemma4Packed12IndexedSlidingOutputQMV
             : gemma4Packed12IndexedFullOutputQMV
-        let output = packedKernel(
+        let packedOutput = packedKernel(
             [projection.weight, packed12.words, metadata.lut, input],
             grid: (32, 1_344, 1),
             threadGroup: (32, 2, 1),
             outputShapes: [[1, 1, 5_376]],
             outputDTypes: [.bfloat16]
         )[0]
+        let output: MLXArray
+        if let coTiledPayload {
+            output = gemma4CoTiledFixed12IndexedSlidingOutputQMV(
+                [coTiledPayload, metadata.lut, input],
+                grid: (32, 1_344, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[1, 1, 5_376]], outputDTypes: [.bfloat16])[0]
+            if verifyCoTiledBits {
+                let matches = arrayEqual(output.view(dtype: .uint16), packedOutput.view(dtype: .uint16))
+                eval(matches)
+                precondition(matches.item(Bool.self), "co-tiled output differs from packed12 qmv_fast")
+            }
+        } else {
+            output = packedOutput
+        }
+        /* packed output call retained above; verifier below remains packed12-versus-U16 */
+        _ = packedKernel
+        /*
+            [projection.weight, packed12.words, metadata.lut, input],
+            grid: (32, 1_344, 1),
+            threadGroup: (32, 2, 1),
+            outputShapes: [[1, 1, 5_376]],
+            outputDTypes: [.bfloat16]
+        )[0]
+        */
         if verifyPacked12Bits {
             let referenceKernel = inputWidth == 8_192
                 ? gemma4IndexedSlidingOutputQMV
@@ -371,7 +489,7 @@ struct IndexedOutputProjection: @unchecked Sendable {
                 outputDTypes: [.bfloat16]
             )[0]
             let matches = arrayEqual(
-                output.view(dtype: .uint16),
+                packedOutput.view(dtype: .uint16),
                 reference.view(dtype: .uint16)
             )
             eval(matches)
