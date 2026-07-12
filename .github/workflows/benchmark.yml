@@ -867,7 +867,10 @@ jobs:
       # checked_steps validation as backstops. attach-gpqa-gates loads the tokenizer, i.e.
       # runs code from the submitted build, so it executes through bench-exec
       # like every other untrusted invocation (the VM pipeline ran it as the
-      # workflow user; the bench uid is strictly less privileged). The raw
+      # workflow user; the bench uid is strictly less privileged) AND -- since it
+      # runs the submission binary as an unsandboxed bench PARENT that reads the
+      # raw GPQA key -- additionally under a trusted network/DNS-deny Seatbelt
+      # profile (see the sandbox note in the step body). The raw
       # inputs are copied in as runner-owned files and scrubbed immediately
       # after, so during any later worker-spawning phase the only hidden file
       # in the workspace is the augmented golden, which the worker Seatbelt
@@ -896,6 +899,35 @@ jobs:
           done
           install -m 0444 "${MLXFAST_PRIVATE_DIR}/raw_golden.json" "${golden_src}"
           install -m 0444 "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" "${gpqa_src}"
+          # DNS-exfil closure for the attach step (defense in depth). Unlike the
+          # scored/gate passes, attach-gpqa-gates does NOT spawn a runtime worker,
+          # so the worker Seatbelt profile never applies -- the SUBMISSION-built
+          # binary runs as the bench PARENT and legitimately reads the raw GPQA
+          # key + golden. bench's PF egress block is uid-scoped, so it does NOT
+          # stop a getaddrinfo() that the system resolver (mDNSResponder, which
+          # egresses from its OWN uid) performs on the process's behalf, leaving a
+          # DNS channel a submission-influenced process could exfil the key over.
+          # (The operator layer already reaps uid-560 + adds a uid-560 port-53 PF
+          # drop, but neither closes this resolver-proxied path from a live bench
+          # parent -- this is the tail of that DNS-exfil containment, fixed in the
+          # repo so the harness itself is safe.) Wrap the invocation in a
+          # trusted-authored Seatbelt profile (authored HERE, not by the
+          # submission binary, which could skip a self-sandbox) that denies
+          # network + the resolver mach-lookup, matching the runtime-worker
+          # profile's egress posture. attach uses no network/DNS, so the
+          # augmented golden output is byte-identical. The profile lives in the
+          # runner-owned, bench-non-writable .ranked-src/ staging dir (bench can
+          # read it, cannot swap it) and is scrubbed with .ranked-src below.
+          attach_sb="${MLXFAST_JOB_WS}/.ranked-src/attach-nonet.sb"
+          printf '%s\n' \
+            '(version 1)' \
+            '(allow default)' \
+            '(deny network*)' \
+            '(deny mach-lookup (global-name "com.apple.mDNSResponder"))' \
+            '(deny mach-lookup (global-name "com.apple.system.mDNSResponder"))' \
+            '(deny mach-lookup (global-name-prefix "com.apple.mDNSResponder"))' \
+            > "${attach_sb}"
+          chmod 0444 "${attach_sb}"
           status=0
           # shellcheck disable=SC2024  # trusted shell owns the capture files
           sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
@@ -904,7 +936,10 @@ jobs:
               MLXFAST_GPQA_MAX_NEW_TOKENS="${MLXFAST_GPQA_MAX_NEW_TOKENS}" /bin/bash -c '
               set -u
               cd "${MJOB_WS}" || exit 97
-              exec .build/release/mlxfast-swift attach-gpqa-gates \
+              # sandbox-exec applies the trusted network/DNS-deny profile to the
+              # submission binary; attach reads local files + tokenizer only.
+              exec /usr/bin/sandbox-exec -f .ranked-src/attach-nonet.sb \
+                .build/release/mlxfast-swift attach-gpqa-gates \
                 --golden .ranked-src/golden.json \
                 --gpqa .ranked-src/gpqa.json \
                 --tokenizer weights \

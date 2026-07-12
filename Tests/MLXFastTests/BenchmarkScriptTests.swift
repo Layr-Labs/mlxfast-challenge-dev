@@ -619,6 +619,16 @@ func benchmarkPlacesHiddenGoldenInputsSymlinkSafely() throws {
     #expect(attach.contains("install -m 0444 \"${MLXFAST_PRIVATE_DIR}/gpqa_reference.json\" \"${gpqa_src}\""))
     #expect(attach.contains("--golden .ranked-src/golden.json"))
     #expect(attach.contains("--gpqa .ranked-src/gpqa.json"))
+    // DNS-exfil closure: attach runs the submission binary as an unsandboxed
+    // bench PARENT that reads the raw GPQA key, and bench's PF egress block is
+    // uid-scoped, so a getaddrinfo()->mDNSResponder resolution would escape.
+    // The invocation is wrapped in a trusted-authored Seatbelt profile that
+    // denies network + the resolver mach-lookup (profile authored by the
+    // workflow, not the submission binary, and staged bench-non-writable).
+    #expect(attach.contains("attach_sb=\"${MLXFAST_JOB_WS}/.ranked-src/attach-nonet.sb\""))
+    #expect(attach.contains("exec /usr/bin/sandbox-exec -f .ranked-src/attach-nonet.sb"))
+    #expect(attach.contains("(deny network*)"))
+    #expect(attach.contains("(deny mach-lookup (global-name \"com.apple.mDNSResponder\"))"))
     // Cleanup unlinks the runner-owned staging dir (never an attacker symlink).
     #expect(attach.contains("rm -rf \"${MLXFAST_JOB_WS}/.ranked-src\""))
     // The old predictable workspace-root names are gone entirely.
