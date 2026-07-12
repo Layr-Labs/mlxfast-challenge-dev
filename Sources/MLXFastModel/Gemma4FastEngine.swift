@@ -23,6 +23,50 @@ private let gemma4VerifyCombinedQKVPrefillPreparationBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+// Retry archive marker: the prior identical runtime reached the semantic judge,
+// whose private API request failed with HTTP 401 before evaluation.
+private let gemma4FusedPrefillLayerBoundariesEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "MLXFAST_FUSED_PREFILL_LAYER_BOUNDARIES"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+private let gemma4VerifyPrefillLayerBoundaryBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "MLXFAST_VERIFY_PREFILL_LAYER_BOUNDARY_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+private func gemma4VerifyPrefillBoundaryBits(
+    candidate: (MLXArray, MLXArray),
+    reference: (MLXArray, MLXArray),
+    label: String
+) {
+    let firstMatches = arrayEqual(
+        candidate.0.view(dtype: .uint16),
+        reference.0.view(dtype: .uint16)
+    )
+    let secondMatches = arrayEqual(
+        candidate.1.view(dtype: .uint16),
+        reference.1.view(dtype: .uint16)
+    )
+    eval(firstMatches, secondMatches)
+    precondition(
+        firstMatches.item(Bool.self),
+        "fused prefill \(label) first output differs in raw BF16 bits"
+    )
+    precondition(
+        secondMatches.item(Bool.self),
+        "fused prefill \(label) second output differs in raw BF16 bits"
+    )
+}
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -100,6 +144,7 @@ struct Gemma4FastLayerResult {
 }
 
 final class Gemma4FastLayer {
+    let isFinalLayer: Bool
     let isSliding: Bool
     let nHeads: Int
     let nKvHeads: Int
@@ -139,6 +184,7 @@ final class Gemma4FastLayer {
     let useFusedGateUpActivation: Bool
 
     init(
+        isFinalLayer: Bool,
         isSliding: Bool,
         nHeads: Int,
         nKvHeads: Int,
@@ -168,6 +214,7 @@ final class Gemma4FastLayer {
         upIndexedMetadata: IndexedAffineMetadata?,
         downIndexedMetadata: IndexedAffineMetadata?
     ) {
+        self.isFinalLayer = isFinalLayer
         self.isSliding = isSliding
         self.nHeads = nHeads
         self.nKvHeads = nKvHeads
@@ -494,7 +541,7 @@ final class Gemma4FastLayer {
         let residual = x
         let h: MLXArray
         if let normalizedInput {
-            precondition(x.dim(0) == 1 && x.dim(1) == 1)
+            precondition(x.dim(0) == 1)
             precondition(normalizedInput.shape == x.shape)
             precondition(normalizedInput.dtype == .bfloat16)
             h = normalizedInput
@@ -768,16 +815,42 @@ final class Gemma4FastLayer {
         let residual2: MLXArray
         let fusedPreFFNNormalized: MLXArray?
         var nextNormalized: MLXArray? = nil
-        if B == 1,
-           L == 1,
-           fusedGateUp != nil,
-           fusedGateUpPostTail != nil,
+        let usesDecodeAttentionBoundary = B == 1
+            && L == 1
+            && fusedGateUp != nil
+            && fusedGateUpPostTail != nil
+        let usesPrefillBoundaries = B == 1
+            && L > 1
+            && (gemma4FusedPrefillLayerBoundariesEnabled
+                || gemma4VerifyPrefillLayerBoundaryBits)
+            && fusedMLPToNextBoundary != nil
+        if usesDecodeAttentionBoundary || usesPrefillBoundaries,
            let fusedAttentionToMLPBoundary
         {
-            let prepared = fusedAttentionToMLPBoundary(
+            var prepared = fusedAttentionToMLPBoundary(
                 attentionOutput: attnOut,
                 residual: residual
             )
+            if usesPrefillBoundaries && gemma4VerifyPrefillLayerBoundaryBits {
+                let referenceResidual = residual + MLXFast.rmsNorm(
+                    attnOut, weight: postAttnNormWeight, eps: eps)
+                let reference = (
+                    referenceResidual,
+                    MLXFast.rmsNorm(
+                        referenceResidual,
+                        weight: preFfnNormWeight,
+                        eps: eps
+                    )
+                )
+                gemma4VerifyPrefillBoundaryBits(
+                    candidate: prepared,
+                    reference: reference,
+                    label: "attention-to-MLP boundary"
+                )
+                if !gemma4FusedPrefillLayerBoundariesEnabled {
+                    prepared = reference
+                }
+            }
             out = prepared.0
             residual2 = prepared.0
             fusedPreFFNNormalized = prepared.1
@@ -813,6 +886,51 @@ final class Gemma4FastLayer {
                 let (gateOutput, upOutput) = fusedGateUp(normalized)
                 out = fusedGateUpPostTail(gateOutput, upOutput, residual2)
             }
+        } else if usesPrefillBoundaries,
+                  let normalized = fusedPreFFNNormalized,
+                  let fusedMLPToNextBoundary
+        {
+            let fullMLP = fusedMLP(normalized)
+            let boundaryMLP: MLXArray
+            let boundaryResidual: MLXArray
+            if isFinalLayer {
+                boundaryMLP = gemma4LastTokenHidden(fullMLP)
+                boundaryResidual = gemma4LastTokenHidden(residual2)
+            } else {
+                boundaryMLP = fullMLP
+                boundaryResidual = residual2
+            }
+            var prepared = fusedMLPToNextBoundary(
+                mlpOutput: boundaryMLP,
+                residual: boundaryResidual
+            )
+            if gemma4VerifyPrefillLayerBoundaryBits {
+                let postNormalized = MLXFast.rmsNorm(
+                    boundaryMLP, weight: postFfnNormWeight, eps: eps)
+                let referenceHidden = (
+                    boundaryResidual + postNormalized
+                ) * layerScalar
+                let reference = (
+                    referenceHidden,
+                    MLXFast.rmsNorm(
+                        referenceHidden,
+                        weight: fusedMLPToNextBoundary.nextNormWeight,
+                        eps: eps
+                    )
+                )
+                gemma4VerifyPrefillBoundaryBits(
+                    candidate: prepared,
+                    reference: reference,
+                    label: isFinalLayer
+                        ? "MLP-to-final-norm boundary"
+                        : "MLP-to-next-layer boundary"
+                )
+                if !gemma4FusedPrefillLayerBoundariesEnabled {
+                    prepared = reference
+                }
+            }
+            out = prepared.0
+            nextNormalized = prepared.1
         } else if let fusedMLPTail {
             out = fusedMLPTail(out, residual2)
         } else {
@@ -1086,6 +1204,7 @@ final class Gemma4FastEngine {
 
             built.append(
                 Gemma4FastLayer(
+                    isFinalLayer: index + 1 == config.numHiddenLayers,
                     isSliding: isSliding,
                     nHeads: config.numAttentionHeads,
                     nKvHeads: nKvHeads,
@@ -1178,6 +1297,13 @@ final class Gemma4FastEngine {
         }
 
         if inputs.dim(1) == 1, let normalizedInput {
+            hidden = normalizedInput
+        } else if inputs.dim(1) > 1,
+                  (gemma4FusedPrefillLayerBoundariesEnabled
+                    || gemma4VerifyPrefillLayerBoundaryBits),
+                  let normalizedInput
+        {
+            precondition(normalizedInput.shape == [1, 1, 5_376])
             hidden = normalizedInput
         } else {
             hidden = gemma4LastTokenHidden(hidden)
