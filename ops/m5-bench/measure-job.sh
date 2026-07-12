@@ -15,6 +15,8 @@
 # Pipeline:
 #   preflight (quarantine flag, quiescence)          [trusted, runner]
 #   -> thermal gate (GPU <= 40C)                     [trusted, runner]
+#   -> per-phase re-quiescence (bench residue reap   [trusted, runner]
+#      + load/util settle) before every timed attempt
 #   -> ensure per-implementation benchmark oracle    [generation untrusted via
 #      (self-generated, cached per binary hash)       bench-exec; assembly trusted]
 #   -> timed official benchmark, candidate           [untrusted via bench-exec]
@@ -189,6 +191,14 @@ readonly MAX_PLAUSIBLE_SPEEDUP="5.0"
 PREFLIGHT_MAX_LOAD="${PREFLIGHT_MAX_LOAD:-2.0}"
 PREFLIGHT_MAX_GPU_UTIL="${PREFLIGHT_MAX_GPU_UTIL:-0.10}"
 PREFLIGHT_PROC_PATTERN="${PREFLIGHT_PROC_PATTERN:-darkbloom}"
+# Per-phase re-quiescence (see phase_quiesce). The reap/assert pattern is
+# benchmark.sh's own RESIDENT_MODEL_PROCESS_PATTERN: the argv of every mlxfast
+# process that holds (or is loading) the ~17 GB model -- the runtime worker in
+# any wrapping (bare or under sandbox-exec; -f matches the full argv) plus the
+# in-process model-holding CLI subcommands. Fixed, not env-tunable: it must
+# always match what the harness actually spawns.
+readonly RESIDENT_MODEL_PATTERN='runtime-worker[[:space:]]+--weights|mlxfast-swift[[:space:]]+(benchmark|correctness|correctness-trace|generate-golden|generate-gpqa-answers|attach-free-run-gate)'
+PHASE_QUIESCE_TIMEOUT="${PHASE_QUIESCE_TIMEOUT:-300}"   # max seconds for load/util to settle per phase
 
 ORACLE_CACHE_DIR="${ORACLE_CACHE_DIR:-${STATE_DIR}/oracle-cache}"
 ORACLE_STEPS="${ORACLE_STEPS:-200}"
@@ -468,6 +478,93 @@ preflight() {
   fi
 
   log "PREFLIGHT_OK load=${load} gpu_util=${util} quarantine=absent"
+}
+
+# --- Per-phase re-quiescence -----------------------------------------------------
+# preflight() checks quiescence ONCE, before anything runs; nothing re-checked
+# it between the timed phases. Each timed attempt's benchmark chain
+# (sudo -> bench-exec -> benchmark.sh -> mlxfast-swift -> runtime worker) can
+# leave live residue behind after the foreground bridge returns: bash defers
+# trap handlers until the foreground child exits, and the model-holding worker
+# can miss stdin-EOF during its multi-minute model load, so the top PID
+# exiting proves nothing about the rest of the tree. A ~17 GB leftover worker
+# from a rejected attempt (or the other side of the pair) still loading or
+# spinning while the next phase is measured is exactly the asymmetric
+# contention the paired ratio cannot cancel. phase_quiesce therefore runs
+# before EVERY timed attempt (baseline, candidate, and each gated retry),
+# ahead of the existing thermal gate in run_timed:
+#   1. reap residual bench processes: TERM the WHOLE bench uid (not one pid),
+#      short grace, KILL survivors. The bench uid exists solely to run
+#      submitted bench code and the box lock guarantees one measure-job per
+#      box, so anything alive there is residue from a prior phase, attempt,
+#      or job. The runner uid cannot signal another uid's processes, so the
+#      kill goes through the same bench-exec bridge the runs (and the
+#      preflight PF probe) already use; it is best-effort remediation -- the
+#      assert below is the guarantee. In direct mode (own-uid validation,
+#      no bench uid) only model-holding processes are reaped: a blanket
+#      same-uid sweep would kill the operator's own session.
+#   2. assert ZERO model-holding processes survive (benchmark.sh's resident-
+#      model argv pattern); fail closed with the preflight quiescence
+#      convention (die 3) if any do.
+#   3. wait for the 1-min load and GPU util to settle back under the SAME
+#      PREFLIGHT_MAX_LOAD / PREFLIGHT_MAX_GPU_UTIL thresholds preflight
+#      enforced -- wait-then-fail like thermal_gate, NOT insta-die like
+#      preflight, because right after a phase finishes the 1-min loadavg
+#      legitimately needs a minute or two to decay (settling, not
+#      contention). bc (not num_lt) is correct here: these are runner-owned
+#      telemetry/sysctl values, never E-notation -- see the num_lt note.
+# The thermal_gate call in run_timed stays unchanged and runs after this, so
+# every attempt on BOTH sides of the pair starts residue-free, quiescent, and
+# cool -- identical measurement preconditions.
+phase_quiesce() {
+  # phase_quiesce <label> <ws>: <ws> is the workspace handed to bench-exec for
+  # the reap (same bridge contract as the preflight PF probe); unused in
+  # direct mode.
+  local label="$1" ws="$2"
+  local pids survivors load util waited=0
+
+  if [ "${MEASURE_EXEC_MODE}" = "direct" ]; then
+    pids="$(pgrep -U "$(id -u)" -fl -- "${RESIDENT_MODEL_PATTERN}" 2>/dev/null | tr '\n' ';')"
+    if [ -n "${pids}" ]; then
+      log "PHASE_QUIESCE_REAP label=${label} mode=direct residue=${pids}"
+      pkill -TERM -U "$(id -u)" -f -- "${RESIDENT_MODEL_PATTERN}" 2>/dev/null || true
+      sleep 2
+      pkill -KILL -U "$(id -u)" -f -- "${RESIDENT_MODEL_PATTERN}" 2>/dev/null || true
+      sleep 1
+    fi
+    survivors="$(pgrep -U "$(id -u)" -fl -- "${RESIDENT_MODEL_PATTERN}" 2>/dev/null | tr '\n' ';')"
+  else
+    pids="$(pgrep -l -U "${BENCH_USER}" 2>/dev/null | tr '\n' ';')"
+    if [ -n "${pids}" ]; then
+      log "PHASE_QUIESCE_REAP label=${label} uid=${BENCH_USER} residue=${pids}"
+      sudo -n "${BENCH_EXEC}" "${ws}" /usr/bin/pkill -TERM -U "${BENCH_USER}" >/dev/null 2>&1 || true
+      sleep 2
+      if pgrep -U "${BENCH_USER}" >/dev/null 2>&1; then
+        sudo -n "${BENCH_EXEC}" "${ws}" /usr/bin/pkill -KILL -U "${BENCH_USER}" >/dev/null 2>&1 || true
+        sleep 1
+      fi
+    fi
+    survivors="$(pgrep -U "${BENCH_USER}" -fl -- "${RESIDENT_MODEL_PATTERN}" 2>/dev/null | tr '\n' ';')"
+  fi
+  if [ -n "${survivors}" ]; then
+    die 3 "phase quiescence (${label}): residual model-holding bench processes survived reap: ${survivors}"
+  fi
+
+  while :; do
+    load="$(sysctl -n vm.loadavg | awk '{print $2}')"
+    util="$(gpu_util)"
+    if [ -n "${util}" ] \
+       && [ "$(echo "${load} < ${PREFLIGHT_MAX_LOAD}" | bc -l)" = "1" ] \
+       && [ "$(echo "${util} < ${PREFLIGHT_MAX_GPU_UTIL}" | bc -l)" = "1" ]; then
+      log "PHASE_QUIESCE_OK label=${label} load=${load} gpu_util=${util} waited=${waited}s"
+      return 0
+    fi
+    sleep 10
+    waited=$((waited + 10))
+    if [ "${waited}" -ge "${PHASE_QUIESCE_TIMEOUT}" ]; then
+      die 3 "phase quiescence (${label}): load=${load:-unknown} gpu_util=${util:-unknown} still above preflight thresholds after ${waited}s"
+    fi
+  done
 }
 
 # --- Workspace prerequisites ----------------------------------------------------
@@ -780,6 +877,10 @@ run_timed() {
   local sealed="${OUT_DIR}/score-${side}.json"
   local tpid bstatus
 
+  # Identical, residue-free preconditions for every attempt on both sides of
+  # the pair: reap prior bench residue, assert none holds the model, wait for
+  # load/util to settle -- then the unchanged thermal gate.
+  phase_quiesce "${side}-a${attempt}" "${ws}"
   thermal_gate "${side}-a${attempt}" || die 2 "thermal gate timeout before ${side} attempt ${attempt}"
 
   "${MACMON}" pipe -i "${TELEM_INTERVAL_MS}" > "${telem}" 2>/dev/null &
