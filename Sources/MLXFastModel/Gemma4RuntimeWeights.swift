@@ -3,6 +3,23 @@ import Foundation
 import MLX
 import MLXFastCore
 import MLXLLM
+
+/// Apple Silicon chip generation for per-generation tuning.
+private enum ChipGeneration {
+    case m1, m2, m3, m4, m5, unknown
+}
+
+/// Detect chip generation via sysctl hw.cpufamily.
+private func detectChipGeneration() -> ChipGeneration {
+    var size = MemoryLayout<Int32>.size
+    var cpufamily: Int32 = 0
+    sysctlbyname("hw.cpufamily", &cpufamily, &size, nil, 0)
+    if cpufamily >= 450_000_000 { return .m5 }
+    if cpufamily >= 395_000_000 { return .m4 }
+    if cpufamily >= 330_000_000 { return .m3 }
+    if cpufamily >= 250_000_000 { return .m2 }
+    return .m1
+}
 import MLXLMCommon
 import MLXNN
 
@@ -39,15 +56,21 @@ public final class Gemma4RuntimeWeightCache {
         // checkpoint plus KV/activation buffers instead of growing without limit
         // across a long decode run.
         //
-        // The ranked M5 Max has enough headroom to retain more freed
-        // intermediate buffers for reuse. This is a soft allocator-cache cap,
-        // not a reservation; model weights remain active allocations.
+        // Chip-specific tuning: M5 ranked runner benefits from larger
+        // Metal command buffers and more aggressive intermediate caching.
         if config.numHiddenLayers >= 16 {
-            // The MLX M5 Max default commits after referencing 50 MiB. Many
-            // 4-bit projections individually exceed that, so use a moderate
-            // limit that can group adjacent kernels without long command buffers.
-            setenv("MLX_MAX_MB_PER_BUFFER", "128", 1)
-            Memory.cacheLimit = 32 << 30
+            let chip = detectChipGeneration()
+            let (bufferMB, cacheGB): (String, Int)
+            switch chip {
+            case .m5:
+                bufferMB = "256"
+                cacheGB = 48
+            default:
+                bufferMB = "128"
+                cacheGB = 32
+            }
+            setenv("MLX_MAX_MB_PER_BUFFER", bufferMB, 1)
+            Memory.cacheLimit = cacheGB << 30
         }
         do {
             libraryModel = try Gemma4RuntimeWeightCache.loadLibraryModel(
