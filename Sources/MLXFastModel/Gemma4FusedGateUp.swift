@@ -1,5 +1,26 @@
+import Foundation
 import MLX
 import MLXNN
+
+private func gemma4GateUpEnvironmentFlag(
+    _ name: String,
+    default defaultValue: Bool
+) -> Bool {
+    guard let raw = ProcessInfo.processInfo.environment[name] else {
+        return defaultValue
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}
+
+private let gemma4GateUpRows8Enabled = gemma4GateUpEnvironmentFlag(
+    "DARKBLOOM_GATE_UP_ROWS8",
+    default: true
+)
+
+private let gemma4VerifyGateUpRows8Bits = gemma4GateUpEnvironmentFlag(
+    "DARKBLOOM_VERIFY_GATE_UP_ROWS8_BITS",
+    default: false
+)
 
 struct IndexedAffineMetadata: @unchecked Sendable {
     let indices: MLXArray
@@ -460,6 +481,144 @@ private let gemma4IndexedFusedGateUpActivationQMV = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Eight output rows per SIMD group keeps the established two-SIMD gate/up
+/// ownership while halving input replay, threadgroups, and barriers. Each row
+/// retains the rows4 kernel's indexed QMV, BF16 projection, GELU, and product
+/// arithmetic topology.
+private let gemma4IndexedFusedGateUpActivationRows8QMV = MLXFast.metalKernel(
+    name: "gemma4_indexed_fused_gate_up_activation_rows8_qmv_5376_v1",
+    inputNames: [
+        "gate_weight", "gate_indices", "gate_lut",
+        "up_weight", "up_indices", "up_lut", "x",
+    ],
+    outputNames: ["activated"],
+    source: """
+        constexpr int kInputWidth = 5376;
+        constexpr int kGroupsPerRow = 84;
+        constexpr int kWeightBytesPerRow = 2688;
+        constexpr int kRowsPerSIMD = 8;
+
+        const bool is_up = simdgroup_index_in_threadgroup == 1;
+        const int output_row = threadgroup_position_in_grid.y * kRowsPerSIMD;
+        const device uint* weight = is_up ? up_weight : gate_weight;
+        const device ushort* indices = is_up ? up_indices : gate_indices;
+
+        const device uchar* weight_bytes =
+            reinterpret_cast<const device uchar*>(weight)
+            + output_row * kWeightBytesPerRow
+            + thread_index_in_simdgroup * 4;
+        const device ushort* row_indices =
+            indices + output_row * kGroupsPerRow
+            + thread_index_in_simdgroup / 8;
+        const device bfloat* input = x + thread_index_in_simdgroup * 8;
+
+        float result[kRowsPerSIMD] = {0};
+        for (int block = 0; block < 21; ++block) {
+            float values[8];
+            const float input_sum = gemma4_rows8_load_qmv_values(input, values);
+
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                const device uchar* row_weight =
+                    weight_bytes + row * kWeightBytesPerRow;
+                const ushort metadata_index = row_indices[row * kGroupsPerRow];
+                const uint pair = is_up
+                    ? up_lut[metadata_index]
+                    : gate_lut[metadata_index];
+                result[row] += gemma4_rows8_qdot_4bit(
+                    row_weight,
+                    values,
+                    gemma4_rows8_pair_scale(pair),
+                    gemma4_rows8_pair_bias(pair),
+                    input_sum);
+            }
+
+            weight_bytes += 128;
+            row_indices += 4;
+            input += 256;
+        }
+
+        threadgroup bfloat projections[2][kRowsPerSIMD];
+        for (int row = 0; row < kRowsPerSIMD; ++row) {
+            result[row] = simd_sum(result[row]);
+            if (thread_index_in_simdgroup == 0) {
+                projections[is_up ? 1 : 0][row] =
+                    static_cast<bfloat>(result[row]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simdgroup_index_in_threadgroup == 0
+            && thread_index_in_simdgroup < kRowsPerSIMD
+        ) {
+            const int row = thread_index_in_simdgroup;
+            const bfloat gate = projections[0][row];
+            const bfloat up = projections[1][row];
+
+            const bfloat cubic0 = static_cast<bfloat>(0.044715f) * gate;
+            const bfloat cubic1 = cubic0 * gate;
+            const bfloat cubic2 = cubic1 * gate;
+            const bfloat inner0 = gate + cubic2;
+            const bfloat inner1 =
+                static_cast<bfloat>(0.7978845834732056f) * inner0;
+            const bfloat tanh_value =
+                static_cast<bfloat>(metal::precise::tanh(inner1));
+            const bfloat shifted = static_cast<bfloat>(1.0f) + tanh_value;
+            const bfloat scaled = static_cast<bfloat>(0.5f) * gate;
+            const bfloat gelu = scaled * shifted;
+            activated[output_row + row] = gelu * up;
+        }
+        """,
+    header: """
+        using namespace metal;
+
+        inline float gemma4_rows8_pair_scale(uint pair) {
+            return static_cast<float>(as_type<bfloat>(static_cast<ushort>(pair)));
+        }
+
+        inline float gemma4_rows8_pair_bias(uint pair) {
+            return static_cast<float>(
+                as_type<bfloat>(static_cast<ushort>(pair >> 16)));
+        }
+
+        inline float gemma4_rows8_load_qmv_values(
+            const device bfloat* input,
+            thread float* values
+        ) {
+            float sum = 0;
+            for (int index = 0; index < 8; index += 4) {
+                sum += input[index] + input[index + 1]
+                    + input[index + 2] + input[index + 3];
+                values[index] = input[index];
+                values[index + 1] = input[index + 1] / 16.0f;
+                values[index + 2] = input[index + 2] / 256.0f;
+                values[index + 3] = input[index + 3] / 4096.0f;
+            }
+            return sum;
+        }
+
+        inline float gemma4_rows8_qdot_4bit(
+            const device uchar* weight,
+            const thread float* values,
+            float scale,
+            float bias,
+            float input_sum
+        ) {
+            const device ushort* packed =
+                reinterpret_cast<const device ushort*>(weight);
+            float accumulator = 0;
+            for (int index = 0; index < 2; ++index) {
+                accumulator +=
+                    (values[4 * index] * (packed[index] & 0x000f)
+                    + values[4 * index + 1] * (packed[index] & 0x00f0)
+                    + values[4 * index + 2] * (packed[index] & 0x0f00)
+                    + values[4 * index + 3] * (packed[index] & 0xf000));
+            }
+            return scale * accumulator + input_sum * bias;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 struct FusedGateUpProjection: @unchecked Sendable {
     let gate: FastQuantizedProjection
     let up: FastQuantizedProjection
@@ -562,16 +721,60 @@ struct FusedGateUpProjection: @unchecked Sendable {
             preconditionFailure("indexed gate/up metadata was not prepared")
         }
         var outputShape = input.shape
-        outputShape[outputShape.count - 1] = gate.weight.dim(0)
-        return gemma4IndexedFusedGateUpActivationQMV(
-            [
-                gate.weight, indexedGate.indices, indexedGate.lut,
-                up.weight, indexedUp.indices, indexedUp.lut, input,
-            ],
-            grid: (32, gate.weight.dim(0) / 2, 1),
-            threadGroup: (32, 2, 1),
-            outputShapes: [outputShape],
-            outputDTypes: [.bfloat16]
-        )[0]
+        let outputWidth = gate.weight.dim(0)
+        outputShape[outputShape.count - 1] = outputWidth
+        let inputs = [
+            gate.weight, indexedGate.indices, indexedGate.lut,
+            up.weight, indexedUp.indices, indexedUp.lut, input,
+        ]
+        let canUseRows8 = outputWidth.isMultiple(of: 8)
+        let runRows8 = canUseRows8
+            && (gemma4GateUpRows8Enabled || gemma4VerifyGateUpRows8Bits)
+
+        let rows8Output: MLXArray? = runRows8
+            ? gemma4IndexedFusedGateUpActivationRows8QMV(
+                inputs,
+                grid: (32, outputWidth / 4, 1),
+                threadGroup: (32, 2, 1),
+                outputShapes: [outputShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+            : nil
+
+        let needsRows4 = !gemma4GateUpRows8Enabled
+            || gemma4VerifyGateUpRows8Bits
+            || !canUseRows8
+        let rows4Output: MLXArray? = needsRows4
+            ? gemma4IndexedFusedGateUpActivationQMV(
+                inputs,
+                grid: (32, outputWidth / 2, 1),
+                threadGroup: (32, 2, 1),
+                outputShapes: [outputShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+            : nil
+
+        if gemma4VerifyGateUpRows8Bits, let rows8Output, let rows4Output {
+            let matches = arrayEqual(
+                rows8Output.view(dtype: .uint16),
+                rows4Output.view(dtype: .uint16)
+            )
+            eval(matches)
+            precondition(
+                matches.item(Bool.self),
+                "rows8 gate/up activation differs from rows4 in raw BF16"
+            )
+        }
+
+        // Verification alone must retain the established output path. This
+        // keeps the verifier behavior-neutral while still executing both
+        // complete kernels on every eligible layer input.
+        if gemma4GateUpRows8Enabled, let rows8Output {
+            return rows8Output
+        }
+        guard let rows4Output else {
+            preconditionFailure("rows4 gate/up activation output was not produced")
+        }
+        return rows4Output
     }
 }
