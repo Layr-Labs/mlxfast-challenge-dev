@@ -99,6 +99,7 @@ final class Gemma4FastLayer {
     let fusedQK: FusedFullQKProjection?
     let combinedAttentionPrefill: CombinedAttentionPrefillProjection?
     let fusedAttentionRMS: FusedAttentionRMSPreparation?
+    let fusedFullQKAttentionPreparation: FusedFullQKAttentionPreparation?
     let fusedAttentionToMLPBoundary: FusedAttentionToMLPBoundary?
     let fusedMLPToNextBoundary: FusedMLPToNextBoundary?
 
@@ -214,6 +215,7 @@ final class Gemma4FastLayer {
         } else {
             fusedQKEnabled = true
         }
+        let fusedFullQKProjection: FusedFullQKProjection?
         if fusedQKEnabled,
            !isSliding,
            useKEqV,
@@ -226,14 +228,17 @@ final class Gemma4FastLayer {
                kMetadata: kIndexedMetadata
            )
         {
-            self.fusedQK = FusedFullQKProjection(
+            let projection = FusedFullQKProjection(
                 q: qProjection,
                 k: kProjection,
                 qMetadata: qIndexedMetadata,
                 kMetadata: kIndexedMetadata
             )
+            self.fusedQK = projection
+            fusedFullQKProjection = projection
         } else {
             self.fusedQK = nil
+            fusedFullQKProjection = nil
         }
         let combinedAttentionPrefillEnabled: Bool
         if let raw = ProcessInfo.processInfo.environment[
@@ -280,6 +285,32 @@ final class Gemma4FastLayer {
                 qNormWeight: qNorm.weight,
                 kNormWeight: kNorm?.weight,
                 eps: eps
+            )
+            : nil
+        let verifyFusedFullQKAttentionPreparation = [
+            "1", "true", "yes", "on",
+        ].contains(
+            ProcessInfo.processInfo.environment[
+                "DARKBLOOM_VERIFY_FUSED_FULL_QK_RMS_BITS"
+            ]?.lowercased() ?? "0"
+        )
+        let fusedFullQKAttentionPreparationEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_FUSED_FULL_QK_RMS"
+        ] {
+            fusedFullQKAttentionPreparationEnabled = [
+                "1", "true", "yes", "on",
+            ].contains(raw.lowercased())
+        } else {
+            fusedFullQKAttentionPreparationEnabled = true
+        }
+        self.fusedFullQKAttentionPreparation =
+            fusedFullQKAttentionPreparationEnabled
+                || verifyFusedFullQKAttentionPreparation
+            ? FusedFullQKAttentionPreparation(
+                projection: fusedFullQKProjection,
+                preparation: self.fusedAttentionRMS,
+                verifyBits: verifyFusedFullQKAttentionPreparation
             )
             : nil
         self.inputNormWeight = inputNorm.weight
@@ -486,11 +517,41 @@ final class Gemma4FastLayer {
 
         let (B, L, _) = (h.dim(0), h.dim(1), h.dim(2))
         let offset = cache?.offset ?? 0
+        let combinedCache = gemma4CombinedKVDirectEnabled()
+            ? cache as? Gemma4CombinedKVCache
+            : nil
+        let fusedFullPrepared: (
+            queries: MLXArray,
+            combinedKV: MLXArray
+        )?
+        if B == 1,
+           L == 1,
+           !isSliding,
+           useKEqV,
+           h.dtype == .bfloat16,
+           combinedCache != nil,
+           let fusedFullQKAttentionPreparation,
+           fusedFullQKAttentionPreparation.supports(offset: offset)
+        {
+            fusedFullPrepared = fusedFullQKAttentionPreparation(
+                h,
+                offset: offset
+            )
+        } else {
+            fusedFullPrepared = nil
+        }
 
         let rawQueries: MLXArray
         let rawKeys: MLXArray
         let rawValues: MLXArray?
-        if B == 1, L == 1, let fusedQKV {
+        if let fusedFullPrepared {
+            // These aliases are not consumed by the candidate branch below;
+            // they keep definite initialization without constructing the
+            // legacy raw Q/K projection graph.
+            rawQueries = fusedFullPrepared.queries
+            rawKeys = fusedFullPrepared.combinedKV
+            rawValues = nil
+        } else if B == 1, L == 1, let fusedQKV {
             let projected = fusedQKV(h)
             rawQueries = projected.0
             rawKeys = projected.1
@@ -521,9 +582,6 @@ final class Gemma4FastLayer {
         let usesFusedAttentionPreparation = B == 1
             && L == 1
             && fusedAttentionRMS?.supports(offset: offset) == true
-        let combinedCache = gemma4CombinedKVDirectEnabled()
-            ? cache as? Gemma4CombinedKVCache
-            : nil
         let usesCombinedKVDecodePreparation = usesFusedAttentionPreparation
             && combinedCache != nil
         let combinedPrefillCapacity = B == 1
@@ -533,7 +591,16 @@ final class Gemma4FastLayer {
             ? combinedCache?.directPrefillCapacity(for: L)
             : nil
         let usesCombinedKVPrefillPreparation = combinedPrefillCapacity != nil
-        if usesCombinedKVDecodePreparation,
+        if let fusedFullPrepared,
+           let combinedCache
+        {
+            queries = fusedFullPrepared.queries
+            let updated = combinedCache.updateCombined(
+                fusedFullPrepared.combinedKV
+            )
+            keys = updated.0
+            values = updated.1
+        } else if usesCombinedKVDecodePreparation,
            let fusedAttentionRMS,
            let combinedCache
         {
