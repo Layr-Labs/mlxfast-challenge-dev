@@ -1617,7 +1617,7 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(runtime.contains("correctnessTokenAccepted("))
     #expect(runtime.contains("kind: \"correctness_begin\""))
     #expect(runtime.contains("kind: \"correctness_step\""))
-    #expect(runtime.contains("teacherForcedCorrectnessStep(previousToken: expectedToken)"))
+    #expect(runtime.contains("worker.teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[step - 1])"))
     #expect(!runtime.contains("correctness_teacher_forced_batch"))
     #expect(!runtime.contains("teacherForcedCorrectnessBatch"))
     #expect(!runtime.contains("let expectedTokens: [Int]?"))
@@ -3878,9 +3878,15 @@ func finalArtifactNamesStayRunIdOnlyAndAuditArtifactsEmbedRunAttempt() throws {
 }
 
 @Test
-func benchmarkWorkflowSerializesEveryDispatch() throws {
+func benchmarkWorkflowUsesPerRunConcurrencyGroupWithoutCancellation() throws {
+    // Ranked serving spans two at-parity m5-bench boxes: the concurrency group
+    // is per-run so a second online runner can claim queued work (per-box
+    // serialization is enforced by the self-hosted runner label queue, one job
+    // per box), and cancel-in-progress stays false so no ranked run is ever
+    // cancelled out from under a box mid-measurement.
     let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
-    #expect(workflow.contains("concurrency:\n  group: mlxfast-ranked-benchmark\n  cancel-in-progress: false"))
+    #expect(workflow.contains("concurrency:\n  group: mlxfast-ranked-${{ github.run_id }}\n  cancel-in-progress: false"))
+    #expect(!workflow.contains("group: mlxfast-ranked-benchmark"))
     #expect(!workflow.contains("group: benchmark-${{ github.ref }}"))
     #expect(!workflow.contains("group: benchmark-${{ inputs.run_benchmark }}"))
 }

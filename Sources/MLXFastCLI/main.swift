@@ -1106,6 +1106,13 @@ private enum MLXFastCLI {
         return value
     }
 
+    private static func parseNonNegativeInt(_ rawValue: String, optionName: String) throws -> Int {
+        guard let value = Int(rawValue), value >= 0 else {
+            throw MLXFastError.invalidInput("\(optionName) must be a non-negative integer")
+        }
+        return value
+    }
+
     private static func runtimeWorkerOptions(
         blockedGoldenPath: String? = nil,
         forwardsWorkerStderr: Bool = false
