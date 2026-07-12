@@ -1284,6 +1284,8 @@ private enum MLXFastCLI {
         (deny process-exec*)
         (allow process-exec (literal "\(seatbeltEscaped(absoluteExecutablePath))"))
         (deny mach-lookup (global-name "com.apple.mDNSResponder"))
+        (deny mach-lookup (global-name "com.apple.system.mDNSResponder"))
+        (deny mach-lookup (global-name-prefix "com.apple.mDNSResponder"))
         """
         try profile.write(to: profileURL, atomically: true, encoding: .utf8)
         return profileURL.path

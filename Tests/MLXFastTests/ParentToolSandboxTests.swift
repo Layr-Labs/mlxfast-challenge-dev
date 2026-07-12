@@ -65,15 +65,24 @@ struct ParentToolSandboxTests {
         let profileRange = try #require(
             cli.range(of: "private static func writeParentToolSandboxProfile(")
         )
-        let profileBody = String(cli[profileRange.lowerBound...].prefix(900))
+        let profileBody = String(cli[profileRange.lowerBound...].prefix(1200))
 
         #expect(profileBody.contains("(deny network*)"))
         #expect(profileBody.contains("(deny process-fork)"))
         #expect(profileBody.contains("(deny process-exec*)"))
         #expect(profileBody.contains("(allow process-exec (literal"))
         // Coordinated with the operator worker profile's mDNSResponder deny.
+        // All three resolver names are pinned: the exact service name, the
+        // legacy system alias, and the prefix form that covers relaunched
+        // (".reloaded"-style) resolver registrations.
         #expect(profileBody.contains(
             "(deny mach-lookup (global-name \"com.apple.mDNSResponder\"))"
+        ))
+        #expect(profileBody.contains(
+            "(deny mach-lookup (global-name \"com.apple.system.mDNSResponder\"))"
+        ))
+        #expect(profileBody.contains(
+            "(deny mach-lookup (global-name-prefix \"com.apple.mDNSResponder\"))"
         ))
     }
 
