@@ -251,8 +251,13 @@ extension GemmaRuntime {
     }
 
     static func validateBenchmarkOptions(_ options: BenchmarkOptions) throws {
-        guard options.correctnessSteps > 0 else {
-            throw MLXFastError.invalidInput("benchmark correctness steps must be positive")
+        // 0 is allowed deliberately: it means "skip the base teacher-forced case on this
+        // run" (still runs anchors/free-run/behavior/GPQA/TTFT/timing), for a run whose
+        // base case is verified in a separate phase of the ranked pipeline. Skipping is
+        // a caller decision, not a harness one -- the harness never treats a steps=0
+        // run as having actually verified correctness by itself.
+        guard options.correctnessSteps >= 0 else {
+            throw MLXFastError.invalidInput("benchmark correctness steps must be >= 0")
         }
         guard options.correctnessSteps <= MLXFastConstants.correctnessSteps else {
             throw MLXFastError.invalidInput(
@@ -438,14 +443,16 @@ extension GemmaRuntime {
             let decode: DecodeMeasurement
             let benchmarkPeakRamGB: Double
             if options.skipTimedBenchmark {
-                // Gates pass: correctness and behavior gates run here; the timed
-                // prefill/decode measurement runs later via measure-job.
-                // Placeholders use the golden-resolved baseline seconds-per-token
-                // exactly (speedup == 1.0, always finite, always clears the floor)
+                // This pass's role is the base case + anchor/free-run/behavior/
+                // GPQA gates only -- the ranked pipeline measures the real
+                // prefill/decode numbers afterwards via measure-job. Placeholders
+                // here use the golden-resolved baseline seconds-per-token exactly
+                // (speedup == 1.0, always finite, always clears the floor)
                 // rather than 0 or some arbitrary value: 0 would divide-by-zero
                 // into +Infinity in BenchmarkScore.speedup, and Double.infinity
-                // fails JSON encoding outright. overlay-paired-timing.sh replaces
-                // these with the measured paired timing before publish.
+                // fails JSON encoding outright. Whatever ships here is
+                // overwritten by the measured paired timing when
+                // overlay-paired-timing.sh assembles the final score.
                 progress("timed benchmark skipped (gates-only phase)")
                 prefillSecondsPerToken = baselinePrefillSecondsPerToken
                 decode = DecodeMeasurement(

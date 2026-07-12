@@ -137,9 +137,7 @@ private enum MLXFastCLI {
     }
 
     private static func runCorrectness(_ options: ParsedOptions) throws -> Int {
-        try options.validate(
-            valueOptions: ["--weights", "--golden"]
-        )
+        try options.validate(valueOptions: ["--weights", "--golden"])
         let weightsPath = options.value(
             for: "--weights",
             default: environmentValue(
@@ -323,17 +321,24 @@ private enum MLXFastCLI {
         if !semanticOutputPath.isEmpty {
             try requirePrivateOutputPath(semanticOutputPath, description: "semantic GPQA answer output")
         }
-        let correctnessSteps = try parsePositiveInt(
+        // Lets a run skip the base teacher-forced case (still runs behavior/GPQA/TTFT/
+        // timing) when that case is verified in a separate phase of the ranked
+        // pipeline. Defaults to the full official window. See the comment on
+        // BenchmarkPreflight/validateBenchmarkOptions for why 0 is accepted: the
+        // harness never treats a steps=0 run as self-certifying correctness; only the
+        // trusted pipeline that assembles the final score may do that.
+        let correctnessSteps = try parseNonNegativeInt(
             environmentValue(
                 "MLXFAST_BENCHMARK_CORRECTNESS_STEPS",
                 fallback: "\(MLXFastConstants.correctnessSteps)"
             ),
             optionName: "MLXFAST_BENCHMARK_CORRECTNESS_STEPS"
         )
-        // Lets the anchor/free-run/behavior/GPQA gates and the timed prefill/
-        // decode measurement each run on their own machine too, same rationale
-        // as MLXFAST_BENCHMARK_CORRECTNESS_STEPS above. Both default to
-        // reproducing the original, single-machine behavior exactly.
+        // Phase controls for the single-machine ranked pipeline: benchmark.yml's
+        // gates pass runs with CHECK_GATES=1 SKIP_TIMED=1 (base case + hidden gates,
+        // no timing), and the timed measurement runs later through measure-job's
+        // own ./benchmark.sh --official invocation. Both default to the original
+        // everything-in-one-run behavior.
         let checkGates = environmentValue("MLXFAST_BENCHMARK_CHECK_GATES", fallback: "1") != "0"
         let skipTimedBenchmark = environmentValue("MLXFAST_BENCHMARK_SKIP_TIMED", fallback: "0") == "1"
         let payload = GemmaRuntime.benchmark(
@@ -1106,9 +1111,9 @@ private enum MLXFastCLI {
         forwardsWorkerStderr: Bool = false
     ) throws -> RuntimeWorkerOptions? {
         // benchmark.sh's enforce_official_sandbox refuses to run the timed benchmark
-        // with the worker or its sandbox disabled on an official run, but the slice
-        // machines invoke `mlxfast-swift correctness` directly, so the same policy
-        // must fail closed here too rather than silently falling back to an
+        // with the worker or its sandbox disabled on an official run, but the public
+        // behavior gate invokes `mlxfast-swift correctness` directly, so the same
+        // policy must fail closed here too rather than silently falling back to an
         // unsandboxed (or worker-less) path. MLXFAST_OFFICIAL_BENCHMARK_RUN is set
         // by trusted workflow env and stripped from the worker's own environment by
         // sanitizedRuntimeWorkerEnvironment, so submitted code cannot observe it.

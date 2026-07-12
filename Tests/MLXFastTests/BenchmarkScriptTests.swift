@@ -376,9 +376,11 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
     #expect(workflow.contains(".github/scripts/download-reference-cache-scope.sh \"${CACHE_SCOPE}\""))
     #expect(workflow.contains("MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: \"0\""))
 
-    // Secret-free by design: this workflow runs setup.sh and the download
-    // script FROM THE DISPATCHED REF with no `environment:` approval gate, so
-    // a repo credential injected here would be exfiltratable by any ref with a
+    // Secret-free by design (a blanket `secrets.` ban): this workflow runs
+    // setup.sh and the download script FROM THE DISPATCHED REF with no
+    // `environment:` approval gate, so a repo credential injected here (as a
+    // prior version did with secrets.MLXFAST_REFERENCE_BASE_URL/
+    // MLXFAST_REFERENCE_AUTH_HEADER) would be exfiltratable by any ref with a
     // modified setup.sh. The public Hugging Face mirror needs no credential
     // and every downloaded byte is verified against the pinned manifest.
     #expect(!workflow.contains("environment:"))
@@ -677,6 +679,9 @@ func hashWeightsDirectoryRejectsHardlinks() throws {
     // Mirrors overlay-editable-paths.sh and GemmaRuntime.directoryDigest.
     #expect(hashScript.contains("-links +1"))
     #expect(hashScript.contains("weights tree contains a hardlinked file"))
+    // Reproducible digest recipe (path-order-stable, content-addressed).
+    #expect(hashScript.contains("shasum -a 256"))
+    #expect(hashScript.contains("LC_ALL=C sort -z"))
 
     let preflight = try String(
         contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimePreflight.swift",
@@ -1887,10 +1892,75 @@ func compareTeacherForcedWithWorkerUsesSerialTeacherForcedSteps() throws {
     #expect(runtime.contains("static func compareTeacherForcedWithWorker("))
     #expect(runtime.contains("try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)"))
     #expect(runtime.contains("for step in 0..<steps {"))
-    #expect(runtime.contains("teacherForcedCorrectnessStep(previousToken: expectedToken)"))
+    #expect(runtime.contains("teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[step - 1])"))
     #expect(!runtime.contains("startStep: Int = 0,"))
     #expect(!runtime.contains("for seedStep in 0..<startStep {"))
     #expect(!runtime.contains("testCase.promptTokens + Array(testCase.expectedTokens[0..<startStep])"))
+}
+
+@Test
+func decodeMeasurementRunsSingleUnmemoizableSeedForward() throws {
+    // The decode measurement must run exactly ONE whole-prompt (seed) forward in
+    // the timed window. A second identical forward (the warmup this used to run
+    // before the seed) let submitted model code memoize one pass and serve the
+    // other from that memo, collapsing two decode-charged forwards into one and
+    // inflating decode_speedup with no real speedup. Guard both decode paths.
+    let worker = try String(
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeWorker.swift",
+        encoding: .utf8
+    )
+    let beginStart = try #require(worker.range(of: "case \"decode_begin\":"))
+    let beginEnd = try #require(worker.range(of: "case \"decode_step\":"))
+    let decodeBegin = String(worker[beginStart.lowerBound..<beginEnd.lowerBound])
+    // Exactly one whole-prompt forward, and no warmup pass preceding the seed.
+    #expect(!decodeBegin.contains("warmupCache"))
+    #expect(!decodeBegin.contains("warmupLogits"))
+    #expect(decodeBegin.components(separatedBy: "Gemma4Model.logits(").count - 1 == 1)
+    #expect(decodeBegin.contains("with NO preceding"))
+
+    let benchmark = try String(
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift",
+        encoding: .utf8
+    )
+    let decodeStart = try #require(benchmark.range(of: "static func measureDecode("))
+    let decodeEnd = try #require(benchmark.range(of: "static func measureWorkerDecode("))
+    let measureDecode = String(benchmark[decodeStart.lowerBound..<decodeEnd.lowerBound])
+    // No warmup pass before the seed prefill. (Unlike decode_begin, this path
+    // inlines the per-step decode loop, which has its own single-token
+    // logits call, so we assert on the absence of the warmup rather than a
+    // whole-prompt forward count.)
+    #expect(!measureDecode.contains("warmupCache"))
+    #expect(!measureDecode.contains("decode warmup start"))
+}
+
+// steps == 0 skips the base teacher-forced case entirely (still runs anchors/
+// free-run/behavior/GPQA/TTFT) for a run whose base case is verified in a
+// separate phase of the ranked pipeline. Skipping is a caller decision; the
+// harness must never treat a steps=0 run as having verified correctness on
+// its own -- only the trusted pipeline that assembles the final score may.
+@Test
+func benchmarkCorrectnessSupportsZeroStepBaseCaseSkipWithoutSelfCertifying() throws {
+    let runtime = try harnessRuntimeSource()
+
+    #expect(runtime.contains("progress?(\"correctness case \\(caseLabel) skipped (steps=0)\")"))
+    #expect(runtime.contains("guard steps > 0 else {"))
+
+    // 0 is an explicit, documented allowance for BenchmarkOptions.correctnessSteps.
+    #expect(runtime.contains("guard options.correctnessSteps >= 0 else {"))
+    #expect(!runtime.contains("guard options.correctnessSteps > 0 else {"))
+}
+
+// checkGates: false must skip all three gate loops (anchors/free-run/behavior/
+// GPQA) and report caseCount as golden.cases.count alone -- the timing-only
+// role that runs against a gate-free oracle golden (see
+// BenchmarkOptions.checkGates).
+@Test
+func correctnessCheckGatesFalseSkipsGateLoopsAndReportsBaseCaseCountAlone() throws {
+    let runtime = try harnessRuntimeSource()
+
+    #expect(runtime.contains("checkGates: Bool = true,"))
+    #expect(runtime.contains("let caseCount = checkGates ? golden.totalCorrectnessCaseCount : golden.cases.count"))
+    #expect(runtime.contains("let gates = checkGates ? golden.correctnessGates : nil"))
 }
 
 // Regression test for a bug caught only by a real dispatch (not reproducible
@@ -1934,12 +2004,22 @@ func benchmarkGatesOnlyRunSkipsSpuriousSemanticCaptureFailure() throws {
 }
 
 @Test
-func benchmarkCliSupportsConfigurableCorrectnessSteps() throws {
+func benchmarkCliSupportsSkippableBenchmarkCorrectness() throws {
     let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
 
     #expect(cli.contains("MLXFAST_BENCHMARK_CORRECTNESS_STEPS"))
-    #expect(cli.contains("private static func parsePositiveInt(_ rawValue: String, optionName: String) throws -> Int {"))
+    #expect(cli.contains("private static func parseNonNegativeInt(_ rawValue: String, optionName: String) throws -> Int {"))
     #expect(cli.contains("correctnessSteps: correctnessSteps,"))
+}
+
+// The correctness-only artifact path must keep validating the produced report
+// against the pinned public fixture hash. (Formerly asserted as part of the
+// retired step-range sidecar test; the workflow validation itself is
+// unchanged.)
+@Test
+func benchmarkWorkflowValidatesCorrectnessReportGoldenHash() throws {
+    let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
+    #expect(workflow.contains(".golden_hash == $golden_hash"))
 }
 
 @Test
@@ -2457,6 +2537,236 @@ func coolGateFanBoostIsOptInSudoSafeAndHardCappedAtSeventyPercent() throws {
     #expect(fan.contains("-k \"F${i}Md\" -w 00"))
     #expect(fan.contains("-k \"F${i}Md\" -w 01"))
     #expect(fan.contains("-k \"F${i}Tg\" -w \"${hex}\""))
+}
+
+// Robustness contract layered on top of the boost: (1) `smc -w` is
+// fire-and-forget, so every boost write is read back and a fan whose write
+// did not stick fails the boost loudly instead of reporting a
+// silently-ineffective 70%; (2) mode inspection covers EVERY fan (a foreign
+// controller or a partially-restored boost can hold any subset manual), and
+// `boost` refuses to overwrite another controller's targets; (3) benchmark.sh
+// tracks whether THIS run applied a boost so a completed run ends with a
+// restore reminder and an INT/TERM abort restores automatic control instead
+// of leaving the machine pinned at 70%.
+@Test
+func fanBoostVerifiesWritesInspectsAllFansAndTracksRunRestoreState() throws {
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    let fan = try String(contentsOfFile: "tools/fan-control.sh", encoding: .utf8)
+
+    // (1) Write verification: both SMC keys are read back per fan, compared
+    // within a small float-rounding tolerance, and a non-stuck write names
+    // the fan and fails the boost (non-zero exit), rolling every fan back to
+    // automatic so no half-boosted state survives a reported failure.
+    #expect(fan.contains("verify_fan_boost_write() {"))
+    #expect(fan.contains("if verify_fan_boost_write \"${i}\" \"${target}\"; then"))
+    #expect(fan.contains("smc_read_number \"F${fan_index}Md\""))
+    #expect(fan.contains("smc_read_number \"F${fan_index}Tg\""))
+    #expect(fan.contains("readonly FAN_TARGET_VERIFY_TOLERANCE_RPM="))
+    #expect(fan.contains("write did not stick"))
+    #expect(fan.contains("boost may not have taken effect for fan(s) ${failed_fans}"))
+    #expect(fan.contains("if [[ -n \"${failed_fans}\" ]]; then"))
+
+    // (2) Foreign-controller detection: every fan's mode bit is inspected
+    // (fan 0 alone no longer decides `status`), and `boost` refuses to
+    // overwrite a manual hold it does not own instead of clobbering it.
+    #expect(fan.contains("list_manual_fans() {"))
+    #expect(fan.contains("fan_mode_is_manual \"${i}\""))
+    #expect(fan.contains("manual_fans=\"$(list_manual_fans \"${fan_count}\")\""))
+    #expect(!fan.contains("smc_read_number \"F0Md\""))
+    #expect(fan.contains("already in manual mode; another fan controller"))
+    // benchmark.sh's offer reconciles with that refusal: a hold this run did
+    // not create skips the offer with one warning (no sudo prompt destined to
+    // be refused, no double-warn) and does not reset the stall clock.
+    #expect(script.contains("if fan_boost_recorded; then"))
+    #expect(script.contains("another fan controller (or a prior un-restored boost) already holds the fans in manual mode"))
+
+    // (3) Run-scoped restore tracking: the top-level local run owns a state
+    // file, gate children record an applied boost into it, a completed run
+    // prints the restore reminder (fans intentionally stay forced -- no
+    // auto-restore on the normal path), and INT/TERM restores ONLY when this
+    // run applied a boost.
+    #expect(script.contains("setup_fan_boost_run_tracking() {"))
+    #expect(script.contains("export MLXFAST_FAN_BOOST_STATE_FILE="))
+    #expect(script.contains("record_fan_boost_applied"))
+    #expect(script.contains("report_fan_boost_restore_reminder"))
+    #expect(script.contains("still forced to 70% of max"))
+    #expect(script.contains("trap 'handle_benchmark_abort_signal INT' INT"))
+    #expect(script.contains("trap 'handle_benchmark_abort_signal TERM' TERM"))
+    #expect(script.contains("if [[ -n \"${FAN_BOOST_STATE_FILE_OWNED}\" ]] && fan_boost_recorded; then"))
+    #expect(script.contains("returning them to macOS automatic control"))
+}
+
+// End-to-end over the real script: a local run that recorded a fan boost
+// finishes successfully, prints the restore reminder, and does NOT hand the
+// fans back automatically -- staying forced through the timed phases (and
+// past exit) is the intended behavior; only the reminder tells the user how
+// to undo it.
+@Test
+func benchmarkPrintsFanRestoreReminderAfterBoostWithoutAutoRestoring() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let score = root.appendingPathComponent("score.local-iterate.json")
+    let integrity = root.appendingPathComponent("benchmark-integrity.local-iterate.json")
+    let fanLog = root.appendingPathComponent("fan-helper-invocations.log")
+    let fakeFanHelper = root.appendingPathComponent("fake-fan-control.sh")
+    try """
+    #!/bin/sh
+    printf '%s\\n' "$1" >> "\(fanLog.path)"
+    if [ "$1" = "status" ]; then echo auto; fi
+    exit 0
+    """.write(to: fakeFanHelper, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeFanHelper.path
+    )
+
+    // The fake benchmark stands in for the cool-gate child that applies a
+    // boost mid-run: it records into the state file benchmark.sh exported,
+    // then completes normally with a passing score payload.
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    printf 'applied\\n' >> "${MLXFAST_FAN_BOOST_STATE_FILE}"
+    cat <<'JSON'
+    {
+      "score": null,
+      "passed": true,
+      "metrics": {
+        "weights_hash": "fake-weights",
+        "weights_file_count": 1,
+        "weights_byte_count": 2
+      }
+    }
+    JSON
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = ["benchmark.sh", "--local-iterate"]
+    process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = benchmarkTestEnvironment([
+        "MLXFAST_NO_SANDBOX": "1",
+        "MLXFAST_SKIP_TRANSFORM": "1",
+        "MLXFAST_SWIFT_BIN": fakeSwift.path,
+        "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_SCORE_PATH": score.path,
+        "MLXFAST_INTEGRITY_PATH": integrity.path,
+        "MLXFAST_FAN_CONTROL_HELPER": fakeFanHelper.path,
+    ])
+    let stderrPipe = Pipe()
+    process.standardError = stderrPipe
+    try process.run()
+    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+
+    #expect(process.terminationStatus == 0)
+    #expect(stderr.contains("this run boosted the fans; they are still forced to 70% of max"))
+    #expect(stderr.contains("./benchmark.sh --fan-speed-normal"))
+    // No automatic restore on the normal path: the helper is never asked to
+    // hand control back (the log records every helper invocation).
+    let helperInvocations = (try? String(contentsOf: fanLog, encoding: .utf8)) ?? ""
+    #expect(!helperInvocations.contains("normal"))
+}
+
+// End-to-end over the real script: TERM during a run that recorded a fan
+// boost restores automatic fan control through the same helper path
+// --fan-speed-normal uses, says so, and exits with the conventional
+// 128+SIGTERM status. Runs that never boosted are untouched by the handler.
+@Test
+func benchmarkRestoresFansWhenAbortedAfterBoost() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let score = root.appendingPathComponent("score.local-iterate.json")
+    let integrity = root.appendingPathComponent("benchmark-integrity.local-iterate.json")
+    let fanLog = root.appendingPathComponent("fan-helper-invocations.log")
+    let fakeFanHelper = root.appendingPathComponent("fake-fan-control.sh")
+    try """
+    #!/bin/sh
+    printf '%s\\n' "$1" >> "\(fanLog.path)"
+    if [ "$1" = "status" ]; then echo manual; fi
+    exit 0
+    """.write(to: fakeFanHelper, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeFanHelper.path
+    )
+
+    // The fake benchmark records a boost, signals it is mid-run via a marker
+    // file, then idles so the test can deliver TERM while the run is live.
+    let marker = root.appendingPathComponent("benchmark-running.marker")
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    printf 'applied\\n' >> "${MLXFAST_FAN_BOOST_STATE_FILE}"
+    : > "\(marker.path)"
+    sleep 5
+    exit 0
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = ["benchmark.sh", "--local-iterate"]
+    process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = benchmarkTestEnvironment([
+        "MLXFAST_NO_SANDBOX": "1",
+        "MLXFAST_SKIP_TRANSFORM": "1",
+        "MLXFAST_SWIFT_BIN": fakeSwift.path,
+        "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_SCORE_PATH": score.path,
+        "MLXFAST_INTEGRITY_PATH": integrity.path,
+        "MLXFAST_FAN_CONTROL_HELPER": fakeFanHelper.path,
+    ])
+    let stderrPipe = Pipe()
+    process.standardError = stderrPipe
+    try process.run()
+
+    var markerSeen = false
+    for _ in 0..<100 {
+        if FileManager.default.fileExists(atPath: marker.path) {
+            markerSeen = true
+            break
+        }
+        usleep(100_000)
+    }
+    #expect(markerSeen)
+    process.terminate()
+
+    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+
+    #expect(process.terminationStatus == 143)
+    #expect(stderr.contains("TERM received after this run boosted the fans"))
+    #expect(stderr.contains("fans restored to macOS automatic control"))
+    let helperInvocations = (try? String(contentsOf: fanLog, encoding: .utf8)) ?? ""
+    #expect(helperInvocations.contains("normal"))
 }
 
 @Test

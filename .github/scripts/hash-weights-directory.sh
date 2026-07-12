@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Write a reproducible content hash of a transformed weights/ tree to stdout (or a file
-# if given a second argument). The digest is path-independent so independent machines
-# with byte-identical weights/ under different roots still agree.
+# if given a second argument). The ranked benchmark.yml hashes the transform output
+# with this immediately after the (untrusted) transform runs, and the gates run's
+# reported weights hash is cross-checked against it before any score is trusted.
 set -euo pipefail
 
 WEIGHTS_PATH="${1:?usage: hash-weights-directory.sh WEIGHTS_PATH [OUTPUT_PATH]}"

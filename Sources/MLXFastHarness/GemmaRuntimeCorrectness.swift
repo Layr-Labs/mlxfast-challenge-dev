@@ -219,6 +219,12 @@ extension GemmaRuntime {
             for (caseIndex, testCase) in golden.cases.enumerated() {
                 currentCase = testCase.name
                 let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
+                // See the matching guard in runLayeredCorrectnessWithWorker: steps == 0
+                // intentionally skips the base case for this run.
+                guard steps > 0 else {
+                    progress?("correctness case \(caseLabel) skipped (steps=0)")
+                    continue
+                }
                 progress?("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
                 let comparison = try compareTeacherForcedCached(
                     testCase: testCase,
@@ -407,6 +413,15 @@ extension GemmaRuntime {
             for (caseIndex, testCase) in golden.cases.enumerated() {
                 currentCase = testCase.name
                 let caseLabel = "\(caseIndex + 1)/\(golden.cases.count)"
+                // steps == 0 means this run intentionally does not verify the base
+                // teacher-forced case itself, because a separate phase of the ranked
+                // pipeline verifies it. Skipping here does NOT mean correctness was
+                // checked; only the trusted pipeline that assembles the final score
+                // may treat the base case as covered.
+                guard steps > 0 else {
+                    progress?("correctness case \(caseLabel) skipped (steps=0)")
+                    continue
+                }
                 progress?("correctness case \(caseLabel) start prompt_tokens=\(testCase.promptTokens.count)")
                 let check = try compareTeacherForcedWithWorker(
                     testCase: testCase,

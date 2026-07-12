@@ -218,13 +218,15 @@ public struct BenchmarkOptions: Equatable {
     public let semanticGPQATokenizerPath: String?
     public let semanticGPQACaseCount: Int
     public let semanticGPQAMaxNewTokens: Int
-    // Both default true/false to reproduce the original, single-machine
-    // behavior exactly. These split one ranked job into phased benchmark
-    // invocations: checkGates false skips anchors/free-run/behavior/GPQA;
-    // skipTimedBenchmark true skips the prefill/decode measurement (the gates
-    // pass sets MLXFAST_BENCHMARK_SKIP_TIMED=1; measure-job runs timing later).
-    // Never both false -- that combination is meaningless and is rejected by
-    // validateBenchmarkOptions.
+    // Phase controls for the serial ranked pipeline (both default to the
+    // original everything-in-one-run behavior): skipTimedBenchmark true skips
+    // the prefill/decode measurement entirely -- benchmark.yml's gates pass
+    // sets it so the timed measurement can run LAST, behind measure-job's
+    // thermal gate, instead of inside the compute-heavy correctness pass.
+    // checkGates false skips anchors/free-run/behavior/GPQA entirely (a
+    // timing-only run against a gate-free oracle golden). Never both false
+    // and both skip at once -- that combination is meaningless (nothing left
+    // to check or time) and is rejected by validateBenchmarkOptions.
     public let checkGates: Bool
     public let skipTimedBenchmark: Bool
 

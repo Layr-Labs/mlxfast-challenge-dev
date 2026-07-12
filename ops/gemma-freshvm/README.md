@@ -1,1 +1,0 @@
-`gemma-freshvm.yml` is the operator thermal-variance probe workflow (isolated fresh-VM benchmark runs), kept here as a reference artifact outside `.github/workflows/` so it never runs from this repo. To activate it, copy the workflow into an operator ops repo's `.github/workflows/`.

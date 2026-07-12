@@ -79,8 +79,12 @@ extension GemmaRuntime {
         var response = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
         var latestExpertStats = response.expertStats ?? .zero
         var peakRamGB = response.peakRamGB ?? 0
-
         for step in 0..<steps {
+            if step > 0 {
+                response = try worker.teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[step - 1])
+                latestExpertStats = response.expertStats ?? latestExpertStats
+                peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
+            }
             guard let actualToken = response.token else {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness response missing token")
             }
@@ -129,14 +133,6 @@ extension GemmaRuntime {
                 intervalSteps: progressIntervalSteps,
                 progress: progress
             )
-
-            if step == steps - 1 {
-                break
-            }
-
-            response = try worker.teacherForcedCorrectnessStep(previousToken: expectedToken)
-            latestExpertStats = response.expertStats ?? latestExpertStats
-            peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
         }
 
         return WorkerCorrectnessResult(

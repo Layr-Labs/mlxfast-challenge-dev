@@ -54,8 +54,10 @@ public enum GemmaCorrectness {
         steps: Int = MLXFastConstants.correctnessSteps,
         nextToken: (_ contextTokens: [Int]) throws -> Int
     ) throws -> CorrectnessTokenComparison {
-        // Reference implementation mirroring compareTeacherForcedWithWorker in a
-        // form that's directly unit-testable without a live worker.
+        // Reference implementation mirroring compareTeacherForcedWithWorker's
+        // teacher-forced seeding in a form that's directly unit-testable without a
+        // live worker: every step's context is the known golden prefix, never the
+        // model's own prior output.
         guard !promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("teacher-forced correctness prompt must not be empty")
         }

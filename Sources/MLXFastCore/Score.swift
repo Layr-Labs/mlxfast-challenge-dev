@@ -252,9 +252,13 @@ public struct ScoreMetrics: Codable, Equatable {
     public let weightsFileCount: Int
     public let runtime: String
     // True whenever this metrics payload still contains baseline-placeholder
-    // values for fields this benchmark phase did not itself measure (see
-    // BenchmarkOptions.checkGates/skipTimedBenchmark). Cleared to false by
-    // overlay-paired-timing.sh when the measured paired timing is merged.
+    // values for the fields a gates-only or timing-only run did not itself
+    // measure (see BenchmarkOptions.checkGates/skipTimedBenchmark). The ONLY
+    // thing that clears this to false today is overlay-paired-timing.sh, when
+    // it overlays measure-job's paired timing into the sealed gates score --
+    // a defense-in-depth marker so a future regression there (or anywhere the
+    // final score is assembled) has a structural signal to check, instead of
+    // relying solely on the YAML wiring being correct.
     public let partialResult: Bool
 
     enum CodingKeys: String, CodingKey {
@@ -662,8 +666,8 @@ extension ScoreMetrics {
     /// to `figures` significant figures, to shrink the timing/memory covert channel
     /// that submitted model code can drive. Ranking- and floor-critical fields
     /// (decode/prefill seconds-per-token, speedups, floors, baselines) are left
-    /// untouched so scoring and the speedup-floor gate are bit-unaffected.
-    /// Ordering pairs the validators assert are re-clamped
+    /// untouched so scoring, the speedup-floor gate, and the paired-timing overlay
+    /// are all bit-unaffected. Ordering pairs the validators assert are re-clamped
     /// after rounding as belt-and-suspenders.
     public func withCoarsenedPublicDiagnostics(
         figures: Int = MLXFastConstants.publicDiagnosticSignificantFigures
