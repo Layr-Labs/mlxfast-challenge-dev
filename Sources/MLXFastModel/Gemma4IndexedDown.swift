@@ -1,7 +1,8 @@
 import Foundation
 import MLX
 
-private let gemma4DownCoTiledPayloadWords = 536
+private let gemma4DownSplitCoTiledWeightBytes = 57_802_752
+private let gemma4DownSplitFixed12MetadataBytes = 2_709_504
 
 /// Pack each run of eight 12-bit indexes as eight low bytes followed by four
 /// bytes containing pairs of high nibbles. This remains 96 bits per eight
@@ -48,23 +49,24 @@ private func gemma4PackFixed12BitPlanes(
     return words
 }
 
-/// Reorder the down weight and fixed-plane metadata into the decode kernel's
-/// exact threadgroup-major ownership. Each `(threadgroup, K-block)` payload is
-/// `[512 weight U32, 24 metadata U32]`, or 536 U32 total.
-private func gemma4MakeCoTiledFixed12DownPayload(
+/// Reorder the down weight and fixed-plane metadata into separate arrays with
+/// the decode kernel's exact threadgroup-major ownership. Separating the
+/// arrays keeps every 512-word weight tile 128-byte aligned.
+private func gemma4MakeSplitCoTiledFixed12DownPayload(
     weight: MLXArray,
     indices: MLXArray,
     materialize: Bool = true
-) -> MLXArray? {
-    precondition(weight.dtype == .uint32)
-    precondition(weight.shape == [5_376, 2_688])
-    precondition(indices.dtype == .uint16)
-    precondition(indices.shape == [5_376, 336])
-    guard let fixedPlanes = gemma4PackFixed12BitPlanes(
-        indices.asArray(UInt16.self),
-        rows: 5_376,
-        groupsPerRow: 336
-    ) else {
+) -> (weight: MLXArray, metadata: MLXArray)? {
+    guard weight.dtype == .uint32,
+          weight.shape == [5_376, 2_688],
+          indices.dtype == .uint16,
+          indices.shape == [5_376, 336],
+          let fixedPlanes = gemma4PackFixed12BitPlanes(
+              indices.asArray(UInt16.self),
+              rows: 5_376,
+              groupsPerRow: 336
+          )
+    else {
         return nil
     }
 
@@ -80,15 +82,23 @@ private func gemma4MakeCoTiledFixed12DownPayload(
         .transposed(0, 3, 1, 2, 4)
         .contiguous()
         .reshaped(672, 42, 24)
-    let payload = concatenated([weightPayload, metadataPayload], axis: 2)
-    precondition(payload.dtype == .uint32)
-    precondition(payload.shape == [672, 42, gemma4DownCoTiledPayloadWords])
-    if materialize {
-        // The sidecar is input-independent and constructed during untimed
-        // model initialization, so decode never inherits this conversion.
-        eval(payload)
+    guard weightPayload.dtype == .uint32,
+          weightPayload.shape == [672, 42, 512],
+          weightPayload.size * MemoryLayout<UInt32>.size
+              == gemma4DownSplitCoTiledWeightBytes,
+          metadataPayload.dtype == .uint32,
+          metadataPayload.shape == [672, 42, 24],
+          metadataPayload.size * MemoryLayout<UInt32>.size
+              == gemma4DownSplitFixed12MetadataBytes
+    else {
+        return nil
     }
-    return payload
+    if materialize {
+        // Both sidecars are input-independent and constructed during untimed
+        // model initialization, so decode never inherits these conversions.
+        eval(weightPayload, metadataPayload)
+    }
+    return (weightPayload, metadataPayload)
 }
 
 private let gemma4Packed12IndexedDownQMV = MLXFast.metalKernel(
@@ -211,9 +221,9 @@ private let gemma4Packed12IndexedDownQMV = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-private let gemma4CoTiledFixed12IndexedDownQMV = MLXFast.metalKernel(
-    name: "gemma4_cotiled_fixed12_indexed_down_qmv_21504_v1",
-    inputNames: ["cotiled_payload", "lut", "x"],
+private let gemma4SplitCoTiledFixed12IndexedDownQMV = MLXFast.metalKernel(
+    name: "gemma4_split_cotiled_fixed12_indexed_down_qmv_21504_v1",
+    inputNames: ["cotiled_weight", "fixed_metadata", "lut", "x"],
     outputNames: ["output"],
     source: """
         constexpr int kInputWidth = 21504;
@@ -226,9 +236,10 @@ private let gemma4CoTiledFixed12IndexedDownQMV = MLXFast.metalKernel(
         constexpr int kWeightWordsPerTile = 2 * kWordsPerSIMD;
         constexpr int kMetadataBytesPerRow = 12;
         constexpr int kMetadataWordsPerTile = 24;
-        constexpr int kPayloadWords =
-            kWeightWordsPerTile + kMetadataWordsPerTile;
-        constexpr int kWordsPerThreadgroup = kBlocks * kPayloadWords;
+        constexpr int kWeightWordsPerThreadgroup =
+            kBlocks * kWeightWordsPerTile;
+        constexpr int kMetadataWordsPerThreadgroup =
+            kBlocks * kMetadataWordsPerTile;
 
         const int threadgroup_row = threadgroup_position_in_grid.y;
         const int simd_group = simdgroup_index_in_threadgroup;
@@ -236,8 +247,12 @@ private let gemma4CoTiledFixed12IndexedDownQMV = MLXFast.metalKernel(
             threadgroup_row * 8 + simd_group * kRowsPerSIMD;
         const uint lane_group = thread_index_in_simdgroup / 4;
         const device bfloat* input = x + thread_index_in_simdgroup * 16;
-        const device uint* tile_words =
-            cotiled_payload + threadgroup_row * kWordsPerThreadgroup;
+        const device uint* weight_tile =
+            cotiled_weight
+            + threadgroup_row * kWeightWordsPerThreadgroup;
+        const device uint* metadata_tile =
+            fixed_metadata
+            + threadgroup_row * kMetadataWordsPerThreadgroup;
 
         float result[kRowsPerSIMD] = {0};
         for (int block = 0; block < kInputWidth; block += kBlockSize) {
@@ -245,12 +260,11 @@ private let gemma4CoTiledFixed12IndexedDownQMV = MLXFast.metalKernel(
             const float input_sum = gemma4_cotiled_down_load_values(
                 input,
                 values);
-            const device uint* weight_words = tile_words
+            const device uint* weight_words = weight_tile
                 + simd_group * kWordsPerSIMD
                 + thread_index_in_simdgroup * kWordsPerLane;
             const device uchar* metadata_bytes =
-                reinterpret_cast<const device uchar*>(
-                    tile_words + kWeightWordsPerTile)
+                reinterpret_cast<const device uchar*>(metadata_tile)
                 + simd_group * kRowsPerSIMD * kMetadataBytesPerRow;
 
             for (int row = 0; row < kRowsPerSIMD; ++row) {
@@ -273,7 +287,8 @@ private let gemma4CoTiledFixed12IndexedDownQMV = MLXFast.metalKernel(
                     input_sum);
             }
 
-            tile_words += kPayloadWords;
+            weight_tile += kWeightWordsPerTile;
+            metadata_tile += kMetadataWordsPerTile;
             input += kBlockSize;
         }
 
@@ -489,13 +504,13 @@ private func environmentFlag(_ name: String, default defaultValue: Bool) -> Bool
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }
 
-private let gemma4DownCoTiledFixed12Enabled = environmentFlag(
-    "DARKBLOOM_DOWN_COTILED_FIXED12",
+private let gemma4DownSplitCoTiledFixed12Enabled = environmentFlag(
+    "DARKBLOOM_DOWN_SPLIT_COTILED_FIXED12",
     default: true
 )
 
-private let gemma4VerifyDownCoTiledFixed12Bits = environmentFlag(
-    "DARKBLOOM_VERIFY_DOWN_COTILED_FIXED12_BITS",
+private let gemma4VerifyDownSplitCoTiledFixed12Bits = environmentFlag(
+    "DARKBLOOM_VERIFY_DOWN_SPLIT_COTILED_FIXED12_BITS",
     default: false
 )
 
@@ -526,8 +541,9 @@ private struct Packed12DownMetadata: @unchecked Sendable {
     }
 }
 
-private struct CoTiledFixed12DownPayload: @unchecked Sendable {
-    let words: MLXArray
+private struct SplitCoTiledFixed12DownPayload: @unchecked Sendable {
+    let weight: MLXArray
+    let metadata: MLXArray
 
     init?(
         projection: FastQuantizedProjection,
@@ -536,14 +552,15 @@ private struct CoTiledFixed12DownPayload: @unchecked Sendable {
         guard metadata.lut.dtype == .uint32,
               metadata.lut.ndim == 1,
               (1...4_096).contains(metadata.lut.size),
-              let words = gemma4MakeCoTiledFixed12DownPayload(
+              let payload = gemma4MakeSplitCoTiledFixed12DownPayload(
                   weight: projection.weight,
                   indices: metadata.indices
               )
         else {
             return nil
         }
-        self.words = words
+        self.weight = payload.weight
+        self.metadata = payload.metadata
     }
 }
 
@@ -571,9 +588,9 @@ struct IndexedDownProjection: @unchecked Sendable {
     let projection: FastQuantizedProjection
     let metadata: IndexedAffineMetadata
     private let packed12: Packed12DownMetadata?
-    private let coTiledFixed12: CoTiledFixed12DownPayload?
+    private let splitCoTiledFixed12: SplitCoTiledFixed12DownPayload?
     private let verifyPacked12Bits: Bool
-    private let verifyCoTiledFixed12Bits: Bool
+    private let verifySplitCoTiledFixed12Bits: Bool
 
     init(
         projection: FastQuantizedProjection,
@@ -594,26 +611,26 @@ struct IndexedDownProjection: @unchecked Sendable {
             default: false
         )
         self.verifyPacked12Bits = verifyPacked12Bits
-        self.verifyCoTiledFixed12Bits =
-            gemma4VerifyDownCoTiledFixed12Bits
+        self.verifySplitCoTiledFixed12Bits =
+            gemma4VerifyDownSplitCoTiledFixed12Bits
 
-        let wantsCoTiled = packedIndicesEnabled
-            && (gemma4DownCoTiledFixed12Enabled
-                || gemma4VerifyDownCoTiledFixed12Bits)
-        let coTiledFixed12 = wantsCoTiled
-            ? CoTiledFixed12DownPayload(
+        let wantsSplitCoTiled = packedIndicesEnabled
+            && (gemma4DownSplitCoTiledFixed12Enabled
+                || gemma4VerifyDownSplitCoTiledFixed12Bits)
+        let splitCoTiledFixed12 = wantsSplitCoTiled
+            ? SplitCoTiledFixed12DownPayload(
                 projection: projection,
                 metadata: metadata)
             : nil
-        self.coTiledFixed12 = coTiledFixed12
+        self.splitCoTiledFixed12 = splitCoTiledFixed12
 
-        // The production co-tile already contains its fixed12 metadata. Keep
-        // the promoted packed12 sidecar only for rollback, fallback, or a
-        // verifier so the default path avoids another ~2.6 MiB per layer.
+        // The split co-tile already contains its fixed12 metadata. Keep the
+        // promoted packed12 sidecar only for rollback, fallback, or a verifier
+        // so an enabled candidate avoids another ~2.6 MiB per layer.
         let needsPacked12 = packedIndicesEnabled
-            && (coTiledFixed12 == nil
-                || !gemma4DownCoTiledFixed12Enabled
-                || gemma4VerifyDownCoTiledFixed12Bits
+            && (splitCoTiledFixed12 == nil
+                || !gemma4DownSplitCoTiledFixed12Enabled
+                || gemma4VerifyDownSplitCoTiledFixed12Bits
                 || verifyPacked12Bits)
         self.packed12 = needsPacked12
             ? Packed12DownMetadata(metadata: metadata)
@@ -626,19 +643,24 @@ struct IndexedDownProjection: @unchecked Sendable {
         let outputShape = [1, 1, 5_376]
 
         var verifiedPacked12: MLXArray?
-        if let coTiledFixed12 {
-            let candidate = gemma4CoTiledFixed12IndexedDownQMV(
-                [coTiledFixed12.words, metadata.lut, input],
+        if let splitCoTiledFixed12 {
+            let candidate = gemma4SplitCoTiledFixed12IndexedDownQMV(
+                [
+                    splitCoTiledFixed12.weight,
+                    splitCoTiledFixed12.metadata,
+                    metadata.lut,
+                    input,
+                ],
                 grid: (32, 1_344, 1),
                 threadGroup: (32, 2, 1),
                 outputShapes: [outputShape],
                 outputDTypes: [.bfloat16]
             )[0]
 
-            if verifyCoTiledFixed12Bits {
+            if verifySplitCoTiledFixed12Bits {
                 guard let packed12 else {
                     preconditionFailure(
-                        "co-tiled fixed12 verifier requires packed12 metadata"
+                        "split co-tiled fixed12 verifier requires packed12 metadata"
                     )
                 }
                 let reference = packed12Output(
@@ -653,7 +675,7 @@ struct IndexedDownProjection: @unchecked Sendable {
                 eval(matches)
                 precondition(
                     matches.item(Bool.self),
-                    "co-tiled fixed12 down projection differs from "
+                    "split co-tiled fixed12 down projection differs from "
                         + "promoted packed12 qmv"
                 )
                 verifyPacked12Output(
@@ -664,7 +686,7 @@ struct IndexedDownProjection: @unchecked Sendable {
                 verifiedPacked12 = reference
             }
 
-            if gemma4DownCoTiledFixed12Enabled {
+            if gemma4DownSplitCoTiledFixed12Enabled {
                 if verifyPacked12Bits && verifiedPacked12 == nil {
                     guard let packed12 else {
                         preconditionFailure(
