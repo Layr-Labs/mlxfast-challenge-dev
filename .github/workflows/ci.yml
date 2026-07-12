@@ -69,6 +69,11 @@ jobs:
               '#!/usr/bin/env bash')
                 bash -n "${script}"
                 ;;
+              # Staged operator references (ops/m5-bench/) are faithful copies
+              # of scripts deployed on the runner box, which use system bash.
+              '#!/bin/bash')
+                bash -n "${script}"
+                ;;
               '#!/usr/bin/env sh')
                 sh -n "${script}"
                 ;;
