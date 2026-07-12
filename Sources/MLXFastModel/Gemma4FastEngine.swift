@@ -911,6 +911,7 @@ final class Gemma4FastEngine {
     let tiedVocabularyHead: Gemma4TiedVocabularyHead?
     let usePacked13TiedVocabularyHead: Bool
     let verifyTiedVocabularyHead: Bool
+    let useFusedPacked13Softcap: Bool
     private let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray
 
     init(
@@ -992,6 +993,11 @@ final class Gemma4FastEngine {
         self.usePacked13TiedVocabularyHead = productionTiedHead
             && !packed13Rollback
         self.verifyTiedVocabularyHead = verifyTiedHead
+        self.useFusedPacked13Softcap = ["1", "true", "yes", "on"].contains(
+            ProcessInfo.processInfo.environment[
+                "DARKBLOOM_TIED_HEAD_FUSED_SOFTCAP"
+            ]?.lowercased() ?? "0"
+        )
         if productionTiedHead || tiedHeadRequested || verifyTiedHead {
             guard let tiedVocabularyHead = Gemma4TiedVocabularyHead(
                 loadedEmbedTokens,
@@ -1185,20 +1191,19 @@ final class Gemma4FastEngine {
         }
         let cap = MLXArray(softcap)
         if let tiedVocabularyHead, usePacked13TiedVocabularyHead {
-            let candidate = tiedVocabularyHead.packed13Softcapped(
-                hidden,
-                cap: cap
-            )
+            if useFusedPacked13Softcap {
+                return tiedVocabularyHead.packed13Softcapped(hidden, cap: cap)
+            }
+            let projected = tiedVocabularyHead.packed13(hidden)
             if verifyTiedVocabularyHead {
-                let stock = logitSoftcap(embedTokens.asLinear(hidden), cap)
-                tiedVocabularyHead.verifyRawFloat32(
-                    candidate,
-                    stock: stock,
-                    candidateName: "packed13 fused-softcap",
-                    stockName: "embedTokens.asLinear + compiled softcap"
+                tiedVocabularyHead.verifyRawBF16(
+                    projected,
+                    stock: embedTokens.asLinear(hidden),
+                    candidateName: "packed13",
+                    stockName: "embedTokens.asLinear"
                 )
             }
-            return candidate
+            return logitSoftcap(projected, cap)
         }
 
         let logits: MLXArray
