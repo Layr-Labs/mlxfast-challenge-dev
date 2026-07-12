@@ -410,6 +410,7 @@ private let gemma4IndexedFusedGateUpActivationQMV = MLXFast.metalKernel(
         }
         """,
     header: """
+        #define kernel kernel, max_total_threads_per_threadgroup(64)
         using namespace metal;
 
         inline float gemma4_pair_scale(uint pair) {
