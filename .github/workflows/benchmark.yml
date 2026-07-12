@@ -925,6 +925,30 @@ jobs:
           done
           install -m 0444 "${MLXFAST_PRIVATE_DIR}/raw_golden.json" "${golden_src}"
           install -m 0444 "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" "${gpqa_src}"
+          # attach-gpqa-gates runs the SUBMITTED build (it loads the tokenizer) while
+          # the raw hidden golden + GPQA answer key are readable, but -- unlike
+          # correctness/benchmark -- it does NOT spawn the sandboxed runtime worker,
+          # so submitted code here runs in an unsandboxed bench parent that could
+          # exfiltrate the hidden material it reads (e.g. DNS via mDNSResponder,
+          # which the bench PF/uid egress block does not attribute to uid 560).
+          # Apply a Seatbelt egress-deny profile to the attach invocation:
+          # (allow default) keeps its legitimate input reads + golden write working,
+          # while (deny network*) + the mDNSResponder mach-lookup denies remove every
+          # exfil egress. The profile is authored HERE by the trusted (runner) shell
+          # into .ranked-src/ -- runner-owned and bench-read-only (the same ACL that
+          # protects golden.json/gpqa.json), so the untrusted build can read-and-apply
+          # but never tamper it (a self-generated profile would be neuterable).
+          # attach does not self-sandbox, so this is a single, non-nested apply.
+          attach_sb="${MLXFAST_JOB_WS}/.ranked-src/attach-sandbox.sb"
+          printf '%s\n' \
+            '(version 1)' \
+            '(allow default)' \
+            '(deny network*)' \
+            '(deny mach-lookup (global-name "com.apple.mDNSResponder"))' \
+            '(deny mach-lookup (global-name "com.apple.system.mDNSResponder"))' \
+            '(deny mach-lookup (global-name-prefix "com.apple.mDNSResponder"))' \
+            > "${attach_sb}"
+          chmod 0444 "${attach_sb}"
           status=0
           # shellcheck disable=SC2024  # trusted shell owns the capture files
           sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
@@ -933,7 +957,8 @@ jobs:
               MLXFAST_GPQA_MAX_NEW_TOKENS="${MLXFAST_GPQA_MAX_NEW_TOKENS}" /bin/bash -c '
               set -u
               cd "${MJOB_WS}" || exit 97
-              exec .build/release/mlxfast-swift attach-gpqa-gates \
+              exec /usr/bin/sandbox-exec -f .ranked-src/attach-sandbox.sb \
+                .build/release/mlxfast-swift attach-gpqa-gates \
                 --golden .ranked-src/golden.json \
                 --gpqa .ranked-src/gpqa.json \
                 --tokenizer weights \

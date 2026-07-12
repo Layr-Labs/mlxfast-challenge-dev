@@ -1212,10 +1212,22 @@ private enum MLXFastCLI {
                 "(deny file-read* (subpath \"\(seatbeltEscaped(absolutePath(privateDir)))\"))"
             )
         }
+        // (deny network*) blocks the worker's OWN sockets, but getaddrinfo(3)
+        // resolves via IPC to mDNSResponder, which egresses from ITS uid -- so a
+        // uid/socket-scoped block never sees the DNS query and submitted code can
+        // exfiltrate over DNS. Deny the worker's mach-lookup of the resolver
+        // (canonical name, legacy alias, and the com.apple.mDNSResponder.* family)
+        // so the resolver is unreachable, matching the operator-layer
+        // outer-bench.sb.template used on the ranked box. This keeps the
+        // harness-generated fallback profile (local runs / any path where the
+        // operator template is not injected) resolver-safe too.
         let profile = """
         (version 1)
         (allow default)
         (deny network*)
+        (deny mach-lookup (global-name "com.apple.mDNSResponder"))
+        (deny mach-lookup (global-name "com.apple.system.mDNSResponder"))
+        (deny mach-lookup (global-name-prefix "com.apple.mDNSResponder"))
         (deny process-fork)
         (deny process-exec*)
         (allow process-exec (literal "\(seatbeltEscaped(absoluteExecutablePath))"))
