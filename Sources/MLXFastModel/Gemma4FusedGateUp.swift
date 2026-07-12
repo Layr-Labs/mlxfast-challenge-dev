@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import MLXNN
 
@@ -466,6 +467,7 @@ struct FusedGateUpProjection: @unchecked Sendable {
     let metadataMode: FusedGateUpMetadataMode
     let indexedGate: IndexedAffineMetadata?
     let indexedUp: IndexedAffineMetadata?
+    let kMajorGate: Gemma4KMajorGate?
 
     init(
         gate: QuantizedLinear,
@@ -497,6 +499,7 @@ struct FusedGateUpProjection: @unchecked Sendable {
         case .raw:
             self.indexedGate = nil
             self.indexedUp = nil
+            self.kMajorGate = nil
         case .indexed:
             let indexedGate = gateIndexedMetadata ?? makeIndexedAffineMetadata(
                 scales: gate.scales,
@@ -512,11 +515,17 @@ struct FusedGateUpProjection: @unchecked Sendable {
                 indexedUp, shape: up.scales.shape))
             self.indexedGate = indexedGate
             self.indexedUp = indexedUp
+            self.kMajorGate = Gemma4KMajorGate(projection: gate, metadata: indexedGate)
         }
     }
 
     func callAsFunction(_ input: MLXArray) -> (MLXArray, MLXArray) {
         precondition(supportsGemma4FusedGateUpInput(input))
+        let enabled = ProcessInfo.processInfo.environment["DARKBLOOM_KMAJOR_GATE"]
+            .map { ["1", "true", "yes", "on"].contains($0.lowercased()) } ?? false
+        if enabled, let kMajorGate, let indexedUp {
+            return (kMajorGate(input), gemma4IndexedUp(up, indexedUp, input))
+        }
         guard let gateBiases = gate.biases, let upBiases = up.biases else {
             preconditionFailure("fused gate/up QMV requires affine biases")
         }
