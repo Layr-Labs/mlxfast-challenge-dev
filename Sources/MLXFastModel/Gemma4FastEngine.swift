@@ -99,6 +99,7 @@ final class Gemma4FastLayer {
     let fusedQK: FusedFullQKProjection?
     let combinedAttentionPrefill: CombinedAttentionPrefillProjection?
     let fusedAttentionRMS: FusedAttentionRMSPreparation?
+    let fullDecodeAttention: Gemma4FullDecodeAttention?
     let fusedAttentionToMLPBoundary: FusedAttentionToMLPBoundary?
     let fusedMLPToNextBoundary: FusedMLPToNextBoundary?
 
@@ -281,6 +282,30 @@ final class Gemma4FastLayer {
                 kNormWeight: kNorm?.weight,
                 eps: eps
             )
+            : nil
+        let verifyFullDecodeAttention = ["1", "true", "yes", "on"].contains(
+            ProcessInfo.processInfo.environment[
+                "DARKBLOOM_VERIFY_FULL_D512_ATTENTION_BITS"
+            ]?.lowercased() ?? "0"
+        )
+        let fullDecodeAttentionEnabled: Bool
+        if verifyFullDecodeAttention {
+            fullDecodeAttentionEnabled = true
+        } else if let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_FULL_D512_ATTENTION"
+        ] {
+            fullDecodeAttentionEnabled = ["1", "true", "yes", "on"]
+                .contains(raw.lowercased())
+        } else {
+            fullDecodeAttentionEnabled = true
+        }
+        self.fullDecodeAttention = fullDecodeAttentionEnabled
+            && !isSliding
+            && useKEqV
+            && nHeads == 32
+            && nKvHeads == 4
+            && headDim == 512
+            ? Gemma4FullDecodeAttention(verifyBits: verifyFullDecodeAttention)
             : nil
         self.inputNormWeight = inputNorm.weight
         self.postAttnNormWeight = postAttnNorm.weight
@@ -653,7 +678,31 @@ final class Gemma4FastLayer {
         }
 
         let attention: MLXArray
-        if L > 1 && offset > 0 {
+        let hasNoAttentionMask: Bool
+        if case .none = attentionMask {
+            hasNoAttentionMask = true
+        } else {
+            hasNoAttentionMask = false
+        }
+        if B == 1,
+           L == 1,
+           !isSliding,
+           useKEqV,
+           scale == 1.0,
+           hasNoAttentionMask,
+           let fullDecodeAttention,
+           fullDecodeAttention.supports(
+               queries: queries,
+               keys: keys,
+               values: values
+           )
+        {
+            attention = fullDecodeAttention(
+                queries: queries,
+                keys: keys,
+                values: values
+            )
+        } else if L > 1 && offset > 0 {
             attention = gemma4FastAttentionFallback(
                 queries: queries,
                 keys: keys,
