@@ -1,5 +1,136 @@
 import MLX
 
+func gemma4FusedAttentionRMSKernelBody(
+    headDim: Int,
+    kvHeads: Int,
+    sharesFullKVReduction: Bool,
+    writesDirectlyToCache: Bool = false,
+    scalesFullQueries: Bool = false
+) -> String {
+    precondition(headDim == 256 || headDim == 512)
+    precondition(kvHeads == 16 || kvHeads == 4)
+    precondition(!scalesFullQueries || sharesFullKVReduction)
+    let outputRowOffset = writesDirectlyToCache
+        ? "(projection_row * capacity + append_index) * kHeadDim"
+        : "projection_row * kHeadDim"
+    let sharedValueRowOffset = writesDirectlyToCache
+        ? "(projection_row * capacity + append_index) * kHeadDim"
+        : "projection_row * kHeadDim"
+    let rotatedStores = scalesFullQueries
+        ? """
+                const bfloat rotated_left = static_cast<bfloat>(
+                    left * cosine - right * sine);
+                const bfloat rotated_right = static_cast<bfloat>(
+                    left * sine + right * cosine);
+                const bfloat one = static_cast<bfloat>(1.0f);
+                output[pair] = is_q ? one * rotated_left : rotated_left;
+                output[pair + kPairs] = is_q
+                    ? one * rotated_right
+                    : rotated_right;
+            """
+        : """
+                output[pair] = static_cast<bfloat>(
+                    left * cosine - right * sine);
+                output[pair + kPairs] = static_cast<bfloat>(
+                    left * sine + right * cosine);
+            """
+    return """
+        constexpr uint kHeadDim = \(headDim);
+        constexpr uint kQHeads = 32;
+        constexpr uint kKVHeads = \(kvHeads);
+        constexpr uint kReads = 4;
+        constexpr uint kSIMDSize = 32;
+        constexpr bool kSharesFullKVReduction = \(sharesFullKVReduction);
+
+        const uint combined_row = threadgroup_position_in_grid.y;
+        const bool is_q = combined_row < kQHeads;
+        const bool is_k = !is_q && (
+            kSharesFullKVReduction
+                || combined_row < kQHeads + kKVHeads);
+        const uint projection_row = is_q
+            ? combined_row
+            : (is_k ? combined_row - kQHeads
+                    : combined_row - kQHeads - kKVHeads);
+
+        const device bfloat* input = is_q
+            ? raw_q + projection_row * kHeadDim
+            : (is_k ? raw_k : raw_v) + projection_row * kHeadDim;
+        const device bfloat* weight = is_q ? q_weight : k_weight;
+        device bfloat* output = is_q
+            ? queries + projection_row * kHeadDim
+            : (is_k ? keys : values) + \(outputRowOffset);
+        const bool has_weight = is_q || is_k;
+
+        float accumulator = 0;
+        input += thread_position_in_threadgroup.x * kReads;
+        if (thread_position_in_threadgroup.x * kReads + kReads <= kHeadDim) {
+            for (uint index = 0; index < kReads; ++index) {
+                const float value = input[index];
+                accumulator += value * value;
+            }
+        }
+        accumulator = simd_sum(accumulator);
+
+        threadgroup float inverse_mean[1];
+        threadgroup float local_sums[kSIMDSize];
+        threadgroup bfloat normalized_row[kHeadDim];
+        if (simdgroup_index_in_threadgroup == 0) {
+            local_sums[thread_index_in_simdgroup] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (thread_index_in_simdgroup == 0) {
+            local_sums[simdgroup_index_in_threadgroup] = accumulator;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simdgroup_index_in_threadgroup == 0) {
+            accumulator = simd_sum(local_sums[thread_index_in_simdgroup]);
+            if (thread_index_in_simdgroup == 0) {
+                inverse_mean[0] = metal::precise::rsqrt(
+                    accumulator / kHeadDim + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const device bfloat* row_weight =
+            weight + thread_position_in_threadgroup.x * kReads;
+        for (uint index = 0; index < kReads; ++index) {
+            const uint dimension =
+                thread_position_in_threadgroup.x * kReads + index;
+            const bfloat normalized = static_cast<bfloat>(
+                input[index] * inverse_mean[0]);
+            const bfloat weighted = has_weight
+                ? row_weight[index] * normalized
+                : static_cast<bfloat>(1.0f) * normalized;
+            normalized_row[dimension] = weighted;
+            if (!has_weight) {
+                output[dimension] = weighted;
+            }
+            if (kSharesFullKVReduction && is_k) {
+                values[\(sharedValueRowOffset) + dimension] =
+                    static_cast<bfloat>(1.0f) * normalized;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (has_weight) {
+            constexpr uint kPairs = kHeadDim / 2;
+            constexpr uint kThreads = kHeadDim / kReads;
+            for (uint pair = thread_position_in_threadgroup.x;
+                 pair < kPairs;
+                 pair += kThreads) {
+                const uint rope_index =
+                    static_cast<uint>(position) * kPairs + pair;
+                const float cosine = rope_cosines[rope_index];
+                const float sine = rope_sines[rope_index];
+                const float left = static_cast<float>(normalized_row[pair]);
+                const float right = static_cast<float>(
+                    normalized_row[pair + kPairs]);
+                \(rotatedStores)
+            }
+        }
+        """
+}
+
 private func makeGemma4FusedAttentionRMSKernel(
     name: String,
     headDim: Int,
@@ -606,6 +737,21 @@ private let gemma4AttentionRopeTables: Gemma4AttentionRopeTables = {
         fullSines: outputs[3]
     )
 }()
+
+func gemma4MaterializedAttentionRopeTables(
+    isSliding: Bool
+) -> (cosines: MLXArray, sines: MLXArray) {
+    if isSliding {
+        return (
+            gemma4AttentionRopeTables.slidingCosines,
+            gemma4AttentionRopeTables.slidingSines
+        )
+    }
+    return (
+        gemma4AttentionRopeTables.fullCosines,
+        gemma4AttentionRopeTables.fullSines
+    )
+}
 
 struct FusedAttentionRMSPreparation: @unchecked Sendable {
     let isSliding: Bool

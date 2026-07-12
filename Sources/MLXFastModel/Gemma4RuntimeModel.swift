@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXFastCore
 import MLXLLM
 import MLXLMCommon
 import MLXNN
@@ -52,6 +53,14 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
             indexedMetadata: indexedMetadata,
             tiedHeadPacked13Metadata: tiedHeadPacked13Metadata
         )
+    }
+
+    func requireNativeResidentWeights() throws -> Gemma4NativeResidentWeights {
+        guard let fastEngine else {
+            throw MLXFastError.invalidInput(
+                "native resident weights require the prepared fast engine")
+        }
+        return fastEngine.nativeResidentWeights
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {

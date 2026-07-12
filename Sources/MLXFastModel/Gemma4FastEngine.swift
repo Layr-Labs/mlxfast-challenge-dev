@@ -67,6 +67,17 @@ struct FastQuantizedProjection: @unchecked Sendable {
         )
     }
 
+    var nativeWeight: Gemma4LinearWeight {
+        Gemma4LinearWeight(
+            weight: weight,
+            scales: scales,
+            biases: biases,
+            logicalShape: [weight.dim(0), weight.dim(1) * 8],
+            groupSize: groupSize,
+            bits: bits
+        )
+    }
+
 }
 
 private struct FastMLPTailWeights: @unchecked Sendable {
@@ -137,6 +148,16 @@ final class Gemma4FastLayer {
     let indexedDown: IndexedDownProjection?
     let indexedDownPostTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let useFusedGateUpActivation: Bool
+    let gateProj: FastQuantizedProjection
+    let upProj: FastQuantizedProjection
+    let downProj: FastQuantizedProjection
+    let nativeQMetadata: IndexedAffineMetadata?
+    let nativeKMetadata: IndexedAffineMetadata?
+    let nativeVMetadata: IndexedAffineMetadata?
+    let nativeGateMetadata: IndexedAffineMetadata?
+    let nativeUpMetadata: IndexedAffineMetadata?
+    let nativeDownMetadata: IndexedAffineMetadata?
+    let nativeOutputMetadata: IndexedAffineMetadata?
 
     init(
         isSliding: Bool,
@@ -192,6 +213,7 @@ final class Gemma4FastLayer {
         self.indexedOutput = indexedOutputEnabled
             ? IndexedOutputProjection(projection: outputProjection)
             : nil
+        self.nativeOutputMetadata = self.indexedOutput?.metadata
         let fusedQKVEnabled: Bool
         if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_QKV"] {
             fusedQKVEnabled = ["1", "true", "yes", "on"].contains(
@@ -348,6 +370,15 @@ final class Gemma4FastLayer {
         let gateP = FastQuantizedProjection(gate)
         let upP = FastQuantizedProjection(up)
         let downP = FastQuantizedProjection(down)
+        self.gateProj = gateP
+        self.upProj = upP
+        self.downProj = downP
+        self.nativeQMetadata = qIndexedMetadata
+        self.nativeKMetadata = kIndexedMetadata
+        self.nativeVMetadata = vIndexedMetadata
+        self.nativeGateMetadata = gateIndexedMetadata
+        self.nativeUpMetadata = upIndexedMetadata
+        self.nativeDownMetadata = downIndexedMetadata
         let gelu = fastGeluApproximate
         let body: @Sendable (MLXArray) -> MLXArray = { x in
             downP(gelu(gateP(x)) * upP(x))
@@ -483,6 +514,38 @@ final class Gemma4FastLayer {
             self.indexedDownPostTail = nil
             self.useFusedGateUpActivation = false
         }
+    }
+
+    var nativeWeights: Gemma4NativeResidentLayerWeights {
+        Gemma4NativeResidentLayerWeights(
+            block: Gemma4BlockWeights(
+                inputLayerNorm: inputNormWeight,
+                postAttentionLayerNorm: postAttnNormWeight,
+                preFeedForwardLayerNorm: preFfnNormWeight,
+                postFeedForwardLayerNorm: postFfnNormWeight,
+                layerScalar: layerScalar
+            ),
+            attention: Gemma4AttentionWeights(
+                qProj: qProj.nativeWeight,
+                kProj: kProj.nativeWeight,
+                vProj: vProj?.nativeWeight,
+                oProj: oProj.nativeWeight,
+                qNorm: qNormWeight,
+                kNorm: kNormWeight!
+            ),
+            mlp: Gemma4MLPWeights(
+                gate: gateProj.nativeWeight,
+                up: upProj.nativeWeight,
+                down: downProj.nativeWeight
+            ),
+            qMetadata: nativeQMetadata,
+            kMetadata: nativeKMetadata,
+            vMetadata: nativeVMetadata,
+            outputMetadata: nativeOutputMetadata,
+            gateMetadata: nativeGateMetadata,
+            upMetadata: nativeUpMetadata,
+            downMetadata: nativeDownMetadata
+        )
     }
 
     func callAsFunction(
@@ -911,6 +974,7 @@ final class Gemma4FastEngine {
     let tiedVocabularyHead: Gemma4TiedVocabularyHead?
     let usePacked13TiedVocabularyHead: Bool
     let verifyTiedVocabularyHead: Bool
+    let nativeModelWeights: Gemma4ModelWeights
     private let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray
 
     init(
@@ -925,7 +989,7 @@ final class Gemma4FastEngine {
         self.slidingWindow = config.slidingWindow
         let asyncLayerGroup = max(
             0,
-            Int(ProcessInfo.processInfo.environment["MLXFAST_ASYNC_LAYER_GROUP"] ?? "10") ?? 10
+            Int(ProcessInfo.processInfo.environment["MLXFAST_ASYNC_LAYER_GROUP"] ?? "5") ?? 5
         )
         self.asyncLayerGroup = asyncLayerGroup
         if asyncLayerGroup > 0 {
@@ -1021,6 +1085,40 @@ final class Gemma4FastEngine {
         }
         let finalNorm = try module("model.norm", as: RMSNorm.self)
         self.finalNormWeight = finalNorm.weight
+        guard let residentGroupSize = config.quantizationGroupSize,
+              let residentBits = config.quantizationBits
+        else {
+            throw MLXFastError.invalidInput(
+                "native resident weights require checkpoint quantization metadata")
+        }
+        func nativeLinear(
+            _ stem: String,
+            logicalShape: [Int]
+        ) throws -> Gemma4LinearWeight {
+            let weight = try array("\(stem).weight")
+            guard let scales = params["\(stem).scales"],
+                  let biases = params["\(stem).biases"]
+            else {
+                throw MLXFastError.invalidInput(
+                    "missing resident affine metadata for \(stem)")
+            }
+            return Gemma4LinearWeight(
+                weight: weight,
+                scales: scales,
+                biases: biases,
+                logicalShape: logicalShape,
+                groupSize: residentGroupSize,
+                bits: residentBits
+            )
+        }
+        self.nativeModelWeights = Gemma4ModelWeights(
+            embedTokens: try nativeLinear(
+                "model.embed_tokens",
+                logicalShape: [config.vocabSize, config.hiddenSize]
+            ),
+            finalNorm: finalNorm.weight,
+            lmHead: nil
+        )
 
         var built: [Gemma4FastLayer] = []
         built.reserveCapacity(config.numHiddenLayers)
@@ -1129,6 +1227,13 @@ final class Gemma4FastEngine {
             compileEnabled = true
         }
         self.logitSoftcap = compileEnabled ? compile(shapeless: true, body) : body
+    }
+
+    var nativeResidentWeights: Gemma4NativeResidentWeights {
+        Gemma4NativeResidentWeights(
+            model: nativeModelWeights,
+            layers: layers.map(\.nativeWeights)
+        )
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {

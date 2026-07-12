@@ -86,18 +86,11 @@ public enum Gemma4Model {
         }
 
         let inputLength = inputIDs.dim(1)
-        let compiledDecodeStep = cache.compiledDecodeStep
-        let validatesLibraryCacheOffsets: Bool
-        if compiledDecodeStep == nil {
-            validatesLibraryCacheOffsets = true
-        } else {
-            validatesLibraryCacheOffsets = false
-        }
         return try executeGemma4CachedForward(
             cache: cache,
             positionOffset: positionOffset,
             inputLength: inputLength,
-            validatesLibraryCacheOffsets: validatesLibraryCacheOffsets,
+            validatesLibraryCacheOffsets: true,
             validateLibraryCacheOffsets: {
                 let kvCaches = cache.kvCache(for: model)
                 try verifyCachePosition(
@@ -107,6 +100,22 @@ public enum Gemma4Model {
             },
             forward: {
                 var kvCaches = cache.kvCache(for: model)
+                let compiledDecodeStep = cache.compiledDecodeStep
+                if compiledDecodeStep == nil {
+                    if cache.hasNativeOwnership && inputLength != 1 {
+                        throw MLXFastError.invalidInput(
+                            "native-owned Gemma 4 requests require singleton decode tokens")
+                    }
+                    if let nativeLogits = try cache.nativeLogits(
+                           inputIDs: inputIDs,
+                           positionOffset: positionOffset,
+                           weightCache: weightCache,
+                           config: weightCache.config
+                       )
+                    {
+                        return nativeLogits
+                    }
+                }
                 // Single-token decode step: optionally route through mlx-swift-lm's
                 // compiled decode (fused, no per-step graph rebuild). The compiled
                 // closure is built once, on the first step, from the seed-populated
@@ -223,16 +232,21 @@ func executeGemma4CachedForward<Result>(
     validateLibraryCacheOffsets: () throws -> Void,
     forward: () throws -> Result
 ) throws -> Result {
-    let nextExpectedPositionOffset = try cache.nextExpectedPositionOffset(
-        positionOffset: positionOffset,
-        inputLength: inputLength
-    )
-    if validatesLibraryCacheOffsets {
-        try validateLibraryCacheOffsets()
+    try cache.withRequestTransaction {
+        let nextExpectedPositionOffset = try cache.nextExpectedPositionOffset(
+            positionOffset: positionOffset,
+            inputLength: inputLength
+        )
+        if validatesLibraryCacheOffsets,
+           cache.compiledDecodeStep == nil,
+           !cache.hasNativeOwnership
+        {
+            try validateLibraryCacheOffsets()
+        }
+        let result = try forward()
+        cache.commitExpectedPositionOffset(nextExpectedPositionOffset)
+        return result
     }
-    let result = try forward()
-    cache.commitExpectedPositionOffset(nextExpectedPositionOffset)
-    return result
 }
 
 func verifyCachePosition(positionOffset: Int, cacheOffsets: [Int]) throws {

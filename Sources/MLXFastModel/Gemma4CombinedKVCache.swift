@@ -293,6 +293,17 @@ final class Gemma4CombinedKVCache: KVCache {
         return (keys, values)
     }
 
+    func nativeCapacityStorage() -> MLXArray? {
+        guard gemma4NativeZeroCopyCacheAdoptionEnabled(),
+              let combinedStorage,
+              offset <= combinedStorage.dim(3),
+              rotatingMaxSize == nil || rotatingIndex == offset
+        else {
+            return nil
+        }
+        return combinedStorage
+    }
+
     var state: [MLXArray] {
         get {
             if let splitCache { return splitCache.state }
@@ -532,3 +543,26 @@ private let gemma4VerifyCombinedKVPrefillBitsFeatureEnabled: Bool = {
     }
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
+
+func gemma4NativeZeroCopyCacheAdoptionEnabled() -> Bool {
+    let nativeEnabled: Bool
+    if let nativeRaw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NATIVE_WHOLE_TOKEN"
+    ] {
+        nativeEnabled = !["0", "false", "no", "off"]
+            .contains(nativeRaw.lowercased())
+    } else if #available(macOS 15.0, *) {
+        nativeEnabled = true
+    } else {
+        nativeEnabled = false
+    }
+    guard nativeEnabled else {
+        return false
+    }
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NATIVE_ZERO_COPY_CACHE_ADOPTION"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}

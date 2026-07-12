@@ -26,6 +26,9 @@ public final class Gemma4RuntimeWeightCache {
     public let libraryModel: Gemma4RuntimeModel?
     public let loadError: Error?
 
+    private let nativeExecutorLock = NSLock()
+    private var preparedNativeExecutor: Gemma4NativeWholeTokenProbe?
+    private var nativePreparationError: Error?
     public init(loader: Gemma4WeightLoader, config: Gemma4Config) {
         self.loader = loader
         self.config = config
@@ -52,6 +55,16 @@ public final class Gemma4RuntimeWeightCache {
         } catch {
             libraryModel = nil
             loadError = error
+        }
+        if Self.nativeWholeTokenEnabled(), let model = libraryModel {
+            do {
+                preparedNativeExecutor = try Self.makePreparedNativeExecutor(
+                    model: model,
+                    config: config
+                )
+            } catch {
+                nativePreparationError = error
+            }
         }
         // Constructor-time warmup for the library model: the runtime worker builds this cache
         // before the benchmark protocol handshake, so the Metal pipeline-state
@@ -143,6 +156,58 @@ public final class Gemma4RuntimeWeightCache {
         return libraryModel
     }
 
+    func claimPreparedNativeExecutor() -> Gemma4NativeWholeTokenProbe? {
+        nativeExecutorLock.lock()
+        defer { nativeExecutorLock.unlock() }
+        let executor = preparedNativeExecutor
+        preparedNativeExecutor = nil
+        if executor == nil,
+           ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_DEBUG_PREPARE"] == "1",
+           let nativePreparationError
+        {
+            print("native_prepare_error=\(nativePreparationError)")
+        }
+        return executor
+    }
+
+    private static func nativeWholeTokenEnabled() -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_NATIVE_WHOLE_TOKEN"
+        ] else {
+            if #available(macOS 15.0, *) {
+                return true
+            }
+            return false
+        }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }
+
+    private static func makePreparedNativeExecutor(
+        model: Gemma4RuntimeModel,
+        config: Gemma4Config
+    ) throws -> Gemma4NativeWholeTokenProbe {
+        let emptySliding = MLXArray.zeros(
+            [1, 16, 0, 256],
+            dtype: .bfloat16
+        )
+        let emptyFull = MLXArray.zeros(
+            [1, 4, 0, 512],
+            dtype: .bfloat16
+        )
+        let keys = config.layerTypes.map {
+            $0 == .sliding ? emptySliding : emptyFull
+        }
+        let executor = try Gemma4NativeWholeTokenProbe(
+            residentWeights: model.requireNativeResidentWeights(),
+            config: config,
+            priorKeys: keys,
+            priorValues: keys,
+            position: 0,
+            useSharedCacheStorage: false
+        )
+        try executor.warmupAndReset(position: 512)
+        return executor
+    }
 }
 
 func loadRuntimeWeightArrays(

@@ -138,6 +138,7 @@ public final class Gemma4LayerCache {
 }
 
 public final class Gemma4ModelCache {
+    static let nativeCacheHorizon = 1_024
     public let layers: [Gemma4LayerCache]
 
     /// Host-side mirror of the library KV-cache position. Compilable caches
@@ -165,6 +166,15 @@ public final class Gemma4ModelCache {
     /// caches, then reused for every subsequent step. nil when compiled decode is
     /// disabled/unsupported (the adapter falls back to the eager per-step forward).
     var compiledDecodeStep: (@Sendable ([MLXArray]) -> [MLXArray])?
+
+    private var nativeExecutor: Gemma4NativeWholeTokenProbe?
+    private var nativeUnavailable = false
+    private var nativeInvalidationReason: String?
+    private let requestLock = NSLock()
+
+    var hasNativeOwnership: Bool {
+        nativeExecutor != nil || nativeInvalidationReason != nil
+    }
 
     /// Adopt the compilable caches that `CompiledDecode.setupCompiledDecode`
     /// promoted in place, so later steps and `materializeCachedState` see them.
@@ -230,6 +240,181 @@ public final class Gemma4ModelCache {
             eval(kvCaches)
         }
     }
+
+    func withRequestTransaction<Result>(_ body: () throws -> Result) rethrows -> Result {
+        requestLock.lock()
+        defer { requestLock.unlock() }
+        return try body()
+    }
+
+    func nativeLogits(
+        inputIDs: MLXArray,
+        positionOffset: Int,
+        weightCache: Gemma4RuntimeWeightCache,
+        config: Gemma4Config
+    ) throws -> MLXArray? {
+        if let nativeInvalidationReason {
+            throw MLXFastError.invalidInput(
+                "native Gemma 4 request is invalid: \(nativeInvalidationReason)")
+        }
+        guard !nativeUnavailable,
+              inputIDs.dtype == .int32,
+              inputIDs.shape == [1, 1]
+        else {
+            if nativeExecutor != nil {
+                nativeInvalidationReason = "native-owned request received a non-Int32 singleton token"
+                throw MLXFastError.invalidInput(nativeInvalidationReason!)
+            }
+            return nil
+        }
+
+        if nativeExecutor == nil {
+            guard positionOffset < Self.nativeCacheHorizon,
+                  let kvCaches,
+                  kvCaches.count == config.numHiddenLayers
+            else {
+                nativeUnavailable = true
+                return nil
+            }
+            let seed: (
+                keys: [MLXArray],
+                values: [MLXArray],
+                adoption: [MLXArray]?
+            )
+            do {
+                seed = try nativeSeedCaches(
+                    kvCaches: kvCaches,
+                    config: config,
+                    position: positionOffset
+                )
+            } catch {
+                nativeUnavailable = true
+                return nil
+            }
+            guard let executor = weightCache.claimPreparedNativeExecutor() else {
+                nativeUnavailable = true
+                return nil
+            }
+            do {
+                if let adoption = seed.adoption {
+                    try executor.adoptCombinedCaches(
+                        storage: adoption,
+                        position: positionOffset
+                    )
+                } else {
+                    try executor.resetCaches(
+                        priorKeys: seed.keys,
+                        priorValues: seed.values,
+                        position: positionOffset
+                    )
+                }
+            } catch {
+                nativeUnavailable = true
+                return nil
+            }
+            nativeExecutor = executor
+        }
+
+        guard let nativeExecutor else {
+            return nil
+        }
+        let token = inputIDs.item(Int32.self)
+        do {
+            let logits = try nativeExecutor.run(token: token)
+            return logits
+        } catch let error as Gemma4NativeWholeTokenProbeError {
+            if case .outputSlotLeased = error {
+                throw error
+            }
+            nativeInvalidationReason = String(describing: error)
+            throw error
+        } catch {
+            nativeInvalidationReason = String(describing: error)
+            throw error
+        }
+    }
+
+    private func nativeSeedCaches(
+        kvCaches: [any KVCache],
+        config: Gemma4Config,
+        position: Int
+    ) throws -> (
+        keys: [MLXArray],
+        values: [MLXArray],
+        adoption: [MLXArray]?
+    ) {
+        guard position >= 0,
+              kvCaches.allSatisfy({ $0.offset == position })
+        else {
+            throw MLXFastError.invalidInput(
+                "native seed caches do not share position \(position)")
+        }
+        var keys: [MLXArray] = []
+        var values: [MLXArray] = []
+        var adoptionStorage: [MLXArray] = []
+        keys.reserveCapacity(kvCaches.count)
+        values.reserveCapacity(kvCaches.count)
+        adoptionStorage.reserveCapacity(kvCaches.count)
+        for layerIndex in kvCaches.indices {
+            switch config.layerTypes[layerIndex] {
+            case .sliding:
+                let snapshot = try Gemma4NativeSlidingCacheState(
+                    cache: kvCaches[layerIndex],
+                    expectedCapacity: config.slidingWindow
+                )
+                guard snapshot.position == position,
+                      snapshot.sourceStart == 0,
+                      snapshot.activeLength == position,
+                      snapshot.writeIndex == position,
+                      snapshot.keys.shape == [1, 16, position, 256],
+                      snapshot.values.shape == snapshot.keys.shape
+                else {
+                    throw MLXFastError.invalidInput(
+                        "layer \(layerIndex) sliding seed is not a canonical pre-window prefix")
+                }
+                keys.append(snapshot.keys)
+                values.append(snapshot.values)
+            case .full:
+                let state = kvCaches[layerIndex].state
+                guard state.count == 2,
+                      state[0].dtype == .bfloat16,
+                      state[0].shape == [1, 4, position, 512],
+                      state[1].dtype == .bfloat16,
+                      state[1].shape == state[0].shape
+                else {
+                    throw MLXFastError.invalidInput(
+                        "layer \(layerIndex) full seed cache is malformed")
+                }
+                keys.append(state[0])
+                values.append(state[1])
+            }
+            if let combined = (kvCaches[layerIndex] as? Gemma4CombinedKVCache)?
+                .nativeCapacityStorage()
+            {
+                adoptionStorage.append(combined)
+            }
+        }
+        if adoptionStorage.count == kvCaches.count {
+            return (keys, values, adoption: adoptionStorage)
+        }
+        let batchContiguousImport: Bool
+        if let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_NATIVE_BATCH_CACHE_IMPORT"
+        ] {
+            batchContiguousImport = !["0", "false", "no", "off"]
+                .contains(raw.lowercased())
+        } else {
+            batchContiguousImport = true
+        }
+        if batchContiguousImport {
+            let contiguousKeys = keys.map { $0.contiguous() }
+            let contiguousValues = values.map { $0.contiguous() }
+            eval(contiguousKeys + contiguousValues)
+            return (contiguousKeys, contiguousValues, adoption: nil)
+        }
+        return (keys, values, adoption: nil)
+    }
+
 }
 
 func advancedCachePosition(
