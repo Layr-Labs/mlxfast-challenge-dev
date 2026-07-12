@@ -412,6 +412,7 @@ final class Gemma4CombinedKVCache: KVCache {
         }
         guard let windowSize else { return .none }
         if offset >= windowSize, maxSize > windowSize {
+            if n == 1 { return .none }
             var currentIndex = rotatingIndex
             if currentIndex >= maxSize { currentIndex = 0 }
             let maskSize = offset < maxSize ? offset + 1 : maxSize
