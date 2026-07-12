@@ -440,7 +440,7 @@ func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
               || decoded.globalPartialRotaryFactor == 0.25,
           decoded.rmsNormEps == 1e-6,
           decoded.vocabSize == MLXFastConstants.vocabSize,
-          decoded.numKeyValueHeads == 8,
+          decoded.numKeyValueHeads == 16,
           decoded.numGlobalKeyValueHeads == 4,
           decoded.numKVSharedLayers == 0,
           decoded.hiddenSizePerLayerInput == 0,

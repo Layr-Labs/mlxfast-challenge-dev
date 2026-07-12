@@ -281,6 +281,13 @@ func scoredBaselinesResolveFromGoldenWithConstantsFallback() throws {
     #expect(benchmark.contains("BenchmarkScore.evaluateTimedRun("))
     #expect(!score.contains("baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken"))
     #expect(!score.contains("baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken"))
+    // The benchmark file feeds the baselines into BenchmarkScore/ScorePayload;
+    // no call site there may bind a baseline argument straight to the raw
+    // constants (parameter DEFAULTS spell ": Double = MLXFastConstants.", so
+    // they do not match). Without this the two negative checks above are
+    // vacuous: Score.swift only ever sees baselines as parameters.
+    #expect(!benchmark.contains("baselineDecodeSecondsPerToken: MLXFastConstants."))
+    #expect(!benchmark.contains("baselinePrefillSecondsPerToken: MLXFastConstants."))
 }
 
 @Test

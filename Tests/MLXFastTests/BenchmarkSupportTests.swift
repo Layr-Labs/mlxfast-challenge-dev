@@ -117,7 +117,7 @@ func runtimeWorkerPinnedConfigurationRejectsUnsafeLibraryOnlyFields() throws {
     addCase("global-partial-rotary") { $0["global_partial_rotary_factor"] = 0.5 }
     addCase("rms-norm") { $0["rms_norm_eps"] = 1e-5 }
     addCase("vocab") { $0["vocab_size"] = MLXFastConstants.vocabSize - 1 }
-    addCase("kv-heads") { $0["num_key_value_heads"] = 16 }
+    addCase("kv-heads") { $0["num_key_value_heads"] = 8 }
     addCase("global-kv-heads") { $0["num_global_key_value_heads"] = 8 }
     addCase("zero-pattern") { $0["sliding_window_pattern"] = 0 }
     addCase("wrong-pattern") { $0["sliding_window_pattern"] = 5 }
@@ -941,7 +941,7 @@ private func minimalGemma4ConfigJSON() -> String {
       "intermediate_size": \(MLXFastConstants.intermediateSize),
       "num_hidden_layers": \(MLXFastConstants.numHiddenLayers),
       "num_attention_heads": \(MLXFastConstants.attentionHeads),
-      "num_key_value_heads": 8,
+      "num_key_value_heads": 16,
       "num_global_key_value_heads": 4,
       "head_dim": 256,
       "global_head_dim": 512,
@@ -1015,7 +1015,7 @@ private func requiredGemma4DenseTensorFixtures() -> [TensorFixture] {
     let heads = MLXFastConstants.attentionHeads
     let headDim = 256
     let globalHeadDim = 512
-    let kvHeads = 8
+    let kvHeads = 16
     let globalKVHeads = 4
 
     func packedCols(_ inFeatures: Int) -> Int {
@@ -1886,7 +1886,7 @@ private func pinnedRuntimeWorkerConfigurationObject() -> [String: Any] {
         "global_head_dim": 512,
         "rms_norm_eps": 1e-6,
         "vocab_size": MLXFastConstants.vocabSize,
-        "num_key_value_heads": 8,
+        "num_key_value_heads": 16,
         "num_global_key_value_heads": 4,
         "num_kv_shared_layers": 0,
         "hidden_size_per_layer_input": 0,
