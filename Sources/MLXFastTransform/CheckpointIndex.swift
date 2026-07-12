@@ -29,7 +29,8 @@ struct CheckpointIndex {
         to path: URL,
         keeping keys: Set<String>,
         totalTensorByteCount: Int,
-        additionalWeightMap: [String: String] = [:]
+        additionalWeightMap: [String: String] = [:],
+        additionalMetadata: [String: String] = [:]
     ) throws {
         var output = raw
         var outputWeightMap = weightMap.filter { keys.contains($0.key) }
@@ -44,6 +45,14 @@ struct CheckpointIndex {
         output["weight_map"] = outputWeightMap
         var metadata = output["metadata"] as? [String: Any] ?? [:]
         metadata["total_size"] = totalTensorByteCount
+        for key in additionalMetadata.keys.sorted() {
+            guard metadata[key] == nil else {
+                throw MLXFastError.invalidInput(
+                    "generated index metadata collides with checkpoint metadata \(key)"
+                )
+            }
+            metadata[key] = additionalMetadata[key]
+        }
         output["metadata"] = metadata
         let data = try JSONSerialization.data(
             withJSONObject: output,

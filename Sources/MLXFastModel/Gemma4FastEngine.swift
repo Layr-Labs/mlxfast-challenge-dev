@@ -113,6 +113,7 @@ final class Gemma4FastLayer {
     let rope: RoPELayer
     let fusedMLP: @Sendable (MLXArray) -> MLXArray
     let fusedMLPTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+    let combinedGateUpPrefillTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let fusedGateUp: FusedGateUpProjection?
     let fusedGateUpPostTail: (@Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray)?
     let fusedGateUpActivation: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
@@ -148,7 +149,9 @@ final class Gemma4FastLayer {
         vIndexedMetadata: IndexedAffineMetadata?,
         gateIndexedMetadata: IndexedAffineMetadata?,
         upIndexedMetadata: IndexedAffineMetadata?,
-        downIndexedMetadata: IndexedAffineMetadata?
+        downIndexedMetadata: IndexedAffineMetadata?,
+        combinedAttentionProjection: FastQuantizedProjection?,
+        combinedGateUpProjection: FastQuantizedProjection?
     ) {
         self.isSliding = isSliding
         self.nHeads = nHeads
@@ -235,31 +238,34 @@ final class Gemma4FastLayer {
         } else {
             self.fusedQK = nil
         }
-        let combinedAttentionPrefillEnabled: Bool
+        let combinedAttentionEnabled: Bool
         if let raw = ProcessInfo.processInfo.environment[
             "MLXFAST_COMBINED_ATTENTION_PREFILL"
         ] {
-            combinedAttentionPrefillEnabled = ["1", "true", "yes", "on"]
+            combinedAttentionEnabled = ["1", "true", "yes", "on"]
                 .contains(raw.lowercased())
         } else {
-            combinedAttentionPrefillEnabled = true
+            combinedAttentionEnabled = true
         }
-        let verifyCombinedAttentionPrefill: Bool
+        let verifyCombinedAttention: Bool
         if let raw = ProcessInfo.processInfo.environment[
             "MLXFAST_VERIFY_COMBINED_ATTENTION_PREFILL"
         ] {
-            verifyCombinedAttentionPrefill = ["1", "true", "yes", "on"]
+            verifyCombinedAttention = ["1", "true", "yes", "on"]
                 .contains(raw.lowercased())
         } else {
-            verifyCombinedAttentionPrefill = false
+            verifyCombinedAttention = false
         }
-        self.combinedAttentionPrefill = combinedAttentionPrefillEnabled
-            ? CombinedAttentionPrefillProjection(
-                q: qProjection,
-                k: kProjection,
-                v: vProjection,
-                verifyBits: verifyCombinedAttentionPrefill
-            )
+        self.combinedAttentionPrefill = combinedAttentionEnabled
+            ? combinedAttentionProjection.flatMap {
+                CombinedAttentionPrefillProjection(
+                    combined: $0,
+                    q: qProjection,
+                    k: kProjection,
+                    v: vProjection,
+                    verifyBits: verifyCombinedAttention
+                )
+            }
             : nil
         self.qNormWeight = qNorm.weight
         self.kNormWeight = kNorm?.weight
@@ -363,6 +369,71 @@ final class Gemma4FastLayer {
             tailEnabled = compileEnabled
         }
         self.fusedMLPTail = tailEnabled ? compile(shapeless: true, tailBody) : nil
+
+        let combinedGateUpEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment[
+            "MLXFAST_COMBINED_GATE_UP_PREFILL"
+        ] {
+            combinedGateUpEnabled = ["1", "true", "yes", "on"]
+                .contains(raw.lowercased())
+        } else {
+            combinedGateUpEnabled = true
+        }
+        let verifyCombinedGateUp: Bool
+        if let raw = ProcessInfo.processInfo.environment[
+            "MLXFAST_VERIFY_COMBINED_GATE_UP_PREFILL"
+        ] {
+            verifyCombinedGateUp = ["1", "true", "yes", "on"]
+                .contains(raw.lowercased())
+        } else {
+            verifyCombinedGateUp = false
+        }
+        if combinedGateUpEnabled,
+           let combinedGateUpProjection,
+           let combinedBiases = combinedGateUpProjection.biases,
+           combinedGateUpProjection.groupSize == 64,
+           combinedGateUpProjection.bits == 4,
+           combinedGateUpProjection.weight.dtype == .uint32,
+           combinedGateUpProjection.weight.shape == [43_008, 672],
+           combinedGateUpProjection.scales.dtype == .bfloat16,
+           combinedGateUpProjection.scales.shape == [43_008, 84],
+           combinedBiases.dtype == .bfloat16,
+           combinedBiases.shape == combinedGateUpProjection.scales.shape,
+           supportsGemma4FusedGateUp(gate: gateP, up: upP)
+        {
+            let intermediateSize = gateP.weight.dim(0)
+            self.combinedGateUpPrefillTail = { x, residual in
+                precondition(x.dtype == .bfloat16)
+                precondition(x.ndim == 3 && x.dim(0) == 1 && x.dim(1) > 1)
+                precondition(x.dim(2) == 5_376)
+                let normalized = MLXFast.rmsNorm(
+                    x, weight: tailWeights.preNorm, eps: eps)
+                let projected = combinedGateUpProjection(normalized)
+                let gateOutput = projected[.ellipsis, 0..<intermediateSize]
+                let upOutput = projected[
+                    .ellipsis, intermediateSize..<(2 * intermediateSize)]
+                let activated = gelu(gateOutput) * upOutput
+                precondition(activated.dtype == .bfloat16)
+                if verifyCombinedGateUp {
+                    let reference = gelu(gateP(normalized)) * upP(normalized)
+                    let matches = arrayEqual(
+                        activated.view(dtype: .uint16),
+                        reference.view(dtype: .uint16)
+                    )
+                    eval(matches)
+                    precondition(
+                        matches.item(Bool.self),
+                        "combined gate/up prefill activation differs from component views"
+                    )
+                }
+                let mlp = downP(activated)
+                let postNormalized = MLXFast.rmsNorm(
+                    mlp, weight: tailWeights.postNorm, eps: eps)
+                return (residual + postNormalized) * tailWeights.layerScalar
+            }
+        } else {
+            self.combinedGateUpPrefillTail = nil
+        }
 
         let fusedGateUpEnabled: Bool
         if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_GATE_UP"] {
@@ -651,6 +722,8 @@ final class Gemma4FastLayer {
                 let (gateOutput, upOutput) = fusedGateUp(normalized)
                 out = fusedGateUpPostTail(gateOutput, upOutput, residual2)
             }
+        } else if B == 1, L > 1, let combinedGateUpPrefillTail {
+            out = combinedGateUpPrefillTail(out, residual2)
         } else if let fusedMLPTail {
             out = fusedMLPTail(out, residual2)
         } else {
@@ -750,7 +823,8 @@ final class Gemma4FastEngine {
 
     init(
         model: Gemma4RuntimeModel,
-        indexedMetadata: [String: IndexedAffineMetadata] = [:]
+        indexedMetadata: [String: IndexedAffineMetadata] = [:],
+        combinedProjections: RuntimeCombinedProjectionSet = .empty
     ) throws {
         let config = model.configuration
         self.embedScale = Float(config.hiddenSize).squareRoot()
@@ -889,7 +963,10 @@ final class Gemma4FastEngine {
                     vIndexedMetadata: indexedMetadata["\(prefix).self_attn.v_proj"],
                     gateIndexedMetadata: indexedMetadata["\(prefix).mlp.gate_proj"],
                     upIndexedMetadata: indexedMetadata["\(prefix).mlp.up_proj"],
-                    downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"]
+                    downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"],
+                    combinedAttentionProjection: combinedProjections
+                        .attentionByLayer[index],
+                    combinedGateUpProjection: combinedProjections.gateUpByLayer[index]
                 )
             )
         }

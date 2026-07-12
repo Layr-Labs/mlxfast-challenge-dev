@@ -110,7 +110,8 @@ public final class Gemma4RuntimeWeightCache {
         let loadedWeights = try loadRuntimeWeightArrays(denseStore: denseStore)
         let partition = try partitionRuntimeWeights(
             loadedWeights,
-            expectedIndexedStems: expectedIndexedProjectionStems(config: config)
+            expectedIndexedStems: expectedIndexedProjectionStems(config: config),
+            combinedProjectionProfile: denseStore.combinedProjectionProfile
         )
         let weights = partition.modelParameters
 
@@ -128,7 +129,10 @@ public final class Gemma4RuntimeWeightCache {
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
         eval(model)
         eval(partition.indexedMetadata.values.flatMap { [$0.indices, $0.lut] })
-        try model.prepareFastEngine(indexedMetadata: partition.indexedMetadata)
+        try model.prepareFastEngine(
+            indexedMetadata: partition.indexedMetadata,
+            combinedProjections: partition.combinedProjections
+        )
         return model
     }
 
@@ -288,6 +292,7 @@ struct RuntimeWeightNameTracker {
 struct RuntimeWeightPartition {
     let modelParameters: [String: MLXArray]
     let indexedMetadata: [String: IndexedAffineMetadata]
+    let combinedProjections: RuntimeCombinedProjectionSet
 }
 
 private struct RuntimeIndexedMetadataParts {
@@ -313,15 +318,20 @@ func expectedIndexedProjectionStems(config: Gemma4Config) -> Set<String> {
 
 func partitionRuntimeWeights(
     _ loaded: [String: MLXArray],
-    expectedIndexedStems: Set<String>
+    expectedIndexedStems: Set<String>,
+    combinedProjectionProfile: String? = nil
 ) throws -> RuntimeWeightPartition {
     let indicesSuffix = ".metadata_indices"
     let lutSuffix = ".metadata_lut"
+    let expanded = try expandCombinedRuntimeWeights(
+        loaded,
+        profile: combinedProjectionProfile
+    )
     var modelParameters: [String: MLXArray] = [:]
     var metadataParts: [String: RuntimeIndexedMetadataParts] = [:]
 
-    for name in loaded.keys.sorted() {
-        guard let array = loaded[name] else { continue }
+    for name in expanded.weights.keys.sorted() {
+        guard let array = expanded.weights[name] else { continue }
         if name.hasSuffix(indicesSuffix) {
             let stem = String(name.dropLast(indicesSuffix.count))
             metadataParts[stem, default: RuntimeIndexedMetadataParts()].indices = array
@@ -336,7 +346,8 @@ func partitionRuntimeWeights(
     guard !metadataParts.isEmpty else {
         return RuntimeWeightPartition(
             modelParameters: modelParameters,
-            indexedMetadata: [:]
+            indexedMetadata: [:],
+            combinedProjections: expanded.projections
         )
     }
     let actualStems = Set(metadataParts.keys)
@@ -393,7 +404,8 @@ func partitionRuntimeWeights(
     }
     return RuntimeWeightPartition(
         modelParameters: modelParameters,
-        indexedMetadata: indexedMetadata
+        indexedMetadata: indexedMetadata,
+        combinedProjections: expanded.projections
     )
 }
 
