@@ -57,6 +57,33 @@ private struct FastMLPTailWeights: @unchecked Sendable {
     let layerScalar: MLXArray
 }
 
+private func supportsCombinedGateUpPrefill(
+    gate: FastQuantizedProjection,
+    up: FastQuantizedProjection
+) -> Bool {
+    guard let gateBiases = gate.biases, let upBiases = up.biases else {
+        return false
+    }
+    let weightShape = [21_504, 672]
+    let metadataShape = [21_504, 84]
+    return gate.groupSize == 64
+        && up.groupSize == gate.groupSize
+        && gate.bits == 4
+        && up.bits == gate.bits
+        && gate.weight.dtype == .uint32
+        && up.weight.dtype == gate.weight.dtype
+        && gate.weight.shape == weightShape
+        && up.weight.shape == weightShape
+        && gate.scales.dtype == .bfloat16
+        && up.scales.dtype == gate.scales.dtype
+        && gate.scales.shape == metadataShape
+        && up.scales.shape == metadataShape
+        && gateBiases.dtype == .bfloat16
+        && upBiases.dtype == gateBiases.dtype
+        && gateBiases.shape == metadataShape
+        && upBiases.shape == metadataShape
+}
+
 /// Approximate tanh-GELU using `x*x*x` (compile-safe), matching the library.
 private let fastGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray) -> MLXArray = { x in
@@ -112,6 +139,7 @@ final class Gemma4FastLayer {
     let rope: RoPELayer
     let fusedMLP: @Sendable (MLXArray) -> MLXArray
     let fusedMLPTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+    let combinedGateUpPrefillTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let fusedGateUp: FusedGateUpProjection?
     let fusedGateUpPostTail: (@Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray)?
     let fusedGateUpActivation: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
@@ -297,9 +325,9 @@ final class Gemma4FastLayer {
             : nil
         self.rope = rope
 
-        // Fuse the gated MLP into one compiled closure: collapses gate/up/GELU/
-        // product/down graph construction. Keep two quantizedMMs (not a packed
-        // gate+up): a single 2x-wide matmul was slower on this silicon.
+        // Fuse the decode fallback into one compiled closure. It keeps separate
+        // gate/up projections; the optional combined projection below is used
+        // only by general batch-one multi-token forwards.
         let gateP = FastQuantizedProjection(gate)
         let upP = FastQuantizedProjection(up)
         let downP = FastQuantizedProjection(down)
@@ -336,6 +364,79 @@ final class Gemma4FastLayer {
             tailEnabled = compileEnabled
         }
         self.fusedMLPTail = tailEnabled ? compile(shapeless: true, tailBody) : nil
+
+        let combinedPrefillEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment[
+            "MLXFAST_COMBINED_GATE_UP_PREFILL"
+        ] {
+            combinedPrefillEnabled = ["1", "true", "yes", "on"].contains(
+                raw.lowercased())
+        } else {
+            combinedPrefillEnabled = true
+        }
+        if combinedPrefillEnabled,
+           supportsCombinedGateUpPrefill(gate: gateP, up: upP),
+           let gateBiases = gateP.biases,
+           let upBiases = upP.biases
+        {
+            let combinedWeight = concatenated([gateP.weight, upP.weight], axis: 0)
+            let combinedScales = concatenated([gateP.scales, upP.scales], axis: 0)
+            let combinedBiases = concatenated([gateBiases, upBiases], axis: 0)
+            precondition(combinedWeight.shape == [43_008, 672])
+            precondition(combinedScales.shape == [43_008, 84])
+            precondition(combinedBiases.shape == [43_008, 84])
+            // These input-independent copies are retained by the layer and are
+            // materialized exactly once during untimed model construction.
+            eval(combinedWeight, combinedScales, combinedBiases)
+            let combinedGateUp = FastQuantizedProjection(
+                weight: combinedWeight,
+                scales: combinedScales,
+                biases: combinedBiases,
+                groupSize: gateP.groupSize,
+                bits: gateP.bits
+            )
+            let verifyActivationBits: Bool
+            if let raw = ProcessInfo.processInfo.environment[
+                "MLXFAST_VERIFY_COMBINED_GATE_UP_PREFILL"
+            ] {
+                verifyActivationBits = ["1", "true", "yes", "on"].contains(
+                    raw.lowercased())
+            } else {
+                verifyActivationBits = false
+            }
+            let intermediateSize = gateP.weight.dim(0)
+            self.combinedGateUpPrefillTail = { x, residual in
+                precondition(x.dtype == .bfloat16)
+                precondition(x.ndim == 3 && x.dim(0) == 1 && x.dim(1) > 1)
+                precondition(x.dim(2) == 5_376)
+                let normalized = MLXFast.rmsNorm(
+                    x, weight: tailWeights.preNorm, eps: eps)
+                let projected = combinedGateUp(normalized)
+                let gateOutput = projected[.ellipsis, 0..<intermediateSize]
+                let upOutput = projected[
+                    .ellipsis, intermediateSize..<(2 * intermediateSize)]
+                let activated = gelu(gateOutput) * upOutput
+                precondition(activated.dtype == .bfloat16)
+                if verifyActivationBits {
+                    let reference = gelu(gateP(normalized)) * upP(normalized)
+                    let matches = arrayEqual(
+                        activated.view(dtype: .uint16),
+                        reference.view(dtype: .uint16)
+                    )
+                    eval(matches)
+                    precondition(
+                        matches.item(Bool.self),
+                        "combined gate/up prefill activation differs from separate QMMs"
+                    )
+                }
+                let mlp = downP(activated)
+                let postNormalized = MLXFast.rmsNorm(
+                    mlp, weight: tailWeights.postNorm, eps: eps)
+                return (residual + postNormalized) * tailWeights.layerScalar
+            }
+        } else {
+            self.combinedGateUpPrefillTail = nil
+        }
 
         let fusedGateUpEnabled: Bool
         if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_GATE_UP"] {
@@ -615,6 +716,8 @@ final class Gemma4FastLayer {
                 let (gateOutput, upOutput) = fusedGateUp(normalized)
                 out = fusedGateUpPostTail(gateOutput, upOutput, residual2)
             }
+        } else if B == 1, L > 1, let combinedGateUpPrefillTail {
+            out = combinedGateUpPrefillTail(out, residual2)
         } else if let fusedMLPTail {
             out = fusedMLPTail(out, residual2)
         } else {
