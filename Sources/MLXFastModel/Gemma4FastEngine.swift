@@ -148,7 +148,8 @@ final class Gemma4FastLayer {
         vIndexedMetadata: IndexedAffineMetadata?,
         gateIndexedMetadata: IndexedAffineMetadata?,
         upIndexedMetadata: IndexedAffineMetadata?,
-        downIndexedMetadata: IndexedAffineMetadata?
+        downIndexedMetadata: IndexedAffineMetadata?,
+        combinedAttentionProjection: FastQuantizedProjection?
     ) {
         self.isSliding = isSliding
         self.nHeads = nHeads
@@ -235,31 +236,34 @@ final class Gemma4FastLayer {
         } else {
             self.fusedQK = nil
         }
-        let combinedAttentionPrefillEnabled: Bool
+        let combinedAttentionEnabled: Bool
         if let raw = ProcessInfo.processInfo.environment[
             "MLXFAST_COMBINED_ATTENTION_PREFILL"
         ] {
-            combinedAttentionPrefillEnabled = ["1", "true", "yes", "on"]
+            combinedAttentionEnabled = ["1", "true", "yes", "on"]
                 .contains(raw.lowercased())
         } else {
-            combinedAttentionPrefillEnabled = true
+            combinedAttentionEnabled = true
         }
-        let verifyCombinedAttentionPrefill: Bool
+        let verifyCombinedAttention: Bool
         if let raw = ProcessInfo.processInfo.environment[
             "MLXFAST_VERIFY_COMBINED_ATTENTION_PREFILL"
         ] {
-            verifyCombinedAttentionPrefill = ["1", "true", "yes", "on"]
+            verifyCombinedAttention = ["1", "true", "yes", "on"]
                 .contains(raw.lowercased())
         } else {
-            verifyCombinedAttentionPrefill = false
+            verifyCombinedAttention = false
         }
-        self.combinedAttentionPrefill = combinedAttentionPrefillEnabled
-            ? CombinedAttentionPrefillProjection(
-                q: qProjection,
-                k: kProjection,
-                v: vProjection,
-                verifyBits: verifyCombinedAttentionPrefill
-            )
+        self.combinedAttentionPrefill = combinedAttentionEnabled
+            ? combinedAttentionProjection.flatMap {
+                CombinedAttentionPrefillProjection(
+                    combined: $0,
+                    q: qProjection,
+                    k: kProjection,
+                    v: vProjection,
+                    verifyBits: verifyCombinedAttention
+                )
+            }
             : nil
         self.qNormWeight = qNorm.weight
         self.kNormWeight = kNorm?.weight
@@ -750,7 +754,8 @@ final class Gemma4FastEngine {
 
     init(
         model: Gemma4RuntimeModel,
-        indexedMetadata: [String: IndexedAffineMetadata] = [:]
+        indexedMetadata: [String: IndexedAffineMetadata] = [:],
+        combinedProjections: RuntimeCombinedProjectionSet = .empty
     ) throws {
         let config = model.configuration
         self.embedScale = Float(config.hiddenSize).squareRoot()
@@ -889,7 +894,9 @@ final class Gemma4FastEngine {
                     vIndexedMetadata: indexedMetadata["\(prefix).self_attn.v_proj"],
                     gateIndexedMetadata: indexedMetadata["\(prefix).mlp.gate_proj"],
                     upIndexedMetadata: indexedMetadata["\(prefix).mlp.up_proj"],
-                    downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"]
+                    downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"],
+                    combinedAttentionProjection: combinedProjections
+                        .attentionByLayer[index]
                 )
             )
         }

@@ -1,5 +1,450 @@
+import Darwin
+import CryptoKit
 import Foundation
 import MLXFastCore
+
+final class TransformSourceFile {
+    private struct Identity: Equatable {
+        let device: UInt64
+        let inode: UInt64
+        let byteCount: Int
+        let modificationSeconds: Int64
+        let modificationNanoseconds: Int64
+        let statusChangeSeconds: Int64
+        let statusChangeNanoseconds: Int64
+        let linkCount: UInt64
+    }
+
+    let header: SafetensorsHeader
+    private let handle: FileHandle
+    private let identity: Identity
+    private let capturedTensors: [String: Data]?
+
+    init(
+        path: URL,
+        expectedHeader: SafetensorsHeader,
+        tensorNames: [String],
+        trustedSHA256: String? = nil,
+        afterDescriptorOpen: (() throws -> Void)? = nil,
+        afterHeaderValidation: (() throws -> Void)? = nil,
+        afterContentCapture: (() throws -> Void)? = nil
+    ) throws {
+        let descriptor = path.path.withCString {
+            Darwin.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        do {
+            let validatedIdentity = try Self.fileIdentity(handle)
+            try afterDescriptorOpen?()
+            try Safetensors.validateSourceIdentity(
+                URL(fileURLWithPath: "/dev/fd/\(descriptor)"),
+                against: expectedHeader
+            )
+            try afterHeaderValidation?()
+            guard try Self.fileIdentity(handle) == validatedIdentity else {
+                throw MLXFastError.invalidInput(
+                    "generation source descriptor changed while being validated"
+                )
+            }
+
+            for name in tensorNames {
+                guard expectedHeader.tensors[name] != nil else {
+                    throw MLXFastError.invalidInput(
+                        "generation source tensor is missing: \(name)"
+                    )
+                }
+            }
+            let capturedTensors: [String: Data]?
+            if let trustedSHA256 {
+                capturedTensors = try Self.captureTrustedTensors(
+                    handle: handle,
+                    expectedHeader: expectedHeader,
+                    tensorNames: tensorNames,
+                    trustedSHA256: trustedSHA256,
+                    fileByteCount: validatedIdentity.byteCount
+                )
+                try afterContentCapture?()
+                guard try Self.fileIdentity(handle) == validatedIdentity else {
+                    throw MLXFastError.invalidInput(
+                        "generation source descriptor changed while content was captured"
+                    )
+                }
+            } else {
+                capturedTensors = nil
+            }
+            self.header = expectedHeader
+            self.handle = handle
+            self.identity = validatedIdentity
+            self.capturedTensors = capturedTensors
+        } catch {
+            try? handle.close()
+            throw error
+        }
+    }
+
+    deinit {
+        try? handle.close()
+    }
+
+    func readTensor(named name: String) throws -> Data {
+        guard let info = header.tensors[name] else {
+            throw MLXFastError.invalidInput(
+                "missing generation source tensor \(name)"
+            )
+        }
+        if let capturedTensors {
+            guard let bytes = capturedTensors[name], bytes.count == info.byteCount else {
+                throw MLXFastError.invalidInput(
+                    "trusted generation source tensor is missing: \(name)"
+                )
+            }
+            return bytes
+        }
+        try validateIdentity()
+        let offset = try absoluteOffset(info, name: name)
+        try handle.seek(toOffset: offset)
+        let bytes = handle.readData(ofLength: info.byteCount)
+        guard bytes.count == info.byteCount else {
+            throw MLXFastError.invalidInput(
+                "short read from generation source tensor \(name)"
+            )
+        }
+        try validateIdentity()
+        return bytes
+    }
+
+    func copyTensor(named name: String, to output: FileHandle) throws {
+        guard let info = header.tensors[name] else {
+            throw MLXFastError.invalidInput(
+                "missing generation source tensor \(name)"
+            )
+        }
+        if let capturedTensors {
+            guard let bytes = capturedTensors[name], bytes.count == info.byteCount else {
+                throw MLXFastError.invalidInput(
+                    "trusted generation source tensor is missing: \(name)"
+                )
+            }
+            try output.write(contentsOf: bytes)
+            return
+        }
+        try validateIdentity()
+        try handle.seek(toOffset: try absoluteOffset(info, name: name))
+        var remaining = info.byteCount
+        while remaining > 0 {
+            let bytes = handle.readData(ofLength: min(8 * 1024 * 1024, remaining))
+            guard !bytes.isEmpty else {
+                throw MLXFastError.invalidInput(
+                    "unexpected EOF in generation source tensor \(name)"
+                )
+            }
+            try output.write(contentsOf: bytes)
+            remaining -= bytes.count
+        }
+        try validateIdentity()
+    }
+
+    func writeSubset(to destination: URL, tensorNames: [String]) throws -> Int {
+        let tensors = try tensorNames.map { name in
+            guard let info = header.tensors[name] else {
+                throw MLXFastError.invalidInput(
+                    "tensor \(name) is missing from trusted generation source"
+                )
+            }
+            return info
+        }.sorted { $0.name < $1.name }
+        guard !tensors.isEmpty else {
+            return 0
+        }
+        let headerData = try Self.makeHeaderData(
+            tensors: tensors,
+            metadata: header.metadata
+        )
+        try Data().write(to: destination, options: [.withoutOverwriting])
+        let output = try FileHandle(forWritingTo: destination)
+        defer { try? output.close() }
+        var headerLength = UInt64(headerData.count).littleEndian
+        try output.write(contentsOf: Data(bytes: &headerLength, count: 8))
+        try output.write(contentsOf: headerData)
+        for tensor in tensors {
+            try copyTensor(named: tensor.name, to: output)
+        }
+        try output.synchronize()
+        return tensors.count
+    }
+
+    private func absoluteOffset(_ info: SafetensorInfo, name: String) throws -> UInt64 {
+        let (offset, overflow) = header.dataBaseOffset.addingReportingOverflow(
+            UInt64(info.dataStart)
+        )
+        guard !overflow else {
+            throw MLXFastError.invalidInput(
+                "generation source tensor offset overflows for \(name)"
+            )
+        }
+        return offset
+    }
+
+    private func validateIdentity() throws {
+        guard try Self.fileIdentity(handle) == identity else {
+            throw MLXFastError.invalidInput(
+                "generation source descriptor changed while being read"
+            )
+        }
+    }
+
+    private struct Capture {
+        let name: String
+        let start: UInt64
+        let end: UInt64
+        var bytes: Data
+    }
+
+    private static func captureTrustedTensors(
+        handle: FileHandle,
+        expectedHeader: SafetensorsHeader,
+        tensorNames: [String],
+        trustedSHA256: String,
+        fileByteCount: Int
+    ) throws -> [String: Data] {
+        try handle.seek(toOffset: 0)
+        var hasher = SHA256()
+        let prefix = try readExactly(handle, count: 8)
+        hasher.update(data: prefix)
+        let rawHeaderLength = prefix.withUnsafeBytes { raw in
+            raw.loadUnaligned(as: UInt64.self).littleEndian
+        }
+        guard rawHeaderLength > 0,
+              rawHeaderLength <= UInt64(Safetensors.maximumHeaderByteCount),
+              let headerLength = Int(exactly: rawHeaderLength),
+              headerLength <= fileByteCount - 8
+        else {
+            throw MLXFastError.invalidInput(
+                "pinned generation source has an invalid safetensors header"
+            )
+        }
+        let headerData = try readExactly(handle, count: headerLength)
+        hasher.update(data: headerData)
+        let header = try parseHeader(
+            headerData,
+            headerLength: headerLength,
+            fileByteCount: fileByteCount
+        )
+        guard header == expectedHeader else {
+            throw MLXFastError.invalidInput(
+                "pinned generation source header changed during validation"
+            )
+        }
+
+        var captures: [Capture] = try tensorNames.map { name in
+            guard let info = header.tensors[name] else {
+                throw MLXFastError.invalidInput(
+                    "trusted generation source tensor is missing: \(name)"
+                )
+            }
+            let (start, startOverflow) = header.dataBaseOffset.addingReportingOverflow(
+                UInt64(info.dataStart)
+            )
+            let (end, endOverflow) = header.dataBaseOffset.addingReportingOverflow(
+                UInt64(info.dataEnd)
+            )
+            guard !startOverflow, !endOverflow, end >= start else {
+                throw MLXFastError.invalidInput(
+                    "trusted generation source tensor range overflows: \(name)"
+                )
+            }
+            var bytes = Data()
+            bytes.reserveCapacity(info.byteCount)
+            return Capture(name: name, start: start, end: end, bytes: bytes)
+        }
+        captures.sort { $0.start < $1.start }
+
+        var fileOffset = header.dataBaseOffset
+        while true {
+            let chunk = handle.readData(ofLength: 8 * 1024 * 1024)
+            if chunk.isEmpty {
+                break
+            }
+            hasher.update(data: chunk)
+            let chunkStart = fileOffset
+            let (chunkEnd, overflow) = chunkStart.addingReportingOverflow(UInt64(chunk.count))
+            guard !overflow else {
+                throw MLXFastError.invalidInput(
+                    "trusted generation source byte count overflows"
+                )
+            }
+            for index in captures.indices {
+                let overlapStart = max(chunkStart, captures[index].start)
+                let overlapEnd = min(chunkEnd, captures[index].end)
+                guard overlapStart < overlapEnd else {
+                    continue
+                }
+                let lower = Int(overlapStart - chunkStart)
+                let upper = Int(overlapEnd - chunkStart)
+                captures[index].bytes.append(contentsOf: chunk[lower..<upper])
+            }
+            fileOffset = chunkEnd
+        }
+
+        guard fileOffset == UInt64(fileByteCount) else {
+            throw MLXFastError.invalidInput(
+                "pinned generation source changed length while being captured"
+            )
+        }
+        let actualSHA256 = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        guard actualSHA256 == trustedSHA256.lowercased() else {
+            throw MLXFastError.invalidInput(
+                "generation source content does not match the pinned checkpoint"
+            )
+        }
+        for capture in captures {
+            guard let info = header.tensors[capture.name],
+                  capture.bytes.count == info.byteCount
+            else {
+                throw MLXFastError.invalidInput(
+                    "trusted generation source tensor is incomplete: \(capture.name)"
+                )
+            }
+        }
+        return Dictionary(uniqueKeysWithValues: captures.map { ($0.name, $0.bytes) })
+    }
+
+    private static func readExactly(_ handle: FileHandle, count: Int) throws -> Data {
+        var result = Data()
+        result.reserveCapacity(count)
+        while result.count < count {
+            let chunk = handle.readData(ofLength: count - result.count)
+            guard !chunk.isEmpty else {
+                throw MLXFastError.invalidInput(
+                    "pinned generation source ended unexpectedly"
+                )
+            }
+            result.append(chunk)
+        }
+        return result
+    }
+
+    private static func parseHeader(
+        _ data: Data,
+        headerLength: Int,
+        fileByteCount: Int
+    ) throws -> SafetensorsHeader {
+        let object = try JSONSerialization.jsonObject(with: data)
+        guard let dictionary = object as? [String: Any] else {
+            throw MLXFastError.invalidInput(
+                "pinned generation source header is not an object"
+            )
+        }
+        let dataByteCount = fileByteCount - 8 - headerLength
+        var metadata: [String: String] = [:]
+        var tensors: [String: SafetensorInfo] = [:]
+        for (name, value) in dictionary {
+            if name == "__metadata__" {
+                metadata = value as? [String: String] ?? [:]
+                continue
+            }
+            guard let tensor = value as? [String: Any],
+                  let dtype = tensor["dtype"] as? String,
+                  let shapeValues = tensor["shape"] as? [NSNumber],
+                  let offsetValues = tensor["data_offsets"] as? [NSNumber],
+                  offsetValues.count == 2
+            else {
+                throw MLXFastError.invalidInput(
+                    "pinned generation source has invalid tensor metadata for \(name)"
+                )
+            }
+            let shape = try shapeValues.map { value in
+                guard let result = Int(value.stringValue), result >= 0 else {
+                    throw MLXFastError.invalidInput(
+                        "pinned generation source has invalid shape for \(name)"
+                    )
+                }
+                return result
+            }
+            guard let start = Int(offsetValues[0].stringValue),
+                  let end = Int(offsetValues[1].stringValue),
+                  start >= 0,
+                  end >= start,
+                  end <= dataByteCount
+            else {
+                throw MLXFastError.invalidInput(
+                    "pinned generation source has invalid offsets for \(name)"
+                )
+            }
+            tensors[name] = SafetensorInfo(
+                name: name,
+                dtype: dtype,
+                shape: shape,
+                dataStart: start,
+                dataEnd: end
+            )
+        }
+        return SafetensorsHeader(
+            headerLength: headerLength,
+            metadata: metadata,
+            tensors: tensors
+        )
+    }
+
+    private static func makeHeaderData(
+        tensors: [SafetensorInfo],
+        metadata: [String: String]
+    ) throws -> Data {
+        var object: [String: Any] = [:]
+        if !metadata.isEmpty {
+            object["__metadata__"] = metadata
+        }
+        var cursor = 0
+        for tensor in tensors {
+            let (end, overflow) = cursor.addingReportingOverflow(tensor.byteCount)
+            guard !overflow else {
+                throw MLXFastError.invalidInput(
+                    "trusted subset offsets overflow for \(tensor.name)"
+                )
+            }
+            object[tensor.name] = [
+                "dtype": tensor.dtype,
+                "shape": tensor.shape,
+                "data_offsets": [cursor, end],
+            ]
+            cursor = end
+        }
+        var data = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys]
+        )
+        while !data.count.isMultiple(of: 8) {
+            data.append(0x20)
+        }
+        return data
+    }
+
+    private static func fileIdentity(_ handle: FileHandle) throws -> Identity {
+        var status = stat()
+        guard Darwin.fstat(handle.fileDescriptor, &status) == 0,
+              (status.st_mode & S_IFMT) == S_IFREG,
+              status.st_size >= 0,
+              let byteCount = Int(exactly: status.st_size)
+        else {
+            throw MLXFastError.invalidInput(
+                "could not inspect generation source descriptor"
+            )
+        }
+        return Identity(
+            device: UInt64(status.st_dev),
+            inode: UInt64(status.st_ino),
+            byteCount: byteCount,
+            modificationSeconds: Int64(status.st_mtimespec.tv_sec),
+            modificationNanoseconds: Int64(status.st_mtimespec.tv_nsec),
+            statusChangeSeconds: Int64(status.st_ctimespec.tv_sec),
+            statusChangeNanoseconds: Int64(status.st_ctimespec.tv_nsec),
+            linkCount: UInt64(status.st_nlink)
+        )
+    }
+}
 
 public struct TransformOptions: Equatable {
     public let referencePath: String
@@ -54,6 +499,21 @@ public enum SwiftTransform {
     /// multimodal-glue and is out of scope for this text-only challenge.
     static let textTowerPrefix = "language_model."
 
+    private struct GenerationSourceSnapshot {
+        let files: [String: TransformSourceFile]
+    }
+
+    private static let pinnedProductionShardSHA256: [String: String] = [
+        "model-00001-of-00004.safetensors":
+            "48deb52fe002cd2bbc0b49c02c152b93ad3255de5e7335faa0d2afd6f4728e7f",
+        "model-00002-of-00004.safetensors":
+            "125c49c624651d420a09786dffb1934d4177e422da0cb3a95a089119eb8f70c2",
+        "model-00003-of-00004.safetensors":
+            "bdbfe71f055e388bf04c5e8953524f948457ece60c5f9bb39025bca731bb5fc8",
+        "model-00004-of-00004.safetensors":
+            "0215f14cd483ee8e589e7a1a3807afa22e7e12e5d4c22d1b373928002cd511ad",
+    ]
+
     public static func run(_ options: TransformOptions) throws -> TransformReport {
         try run(
             options,
@@ -104,9 +564,6 @@ public enum SwiftTransform {
             throw MLXFastError.invalidInput("checkpoint index contains no text-tower tensors")
         }
 
-        let textKeysByShard = Dictionary(grouping: textKeys) { key in
-            index.weightMap[key] ?? ""
-        }
         var totalTensorByteCount = 0
         for key in textKeys.sorted() {
             guard let shardName = index.weightMap[key],
@@ -144,33 +601,99 @@ public enum SwiftTransform {
             }
         }
 
+        let combinedSourceKeys = CombinedProjectionTransform.sourcePayloadKeys(
+            selectedKeys: textKeys
+        )
+        let generationSourceKeys = AffineMetadataCoding.sourcePayloadKeys(
+            selectedKeys: textKeys
+        ).union(combinedSourceKeys)
+        let requirePinnedContent = !combinedSourceKeys.isEmpty
+        let generationSnapshot = try openGenerationSources(
+            sourceDirectory: referenceDirectory,
+            index: index,
+            sourceHeaders: validatedHeaders,
+            sourceKeys: requirePinnedContent ? textKeys : generationSourceKeys,
+            requirePinnedContent: requirePinnedContent
+        )
+
+        let copiedKeys = textKeys.subtracting(combinedSourceKeys)
+        let copiedKeysByShard = Dictionary(grouping: copiedKeys) { key in
+            index.weightMap[key] ?? ""
+        }
+
         var copiedTensors = 0
-        var stagedHeaders: [String: SafetensorsHeader] = [:]
-        for shardName in textKeysByShard.keys.sorted() {
+        for shardName in copiedKeysByShard.keys.sorted() {
             let source = referenceDirectory.appendingPathComponent(shardName)
             let destination = stagingDirectory.appendingPathComponent(shardName)
             guard let header = validatedHeaders[shardName] else {
                 throw MLXFastError.invalidInput("missing validated header for checkpoint shard \(shardName)")
             }
-            copiedTensors += try Safetensors.copySubset(
-                from: source,
-                to: destination,
-                tensorNames: textKeysByShard[shardName, default: []].sorted(),
-                validatedHeader: header
-            )
-            stagedHeaders[shardName] = try Safetensors.readHeader(destination)
+            let tensorNames = copiedKeysByShard[shardName, default: []].sorted()
+            if requirePinnedContent {
+                guard let sourceFile = generationSnapshot.files[shardName] else {
+                    throw MLXFastError.invalidInput(
+                        "missing pinned production source shard \(shardName)"
+                    )
+                }
+                copiedTensors += try sourceFile.writeSubset(
+                    to: destination,
+                    tensorNames: tensorNames
+                )
+            } else {
+                copiedTensors += try Safetensors.copySubset(
+                    from: source,
+                    to: destination,
+                    tensorNames: tensorNames,
+                    validatedHeader: header
+                )
+            }
         }
 
         try beforeSidecarGeneration?()
         let generatedMetadata = try AffineMetadataCoding.writeProjectionSidecar(
-            sourceDirectory: stagingDirectory,
             index: index,
-            sourceHeaders: stagedHeaders,
+            sourceFiles: generationSnapshot.files,
+            metadataHeaders: validatedHeaders,
             selectedKeys: textKeys,
             destinationDirectory: stagingDirectory
         )
+        let combined = try CombinedProjectionTransform.writeCombinedShard(
+            index: index,
+            sourceFiles: generationSnapshot.files,
+            selectedKeys: textKeys,
+            destinationDirectory: stagingDirectory
+        )
+        guard combined.prunedKeys == combinedSourceKeys else {
+            throw MLXFastError.invalidInput(
+                "combined projection source inventory changed during transform"
+            )
+        }
+        let retainedTensorByteCount = totalTensorByteCount
+            .subtractingReportingOverflow(combined.sourceTensorByteCount)
+        guard !retainedTensorByteCount.overflow else {
+            throw MLXFastError.invalidInput("transformed tensor byte count underflows Int")
+        }
+        let physicalTensorByteCount = retainedTensorByteCount.partialValue
+            .addingReportingOverflow(combined.tensorByteCount)
+        guard !physicalTensorByteCount.overflow,
+              physicalTensorByteCount.partialValue == totalTensorByteCount
+        else {
+            throw MLXFastError.invalidInput(
+                "combined transform changed tensor payload byte accounting"
+            )
+        }
+        let generatedWeightMap = generatedMetadata.weightMap.merging(
+            combined.weightMap
+        ) { key, _ in key }
+        guard generatedWeightMap.count
+                == generatedMetadata.weightMap.count + combined.weightMap.count
+        else {
+            throw MLXFastError.invalidInput(
+                "combined projection tensor names collide with indexed metadata"
+            )
+        }
         let (outputTensorByteCount, generatedSizeOverflow) =
-            totalTensorByteCount.addingReportingOverflow(
+            physicalTensorByteCount.partialValue.addingReportingOverflow(
                 generatedMetadata.tensorByteCount
             )
         guard !generatedSizeOverflow else {
@@ -180,9 +703,10 @@ public enum SwiftTransform {
         try writeMetadataFiles(metadataSnapshot, to: stagingDirectory)
         try index.writeStripped(
             to: stagingDirectory.appendingPathComponent("model.safetensors.index.json"),
-            keeping: textKeys,
+            keeping: copiedKeys,
             totalTensorByteCount: outputTensorByteCount,
-            additionalWeightMap: generatedMetadata.weightMap
+            additionalWeightMap: generatedWeightMap,
+            additionalMetadata: combined.indexMetadata
         )
 
         try runtimeConfigData.write(
@@ -227,11 +751,54 @@ public enum SwiftTransform {
         return TransformReport(
             referencePath: referenceDirectory.path,
             outputPath: outputDirectory.path,
-            denseTensorCount: copiedTensors + generatedMetadata.tensorCount,
-            denseShardCount: textKeysByShard.count + generatedMetadata.shardCount,
+            denseTensorCount: copiedTensors + generatedMetadata.tensorCount
+                + combined.tensorCount,
+            denseShardCount: copiedKeysByShard.count + generatedMetadata.shardCount
+                + combined.shardCount,
             configPath: configPath.path,
             indexPath: indexPath.path
         )
+    }
+
+    private static func openGenerationSources(
+        sourceDirectory: URL,
+        index: CheckpointIndex,
+        sourceHeaders: [String: SafetensorsHeader],
+        sourceKeys: Set<String>,
+        requirePinnedContent: Bool
+    ) throws -> GenerationSourceSnapshot {
+        let keysByShard = Dictionary(grouping: sourceKeys) { key in
+            index.weightMap[key] ?? ""
+        }
+        var files: [String: TransformSourceFile] = [:]
+        do {
+            for shardName in keysByShard.keys.sorted() {
+                guard !shardName.isEmpty,
+                      let sourceHeader = sourceHeaders[shardName]
+                else {
+                    throw MLXFastError.invalidInput(
+                        "missing validated generation source shard"
+                    )
+                }
+                let tensorNames = keysByShard[shardName, default: []].sorted()
+                let trustedSHA256 = pinnedProductionShardSHA256[shardName]
+                if requirePinnedContent, trustedSHA256 == nil {
+                    throw MLXFastError.invalidInput(
+                        "production generation source shard is not pinned: \(shardName)"
+                    )
+                }
+                files[shardName] = try TransformSourceFile(
+                    path: sourceDirectory.appendingPathComponent(shardName),
+                    expectedHeader: sourceHeader,
+                    tensorNames: tensorNames,
+                    trustedSHA256: requirePinnedContent ? trustedSHA256 : nil
+                )
+            }
+        } catch {
+            files.removeAll()
+            throw error
+        }
+        return GenerationSourceSnapshot(files: files)
     }
 
     private static func loadIndex(_ referenceDirectory: URL) throws -> CheckpointIndex {

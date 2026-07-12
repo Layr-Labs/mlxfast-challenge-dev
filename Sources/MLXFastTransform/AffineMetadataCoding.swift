@@ -40,12 +40,13 @@ enum AffineMetadataCoding {
     }
 
     static func writeProjectionSidecar(
-        sourceDirectory: URL,
         index: CheckpointIndex,
-        sourceHeaders: [String: SafetensorsHeader],
+        sourceFiles: [String: TransformSourceFile],
+        metadataHeaders: [String: SafetensorsHeader]? = nil,
         selectedKeys: Set<String>,
         destinationDirectory: URL
     ) throws -> GeneratedAffineMetadataReport {
+        let metadataHeaders = metadataHeaders ?? sourceFiles.mapValues(\.header)
         let stems = selectedKeys.compactMap(indexedProjectionStem).sorted()
         guard !stems.isEmpty else {
             return GeneratedAffineMetadataReport(weightMap: [:], tensorByteCount: 0)
@@ -78,17 +79,17 @@ enum AffineMetadataCoding {
             let weightInfo = try tensorInfo(
                 named: weightName,
                 index: index,
-                sourceHeaders: sourceHeaders
+                sourceHeaders: metadataHeaders
             )
             let scalesInfo = try tensorInfo(
                 named: scalesName,
                 index: index,
-                sourceHeaders: sourceHeaders
+                sourceHeaders: metadataHeaders
             )
             let biasesInfo = try tensorInfo(
                 named: biasesName,
                 index: index,
-                sourceHeaders: sourceHeaders
+                sourceHeaders: metadataHeaders
             )
             guard weightInfo.dtype == TensorDType.u32.rawValue,
                   weightInfo.shape.count == 2,
@@ -106,15 +107,13 @@ enum AffineMetadataCoding {
 
             let scales = try tensorBytes(
                 named: scalesName,
-                sourceDirectory: sourceDirectory,
                 index: index,
-                sourceHeaders: sourceHeaders
+                sourceFiles: sourceFiles
             )
             let biases = try tensorBytes(
                 named: biasesName,
-                sourceDirectory: sourceDirectory,
                 index: index,
-                sourceHeaders: sourceHeaders
+                sourceFiles: sourceFiles
             )
             let lut = try makeOrderedLUT(scales: scales, biases: biases, name: stem)
             projections.append(
@@ -163,9 +162,8 @@ enum AffineMetadataCoding {
             destination,
             tensors: tensors,
             projections: projections,
-            sourceDirectory: sourceDirectory,
             index: index,
-            sourceHeaders: sourceHeaders
+            sourceFiles: sourceFiles
         )
 
         let totalBytes = tensors.reduce(0) { $0 + $1.byteCount }
@@ -173,6 +171,12 @@ enum AffineMetadataCoding {
             weightMap: Dictionary(uniqueKeysWithValues: tensors.map { ($0.name, shardName) }),
             tensorByteCount: totalBytes
         )
+    }
+
+    static func sourcePayloadKeys(selectedKeys: Set<String>) -> Set<String> {
+        Set(selectedKeys.compactMap(indexedProjectionStem).flatMap { stem in
+            ["\(stem).scales", "\(stem).biases"].filter(selectedKeys.contains)
+        })
     }
 
     private static func indexedProjectionStem(_ name: String) -> String? {
@@ -214,33 +218,15 @@ enum AffineMetadataCoding {
 
     private static func tensorBytes(
         named name: String,
-        sourceDirectory: URL,
         index: CheckpointIndex,
-        sourceHeaders: [String: SafetensorsHeader]
+        sourceFiles: [String: TransformSourceFile]
     ) throws -> Data {
         guard let sourceShard = index.weightMap[name],
-              let header = sourceHeaders[sourceShard],
-              let info = header.tensors[name]
+              let sourceFile = sourceFiles[sourceShard]
         else {
             throw MLXFastError.invalidInput("missing validated tensor metadata for \(name)")
         }
-        let source = sourceDirectory.appendingPathComponent(sourceShard)
-        let handle = try FileHandle(forReadingFrom: source)
-        defer { try? handle.close() }
-        let (offset, overflow) = header.dataBaseOffset.addingReportingOverflow(
-            UInt64(info.dataStart)
-        )
-        guard !overflow else {
-            throw MLXFastError.invalidInput("tensor byte offset overflows for \(name)")
-        }
-        try handle.seek(toOffset: offset)
-        let bytes = handle.readData(ofLength: info.byteCount)
-        guard bytes.count == info.byteCount else {
-            throw MLXFastError.invalidInput(
-                "short read while generating indexed metadata for \(name)"
-            )
-        }
-        return bytes
+        return try sourceFile.readTensor(named: name)
     }
 
     private static func makeOrderedLUT(
@@ -305,9 +291,8 @@ enum AffineMetadataCoding {
         _ destination: URL,
         tensors: [GeneratedTensor],
         projections: [Projection],
-        sourceDirectory: URL,
         index: CheckpointIndex,
-        sourceHeaders: [String: SafetensorsHeader]
+        sourceFiles: [String: TransformSourceFile]
     ) throws {
         var headerObject: [String: Any] = [
             "__metadata__": ["format": "mlxfast-projection-indexed-v3"]
@@ -346,15 +331,13 @@ enum AffineMetadataCoding {
             case .indices:
                 let scales = try tensorBytes(
                     named: projection.scalesName,
-                    sourceDirectory: sourceDirectory,
                     index: index,
-                    sourceHeaders: sourceHeaders
+                    sourceFiles: sourceFiles
                 )
                 let biases = try tensorBytes(
                     named: projection.biasesName,
-                    sourceDirectory: sourceDirectory,
                     index: index,
-                    sourceHeaders: sourceHeaders
+                    sourceFiles: sourceFiles
                 )
                 try output.write(contentsOf: try makeIndices(
                     scales: scales,
