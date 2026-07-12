@@ -1,1 +1,3 @@
 `m5-bench-timing.yml` is the operator timing workflow for the self-hosted M5 bench runner, kept here as a reference artifact (intentionally outside `.github/workflows/` so it never runs from this repo); to activate it, copy it into an operator ops repo's `.github/workflows/`.
+
+`measure-job.sh` is the measurement wrapper that workflow invokes on the runner box, staged here the same way (reference artifact only; nothing in this repo executes it); to deploy it, an operator copies it to `/opt/bench-runner/measure-job.sh` on the runner and re-signs the protected-surface integrity manifest per the RUNBOOK.
