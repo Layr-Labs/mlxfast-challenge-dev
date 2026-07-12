@@ -76,11 +76,6 @@ private let fastGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
 /// Attention stays eager with active-length KV caches (bit-parity with the
 /// baseline). The gated MLP is fused into one compiled closure to collapse
 /// gate/up/GELU/product/down graph-construction overhead.
-struct Gemma4FastLayerResult {
-    let hidden: MLXArray
-    let nextNormalized: MLXArray?
-}
-
 final class Gemma4FastLayer {
     let isSliding: Bool
     let nHeads: Int
@@ -94,13 +89,8 @@ final class Gemma4FastLayer {
     let kProj: FastQuantizedProjection
     let vProj: FastQuantizedProjection?
     let oProj: FastQuantizedProjection
-    let indexedOutput: IndexedOutputProjection?
     let fusedQKV: FusedSlidingQKVProjection?
     let fusedQK: FusedFullQKProjection?
-    let combinedAttentionPrefill: CombinedAttentionPrefillProjection?
-    let fusedAttentionRMS: FusedAttentionRMSPreparation?
-    let fusedAttentionToMLPBoundary: FusedAttentionToMLPBoundary?
-    let fusedMLPToNextBoundary: FusedMLPToNextBoundary?
 
     let qNormWeight: MLXArray
     let kNormWeight: MLXArray?
@@ -141,7 +131,6 @@ final class Gemma4FastLayer {
         up: QuantizedLinear,
         down: QuantizedLinear,
         layerScalar: MLXArray,
-        nextInputNormWeight: MLXArray?,
         rope: RoPELayer,
         qIndexedMetadata: IndexedAffineMetadata?,
         kIndexedMetadata: IndexedAffineMetadata?,
@@ -162,18 +151,7 @@ final class Gemma4FastLayer {
         self.qProj = qProjection
         self.kProj = kProjection
         self.vProj = vProjection
-        let outputProjection = FastQuantizedProjection(oProj)
-        self.oProj = outputProjection
-        let indexedOutputEnabled: Bool
-        if let raw = ProcessInfo.processInfo.environment["MLXFAST_INDEXED_OUTPUT_FAST"] {
-            indexedOutputEnabled = ["1", "true", "yes", "on"].contains(
-                raw.lowercased())
-        } else {
-            indexedOutputEnabled = true
-        }
-        self.indexedOutput = indexedOutputEnabled
-            ? IndexedOutputProjection(projection: outputProjection)
-            : nil
+        self.oProj = FastQuantizedProjection(oProj)
         let fusedQKVEnabled: Bool
         if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_QKV"] {
             fusedQKVEnabled = ["1", "true", "yes", "on"].contains(
@@ -235,93 +213,13 @@ final class Gemma4FastLayer {
         } else {
             self.fusedQK = nil
         }
-        let combinedAttentionPrefillEnabled: Bool
-        if let raw = ProcessInfo.processInfo.environment[
-            "MLXFAST_COMBINED_ATTENTION_PREFILL"
-        ] {
-            combinedAttentionPrefillEnabled = ["1", "true", "yes", "on"]
-                .contains(raw.lowercased())
-        } else {
-            combinedAttentionPrefillEnabled = true
-        }
-        let verifyCombinedAttentionPrefill: Bool
-        if let raw = ProcessInfo.processInfo.environment[
-            "MLXFAST_VERIFY_COMBINED_ATTENTION_PREFILL"
-        ] {
-            verifyCombinedAttentionPrefill = ["1", "true", "yes", "on"]
-                .contains(raw.lowercased())
-        } else {
-            verifyCombinedAttentionPrefill = false
-        }
-        self.combinedAttentionPrefill = combinedAttentionPrefillEnabled
-            ? CombinedAttentionPrefillProjection(
-                q: qProjection,
-                k: kProjection,
-                v: vProjection,
-                verifyBits: verifyCombinedAttentionPrefill
-            )
-            : nil
         self.qNormWeight = qNorm.weight
         self.kNormWeight = kNorm?.weight
-        let fusedAttentionRMSEnabled: Bool
-        if let raw = ProcessInfo.processInfo.environment[
-            "MLXFAST_FUSED_ATTENTION_RMS"
-        ] {
-            fusedAttentionRMSEnabled = ["1", "true", "yes", "on"]
-                .contains(raw.lowercased())
-        } else {
-            fusedAttentionRMSEnabled = true
-        }
-        self.fusedAttentionRMS = fusedAttentionRMSEnabled
-            ? FusedAttentionRMSPreparation(
-                isSliding: isSliding,
-                headDim: headDim,
-                kvHeads: nKvHeads,
-                qNormWeight: qNorm.weight,
-                kNormWeight: kNorm?.weight,
-                eps: eps
-            )
-            : nil
         self.inputNormWeight = inputNorm.weight
         self.postAttnNormWeight = postAttnNorm.weight
         self.preFfnNormWeight = preFfnNorm.weight
         self.postFfnNormWeight = postFfnNorm.weight
         self.layerScalar = layerScalar
-        let fusedAttentionToMLPBoundaryEnabled: Bool
-        if let raw = ProcessInfo.processInfo.environment[
-            "MLXFAST_FUSED_ATTENTION_TO_MLP_BOUNDARY"
-        ] {
-            fusedAttentionToMLPBoundaryEnabled = ["1", "true", "yes", "on"]
-                .contains(raw.lowercased())
-        } else {
-            fusedAttentionToMLPBoundaryEnabled = true
-        }
-        self.fusedAttentionToMLPBoundary = fusedAttentionToMLPBoundaryEnabled
-            ? FusedAttentionToMLPBoundary(
-                postAttentionWeight: postAttnNorm.weight,
-                preFFNWeight: preFfnNorm.weight,
-                eps: eps
-            )
-            : nil
-        let fusedMLPToNextBoundaryEnabled: Bool
-        if let raw = ProcessInfo.processInfo.environment[
-            "MLXFAST_FUSED_MLP_TO_NEXT_BOUNDARY"
-        ] {
-            fusedMLPToNextBoundaryEnabled = ["1", "true", "yes", "on"]
-                .contains(raw.lowercased())
-        } else {
-            fusedMLPToNextBoundaryEnabled = true
-        }
-        self.fusedMLPToNextBoundary = fusedMLPToNextBoundaryEnabled
-            ? nextInputNormWeight.flatMap {
-                FusedMLPToNextBoundary(
-                    postFFNWeight: postFfnNorm.weight,
-                    layerScalar: layerScalar,
-                    nextNormWeight: $0,
-                    eps: eps
-                )
-            }
-            : nil
         self.rope = rope
 
         // Fuse the gated MLP into one compiled closure: collapses gate/up/GELU/
@@ -379,7 +277,7 @@ final class Gemma4FastLayer {
             ] {
                 guard let parsed = FusedGateUpMetadataMode(rawValue: raw.lowercased()) else {
                     preconditionFailure(
-                        "MLXFAST_FUSED_GATE_UP_METADATA must be raw or indexed")
+                        "MLXFAST_FUSED_GATE_UP_METADATA must be raw, pair, or indexed")
                 }
                 metadataMode = parsed
             } else {
@@ -469,20 +367,11 @@ final class Gemma4FastLayer {
 
     func callAsFunction(
         _ x: MLXArray,
-        normalizedInput: MLXArray?,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?
-    ) -> Gemma4FastLayerResult {
+    ) -> MLXArray {
         let residual = x
-        let h: MLXArray
-        if let normalizedInput {
-            precondition(x.dim(0) == 1 && x.dim(1) == 1)
-            precondition(normalizedInput.shape == x.shape)
-            precondition(normalizedInput.dtype == .bfloat16)
-            h = normalizedInput
-        } else {
-            h = MLXFast.rmsNorm(x, weight: inputNormWeight, eps: eps)
-        }
+        let h = MLXFast.rmsNorm(x, weight: inputNormWeight, eps: eps)
 
         let (B, L, _) = (h.dim(0), h.dim(1), h.dim(2))
         let offset = cache?.offset ?? 0
@@ -500,149 +389,37 @@ final class Gemma4FastLayer {
             rawQueries = projected.0
             rawKeys = projected.1
             rawValues = nil
-        } else if B == 1,
-                  L > 1,
-                  h.dtype == .bfloat16,
-                  let combinedAttentionPrefill
-        {
-            let projected = combinedAttentionPrefill(h)
-            rawQueries = projected.queries
-            rawKeys = projected.keys
-            rawValues = projected.values
         } else {
             rawQueries = qProj(h)
             rawKeys = kProj(h)
             rawValues = vProj?(h)
         }
 
-        var queries: MLXArray
-        var keys: MLXArray
+        var queries = rawQueries.reshaped(B, L, nHeads, headDim)
+        queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
+
+        let shapedKeys = rawKeys.reshaped(B, L, nKvHeads, headDim)
+        var keys = MLXFast.rmsNorm(shapedKeys, weight: kNormWeight!, eps: eps)
+        keys = keys.transposed(0, 2, 1, 3)
+        keys = rope(keys, offset: offset)
+
         var values: MLXArray
-        let usesFusedAttentionPreparation = B == 1
-            && L == 1
-            && fusedAttentionRMS?.supports(offset: offset) == true
-        let combinedCache = gemma4CombinedKVDirectEnabled()
-            ? cache as? Gemma4CombinedKVCache
-            : nil
-        let usesCombinedKVDecodePreparation = usesFusedAttentionPreparation
-            && combinedCache != nil
-        let combinedPrefillCapacity = B == 1
-            && L > 1
-            && gemma4CombinedKVPrefillEnabled()
-            && fusedAttentionRMS?.supportsPrefill(offset: offset, length: L) == true
-            ? combinedCache?.directPrefillCapacity(for: L)
-            : nil
-        let usesCombinedKVPrefillPreparation = combinedPrefillCapacity != nil
-        if usesCombinedKVDecodePreparation,
-           let fusedAttentionRMS,
-           let combinedCache
-        {
-            let prepared = fusedAttentionRMS.callCombined(
-                rawQueries: rawQueries,
-                rawKeys: rawKeys,
-                rawValues: rawValues,
-                offset: offset
-            )
-            queries = prepared.queries
-            let updated = combinedCache.updateCombined(prepared.combinedKV)
-            keys = updated.0
-            values = updated.1
-        } else if usesFusedAttentionPreparation, let fusedAttentionRMS {
-            let prepared = fusedAttentionRMS(
-                rawQueries: rawQueries,
-                rawKeys: rawKeys,
-                rawValues: rawValues,
-                offset: offset
-            )
-            queries = prepared.0
-            keys = prepared.1
-            values = prepared.2
-        } else if usesCombinedKVPrefillPreparation,
-                  let fusedAttentionRMS,
-                  let combinedCache,
-                  let combinedPrefillCapacity
-        {
-            // Preserve the stock query path exactly. K/V normalization,
-            // transposition, RoPE, cache layout, and capacity reservation are
-            // emitted directly by one multi-token Metal kernel. `rawQueries`
-            // may come from the promoted combined Q/K/V prefill projection;
-            // keeping it here preserves that dispatch and its single QMM.
-            queries = rawQueries.reshaped(B, L, nHeads, headDim)
-            queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
-            let combined = fusedAttentionRMS.callCombinedPrefill(
-                rawKeys: rawKeys,
-                rawValues: rawValues,
-                offset: offset,
-                length: L,
-                capacity: combinedPrefillCapacity
-            )
-            let updated = combinedCache.adoptDirectPrefill(combined, length: L)
-            keys = updated.0
-            values = updated.1
-            if gemma4VerifyCombinedKVPrefillBitsEnabled() {
-                let shapedKeys = rawKeys.reshaped(B, L, nKvHeads, headDim)
-                var referenceKeys = MLXFast.rmsNorm(
-                    shapedKeys, weight: kNormWeight!, eps: eps)
-                    .transposed(0, 2, 1, 3)
-                referenceKeys = rope(referenceKeys, offset: offset)
-                let referenceValueInput = rawValues?.reshaped(
-                    B, L, nKvHeads, headDim
-                ) ?? shapedKeys
-                let referenceValues = MLXFast.rmsNorm(
-                    referenceValueInput,
-                    weight: MLXArray.mlxNone,
-                    eps: eps
-                ).transposed(0, 2, 1, 3)
-                let keysMatch = arrayEqual(
-                    keys.view(dtype: .uint16),
-                    referenceKeys.view(dtype: .uint16)
-                )
-                let valuesMatch = arrayEqual(
-                    values.view(dtype: .uint16),
-                    referenceValues.view(dtype: .uint16)
-                )
-                eval(keysMatch, valuesMatch)
-                precondition(
-                    keysMatch.item(Bool.self) && valuesMatch.item(Bool.self),
-                    "direct combined KV prefill differs from stock RMSNorm/RoPE"
-                )
-            }
+        if let rawValues {
+            values = rawValues.reshaped(B, L, nKvHeads, headDim)
         } else {
-            queries = rawQueries.reshaped(B, L, nHeads, headDim)
-            queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
-
-            let shapedKeys = rawKeys.reshaped(B, L, nKvHeads, headDim)
-            keys = MLXFast.rmsNorm(shapedKeys, weight: kNormWeight!, eps: eps)
-            keys = keys.transposed(0, 2, 1, 3)
-
-            if let rawValues {
-                values = rawValues.reshaped(B, L, nKvHeads, headDim)
-            } else {
-                values = shapedKeys
-            }
-            values = MLXFast.rmsNorm(
-                values, weight: MLXArray.mlxNone, eps: eps)
-            values = values.transposed(0, 2, 1, 3)
+            values = shapedKeys
         }
-        if !usesFusedAttentionPreparation && !usesCombinedKVPrefillPreparation {
-            keys = rope(keys, offset: offset)
-        }
+        values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: eps)
+        values = values.transposed(0, 2, 1, 3)
 
-        if let cache,
-           !usesCombinedKVDecodePreparation,
-           !usesCombinedKVPrefillPreparation
-        {
+        if let cache {
             let updated = cache.update(keys: keys, values: values)
             keys = updated.0
             values = updated.1
         }
 
-        if !usesFusedAttentionPreparation {
-            queries = queries.transposed(0, 2, 1, 3)
-        }
-        if !usesFusedAttentionPreparation {
-            queries = rope(queries, offset: offset)
-        }
+        queries = queries.transposed(0, 2, 1, 3)
+        queries = rope(queries, offset: offset)
 
         var attentionMask = mask
         if case .array(let maskArray) = mask {
@@ -675,38 +452,11 @@ final class Gemma4FastLayer {
         }
 
         let mergedAttention = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
-        let attnOut: MLXArray
-        if B == 1, L == 1, let indexedOutput {
-            attnOut = indexedOutput(mergedAttention)
-        } else {
-            attnOut = oProj(mergedAttention)
-        }
-        var out: MLXArray
-        let residual2: MLXArray
-        let fusedPreFFNNormalized: MLXArray?
-        var nextNormalized: MLXArray? = nil
-        if B == 1,
-           L == 1,
-           fusedGateUp != nil,
-           fusedGateUpPostTail != nil,
-           let fusedAttentionToMLPBoundary
-        {
-            let prepared = fusedAttentionToMLPBoundary(
-                attentionOutput: attnOut,
-                residual: residual
-            )
-            out = prepared.0
-            residual2 = prepared.0
-            fusedPreFFNNormalized = prepared.1
-        } else {
-            out = residual + MLXFast.rmsNorm(
-                attnOut, weight: postAttnNormWeight, eps: eps)
-            residual2 = out
-            fusedPreFFNNormalized = nil
-        }
+        let attnOut = oProj(mergedAttention)
+        var out = residual + MLXFast.rmsNorm(attnOut, weight: postAttnNormWeight, eps: eps)
+        let residual2 = out
         if B == 1, L == 1, let fusedGateUp, let fusedGateUpPostTail {
-            let normalized = fusedPreFFNNormalized ?? MLXFast.rmsNorm(
-                out, weight: preFfnNormWeight, eps: eps)
+            let normalized = MLXFast.rmsNorm(out, weight: preFfnNormWeight, eps: eps)
             if let fusedGateUpActivation, let indexedDown, let indexedDownPostTail {
                 let activated: MLXArray
                 if useFusedGateUpActivation {
@@ -716,16 +466,7 @@ final class Gemma4FastLayer {
                     activated = fusedGateUpActivation(gateOutput, upOutput)
                 }
                 let mlp = indexedDown(activated)
-                if let fusedMLPToNextBoundary {
-                    let prepared = fusedMLPToNextBoundary(
-                        mlpOutput: mlp,
-                        residual: residual2
-                    )
-                    out = prepared.0
-                    nextNormalized = prepared.1
-                } else {
-                    out = indexedDownPostTail(mlp, residual2)
-                }
+                out = indexedDownPostTail(mlp, residual2)
             } else {
                 let (gateOutput, upOutput) = fusedGateUp(normalized)
                 out = fusedGateUpPostTail(gateOutput, upOutput, residual2)
@@ -739,10 +480,7 @@ final class Gemma4FastLayer {
             out = residual2 + out
             out = out * layerScalar
         }
-        return Gemma4FastLayerResult(
-            hidden: out,
-            nextNormalized: nextNormalized
-        )
+        return out
     }
 }
 
@@ -824,40 +562,21 @@ final class Gemma4FastEngine {
     let layers: [Gemma4FastLayer]
     let slidingWindow: Int
     let asyncLayerGroup: Int
-    let asyncLayerLead: Int
-    let tiedVocabularyHead: Gemma4TiedVocabularyHead?
-    let usePacked13TiedVocabularyHead: Bool
-    let verifyTiedVocabularyHead: Bool
     private let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray
 
     init(
         model: Gemma4RuntimeModel,
-        indexedMetadata: [String: IndexedAffineMetadata] = [:],
-        tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata? = nil
+        indexedMetadata: [String: IndexedAffineMetadata] = [:]
     ) throws {
         let config = model.configuration
         self.embedScale = Float(config.hiddenSize).squareRoot()
         self.eps = config.rmsNormEps
         self.softcap = config.finalLogitSoftcapping
         self.slidingWindow = config.slidingWindow
-        let asyncLayerGroup = max(
+        self.asyncLayerGroup = max(
             0,
             Int(ProcessInfo.processInfo.environment["MLXFAST_ASYNC_LAYER_GROUP"] ?? "10") ?? 10
         )
-        self.asyncLayerGroup = asyncLayerGroup
-        if asyncLayerGroup > 0 {
-            self.asyncLayerLead = min(
-                asyncLayerGroup,
-                max(
-                    1,
-                    Int(ProcessInfo.processInfo.environment[
-                        "MLXFAST_ASYNC_LAYER_LEAD"
-                    ] ?? "1") ?? 1
-                )
-            )
-        } else {
-            self.asyncLayerLead = 0
-        }
 
         let modules = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
         let params = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
@@ -878,64 +597,6 @@ final class Gemma4FastEngine {
 
         let loadedEmbedTokens = try module("model.embed_tokens", as: Embedding.self)
         self.embedTokens = loadedEmbedTokens
-        let tiedHeadRequested = ["1", "true", "yes", "on"].contains(
-            ProcessInfo.processInfo.environment["DARKBLOOM_TIED_HEAD_QMV"]?
-                .lowercased() ?? "0"
-        )
-        let verifyTiedHead = ["1", "true", "yes", "on"].contains(
-            ProcessInfo.processInfo.environment["DARKBLOOM_VERIFY_TIED_HEAD_BITS"]?
-                .lowercased() ?? "0"
-        )
-        let packed13Rollback: Bool
-        if let rawPacked13 = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_TIED_HEAD_PACKED13"
-        ]?.lowercased() {
-            switch rawPacked13 {
-            case "0", "false", "no", "off":
-                packed13Rollback = true
-            case "1", "true", "yes", "on":
-                packed13Rollback = false
-            default:
-                throw MLXFastError.invalidInput(
-                    "DARKBLOOM_TIED_HEAD_PACKED13 must be 0 or 1"
-                )
-            }
-        } else {
-            packed13Rollback = false
-        }
-        let productionTiedHead = isGemma4ProductionTiedVocabularyHead(
-            loadedEmbedTokens
-        )
-        self.usePacked13TiedVocabularyHead = productionTiedHead
-            && !packed13Rollback
-        self.verifyTiedVocabularyHead = verifyTiedHead
-        if productionTiedHead || tiedHeadRequested || verifyTiedHead {
-            guard let tiedVocabularyHead = Gemma4TiedVocabularyHead(
-                loadedEmbedTokens,
-                packed13Metadata: tiedHeadPacked13Metadata
-            ) else {
-                throw MLXFastError.invalidInput(
-                    "opt-in tied vocabulary head requires affine 4-bit "
-                        + "QuantizedEmbedding [262144, 672] with BF16 "
-                        + "scales and biases [262144, 84]"
-                )
-            }
-            guard !usePacked13TiedVocabularyHead
-                    || tiedVocabularyHead.packed13Metadata != nil
-            else {
-                throw MLXFastError.invalidInput(
-                    "default tied vocabulary packed13 head requires validated "
-                        + "transform-authored metadata"
-                )
-            }
-            self.tiedVocabularyHead = usePacked13TiedVocabularyHead
-                    || tiedHeadRequested
-                    || verifyTiedHead
-                ? tiedVocabularyHead
-                : nil
-        } else {
-            self.tiedVocabularyHead = nil
-        }
         let finalNorm = try module("model.norm", as: RMSNorm.self)
         self.finalNormWeight = finalNorm.weight
 
@@ -990,17 +651,6 @@ final class Gemma4FastEngine {
                 kNorm = try module("\(prefix).self_attn.k_norm", as: RMSNorm.self)
             }
 
-            let nextInputNormWeight: MLXArray?
-            if index + 1 < config.numHiddenLayers {
-                let nextPrefix = "model.layers.\(index + 1)"
-                nextInputNormWeight = try module(
-                    "\(nextPrefix).input_layernorm",
-                    as: RMSNorm.self
-                ).weight
-            } else {
-                nextInputNormWeight = finalNorm.weight
-            }
-
             built.append(
                 Gemma4FastLayer(
                     isSliding: isSliding,
@@ -1023,7 +673,6 @@ final class Gemma4FastEngine {
                     up: try module("\(prefix).mlp.up_proj", as: QuantizedLinear.self),
                     down: try module("\(prefix).mlp.down_proj", as: QuantizedLinear.self),
                     layerScalar: try array("\(prefix).layer_scalar"),
-                    nextInputNormWeight: nextInputNormWeight,
                     rope: rope,
                     qIndexedMetadata: indexedMetadata["\(prefix).self_attn.q_proj"],
                     kIndexedMetadata: indexedMetadata["\(prefix).self_attn.k_proj"],
@@ -1069,70 +718,20 @@ final class Gemma4FastEngine {
             createAttentionMask(h: hidden, cache: layerCache($0), windowSize: nil)
         }
 
-        var normalizedInput: MLXArray? = nil
         for (index, layer) in layers.enumerated() {
             let mask = layer.isSliding ? (slidingMask ?? .none) : (fullMask ?? .none)
-            let result = layer(
-                hidden,
-                normalizedInput: normalizedInput,
-                mask: mask,
-                cache: layerCache(index)
-            )
-            hidden = result.hidden
-            normalizedInput = result.nextNormalized
-            let layerNumber = index + 1
+            hidden = layer(hidden, mask: mask, cache: layerCache(index))
             if inputs.dim(1) == 1,
                asyncLayerGroup > 0,
-               layerNumber >= asyncLayerLead,
-               (layerNumber - asyncLayerLead).isMultiple(of: asyncLayerGroup)
+               (index + 1).isMultiple(of: asyncLayerGroup)
             {
-                if let normalizedInput {
-                    asyncEval(hidden, normalizedInput)
-                } else {
-                    asyncEval(hidden)
-                }
+                asyncEval(hidden)
             }
         }
 
-        if inputs.dim(1) == 1, let normalizedInput {
-            hidden = normalizedInput
-        } else {
-            hidden = gemma4LastTokenHidden(hidden)
-            hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
-        }
-        let cap = MLXArray(softcap)
-        if let tiedVocabularyHead, usePacked13TiedVocabularyHead {
-            let candidate = tiedVocabularyHead.packed13Softcapped(
-                hidden,
-                cap: cap
-            )
-            if verifyTiedVocabularyHead {
-                let stock = logitSoftcap(embedTokens.asLinear(hidden), cap)
-                tiedVocabularyHead.verifyRawFloat32(
-                    candidate,
-                    stock: stock,
-                    candidateName: "packed13 fused-softcap",
-                    stockName: "embedTokens.asLinear + compiled softcap"
-                )
-            }
-            return candidate
-        }
-
-        let logits: MLXArray
-        if let tiedVocabularyHead {
-            let candidate = tiedVocabularyHead(hidden)
-            if verifyTiedVocabularyHead {
-                tiedVocabularyHead.verifyRawBF16(
-                    candidate,
-                    stock: embedTokens.asLinear(hidden),
-                    candidateName: "stock-metadata custom",
-                    stockName: "embedTokens.asLinear"
-                )
-            }
-            logits = candidate
-        } else {
-            logits = embedTokens.asLinear(hidden)
-        }
-        return logitSoftcap(logits, cap)
+        hidden = gemma4LastTokenHidden(hidden)
+        hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
+        let logits = embedTokens.asLinear(hidden)
+        return logitSoftcap(logits, MLXArray(softcap))
     }
 }

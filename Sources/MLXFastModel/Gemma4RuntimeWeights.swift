@@ -107,13 +107,10 @@ public final class Gemma4RuntimeWeightCache {
         let textConfig = try JSONDecoder().decode(Gemma4TextConfiguration.self, from: configData)
         let model = Gemma4RuntimeModel(textConfig)
 
-        let validatedTiedHeadPacked13Metadata =
-            try validateGemma4TiedHeadPacked13MetadataBytes(denseStore: denseStore)
         let loadedWeights = try loadRuntimeWeightArrays(denseStore: denseStore)
         let partition = try partitionRuntimeWeights(
             loadedWeights,
-            expectedIndexedStems: expectedIndexedProjectionStems(config: config),
-            validatedTiedHeadPacked13Metadata: validatedTiedHeadPacked13Metadata
+            expectedIndexedStems: expectedIndexedProjectionStems(config: config)
         )
         let weights = partition.modelParameters
 
@@ -131,13 +128,7 @@ public final class Gemma4RuntimeWeightCache {
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
         eval(model)
         eval(partition.indexedMetadata.values.flatMap { [$0.indices, $0.lut] })
-        // The constructor's decode warmup consumes the packed head before the
-        // worker handshake and materializes these arrays. Avoid a standalone
-        // GPU command before FastEngine finishes its host-side preparation.
-        try model.prepareFastEngine(
-            indexedMetadata: partition.indexedMetadata,
-            tiedHeadPacked13Metadata: partition.tiedHeadPacked13Metadata
-        )
+        try model.prepareFastEngine(indexedMetadata: partition.indexedMetadata)
         return model
     }
 
@@ -197,7 +188,8 @@ public final class Gemma4RuntimeWeightCache {
 }
 
 func loadRuntimeWeightArrays(
-    denseStore: DenseTensorStore
+    denseStore: DenseTensorStore,
+    restrictingTo requestedShards: Set<String>? = nil
 ) throws -> [String: MLXArray] {
     let directory = URL(fileURLWithPath: denseStore.weightsPath)
     let entries = try FileManager.default.contentsOfDirectory(
@@ -206,10 +198,26 @@ func loadRuntimeWeightArrays(
     let discoveredShards = entries
         .filter { $0.pathExtension == "safetensors" }
         .map(\.lastPathComponent)
-    let shardNames = try validateRuntimeShardInventory(
+    let allShardNames = try validateRuntimeShardInventory(
         referencedShards: denseStore.shardNames,
         discoveredShards: discoveredShards
     )
+
+    let shardNames: [String]
+    if let requestedShards {
+        let unknown = requestedShards.subtracting(allShardNames).sorted()
+        guard unknown.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "requested runtime shards are not indexed: \(unknown.joined(separator: ", "))"
+            )
+        }
+        guard !requestedShards.isEmpty else {
+            throw MLXFastError.invalidInput("requested runtime shard set is empty")
+        }
+        shardNames = allShardNames.filter(requestedShards.contains)
+    } else {
+        shardNames = allShardNames
+    }
 
     var loadedWeights: [String: MLXArray] = [:]
     var expectedLoadedNames: Set<String> = []
@@ -297,7 +305,6 @@ struct RuntimeWeightNameTracker {
 struct RuntimeWeightPartition {
     let modelParameters: [String: MLXArray]
     let indexedMetadata: [String: IndexedAffineMetadata]
-    let tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata?
 }
 
 private struct RuntimeIndexedMetadataParts {
@@ -323,27 +330,16 @@ func expectedIndexedProjectionStems(config: Gemma4Config) -> Set<String> {
 
 func partitionRuntimeWeights(
     _ loaded: [String: MLXArray],
-    expectedIndexedStems: Set<String>,
-    validatedTiedHeadPacked13Metadata:
-        ValidatedGemma4TiedHeadPacked13Metadata? = nil
+    expectedIndexedStems: Set<String>
 ) throws -> RuntimeWeightPartition {
-    let tiedHeadPackedIndicesName =
-        "model.embed_tokens.tied_head_packed13_indices"
-    let tiedHeadLUTName = "model.embed_tokens.tied_head_packed13_lut"
     let indicesSuffix = ".metadata_indices"
     let lutSuffix = ".metadata_lut"
     var modelParameters: [String: MLXArray] = [:]
     var metadataParts: [String: RuntimeIndexedMetadataParts] = [:]
-    var tiedHeadPackedIndices: MLXArray?
-    var tiedHeadLUT: MLXArray?
 
     for name in loaded.keys.sorted() {
         guard let array = loaded[name] else { continue }
-        if name == tiedHeadPackedIndicesName {
-            tiedHeadPackedIndices = array
-        } else if name == tiedHeadLUTName {
-            tiedHeadLUT = array
-        } else if name.hasSuffix(indicesSuffix) {
+        if name.hasSuffix(indicesSuffix) {
             let stem = String(name.dropLast(indicesSuffix.count))
             metadataParts[stem, default: RuntimeIndexedMetadataParts()].indices = array
         } else if name.hasSuffix(lutSuffix) {
@@ -354,48 +350,10 @@ func partitionRuntimeWeights(
         }
     }
 
-    let tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata?
-    switch (tiedHeadPackedIndices, tiedHeadLUT) {
-    case (nil, nil):
-        tiedHeadPacked13Metadata = nil
-    case let (packedIndices?, lut?):
-        guard let weight = modelParameters["model.embed_tokens.weight"],
-              let scales = modelParameters["model.embed_tokens.scales"],
-              let biases = modelParameters["model.embed_tokens.biases"]
-        else {
-            throw MLXFastError.invalidInput(
-                "tied-head packed13 metadata is missing stock affine tensors"
-            )
-        }
-        let metadata = Gemma4TiedHeadPacked13Metadata(
-            packedIndices: packedIndices,
-            lut: lut
-        )
-        try validateGemma4TiedHeadPacked13MetadataLayout(
-            metadata,
-            weight: weight,
-            scales: scales,
-            biases: biases
-        )
-        guard let validatedTiedHeadPacked13Metadata,
-              validatedTiedHeadPacked13Metadata.lutCount == lut.size
-        else {
-            throw MLXFastError.invalidInput(
-                "tied-head packed13 metadata was not validated from raw bytes"
-            )
-        }
-        tiedHeadPacked13Metadata = metadata
-    default:
-        throw MLXFastError.invalidInput(
-            "tied-head packed13 metadata payload is incomplete"
-        )
-    }
-
     guard !metadataParts.isEmpty else {
         return RuntimeWeightPartition(
             modelParameters: modelParameters,
-            indexedMetadata: [:],
-            tiedHeadPacked13Metadata: tiedHeadPacked13Metadata
+            indexedMetadata: [:]
         )
     }
     let actualStems = Set(metadataParts.keys)
@@ -452,8 +410,7 @@ func partitionRuntimeWeights(
     }
     return RuntimeWeightPartition(
         modelParameters: modelParameters,
-        indexedMetadata: indexedMetadata,
-        tiedHeadPacked13Metadata: tiedHeadPacked13Metadata
+        indexedMetadata: indexedMetadata
     )
 }
 

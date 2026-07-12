@@ -43,14 +43,16 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
     }
 
     /// Build the fused-MLP engine after weights are loaded and quantized.
+    public func prepareFastEngine() throws {
+        try prepareFastEngine(indexedMetadata: [:])
+    }
+
     func prepareFastEngine(
-        indexedMetadata: [String: IndexedAffineMetadata],
-        tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata?
+        indexedMetadata: [String: IndexedAffineMetadata]
     ) throws {
         fastEngine = try Gemma4FastEngine(
             model: self,
-            indexedMetadata: indexedMetadata,
-            tiedHeadPacked13Metadata: tiedHeadPacked13Metadata
+            indexedMetadata: indexedMetadata
         )
     }
 
@@ -74,24 +76,11 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
 
     public func newCache(parameters _: GenerateParameters?) -> [KVCache] {
         let firstSharedLayer = configuration.numHiddenLayers - configuration.numKvSharedLayers
-        let useCombinedCache = gemma4CombinedKVCacheEnabled()
         return (0..<firstSharedLayer).map { layerIndex in
             if configuration.layerTypes[layerIndex] == Gemma4LayerType.full.rawValue {
-                if useCombinedCache {
-                    Gemma4CombinedKVCache(fullStep: 256)
-                } else {
-                    StandardKVCache()
-                }
+                StandardKVCache()
             } else {
-                if useCombinedCache {
-                    Gemma4CombinedKVCache(
-                        rotatingMaxSize: configuration.slidingWindow,
-                        keep: 0,
-                        step: 256
-                    )
-                } else {
-                    RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
-                }
+                RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
             }
         }
     }
