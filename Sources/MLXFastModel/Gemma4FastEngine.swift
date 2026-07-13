@@ -754,6 +754,22 @@ final class Gemma4FastLayer {
         }
 
         let attention: MLXArray
+        let hasNoAttentionMask: Bool
+        if case .none = attentionMask {
+            hasNoAttentionMask = true
+        } else {
+            hasNoAttentionMask = false
+        }
+        let canUsePairedSlidingDecode = B == 1
+            && L == 1
+            && isSliding
+            && supportsGemma4PairedSlidingGQADecodeAttention(
+                queries: queries,
+                keys: keys,
+                values: values,
+                scale: scale,
+                hasMask: !hasNoAttentionMask
+            )
         let canUseStagedSlidingPrefill = B == 1
             && L == 512
             && offset == 0
@@ -762,7 +778,40 @@ final class Gemma4FastLayer {
             && queries.shape == [1, 32, 512, 256]
             && keys.shape == [1, 16, 512, 256]
             && values.shape == [1, 16, 512, 256]
-        if canUseStagedSlidingPrefill
+        if canUsePairedSlidingDecode
+            && (gemma4PairedSlidingGQADecodeAttentionEnabled
+                || gemma4VerifyPairedSlidingGQADecodeAttentionBits),
+           let candidate = gemma4PairedSlidingGQADecodeAttention(
+               queries: queries,
+               keys: keys,
+               values: values,
+               scale: scale,
+               hasMask: false
+           )
+        {
+            if gemma4VerifyPairedSlidingGQADecodeAttentionBits {
+                let reference = MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    scale: scale,
+                    mask: attentionMask
+                )
+                let matches = arrayEqual(
+                    candidate.view(dtype: .uint16),
+                    reference.view(dtype: .uint16)
+                )
+                eval(matches)
+                precondition(
+                    matches.item(Bool.self),
+                    "paired sliding GQA decode attention differs from stock SDPA"
+                )
+                // Qualification mode is deliberately stock-propagating.
+                attention = reference
+            } else {
+                attention = candidate
+            }
+        } else if canUseStagedSlidingPrefill
             && (gemma4StagedSlidingPrefillAttentionEnabled
                 || gemma4VerifyStagedSlidingPrefillAttentionBits)
         {
