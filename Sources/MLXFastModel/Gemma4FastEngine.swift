@@ -897,6 +897,32 @@ private func gemma4FastAttentionFallback(
     return output
 }
 
+struct Gemma4AsyncSchedule: Equatable {
+    let layerFrontiers: [Int]
+    let evaluatesFinalLogits: Bool
+}
+
+func gemma4AsyncSchedule(
+    isDecode: Bool,
+    layerCount: Int,
+    group: Int,
+    lead: Int,
+    logitsTailEnabled: Bool
+) -> Gemma4AsyncSchedule {
+    guard isDecode, group > 0 else {
+        return Gemma4AsyncSchedule(layerFrontiers: [], evaluatesFinalLogits: false)
+    }
+    let frontiers = (1...layerCount).filter {
+        $0 >= lead && ($0 - lead).isMultiple(of: group)
+    }
+    let useLogitsTail = logitsTailEnabled
+        && group == 10 && lead == 1 && layerCount == 60
+    return Gemma4AsyncSchedule(
+        layerFrontiers: useLogitsTail ? frontiers.filter { $0 != 51 } : frontiers,
+        evaluatesFinalLogits: useLogitsTail
+    )
+}
+
 /// High-performance Gemma 4 trunk built from the already-loaded library modules.
 final class Gemma4FastEngine {
     let embedTokens: Embedding
@@ -908,6 +934,7 @@ final class Gemma4FastEngine {
     let slidingWindow: Int
     let asyncLayerGroup: Int
     let asyncLayerLead: Int
+    let asyncLogitsTailEnabled: Bool
     let tiedVocabularyHead: Gemma4TiedVocabularyHead?
     let usePacked13TiedVocabularyHead: Bool
     let verifyTiedVocabularyHead: Bool
@@ -941,6 +968,17 @@ final class Gemma4FastEngine {
         } else {
             self.asyncLayerLead = 0
         }
+        let logitsTailRequested: Bool
+        if let raw = ProcessInfo.processInfo.environment["MLXFAST_ASYNC_LOGITS_TAIL"] {
+            logitsTailRequested = !["0", "false", "no", "off"].contains(
+                raw.lowercased())
+        } else {
+            logitsTailRequested = true
+        }
+        self.asyncLogitsTailEnabled = logitsTailRequested
+            && asyncLayerGroup == 10
+            && self.asyncLayerLead == 1
+            && config.numHiddenLayers == 60
 
         let modules = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
         let params = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
@@ -1132,6 +1170,7 @@ final class Gemma4FastEngine {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let isDecode = inputs.dim(1) == 1
         var hidden = embedTokens(inputs) * embedScale
 
         func layerCache(_ index: Int) -> KVCache? {
@@ -1164,10 +1203,11 @@ final class Gemma4FastEngine {
             hidden = result.hidden
             normalizedInput = result.nextNormalized
             let layerNumber = index + 1
-            if inputs.dim(1) == 1,
+            if isDecode,
                asyncLayerGroup > 0,
                layerNumber >= asyncLayerLead,
-               (layerNumber - asyncLayerLead).isMultiple(of: asyncLayerGroup)
+               (layerNumber - asyncLayerLead).isMultiple(of: asyncLayerGroup),
+               !(asyncLogitsTailEnabled && layerNumber == 51)
             {
                 if let normalizedInput {
                     asyncEval(hidden, normalizedInput)
@@ -1177,13 +1217,14 @@ final class Gemma4FastEngine {
             }
         }
 
-        if inputs.dim(1) == 1, let normalizedInput {
+        if isDecode, let normalizedInput {
             hidden = normalizedInput
         } else {
             hidden = gemma4LastTokenHidden(hidden)
             hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
         }
         let cap = MLXArray(softcap)
+        let finalLogits: MLXArray
         if let tiedVocabularyHead, usePacked13TiedVocabularyHead {
             let candidate = tiedVocabularyHead.packed13Softcapped(
                 hidden,
@@ -1198,24 +1239,28 @@ final class Gemma4FastEngine {
                     stockName: "embedTokens.asLinear + compiled softcap"
                 )
             }
-            return candidate
-        }
-
-        let logits: MLXArray
-        if let tiedVocabularyHead {
-            let candidate = tiedVocabularyHead(hidden)
-            if verifyTiedVocabularyHead {
-                tiedVocabularyHead.verifyRawBF16(
-                    candidate,
-                    stock: embedTokens.asLinear(hidden),
-                    candidateName: "stock-metadata custom",
-                    stockName: "embedTokens.asLinear"
-                )
-            }
-            logits = candidate
+            finalLogits = candidate
         } else {
-            logits = embedTokens.asLinear(hidden)
+            let logits: MLXArray
+            if let tiedVocabularyHead {
+                let candidate = tiedVocabularyHead(hidden)
+                if verifyTiedVocabularyHead {
+                    tiedVocabularyHead.verifyRawBF16(
+                        candidate,
+                        stock: embedTokens.asLinear(hidden),
+                        candidateName: "stock-metadata custom",
+                        stockName: "embedTokens.asLinear"
+                    )
+                }
+                logits = candidate
+            } else {
+                logits = embedTokens.asLinear(hidden)
+            }
+            finalLogits = logitSoftcap(logits, cap)
         }
-        return logitSoftcap(logits, cap)
+        if isDecode && asyncLogitsTailEnabled {
+            asyncEval(finalLogits)
+        }
+        return finalLogits
     }
 }
