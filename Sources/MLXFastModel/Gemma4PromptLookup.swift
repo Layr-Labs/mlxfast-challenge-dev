@@ -7,56 +7,81 @@ enum Gemma4PromptLookupPendingResolution: Equatable {
     case mismatch
 }
 
-/// Request-local token history for generic one-token prompt lookup.
+/// Request-local token history for generic prompt lookup with up to two drafts.
 ///
-/// A draft is the token following the most recent prior occurrence of the
+/// Drafts are the tokens following the most recent prior occurrence of the
 /// longest suffix up to six tokens. Pending drafts are not added to history
-/// until the caller presents that token on the next model invocation.
+/// until the caller presents each token on a subsequent model invocation.
 struct Gemma4PromptLookupState: Equatable {
     private(set) var tokens: [Int32] = []
-    private(set) var pendingDraft: Int32?
+    private(set) var pendingDrafts: [Int32] = []
+
+    /// Compatibility view for the promoted one-draft model integration.
+    var pendingDraft: Int32? {
+        pendingDrafts.first
+    }
 
     mutating func reset(tokens: [Int32] = []) {
         self.tokens = tokens
-        pendingDraft = nil
+        pendingDrafts.removeAll(keepingCapacity: true)
     }
 
     mutating func recordInput(_ token: Int32) {
-        precondition(pendingDraft == nil)
+        precondition(pendingDrafts.isEmpty)
         tokens.append(token)
     }
 
+    func drafts(maxCount: Int = 2) -> [Int32] {
+        gemma4PromptLookupDrafts(tokens: tokens, maxCount: maxCount)
+    }
+
+    func drafts(appending token: Int32, maxCount: Int = 2) -> [Int32] {
+        gemma4PromptLookupDrafts(tokens: tokens + [token], maxCount: maxCount)
+    }
+
+    /// Compatibility wrappers for the promoted one-draft model integration.
     func draft() -> Int32? {
-        gemma4PromptLookupDraft(tokens: tokens)
+        drafts(maxCount: 1).first
     }
 
     func draft(appending token: Int32) -> Int32? {
-        gemma4PromptLookupDraft(tokens: tokens + [token])
+        drafts(appending: token, maxCount: 1).first
+    }
+
+    mutating func setPendingDrafts(_ tokens: [Int32]) {
+        precondition(pendingDrafts.isEmpty)
+        precondition((1...2).contains(tokens.count))
+        pendingDrafts = tokens
     }
 
     mutating func setPendingDraft(_ token: Int32) {
-        precondition(pendingDraft == nil)
-        pendingDraft = token
+        setPendingDrafts([token])
     }
 
     mutating func resolvePending(actualInput: Int32) -> Gemma4PromptLookupPendingResolution {
-        guard let pendingDraft else { return .none }
-        self.pendingDraft = nil
-        guard actualInput == pendingDraft else { return .mismatch }
+        guard let expected = pendingDrafts.first else { return .none }
+        guard actualInput == expected else {
+            pendingDrafts.removeAll(keepingCapacity: true)
+            return .mismatch
+        }
+        pendingDrafts.removeFirst()
         tokens.append(actualInput)
         return .accepted
     }
 
-
     mutating func cancelPending() {
-        pendingDraft = nil
+        pendingDrafts.removeAll(keepingCapacity: true)
     }
 }
 
-/// Fixed generic N=6, k=1 lookup. Suffix lengths are tried longest-first, then
-/// prior starts newest-first, exactly matching the offline policy evaluator.
-func gemma4PromptLookupDraft(tokens: [Int32]) -> Int32? {
-    guard tokens.count >= 2 else { return nil }
+/// Fixed generic N=6 lookup returning up to `maxCount` contiguous continuation
+/// tokens from the selected prior match. Suffix lengths are tried longest-first,
+/// then prior starts newest-first, exactly matching the promoted k=1 policy.
+/// Consequently the first returned draft is bit-for-bit policy-compatible with
+/// `gemma4PromptLookupDraft(tokens:)`.
+func gemma4PromptLookupDrafts(tokens: [Int32], maxCount: Int = 2) -> [Int32] {
+    precondition(maxCount > 0)
+    guard tokens.count >= 2 else { return [] }
     for length in stride(from: min(6, tokens.count), through: 1, by: -1) {
         let suffixStart = tokens.count - length
         guard suffixStart > 0 else { continue }
@@ -67,11 +92,22 @@ func gemma4PromptLookupDraft(tokens: [Int32]) -> Int32? {
                 break
             }
             if matches {
-                return tokens[start + length]
+                let continuationStart = start + length
+                let continuationCount = min(
+                    maxCount,
+                    tokens.count - continuationStart
+                )
+                let continuationEnd = continuationStart + continuationCount
+                return Array(tokens[continuationStart..<continuationEnd])
             }
         }
     }
-    return nil
+    return []
+}
+
+/// Compatibility wrapper for the promoted one-draft model integration.
+func gemma4PromptLookupDraft(tokens: [Int32]) -> Int32? {
+    gemma4PromptLookupDrafts(tokens: tokens, maxCount: 1).first
 }
 
 @inline(__always)
@@ -121,6 +157,36 @@ func gemma4VerifyPromptLookupPair(
     precondition(
         firstMatches.item(Bool.self) && secondMatches.item(Bool.self),
         "exact prompt-lookup pair differs from serialized decode"
+    )
+    precondition(!candidateOffsets.isEmpty)
+    precondition(candidateOffsets.allSatisfy { $0 == candidateOffsets[0] })
+    precondition(referenceOffsets == candidateOffsets)
+}
+
+func gemma4VerifyPromptLookupTriple(
+    _ candidate: MLXArray,
+    references: [MLXArray],
+    candidateOffsets: [Int],
+    referenceOffsets: [Int]
+) {
+    precondition(candidate.dtype == .float32 && candidate.shape == [3, 262_144])
+    precondition(references.count == 3)
+    var matches: [MLXArray] = []
+    for index in 0..<3 {
+        precondition(
+            references[index].dtype == .float32
+                && references[index].shape == [1, 1, 262_144])
+        matches.append(arrayEqual(
+            candidate[index..<(index + 1), 0...]
+                .reshaped(1, 1, 262_144)
+                .view(dtype: .uint32),
+            references[index].view(dtype: .uint32)
+        ))
+    }
+    eval(matches)
+    precondition(
+        matches.allSatisfy { $0.item(Bool.self) },
+        "exact two-draft prompt lookup differs from serialized decode"
     )
     precondition(!candidateOffsets.isEmpty)
     precondition(candidateOffsets.allSatisfy { $0 == candidateOffsets[0] })

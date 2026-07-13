@@ -167,7 +167,7 @@ public final class Gemma4ModelCache {
     var compiledDecodeStep: (@Sendable ([MLXArray]) -> [MLXArray])?
 
     var promptLookupState = Gemma4PromptLookupState()
-    var promptLookupPendingLogits: MLXArray?
+    var promptLookupPendingLogits: [MLXArray] = []
     var promptLookupTrackingValid = true
 
     /// Adopt the compilable caches that `CompiledDecode.setupCompiledDecode`
@@ -219,16 +219,16 @@ public final class Gemma4ModelCache {
         guard !tokens.isEmpty else { return }
         if positionOffset == 0 {
             promptLookupState.reset(tokens: tokens)
-            promptLookupPendingLogits = nil
+            promptLookupPendingLogits.removeAll(keepingCapacity: true)
             promptLookupTrackingValid = true
             return
         }
         guard promptLookupTrackingValid,
-              promptLookupState.pendingDraft == nil,
+              promptLookupState.pendingDrafts.isEmpty,
               promptLookupState.tokens.count == positionOffset
         else {
             promptLookupState.reset()
-            promptLookupPendingLogits = nil
+            promptLookupPendingLogits.removeAll(keepingCapacity: true)
             promptLookupTrackingValid = false
             return
         }

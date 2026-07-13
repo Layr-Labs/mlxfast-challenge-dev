@@ -194,8 +194,11 @@ struct FusedAttentionToMLPBoundary: @unchecked Sendable {
         if attentionOutput.shape == [1, 1, 5376] {
             tokenCount = 1
         } else {
-            precondition(attentionOutput.shape == [2, 5376])
-            tokenCount = 2
+            precondition(
+                attentionOutput.ndim == 2
+                    && (2...3).contains(attentionOutput.dim(0))
+                    && attentionOutput.dim(1) == 5376)
+            tokenCount = attentionOutput.dim(0)
         }
         precondition(residual.shape == attentionOutput.shape)
         precondition(attentionOutput.dtype == .bfloat16)
@@ -413,8 +416,11 @@ struct FusedMLPToNextBoundary: @unchecked Sendable {
         if mlpOutput.shape == [1, 1, 5376] {
             tokenCount = 1
         } else {
-            precondition(mlpOutput.shape == [2, 5376])
-            tokenCount = 2
+            precondition(
+                mlpOutput.ndim == 2
+                    && (2...3).contains(mlpOutput.dim(0))
+                    && mlpOutput.dim(1) == 5376)
+            tokenCount = mlpOutput.dim(0)
         }
         precondition(residual.shape == mlpOutput.shape)
         precondition(mlpOutput.dtype == .bfloat16)

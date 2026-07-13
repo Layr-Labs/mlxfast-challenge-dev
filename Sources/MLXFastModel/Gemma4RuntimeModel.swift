@@ -82,6 +82,24 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
         fastEngine?.canRunExactTwoVector(cache: cache) == true
     }
 
+    var supportsExactTwoDraftPromptLookup: Bool {
+        fastEngine?.supportsExactThreeVector == true
+    }
+
+    func exactPromptLookupTriple(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) -> MLXArray {
+        guard let fastEngine, fastEngine.supportsExactThreeVector else {
+            preconditionFailure("exact two-draft prompt-lookup engine is unavailable")
+        }
+        return fastEngine.exactThreeVector(inputs, cache: cache)
+    }
+
+    func canRunExactTwoDraftPromptLookup(cache: [KVCache]) -> Bool {
+        fastEngine?.canRunExactThreeVector(cache: cache) == true
+    }
+
     public func prepare(
         _ input: LMInput,
         cache _: [KVCache],

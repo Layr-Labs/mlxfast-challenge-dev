@@ -26,8 +26,9 @@ final class Gemma4CombinedKVCache: KVCache {
     private var rotatingIndex: Int = 0
     private var rotatingMaxSize: Int?
     private var combinedMutationGeneration = 0
-    private var lastPairAppendGeneration: Int?
-    private var deferredCombinedPosition: Int?
+    private var lastSpeculativeAppendGeneration: Int?
+    private var lastSpeculativeAppendLength: Int?
+    private var deferredCombinedEndPosition: Int?
     private var deferredCombinedGeneration: Int?
     private(set) var offset: Int = 0
 
@@ -126,9 +127,8 @@ final class Gemma4CombinedKVCache: KVCache {
         combinedStorage = combined
         splitCache = nil
         combinedMutationGeneration &+= 1
-        lastPairAppendGeneration = nil
-        deferredCombinedPosition = nil
-        deferredCombinedGeneration = nil
+        clearSpeculativeAppendMarker()
+        clearDeferredCombinedPositions()
         offset = length
         if rotatingMaxSize != nil {
             rotatingIndex = length
@@ -151,13 +151,15 @@ final class Gemma4CombinedKVCache: KVCache {
         precondition(keys.shape[0...2] == values.shape[0...2])
         precondition(keys.dtype == values.dtype)
 
-        precondition(deferredCombinedPosition == nil)
-        precondition(lastPairAppendGeneration == nil)
+        precondition(deferredCombinedEndPosition == nil)
+        precondition(deferredCombinedGeneration == nil)
+        precondition(lastSpeculativeAppendGeneration == nil)
+        precondition(lastSpeculativeAppendLength == nil)
         if combinedStorage != nil {
             splitCache = makeUpstreamCache()
             combinedStorage = nil
             combinedMutationGeneration &+= 1
-            lastPairAppendGeneration = nil
+            clearSpeculativeAppendMarker()
         }
         guard let splitCache else {
             preconditionFailure("combined KV cache lost its split fallback")
@@ -167,16 +169,19 @@ final class Gemma4CombinedKVCache: KVCache {
         return result
     }
 
-    /// Optimized path for one ordinary or two speculative positions.
+    /// Optimized path for one ordinary position or a speculative append containing
+    /// one actual position followed by one or two draft positions.
     /// `combined` must be direct output from fused attention preparation, with
-    /// shape `[2,B,Hkv,L,D]` where `L` is one or two.
+    /// shape `[2,B,Hkv,L,D]` where `L` is between one and three.
     func updateCombined(_ combined: MLXArray) -> (MLXArray, MLXArray) {
         precondition(combined.ndim == 5)
         precondition(combined.dim(0) == 2)
         precondition(combined.dim(1) == 1)
-        precondition((1...2).contains(combined.dim(3)))
-        precondition(deferredCombinedPosition == nil)
-        precondition(lastPairAppendGeneration == nil)
+        precondition((1...3).contains(combined.dim(3)))
+        precondition(deferredCombinedEndPosition == nil)
+        precondition(deferredCombinedGeneration == nil)
+        precondition(lastSpeculativeAppendGeneration == nil)
+        precondition(lastSpeculativeAppendLength == nil)
 
         convertSplitStorageIfNeeded(matching: combined)
         let result: (MLXArray, MLXArray)
@@ -186,81 +191,108 @@ final class Gemma4CombinedKVCache: KVCache {
         case .rotating:
             result = updateRotating(combined)
         }
-        if combined.dim(3) == 2 {
+        let appendLength = combined.dim(3)
+        if appendLength > 1 {
             combinedMutationGeneration &+= 1
-            lastPairAppendGeneration = combinedMutationGeneration
+            lastSpeculativeAppendGeneration = combinedMutationGeneration
+            lastSpeculativeAppendLength = appendLength
         } else {
-            lastPairAppendGeneration = nil
+            clearSpeculativeAppendMarker()
         }
         return result
     }
 
-    /// Speculative pair appends deliberately avoid cache growth and ring wrap.
-    /// This keeps one-position rollback metadata-only and guarantees that the
-    /// older position needed by token zero remains available as a prefix view.
-    func canAppendCombinedPair() -> Bool {
-        guard deferredCombinedPosition == nil,
-              lastPairAppendGeneration == nil,
+    /// Speculative multi-position appends deliberately avoid cache growth and
+    /// rotating-cache wrap. This keeps rollback metadata-only and guarantees
+    /// that every causal prefix needed by the speculative rows remains available.
+    func canAppendCombined(count: Int) -> Bool {
+        guard (2...3).contains(count),
+              deferredCombinedEndPosition == nil,
+              deferredCombinedGeneration == nil,
+              lastSpeculativeAppendGeneration == nil,
+              lastSpeculativeAppendLength == nil,
               splitCache == nil,
               let combinedStorage
         else { return false }
+        let (end, overflow) = offset.addingReportingOverflow(count)
+        guard !overflow else { return false }
         switch kind {
         case .full:
-            return offset + 2 <= combinedStorage.dim(3)
+            return end <= combinedStorage.dim(3)
         case .rotating(let maxSize, _, _):
             return offset == rotatingIndex
-                && offset + 2 <= maxSize
-                && rotatingIndex + 2 <= combinedStorage.dim(3)
+                && end <= maxSize
+                && end <= combinedStorage.dim(3)
         }
     }
 
-    /// Hide the newest speculative position from the public cache offset while
-    /// retaining its bytes. The outer model cache advances by one API input per
-    /// call, so the second row cannot become visible until the next call proves
-    /// that its input token equals the draft.
-    func canDeferNewestCombinedPosition() -> Bool {
-        guard deferredCombinedPosition == nil,
+    /// Compatibility wrapper for the promoted one-draft path.
+    func canAppendCombinedPair() -> Bool {
+        canAppendCombined(count: 2)
+    }
+
+    /// Hide the speculative suffix from the public cache offset while retaining
+    /// its bytes. Exactly one row from the append remains visible: the actual API
+    /// input. Deferred rows are recommitted one at a time as callers prove each
+    /// draft token.
+    func canDeferNewestCombinedPositions(_ count: Int) -> Bool {
+        guard count > 0,
+              deferredCombinedEndPosition == nil,
+              deferredCombinedGeneration == nil,
               splitCache == nil,
               let combinedStorage,
-              lastPairAppendGeneration == combinedMutationGeneration,
-              offset > 0
+              lastSpeculativeAppendGeneration == combinedMutationGeneration,
+              let appendLength = lastSpeculativeAppendLength,
+              appendLength == count + 1,
+              offset >= appendLength
         else { return false }
         if let maxSize = rotatingMaxSize {
             return offset == rotatingIndex
                 && offset <= maxSize
-                && rotatingIndex > 0
+                && rotatingIndex >= appendLength
                 && rotatingIndex <= combinedStorage.dim(3)
         }
         return offset <= combinedStorage.dim(3)
     }
 
     @discardableResult
-    func deferNewestCombinedPosition() -> Bool {
-        guard canDeferNewestCombinedPosition() else { return false }
-        offset -= 1
+    func deferNewestCombinedPositions(_ count: Int) -> Bool {
+        guard canDeferNewestCombinedPositions(count) else { return false }
+        let endPosition = offset
+        offset -= count
         if rotatingMaxSize != nil {
-            rotatingIndex -= 1
+            rotatingIndex -= count
         }
-        deferredCombinedPosition = offset
+        deferredCombinedEndPosition = endPosition
         deferredCombinedGeneration = combinedMutationGeneration
-        lastPairAppendGeneration = nil
+        clearSpeculativeAppendMarker()
         return true
     }
 
+    /// Compatibility wrappers for the promoted one-draft path.
+    func canDeferNewestCombinedPosition() -> Bool {
+        canDeferNewestCombinedPositions(1)
+    }
+
+    @discardableResult
+    func deferNewestCombinedPosition() -> Bool {
+        deferNewestCombinedPositions(1)
+    }
+
     func canRecommitDeferredCombinedPosition() -> Bool {
-        guard let deferredCombinedPosition,
+        guard let deferredCombinedEndPosition,
               let deferredCombinedGeneration,
               splitCache == nil,
               let combinedStorage,
-              deferredCombinedPosition == offset,
+              offset < deferredCombinedEndPosition,
               deferredCombinedGeneration == combinedMutationGeneration
         else { return false }
         if let maxSize = rotatingMaxSize {
-            return rotatingIndex == deferredCombinedPosition
-                && offset + 1 <= maxSize
-                && rotatingIndex + 1 <= combinedStorage.dim(3)
+            return rotatingIndex == offset
+                && deferredCombinedEndPosition <= maxSize
+                && deferredCombinedEndPosition <= combinedStorage.dim(3)
         }
-        return offset + 1 <= combinedStorage.dim(3)
+        return deferredCombinedEndPosition <= combinedStorage.dim(3)
     }
 
     @discardableResult
@@ -270,35 +302,61 @@ final class Gemma4CombinedKVCache: KVCache {
         if rotatingMaxSize != nil {
             rotatingIndex += 1
         }
-        deferredCombinedPosition = nil
-        deferredCombinedGeneration = nil
-        return true
-    }
-
-    /// Reject the deferred row without changing the visible offset. The next
-    /// ordinary cache update overwrites the retained storage slot.
-    func canDiscardDeferredCombinedPosition() -> Bool {
-        guard let deferredCombinedPosition,
-              let deferredCombinedGeneration,
-              deferredCombinedPosition == offset,
-              deferredCombinedGeneration == combinedMutationGeneration
-        else { return false }
-        if rotatingMaxSize != nil {
-            return rotatingIndex == deferredCombinedPosition
+        if offset == deferredCombinedEndPosition {
+            clearDeferredCombinedPositions()
         }
         return true
     }
 
+    /// Reject every remaining deferred row without changing the visible offset.
+    /// The next ordinary or speculative cache update overwrites the retained
+    /// storage slots.
+    func canDiscardDeferredCombinedPositions() -> Bool {
+        guard let deferredCombinedEndPosition,
+              let deferredCombinedGeneration,
+              splitCache == nil,
+              let combinedStorage,
+              offset < deferredCombinedEndPosition,
+              deferredCombinedGeneration == combinedMutationGeneration
+        else { return false }
+        if rotatingMaxSize != nil {
+            return rotatingIndex == offset
+                && deferredCombinedEndPosition <= combinedStorage.dim(3)
+        }
+        return deferredCombinedEndPosition <= combinedStorage.dim(3)
+    }
+
     @discardableResult
-    func discardDeferredCombinedPosition() -> Bool {
-        guard canDiscardDeferredCombinedPosition() else { return false }
-        deferredCombinedPosition = nil
-        deferredCombinedGeneration = nil
+    func discardDeferredCombinedPositions() -> Bool {
+        guard canDiscardDeferredCombinedPositions() else { return false }
+        clearDeferredCombinedPositions()
         return true
     }
 
+    /// Compatibility wrappers for the promoted one-draft path. A pair can only
+    /// have one deferred row, while the generalized implementation discards all
+    /// rows that remain in the transaction.
+    func canDiscardDeferredCombinedPosition() -> Bool {
+        canDiscardDeferredCombinedPositions()
+    }
+
+    @discardableResult
+    func discardDeferredCombinedPosition() -> Bool {
+        discardDeferredCombinedPositions()
+    }
+
+    var deferredCombinedPositionCount: Int {
+        guard let deferredCombinedEndPosition else {
+            precondition(deferredCombinedGeneration == nil)
+            return 0
+        }
+        precondition(deferredCombinedGeneration != nil)
+        precondition(deferredCombinedEndPosition > offset)
+        return deferredCombinedEndPosition - offset
+    }
+
     var hasDeferredCombinedPosition: Bool {
-        deferredCombinedPosition != nil
+        deferredCombinedPositionCount > 0
     }
 
     /// Views the materialized prefix before the newest speculative positions.
@@ -343,7 +401,7 @@ final class Gemma4CombinedKVCache: KVCache {
     private func updateFull(_ incoming: MLXArray, step: Int) -> (MLXArray, MLXArray) {
         let previous = offset
         let length = incoming.dim(3)
-        precondition((1...2).contains(length))
+        precondition((1...3).contains(length))
 
         if combinedStorage == nil || previous + length > combinedStorage!.dim(3) {
             let chunks = (step + length - 1) / step
@@ -373,7 +431,7 @@ final class Gemma4CombinedKVCache: KVCache {
         }
         let previous = offset
         let length = incoming.dim(3)
-        precondition((1...2).contains(length))
+        precondition((1...3).contains(length))
 
         if combinedStorage == nil
             || (previous + length > combinedStorage!.dim(3)
@@ -455,8 +513,10 @@ final class Gemma4CombinedKVCache: KVCache {
             return [result.0, result.1]
         }
         set {
-            precondition(deferredCombinedPosition == nil)
-            precondition(lastPairAppendGeneration == nil)
+            precondition(deferredCombinedEndPosition == nil)
+            precondition(deferredCombinedGeneration == nil)
+            precondition(lastSpeculativeAppendGeneration == nil)
+            precondition(lastSpeculativeAppendLength == nil)
             precondition(newValue.count == 2)
             var upstream = freshUpstreamCache()
             upstream.state = newValue
@@ -468,7 +528,7 @@ final class Gemma4CombinedKVCache: KVCache {
             splitCache = upstream
             combinedStorage = nil
             combinedMutationGeneration &+= 1
-            lastPairAppendGeneration = nil
+            clearSpeculativeAppendMarker()
         }
     }
 
@@ -482,8 +542,10 @@ final class Gemma4CombinedKVCache: KVCache {
             ]
         }
         set {
-            precondition(deferredCombinedPosition == nil)
-            precondition(lastPairAppendGeneration == nil)
+            precondition(deferredCombinedEndPosition == nil)
+            precondition(deferredCombinedGeneration == nil)
+            precondition(lastSpeculativeAppendGeneration == nil)
+            precondition(lastSpeculativeAppendLength == nil)
             if rotatingMaxSize == nil {
                 precondition(newValue.count == 1 && newValue[0].isEmpty)
                 return
@@ -507,7 +569,7 @@ final class Gemma4CombinedKVCache: KVCache {
                 self.splitCache = splitCache
             }
             combinedMutationGeneration &+= 1
-            lastPairAppendGeneration = nil
+            clearSpeculativeAppendMarker()
         }
     }
 
@@ -519,8 +581,10 @@ final class Gemma4CombinedKVCache: KVCache {
 
     @discardableResult
     func trim(_ n: Int) -> Int {
-        precondition(deferredCombinedPosition == nil)
-        precondition(lastPairAppendGeneration == nil)
+        precondition(deferredCombinedEndPosition == nil)
+        precondition(deferredCombinedGeneration == nil)
+        precondition(lastSpeculativeAppendGeneration == nil)
+        precondition(lastSpeculativeAppendLength == nil)
         if let splitCache {
             let trimmed = splitCache.trim(n)
             syncMetadata(from: splitCache)
@@ -532,7 +596,7 @@ final class Gemma4CombinedKVCache: KVCache {
             rotatingIndex -= trimmed
         }
         combinedMutationGeneration &+= 1
-        lastPairAppendGeneration = nil
+        clearSpeculativeAppendMarker()
         return trimmed
     }
 
@@ -580,8 +644,10 @@ final class Gemma4CombinedKVCache: KVCache {
     }
 
     func copy() -> any KVCache {
-        precondition(deferredCombinedPosition == nil)
-        precondition(lastPairAppendGeneration == nil)
+        precondition(deferredCombinedEndPosition == nil)
+        precondition(deferredCombinedGeneration == nil)
+        precondition(lastSpeculativeAppendGeneration == nil)
+        precondition(lastSpeculativeAppendLength == nil)
         let splitCopy = splitCache?.copy()
         let storageCopy = combinedStorage.map { $0[0..., 0..., 0..., 0..., 0...] }
         return Gemma4CombinedKVCache(
@@ -600,8 +666,10 @@ final class Gemma4CombinedKVCache: KVCache {
     /// Convert this editable cache back to an upstream concrete cache before
     /// CompiledDecode performs its strict type eligibility check.
     func makeUpstreamCache() -> any KVCache {
-        precondition(deferredCombinedPosition == nil)
-        precondition(lastPairAppendGeneration == nil)
+        precondition(deferredCombinedEndPosition == nil)
+        precondition(deferredCombinedGeneration == nil)
+        precondition(lastSpeculativeAppendGeneration == nil)
+        precondition(lastSpeculativeAppendLength == nil)
         if let splitCache { return splitCache }
         var upstream = freshUpstreamCache()
         let currentState = state
@@ -612,6 +680,16 @@ final class Gemma4CombinedKVCache: KVCache {
             upstream.metaState = metaState
         }
         return upstream
+    }
+
+    private func clearSpeculativeAppendMarker() {
+        lastSpeculativeAppendGeneration = nil
+        lastSpeculativeAppendLength = nil
+    }
+
+    private func clearDeferredCombinedPositions() {
+        deferredCombinedEndPosition = nil
+        deferredCombinedGeneration = nil
     }
 
     private func freshUpstreamCache() -> any KVCache {

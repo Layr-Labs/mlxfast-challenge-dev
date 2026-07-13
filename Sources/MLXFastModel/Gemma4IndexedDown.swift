@@ -779,6 +779,33 @@ struct IndexedDownProjection: @unchecked Sendable {
             input: input
         )
     }
+
+    /// Research-only three-row route. The fixed12 and direct-U16 choices are
+    /// identical to exact-two; no top-level model scheduling is changed.
+    func exactThreeVector(_ input: MLXArray) -> MLXArray {
+        precondition(input.dtype == .bfloat16 && input.shape == [3, 21_504])
+        guard supportsExactTwoVector else {
+            preconditionFailure("exact three-vector down payload is unavailable")
+        }
+        let mode = gemma4ExactTwoVectorDownMode(
+            lutCount: metadata.lut.size,
+            hasFixed12CoTile: coTiledFixed12 != nil,
+            fixed12CoTileEnabled: gemma4DownCoTiledFixed12Enabled
+        )
+        if mode == .fixed12, let coTiledFixed12 {
+            return gemma4ExactThreeVectorIndexedDown(
+                payload: coTiledFixed12.words,
+                lut: metadata.lut,
+                input: input
+            )
+        }
+        return gemma4ExactThreeVectorU16IndexedDown(
+            weight: projection.weight,
+            indices: metadata.indices,
+            lut: metadata.lut,
+            input: input
+        )
+    }
 }
 
 enum Gemma4ExactTwoVectorDownMode: Equatable {

@@ -1429,6 +1429,16 @@ struct FusedGateUpProjection: @unchecked Sendable {
         exactTwoVectorMode != nil
     }
 
+    var supportsExactThreeVector: Bool {
+        guard let mode = exactTwoVectorMode else { return false }
+        switch mode {
+        case .fixed12:
+            return true
+        case .u16:
+            return supportsExactThreeVectorU16
+        }
+    }
+
     func exactTwoVectorActivated(_ input: MLXArray) -> MLXArray {
         precondition(input.dtype == .bfloat16 && input.shape == [2, 5_376])
         guard let mode = exactTwoVectorMode,
@@ -1458,6 +1468,32 @@ struct FusedGateUpProjection: @unchecked Sendable {
                 upLUT: indexedUp.lut,
                 input: input
             )
+        }
+    }
+
+    func exactThreeVectorActivated(_ input: MLXArray) -> MLXArray {
+        precondition(input.dtype == .bfloat16 && input.shape == [3, 5_376])
+        guard let mode = exactTwoVectorMode,
+              let indexedGate,
+              let indexedUp
+        else {
+            preconditionFailure(
+                "exact three-vector gate/up payload is unavailable")
+        }
+        switch mode {
+        case .fixed12:
+            guard let coTiledFixed12GateUp else {
+                preconditionFailure(
+                    "exact three-vector fixed12 gate/up payload is unavailable")
+            }
+            return gemma4ExactThreeVectorGateUpActivated(
+                payload: coTiledFixed12GateUp.words,
+                gateLUT: indexedGate.lut,
+                upLUT: indexedUp.lut,
+                input: input
+            )
+        case .u16:
+            return exactThreeVectorU16Activated(input)
         }
     }
 }

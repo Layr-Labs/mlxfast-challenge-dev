@@ -930,4 +930,21 @@ struct IndexedOutputProjection: @unchecked Sendable {
             indexBits: coTiled.indexBits
         )
     }
+
+    /// Research-only three-row route. It deliberately mirrors the existing
+    /// exact-two eligibility and leaves production scheduling unchanged.
+    func exactThreeVector(_ input: MLXArray) -> MLXArray {
+        precondition(input.dtype == .bfloat16)
+        precondition(input.shape == [3, inputWidth])
+        guard supportsExactTwoVector, let coTiled else {
+            preconditionFailure("exact three-vector output payload is unavailable")
+        }
+        return gemma4ExactThreeVectorIndexedOutput(
+            payload: coTiled.words,
+            lut: metadata.lut,
+            input: input,
+            inputWidth: inputWidth,
+            indexBits: coTiled.indexBits
+        )
+    }
 }

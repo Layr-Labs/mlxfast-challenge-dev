@@ -146,8 +146,8 @@ public enum Gemma4Model {
             )
         }
 
-        let hasPendingPromptLookup = cache.promptLookupState.pendingDraft != nil
-            || cache.promptLookupPendingLogits != nil
+        let hasPendingPromptLookup = !cache.promptLookupState.pendingDrafts.isEmpty
+            || !cache.promptLookupPendingLogits.isEmpty
         let promptLookupActive = model.supportsExactPromptLookup
             && gemma4PromptLookupEnvironmentEnabled(ProcessInfo.processInfo.environment)
             && ProcessInfo.processInfo.environment["DARKBLOOM_COMPILED_DECODE"] != "1"
@@ -157,10 +157,15 @@ public enum Gemma4Model {
         let inputTokens = gemma4PromptLookupInputTokens(inputIDs)
         if hasPendingPromptLookup {
             guard let pendingDraft = cache.promptLookupState.pendingDraft,
-                  let pendingLogits = cache.promptLookupPendingLogits,
+                  let pendingLogits = cache.promptLookupPendingLogits.first,
+                  cache.promptLookupState.pendingDrafts.count
+                      == cache.promptLookupPendingLogits.count,
                   let combinedCaches = cache.promptLookupCombinedCaches(
                       expectedCount: model.configuration.numHiddenLayers),
-                  combinedCaches.allSatisfy(\.hasDeferredCombinedPosition)
+                  combinedCaches.allSatisfy({
+                      $0.deferredCombinedPositionCount
+                          == cache.promptLookupState.pendingDrafts.count
+                  })
             else {
                 throw MLXFastError.invalidInput(
                     "prompt-lookup pending state is inconsistent with KV caches")
@@ -190,12 +195,14 @@ public enum Gemma4Model {
                     validatesLibraryCacheOffsets: validatesLibraryCacheOffsets,
                     validateLibraryCacheOffsets: validateLibraryCacheOffsets,
                     forward: {
+                        let remainingCount =
+                            cache.promptLookupState.pendingDrafts.count - 1
                         for layerCache in combinedCaches {
                             precondition(layerCache.recommitDeferredCombinedPosition())
                         }
                         precondition(combinedCaches.allSatisfy {
                             $0.offset == positionOffset + 1
-                                && !$0.hasDeferredCombinedPosition
+                                && $0.deferredCombinedPositionCount == remainingCount
                         })
                         return pendingLogits
                     }
@@ -203,24 +210,27 @@ public enum Gemma4Model {
                 precondition(
                     cache.promptLookupState.resolvePending(actualInput: actualInput)
                         == .accepted)
-                cache.promptLookupPendingLogits = nil
+                cache.promptLookupPendingLogits.removeFirst()
+                precondition(
+                    cache.promptLookupState.pendingDrafts.count
+                        == cache.promptLookupPendingLogits.count)
                 return result
             }
 
             guard combinedCaches.allSatisfy({
-                $0.canDiscardDeferredCombinedPosition()
+                $0.canDiscardDeferredCombinedPositions()
             }) else {
                 throw MLXFastError.invalidInput(
                     "prompt-lookup deferred cache row cannot be discarded")
             }
             for layerCache in combinedCaches {
-                precondition(layerCache.discardDeferredCombinedPosition())
+                precondition(layerCache.discardDeferredCombinedPositions())
             }
             precondition(combinedCaches.allSatisfy {
                 $0.offset == positionOffset && !$0.hasDeferredCombinedPosition
             })
             cache.promptLookupState.cancelPending()
-            cache.promptLookupPendingLogits = nil
+            cache.promptLookupPendingLogits.removeAll(keepingCapacity: true)
             // Re-enter the ordinary lookup decision with the actual token.
             // A rejected draft must not force an otherwise avoidable one-token
             // model step before the next eligible suffix lookup.
@@ -232,86 +242,176 @@ public enum Gemma4Model {
            cache.promptLookupTrackingValid,
            cache.promptLookupState.tokens.count == positionOffset,
            let actualInput = inputTokens?.first,
-           let draft = cache.promptLookupState.draft(appending: actualInput),
            let combinedCaches = cache.promptLookupCombinedCaches(
-               expectedCount: model.configuration.numHiddenLayers),
-           model.canRunExactPromptLookup(cache: cache.kvCache(for: model)),
-           combinedCaches.allSatisfy({
-               $0.offset == positionOffset
-                   && !$0.hasDeferredCombinedPosition
-                   && $0.canAppendCombinedPair()
-           })
+               expectedCount: model.configuration.numHiddenLayers)
         {
-            let pairInputs = MLXArray([actualInput, draft], [1, 2])
+            let drafts = cache.promptLookupState.drafts(appending: actualInput)
             let verifyBits = gemma4PromptLookupVerificationEnabled(
                 ProcessInfo.processInfo.environment)
-            let referenceCaches = verifyBits
-                ? cache.kvCache(for: model).map { $0.copy() }
-                : nil
-            var pendingCandidate: MLXArray?
-            let result = try executeGemma4CachedForward(
-                cache: cache,
-                positionOffset: positionOffset,
-                inputLength: 1,
-                validatesLibraryCacheOffsets: true,
-                validateLibraryCacheOffsets: validateLibraryCacheOffsets,
-                forward: {
-                    let pairLogits = model.exactPromptLookupPair(
-                        pairInputs,
-                        cache: cache.kvCache(for: model)
-                    )
-                    precondition(
-                        pairLogits.dtype == .float32
-                            && pairLogits.shape == [2, 262_144])
 
-                    // The deferred cache bytes must be complete before a later
-                    // mismatch is allowed to overwrite their logical slot.
-                    eval(pairLogits)
-                    cache.materializeCachedState()
-
-                    if let referenceCaches {
-                        let current = MLXArray([actualInput], [1, 1])
-                        let drafted = MLXArray([draft], [1, 1])
-                        let reference0 = model(current, cache: referenceCaches)
-                        eval(reference0)
-                        let reference1 = model(drafted, cache: referenceCaches)
-                        eval(reference1)
-                        gemma4VerifyPromptLookupPair(
-                            pairLogits,
-                            reference0: reference0,
-                            reference1: reference1,
-                            candidateOffsets: cache.kvCache(for: model).map(\.offset),
-                            referenceOffsets: referenceCaches.map(\.offset)
+            if drafts.count == 2,
+               model.supportsExactTwoDraftPromptLookup,
+               model.canRunExactTwoDraftPromptLookup(
+                   cache: cache.kvCache(for: model)),
+               combinedCaches.allSatisfy({
+                   $0.offset == positionOffset
+                       && !$0.hasDeferredCombinedPosition
+                       && $0.canAppendCombined(count: 3)
+               })
+            {
+                let tripleInputs = MLXArray(
+                    [actualInput, drafts[0], drafts[1]], [1, 3])
+                let referenceCaches = verifyBits
+                    ? cache.kvCache(for: model).map { $0.copy() }
+                    : nil
+                var pendingCandidates: [MLXArray] = []
+                let result = try executeGemma4CachedForward(
+                    cache: cache,
+                    positionOffset: positionOffset,
+                    inputLength: 1,
+                    validatesLibraryCacheOffsets: true,
+                    validateLibraryCacheOffsets: validateLibraryCacheOffsets,
+                    forward: {
+                        let tripleLogits = model.exactPromptLookupTriple(
+                            tripleInputs,
+                            cache: cache.kvCache(for: model)
                         )
-                    }
+                        precondition(
+                            tripleLogits.dtype == .float32
+                                && tripleLogits.shape == [3, 262_144])
+                        eval(tripleLogits)
+                        cache.materializeCachedState()
 
-                    guard combinedCaches.allSatisfy({
-                        $0.offset == positionOffset + 2
-                            && $0.canDeferNewestCombinedPosition()
-                    }) else {
-                        preconditionFailure(
-                            "prompt-lookup pair cannot defer its second cache row")
+                        if let referenceCaches {
+                            let reference0 = model(
+                                MLXArray([actualInput], [1, 1]),
+                                cache: referenceCaches)
+                            eval(reference0)
+                            let reference1 = model(
+                                MLXArray([drafts[0]], [1, 1]),
+                                cache: referenceCaches)
+                            eval(reference1)
+                            let reference2 = model(
+                                MLXArray([drafts[1]], [1, 1]),
+                                cache: referenceCaches)
+                            eval(reference2)
+                            gemma4VerifyPromptLookupTriple(
+                                tripleLogits,
+                                references: [reference0, reference1, reference2],
+                                candidateOffsets: cache.kvCache(for: model)
+                                    .map(\.offset),
+                                referenceOffsets: referenceCaches.map(\.offset)
+                            )
+                        }
+
+                        guard combinedCaches.allSatisfy({
+                            $0.offset == positionOffset + 3
+                                && $0.canDeferNewestCombinedPositions(2)
+                        }) else {
+                            preconditionFailure(
+                                "two-draft lookup cannot defer its speculative rows")
+                        }
+                        for layerCache in combinedCaches {
+                            precondition(
+                                layerCache.deferNewestCombinedPositions(2))
+                        }
+                        precondition(combinedCaches.allSatisfy {
+                            $0.offset == positionOffset + 1
+                                && $0.deferredCombinedPositionCount == 2
+                        })
+                        pendingCandidates = [
+                            tripleLogits[1..<2, 0...].reshaped(1, 1, 262_144),
+                            tripleLogits[2..<3, 0...].reshaped(1, 1, 262_144),
+                        ]
+                        return tripleLogits[0..<1, 0...]
+                            .reshaped(1, 1, 262_144)
                     }
-                    for layerCache in combinedCaches {
-                        precondition(layerCache.deferNewestCombinedPosition())
-                    }
-                    precondition(combinedCaches.allSatisfy {
-                        $0.offset == positionOffset + 1
-                            && $0.hasDeferredCombinedPosition
-                    })
-                    pendingCandidate = pairLogits[1..<2, 0...]
-                        .reshaped(1, 1, 262_144)
-                    return pairLogits[0..<1, 0...]
-                        .reshaped(1, 1, 262_144)
-                }
-            )
-            guard let pendingCandidate else {
-                preconditionFailure("prompt-lookup pair did not retain row-1 logits")
+                )
+                precondition(pendingCandidates.count == 2)
+                cache.promptLookupState.recordInput(actualInput)
+                cache.promptLookupState.setPendingDrafts(drafts)
+                cache.promptLookupPendingLogits = pendingCandidates
+                return result
             }
-            cache.promptLookupState.recordInput(actualInput)
-            cache.promptLookupState.setPendingDraft(draft)
-            cache.promptLookupPendingLogits = pendingCandidate
-            return result
+
+            if let draft = drafts.first,
+               model.canRunExactPromptLookup(cache: cache.kvCache(for: model)),
+               combinedCaches.allSatisfy({
+                   $0.offset == positionOffset
+                       && !$0.hasDeferredCombinedPosition
+                       && $0.canAppendCombinedPair()
+               })
+            {
+                let pairInputs = MLXArray([actualInput, draft], [1, 2])
+                let referenceCaches = verifyBits
+                    ? cache.kvCache(for: model).map { $0.copy() }
+                    : nil
+                var pendingCandidate: MLXArray?
+                let result = try executeGemma4CachedForward(
+                    cache: cache,
+                    positionOffset: positionOffset,
+                    inputLength: 1,
+                    validatesLibraryCacheOffsets: true,
+                    validateLibraryCacheOffsets: validateLibraryCacheOffsets,
+                    forward: {
+                        let pairLogits = model.exactPromptLookupPair(
+                            pairInputs,
+                            cache: cache.kvCache(for: model)
+                        )
+                        precondition(
+                            pairLogits.dtype == .float32
+                                && pairLogits.shape == [2, 262_144])
+                        eval(pairLogits)
+                        cache.materializeCachedState()
+
+                        if let referenceCaches {
+                            let reference0 = model(
+                                MLXArray([actualInput], [1, 1]),
+                                cache: referenceCaches)
+                            eval(reference0)
+                            let reference1 = model(
+                                MLXArray([draft], [1, 1]),
+                                cache: referenceCaches)
+                            eval(reference1)
+                            gemma4VerifyPromptLookupPair(
+                                pairLogits,
+                                reference0: reference0,
+                                reference1: reference1,
+                                candidateOffsets: cache.kvCache(for: model)
+                                    .map(\.offset),
+                                referenceOffsets: referenceCaches.map(\.offset)
+                            )
+                        }
+
+                        guard combinedCaches.allSatisfy({
+                            $0.offset == positionOffset + 2
+                                && $0.canDeferNewestCombinedPosition()
+                        }) else {
+                            preconditionFailure(
+                                "prompt-lookup pair cannot defer its second cache row")
+                        }
+                        for layerCache in combinedCaches {
+                            precondition(layerCache.deferNewestCombinedPosition())
+                        }
+                        precondition(combinedCaches.allSatisfy {
+                            $0.offset == positionOffset + 1
+                                && $0.deferredCombinedPositionCount == 1
+                        })
+                        pendingCandidate = pairLogits[1..<2, 0...]
+                            .reshaped(1, 1, 262_144)
+                        return pairLogits[0..<1, 0...]
+                            .reshaped(1, 1, 262_144)
+                    }
+                )
+                guard let pendingCandidate else {
+                    preconditionFailure(
+                        "prompt-lookup pair did not retain row-1 logits")
+                }
+                cache.promptLookupState.recordInput(actualInput)
+                cache.promptLookupState.setPendingDraft(draft)
+                cache.promptLookupPendingLogits = [pendingCandidate]
+                return result
+            }
         }
 
         let result = try ordinaryCachedForward()
@@ -322,7 +422,7 @@ public enum Gemma4Model {
             )
         } else {
             cache.promptLookupState.reset()
-            cache.promptLookupPendingLogits = nil
+            cache.promptLookupPendingLogits.removeAll(keepingCapacity: true)
             cache.promptLookupTrackingValid = false
         }
         return result

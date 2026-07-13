@@ -995,6 +995,120 @@ final class Gemma4FastLayer {
             nextNormalized: mlpBoundary.1
         )
     }
+
+    var supportsExactThreeVector: Bool {
+        let hasQKV = isSliding ? fusedQKV != nil : fusedQK != nil
+        return gemma4ExactTwoVectorLayerIsEligible(
+            hasQKV: hasQKV,
+            hasAttentionPreparation: fusedAttentionRMS != nil,
+            hasAttentionBoundary: fusedAttentionToMLPBoundary != nil,
+            hasNextBoundary: fusedMLPToNextBoundary != nil,
+            hasOutput: indexedOutput?.supportsExactTwoVector == true,
+            hasGateUp: fusedGateUp?.supportsExactThreeVector == true,
+            hasDown: indexedDown?.supportsExactTwoVector == true,
+            usesFusedActivation: useFusedGateUpActivation
+        )
+    }
+
+    func canRunExactThreeVector(offset: Int) -> Bool {
+        supportsExactThreeVector
+            && fusedAttentionRMS?.supportsPrefill(offset: offset, length: 3) == true
+    }
+
+    func exactThreeVector(
+        _ x: MLXArray,
+        normalizedInput: MLXArray?,
+        cache: Gemma4CombinedKVCache
+    ) -> Gemma4FastLayerResult {
+        precondition(supportsExactThreeVector)
+        precondition(x.dtype == .bfloat16 && x.shape == [3, 5_376])
+        precondition(cache.canAppendCombined(count: 3))
+        let offset = cache.offset
+
+        let h: MLXArray
+        if let normalizedInput {
+            precondition(
+                normalizedInput.dtype == .bfloat16
+                    && normalizedInput.shape == x.shape)
+            h = normalizedInput
+        } else {
+            h = gemma4SerializedThreeRowRMSNorm(
+                x,
+                weight: inputNormWeight,
+                eps: eps
+            )
+        }
+
+        let rawQueries: MLXArray
+        let rawKeys: MLXArray
+        let rawValues: MLXArray?
+        if isSliding, let fusedQKV {
+            let projected = fusedQKV.exactThreeVector(h)
+            rawQueries = projected.queries.reshaped(1, 3, 8_192)
+            rawKeys = projected.keys.reshaped(1, 3, 4_096)
+            rawValues = projected.values.reshaped(1, 3, 4_096)
+        } else if let fusedQK {
+            let projected = fusedQK.exactThreeVector(h)
+            rawQueries = projected.queries.reshaped(1, 3, 16_384)
+            rawKeys = projected.keys.reshaped(1, 3, 2_048)
+            rawValues = nil
+        } else {
+            preconditionFailure("exact three-vector QKV projection is unavailable")
+        }
+
+        guard let fusedAttentionRMS,
+              fusedAttentionRMS.supportsPrefill(offset: offset, length: 3)
+        else {
+            preconditionFailure(
+                "exact three-vector attention preparation is unavailable")
+        }
+        let prepared = fusedAttentionRMS.callCombinedQKVPrefill(
+            rawQueries: rawQueries,
+            rawKeys: rawKeys,
+            rawValues: rawValues,
+            offset: offset,
+            length: 3,
+            capacity: 3
+        )
+        let updated = cache.updateCombined(prepared.combinedKV)
+        let afterActual = cache.viewsExcludingNewest(2)
+        let afterFirstDraft = cache.viewsExcludingNewest(1)
+        let attention = gemma4ExactThreeTokenAttention(
+            queries: prepared.queries,
+            keysAfterActual: afterActual.0,
+            valuesAfterActual: afterActual.1,
+            keysAfterFirstDraft: afterFirstDraft.0,
+            valuesAfterFirstDraft: afterFirstDraft.1,
+            keysWithBothDrafts: updated.0,
+            valuesWithBothDrafts: updated.1,
+            scale: scale
+        )
+        let mergedAttention = attention.transposed(0, 2, 1, 3)
+            .reshaped(3, nHeads * headDim)
+        guard let indexedOutput,
+              let fusedAttentionToMLPBoundary,
+              let fusedGateUp,
+              let indexedDown,
+              let fusedMLPToNextBoundary
+        else {
+            preconditionFailure("exact three-vector layer payload is unavailable")
+        }
+        let attentionOutput = indexedOutput.exactThreeVector(mergedAttention)
+        let attentionBoundary = fusedAttentionToMLPBoundary(
+            attentionOutput: attentionOutput,
+            residual: x
+        )
+        let activated = fusedGateUp.exactThreeVectorActivated(attentionBoundary.1)
+        let mlp = indexedDown.exactThreeVector(activated)
+        let mlpBoundary = fusedMLPToNextBoundary(
+            mlpOutput: mlp,
+            residual: attentionBoundary.0
+        )
+        return Gemma4FastLayerResult(
+            hidden: mlpBoundary.0,
+            nextNormalized: mlpBoundary.1
+        )
+    }
 }
 
 func gemma4ExactTwoVectorLayerIsEligible(
@@ -1042,6 +1156,31 @@ private func gemma4SerializedTwoRowRMSNorm(
         eps: eps
     )
     return concatenated([first, second], axis: 1).reshaped(2, 5_376)
+}
+
+private func gemma4SerializedThreeRowRMSNorm(
+    _ input: MLXArray,
+    weight: MLXArray,
+    eps: Float
+) -> MLXArray {
+    precondition(input.dtype == .bfloat16 && input.shape == [3, 5_376])
+    let shaped = input.reshaped(1, 3, 5_376)
+    let first = MLXFast.rmsNorm(
+        shaped[0..., 0..<1, 0...],
+        weight: weight,
+        eps: eps
+    )
+    let second = MLXFast.rmsNorm(
+        shaped[0..., 1..<2, 0...],
+        weight: weight,
+        eps: eps
+    )
+    let third = MLXFast.rmsNorm(
+        shaped[0..., 2..<3, 0...],
+        weight: weight,
+        eps: eps
+    )
+    return concatenated([first, second, third], axis: 1).reshaped(3, 5_376)
 }
 
 /// Manual attention fallback matching the library's batched/ragged path.
@@ -1127,6 +1266,7 @@ final class Gemma4FastEngine {
     let usePacked13TiedVocabularyHead: Bool
     let verifyTiedVocabularyHead: Bool
     let supportsExactTwoVector: Bool
+    let supportsExactThreeVector: Bool
     private let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray
 
     init(
@@ -1338,6 +1478,10 @@ final class Gemma4FastEngine {
             && !verifyTiedVocabularyHead
             && tiedVocabularyHead?.supportsExactTwoVectorPacked13 == true
             && built.allSatisfy(\.supportsExactTwoVector)
+        self.supportsExactThreeVector = usePacked13TiedVocabularyHead
+            && !verifyTiedVocabularyHead
+            && tiedVocabularyHead?.supportsExactTwoVectorPacked13 == true
+            && built.allSatisfy(\.supportsExactThreeVector)
 
         let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { logits, cap in
             tanh(logits / cap) * cap
@@ -1480,6 +1624,46 @@ final class Gemma4FastEngine {
         )
     }
 
+    func exactThreeVector(_ inputs: MLXArray, cache: [KVCache]) -> MLXArray {
+        precondition(canRunExactThreeVector(cache: cache))
+        precondition(inputs.shape == [1, 3])
+        let combinedCaches = cache.compactMap { $0 as? Gemma4CombinedKVCache }
+
+        let first = embedTokens(inputs[0..., 0..<1]) * embedScale
+        let second = embedTokens(inputs[0..., 1..<2]) * embedScale
+        let third = embedTokens(inputs[0..., 2..<3]) * embedScale
+        var hidden = concatenated([first, second, third], axis: 1)
+            .reshaped(3, 5_376)
+        var normalizedInput: MLXArray?
+        for (index, layer) in layers.enumerated() {
+            let result = layer.exactThreeVector(
+                hidden,
+                normalizedInput: normalizedInput,
+                cache: combinedCaches[index]
+            )
+            hidden = result.hidden
+            normalizedInput = result.nextNormalized
+            let layerNumber = index + 1
+            if asyncLayerGroup > 0,
+               layerNumber >= asyncLayerLead,
+               (layerNumber - asyncLayerLead).isMultiple(of: asyncLayerGroup)
+            {
+                if let normalizedInput {
+                    asyncEval(hidden, normalizedInput)
+                } else {
+                    asyncEval(hidden)
+                }
+            }
+        }
+        guard let normalizedInput, let tiedVocabularyHead else {
+            preconditionFailure("exact three-vector final boundary is unavailable")
+        }
+        return tiedVocabularyHead.exactThreeVectorPacked13Softcapped(
+            normalizedInput,
+            cap: MLXArray(softcap)
+        )
+    }
+
     func canRunExactTwoVector(cache: [KVCache]) -> Bool {
         guard supportsExactTwoVector, cache.count == layers.count else { return false }
         let combinedCaches = cache.compactMap { $0 as? Gemma4CombinedKVCache }
@@ -1488,6 +1672,19 @@ final class Gemma4FastEngine {
         else { return false }
         return layers.indices.allSatisfy {
             layers[$0].canRunExactTwoVector(offset: combinedCaches[$0].offset)
+        }
+    }
+
+    func canRunExactThreeVector(cache: [KVCache]) -> Bool {
+        guard supportsExactThreeVector, cache.count == layers.count else {
+            return false
+        }
+        let combinedCaches = cache.compactMap { $0 as? Gemma4CombinedKVCache }
+        guard combinedCaches.count == layers.count,
+              combinedCaches.allSatisfy({ $0.canAppendCombined(count: 3) })
+        else { return false }
+        return layers.indices.allSatisfy {
+            layers[$0].canRunExactThreeVector(offset: combinedCaches[$0].offset)
         }
     }
 }
