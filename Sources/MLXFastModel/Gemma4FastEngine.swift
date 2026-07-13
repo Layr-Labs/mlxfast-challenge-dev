@@ -154,6 +154,7 @@ final class Gemma4FastLayer {
     let fusedGateUpActivation: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let indexedDown: IndexedDownProjection?
     let indexedDownPostTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+    let persistentDecodeMLP: PersistentDecodeMLP?
     let useFusedGateUpActivation: Bool
 
     init(
@@ -469,6 +470,26 @@ final class Gemma4FastLayer {
                     projection: downP,
                     metadata: downIndexedMetadata
                 )
+                let persistentRequested = ["1", "true", "yes", "on"].contains(
+                    ProcessInfo.processInfo.environment[
+                        "MLXFAST_PERSISTENT_DECODE_MLP"
+                    ]?.lowercased() ?? "0"
+                )
+                let persistentCandidate = persistentRequested
+                    ? PersistentDecodeMLP(
+                        gate: gateP,
+                        up: upP,
+                        down: downP,
+                        gateMetadata: gateIndexedMetadata!,
+                        upMetadata: upIndexedMetadata!,
+                        downMetadata: downIndexedMetadata
+                    )
+                    : nil
+                // Fail closed: the current MLX custom-kernel API cannot prove
+                // a fully resident grid, so never launch a grid-wide barrier.
+                self.persistentDecodeMLP = persistentCandidate?.isQualified == true
+                    ? persistentCandidate
+                    : nil
                 let postDownBody: @Sendable (MLXArray, MLXArray) -> MLXArray = {
                     mlp, residual in
                     let postNormalized = MLXFast.rmsNorm(
@@ -491,6 +512,7 @@ final class Gemma4FastLayer {
                 self.fusedGateUpActivation = nil
                 self.indexedDown = nil
                 self.indexedDownPostTail = nil
+                self.persistentDecodeMLP = nil
                 self.useFusedGateUpActivation = false
             }
         } else {
@@ -499,6 +521,7 @@ final class Gemma4FastLayer {
             self.fusedGateUpActivation = nil
             self.indexedDown = nil
             self.indexedDownPostTail = nil
+            self.persistentDecodeMLP = nil
             self.useFusedGateUpActivation = false
         }
     }
