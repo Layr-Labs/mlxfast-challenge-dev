@@ -1096,24 +1096,9 @@ final class Gemma4FastEngine {
 
             let rope: RoPELayer
             if isSliding {
-                rope = initializeRope(
-                    dims: headDim,
-                    base: config.slidingRopeTheta,
-                    traditional: false,
-                    scalingConfig: nil,
-                    maxPositionEmbeddings: nil
-                )
+                rope = Gemma4PartialRoPEMetalTile(dims: headDim)
             } else {
-                rope = initializeRope(
-                    dims: headDim,
-                    base: config.fullRopeTheta,
-                    traditional: false,
-                    scalingConfig: [
-                        "type": .string("proportional"),
-                        "partial_rotary_factor": .float(config.fullPartialRotaryFactor),
-                    ],
-                    maxPositionEmbeddings: nil
-                )
+                rope = Gemma4PartialRoPEMetalTile(dims: headDim)
             }
 
             let vProj: QuantizedLinear?
