@@ -48,6 +48,9 @@
     ],
     "subagentStart": [
       {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor session"
+      },
+      {
         "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],

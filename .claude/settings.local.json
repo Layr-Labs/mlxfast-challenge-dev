@@ -53,6 +53,16 @@
           }
         ]
       }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude session"
+          }
+        ]
+      }
     ]
   }
 }
