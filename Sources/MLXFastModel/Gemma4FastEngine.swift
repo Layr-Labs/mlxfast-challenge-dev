@@ -152,6 +152,8 @@ final class Gemma4FastLayer {
     let fusedGateUp: FusedGateUpProjection?
     let fusedGateUpPostTail: (@Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray)?
     let fusedGateUpActivation: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+    let pairedGateUpPrefill: PairedGateUpPrefillProjection?
+    let mlpDownProjection: FastQuantizedProjection
     let indexedDown: IndexedDownProjection?
     let indexedDownPostTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let useFusedGateUpActivation: Bool
@@ -366,6 +368,11 @@ final class Gemma4FastLayer {
         let gateP = FastQuantizedProjection(gate)
         let upP = FastQuantizedProjection(up)
         let downP = FastQuantizedProjection(down)
+        self.pairedGateUpPrefill = PairedGateUpPrefillProjection(
+            gate: gateP,
+            up: upP
+        )
+        self.mlpDownProjection = downP
         let gelu = fastGeluApproximate
         let body: @Sendable (MLXArray) -> MLXArray = { x in
             downP(gelu(gateP(x)) * upP(x))
@@ -845,7 +852,28 @@ final class Gemma4FastLayer {
             residual2 = out
             fusedPreFFNNormalized = nil
         }
-        if B == 1, L == 1, let fusedGateUp, let fusedGateUpPostTail {
+        if B == 1,
+           L > 1,
+           let pairedGateUpPrefill,
+           pairedGateUpPrefill.supports(out)
+        {
+            let normalized = fusedPreFFNNormalized ?? MLXFast.rmsNorm(
+                out, weight: preFfnNormWeight, eps: eps)
+            let activated = pairedGateUpPrefill(normalized)
+            let mlp = mlpDownProjection(activated)
+            if let fusedMLPToNextBoundary {
+                let prepared = fusedMLPToNextBoundary(
+                    mlpOutput: mlp,
+                    residual: residual2
+                )
+                out = prepared.0
+                nextNormalized = prepared.1
+            } else {
+                out = MLXFast.rmsNorm(
+                    mlp, weight: postFfnNormWeight, eps: eps)
+                out = (residual2 + out) * layerScalar
+            }
+        } else if B == 1, L == 1, let fusedGateUp, let fusedGateUpPostTail {
             let normalized = fusedPreFFNNormalized ?? MLXFast.rmsNorm(
                 out, weight: preFfnNormWeight, eps: eps)
             if let fusedGateUpActivation, let indexedDown, let indexedDownPostTail {
