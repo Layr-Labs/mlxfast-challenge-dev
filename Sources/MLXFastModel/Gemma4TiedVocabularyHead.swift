@@ -1,6 +1,203 @@
+import Foundation
 import MLX
 import MLXFastCore
 import MLXNN
+
+private let gemma4TiedHeadCoTiledRowsPerThreadgroup = 16
+private let gemma4TiedHeadCoTiledGroupsPerBlock = 4
+private let gemma4TiedHeadCoTiledBlocks = 21
+private let gemma4TiedHeadCoTiledWeightWordsPerTile = 512
+private let gemma4TiedHeadCoTiledMetadataWordsPerTile = 32
+private let gemma4TiedHeadCoTiledPayloadWordsPerTile = 544
+private let gemma4TiedHeadCoTiledPayloadByteCount = 748_683_264
+
+private func gemma4TiedHeadEnvironmentFlag(
+    _ name: String,
+    default defaultValue: Bool
+) -> Bool {
+    guard let raw = ProcessInfo.processInfo.environment[name] else {
+        return defaultValue
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}
+
+private let gemma4TiedHeadCoTiledU16Enabled = gemma4TiedHeadEnvironmentFlag(
+    "DARKBLOOM_TIED_HEAD_COTILED_U16",
+    default: true
+)
+
+private let gemma4VerifyTiedHeadCoTiledU16Bits = gemma4TiedHeadEnvironmentFlag(
+    "DARKBLOOM_VERIFY_TIED_HEAD_COTILED_U16_BITS",
+    default: false
+)
+
+/// Losslessly expand independently row-packed 13-bit LUT indexes to U16.
+/// Returning nil is fail-closed for malformed shapes, arithmetic overflow, or
+/// an index outside the supplied LUT.
+func gemma4DecodeTiedHeadPacked13Indices(
+    _ packed: [UInt32],
+    rows: Int,
+    groupsPerRow: Int,
+    lutCount: Int
+) -> [UInt16]? {
+    guard rows > 0,
+          groupsPerRow > 0,
+          (1...8_192).contains(lutCount)
+    else {
+        return nil
+    }
+    let (rowBits, rowBitsOverflow) = groupsPerRow.multipliedReportingOverflow(
+        by: 13)
+    guard !rowBitsOverflow else { return nil }
+    let (paddedRowBits, paddedRowBitsOverflow) = rowBits.addingReportingOverflow(
+        31)
+    guard !paddedRowBitsOverflow else { return nil }
+    let wordsPerRow = paddedRowBits / 32
+    let (wordCount, wordCountOverflow) = rows.multipliedReportingOverflow(
+        by: wordsPerRow)
+    let (indexCount, indexCountOverflow) = rows.multipliedReportingOverflow(
+        by: groupsPerRow)
+    guard !wordCountOverflow,
+          !indexCountOverflow,
+          packed.count == wordCount
+    else {
+        return nil
+    }
+
+    var indices = [UInt16](repeating: 0, count: indexCount)
+    for row in 0..<rows {
+        let packedRow = row * wordsPerRow
+        let indexRow = row * groupsPerRow
+        for group in 0..<groupsPerRow {
+            let bitOffset = group * 13
+            let word = bitOffset / 32
+            let shift = bitOffset % 32
+            var index = packed[packedRow + word] >> UInt32(shift)
+            if shift > 19 {
+                index |= packed[packedRow + word + 1]
+                    << UInt32(32 - shift)
+            }
+            index &= 0x1fff
+            guard index < UInt32(lutCount) else { return nil }
+            indices[indexRow + group] = UInt16(index)
+        }
+    }
+    return indices
+}
+
+/// Reorder direct U16 LUT indexes into the exact threadgroup/K-block ownership
+/// of the co-tiled kernel. Two adjacent U16 indexes are stored per U32 word.
+func gemma4PackTiedHeadCoTiledU16Metadata(
+    _ indices: [UInt16],
+    rows: Int,
+    groupsPerRow: Int
+) -> [UInt32]? {
+    guard rows > 0,
+          rows.isMultiple(of: gemma4TiedHeadCoTiledRowsPerThreadgroup),
+          groupsPerRow > 0,
+          groupsPerRow.isMultiple(of: gemma4TiedHeadCoTiledGroupsPerBlock)
+    else {
+        return nil
+    }
+    let (indexCount, indexCountOverflow) = rows.multipliedReportingOverflow(
+        by: groupsPerRow)
+    guard !indexCountOverflow, indices.count == indexCount else { return nil }
+
+    let threadgroups = rows / gemma4TiedHeadCoTiledRowsPerThreadgroup
+    let blocks = groupsPerRow / gemma4TiedHeadCoTiledGroupsPerBlock
+    let (tileCount, tileCountOverflow) = threadgroups.multipliedReportingOverflow(
+        by: blocks)
+    let (wordCount, wordCountOverflow) = tileCount.multipliedReportingOverflow(
+        by: gemma4TiedHeadCoTiledMetadataWordsPerTile)
+    guard !tileCountOverflow, !wordCountOverflow else { return nil }
+
+    var words = [UInt32](repeating: 0, count: wordCount)
+    for threadgroup in 0..<threadgroups {
+        for block in 0..<blocks {
+            let outputTile = (threadgroup * blocks + block)
+                * gemma4TiedHeadCoTiledMetadataWordsPerTile
+            for localRow in 0..<gemma4TiedHeadCoTiledRowsPerThreadgroup {
+                let inputRow = (threadgroup
+                    * gemma4TiedHeadCoTiledRowsPerThreadgroup + localRow)
+                    * groupsPerRow
+                let inputBlock = inputRow
+                    + block * gemma4TiedHeadCoTiledGroupsPerBlock
+                let outputRow = outputTile + localRow * 2
+                for pair in 0..<2 {
+                    let low = UInt32(indices[inputBlock + pair * 2])
+                    let high = UInt32(indices[inputBlock + pair * 2 + 1])
+                    words[outputRow + pair] = low | (high << 16)
+                }
+            }
+        }
+    }
+    return words
+}
+
+private func gemma4MakeTiedHeadCoTiledU16Payload(
+    weight: MLXArray,
+    metadata: Gemma4TiedHeadPacked13Metadata,
+    materialize: Bool = true
+) -> MLXArray? {
+    guard weight.dtype == .uint32,
+          weight.shape == [262_144, 672],
+          metadata.packedIndices.dtype == .uint32,
+          metadata.packedIndices.shape == [262_144, 35],
+          metadata.lut.dtype == .uint32,
+          metadata.lut.ndim == 1,
+          (1...8_192).contains(metadata.lut.size),
+          let indices = gemma4DecodeTiedHeadPacked13Indices(
+              metadata.packedIndices.asArray(UInt32.self),
+              rows: 262_144,
+              groupsPerRow: 84,
+              lutCount: metadata.lut.size
+          ),
+          let metadataWords = gemma4PackTiedHeadCoTiledU16Metadata(
+              indices,
+              rows: 262_144,
+              groupsPerRow: 84
+          )
+    else {
+        return nil
+    }
+
+    // A tile owns 16 output rows and one 256-wide K block. Its payload is
+    // [16 rows * 32 weight U32, 16 rows * 4 direct U16 indexes].
+    let weightPayload = weight
+        .reshaped(16_384, 16, gemma4TiedHeadCoTiledBlocks, 32)
+        .transposed(0, 2, 1, 3)
+        .contiguous()
+        .reshaped(
+            16_384,
+            gemma4TiedHeadCoTiledBlocks,
+            gemma4TiedHeadCoTiledWeightWordsPerTile
+        )
+    let metadataPayload = MLXArray(
+        metadataWords,
+        [
+            16_384,
+            gemma4TiedHeadCoTiledBlocks,
+            gemma4TiedHeadCoTiledMetadataWordsPerTile,
+        ]
+    )
+    let payload = concatenated([weightPayload, metadataPayload], axis: 2)
+    guard payload.dtype == .uint32,
+          payload.shape == [
+              16_384,
+              gemma4TiedHeadCoTiledBlocks,
+              gemma4TiedHeadCoTiledPayloadWordsPerTile,
+          ],
+          payload.size * MemoryLayout<UInt32>.size
+              == gemma4TiedHeadCoTiledPayloadByteCount
+    else {
+        return nil
+    }
+    if materialize {
+        // This input-independent sidecar is built during untimed model init.
+        eval(payload)
+    }
+    return payload
+}
 
 private let gemma4TiedVocabularyHeadQMV = MLXFast.metalKernel(
     name: "gemma4_tied_vocabulary_head_qmv_262144x5376_v1",
@@ -235,6 +432,129 @@ private let gemma4TiedVocabularyHeadPacked13SoftcapQMV = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+private let gemma4TiedVocabularyHeadCoTiledU16SoftcapQMV = MLXFast.metalKernel(
+    name: "gemma4_tied_vocabulary_head_cotiled_u16_softcap_262144x5376_v1",
+    inputNames: ["cotiled_payload", "lut", "x", "cap"],
+    outputNames: ["output"],
+    source: """
+        constexpr int kRowsPerSIMD = 4;
+        constexpr int kSIMDGroupsPerThreadgroup = 4;
+        constexpr int kBlocks = 21;
+        constexpr int kWeightWordsPerRow = 32;
+        constexpr int kWeightWordsPerSIMD =
+            kRowsPerSIMD * kWeightWordsPerRow;
+        constexpr int kWeightWordsPerTile = 512;
+        constexpr int kMetadataGroupsPerRow = 4;
+        constexpr int kMetadataWordsPerTile = 32;
+        constexpr int kPayloadWords =
+            kWeightWordsPerTile + kMetadataWordsPerTile;
+        constexpr int kWordsPerThreadgroup = kBlocks * kPayloadWords;
+
+        const int threadgroup_row = threadgroup_position_in_grid.y;
+        const int simd_group = simdgroup_index_in_threadgroup;
+        const int output_row =
+            threadgroup_row * kRowsPerSIMD * kSIMDGroupsPerThreadgroup
+            + simd_group * kRowsPerSIMD;
+        const device bfloat* input = x + thread_index_in_simdgroup * 8;
+        const device uint* tile_words =
+            cotiled_payload + threadgroup_row * kWordsPerThreadgroup;
+
+        float result[kRowsPerSIMD] = {0};
+        for (int block = 0; block < kBlocks; ++block) {
+            float values[8];
+            const float input_sum =
+                gemma4_tied_head_cotiled_u16_load_values(input, values);
+            const device uint* weight_words = tile_words
+                + simd_group * kWeightWordsPerSIMD
+                + thread_index_in_simdgroup;
+            const device ushort* metadata =
+                reinterpret_cast<const device ushort*>(
+                    tile_words + kWeightWordsPerTile)
+                + simd_group * kRowsPerSIMD * kMetadataGroupsPerRow;
+            const uint metadata_column = thread_index_in_simdgroup / 8;
+
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                const device uchar* row_weight =
+                    reinterpret_cast<const device uchar*>(
+                        weight_words + row * kWeightWordsPerRow);
+                const ushort metadata_index =
+                    metadata[row * kMetadataGroupsPerRow + metadata_column];
+                const uint pair = lut[metadata_index];
+                result[row] += gemma4_tied_head_cotiled_u16_qdot_4bit(
+                    row_weight,
+                    values,
+                    gemma4_tied_head_cotiled_u16_pair_scale(pair),
+                    gemma4_tied_head_cotiled_u16_pair_bias(pair),
+                    input_sum);
+            }
+
+            tile_words += kPayloadWords;
+            input += 256;
+        }
+
+        for (int row = 0; row < kRowsPerSIMD; ++row) {
+            result[row] = simd_sum(result[row]);
+            if (thread_index_in_simdgroup == 0) {
+                // Preserve the stock fused kernel's BF16 projection boundary
+                // and precise Float32 softcap suffix exactly.
+                const bfloat projected = static_cast<bfloat>(result[row]);
+                const float quotient = static_cast<float>(projected) / cap;
+                const float softened = metal::precise::tanh(quotient);
+                output[output_row + row] = softened * cap;
+            }
+        }
+        """,
+    header: """
+        using namespace metal;
+
+        inline float gemma4_tied_head_cotiled_u16_pair_scale(uint pair) {
+            return static_cast<float>(as_type<bfloat>(static_cast<ushort>(pair)));
+        }
+
+        inline float gemma4_tied_head_cotiled_u16_pair_bias(uint pair) {
+            return static_cast<float>(
+                as_type<bfloat>(static_cast<ushort>(pair >> 16)));
+        }
+
+        inline float gemma4_tied_head_cotiled_u16_load_values(
+            const device bfloat* input,
+            thread float* values
+        ) {
+            float sum = 0;
+            for (int index = 0; index < 8; index += 4) {
+                sum += input[index] + input[index + 1]
+                    + input[index + 2] + input[index + 3];
+                values[index] = input[index];
+                values[index + 1] = input[index + 1] / 16.0f;
+                values[index + 2] = input[index + 2] / 256.0f;
+                values[index + 3] = input[index + 3] / 4096.0f;
+            }
+            return sum;
+        }
+
+        inline float gemma4_tied_head_cotiled_u16_qdot_4bit(
+            const device uchar* weight,
+            const thread float* values,
+            float scale,
+            float bias,
+            float input_sum
+        ) {
+            const device ushort* packed =
+                reinterpret_cast<const device ushort*>(weight);
+            float accumulator = 0;
+            for (int index = 0; index < 2; ++index) {
+                accumulator +=
+                    (values[4 * index] * (packed[index] & 0x000f)
+                    + values[4 * index + 1] * (packed[index] & 0x00f0)
+                    + values[4 * index + 2] * (packed[index] & 0x0f00)
+                    + values[4 * index + 3] * (packed[index] & 0xf000));
+            }
+            return scale * accumulator + input_sum * bias;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 private let gemma4TiedHeadMaximumPacked13LUTCount = 8_192
 
 struct Gemma4TiedHeadPacked13Metadata: @unchecked Sendable {
@@ -300,6 +620,7 @@ struct Gemma4TiedVocabularyHead: @unchecked Sendable {
     let scales: MLXArray
     let biases: MLXArray
     let packed13Metadata: Gemma4TiedHeadPacked13Metadata?
+    private let coTiledU16Payload: MLXArray?
 
     init?(
         _ embedding: Embedding,
@@ -320,6 +641,30 @@ struct Gemma4TiedVocabularyHead: @unchecked Sendable {
         self.scales = embedding.scales
         self.biases = biases
         self.packed13Metadata = packed13Metadata
+        if gemma4TiedHeadCoTiledU16Enabled
+            || gemma4VerifyTiedHeadCoTiledU16Bits
+        {
+            guard let packed13Metadata else {
+                preconditionFailure(
+                    "requested tied-head co-tiled U16 path requires "
+                        + "validated packed13 metadata"
+                )
+            }
+            guard let coTiledU16Payload =
+                gemma4MakeTiedHeadCoTiledU16Payload(
+                    weight: embedding.weight,
+                    metadata: packed13Metadata
+                )
+            else {
+                preconditionFailure(
+                    "requested tied-head co-tiled U16 payload could not be "
+                        + "derived losslessly from packed13 metadata"
+                )
+            }
+            self.coTiledU16Payload = coTiledU16Payload
+        } else {
+            self.coTiledU16Payload = nil
+        }
     }
 
     func callAsFunction(_ input: MLXArray) -> MLXArray {
@@ -342,8 +687,49 @@ struct Gemma4TiedVocabularyHead: @unchecked Sendable {
         guard let packed13Metadata else {
             preconditionFailure("tied vocabulary packed13 metadata was not prepared")
         }
-        return gemma4TiedVocabularyHeadPacked13SoftcapQMV(
-            [weight, packed13Metadata.packedIndices, packed13Metadata.lut, input, cap],
+
+        var verifiedStock: MLXArray?
+        if let coTiledU16Payload {
+            let candidate = gemma4TiedVocabularyHeadCoTiledU16SoftcapQMV(
+                [coTiledU16Payload, packed13Metadata.lut, input, cap],
+                grid: (32, 65_536, 1),
+                threadGroup: (32, 4, 1),
+                outputShapes: [[1, 1, 262_144]],
+                outputDTypes: [.float32]
+            )[0]
+            if gemma4VerifyTiedHeadCoTiledU16Bits {
+                let stock = packed13SoftcappedStock(
+                    input,
+                    cap: cap,
+                    metadata: packed13Metadata
+                )
+                verifyRawFloat32(
+                    candidate,
+                    stock: stock,
+                    candidateName: "co-tiled direct-U16 fused-softcap",
+                    stockName: "packed13 fused-softcap"
+                )
+                verifiedStock = stock
+            }
+            if gemma4TiedHeadCoTiledU16Enabled {
+                return candidate
+            }
+        }
+
+        return verifiedStock ?? packed13SoftcappedStock(
+            input,
+            cap: cap,
+            metadata: packed13Metadata
+        )
+    }
+
+    private func packed13SoftcappedStock(
+        _ input: MLXArray,
+        cap: MLXArray,
+        metadata: Gemma4TiedHeadPacked13Metadata
+    ) -> MLXArray {
+        gemma4TiedVocabularyHeadPacked13SoftcapQMV(
+            [weight, metadata.packedIndices, metadata.lut, input, cap],
             grid: (32, 65_536, 1),
             threadGroup: (32, 4, 1),
             outputShapes: [[1, 1, 262_144]],
