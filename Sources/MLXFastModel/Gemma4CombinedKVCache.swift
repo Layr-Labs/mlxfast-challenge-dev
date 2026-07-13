@@ -7,8 +7,11 @@ import MLXLMCommon
 /// Supported prompt prefills can install a K/V-major parent allocation
 /// directly, with one normal cache-growth quantum reserved for decode. This
 /// avoids both split-to-combined conversion and first-token growth. Unsupported
-/// shapes deliberately retain the upstream split-cache fallback. Slab zero is
-/// K and slab one is V.
+/// shapes deliberately retain the upstream split-cache fallback. The allocation
+/// is flattened to `[B,2*Hkv,L,D]`: the first head slab is K and the second is
+/// V. This is byte-identical to `[2,B,Hkv,L,D]` for the supported `B == 1`
+/// path, while letting consumers use two range slices without two extra squeeze
+/// graph nodes on every layer and decode token.
 final class Gemma4CombinedKVCache: KVCache {
     enum Kind {
         case full(step: Int)
@@ -111,10 +114,10 @@ final class Gemma4CombinedKVCache: KVCache {
         guard let capacity = directPrefillCapacity(for: length) else {
             preconditionFailure("combined KV cache cannot adopt this prefill")
         }
-        precondition(combined.ndim == 5)
-        precondition(combined.dim(0) == 2)
-        precondition(combined.dim(1) == 1)
-        precondition(combined.dim(3) == capacity)
+        precondition(combined.ndim == 4)
+        precondition(combined.dim(0) == 1)
+        precondition(combined.dim(1).isMultiple(of: 2))
+        precondition(combined.dim(2) == capacity)
         precondition(combined.dtype == .bfloat16)
 
         combinedStorage = combined
@@ -154,12 +157,12 @@ final class Gemma4CombinedKVCache: KVCache {
     }
 
     /// Single-write optimized path. `combined` must be direct output from the
-    /// fused attention-preparation kernel, with shape `[2,B,Hkv,1,D]`.
+    /// fused attention-preparation kernel, with shape `[1,2*Hkv,1,D]`.
     func updateCombined(_ combined: MLXArray) -> (MLXArray, MLXArray) {
-        precondition(combined.ndim == 5)
-        precondition(combined.dim(0) == 2)
-        precondition(combined.dim(1) == 1)
-        precondition(combined.dim(3) == 1)
+        precondition(combined.ndim == 4)
+        precondition(combined.dim(0) == 1)
+        precondition(combined.dim(1).isMultiple(of: 2))
+        precondition(combined.dim(2) == 1)
 
         convertSplitStorageIfNeeded(matching: combined)
         switch kind {
@@ -185,40 +188,41 @@ final class Gemma4CombinedKVCache: KVCache {
         precondition(inner[0].shape == inner[1].shape)
         precondition(inner[0].dtype == inner[1].dtype)
         precondition(inner[0].dtype == incoming.dtype)
-        precondition(inner[0].dim(0) == incoming.dim(1))
-        precondition(inner[0].dim(1) == incoming.dim(2))
-        precondition(inner[0].dim(3) == incoming.dim(4))
+        precondition(inner[0].dim(0) == incoming.dim(0))
+        precondition(inner[0].dim(1) * 2 == incoming.dim(1))
+        precondition(inner[0].dim(3) == incoming.dim(3))
 
-        // This one-time stack happens at the decode boundary. The recurring
-        // path receives the combined parent allocation directly from Metal.
-        combinedStorage = stacked(inner, axis: 0)
+        // This one-time concatenate happens at the decode boundary. The
+        // recurring path receives the combined parent allocation directly
+        // from Metal in the same K-heads-then-V-heads byte order.
+        combinedStorage = concatenated(inner, axis: 1)
         self.splitCache = nil
     }
 
     private func updateFull(_ incoming: MLXArray, step: Int) -> (MLXArray, MLXArray) {
         let previous = offset
-        let length = incoming.dim(3)
+        let length = incoming.dim(2)
         precondition(length == 1)
 
-        if combinedStorage == nil || previous + length > combinedStorage!.dim(3) {
+        if combinedStorage == nil || previous + length > combinedStorage!.dim(2) {
             let chunks = (step + length - 1) / step
             let appendCapacity = chunks * step
             let zeroShape = [
-                2, incoming.dim(1), incoming.dim(2), appendCapacity, incoming.dim(4),
+                incoming.dim(0), incoming.dim(1), appendCapacity, incoming.dim(3),
             ]
             let newSpace = MLXArray.zeros(zeroShape, dtype: incoming.dtype)
             if let current = combinedStorage {
                 let retained = previous % step == 0
                     ? current
-                    : current[0..., 0..., 0..., 0..<previous, 0...]
-                combinedStorage = concatenated([retained, newSpace], axis: 3)
+                    : current[0..., 0..., 0..<previous, 0...]
+                combinedStorage = concatenated([retained, newSpace], axis: 2)
             } else {
                 combinedStorage = newSpace
             }
         }
 
         offset += length
-        combinedStorage![0..., 0..., 0..., previous..<offset, 0...] = incoming
+        combinedStorage![0..., 0..., previous..<offset, 0...] = incoming
         return views(range: 0..<offset)
     }
 
@@ -227,27 +231,27 @@ final class Gemma4CombinedKVCache: KVCache {
             preconditionFailure("rotating cache has no maximum size")
         }
         let previous = offset
-        let length = incoming.dim(3)
+        let length = incoming.dim(2)
         precondition(length == 1)
 
         if combinedStorage == nil
-            || (previous >= combinedStorage!.dim(3) && combinedStorage!.dim(3) < maxSize)
+            || (previous >= combinedStorage!.dim(2) && combinedStorage!.dim(2) < maxSize)
         {
             let newSize = min(rotatingStep, maxSize - previous)
             precondition(newSize > 0)
             let newSpace = MLXArray.zeros(
-                [2, incoming.dim(1), incoming.dim(2), newSize, incoming.dim(4)],
+                [incoming.dim(0), incoming.dim(1), newSize, incoming.dim(3)],
                 dtype: incoming.dtype
             )
             if let current = combinedStorage {
-                combinedStorage = concatenated([current, newSpace], axis: 3)
+                combinedStorage = concatenated([current, newSpace], axis: 2)
             } else {
                 combinedStorage = newSpace
             }
             rotatingIndex = previous
         }
 
-        let trimSize = combinedStorage!.dim(3) - maxSize
+        let trimSize = combinedStorage!.dim(2) - maxSize
         if trimSize > 0 {
             combinedStorage = trimStorage(combinedStorage!, trimSize: trimSize)
             rotatingIndex = maxSize
@@ -256,14 +260,14 @@ final class Gemma4CombinedKVCache: KVCache {
             rotatingIndex = keep
         }
 
-        precondition(rotatingIndex + length <= combinedStorage!.dim(3))
+        precondition(rotatingIndex + length <= combinedStorage!.dim(2))
         combinedStorage![
-            0..., 0..., 0..., rotatingIndex..<(rotatingIndex + length), 0...
+            0..., 0..., rotatingIndex..<(rotatingIndex + length), 0...
         ] = incoming
         offset += length
         rotatingIndex += length
 
-        let validLength = offset < maxSize ? offset : combinedStorage!.dim(3)
+        let validLength = offset < maxSize ? offset : combinedStorage!.dim(2)
         return views(range: 0..<validLength)
     }
 
@@ -271,25 +275,26 @@ final class Gemma4CombinedKVCache: KVCache {
         if trimSize <= 0 { return storage }
         return concatenated(
             [
-                storage[0..., 0..., 0..., 0..<keep, 0...],
-                storage[0..., 0..., 0..., (trimSize + keep)..., 0...],
+                storage[0..., 0..., 0..<keep, 0...],
+                storage[0..., 0..., (trimSize + keep)..., 0...],
             ],
-            axis: 3
+            axis: 2
         )
     }
 
-    /// Range slicing plus squeeze is intentional: integer indexing lowers to
-    /// `take`, while these are metadata-only slab views.
+    /// Head-range slices are metadata-only views. Flattening K/V into the head
+    /// axis avoids both integer-index/take and the two former squeeze nodes.
     private func views(range: Range<Int>) -> (MLXArray, MLXArray) {
         guard let combinedStorage else {
             preconditionFailure("combined KV storage is empty")
         }
+        let kvHeads = combinedStorage.dim(1) / 2
         let keys = combinedStorage[
-            0..<1, 0..., 0..., range, 0...
-        ].squeezed(axis: 0)
+            0..., 0..<kvHeads, range, 0...
+        ]
         let values = combinedStorage[
-            1..<2, 0..., 0..., range, 0...
-        ].squeezed(axis: 0)
+            0..., kvHeads..<(2 * kvHeads), range, 0...
+        ]
         return (keys, values)
     }
 
@@ -299,11 +304,11 @@ final class Gemma4CombinedKVCache: KVCache {
             guard let combinedStorage else { return [] }
             let length: Int
             if let maxSize = rotatingMaxSize {
-                length = offset < combinedStorage.dim(3)
+                length = offset < combinedStorage.dim(2)
                     ? offset
-                    : min(maxSize, combinedStorage.dim(3))
+                    : min(maxSize, combinedStorage.dim(2))
             } else {
-                length = min(offset, combinedStorage.dim(3))
+                length = min(offset, combinedStorage.dim(2))
             }
             let result = views(range: 0..<length)
             return [result.0, result.1]
@@ -423,7 +428,7 @@ final class Gemma4CombinedKVCache: KVCache {
 
     func copy() -> any KVCache {
         let splitCopy = splitCache?.copy()
-        let storageCopy = combinedStorage.map { $0[0..., 0..., 0..., 0..., 0...] }
+        let storageCopy = combinedStorage.map { $0[0..., 0..., 0..., 0...] }
         return Gemma4CombinedKVCache(
             kind: kind,
             splitCache: splitCopy,

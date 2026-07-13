@@ -1000,8 +1000,8 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
     }
 
     /// Direct-output variant for `Gemma4CombinedKVCache`. The second output is
-    /// the parent K/V-major allocation `[2,1,Hkv,1,D]`; the cache extracts K/V
-    /// consumers with range slices, never integer-index/take operations.
+    /// the parent K/V-major allocation `[1,2*Hkv,1,D]`; the cache extracts K/V
+    /// consumers with head-range slices, never integer-index/take/squeeze ops.
     func callCombined(
         rawQueries: MLXArray,
         rawKeys: MLXArray,
@@ -1032,7 +1032,7 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
             threadGroup: (threads, 1, 1),
             outputShapes: [
                 [1, 32, 1, headDim],
-                [2, 1, kvHeads, 1, headDim],
+                [1, 2 * kvHeads, 1, headDim],
             ],
             outputDTypes: [.bfloat16, .bfloat16]
         )
@@ -1066,7 +1066,7 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
             ropeCosines, ropeSines,
         ]
         let grid = (threads, capacity * rowsPerToken, 1)
-        let shapes = [[2, 1, kvHeads, capacity, headDim]]
+        let shapes = [[1, 2 * kvHeads, capacity, headDim]]
         let candidate: [MLXArray]?
         if directPrefillRMSRoPE || verifyDirectPrefillRMSRoPEBits {
             let candidateKernel = isSliding
@@ -1155,7 +1155,7 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
         )
         let shapes = [
             [1, 32, length, headDim],
-            [2, 1, kvHeads, capacity, headDim],
+            [1, 2 * kvHeads, capacity, headDim],
         ]
         let candidate: [MLXArray]?
         if directPrefillRMSRoPE || verifyDirectPrefillRMSRoPEBits {
