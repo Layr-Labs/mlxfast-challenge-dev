@@ -200,7 +200,7 @@ struct FusedSlidingQKVProjection: @unchecked Sendable {
                 k.weight, kMetadata.indices, kMetadata.lut,
                 v.weight, vMetadata.indices, vMetadata.lut, input,
             ],
-            grid: (32, 4_096, 1),
+            grid: (32, 1_024, 1),
             threadGroup: (32, 4, 1),
             outputShapes: [
                 [1, 1, 8_192],
@@ -368,7 +368,7 @@ struct FusedFullQKProjection: @unchecked Sendable {
                 q.weight, qMetadata.indices, qMetadata.lut,
                 k.weight, kMetadata.indices, kMetadata.lut, input,
             ],
-            grid: (32, 4_608, 1),
+            grid: (32, 512, 1),
             threadGroup: (32, 9, 1),
             outputShapes: [[1, 1, 16_384], [1, 1, 2_048]],
             outputDTypes: [.bfloat16, .bfloat16]
