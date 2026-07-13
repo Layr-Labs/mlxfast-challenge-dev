@@ -224,7 +224,7 @@ public final class Gemma4ModelCache {
             return
         }
         guard promptLookupTrackingValid,
-              promptLookupState.pendingDraft == nil,
+              promptLookupState.pendingDrafts.isEmpty,
               promptLookupState.tokens.count == positionOffset
         else {
             promptLookupState.reset()

@@ -146,7 +146,7 @@ public enum Gemma4Model {
             )
         }
 
-        let hasPendingPromptLookup = cache.promptLookupState.pendingDraft != nil
+        let hasPendingPromptLookup = !cache.promptLookupState.pendingDrafts.isEmpty
             || cache.promptLookupPendingLogits != nil
         let promptLookupActive = model.supportsExactPromptLookup
             && gemma4PromptLookupEnvironmentEnabled(ProcessInfo.processInfo.environment)
@@ -156,11 +156,11 @@ public enum Gemma4Model {
         }
         let inputTokens = gemma4PromptLookupInputTokens(inputIDs)
         if hasPendingPromptLookup {
-            guard let pendingDraft = cache.promptLookupState.pendingDraft,
+            guard let pendingDraft = cache.promptLookupState.pendingDrafts.first,
                   let pendingLogits = cache.promptLookupPendingLogits,
                   let combinedCaches = cache.promptLookupCombinedCaches(
                       expectedCount: model.configuration.numHiddenLayers),
-                  combinedCaches.allSatisfy(\.hasDeferredCombinedPosition)
+                  combinedCaches.allSatisfy(\.hasDeferredCombinedPositions)
             else {
                 throw MLXFastError.invalidInput(
                     "prompt-lookup pending state is inconsistent with KV caches")
@@ -178,7 +178,7 @@ public enum Gemma4Model {
                actualInput == pendingDraft
             {
                 guard combinedCaches.allSatisfy({
-                    $0.canRecommitDeferredCombinedPosition()
+                    $0.canRecommitOldestDeferredCombinedPosition()
                 }) else {
                     throw MLXFastError.invalidInput(
                         "prompt-lookup deferred cache row cannot be recommitted")
@@ -191,33 +191,33 @@ public enum Gemma4Model {
                     validateLibraryCacheOffsets: validateLibraryCacheOffsets,
                     forward: {
                         for layerCache in combinedCaches {
-                            precondition(layerCache.recommitDeferredCombinedPosition())
+                            precondition(layerCache.recommitOldestDeferredCombinedPosition())
                         }
                         precondition(combinedCaches.allSatisfy {
                             $0.offset == positionOffset + 1
-                                && !$0.hasDeferredCombinedPosition
                         })
-                        return pendingLogits
+                        return pendingLogits[0..<1, 0...].reshaped(1, 1, 262_144)
                     }
                 )
                 precondition(
                     cache.promptLookupState.resolvePending(actualInput: actualInput)
                         == .accepted)
-                cache.promptLookupPendingLogits = nil
+                cache.promptLookupPendingLogits = cache.promptLookupState.pendingDrafts.isEmpty
+                    ? nil : pendingLogits[1..., 0...]
                 return result
             }
 
             guard combinedCaches.allSatisfy({
-                $0.canDiscardDeferredCombinedPosition()
+                $0.canDiscardDeferredCombinedPositions()
             }) else {
                 throw MLXFastError.invalidInput(
                     "prompt-lookup deferred cache row cannot be discarded")
             }
             for layerCache in combinedCaches {
-                precondition(layerCache.discardDeferredCombinedPosition())
+                precondition(layerCache.discardDeferredCombinedPositions())
             }
             precondition(combinedCaches.allSatisfy {
-                $0.offset == positionOffset && !$0.hasDeferredCombinedPosition
+                $0.offset == positionOffset && !$0.hasDeferredCombinedPositions
             })
             cache.promptLookupState.cancelPending()
             cache.promptLookupPendingLogits = nil
@@ -235,11 +235,12 @@ public enum Gemma4Model {
            let draft = cache.promptLookupState.draft(appending: actualInput),
            let combinedCaches = cache.promptLookupCombinedCaches(
                expectedCount: model.configuration.numHiddenLayers),
-           model.canRunExactPromptLookup(cache: cache.kvCache(for: model)),
+           model.canRunExactPromptLookup(
+               cache: cache.kvCache(for: model), length: draft.tokens.count + 1),
            combinedCaches.allSatisfy({
                $0.offset == positionOffset
-                   && !$0.hasDeferredCombinedPosition
-                   && $0.canAppendCombinedPair()
+                   && !$0.hasDeferredCombinedPositions
+                   && $0.canAppendCombined(length: draft.tokens.count + 1)
            })
         {
             let pairInputs = MLXArray([actualInput, draft], [1, 2])

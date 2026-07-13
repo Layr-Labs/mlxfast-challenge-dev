@@ -905,6 +905,66 @@ final class Gemma4FastLayer {
             && fusedAttentionRMS?.supportsPrefill(offset: offset, length: 2) == true
     }
 
+    func exactThreeVector(
+        _ x: MLXArray,
+        normalizedInput: MLXArray?,
+        cache: Gemma4CombinedKVCache
+    ) -> Gemma4FastLayerResult {
+        precondition(supportsExactTwoVector)
+        precondition(x.dtype == .bfloat16 && x.shape == [3, 5_376])
+        precondition(cache.canAppendCombined(length: 3))
+        let offset = cache.offset
+        let h: MLXArray
+        if let normalizedInput {
+            precondition(normalizedInput.shape == x.shape)
+            h = normalizedInput
+        } else {
+            let shaped = x.reshaped(1, 3, 5_376)
+            h = concatenated((0..<3).map {
+                MLXFast.rmsNorm(shaped[0..., $0..<($0 + 1), 0...],
+                                weight: inputNormWeight, eps: eps)
+            }, axis: 1).reshaped(3, 5_376)
+        }
+        let rawQueries: MLXArray
+        let rawKeys: MLXArray
+        let rawValues: MLXArray?
+        if isSliding, let fusedQKV {
+            let p = fusedQKV.exactThreeVector(h)
+            rawQueries = p.queries.reshaped(1, 3, 8_192)
+            rawKeys = p.keys.reshaped(1, 3, 4_096)
+            rawValues = p.values.reshaped(1, 3, 4_096)
+        } else if let fusedQK {
+            let p = fusedQK.exactThreeVector(h)
+            rawQueries = p.queries.reshaped(1, 3, 16_384)
+            rawKeys = p.keys.reshaped(1, 3, 2_048)
+            rawValues = nil
+        } else { preconditionFailure("exact three-vector QKV unavailable") }
+        guard let fusedAttentionRMS,
+              fusedAttentionRMS.supportsPrefill(offset: offset, length: 3) else {
+            preconditionFailure("exact three-vector attention preparation unavailable")
+        }
+        let prepared = fusedAttentionRMS.callCombinedQKVPrefill(
+            rawQueries: rawQueries, rawKeys: rawKeys, rawValues: rawValues,
+            offset: offset, length: 3, capacity: 3)
+        let updated = cache.updateCombined(prepared.combinedKV)
+        let before = cache.viewsExcludingNewest(2)
+        let attention = gemma4ExactThreeTokenAttention(
+            queries: prepared.queries, keysBeforeDrafts: before.0,
+            valuesBeforeDrafts: before.1, keysWithDrafts: updated.0,
+            valuesWithDrafts: updated.1, scale: scale)
+        let merged = attention.transposed(0, 2, 1, 3).reshaped(3, nHeads * headDim)
+        guard let indexedOutput, let fusedAttentionToMLPBoundary,
+              let fusedGateUp, let indexedDown, let fusedMLPToNextBoundary else {
+            preconditionFailure("exact three-vector layer payload unavailable")
+        }
+        let projected = indexedOutput.exactThreeVector(merged)
+        let boundary = fusedAttentionToMLPBoundary(attentionOutput: projected, residual: x)
+        let activated = fusedGateUp.exactThreeVectorActivated(boundary.1)
+        let mlp = indexedDown.exactThreeVector(activated)
+        let next = fusedMLPToNextBoundary(mlpOutput: mlp, residual: boundary.0)
+        return Gemma4FastLayerResult(hidden: next.0, nextNormalized: next.1)
+    }
+
     func exactTwoVector(
         _ x: MLXArray,
         normalizedInput: MLXArray?,
@@ -912,7 +972,7 @@ final class Gemma4FastLayer {
     ) -> Gemma4FastLayerResult {
         precondition(supportsExactTwoVector)
         precondition(x.dtype == .bfloat16 && x.shape == [2, 5_376])
-        precondition(cache.canAppendCombinedPair())
+        precondition(cache.canAppendCombined(length: 2))
         let offset = cache.offset
 
         let h: MLXArray
@@ -1439,6 +1499,37 @@ final class Gemma4FastEngine {
         return logitSoftcap(logits, cap)
     }
 
+    func exactThreeVector(_ inputs: MLXArray, cache: [KVCache]) -> MLXArray {
+        precondition(canRunExactThreeVector(cache: cache) && inputs.shape == [1, 3])
+        let combinedCaches = cache.compactMap { $0 as? Gemma4CombinedKVCache }
+        let rows = (0..<3).map { embedTokens(inputs[0..., $0..<($0 + 1)]) * embedScale }
+        var hidden = concatenated(rows, axis: 1).reshaped(3, 5_376)
+        var normalizedInput: MLXArray?
+        for (index, layer) in layers.enumerated() {
+            let result = layer.exactThreeVector(hidden, normalizedInput: normalizedInput,
+                                                cache: combinedCaches[index])
+            hidden = result.hidden
+            normalizedInput = result.nextNormalized
+        }
+        guard let normalizedInput, let tiedVocabularyHead else {
+            preconditionFailure("exact three-vector final boundary unavailable")
+        }
+        return tiedVocabularyHead.exactThreeVectorPacked13Softcapped(
+            normalizedInput, cap: MLXArray(softcap))
+    }
+
+    func canRunExactThreeVector(cache: [KVCache]) -> Bool {
+        guard supportsExactTwoVector, cache.count == layers.count else { return false }
+        let combined = cache.compactMap { $0 as? Gemma4CombinedKVCache }
+        return combined.count == layers.count
+            && combined.allSatisfy { $0.canAppendCombined(length: 3) }
+            && layers.indices.allSatisfy {
+                layers[$0].supportsExactTwoVector
+                    && layers[$0].fusedAttentionRMS?.supportsPrefill(
+                        offset: combined[$0].offset, length: 3) == true
+            }
+    }
+
     func exactTwoVector(_ inputs: MLXArray, cache: [KVCache]) -> MLXArray {
         precondition(canRunExactTwoVector(cache: cache))
         precondition(inputs.shape == [1, 2])
@@ -1484,7 +1575,7 @@ final class Gemma4FastEngine {
         guard supportsExactTwoVector, cache.count == layers.count else { return false }
         let combinedCaches = cache.compactMap { $0 as? Gemma4CombinedKVCache }
         guard combinedCaches.count == layers.count,
-              combinedCaches.allSatisfy({ $0.canAppendCombinedPair() })
+              combinedCaches.allSatisfy({ $0.canAppendCombined(length: 2) })
         else { return false }
         return layers.indices.allSatisfy {
             layers[$0].canRunExactTwoVector(offset: combinedCaches[$0].offset)
