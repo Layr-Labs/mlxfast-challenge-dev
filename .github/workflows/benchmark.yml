@@ -601,36 +601,96 @@ jobs:
             "${MLXFAST_JOB_WS}/benchmark.json"
           echo "benchmark: bench workspace ready at ${MLXFAST_JOB_WS} (trusted harness surfaces ACL-locked against bench writes)"
 
-      # Fail closed unless the bench uid's PF network-egress lockdown is provably
-      # active BEFORE any submitted code runs (build is the first bench-exec
-      # invocation of submission-built code). The runner cannot read pfctl (root
-      # only) and sudo permits only bench-exec/janitor, so the property is
-      # verified functionally: an outbound TCP connection made AS the bench uid
-      # must NOT succeed. If it does, egress is open and the run aborts rather
-      # than executing submitted code with a live network path. The sibling
-      # operator change adds the parallel pfctl-level assertion inside
-      # measure-job's preflight; this is the repo-side, before-any-submitted-code
-      # anchor covering the build/transform/gates phases.
+      # Verify the bench uid's PF network-egress lockdown BEFORE any submitted
+      # code runs (build is the first bench-exec invocation of submission-built
+      # code). The runner cannot read pfctl (root only) and sudo permits only
+      # bench-exec/janitor, so the property is verified functionally: an
+      # outbound TCP connection made AS the bench uid must NOT succeed.
+      #
+      # CONDITIONAL-UNTIL-LIVE: the PF bench-egress block is designed and
+      # staged but not yet enabled on the box (see
+      # docs/private-benchmark-security.md "Current posture and known gaps"),
+      # so this preflight must not brick every run in the meantime. Decision
+      # matrix, in order:
+      #   1. Bench-uid probe BLOCKED        -> lockdown live and effective: PASS
+      #      (this branch starts verifying automatically the moment the
+      #      operator ships the PF block -- no repo change needed).
+      #   2. Bench-uid probe OPEN and PF wiring for the bench lockdown is
+      #      provisioned in the world-readable PF configuration (/etc/pf.conf
+      #      or /etc/pf.anchors/*, matched by operator naming tokens), or the
+      #      explicit MLXFAST_REQUIRE_BENCH_EGRESS_LOCKDOWN=1 override is set
+      #      -> a provisioned lockdown is NOT effective: FAIL CLOSED.
+      #   3. Bench-uid probe OPEN and no lockdown provisioned -> dormant:
+      #      WARN and continue (today's documented posture).
+      #   4. Probe cannot run (runner itself offline, curl unavailable,
+      #      bridge error) -> WARN "cannot assess" and continue; never claim
+      #      "verified" on a failed probe. A truly offline box fails closed
+      #      minutes later at the hidden-golden download.
+      # The runner-uid control probe distinguishes "bench blocked by PF" from
+      # "the whole box is offline". The sibling operator change adds the
+      # parallel pfctl-level assertion inside measure-job's preflight; this is
+      # the repo-side, before-any-submitted-code anchor covering the
+      # build/transform/gates phases.
       - name: Assert bench network egress lockdown
         run: |
           set -euo pipefail
-          probe='
+          probe="$(cat <<'PROBE'
             set -u
+            [ -x /usr/bin/curl ] || exit 2
             rc=1
             for target in https://1.1.1.1 https://8.8.8.8; do
-              if curl --silent --show-error --max-time 5 --output /dev/null "${target}" 2>/dev/null; then
+              if /usr/bin/curl --silent --show-error --max-time 5 --output /dev/null "${target}" 2>/dev/null; then
                 echo "bench egress reached ${target}"
                 rc=0
                 break
               fi
             done
             exit "${rc}"
-          '
-          if sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" /bin/bash -c "${probe}"; then
-            echo "::error::bench network egress is NOT locked down (a bench-uid outbound connection succeeded); refusing to run submitted code" >&2
+          PROBE
+          )"
+          # Control probe as the trusted runner uid: if the runner itself has
+          # no egress we cannot attribute a blocked bench probe to PF.
+          runner_egress=0
+          for target in https://1.1.1.1 https://8.8.8.8; do
+            if /usr/bin/curl --silent --max-time 5 --output /dev/null "${target}" 2>/dev/null; then
+              runner_egress=1
+              break
+            fi
+          done
+          if [[ "${runner_egress}" -ne 1 ]]; then
+            echo "::warning::bench egress preflight cannot assess PF lockdown (trusted-uid egress probe failed; box appears offline); continuing -- trusted network steps will fail closed if the box is truly offline"
+            exit 0
+          fi
+          bench_rc=0
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" /bin/bash -c "${probe}" || bench_rc=$?
+          if [[ "${bench_rc}" -eq 1 ]]; then
+            echo "benchmark: bench network egress lockdown verified (bench-uid egress blocked)"
+            exit 0
+          fi
+          if [[ "${bench_rc}" -ne 0 ]]; then
+            echo "::warning::bench egress preflight cannot assess PF lockdown (bench probe exited ${bench_rc}: curl unavailable or bridge error); continuing without a verdict"
+            exit 0
+          fi
+          # bench_rc == 0: bench egress is OPEN. Enforce only if the lockdown
+          # is supposed to be live on this box.
+          # Provisioning detection reads only world-readable PF configuration
+          # (pfctl itself is root-only). Tokens cover the operator naming
+          # conventions plus literal PF rule syntax for the bench uid
+          # ("user bench" / "user 560"); stock macOS pf.conf/anchors contain
+          # none of these, so a vanilla box cannot false-positive into the
+          # fail-closed branch.
+          pf_provisioned=0
+          if grep -Eisq 'mlxfast|darkbloom|bench[-_.]?egress|egress[-_.]?bench|uid[-_.]?560|user[[:space:]]+bench|user[[:space:]]+560([^0-9]|$)' /etc/pf.conf /etc/pf.anchors/* 2>/dev/null; then
+            pf_provisioned=1
+          fi
+          if [[ "${MLXFAST_REQUIRE_BENCH_EGRESS_LOCKDOWN:-0}" == "1" ]]; then
+            pf_provisioned=1
+          fi
+          if [[ "${pf_provisioned}" -eq 1 ]]; then
+            echo "::error::bench network egress is NOT locked down (a bench-uid outbound connection succeeded) although the PF bench-egress lockdown is provisioned on this box; refusing to run submitted code" >&2
             exit 1
           fi
-          echo "benchmark: bench network egress lockdown verified (bench-uid egress blocked)"
+          echo "::warning::PF bench-egress lockdown not yet active on this box; egress preflight is dormant (bench-uid egress currently open). It will enforce automatically once the operator ships the PF lockdown."
 
       # Build through the bridge: compiling the submitted surface is already
       # untrusted-code execution (SwiftPM manifest evaluation, build plugins),

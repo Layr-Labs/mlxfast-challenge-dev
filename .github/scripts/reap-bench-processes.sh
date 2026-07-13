@@ -53,4 +53,18 @@ reap_signal() {
 reap_signal TERM
 sleep 1
 reap_signal KILL
+
+# Post-KILL residual check: SIGKILL is unblockable, so anything still alive is
+# in uninterruptible kernel sleep (or a zombie awaiting reap) -- report it for
+# the audit trail rather than failing the run over an unkillable corpse.
+residual=""
+while read -r pid pgid; do
+  [[ -z "${pid}" ]] && continue
+  [[ "${protected_pids}" == *" ${pid} "* ]] && continue
+  [[ -n "${self_pgid}" && "${pgid}" == "${self_pgid}" ]] && continue
+  residual+="${pid} "
+done < <(ps -axo pid=,pgid=,uid= | awk -v u="${bench_uid}" '$3 == u { print $1, $2 }')
+if [[ -n "${residual}" ]]; then
+  echo "reap-bench-processes: WARNING uid=${bench_uid} pids survived SIGKILL (kernel-stuck or zombie): ${residual}" >&2
+fi
 echo "reap-bench-processes: reaped stray uid=${bench_uid} processes (protected reaper tree)"

@@ -4,8 +4,8 @@ import Testing
 // Structural guards for the ranked-pipeline isolation hardening: the
 // gates->timed allowlist scrub, between-phase bench-process reaping, R2
 // object-key scoping, hardened git against the untrusted worktree, and the
-// fail-closed PF egress preflight. These pin the workflow wiring so a refactor
-// cannot silently reopen the closed gaps.
+// conditional-until-live PF egress preflight. These pin the workflow wiring so
+// a refactor cannot silently reopen the closed gaps.
 @Suite
 struct RankedWorkflowIsolationTests {
     private func workflow() throws -> String {
@@ -180,10 +180,14 @@ struct RankedWorkflowIsolationTests {
         #expect(reaper.contains("awk -v u=\"${bench_uid}\" '$3 == u { print $1, $2 }'"))
     }
 
-    // F7: the bench egress lockdown is asserted fail-closed before any submitted
-    // code runs (before the first bench build).
+    // F7: the bench egress preflight runs before any submitted code (before the
+    // first bench build) and is CONDITIONAL-UNTIL-LIVE: it verifies (passes)
+    // when the bench probe is blocked, fails closed when egress is open while
+    // the PF lockdown is provisioned (config-detected or explicitly required),
+    // and stays dormant with a warning while the lockdown has not shipped. It
+    // must never fail merely because the staged PF block is still deferred.
     @Test
-    func benchEgressLockdownIsAssertedBeforeSubmittedCodeRuns() throws {
+    func benchEgressPreflightIsConditionalUntilPFLockdownShips() throws {
         let workflow = try workflow()
 
         let egressRange = try #require(workflow.range(of: "- name: Assert bench network egress lockdown"))
@@ -200,10 +204,27 @@ struct RankedWorkflowIsolationTests {
             from: "- name: Assert bench network egress lockdown",
             to: "- name: Build harness in bench sandbox"
         )
-        // Functional probe AS bench through the bridge; egress success is a
-        // fail-closed error.
+        // Functional probe AS bench through the bridge, with a trusted-uid
+        // control probe so "box offline" is never mistaken for "PF live".
         #expect(egressStep.contains("sudo -n \"${MLXFAST_BENCH_EXEC}\" \"${MLXFAST_JOB_WS}\" /bin/bash -c \"${probe}\""))
+        #expect(egressStep.contains("trusted-uid egress probe failed"))
+        // Verified branch: a blocked bench probe passes (and starts verifying
+        // automatically once the operator ships the PF block).
+        #expect(egressStep.contains(
+            "benchmark: bench network egress lockdown verified (bench-uid egress blocked)"
+        ))
+        // Enforcing branch: open egress with the lockdown provisioned fails
+        // closed. Provisioning is detected from the world-readable PF config
+        // or forced by the explicit override.
+        #expect(egressStep.contains("/etc/pf.conf /etc/pf.anchors/*"))
+        #expect(egressStep.contains("MLXFAST_REQUIRE_BENCH_EGRESS_LOCKDOWN"))
         #expect(egressStep.contains("bench network egress is NOT locked down"))
         #expect(egressStep.contains("refusing to run submitted code"))
+        // Dormant branch: no provisioned lockdown -> warn, never abort.
+        #expect(egressStep.contains("PF bench-egress lockdown not yet active on this box"))
+        #expect(egressStep.contains("It will enforce automatically once the operator ships the PF lockdown."))
+        // The probe never reports "blocked" vacuously: a missing curl is a
+        // distinct no-verdict exit, and the probe pins the absolute path.
+        #expect(egressStep.contains("[ -x /usr/bin/curl ] || exit 2"))
     }
 }

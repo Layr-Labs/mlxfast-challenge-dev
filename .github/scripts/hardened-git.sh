@@ -27,6 +27,9 @@ if [[ -z "${git_bin}" ]]; then
   exit 1
 fi
 
+# safe.directory='*' only bypasses git's cross-uid ownership refusal (env -i +
+# HOME=/var/empty dropped the runner gitconfig that normally grants it); it
+# enables no config/hook execution -- those vectors are neutralized above it.
 exec env -i \
   PATH="${PATH}" \
   GIT_CONFIG_GLOBAL=/dev/null \
