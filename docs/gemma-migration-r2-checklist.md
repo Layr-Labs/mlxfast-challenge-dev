@@ -15,7 +15,7 @@ Nothing here changed the R2 secret/env plumbing (`R2_ACCESS_KEY_ID`,
 correct. Only the *contents* of the private objects (and the pins that
 verify them) were regenerated.
 
-## 1. Hidden correctness/benchmark golden (R2) — DONE (uploaded 2026-07-09)
+## 1. Hidden correctness golden (R2) — DONE (uploaded 2026-07-09)
 
 - **Object:** `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json`
 - **Contents:** 512-token base prompt retokenized with the Gemma tokenizer;
@@ -23,11 +23,12 @@ verify them) were regenerated.
   the trusted Gemma 4 31B 4-bit rebase reference; a
   `correctness_gates.free_run` gate covering the full timed decode offset
   range (`attach-free-run-gate` defaults, 128 steps); and the benchmark
-  oracle (prefill next token, 512-token decode seed next token, 256 timed
-  decode tokens). Per-prompt `baseline_*_seconds_per_token` calibration is
-  intentionally omitted: the ranked pipeline measures the pinned reference
-  baseline live on the same box, so no golden-carried calibration is needed
-  there, and local modes fall back to the calibrated constants.
+  section required by the common harness schema. That section is not the
+  ranked timed target: the ranked measurement wrapper self-generates its own
+  oracle from the separately provisioned private timed prompt. Per-prompt
+  `baseline_*_seconds_per_token` calibration is intentionally omitted: the
+  ranked pipeline measures the pinned reference baseline live on the same box,
+  and local modes fall back to the calibrated constants.
 - **Consumed by:** `.github/workflows/benchmark.yml` — the single ranked
   job's "Prepare hidden correctness golden" step downloads and pin-verifies
   the raw object; "Attach GPQA gates and verify augmented golden" then
