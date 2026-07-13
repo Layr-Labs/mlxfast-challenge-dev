@@ -710,10 +710,37 @@ final class Gemma4FastLayer {
             }
         } else {
             queries = rawQueries.reshaped(B, L, nHeads, headDim)
-            queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
+            if !usesFusedAttentionPreparation && !usesCombinedQKVPrefillPreparation {
+                // Fused RMSNorm + RoPE on the contiguous [B, L, n_heads, head_dim]
+                // tensor — replaces 2 launches (MLXFast.rmsNorm + rope) with 1.
+                let positions = gemma4BuildFusedPositions(start: offset, length: B * L)
+                queries = Gemma4FusedRMSNormRoPE.apply(
+                    x: queries,
+                    weight: qNormWeight,
+                    positions: positions,
+                    eps: Float(eps),
+                    headDim: headDim,
+                    isSliding: isSliding
+                )
+            } else {
+                queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: Float(eps))
+            }
+            queries = queries.transposed(0, 2, 1, 3)
 
             let shapedKeys = rawKeys.reshaped(B, L, nKvHeads, headDim)
-            keys = MLXFast.rmsNorm(shapedKeys, weight: kNormWeight!, eps: eps)
+            if !usesFusedAttentionPreparation && !usesCombinedKVPrefillPreparation {
+                let positions = gemma4BuildFusedPositions(start: offset, length: B * L)
+                keys = Gemma4FusedRMSNormRoPE.apply(
+                    x: shapedKeys,
+                    weight: kNormWeight!,
+                    positions: positions,
+                    eps: Float(eps),
+                    headDim: headDim,
+                    isSliding: isSliding
+                )
+            } else {
+                keys = MLXFast.rmsNorm(shapedKeys, weight: kNormWeight!, eps: Float(eps))
+            }
             keys = keys.transposed(0, 2, 1, 3)
 
             if let rawValues {
@@ -726,7 +753,8 @@ final class Gemma4FastLayer {
             values = values.transposed(0, 2, 1, 3)
         }
         if !usesFusedAttentionPreparation && !usesCombinedKVPrefillPreparation {
-            keys = rope(keys, offset: offset)
+            // keys was already RoPE'd in the fused path
+            _ = keys
         }
 
         if let cache,
@@ -1096,24 +1124,9 @@ final class Gemma4FastEngine {
 
             let rope: RoPELayer
             if isSliding {
-                rope = initializeRope(
-                    dims: headDim,
-                    base: config.slidingRopeTheta,
-                    traditional: false,
-                    scalingConfig: nil,
-                    maxPositionEmbeddings: nil
-                )
+                rope = Gemma4PartialRoPEMetalTile(dims: headDim)
             } else {
-                rope = initializeRope(
-                    dims: headDim,
-                    base: config.fullRopeTheta,
-                    traditional: false,
-                    scalingConfig: [
-                        "type": .string("proportional"),
-                        "partial_rotary_factor": .float(config.fullPartialRotaryFactor),
-                    ],
-                    maxPositionEmbeddings: nil
-                )
+                rope = Gemma4PartialRoPEMetalTile(dims: headDim)
             }
 
             let vProj: QuantizedLinear?
