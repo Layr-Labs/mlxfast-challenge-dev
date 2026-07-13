@@ -990,13 +990,45 @@ jobs:
       # present (the gates phase) -- closing the "saw hidden tokens -> a file
       # survives into the timed measurement" bridge. Runner-owned, so the bench
       # uid cannot tamper with the manifest.
+      #
+      # The bench-owned TMPDIR scratch (${MLXFAST_JOB_WS}/tmp, provisioned by
+      # the bridge) is purged THROUGH the bridge first: the runner uid cannot
+      # unlink inside a bench-owned directory, so leaving scratch behind would
+      # either park bench-written bytes where the timed phase could read them
+      # or force the scrub to fail on files it cannot delete. Purging as bench
+      # (which owns the scratch; same pattern as the end-of-job cleanup)
+      # removes the residual instead of allowlisting it. The remaining
+      # tolerated find skips are bench-private 0700 module caches inside
+      # .build/ -- an allowlisted path the scrub never walks, kept consistent
+      # by construction; any find error other than Permission denied fails
+      # the snapshot closed.
       - name: Snapshot post-transform workspace
         if: ${{ inputs.run_benchmark }}
         run: |
           set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" /bin/bash -c '
+              set -u
+              if [ -d "${MJOB_WS}/tmp" ]; then
+                find "${MJOB_WS}/tmp" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+              fi
+            '
           manifest="${MLXFAST_PRIVATE_DIR}/post-transform-manifest.nul"
-          ( cd "${MLXFAST_JOB_WS}" && find . -mindepth 1 \( -type f -o -type l \) -print0 ) \
+          find_err="${MLXFAST_PRIVATE_DIR}/post-transform-find.err"
+          set +e
+          ( cd "${MLXFAST_JOB_WS}" && find . -mindepth 1 \( -type f -o -type l \) -print0 2> "${find_err}" ) \
             | LC_ALL=C sort -z > "${manifest}"
+          set -e
+          if [[ -s "${find_err}" ]]; then
+            if grep -vq 'Permission denied' "${find_err}"; then
+              echo "::error::workspace snapshot hit unexpected find errors (only bench-private Permission denied subtrees are tolerated):" >&2
+              cat "${find_err}" >&2
+              exit 1
+            fi
+            skipped="$(grep -c 'Permission denied' "${find_err}" | tr -d ' ')"
+            echo "benchmark: snapshot skipped ${skipped} bench-private (0700) subtrees the runner cannot read; the scrub is equally blind there and end-of-job cleanup wipes them"
+          fi
+          test -s "${manifest}"
           count="$(tr -cd '\0' < "${manifest}" | wc -c | tr -d ' ')"
           echo "benchmark: snapshotted ${count} pre-hidden workspace files for the allowlist scrub"
 
@@ -1316,6 +1348,19 @@ jobs:
           rm -f "${MLXFAST_JOB_WS}/correctness_golden_ranked.json"
           rm -rf "${MLXFAST_JOB_WS}/private"
           mkdir -p "${MLXFAST_JOB_WS}/private"
+          # Purge the bench-owned TMPDIR scratch THROUGH the bridge (the
+          # runner uid cannot unlink inside bench-owned dirs, and 0700
+          # scratch subdirs written during gates stay readable to the
+          # same-uid timed workers -- a gates->timed bridge the manifest
+          # diff cannot see). Same pattern as the snapshot step and the
+          # end-of-job cleanup.
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" /bin/bash -c '
+              set -u
+              if [ -d "${MJOB_WS}/tmp" ]; then
+                find "${MJOB_WS}/tmp" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+              fi
+            '
           manifest="${MLXFAST_PRIVATE_DIR}/post-transform-manifest.nul"
           test -s "${manifest}"
           scrub_failed=0

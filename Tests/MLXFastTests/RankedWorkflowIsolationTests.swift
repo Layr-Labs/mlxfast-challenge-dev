@@ -116,6 +116,15 @@ struct RankedWorkflowIsolationTests {
         #expect(snapshotStep.contains("-type f -o -type l"))
         #expect(snapshotStep.contains("-print0"))
         #expect(snapshotStep.contains("sort -z"))
+        // The bench-owned TMPDIR scratch is purged THROUGH the bridge before
+        // the manifest is recorded (the runner uid cannot unlink inside
+        // bench-owned dirs), and only bench-private Permission denied subtrees
+        // are tolerated by the manifest walk -- anything else fails closed.
+        #expect(snapshotStep.contains(
+            "find \"${MJOB_WS}/tmp\" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +"
+        ))
+        #expect(snapshotStep.contains("post-transform-find.err"))
+        #expect(snapshotStep.contains("only bench-private Permission denied subtrees are tolerated"))
 
         let scrubStep = try stepBody(
             workflow,
@@ -125,6 +134,11 @@ struct RankedWorkflowIsolationTests {
         // Explicit hidden-file removal is kept.
         #expect(scrubStep.contains("rm -f \"${MLXFAST_JOB_WS}/correctness_golden_ranked.json\""))
         #expect(scrubStep.contains("rm -rf \"${MLXFAST_JOB_WS}/private\""))
+        // Gates-phase bench TMPDIR scratch is purged through the bridge too,
+        // so 0700 bench scratch cannot bridge hidden-phase bytes into timing.
+        #expect(scrubStep.contains(
+            "find \"${MJOB_WS}/tmp\" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +"
+        ))
         // Allowlist diff against the pre-hidden snapshot, fail-closed.
         #expect(scrubStep.contains("post-transform-manifest.nul"))
         #expect(scrubStep.contains("grep -zqxF -- \"${rel}\" \"${manifest}\""))
