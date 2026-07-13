@@ -41,6 +41,34 @@ private let gemma4VerifyStagedSlidingPrefillAttentionBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+private let gemma4FusedSlidingQKVAttentionPreparationEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_FUSED_SLIDING_QKV_RMS"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+/// The maximum-sized topology is retained solely as an explicit diagnostic
+/// control for paired kernel experiments. Ordinary production always selects
+/// the materially distinct 512-thread tiled implementation.
+private let gemma4FusedSlidingQKVAttentionPreparationTopology: FusedSlidingQKVAttentionPreparationTopology = {
+    let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_FUSED_SLIDING_QKV_RMS_TOPOLOGY"
+    ]?.lowercased()
+    return raw == "head1024" ? .head1024 : .tiled512
+}()
+
+private let gemma4VerifyFusedSlidingQKVAttentionPreparationBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_FUSED_SLIDING_QKV_RMS_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -135,6 +163,8 @@ final class Gemma4FastLayer {
     let fusedQK: FusedFullQKProjection?
     let combinedAttentionPrefill: CombinedAttentionPrefillProjection?
     let fusedAttentionRMS: FusedAttentionRMSPreparation?
+    let fusedSlidingQKVAttentionPreparation:
+        FusedSlidingQKVAttentionPreparation?
     let fusedAttentionToMLPBoundary: FusedAttentionToMLPBoundary?
     let fusedMLPToNextBoundary: FusedMLPToNextBoundary?
 
@@ -217,6 +247,7 @@ final class Gemma4FastLayer {
         } else {
             fusedQKVEnabled = true
         }
+        let fusedSlidingQKVProjection: FusedSlidingQKVProjection?
         if fusedQKVEnabled,
            isSliding,
            let vProjection,
@@ -232,7 +263,7 @@ final class Gemma4FastLayer {
                vMetadata: vIndexedMetadata
            )
         {
-            self.fusedQKV = FusedSlidingQKVProjection(
+            let projection = FusedSlidingQKVProjection(
                 q: qProjection,
                 k: kProjection,
                 v: vProjection,
@@ -240,8 +271,11 @@ final class Gemma4FastLayer {
                 kMetadata: kIndexedMetadata,
                 vMetadata: vIndexedMetadata
             )
+            self.fusedQKV = projection
+            fusedSlidingQKVProjection = projection
         } else {
             self.fusedQKV = nil
+            fusedSlidingQKVProjection = nil
         }
         let fusedQKEnabled: Bool
         if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_FULL_QK"] {
@@ -308,7 +342,7 @@ final class Gemma4FastLayer {
         } else {
             fusedAttentionRMSEnabled = true
         }
-        self.fusedAttentionRMS = fusedAttentionRMSEnabled
+        let fusedAttentionRMSPreparation = fusedAttentionRMSEnabled
             ? FusedAttentionRMSPreparation(
                 isSliding: isSliding,
                 headDim: headDim,
@@ -316,6 +350,21 @@ final class Gemma4FastLayer {
                 qNormWeight: qNorm.weight,
                 kNormWeight: kNorm?.weight,
                 eps: eps
+            )
+            : nil
+        self.fusedAttentionRMS = fusedAttentionRMSPreparation
+        self.fusedSlidingQKVAttentionPreparation =
+            gemma4FusedSlidingQKVAttentionPreparationEnabled
+                || gemma4VerifyFusedSlidingQKVAttentionPreparationBits
+            ? FusedSlidingQKVAttentionPreparation(
+                projection: fusedSlidingQKVProjection,
+                preparation: fusedAttentionRMSPreparation,
+                useCandidate:
+                    gemma4FusedSlidingQKVAttentionPreparationEnabled,
+                verifyBits:
+                    gemma4VerifyFusedSlidingQKVAttentionPreparationBits,
+                topology:
+                    gemma4FusedSlidingQKVAttentionPreparationTopology
             )
             : nil
         self.inputNormWeight = inputNorm.weight
@@ -523,226 +572,252 @@ final class Gemma4FastLayer {
         let (B, L, _) = (h.dim(0), h.dim(1), h.dim(2))
         let offset = cache?.offset ?? 0
 
-        let rawQueries: MLXArray
-        let rawKeys: MLXArray
-        let rawValues: MLXArray?
-        if B == 1, L == 1, let fusedQKV {
-            let projected = fusedQKV(h)
-            rawQueries = projected.0
-            rawKeys = projected.1
-            rawValues = projected.2
-        } else if B == 1, L == 1, let fusedQK {
-            let projected = fusedQK(h)
-            rawQueries = projected.0
-            rawKeys = projected.1
-            rawValues = nil
-        } else if B == 1,
-                  L > 1,
-                  h.dtype == .bfloat16,
-                  let combinedAttentionPrefill
-        {
-            let projected = combinedAttentionPrefill(h)
-            rawQueries = projected.queries
-            rawKeys = projected.keys
-            rawValues = projected.values
-        } else {
-            rawQueries = qProj(h)
-            rawKeys = kProj(h)
-            rawValues = vProj?(h)
-        }
-
         var queries: MLXArray
         var keys: MLXArray
         var values: MLXArray
-        let usesFusedAttentionPreparation = B == 1
-            && L == 1
-            && fusedAttentionRMS?.supports(offset: offset) == true
         let combinedCache = gemma4CombinedKVDirectEnabled()
             ? cache as? Gemma4CombinedKVCache
             : nil
-        let usesCombinedKVDecodePreparation = usesFusedAttentionPreparation
-            && combinedCache != nil
-        let combinedPrefillCapacity = B == 1
-            && L > 1
-            && gemma4CombinedKVPrefillEnabled()
-            && fusedAttentionRMS?.supportsPrefill(offset: offset, length: L) == true
-            ? combinedCache?.directPrefillCapacity(for: L)
-            : nil
-        let usesCombinedKVPrefillPreparation = combinedPrefillCapacity != nil
-        let usesCombinedQKVPrefillPreparation =
-            usesCombinedKVPrefillPreparation
-            && offset == 0
+        let usesFusedSlidingQKVAttentionPreparation = B == 1
+            && L == 1
+            && isSliding
             && h.dtype == .bfloat16
-            && combinedAttentionPrefill != nil
-            && (gemma4CombinedQKVPrefillPreparationEnabled
-                || gemma4VerifyCombinedQKVPrefillPreparationBits)
-        if usesCombinedKVDecodePreparation,
-           let fusedAttentionRMS,
+            && combinedCache != nil
+            && fusedSlidingQKVAttentionPreparation?.supports(
+                offset: offset
+            ) == true
+        if usesFusedSlidingQKVAttentionPreparation,
+           let fusedSlidingQKVAttentionPreparation,
            let combinedCache
         {
-            let prepared = fusedAttentionRMS.callCombined(
-                rawQueries: rawQueries,
-                rawKeys: rawKeys,
-                rawValues: rawValues,
+            // Select this route before constructing the raw projection graph:
+            // production mode has no raw Q/K/V output arrays or second prep
+            // dispatch. Verifier-only mode computes the reference internally
+            // and deliberately returns it after a raw-UInt16 comparison.
+            let prepared = fusedSlidingQKVAttentionPreparation(
+                h,
                 offset: offset
             )
             queries = prepared.queries
             let updated = combinedCache.updateCombined(prepared.combinedKV)
             keys = updated.0
             values = updated.1
-        } else if usesFusedAttentionPreparation, let fusedAttentionRMS {
-            let prepared = fusedAttentionRMS(
-                rawQueries: rawQueries,
-                rawKeys: rawKeys,
-                rawValues: rawValues,
-                offset: offset
-            )
-            queries = prepared.0
-            keys = prepared.1
-            values = prepared.2
-        } else if usesCombinedQKVPrefillPreparation,
-                  let fusedAttentionRMS,
-                  let combinedCache,
-                  let combinedPrefillCapacity
-        {
-            let candidate = fusedAttentionRMS.callCombinedQKVPrefill(
-                rawQueries: rawQueries,
-                rawKeys: rawKeys,
-                rawValues: rawValues,
-                offset: offset,
-                length: L,
-                capacity: combinedPrefillCapacity
-            )
-            var selectedQueries = candidate.queries
-            var selectedCombinedKV = candidate.combinedKV
+        } else {
+            let rawQueries: MLXArray
+            let rawKeys: MLXArray
+            let rawValues: MLXArray?
+            if B == 1, L == 1, let fusedQKV {
+                let projected = fusedQKV(h)
+                rawQueries = projected.0
+                rawKeys = projected.1
+                rawValues = projected.2
+            } else if B == 1, L == 1, let fusedQK {
+                let projected = fusedQK(h)
+                rawQueries = projected.0
+                rawKeys = projected.1
+                rawValues = nil
+            } else if B == 1,
+                      L > 1,
+                      h.dtype == .bfloat16,
+                      let combinedAttentionPrefill
+            {
+                let projected = combinedAttentionPrefill(h)
+                rawQueries = projected.queries
+                rawKeys = projected.keys
+                rawValues = projected.values
+            } else {
+                rawQueries = qProj(h)
+                rawKeys = kProj(h)
+                rawValues = vProj?(h)
+            }
 
-            if gemma4VerifyCombinedQKVPrefillPreparationBits {
-                var referenceQueries = rawQueries.reshaped(
-                    B, L, nHeads, headDim)
-                referenceQueries = MLXFast.rmsNorm(
-                    referenceQueries, weight: qNormWeight, eps: eps)
-                referenceQueries = referenceQueries.transposed(0, 2, 1, 3)
-                referenceQueries = rope(referenceQueries, offset: offset)
-                let referenceCombinedKV = fusedAttentionRMS.callCombinedPrefill(
+            let usesFusedAttentionPreparation = B == 1
+                && L == 1
+                && fusedAttentionRMS?.supports(offset: offset) == true
+            let usesCombinedKVDecodePreparation = usesFusedAttentionPreparation
+                && combinedCache != nil
+            let combinedPrefillCapacity = B == 1
+                && L > 1
+                && gemma4CombinedKVPrefillEnabled()
+                && fusedAttentionRMS?.supportsPrefill(offset: offset, length: L) == true
+                ? combinedCache?.directPrefillCapacity(for: L)
+                : nil
+            let usesCombinedKVPrefillPreparation = combinedPrefillCapacity != nil
+            let usesCombinedQKVPrefillPreparation =
+                usesCombinedKVPrefillPreparation
+                && offset == 0
+                && h.dtype == .bfloat16
+                && combinedAttentionPrefill != nil
+                && (gemma4CombinedQKVPrefillPreparationEnabled
+                    || gemma4VerifyCombinedQKVPrefillPreparationBits)
+            if usesCombinedKVDecodePreparation,
+               let fusedAttentionRMS,
+               let combinedCache
+            {
+                let prepared = fusedAttentionRMS.callCombined(
+                    rawQueries: rawQueries,
+                    rawKeys: rawKeys,
+                    rawValues: rawValues,
+                    offset: offset
+                )
+                queries = prepared.queries
+                let updated = combinedCache.updateCombined(prepared.combinedKV)
+                keys = updated.0
+                values = updated.1
+            } else if usesFusedAttentionPreparation, let fusedAttentionRMS {
+                let prepared = fusedAttentionRMS(
+                    rawQueries: rawQueries,
+                    rawKeys: rawKeys,
+                    rawValues: rawValues,
+                    offset: offset
+                )
+                queries = prepared.0
+                keys = prepared.1
+                values = prepared.2
+            } else if usesCombinedQKVPrefillPreparation,
+                      let fusedAttentionRMS,
+                      let combinedCache,
+                      let combinedPrefillCapacity
+            {
+                let candidate = fusedAttentionRMS.callCombinedQKVPrefill(
+                    rawQueries: rawQueries,
                     rawKeys: rawKeys,
                     rawValues: rawValues,
                     offset: offset,
                     length: L,
                     capacity: combinedPrefillCapacity
                 )
-                let queriesMatch = arrayEqual(
-                    candidate.queries.view(dtype: .uint16),
-                    referenceQueries.view(dtype: .uint16)
-                )
-                let combinedKVMatches = arrayEqual(
-                    candidate.combinedKV.view(dtype: .uint16),
-                    referenceCombinedKV.view(dtype: .uint16)
-                )
-                eval(queriesMatch, combinedKVMatches)
-                precondition(
-                    queriesMatch.item(Bool.self),
-                    "combined QKV prefill queries differ from stock RMSNorm/RoPE"
-                )
-                precondition(
-                    combinedKVMatches.item(Bool.self),
-                    "combined QKV prefill cache differs from K/V-only preparation"
-                )
-                if !gemma4CombinedQKVPrefillPreparationEnabled {
-                    selectedQueries = referenceQueries
-                    selectedCombinedKV = referenceCombinedKV
+                var selectedQueries = candidate.queries
+                var selectedCombinedKV = candidate.combinedKV
+
+                if gemma4VerifyCombinedQKVPrefillPreparationBits {
+                    var referenceQueries = rawQueries.reshaped(
+                        B, L, nHeads, headDim)
+                    referenceQueries = MLXFast.rmsNorm(
+                        referenceQueries, weight: qNormWeight, eps: eps)
+                    referenceQueries = referenceQueries.transposed(0, 2, 1, 3)
+                    referenceQueries = rope(referenceQueries, offset: offset)
+                    let referenceCombinedKV = fusedAttentionRMS.callCombinedPrefill(
+                        rawKeys: rawKeys,
+                        rawValues: rawValues,
+                        offset: offset,
+                        length: L,
+                        capacity: combinedPrefillCapacity
+                    )
+                    let queriesMatch = arrayEqual(
+                        candidate.queries.view(dtype: .uint16),
+                        referenceQueries.view(dtype: .uint16)
+                    )
+                    let combinedKVMatches = arrayEqual(
+                        candidate.combinedKV.view(dtype: .uint16),
+                        referenceCombinedKV.view(dtype: .uint16)
+                    )
+                    eval(queriesMatch, combinedKVMatches)
+                    precondition(
+                        queriesMatch.item(Bool.self),
+                        "combined QKV prefill queries differ from stock RMSNorm/RoPE"
+                    )
+                    precondition(
+                        combinedKVMatches.item(Bool.self),
+                        "combined QKV prefill cache differs from K/V-only preparation"
+                    )
+                    if !gemma4CombinedQKVPrefillPreparationEnabled {
+                        selectedQueries = referenceQueries
+                        selectedCombinedKV = referenceCombinedKV
+                    }
                 }
-            }
 
-            queries = selectedQueries
-            let updated = combinedCache.adoptDirectPrefill(
-                selectedCombinedKV, length: L)
-            keys = updated.0
-            values = updated.1
-        } else if usesCombinedKVPrefillPreparation,
-                  let fusedAttentionRMS,
-                  let combinedCache,
-                  let combinedPrefillCapacity
-        {
-            // Preserve the stock query path exactly. K/V normalization,
-            // transposition, RoPE, cache layout, and capacity reservation are
-            // emitted directly by one multi-token Metal kernel. `rawQueries`
-            // may come from the promoted combined Q/K/V prefill projection;
-            // keeping it here preserves that dispatch and its single QMM.
-            queries = rawQueries.reshaped(B, L, nHeads, headDim)
-            queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
-            let combined = fusedAttentionRMS.callCombinedPrefill(
-                rawKeys: rawKeys,
-                rawValues: rawValues,
-                offset: offset,
-                length: L,
-                capacity: combinedPrefillCapacity
-            )
-            let updated = combinedCache.adoptDirectPrefill(combined, length: L)
-            keys = updated.0
-            values = updated.1
-            if gemma4VerifyCombinedKVPrefillBitsEnabled() {
-                let shapedKeys = rawKeys.reshaped(B, L, nKvHeads, headDim)
-                var referenceKeys = MLXFast.rmsNorm(
-                    shapedKeys, weight: kNormWeight!, eps: eps)
-                    .transposed(0, 2, 1, 3)
-                referenceKeys = rope(referenceKeys, offset: offset)
-                let referenceValueInput = rawValues?.reshaped(
-                    B, L, nKvHeads, headDim
-                ) ?? shapedKeys
-                let referenceValues = MLXFast.rmsNorm(
-                    referenceValueInput,
-                    weight: MLXArray.mlxNone,
-                    eps: eps
-                ).transposed(0, 2, 1, 3)
-                let keysMatch = arrayEqual(
-                    keys.view(dtype: .uint16),
-                    referenceKeys.view(dtype: .uint16)
+                queries = selectedQueries
+                let updated = combinedCache.adoptDirectPrefill(
+                    selectedCombinedKV, length: L)
+                keys = updated.0
+                values = updated.1
+            } else if usesCombinedKVPrefillPreparation,
+                      let fusedAttentionRMS,
+                      let combinedCache,
+                      let combinedPrefillCapacity
+            {
+                // Preserve the stock query path exactly. K/V normalization,
+                // transposition, RoPE, cache layout, and capacity reservation are
+                // emitted directly by one multi-token Metal kernel. `rawQueries`
+                // may come from the promoted combined Q/K/V prefill projection;
+                // keeping it here preserves that dispatch and its single QMM.
+                queries = rawQueries.reshaped(B, L, nHeads, headDim)
+                queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
+                let combined = fusedAttentionRMS.callCombinedPrefill(
+                    rawKeys: rawKeys,
+                    rawValues: rawValues,
+                    offset: offset,
+                    length: L,
+                    capacity: combinedPrefillCapacity
                 )
-                let valuesMatch = arrayEqual(
-                    values.view(dtype: .uint16),
-                    referenceValues.view(dtype: .uint16)
-                )
-                eval(keysMatch, valuesMatch)
-                precondition(
-                    keysMatch.item(Bool.self) && valuesMatch.item(Bool.self),
-                    "direct combined KV prefill differs from stock RMSNorm/RoPE"
-                )
-            }
-        } else {
-            queries = rawQueries.reshaped(B, L, nHeads, headDim)
-            queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
-
-            let shapedKeys = rawKeys.reshaped(B, L, nKvHeads, headDim)
-            keys = MLXFast.rmsNorm(shapedKeys, weight: kNormWeight!, eps: eps)
-            keys = keys.transposed(0, 2, 1, 3)
-
-            if let rawValues {
-                values = rawValues.reshaped(B, L, nKvHeads, headDim)
+                let updated = combinedCache.adoptDirectPrefill(combined, length: L)
+                keys = updated.0
+                values = updated.1
+                if gemma4VerifyCombinedKVPrefillBitsEnabled() {
+                    let shapedKeys = rawKeys.reshaped(B, L, nKvHeads, headDim)
+                    var referenceKeys = MLXFast.rmsNorm(
+                        shapedKeys, weight: kNormWeight!, eps: eps)
+                        .transposed(0, 2, 1, 3)
+                    referenceKeys = rope(referenceKeys, offset: offset)
+                    let referenceValueInput = rawValues?.reshaped(
+                        B, L, nKvHeads, headDim
+                    ) ?? shapedKeys
+                    let referenceValues = MLXFast.rmsNorm(
+                        referenceValueInput,
+                        weight: MLXArray.mlxNone,
+                        eps: eps
+                    ).transposed(0, 2, 1, 3)
+                    let keysMatch = arrayEqual(
+                        keys.view(dtype: .uint16),
+                        referenceKeys.view(dtype: .uint16)
+                    )
+                    let valuesMatch = arrayEqual(
+                        values.view(dtype: .uint16),
+                        referenceValues.view(dtype: .uint16)
+                    )
+                    eval(keysMatch, valuesMatch)
+                    precondition(
+                        keysMatch.item(Bool.self) && valuesMatch.item(Bool.self),
+                        "direct combined KV prefill differs from stock RMSNorm/RoPE"
+                    )
+                }
             } else {
-                values = shapedKeys
+                queries = rawQueries.reshaped(B, L, nHeads, headDim)
+                queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
+
+                let shapedKeys = rawKeys.reshaped(B, L, nKvHeads, headDim)
+                keys = MLXFast.rmsNorm(shapedKeys, weight: kNormWeight!, eps: eps)
+                keys = keys.transposed(0, 2, 1, 3)
+
+                if let rawValues {
+                    values = rawValues.reshaped(B, L, nKvHeads, headDim)
+                } else {
+                    values = shapedKeys
+                }
+                values = MLXFast.rmsNorm(
+                    values, weight: MLXArray.mlxNone, eps: eps)
+                values = values.transposed(0, 2, 1, 3)
             }
-            values = MLXFast.rmsNorm(
-                values, weight: MLXArray.mlxNone, eps: eps)
-            values = values.transposed(0, 2, 1, 3)
-        }
-        if !usesFusedAttentionPreparation && !usesCombinedKVPrefillPreparation {
-            keys = rope(keys, offset: offset)
-        }
+            if !usesFusedAttentionPreparation && !usesCombinedKVPrefillPreparation {
+                keys = rope(keys, offset: offset)
+            }
 
-        if let cache,
-           !usesCombinedKVDecodePreparation,
-           !usesCombinedKVPrefillPreparation
-        {
-            let updated = cache.update(keys: keys, values: values)
-            keys = updated.0
-            values = updated.1
-        }
+            if let cache,
+               !usesCombinedKVDecodePreparation,
+               !usesCombinedKVPrefillPreparation
+            {
+                let updated = cache.update(keys: keys, values: values)
+                keys = updated.0
+                values = updated.1
+            }
 
-        if !usesFusedAttentionPreparation && !usesCombinedQKVPrefillPreparation {
-            queries = queries.transposed(0, 2, 1, 3)
-        }
-        if !usesFusedAttentionPreparation && !usesCombinedQKVPrefillPreparation {
-            queries = rope(queries, offset: offset)
+            if !usesFusedAttentionPreparation && !usesCombinedQKVPrefillPreparation {
+                queries = queries.transposed(0, 2, 1, 3)
+            }
+            if !usesFusedAttentionPreparation && !usesCombinedQKVPrefillPreparation {
+                queries = rope(queries, offset: offset)
+            }
         }
 
         var attentionMask = mask
