@@ -96,6 +96,21 @@ verify them) were regenerated.
     (the 1024 fixture's digest is
     `2de5474bbe707bcb2e8b71d7d771ffd9be70c252d3ecce7f1511aa2a50933b4d`).
 
+## 4b. Private timed decode target (R2) — STAGED, not yet uploaded
+
+- **Object:** `benchmark_prompts/timed_decode_lowsim_prose_v1.txt` (the
+  independent timed prefill/decode target introduced by the timed-decode
+  fairness change; see `docs/timed-decode-evaluation.md`).
+- **Pins:** `MLXFAST_TIMED_DECODE_PROMPT_SHA256` / `_BYTES` variables on the
+  `benchmark-private-prompts` environment. Set at upload time from the staged
+  artifact; validated by the workflow before any bench phase runs.
+- **Gate:** the target activates only after its M5-generated greedy
+  continuation passes `analyze-ngram-similarity` at
+  `benchmarkMaxPromptLookupHitRate` (3%), and after the coordinated
+  measure-job wrapper (explicit `--prompt/--prompt-sha256/--target-id`
+  interface, per-target oracle-cache identity) is deployed and the box
+  baseline calibration is refreshed on the new target per the RUNBOOK.
+
 ## 5. Ranked baseline — DONE (superseded by the on-box pinned baseline)
 
 - The ranked score no longer prices against a repo-pinned baseline ref or

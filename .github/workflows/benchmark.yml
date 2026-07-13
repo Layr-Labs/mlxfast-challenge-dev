@@ -167,7 +167,7 @@ jobs:
       # the exact fixture while operators rotate it without publishing it.
       # Keep the ID in sync with
       # MLXFastConstants.benchmarkEvaluationTargetID.
-      MLXFAST_TIMED_DECODE_TARGET_ID: heterogeneous-synthesis-v1
+      MLXFAST_TIMED_DECODE_TARGET_ID: lowsim-prose-v1
       MLXFAST_TIMED_DECODE_PROMPT_SHA256: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}
       MLXFAST_TIMED_DECODE_PROMPT_BYTES: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_BYTES }}
       # The private R2 object KEYS (MLXFAST_CORRECTNESS_GOLDEN_R2_PATH /
@@ -1441,7 +1441,7 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: benchmark_prompts/timed_decode_heterogeneous_synthesis_v1.txt
+          MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: benchmark_prompts/timed_decode_lowsim_prose_v1.txt
         run: |
           set -euo pipefail
           .github/scripts/download-r2-object.sh \

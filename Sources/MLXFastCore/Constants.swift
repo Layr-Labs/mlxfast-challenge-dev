@@ -68,7 +68,7 @@ public enum MLXFastConstants {
     // prompt bytes remain operator-provisioned; changing this identifier is a
     // ranking-contract change and forces build-hash-keyed timed oracles to be
     // regenerated.
-    public static let benchmarkEvaluationTargetID = "heterogeneous-synthesis-v1"
+    public static let benchmarkEvaluationTargetID = "lowsim-prose-v1"
     // Offline prompt-lookup susceptibility gate. The analyzer simulates a
     // longest recurrent suffix predictor over these orders. At <= 3% accepted
     // draft tokens, even an idealized zero-overhead predictor is capped near

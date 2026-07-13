@@ -19,23 +19,24 @@ Oracle cache identity must include the binary hash, evaluation target ID, and
 prompt SHA-256. A prompt rotation must therefore miss the old cache even when a
 binary did not otherwise change.
 
-## Target class
+## Target definition
 
-`heterogeneous-synthesis-v1` should be an organizer-authored, heterogeneous
-synthesis prompt. Use original prose that moves through several unrelated
-entities, concrete observations, numbers, and causal relationships, then asks
-for one coherent analytical continuation. Avoid copy/transcription tasks,
-repeated passages, dialogue refrains, numbered templates, tables, source-code
-boilerplate, and repeated headings. The first 512 Gemma tokenizer tokens must
-contain enough context and the complete response instruction.
+`lowsim-prose-v1` is an organizer-authored prose target selected by
+measurement, not by content class. The public contract is its shape and its
+gate: original text whose first 512 Gemma tokenizer tokens form the seed, and
+whose 129-token greedy continuation (the seed next-token plus the 128 checked
+decode tokens) passes the self-similarity metric below on the ranked M5
+hardware. The specific text, its subject matter, and its genre are private,
+exactly like the hidden correctness prompts; publishing the class would only
+help submissions specialize against it.
 
 This remains a representative text-generation workload: a normal 512-token
-prefill followed by a 129-token greedy continuation (the seed next-token plus
-the 128 checked decode tokens). Its varied vocabulary and changing sentence
-structure should make suffix matches point to inconsistent followers instead
-of long reusable runs. That expectation is not a substitute for measurement;
-the actual greedy continuation generated on the ranked M5 must pass the metric
-below before the target is activated.
+prefill followed by a 129-token greedy continuation. Authoring guidance for
+future rotations (which content shapes keep a greedy continuation diverse
+instead of collapsing into repetition) lives in the private operator RUNBOOK.
+Expectations are not a substitute for measurement: the actual greedy
+continuation generated on the ranked M5 must pass the metric below before a
+target is activated, and candidates that fail are discarded, not tuned around.
 
 ## Self-similarity metric
 
