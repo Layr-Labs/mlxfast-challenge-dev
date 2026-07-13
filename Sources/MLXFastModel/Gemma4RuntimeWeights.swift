@@ -26,12 +26,6 @@ public final class Gemma4RuntimeWeightCache {
     public let libraryModel: Gemma4RuntimeModel?
     public let loadError: Error?
 
-    private var cachedModelWeights: Gemma4ModelWeights?
-    private var cachedBlockWeights: [Int: Gemma4BlockWeights] = [:]
-    private var cachedAttentionWeights: [Int: Gemma4AttentionWeights] = [:]
-    private var cachedMLPWeights: [Int: Gemma4MLPWeights] = [:]
-    private var cachedAttentionSpecs: [Int: Gemma4AttentionSpec] = [:]
-
     public init(loader: Gemma4WeightLoader, config: Gemma4Config) {
         self.loader = loader
         self.config = config
@@ -46,10 +40,7 @@ public final class Gemma4RuntimeWeightCache {
             // The MLX M5 Max default commits after referencing 50 MiB. Many
             // 4-bit projections individually exceed that, so use a moderate
             // limit that can group adjacent kernels without long command buffers.
-            setenv("MLX_MAX_MB_PER_BUFFER", "320", 1)
-            // Decode's explicit async-eval groups remain the outer command-
-            // buffer boundary; let the referenced-buffer budget govern within them.
-            setenv("MLX_MAX_OPS_PER_BUFFER", "128", 1)
+            setenv("MLX_MAX_MB_PER_BUFFER", "128", 1)
             Memory.cacheLimit = 32 << 30
         }
         do {
@@ -76,9 +67,9 @@ public final class Gemma4RuntimeWeightCache {
         }
     }
 
-    /// One prefill-shaped forward (512 tokens), one single-token decode step,
-    /// and the optional exact two-token path against a throwaway cache. Inputs
-    /// are constant BOS tokens, so this is prompt-independent and cannot affect
+    /// One prefill-shaped forward (512 tokens) and one single-token decode
+    /// step against a throwaway cache, evaluated and discarded. Inputs are
+    /// constant BOS tokens, so this is prompt-independent and cannot affect
     /// model output; freed warmup buffers remain eligible for allocator reuse.
     private static func warmLibraryModel(_ model: Gemma4RuntimeModel) {
         let bosToken = Int32(2)
@@ -90,12 +81,6 @@ public final class Gemma4RuntimeWeightCache {
         eval(model(prefillTokens, cache: warmupCache))
         let decodeToken = MLXArray([bosToken], [1, 1])
         eval(model(decodeToken, cache: warmupCache))
-        if gemma4PromptLookupEnvironmentEnabled(ProcessInfo.processInfo.environment),
-           model.canRunExactPromptLookup(cache: warmupCache)
-        {
-            let pair = MLXArray([bosToken, bosToken], [1, 2])
-            eval(model.exactPromptLookupPair(pair, cache: warmupCache))
-        }
     }
 
     /// Construct and weight-load the mlx-swift-lm Gemma 4 text tower from the
@@ -156,51 +141,6 @@ public final class Gemma4RuntimeWeightCache {
                 ?? MLXFastError.invalidInput("Gemma 4 reference model was not loaded")
         }
         return libraryModel
-    }
-
-    public func attentionSpec(layerIndex: Int) -> Gemma4AttentionSpec {
-        if let spec = cachedAttentionSpecs[layerIndex] {
-            return spec
-        }
-        let spec = Gemma4AttentionSpec(layerIndex: layerIndex, config: config)
-        cachedAttentionSpecs[layerIndex] = spec
-        return spec
-    }
-
-    public func modelWeights() throws -> Gemma4ModelWeights {
-        if let cachedModelWeights {
-            return cachedModelWeights
-        }
-        let weights = try loader.modelWeights(config: config)
-        cachedModelWeights = weights
-        return weights
-    }
-
-    public func blockWeights(layerIndex: Int) throws -> Gemma4BlockWeights {
-        if let weights = cachedBlockWeights[layerIndex] {
-            return weights
-        }
-        let weights = try loader.blockWeights(layerIndex: layerIndex, config: config)
-        cachedBlockWeights[layerIndex] = weights
-        return weights
-    }
-
-    public func attentionWeights(layerIndex: Int) throws -> Gemma4AttentionWeights {
-        if let weights = cachedAttentionWeights[layerIndex] {
-            return weights
-        }
-        let weights = try loader.attentionWeights(layerIndex: layerIndex, config: config)
-        cachedAttentionWeights[layerIndex] = weights
-        return weights
-    }
-
-    public func mlpWeights(layerIndex: Int) throws -> Gemma4MLPWeights {
-        if let weights = cachedMLPWeights[layerIndex] {
-            return weights
-        }
-        let weights = try loader.mlpWeights(layerIndex: layerIndex, config: config)
-        cachedMLPWeights[layerIndex] = weights
-        return weights
     }
 
 }
