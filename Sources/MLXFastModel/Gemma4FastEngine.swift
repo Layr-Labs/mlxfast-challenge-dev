@@ -929,13 +929,15 @@ final class Gemma4FastEngine {
         )
         self.asyncLayerGroup = asyncLayerGroup
         if asyncLayerGroup > 0 {
+            // End the first phase after the six-layer motif's full-attention layer,
+            // then repeat every ten layers while preserving six frontiers.
             self.asyncLayerLead = min(
                 asyncLayerGroup,
                 max(
                     1,
                     Int(ProcessInfo.processInfo.environment[
                         "MLXFAST_ASYNC_LAYER_LEAD"
-                    ] ?? "1") ?? 1
+                    ] ?? "6") ?? 6
                 )
             )
         } else {
