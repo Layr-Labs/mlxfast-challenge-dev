@@ -23,24 +23,6 @@ private let gemma4VerifyCombinedQKVPrefillPreparationBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
-private let gemma4StagedSlidingPrefillAttentionEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_STAGED_SLIDING_PREFILL_ATTENTION"
-    ] else {
-        return true
-    }
-    return ["1", "true", "yes", "on"].contains(raw.lowercased())
-}()
-
-private let gemma4VerifyStagedSlidingPrefillAttentionBits: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_VERIFY_STAGED_SLIDING_PREFILL_ATTENTION_BITS"
-    ] else {
-        return false
-    }
-    return ["1", "true", "yes", "on"].contains(raw.lowercased())
-}()
-
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -753,67 +735,19 @@ final class Gemma4FastLayer {
             }
         }
 
-        let attention: MLXArray
-        let canUseStagedSlidingPrefill = B == 1
-            && L == 512
-            && offset == 0
-            && isSliding
-            && queries.dtype == .bfloat16
-            && queries.shape == [1, 32, 512, 256]
-            && keys.shape == [1, 16, 512, 256]
-            && values.shape == [1, 16, 512, 256]
-        if canUseStagedSlidingPrefill
-            && (gemma4StagedSlidingPrefillAttentionEnabled
-                || gemma4VerifyStagedSlidingPrefillAttentionBits)
-        {
-            let candidate = gemma4StagedSlidingPrefill512(
-                queries: queries,
-                keys: keys,
-                values: values
-            )
-            if gemma4VerifyStagedSlidingPrefillAttentionBits {
-                let reference = MLXFast.scaledDotProductAttention(
-                    queries: queries,
-                    keys: keys,
-                    values: values,
-                    scale: scale,
-                    mask: attentionMask
-                )
-                let matches = arrayEqual(
-                    candidate.view(dtype: .uint16),
-                    reference.view(dtype: .uint16)
-                )
-                eval(matches)
-                precondition(
-                    matches.item(Bool.self),
-                    "staged sliding prefill attention differs from stock SDPA"
-                )
-                attention = gemma4StagedSlidingPrefillAttentionEnabled
-                    ? candidate
-                    : reference
-            } else {
-                attention = candidate
-            }
-        } else if L > 1 && offset > 0 {
-            attention = gemma4FastAttentionFallback(
-                queries: queries,
-                keys: keys,
-                values: values,
-                scale: scale,
-                mask: attentionMask
-            )
-        } else {
-            // Prefer library SDPA: D=256 sliding uses fused vector kernel;
-            // D=512 full uses its internal fallback. Compiling our own D=512
-            // fallback changes the public near-tie reduction order.
-            attention = MLXFast.scaledDotProductAttention(
-                queries: queries,
-                keys: keys,
-                values: values,
-                scale: scale,
-                mask: attentionMask
-            )
-        }
+        // Always use the library SDPA — it dispatches D=256 through its fused
+        // vector kernel and D=512 through its internal fallback. The library
+        // handles GQA expansion, causal/array masks, and Float32 softmax
+        // internally in one fused Metal dispatch, which is faster than the
+        // manual matmul/softmax/matmul decomposition that was previously used
+        // for the L>1, offset>0 (seed decode prefill) path.
+        let attention = MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: keys,
+            values: values,
+            scale: scale,
+            mask: attentionMask
+        )
 
         let mergedAttention = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         let attnOut: MLXArray
@@ -885,74 +819,6 @@ final class Gemma4FastLayer {
             nextNormalized: nextNormalized
         )
     }
-}
-
-/// Manual attention fallback matching the library's batched/ragged path.
-private func gemma4FastAttentionFallback(
-    queries: MLXArray,
-    keys: MLXArray,
-    values: MLXArray,
-    scale: Float,
-    mask: MLXFast.ScaledDotProductAttentionMaskMode
-) -> MLXArray {
-    let (B, nQHeads, L, D) = (
-        queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3)
-    )
-    let nKVHeads = keys.dim(1)
-    let repeats = nQHeads / nKVHeads
-
-    var q = queries * scale
-    var k = keys
-    var v = values
-    if repeats > 1 {
-        q = q.reshaped([B, nKVHeads, repeats, L, D])
-        k = expandedDimensions(k, axis: 2)
-        v = expandedDimensions(v, axis: 2)
-    }
-
-    var scores = matmul(q, k.swappedAxes(-1, -2))
-
-    func applyMask(_ maskArray: MLXArray) {
-        var mask = maskArray
-        if scores.ndim == 5 && mask.ndim == 4 && mask.dim(0) == scores.dim(0) {
-            mask = expandedDimensions(mask, axis: 2)
-        }
-        if mask.dtype == .bool {
-            scores = MLX.where(
-                mask, scores, MLXArray(-Float.infinity, dtype: scores.dtype))
-        } else {
-            scores = scores + mask
-        }
-    }
-
-    switch mask {
-    case .none:
-        break
-    case .causal:
-        let qL = scores.dim(-2)
-        let kL = scores.dim(-1)
-        let qIndices = MLXArray(0..<qL) + MLXArray(kL - qL)
-        let kIndices = MLXArray(0..<kL)
-        let causalMask = greaterEqual(
-            expandedDimensions(qIndices, axis: -1),
-            expandedDimensions(kIndices, axis: -2))
-        applyMask(causalMask)
-    case .array(let maskArray):
-        applyMask(maskArray)
-    case .arrays(let maskArrays):
-        if let maskArray = maskArrays.first {
-            applyMask(maskArray)
-        }
-    }
-
-    var probs = softmax(scores.asType(.float32), axis: -1, precise: true)
-    probs = MLX.where(probs .!= probs, MLXArray(Float(0)), probs)
-    scores = probs.asType(scores.dtype)
-    var output = matmul(scores, v)
-    if repeats > 1 {
-        output = output.reshaped([B, nQHeads, L, values.dim(3)])
-    }
-    return output
 }
 
 /// High-performance Gemma 4 trunk built from the already-loaded library modules.
