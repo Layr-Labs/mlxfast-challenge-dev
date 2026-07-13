@@ -544,7 +544,7 @@ private let gemma4OutputCoTiledSlidingEnabled = gemma4OutputEnvironmentFlag(
 )
 private let gemma4OutputCoTiledFullEnabled = gemma4OutputEnvironmentFlag(
     "DARKBLOOM_OUTPUT_COTILED_FULL",
-    default: gemma4OutputCoTiledEnabled
+    default: false
 )
 
 private let gemma4VerifyOutputCoTiledBits = gemma4OutputEnvironmentFlag(
