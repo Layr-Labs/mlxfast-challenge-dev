@@ -53,8 +53,12 @@ struct Gemma4PromptLookupState: Equatable {
     }
 }
 
-/// Fixed generic N=6, k=1 lookup. Suffix lengths are tried longest-first, then
-/// prior starts newest-first, exactly matching the offline policy evaluator.
+/// Fixed generic N=6, k=1 lookup. Suffix lengths are tried longest-first and
+/// prior starts newest-first. A full six-token match and a suffix seen only once
+/// keep the promoted newest-source behavior. For shorter suffixes with two or
+/// more sources, the newest two must agree on their continuation; disagreement
+/// is an ambiguity signal and leaves the current token on the ordinary
+/// one-vector path.
 func gemma4PromptLookupDraft(tokens: [Int32]) -> Int32? {
     guard tokens.count >= 2 else { return nil }
     for length in stride(from: min(6, tokens.count), through: 1, by: -1) {
@@ -67,7 +71,24 @@ func gemma4PromptLookupDraft(tokens: [Int32]) -> Int32? {
                 break
             }
             if matches {
-                return tokens[start + length]
+                let newestContinuation = tokens[start + length]
+                guard length < 6, start > 0 else { return newestContinuation }
+                for olderStart in stride(from: start - 1, through: 0, by: -1) {
+                    var olderMatches = true
+                    for index in 0..<length
+                    where tokens[olderStart + index]
+                        != tokens[suffixStart + index]
+                    {
+                        olderMatches = false
+                        break
+                    }
+                    if olderMatches {
+                        return tokens[olderStart + length] == newestContinuation
+                            ? newestContinuation
+                            : nil
+                    }
+                }
+                return newestContinuation
             }
         }
     }
