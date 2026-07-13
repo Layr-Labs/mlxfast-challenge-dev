@@ -41,6 +41,24 @@ private let gemma4VerifyStagedSlidingPrefillAttentionBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+private let gemma4StagedFullPrefillAttentionEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_STAGED_FULL_PREFILL_ATTENTION"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+private let gemma4VerifyStagedFullPrefillAttentionBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_STAGED_FULL_PREFILL_ATTENTION_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -762,6 +780,14 @@ final class Gemma4FastLayer {
             && queries.shape == [1, 32, 512, 256]
             && keys.shape == [1, 16, 512, 256]
             && values.shape == [1, 16, 512, 256]
+        let canUseStagedFullPrefill = B == 1
+            && L == 512
+            && offset == 0
+            && !isSliding
+            && queries.dtype == .bfloat16
+            && queries.shape == [1, 32, 512, 512]
+            && keys.shape == [1, 4, 512, 512]
+            && values.shape == [1, 4, 512, 512]
         if canUseStagedSlidingPrefill
             && (gemma4StagedSlidingPrefillAttentionEnabled
                 || gemma4VerifyStagedSlidingPrefillAttentionBits)
@@ -789,6 +815,38 @@ final class Gemma4FastLayer {
                     "staged sliding prefill attention differs from stock SDPA"
                 )
                 attention = gemma4StagedSlidingPrefillAttentionEnabled
+                    ? candidate
+                    : reference
+            } else {
+                attention = candidate
+            }
+        } else if canUseStagedFullPrefill
+            && (gemma4StagedFullPrefillAttentionEnabled
+                || gemma4VerifyStagedFullPrefillAttentionBits)
+        {
+            let candidate = gemma4StagedFullPrefill512(
+                queries: queries,
+                keys: keys,
+                values: values
+            )
+            if gemma4VerifyStagedFullPrefillAttentionBits {
+                let reference = MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    scale: scale,
+                    mask: attentionMask
+                )
+                let matches = arrayEqual(
+                    candidate.view(dtype: .uint16),
+                    reference.view(dtype: .uint16)
+                )
+                eval(matches)
+                precondition(
+                    matches.item(Bool.self),
+                    "staged full prefill attention differs from stock SDPA"
+                )
+                attention = gemma4StagedFullPrefillAttentionEnabled
                     ? candidate
                     : reference
             } else {
