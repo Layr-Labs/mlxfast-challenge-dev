@@ -1429,6 +1429,55 @@ struct FusedGateUpProjection: @unchecked Sendable {
         exactTwoVectorMode != nil
     }
 
+    var supportsExactThreeVector: Bool {
+        exactTwoVectorMode != nil
+    }
+
+    func exactThreeVectorActivated(_ input: MLXArray) -> MLXArray {
+        precondition(input.dtype == .bfloat16 && input.shape == [3, 5_376])
+        guard let mode = exactTwoVectorMode,
+              let indexedGate,
+              let indexedUp
+        else {
+            preconditionFailure("exact three-vector gate/up payload is unavailable")
+        }
+        switch mode {
+        case .fixed12:
+            guard let coTiledFixed12GateUp else {
+                preconditionFailure("exact fixed12 gate/up payload is unavailable")
+            }
+            return gemma4ExactThreeVectorGateUpActivated(
+                payload: coTiledFixed12GateUp.words,
+                gateLUT: indexedGate.lut,
+                upLUT: indexedUp.lut,
+                input: input
+            )
+        case .u16:
+            return gemma4ExactThreeVectorU16GateUpActivated(
+                gateWeight: gate.weight,
+                gateIndices: indexedGate.indices,
+                gateLUT: indexedGate.lut,
+                upWeight: up.weight,
+                upIndices: indexedUp.indices,
+                upLUT: indexedUp.lut,
+                input: input
+            )
+        }
+    }
+
+    /// Qualification helper only. Production model code must not call this.
+    func exactThreeVectorDiagnostic(
+        _ input: MLXArray
+    ) -> (candidate: MLXArray, reference: MLXArray) {
+        precondition(input.dtype == .bfloat16 && input.shape == [3, 5_376])
+        let reference = concatenated([
+            activated(input[0..<1, 0...]),
+            activated(input[1..<2, 0...]),
+            activated(input[2..<3, 0...]),
+        ], axis: 0)
+        return (exactThreeVectorActivated(input), reference)
+    }
+
     func exactTwoVectorActivated(_ input: MLXArray) -> MLXArray {
         precondition(input.dtype == .bfloat16 && input.shape == [2, 5_376])
         guard let mode = exactTwoVectorMode,
