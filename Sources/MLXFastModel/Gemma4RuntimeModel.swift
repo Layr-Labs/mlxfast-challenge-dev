@@ -22,6 +22,7 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
 
     public let configuration: Gemma4TextConfiguration
     private var fastEngine: Gemma4FastEngine?
+    private var restoredRuntimeCacheLimit = false
 
     private static let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray = {
         let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { logits, cap in
@@ -55,6 +56,16 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        if !restoredRuntimeCacheLimit,
+           configuration.numHiddenLayers >= 16,
+           Memory.cacheLimit == 6 << 30
+        {
+            let gigabytes = Int(
+                ProcessInfo.processInfo.environment["DARKBLOOM_RUNTIME_CACHE_GB"] ?? "32"
+            ) ?? 32
+            Memory.cacheLimit = max(0, gigabytes) << 30
+            restoredRuntimeCacheLimit = true
+        }
         if let fastEngine {
             return fastEngine(inputs, cache: cache)
         }
