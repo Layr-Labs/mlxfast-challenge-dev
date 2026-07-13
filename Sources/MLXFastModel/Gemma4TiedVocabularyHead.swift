@@ -1,6 +1,63 @@
+import Foundation
 import MLX
 import MLXFastCore
 import MLXNN
+
+let gemma4TiedHeadRowsPerThreadgroup = 16
+let gemma4TiedHeadBlocks = 21
+let gemma4TiedHeadWeightWordsPerBlock = 512
+let gemma4TiedHeadMetadataWordsPerBlock = 26
+let gemma4TiedHeadPayloadWordsPerBlock = 538
+
+func gemma4TiedHeadCoTileWeightSourceWordIndex(
+    threadgroup: Int, block: Int, localRow: Int, word: Int
+) -> Int? {
+    guard (0..<16_384).contains(threadgroup), (0..<21).contains(block),
+          (0..<16).contains(localRow), (0..<32).contains(word) else { return nil }
+    return (threadgroup * 16 + localRow) * 672 + block * 32 + word
+}
+
+func gemma4PackTiedHeadCoTileMetadata(_ indices: [UInt16]) -> [UInt32]? {
+    guard indices.count == 262_144 * 84,
+          indices.allSatisfy({ $0 < 8_192 }) else { return nil }
+    var result = [UInt32](repeating: 0, count: 16_384 * 21 * 26)
+    for tg in 0..<16_384 {
+        for block in 0..<21 {
+            let destination = (tg * 21 + block) * 26
+            for row in 0..<16 {
+                let source = (tg * 16 + row) * 84 + block * 4
+                for group in 0..<4 {
+                    let field = row * 4 + group
+                    let bit = field * 13
+                    let word = bit >> 5
+                    let shift = bit & 31
+                    let value = UInt32(indices[source + group])
+                    result[destination + word] |= value << UInt32(shift)
+                    if shift > 19 {
+                        result[destination + word + 1] |= value >> UInt32(32 - shift)
+                    }
+                }
+            }
+        }
+    }
+    return result
+}
+
+func gemma4UnpackTiedHeadCoTileMetadata(
+    _ words: [UInt32], threadgroup: Int, block: Int,
+    localRow: Int, group: Int
+) -> UInt16? {
+    guard words.count == 16_384 * 21 * 26,
+          (0..<16_384).contains(threadgroup), (0..<21).contains(block),
+          (0..<16).contains(localRow), (0..<4).contains(group) else { return nil }
+    let bit = (localRow * 4 + group) * 13
+    let base = (threadgroup * 21 + block) * 26
+    let index = bit >> 5
+    let shift = bit & 31
+    var value = words[base + index] >> UInt32(shift)
+    if shift > 19 { value |= words[base + index + 1] << UInt32(32 - shift) }
+    return UInt16(value & 0x1fff)
+}
 
 private let gemma4TiedVocabularyHeadQMV = MLXFast.metalKernel(
     name: "gemma4_tied_vocabulary_head_qmv_262144x5376_v1",
@@ -235,11 +292,117 @@ private let gemma4TiedVocabularyHeadPacked13SoftcapQMV = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+private let gemma4TiedVocabularyHeadCoTiledPacked13SoftcapQMV = MLXFast.metalKernel(
+    name: "gemma4_tied_vocabulary_head_cotiled_packed13_softcap_qmv_v1",
+    inputNames: ["payload", "lut", "x", "cap"],
+    outputNames: ["output"],
+    source: """
+        constexpr int kRowsPerSIMD = 4;
+        constexpr int kSIMDGroupsPerThreadgroup = 4;
+        constexpr int kTileWords = 538;
+        const int tg = threadgroup_position_in_grid.y;
+        const int output_row = tg * 16 + simdgroup_index_in_threadgroup * 4;
+        const device bfloat* input = x + thread_index_in_simdgroup * 8;
+        float result[kRowsPerSIMD] = {0};
+        for (int block = 0; block < 21; ++block) {
+            const device uint* tile = payload + (tg * 21 + block) * kTileWords;
+            const device uint* metadata = tile + 512;
+            float values[8];
+            const float input_sum = gemma4_tied_head_cotiled_load_values(input, values);
+            const uint column = thread_index_in_simdgroup / 8;
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                const int local_row = simdgroup_index_in_threadgroup * 4 + row;
+                const device uchar* row_weight = reinterpret_cast<const device uchar*>(
+                    tile + local_row * 32) + thread_index_in_simdgroup * 4;
+                const ushort metadata_index = gemma4_tied_head_cotiled_extract13(
+                    metadata, local_row * 4 + column);
+                const uint pair = lut[metadata_index];
+                result[row] += gemma4_tied_head_cotiled_qdot(
+                    row_weight, values,
+                    gemma4_tied_head_cotiled_scale(pair),
+                    gemma4_tied_head_cotiled_bias(pair), input_sum);
+            }
+            input += 256;
+        }
+        for (int row = 0; row < kRowsPerSIMD; ++row) {
+            result[row] = simd_sum(result[row]);
+            if (thread_index_in_simdgroup == 0) {
+                const bfloat projected = static_cast<bfloat>(result[row]);
+                const float quotient = static_cast<float>(projected) / cap;
+                const float softened = metal::precise::tanh(quotient);
+                output[output_row + row] = softened * cap;
+            }
+        }
+        """,
+    header: """
+        using namespace metal;
+        inline ushort gemma4_tied_head_cotiled_extract13(const device uint* words, uint column) {
+            const uint bit = column * 13, wi = bit >> 5, shift = bit & 31;
+            uint value = words[wi] >> shift;
+            if (shift > 19) value |= words[wi + 1] << (32 - shift);
+            return static_cast<ushort>(value & 0x1fff);
+        }
+        inline float gemma4_tied_head_cotiled_scale(uint pair) {
+            return static_cast<float>(as_type<bfloat>(static_cast<ushort>(pair)));
+        }
+        inline float gemma4_tied_head_cotiled_bias(uint pair) {
+            return static_cast<float>(as_type<bfloat>(static_cast<ushort>(pair >> 16)));
+        }
+        inline float gemma4_tied_head_cotiled_load_values(const device bfloat* input, thread float* values) {
+            float sum = 0;
+            for (int index = 0; index < 8; index += 4) {
+                sum += input[index] + input[index + 1] + input[index + 2] + input[index + 3];
+                values[index] = input[index]; values[index + 1] = input[index + 1] / 16.0f;
+                values[index + 2] = input[index + 2] / 256.0f; values[index + 3] = input[index + 3] / 4096.0f;
+            }
+            return sum;
+        }
+        inline float gemma4_tied_head_cotiled_qdot(const device uchar* weight, const thread float* values,
+                                                    float scale, float bias, float input_sum) {
+            const device ushort* packed = reinterpret_cast<const device ushort*>(weight);
+            float accumulator = 0;
+            for (int index = 0; index < 2; ++index) {
+                accumulator += (values[4 * index] * (packed[index] & 0x000f)
+                    + values[4 * index + 1] * (packed[index] & 0x00f0)
+                    + values[4 * index + 2] * (packed[index] & 0x0f00)
+                    + values[4 * index + 3] * (packed[index] & 0xf000));
+            }
+            return scale * accumulator + input_sum * bias;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 private let gemma4TiedHeadMaximumPacked13LUTCount = 8_192
 
 struct Gemma4TiedHeadPacked13Metadata: @unchecked Sendable {
     let packedIndices: MLXArray
     let lut: MLXArray
+}
+
+private func gemma4MakeCoTiledTiedHeadPayload(
+    weight: MLXArray, metadata: Gemma4TiedHeadPacked13Metadata
+) -> MLXArray? {
+    let packed = metadata.packedIndices.asArray(UInt32.self)
+    var indices = [UInt16](repeating: 0, count: 262_144 * 84)
+    for row in 0..<262_144 {
+        for column in 0..<84 {
+            let bit = column * 13, word = bit >> 5, shift = bit & 31
+            var value = packed[row * 35 + word] >> UInt32(shift)
+            if shift > 19 { value |= packed[row * 35 + word + 1] << UInt32(32 - shift) }
+            indices[row * 84 + column] = UInt16(value & 0x1fff)
+        }
+    }
+    guard let metadataWords = gemma4PackTiedHeadCoTileMetadata(indices) else { return nil }
+    let weights = weight.reshaped(16_384, 16, 21, 32)
+        .transposed(0, 2, 1, 3).contiguous()
+        .reshaped(16_384, 21, 512)
+    // Each tile contains 16 rows × 32 U32 weight words = 512 words.
+    let metadataArray = MLXArray(metadataWords, [16_384, 21, 26])
+    let payload = concatenated([weights, metadataArray], axis: 2)
+    precondition(payload.dtype == .uint32 && payload.shape == [16_384, 21, 538])
+    eval(payload)
+    return payload
 }
 
 func validateGemma4TiedHeadPacked13MetadataLayout(
@@ -300,6 +463,9 @@ struct Gemma4TiedVocabularyHead: @unchecked Sendable {
     let scales: MLXArray
     let biases: MLXArray
     let packed13Metadata: Gemma4TiedHeadPacked13Metadata?
+    let coTiledPayload: MLXArray?
+    let useCoTiled: Bool
+    let verifyCoTiledBits: Bool
 
     init?(
         _ embedding: Embedding,
@@ -320,6 +486,12 @@ struct Gemma4TiedVocabularyHead: @unchecked Sendable {
         self.scales = embedding.scales
         self.biases = biases
         self.packed13Metadata = packed13Metadata
+        let environment = ProcessInfo.processInfo.environment
+        self.useCoTiled = environment["DARKBLOOM_TIED_HEAD_COTILED"] != "0"
+        self.verifyCoTiledBits = environment["DARKBLOOM_VERIFY_TIED_HEAD_COTILED_BITS"] == "1"
+        self.coTiledPayload = packed13Metadata.flatMap {
+            gemma4MakeCoTiledTiedHeadPayload(weight: embedding.weight, metadata: $0)
+        }
     }
 
     func callAsFunction(_ input: MLXArray) -> MLXArray {
@@ -342,13 +514,25 @@ struct Gemma4TiedVocabularyHead: @unchecked Sendable {
         guard let packed13Metadata else {
             preconditionFailure("tied vocabulary packed13 metadata was not prepared")
         }
-        return gemma4TiedVocabularyHeadPacked13SoftcapQMV(
-            [weight, packed13Metadata.packedIndices, packed13Metadata.lut, input, cap],
-            grid: (32, 65_536, 1),
-            threadGroup: (32, 4, 1),
-            outputShapes: [[1, 1, 262_144]],
-            outputDTypes: [.float32]
+        let current = {
+            gemma4TiedVocabularyHeadPacked13SoftcapQMV(
+                [weight, packed13Metadata.packedIndices, packed13Metadata.lut, input, cap],
+                grid: (32, 65_536, 1), threadGroup: (32, 4, 1),
+                outputShapes: [[1, 1, 262_144]], outputDTypes: [.float32]
+            )[0]
+        }
+        guard useCoTiled, let coTiledPayload else { return current() }
+        let candidate = gemma4TiedVocabularyHeadCoTiledPacked13SoftcapQMV(
+            [coTiledPayload, packed13Metadata.lut, input, cap],
+            grid: (32, 65_536, 1), threadGroup: (32, 4, 1),
+            outputShapes: [[1, 1, 262_144]], outputDTypes: [.float32]
         )[0]
+        if verifyCoTiledBits {
+            verifyRawFloat32(candidate, stock: current(), candidateName: "co-tiled packed13 fused-softcap",
+                             stockName: "packed13 fused-softcap")
+            return current()
+        }
+        return candidate
     }
 
     func verifyRawFloat32(
