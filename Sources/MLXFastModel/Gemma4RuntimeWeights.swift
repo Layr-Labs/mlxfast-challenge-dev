@@ -43,13 +43,19 @@ public final class Gemma4RuntimeWeightCache {
         // intermediate buffers for reuse. This is a soft allocator-cache cap,
         // not a reservation; model weights remain active allocations.
         if config.numHiddenLayers >= 16 {
-            // The MLX M5 Max default commits after referencing 50 MiB. Many
-            // 4-bit projections individually exceed that, so use a moderate
-            // limit that can group adjacent kernels without long command buffers.
-            setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
-            // Decode's explicit async-eval groups remain the outer command-
-            // buffer boundary; let the referenced-buffer budget govern within them.
-            setenv("MLX_MAX_OPS_PER_BUFFER", "128", 1)
+            // MLX_MAX_MB_PER_BUFFER caps counted array *elements* referenced by a
+            // command buffer, not storage bytes. Each decode layer references
+            // ~70-74M elements, so the promoted 512 groups only ~7 layers and
+            // still fragments each intended 10-layer async-eval group into ~7+3
+            // command buffers. Raise the budget past the full 10-layer sum
+            // (~745M) so the whole group commits once, at the engine's own
+            // async-eval boundary -- strictly fewer commits, same graph.
+            setenv("MLX_MAX_MB_PER_BUFFER", "1024", 1)
+            // Match the op budget to ~10 layers of dispatches; the promoted 128
+            // splits a group after dispatch 129, below the ten-layer boundary.
+            // Decode's explicit async-eval groups remain the outer command-buffer
+            // boundary; let the referenced-buffer budget govern within them.
+            setenv("MLX_MAX_OPS_PER_BUFFER", "192", 1)
             Memory.cacheLimit = 32 << 30
         }
         do {
