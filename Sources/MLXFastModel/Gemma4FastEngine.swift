@@ -41,6 +41,24 @@ private let gemma4VerifyStagedSlidingPrefillAttentionBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+private let gemma4FullAttentionD512ExactFallbackEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_FULL_ATTENTION_D512_EXACT_FALLBACK"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+private let gemma4VerifyFullAttentionD512ExactFallbackBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_FULL_ATTENTION_D512_EXACT_FALLBACK_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -794,6 +812,39 @@ final class Gemma4FastLayer {
             } else {
                 attention = candidate
             }
+        } else if (gemma4FullAttentionD512ExactFallbackEnabled
+                    || gemma4VerifyFullAttentionD512ExactFallbackBits)
+            && supportsGemma4FullAttentionD512ExactFallback(
+                queries: queries,
+                keys: keys,
+                values: values,
+                scale: scale,
+                mask: attentionMask
+            )
+        {
+            let candidate = gemma4FullAttentionD512ExactFallback(
+                queries: queries,
+                keys: keys,
+                values: values
+            )
+            if gemma4VerifyFullAttentionD512ExactFallbackBits {
+                let reference = MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    scale: scale,
+                    mask: attentionMask
+                )
+                verifyGemma4FullAttentionD512ExactFallbackBits(
+                    candidate: candidate,
+                    reference: reference
+                )
+                attention = gemma4FullAttentionD512ExactFallbackEnabled
+                    ? candidate
+                    : reference
+            } else {
+                attention = candidate
+            }
         } else if L > 1 && offset > 0 {
             attention = gemma4FastAttentionFallback(
                 queries: queries,
@@ -804,8 +855,9 @@ final class Gemma4FastLayer {
             )
         } else {
             // Prefer library SDPA: D=256 sliding uses fused vector kernel;
-            // D=512 full uses its internal fallback. Compiling our own D=512
-            // fallback changes the public near-tie reduction order.
+            // the exact D=512 decode geometry was handled above. Unsupported
+            // D=512 shapes and masks retain the internal fallback because a
+            // compiled replacement changes the public near-tie reduction.
             attention = MLXFast.scaledDotProductAttention(
                 queries: queries,
                 keys: keys,
