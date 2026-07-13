@@ -29,6 +29,7 @@ final class Gemma4CombinedKVCache: KVCache {
     private var lastPairAppendGeneration: Int?
     private var deferredCombinedPosition: Int?
     private var deferredCombinedGeneration: Int?
+    private var deferredCombinedCount = 0
     private(set) var offset: Int = 0
 
     init(fullStep step: Int = 256) {
@@ -174,10 +175,14 @@ final class Gemma4CombinedKVCache: KVCache {
         precondition(combined.ndim == 5)
         precondition(combined.dim(0) == 2)
         precondition(combined.dim(1) == 1)
-        precondition((1...2).contains(combined.dim(3)))
+        precondition((1...3).contains(combined.dim(3)))
         precondition(deferredCombinedPosition == nil)
-        precondition(lastPairAppendGeneration == nil)
+        // A singleton may immediately complete an exact 2+1 transaction. Keep
+        // the pair generation live so both speculative rows can be deferred.
+        precondition(lastPairAppendGeneration == nil || combined.dim(3) == 1)
 
+        let completesTriple = lastPairAppendGeneration == combinedMutationGeneration
+            && combined.dim(3) == 1
         convertSplitStorageIfNeeded(matching: combined)
         let result: (MLXArray, MLXArray)
         switch kind {
@@ -186,8 +191,11 @@ final class Gemma4CombinedKVCache: KVCache {
         case .rotating:
             result = updateRotating(combined)
         }
-        if combined.dim(3) == 2 {
+        if combined.dim(3) >= 2 {
             combinedMutationGeneration &+= 1
+            lastPairAppendGeneration = combinedMutationGeneration
+        } else if completesTriple {
+            // Preserve the generation marker established by the pair append.
             lastPairAppendGeneration = combinedMutationGeneration
         } else {
             lastPairAppendGeneration = nil
@@ -198,19 +206,19 @@ final class Gemma4CombinedKVCache: KVCache {
     /// Speculative pair appends deliberately avoid cache growth and ring wrap.
     /// This keeps one-position rollback metadata-only and guarantees that the
     /// older position needed by token zero remains available as a prefix view.
-    func canAppendCombinedPair() -> Bool {
-        guard deferredCombinedPosition == nil,
-              lastPairAppendGeneration == nil,
-              splitCache == nil,
-              let combinedStorage
-        else { return false }
+    func canAppendCombinedPair() -> Bool { canAppendCombinedPositions(2) }
+
+    func canAppendCombinedPositions(_ count: Int) -> Bool {
+        guard (1...3).contains(count), deferredCombinedPosition == nil,
+              lastPairAppendGeneration == nil, splitCache == nil,
+              let combinedStorage else { return false }
         switch kind {
         case .full:
-            return offset + 2 <= combinedStorage.dim(3)
+            return offset + count <= combinedStorage.dim(3)
         case .rotating(let maxSize, _, _):
             return offset == rotatingIndex
-                && offset + 2 <= maxSize
-                && rotatingIndex + 2 <= combinedStorage.dim(3)
+                && offset + count <= maxSize
+                && rotatingIndex + count <= combinedStorage.dim(3)
         }
     }
 
@@ -236,12 +244,18 @@ final class Gemma4CombinedKVCache: KVCache {
 
     @discardableResult
     func deferNewestCombinedPosition() -> Bool {
-        guard canDeferNewestCombinedPosition() else { return false }
-        offset -= 1
-        if rotatingMaxSize != nil {
-            rotatingIndex -= 1
+        deferNewestCombinedPositions(1)
+    }
+
+    @discardableResult
+    func deferNewestCombinedPositions(_ count: Int) -> Bool {
+        guard (1...2).contains(count), canDeferNewestCombinedPosition(), offset >= count else {
+            return false
         }
+        offset -= count
+        if rotatingMaxSize != nil { rotatingIndex -= count }
         deferredCombinedPosition = offset
+        deferredCombinedCount = count
         deferredCombinedGeneration = combinedMutationGeneration
         lastPairAppendGeneration = nil
         return true
@@ -267,11 +281,14 @@ final class Gemma4CombinedKVCache: KVCache {
     func recommitDeferredCombinedPosition() -> Bool {
         guard canRecommitDeferredCombinedPosition() else { return false }
         offset += 1
-        if rotatingMaxSize != nil {
-            rotatingIndex += 1
+        if rotatingMaxSize != nil { rotatingIndex += 1 }
+        deferredCombinedCount -= 1
+        if deferredCombinedCount == 0 {
+            deferredCombinedPosition = nil
+            deferredCombinedGeneration = nil
+        } else {
+            deferredCombinedPosition = offset
         }
-        deferredCombinedPosition = nil
-        deferredCombinedGeneration = nil
         return true
     }
 
@@ -294,8 +311,21 @@ final class Gemma4CombinedKVCache: KVCache {
         guard canDiscardDeferredCombinedPosition() else { return false }
         deferredCombinedPosition = nil
         deferredCombinedGeneration = nil
+        deferredCombinedCount = 0
         return true
     }
+
+    @discardableResult
+    func recommitOldestDeferredPosition() -> Bool {
+        recommitDeferredCombinedPosition()
+    }
+
+    @discardableResult
+    func discardAllDeferredPositions() -> Bool {
+        discardDeferredCombinedPosition()
+    }
+
+    var deferredCombinedPositions: Int { deferredCombinedCount }
 
     var hasDeferredCombinedPosition: Bool {
         deferredCombinedPosition != nil
@@ -343,7 +373,7 @@ final class Gemma4CombinedKVCache: KVCache {
     private func updateFull(_ incoming: MLXArray, step: Int) -> (MLXArray, MLXArray) {
         let previous = offset
         let length = incoming.dim(3)
-        precondition((1...2).contains(length))
+        precondition((1...3).contains(length))
 
         if combinedStorage == nil || previous + length > combinedStorage!.dim(3) {
             let chunks = (step + length - 1) / step
@@ -373,7 +403,7 @@ final class Gemma4CombinedKVCache: KVCache {
         }
         let previous = offset
         let length = incoming.dim(3)
-        precondition((1...2).contains(length))
+        precondition((1...3).contains(length))
 
         if combinedStorage == nil
             || (previous + length > combinedStorage!.dim(3)

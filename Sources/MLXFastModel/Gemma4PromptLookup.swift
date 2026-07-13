@@ -14,42 +14,65 @@ enum Gemma4PromptLookupPendingResolution: Equatable {
 /// until the caller presents that token on the next model invocation.
 struct Gemma4PromptLookupState: Equatable {
     private(set) var tokens: [Int32] = []
-    private(set) var pendingDraft: Int32?
+    private(set) var pendingDrafts: [Int32] = []
+    private(set) var acceptedPrefixCount = 0
+
+    // Compatibility view used by the k=1 rollback path.
+    var pendingDraft: Int32? { pendingDrafts.first }
 
     mutating func reset(tokens: [Int32] = []) {
         self.tokens = tokens
-        pendingDraft = nil
+        pendingDrafts.removeAll(keepingCapacity: true)
+        acceptedPrefixCount = 0
     }
 
     mutating func recordInput(_ token: Int32) {
-        precondition(pendingDraft == nil)
+        precondition(pendingDrafts.isEmpty)
         tokens.append(token)
     }
 
-    func draft() -> Int32? {
-        gemma4PromptLookupDraft(tokens: tokens)
-    }
+    func draft() -> Int32? { gemma4PromptLookupDraft(tokens: tokens) }
 
     func draft(appending token: Int32) -> Int32? {
         gemma4PromptLookupDraft(tokens: tokens + [token])
     }
 
+    func drafts(appending token: Int32) -> [Int32] {
+        guard let first = gemma4PromptLookupDraft(tokens: tokens + [token]) else {
+            return []
+        }
+        guard let second = gemma4PromptLookupDraft(tokens: tokens + [token, first]) else {
+            return [first]
+        }
+        return [first, second]
+    }
+
     mutating func setPendingDraft(_ token: Int32) {
-        precondition(pendingDraft == nil)
-        pendingDraft = token
+        setPendingDrafts([token])
+    }
+
+    mutating func setPendingDrafts(_ drafts: [Int32]) {
+        precondition(pendingDrafts.isEmpty && (1...2).contains(drafts.count))
+        pendingDrafts = drafts
+        acceptedPrefixCount = 0
     }
 
     mutating func resolvePending(actualInput: Int32) -> Gemma4PromptLookupPendingResolution {
-        guard let pendingDraft else { return .none }
-        self.pendingDraft = nil
-        guard actualInput == pendingDraft else { return .mismatch }
+        guard let pending = pendingDrafts.first else { return .none }
+        guard actualInput == pending else {
+            pendingDrafts.removeAll(keepingCapacity: true)
+            acceptedPrefixCount = 0
+            return .mismatch
+        }
+        pendingDrafts.removeFirst()
         tokens.append(actualInput)
+        acceptedPrefixCount += 1
         return .accepted
     }
 
-
     mutating func cancelPending() {
-        pendingDraft = nil
+        pendingDrafts.removeAll(keepingCapacity: true)
+        acceptedPrefixCount = 0
     }
 }
 
@@ -77,6 +100,12 @@ func gemma4PromptLookupDraft(tokens: [Int32]) -> Int32? {
 @inline(__always)
 func gemma4PromptLookupEnvironmentEnabled(_ environment: [String: String]) -> Bool {
     guard let raw = environment["DARKBLOOM_PROMPT_LOOKUP"] else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+@inline(__always)
+func gemma4PromptLookupK2Enabled(_ environment: [String: String]) -> Bool {
+    guard let raw = environment["DARKBLOOM_PROMPT_LOOKUP_K2"] else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }
 

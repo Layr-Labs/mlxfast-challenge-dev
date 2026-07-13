@@ -195,15 +195,23 @@ public enum Gemma4Model {
                         }
                         precondition(combinedCaches.allSatisfy {
                             $0.offset == positionOffset + 1
-                                && !$0.hasDeferredCombinedPosition
+                                && ($0.deferredCombinedPositions == 0
+                                    || $0.deferredCombinedPositions == 1)
                         })
-                        return pendingLogits
+                        return pendingLogits.dim(1) == 2
+                            ? pendingLogits[0..., 0..<1, 0...]
+                            : pendingLogits
                     }
                 )
                 precondition(
                     cache.promptLookupState.resolvePending(actualInput: actualInput)
                         == .accepted)
-                cache.promptLookupPendingLogits = nil
+                if cache.promptLookupState.pendingDraft != nil {
+                    precondition(pendingLogits.dim(1) == 2)
+                    cache.promptLookupPendingLogits = pendingLogits[0..., 1..<2, 0...]
+                } else {
+                    cache.promptLookupPendingLogits = nil
+                }
                 return result
             }
 
@@ -224,6 +232,49 @@ public enum Gemma4Model {
             // Re-enter the ordinary lookup decision with the actual token.
             // A rejected draft must not force an otherwise avoidable one-token
             // model step before the next eligible suffix lookup.
+        }
+
+        if inputLength == 1,
+           compiledDecodeStep == nil,
+           promptLookupActive,
+           gemma4PromptLookupK2Enabled(ProcessInfo.processInfo.environment),
+           cache.promptLookupTrackingValid,
+           cache.promptLookupState.tokens.count == positionOffset,
+           let actualInput = inputTokens?.first,
+           cache.promptLookupState.drafts(appending: actualInput).count == 2,
+           let combinedCaches = cache.promptLookupCombinedCaches(
+               expectedCount: model.configuration.numHiddenLayers),
+           model.canRunExactThreeVector(cache: cache.kvCache(for: model)),
+           combinedCaches.allSatisfy({
+               $0.offset == positionOffset && !$0.hasDeferredCombinedPosition
+                   && $0.canAppendCombinedPositions(3)
+           })
+        {
+            let drafts = cache.promptLookupState.drafts(appending: actualInput)
+            let tripleInputs = MLXArray([actualInput, drafts[0], drafts[1]], [1, 3])
+            var pending: MLXArray?
+            let result = try executeGemma4CachedForward(
+                cache: cache,
+                positionOffset: positionOffset,
+                inputLength: 1,
+                validatesLibraryCacheOffsets: true,
+                validateLibraryCacheOffsets: validateLibraryCacheOffsets,
+                forward: {
+                    let logits = model.exactThreeVector(
+                        tripleInputs, cache: cache.kvCache(for: model))
+                    precondition(logits.dtype == .float32 && logits.shape == [3, 262_144])
+                    eval(logits)
+                    cache.materializeCachedState()
+                    for layerCache in combinedCaches {
+                        precondition(layerCache.deferNewestCombinedPositions(2))
+                    }
+                    pending = logits[1..<3, 0...].reshaped(1, 2, 262_144)
+                    return logits[0..<1, 0...].reshaped(1, 1, 262_144)
+                })
+            cache.promptLookupState.recordInput(actualInput)
+            cache.promptLookupState.setPendingDrafts(drafts)
+            cache.promptLookupPendingLogits = pending
+            return result
         }
 
         if inputLength == 1,

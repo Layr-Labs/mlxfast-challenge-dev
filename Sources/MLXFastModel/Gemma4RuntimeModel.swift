@@ -82,6 +82,21 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
         fastEngine?.canRunExactTwoVector(cache: cache) == true
     }
 
+    var supportsExactThreeVector: Bool {
+        fastEngine?.supportsExactThreeVector == true
+    }
+
+    func canRunExactThreeVector(cache: [KVCache]) -> Bool {
+        fastEngine?.canRunExactThreeVector(cache: cache) == true
+    }
+
+    func exactThreeVector(_ inputs: MLXArray, cache: [KVCache]) -> MLXArray {
+        guard let fastEngine, fastEngine.supportsExactThreeVector else {
+            preconditionFailure("exact three-vector engine is unavailable")
+        }
+        return fastEngine.exactThreeVector(inputs, cache: cache)
+    }
+
     public func prepare(
         _ input: LMInput,
         cache _: [KVCache],

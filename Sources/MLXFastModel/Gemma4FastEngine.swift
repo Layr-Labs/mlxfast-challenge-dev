@@ -1480,6 +1480,32 @@ final class Gemma4FastEngine {
         )
     }
 
+    var supportsExactThreeVector: Bool { supportsExactTwoVector }
+
+    func exactThreeVector(_ inputs: MLXArray, cache: [KVCache]) -> MLXArray {
+        precondition(canRunExactThreeVector(cache: cache))
+        precondition(inputs.shape == [1, 3])
+        // Keep the qualified pair arithmetic intact, then execute row two with
+        // the promoted singleton path. Both operations stay in one lazy graph;
+        // this is the fail-closed host fallback for devices where a mixed 2+1
+        // Metal threadgroup has not yet been qualified.
+        let pair = exactTwoVector(inputs[0..., 0..<2], cache: cache)
+        let third = callAsFunction(inputs[0..., 2..<3], cache: cache)
+            .reshaped(1, 262_144)
+        return concatenated([pair, third], axis: 0)
+    }
+
+    func canRunExactThreeVector(cache: [KVCache]) -> Bool {
+        guard supportsExactThreeVector, cache.count == layers.count else { return false }
+        let combined = cache.compactMap { $0 as? Gemma4CombinedKVCache }
+        guard combined.count == layers.count,
+              combined.allSatisfy({ $0.canAppendCombinedPositions(3) })
+        else { return false }
+        return layers.indices.allSatisfy {
+            layers[$0].canRunExactTwoVector(offset: combined[$0].offset)
+        }
+    }
+
     func canRunExactTwoVector(cache: [KVCache]) -> Bool {
         guard supportsExactTwoVector, cache.count == layers.count else { return false }
         let combinedCaches = cache.compactMap { $0 as? Gemma4CombinedKVCache }
