@@ -1,11 +1,110 @@
+import Foundation
 import MLX
+
+private func gemma4AttentionPreparationEnvironmentFlag(
+    _ name: String,
+    default defaultValue: Bool
+) -> Bool {
+    guard let raw = ProcessInfo.processInfo.environment[name] else {
+        return defaultValue
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}
+
+private let gemma4DirectAttentionRMSRoPEDefault = true
+
+private func gemma4RecordDirectAttentionRMSRoPEVerification(
+    kind: String,
+    arrays: Int,
+    values: Int
+) {
+    FileHandle.standardError.write(Data(
+        (
+            "verify_direct_attention_rms_rope kind=\(kind) arrays=\(arrays) "
+                + "values=\(values)\n"
+        ).utf8
+    ))
+}
+
+/// Derives a direct-normalization RoPE specialization from the exact promoted
+/// source. The RMS reduction is unchanged. Only the BF16 staging row and its
+/// final barrier are replaced: RoPE-owning threads form the same rounded BF16
+/// normalized/weighted values directly from the original row and weights.
+func gemma4DirectAttentionRMSRoPESource(
+    _ reference: String,
+    sharedValueOutput: String
+) -> String {
+    var source = reference
+
+    let declaration = "threadgroup bfloat normalized_row[kHeadDim];"
+    precondition(source.components(separatedBy: declaration).count == 2)
+    source = source.replacingOccurrences(of: declaration, with: "")
+
+    let stagedBodyStart = "const device bfloat* row_weight ="
+    precondition(source.components(separatedBy: stagedBodyStart).count == 2)
+    guard let stagedRange = source.range(of: stagedBodyStart) else {
+        preconditionFailure("missing staged attention RMS/RoPE body")
+    }
+
+    let directBody = """
+    if (!has_weight) {
+                    for (uint index = 0; index < kReads; ++index) {
+                        const uint dimension =
+                            thread_position_in_threadgroup.x * kReads + index;
+                        const bfloat normalized = static_cast<bfloat>(
+                            input[index] * inverse_mean[0]);
+                        output[dimension] =
+                            static_cast<bfloat>(1.0f) * normalized;
+                    }
+                } else {
+                    constexpr uint kPairs = kHeadDim / 2;
+                    constexpr uint kThreads = kHeadDim / kReads;
+                    const device bfloat* row_input = input
+                        - thread_position_in_threadgroup.x * kReads;
+                    for (uint pair = thread_position_in_threadgroup.x;
+                         pair < kPairs;
+                         pair += kThreads) {
+                        const bfloat normalized_left = static_cast<bfloat>(
+                            row_input[pair] * inverse_mean[0]);
+                        const bfloat normalized_right = static_cast<bfloat>(
+                            row_input[pair + kPairs] * inverse_mean[0]);
+                        const bfloat weighted_left =
+                            weight[pair] * normalized_left;
+                        const bfloat weighted_right =
+                            weight[pair + kPairs] * normalized_right;
+                        if (kSharesFullKVReduction && is_k) {
+                            \(sharedValueOutput.replacingOccurrences(
+                                of: "dimension", with: "pair")) =
+                                static_cast<bfloat>(1.0f) * normalized_left;
+                            \(sharedValueOutput.replacingOccurrences(
+                                of: "dimension", with: "pair + kPairs")) =
+                                static_cast<bfloat>(1.0f) * normalized_right;
+                        }
+                        const uint rope_index =
+                            static_cast<uint>(position) * kPairs + pair;
+                        const float cosine = rope_cosines[rope_index];
+                        const float sine = rope_sines[rope_index];
+                        const float left = static_cast<float>(weighted_left);
+                        const float right = static_cast<float>(weighted_right);
+                        output[pair] = static_cast<bfloat>(
+                            left * cosine - right * sine);
+                        output[pair + kPairs] = static_cast<bfloat>(
+                            left * sine + right * cosine);
+                    }
+                }
+    """
+    source.replaceSubrange(stagedRange.lowerBound..<source.endIndex, with: directBody)
+    precondition(!source.contains("normalized_row"))
+    return source
+}
 
 private func makeGemma4FusedAttentionRMSKernel(
     name: String,
     headDim: Int,
     kvHeads: Int,
     sharesFullKVReduction: Bool,
-    combinedKVOutput: Bool = false
+    combinedKVOutput: Bool = false,
+    directRMSRoPE: Bool = false
 ) -> MLXFast.MLXFastKernel {
     precondition(headDim == 256 || headDim == 512)
     precondition(kvHeads == 16 || kvHeads == 4)
@@ -18,14 +117,7 @@ private func makeGemma4FusedAttentionRMSKernel(
     let sharedValueOutput = combinedKVOutput
         ? "combined_kv[kKVSlabElements + projection_row * kHeadDim + dimension]"
         : "values[projection_row * kHeadDim + dimension]"
-    return MLXFast.metalKernel(
-        name: name,
-        inputNames: [
-            "raw_q", "raw_k", "raw_v", "q_weight", "k_weight",
-            "position", "rope_cosines", "rope_sines",
-        ],
-        outputNames: outputNames,
-        source: """
+    let referenceSource = """
             constexpr uint kHeadDim = \(headDim);
             constexpr uint kQHeads = 32;
             constexpr uint kKVHeads = \(kvHeads);
@@ -123,7 +215,21 @@ private func makeGemma4FusedAttentionRMSKernel(
                         left * sine + right * cosine);
                 }
             }
-            """,
+            """
+    let source = directRMSRoPE
+        ? gemma4DirectAttentionRMSRoPESource(
+            referenceSource,
+            sharedValueOutput: sharedValueOutput
+        )
+        : referenceSource
+    return MLXFast.metalKernel(
+        name: name,
+        inputNames: [
+            "raw_q", "raw_k", "raw_v", "q_weight", "k_weight",
+            "position", "rope_cosines", "rope_sines",
+        ],
+        outputNames: outputNames,
+        source: source,
         header: "using namespace metal;",
         ensureRowContiguous: true
     )
@@ -158,6 +264,42 @@ private let gemma4FusedFullAttentionRMSCombined = makeGemma4FusedAttentionRMSKer
     sharesFullKVReduction: true,
     combinedKVOutput: true
 )
+
+private let gemma4DirectSlidingAttentionRMS = makeGemma4FusedAttentionRMSKernel(
+    name: "gemma4_direct_sliding_attention_rms_rope_256_v1",
+    headDim: 256,
+    kvHeads: 16,
+    sharesFullKVReduction: false,
+    directRMSRoPE: true
+)
+
+private let gemma4DirectFullAttentionRMS = makeGemma4FusedAttentionRMSKernel(
+    name: "gemma4_direct_full_attention_rms_rope_shared_kv_512_v1",
+    headDim: 512,
+    kvHeads: 4,
+    sharesFullKVReduction: true,
+    directRMSRoPE: true
+)
+
+private let gemma4DirectSlidingAttentionRMSCombined =
+    makeGemma4FusedAttentionRMSKernel(
+        name: "gemma4_direct_sliding_attention_rms_rope_combined_kv_256_v1",
+        headDim: 256,
+        kvHeads: 16,
+        sharesFullKVReduction: false,
+        combinedKVOutput: true,
+        directRMSRoPE: true
+    )
+
+private let gemma4DirectFullAttentionRMSCombined =
+    makeGemma4FusedAttentionRMSKernel(
+        name: "gemma4_direct_full_attention_rms_rope_shared_combined_kv_512_v1",
+        headDim: 512,
+        kvHeads: 4,
+        sharesFullKVReduction: true,
+        combinedKVOutput: true,
+        directRMSRoPE: true
+    )
 
 private func makeGemma4CombinedKVPrefillKernel(
     name: String,
@@ -607,6 +749,45 @@ private let gemma4AttentionRopeTables: Gemma4AttentionRopeTables = {
     )
 }()
 
+private func gemma4VerifyDirectAttentionRMSRoPEOutputs(
+    candidate: [MLXArray],
+    reference: [MLXArray],
+    kind: String
+) {
+    precondition(candidate.count == reference.count)
+    var valueCount = 0
+    for (outputIndex, pair) in zip(candidate, reference).enumerated() {
+        let candidateOutput = pair.0
+        let referenceOutput = pair.1
+        precondition(candidateOutput.dtype == .bfloat16)
+        precondition(referenceOutput.dtype == .bfloat16)
+        precondition(candidateOutput.shape == referenceOutput.shape)
+        valueCount += candidateOutput.size
+        let candidateBits = candidateOutput.view(dtype: .uint16)
+        let referenceBits = referenceOutput.view(dtype: .uint16)
+        let matches = arrayEqual(candidateBits, referenceBits)
+        eval(matches)
+        guard matches.item(Bool.self) else {
+            let candidateValues = candidateBits.asArray(UInt16.self)
+            let referenceValues = referenceBits.asArray(UInt16.self)
+            let mismatch = zip(candidateValues, referenceValues)
+                .enumerated()
+                .first { $0.element.0 != $0.element.1 }
+            preconditionFailure(
+                "direct attention RMS/RoPE raw BF16 mismatch kind=\(kind) "
+                    + "output=\(outputIndex) index=\(mismatch?.offset ?? -1) "
+                    + "candidate=\(mismatch?.element.0 ?? 0) "
+                    + "reference=\(mismatch?.element.1 ?? 0)"
+            )
+        }
+    }
+    gemma4RecordDirectAttentionRMSRoPEVerification(
+        kind: kind,
+        arrays: candidate.count,
+        values: valueCount
+    )
+}
+
 struct FusedAttentionRMSPreparation: @unchecked Sendable {
     let isSliding: Bool
     let headDim: Int
@@ -617,6 +798,8 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
     let positionViews: [MLXArray]
     let ropeCosines: MLXArray
     let ropeSines: MLXArray
+    private let directRMSRoPE: Bool
+    private let verifyDirectRMSRoPEBits: Bool
 
     init?(
         isSliding: Bool,
@@ -648,6 +831,14 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
         self.ropeSines = isSliding
             ? gemma4AttentionRopeTables.slidingSines
             : gemma4AttentionRopeTables.fullSines
+        self.directRMSRoPE = gemma4AttentionPreparationEnvironmentFlag(
+            "DARKBLOOM_DIRECT_ATTENTION_RMS_ROPE",
+            default: gemma4DirectAttentionRMSRoPEDefault
+        )
+        self.verifyDirectRMSRoPEBits = gemma4AttentionPreparationEnvironmentFlag(
+            "DARKBLOOM_VERIFY_DIRECT_ATTENTION_RMS_ROPE_BITS",
+            default: false
+        )
     }
 
     func supports(offset: Int) -> Bool {
@@ -677,26 +868,64 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
         precondition(valueInput.shape == [1, 1, kvWidth])
 
         let threads = headDim / 4
-        let kernel = isSliding
-            ? gemma4FusedSlidingAttentionRMS
-            : gemma4FusedFullAttentionRMS
         precondition(supports(offset: offset))
         let position = positionViews[offset]
         let inputs = [
             rawQueries, rawKeys, valueInput, qNormWeight, kNormWeight,
             position, ropeCosines, ropeSines,
         ]
-        let outputs = kernel(
-            inputs,
-            grid: (threads, 32 + (isSliding ? 2 * kvHeads : kvHeads), 1),
-            threadGroup: (threads, 1, 1),
-            outputShapes: [
-                [1, 32, 1, headDim],
-                [1, kvHeads, 1, headDim],
-                [1, kvHeads, 1, headDim],
-            ],
-            outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
-        )
+        let grid = (threads, 32 + (isSliding ? 2 * kvHeads : kvHeads), 1)
+        let shapes = [
+            [1, 32, 1, headDim],
+            [1, kvHeads, 1, headDim],
+            [1, kvHeads, 1, headDim],
+        ]
+        let candidate: [MLXArray]?
+        if directRMSRoPE || verifyDirectRMSRoPEBits {
+            let candidateKernel = isSliding
+                ? gemma4DirectSlidingAttentionRMS
+                : gemma4DirectFullAttentionRMS
+            candidate = candidateKernel(
+                inputs,
+                grid: grid,
+                threadGroup: (threads, 1, 1),
+                outputShapes: shapes,
+                outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
+            )
+        } else {
+            candidate = nil
+        }
+        let reference: [MLXArray]?
+        if !directRMSRoPE || verifyDirectRMSRoPEBits {
+            let referenceKernel = isSliding
+                ? gemma4FusedSlidingAttentionRMS
+                : gemma4FusedFullAttentionRMS
+            reference = referenceKernel(
+                inputs,
+                grid: grid,
+                threadGroup: (threads, 1, 1),
+                outputShapes: shapes,
+                outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
+            )
+        } else {
+            reference = nil
+        }
+        if verifyDirectRMSRoPEBits,
+           let candidate,
+           let reference
+        {
+            gemma4VerifyDirectAttentionRMSRoPEOutputs(
+                candidate: candidate,
+                reference: reference,
+                kind: isSliding ? "sliding_separate" : "full_separate"
+            )
+        }
+        let outputs = directRMSRoPE
+            ? (candidate ?? reference)
+            : (reference ?? candidate)
+        guard let outputs else {
+            preconditionFailure("attention RMS/RoPE kernel was not selected")
+        }
 
         return (outputs[0], outputs[1], outputs[2])
     }
@@ -722,22 +951,63 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
         precondition(supports(offset: offset))
 
         let threads = headDim / 4
-        let kernel = isSliding
-            ? gemma4FusedSlidingAttentionRMSCombined
-            : gemma4FusedFullAttentionRMSCombined
-        let outputs = kernel(
-            [
-                rawQueries, rawKeys, valueInput, qNormWeight, kNormWeight,
-                positionViews[offset], ropeCosines, ropeSines,
-            ],
-            grid: (threads, 32 + (isSliding ? 2 * kvHeads : kvHeads), 1),
-            threadGroup: (threads, 1, 1),
-            outputShapes: [
-                [1, 32, 1, headDim],
-                [2, 1, kvHeads, 1, headDim],
-            ],
-            outputDTypes: [.bfloat16, .bfloat16]
-        )
+        let inputs = [
+            rawQueries, rawKeys, valueInput, qNormWeight, kNormWeight,
+            positionViews[offset], ropeCosines, ropeSines,
+        ]
+        let grid = (threads, 32 + (isSliding ? 2 * kvHeads : kvHeads), 1)
+        let shapes = [
+            [1, 32, 1, headDim],
+            [2, 1, kvHeads, 1, headDim],
+        ]
+        let candidate: [MLXArray]?
+        if directRMSRoPE || verifyDirectRMSRoPEBits {
+            let candidateKernel = isSliding
+                ? gemma4DirectSlidingAttentionRMSCombined
+                : gemma4DirectFullAttentionRMSCombined
+            candidate = candidateKernel(
+                inputs,
+                grid: grid,
+                threadGroup: (threads, 1, 1),
+                outputShapes: shapes,
+                outputDTypes: [.bfloat16, .bfloat16]
+            )
+        } else {
+            candidate = nil
+        }
+        let reference: [MLXArray]?
+        if !directRMSRoPE || verifyDirectRMSRoPEBits {
+            let referenceKernel = isSliding
+                ? gemma4FusedSlidingAttentionRMSCombined
+                : gemma4FusedFullAttentionRMSCombined
+            reference = referenceKernel(
+                inputs,
+                grid: grid,
+                threadGroup: (threads, 1, 1),
+                outputShapes: shapes,
+                outputDTypes: [.bfloat16, .bfloat16]
+            )
+        } else {
+            reference = nil
+        }
+        if verifyDirectRMSRoPEBits,
+           let candidate,
+           let reference
+        {
+            gemma4VerifyDirectAttentionRMSRoPEOutputs(
+                candidate: candidate,
+                reference: reference,
+                kind: isSliding ? "sliding_combined" : "full_combined"
+            )
+        }
+        let outputs = directRMSRoPE
+            ? (candidate ?? reference)
+            : (reference ?? candidate)
+        guard let outputs else {
+            preconditionFailure(
+                "combined attention RMS/RoPE kernel was not selected"
+            )
+        }
         return (outputs[0], outputs[1])
     }
 
