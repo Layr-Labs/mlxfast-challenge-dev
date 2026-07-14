@@ -503,6 +503,26 @@ final class Gemma4FastLayer {
         }
     }
 
+    /// Reuses the loaded gate/up tensors and indexed metadata while preparing
+    /// both derived payloads. Qualification-only; production routing is untouched.
+    func makeGateUpQualificationProjection() -> FusedGateUpProjection? {
+        guard let fusedGateUp,
+              fusedGateUp.metadataMode == .indexed,
+              let indexedGate = fusedGateUp.indexedGate,
+              let indexedUp = fusedGateUp.indexedUp
+        else {
+            return nil
+        }
+        return FusedGateUpProjection(
+            gate: fusedGateUp.gate,
+            up: fusedGateUp.up,
+            metadataMode: .indexed,
+            gateIndexedMetadata: indexedGate,
+            upIndexedMetadata: indexedUp,
+            prepareQualificationRoutes: true
+        )
+    }
+
     func callAsFunction(
         _ x: MLXArray,
         normalizedInput: MLXArray?,

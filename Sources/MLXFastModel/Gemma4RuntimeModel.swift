@@ -54,6 +54,13 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
         )
     }
 
+    func gateUpQualificationProjection(layer index: Int) -> FusedGateUpProjection? {
+        guard let fastEngine, fastEngine.layers.indices.contains(index) else {
+            return nil
+        }
+        return fastEngine.layers[index].makeGateUpQualificationProjection()
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         if let fastEngine {
             return fastEngine(inputs, cache: cache)

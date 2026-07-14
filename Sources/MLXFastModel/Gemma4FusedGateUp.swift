@@ -1142,6 +1142,11 @@ private let gemma4IndexedFusedGateUpActivationQMV = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+enum Gemma4GateUpQualificationRoute: Sendable {
+    case coTiledFixed12
+    case packed12
+}
+
 struct FusedGateUpProjection: @unchecked Sendable {
     let gate: FastQuantizedProjection
     let up: FastQuantizedProjection
@@ -1172,7 +1177,8 @@ struct FusedGateUpProjection: @unchecked Sendable {
         up: FastQuantizedProjection,
         metadataMode: FusedGateUpMetadataMode = .raw,
         gateIndexedMetadata: IndexedAffineMetadata? = nil,
-        upIndexedMetadata: IndexedAffineMetadata? = nil
+        upIndexedMetadata: IndexedAffineMetadata? = nil,
+        prepareQualificationRoutes: Bool = false
     ) {
         self.gate = gate
         self.up = up
@@ -1220,6 +1226,7 @@ struct FusedGateUpProjection: @unchecked Sendable {
             self.indexedUp = indexedUp
             if useCoTiledFixed12GateUp
                 || verifyCoTiledFixed12GateUpBits
+                || prepareQualificationRoutes
             {
                 coTiledFixed12GateUp = CoTiledFixed12GateUpPayload(
                     gate: gate,
@@ -1228,7 +1235,8 @@ struct FusedGateUpProjection: @unchecked Sendable {
                     upMetadata: indexedUp
                 )
             }
-            let needsPacked12 = verifyCoTiledFixed12GateUpBits
+            let needsPacked12 = prepareQualificationRoutes
+                || verifyCoTiledFixed12GateUpBits
                 || verifyPacked12IndexedBits
                 || (usePacked12IndexedGateUp
                     && (coTiledFixed12GateUp == nil
@@ -1296,6 +1304,60 @@ struct FusedGateUpProjection: @unchecked Sendable {
         return (outputs[0], outputs[1])
     }
 
+    private func coTiledFixed12Activated(_ input: MLXArray) -> MLXArray {
+        precondition(supportsGemma4FusedGateUpInput(input))
+        precondition(metadataMode == .indexed)
+        guard let indexedGate, let indexedUp, let coTiledFixed12GateUp else {
+            preconditionFailure("co-tiled fixed12 qualification payload was not prepared")
+        }
+        var outputShape = input.shape
+        let outputWidth = gate.weight.dim(0)
+        outputShape[outputShape.count - 1] = outputWidth
+        return gemma4CoTiledFixed12FusedGateUpActivationQMV(
+            [
+                coTiledFixed12GateUp.words,
+                indexedGate.lut, indexedUp.lut, input,
+            ],
+            grid: (32, outputWidth / 2, 1),
+            threadGroup: (32, 2, 1),
+            outputShapes: [outputShape],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
+    private func packed12Activated(_ input: MLXArray) -> MLXArray {
+        precondition(supportsGemma4FusedGateUpInput(input))
+        precondition(metadataMode == .indexed)
+        guard let indexedGate, let indexedUp, let packed12IndexedGateUp else {
+            preconditionFailure("packed12 qualification metadata was not prepared")
+        }
+        var outputShape = input.shape
+        let outputWidth = gate.weight.dim(0)
+        outputShape[outputShape.count - 1] = outputWidth
+        return gemma4Packed12IndexedFusedGateUpActivationQMV(
+            [
+                gate.weight, packed12IndexedGateUp.gate.bytes, indexedGate.lut,
+                up.weight, packed12IndexedGateUp.up.bytes, indexedUp.lut, input,
+            ],
+            grid: (32, outputWidth / 2, 1),
+            threadGroup: (32, 2, 1),
+            outputShapes: [outputShape],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
+    func activatedForQualification(
+        _ input: MLXArray,
+        route: Gemma4GateUpQualificationRoute
+    ) -> MLXArray {
+        switch route {
+        case .coTiledFixed12:
+            coTiledFixed12Activated(input)
+        case .packed12:
+            packed12Activated(input)
+        }
+    }
+
     func activated(_ input: MLXArray) -> MLXArray {
         precondition(supportsGemma4FusedGateUpInput(input))
         precondition(metadataMode == .indexed)
@@ -1305,20 +1367,8 @@ struct FusedGateUpProjection: @unchecked Sendable {
         var outputShape = input.shape
         let outputWidth = gate.weight.dim(0)
         outputShape[outputShape.count - 1] = outputWidth
-        let coTiledOutput: MLXArray?
-        if let coTiledFixed12GateUp {
-            coTiledOutput = gemma4CoTiledFixed12FusedGateUpActivationQMV(
-                [
-                    coTiledFixed12GateUp.words,
-                    indexedGate.lut, indexedUp.lut, input,
-                ],
-                grid: (32, outputWidth / 2, 1),
-                threadGroup: (32, 2, 1),
-                outputShapes: [outputShape],
-                outputDTypes: [.bfloat16]
-            )[0]
-        } else {
-            coTiledOutput = nil
+        let coTiledOutput = coTiledFixed12GateUp.map { _ in
+            coTiledFixed12Activated(input)
         }
 
         let runPacked = verifyCoTiledFixed12GateUpBits
@@ -1330,17 +1380,8 @@ struct FusedGateUpProjection: @unchecked Sendable {
                 || verifyPacked12IndexedBits))
 
         let packedOutput: MLXArray?
-        if runPacked, let packed12IndexedGateUp {
-            packedOutput = gemma4Packed12IndexedFusedGateUpActivationQMV(
-                [
-                    gate.weight, packed12IndexedGateUp.gate.bytes, indexedGate.lut,
-                    up.weight, packed12IndexedGateUp.up.bytes, indexedUp.lut, input,
-                ],
-                grid: (32, outputWidth / 2, 1),
-                threadGroup: (32, 2, 1),
-                outputShapes: [outputShape],
-                outputDTypes: [.bfloat16]
-            )[0]
+        if runPacked, packed12IndexedGateUp != nil {
+            packedOutput = packed12Activated(input)
         } else {
             packedOutput = nil
         }
