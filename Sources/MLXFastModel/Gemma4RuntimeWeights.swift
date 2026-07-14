@@ -41,9 +41,13 @@ public final class Gemma4RuntimeWeightCache {
             // protect local Macs from retaining ~14.5 GiB of alternate weight
             // layouts on top of the ~16.9 GiB source model. The policy is
             // selected before model loading so file-global feature switches are
-            // first observed after their low-memory overrides are installed.
+            // first observed after their low-memory defaults are installed;
+            // the defaults never overwrite flags the user set explicitly.
             let policy = Gemma4StartupMemoryPolicy.resolve(
-                physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory
+                physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+                requestedProfile: ProcessInfo.processInfo.environment[
+                    Gemma4StartupMemoryPolicy.profileOverrideEnvironmentName
+                ]
             )
             policy.apply()
             startupMemoryPolicy = policy

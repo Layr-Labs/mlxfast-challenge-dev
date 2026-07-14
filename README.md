@@ -175,8 +175,10 @@ are profitable on the 128 GB ranked machine but would duplicate roughly
 with less than 64 GiB therefore select a low-memory profile automatically:
 large persistent co-tiles and compiled decode are disabled, the MLX allocator
 cache is capped at 6 GiB, and free warmup buffers are released before the
-worker begins serving requests. This changes local speed only; the 128 GB
-ranked runner keeps the full optimized profile.
+worker begins serving requests. The profile announces itself on stderr, never
+overrides feature flags you exported explicitly, and can be forced either way
+with `DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low`. This changes local speed
+only; the 128 GB ranked runner keeps the full optimized profile.
 
 That does not mean there is nothing left to optimize. Attention alternates
 five sliding-window layers (1024-token window, GQA with 16 KV heads) with one
