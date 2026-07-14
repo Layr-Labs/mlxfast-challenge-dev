@@ -133,6 +133,13 @@ final class Gemma4CombinedKVCache: KVCache {
         return splitCache?.innerState() ?? []
     }
 
+    /// Diagnostic roots for seed profiling. Returns the backing parent arrays
+    /// directly, without slicing, copying, evaluating, or changing cache state.
+    func seedProfileParentArrays() -> [MLXArray] {
+        if let combinedStorage { return [combinedStorage] }
+        return splitCache?.innerState() ?? []
+    }
+
     /// Generic protocol fallback. Prefill remains entirely on the upstream
     /// split cache. If an unsupported generic update arrives after conversion,
     /// convert back first so uncommon shapes retain upstream behavior.

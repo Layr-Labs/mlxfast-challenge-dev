@@ -118,6 +118,7 @@ struct Gemma4FastLayerResult {
 }
 
 final class Gemma4FastLayer {
+    let layerIndex: Int
     let isSliding: Bool
     let nHeads: Int
     let nKvHeads: Int
@@ -157,6 +158,7 @@ final class Gemma4FastLayer {
     let useFusedGateUpActivation: Bool
 
     init(
+        layerIndex: Int,
         isSliding: Bool,
         nHeads: Int,
         nKvHeads: Int,
@@ -186,6 +188,7 @@ final class Gemma4FastLayer {
         upIndexedMetadata: IndexedAffineMetadata?,
         downIndexedMetadata: IndexedAffineMetadata?
     ) {
+        self.layerIndex = layerIndex
         self.isSliding = isSliding
         self.nHeads = nHeads
         self.nKvHeads = nKvHeads
@@ -507,7 +510,8 @@ final class Gemma4FastLayer {
         _ x: MLXArray,
         normalizedInput: MLXArray?,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: KVCache?
+        cache: KVCache?,
+        diagnosticCheckpoint: Gemma4SeedProfileRun.Checkpoint? = nil
     ) -> Gemma4FastLayerResult {
         let residual = x
         let h: MLXArray
@@ -822,6 +826,15 @@ final class Gemma4FastLayer {
         } else {
             attnOut = oProj(mergedAttention)
         }
+        if let diagnosticCheckpoint {
+            var roots = [attnOut]
+            if let combined = cache as? Gemma4CombinedKVCache {
+                roots.append(contentsOf: combined.seedProfileParentArrays())
+            } else if let cache {
+                roots.append(contentsOf: cache.innerState())
+            }
+            diagnosticCheckpoint("attention_front_sdpa_output", roots)
+        }
         var out: MLXArray
         let residual2: MLXArray
         let fusedPreFFNNormalized: MLXArray?
@@ -880,6 +893,7 @@ final class Gemma4FastLayer {
             out = residual2 + out
             out = out * layerScalar
         }
+        diagnosticCheckpoint?("mlp_boundaries", [out])
         return Gemma4FastLayerResult(
             hidden: out,
             nextNormalized: nextNormalized
@@ -1144,6 +1158,7 @@ final class Gemma4FastEngine {
 
             built.append(
                 Gemma4FastLayer(
+                    layerIndex: index,
                     isSliding: isSliding,
                     nHeads: config.numAttentionHeads,
                     nKvHeads: nKvHeads,
@@ -1190,11 +1205,26 @@ final class Gemma4FastEngine {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let seedProfile = Gemma4SeedProfileRun.armIfQualifying(
+            inputs: inputs, cache: cache)
         var hidden = embedTokens(inputs) * embedScale
 
         func layerCache(_ index: Int) -> KVCache? {
             guard let cache, index < cache.count else { return nil }
             return cache[index]
+        }
+
+        func cacheParents(_ range: Range<Int>) -> [MLXArray] {
+            guard let cache else { return [] }
+            let lower = max(0, range.lowerBound)
+            let upper = min(cache.count, range.upperBound)
+            guard lower < upper else { return [] }
+            return (lower..<upper).flatMap { index in
+                if let combined = cache[index] as? Gemma4CombinedKVCache {
+                    return combined.seedProfileParentArrays()
+                }
+                return cache[index].innerState()
+            }
         }
 
         let slidingIndex = layers.firstIndex(where: \.isSliding)
@@ -1213,15 +1243,40 @@ final class Gemma4FastEngine {
         var normalizedInput: MLXArray? = nil
         for (index, layer) in layers.enumerated() {
             let mask = layer.isSliding ? (slidingMask ?? .none) : (fullMask ?? .none)
+            let detailed = (seedProfile?.mode == .detailSliding && layer.layerIndex == 54)
+                || (seedProfile?.mode == .detailFull && layer.layerIndex == 59)
+            if detailed, let seedProfile {
+                var roots = [hidden]
+                if let normalizedInput { roots.append(normalizedInput) }
+                roots.append(contentsOf: cacheParents(0..<layers.count))
+                seedProfile.evaluateCheckpoint(name: "detail_prefix", roots: roots)
+            }
+            let checkpoint: Gemma4SeedProfileRun.Checkpoint? = detailed
+                ? { name, roots in
+                    seedProfile?.evaluateCheckpoint(name: name, roots: roots)
+                }
+                : nil
             let result = layer(
                 hidden,
                 normalizedInput: normalizedInput,
                 mask: mask,
-                cache: layerCache(index)
+                cache: layerCache(index),
+                diagnosticCheckpoint: checkpoint
             )
             hidden = result.hidden
             normalizedInput = result.nextNormalized
             let layerNumber = index + 1
+            if seedProfile?.mode == .coarse && (index == 47 || index == 59),
+               let seedProfile
+            {
+                var roots = [hidden]
+                if let normalizedInput { roots.append(normalizedInput) }
+                roots.append(contentsOf: cacheParents(0..<(index + 1)))
+                seedProfile.evaluateCheckpoint(
+                    name: index == 47 ? "tower_0_47" : "tower_48_59",
+                    roots: roots
+                )
+            }
             if inputs.dim(1) == 1,
                asyncLayerGroup > 0,
                layerNumber >= asyncLayerLead,
@@ -1241,7 +1296,12 @@ final class Gemma4FastEngine {
             hidden = gemma4LastTokenHidden(hidden)
             hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
         }
+        if seedProfile?.mode == .coarse {
+            seedProfile?.evaluateCheckpoint(name: "final_norm", roots: [hidden])
+        }
+
         let cap = MLXArray(softcap)
+        let output: MLXArray
         if let tiedVocabularyHead, usePacked13TiedVocabularyHead {
             let candidate = tiedVocabularyHead.packed13Softcapped(
                 hidden,
@@ -1256,24 +1316,29 @@ final class Gemma4FastEngine {
                     stockName: "embedTokens.asLinear + compiled softcap"
                 )
             }
-            return candidate
-        }
-
-        let logits: MLXArray
-        if let tiedVocabularyHead {
-            let candidate = tiedVocabularyHead(hidden)
-            if verifyTiedVocabularyHead {
-                tiedVocabularyHead.verifyRawBF16(
-                    candidate,
-                    stock: embedTokens.asLinear(hidden),
-                    candidateName: "stock-metadata custom",
-                    stockName: "embedTokens.asLinear"
-                )
-            }
-            logits = candidate
+            output = candidate
         } else {
-            logits = embedTokens.asLinear(hidden)
+            let logits: MLXArray
+            if let tiedVocabularyHead {
+                let candidate = tiedVocabularyHead(hidden)
+                if verifyTiedVocabularyHead {
+                    tiedVocabularyHead.verifyRawBF16(
+                        candidate,
+                        stock: embedTokens.asLinear(hidden),
+                        candidateName: "stock-metadata custom",
+                        stockName: "embedTokens.asLinear"
+                    )
+                }
+                logits = candidate
+            } else {
+                logits = embedTokens.asLinear(hidden)
+            }
+            output = logitSoftcap(logits, cap)
         }
-        return logitSoftcap(logits, cap)
+        if let seedProfile {
+            seedProfile.evaluateCheckpoint(name: "head", roots: [output])
+            seedProfile.finish()
+        }
+        return output
     }
 }
