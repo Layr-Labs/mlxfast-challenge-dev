@@ -41,6 +41,31 @@ private let gemma4VerifyStagedSlidingPrefillAttentionBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+/// Process-start scheduling selector. Multi-token calls use one asynchronous
+/// frontier per complete six-layer attention motif unless explicitly rolled
+/// back. Singleton decode scheduling is controlled independently below.
+private let gemma4PrefillMotifWavefrontEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_MOTIF_WAVEFRONT"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+/// Qualification-only whole-seed timing. This is dormant by default and adds
+/// no synchronization unless explicitly enabled. In timing mode the final
+/// logits are evaluated (never an intermediate layer) so the reported duration
+/// covers the complete model call rather than only lazy graph construction.
+private let gemma4PrefillMotifWavefrontTimingEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_MOTIF_WAVEFRONT_TIMING"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -1190,6 +1215,33 @@ final class Gemma4FastEngine {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let isPrefillCall = inputs.ndim == 2
+            && inputs.dim(0) == 1
+            && inputs.dim(1) > 1
+        let shouldTimeSeed = gemma4PrefillMotifWavefrontTimingEnabled
+            && inputs.ndim == 2
+            && inputs.dim(0) == 1
+            && inputs.dim(1) == 512
+            && (cache?.first?.offset ?? 0) == 0
+        let seedStart = shouldTimeSeed ? Date().timeIntervalSinceReferenceDate : nil
+
+        func finish(_ output: MLXArray) -> MLXArray {
+            guard let seedStart else { return output }
+            // Qualification mode deliberately synchronizes only the complete
+            // output, never an intermediate motif.
+            eval(output)
+            let elapsed = Date().timeIntervalSinceReferenceDate - seedStart
+            let activeMiB = Double(Memory.activeMemory) / Double(1 << 20)
+            let cacheMiB = Double(Memory.cacheMemory) / Double(1 << 20)
+            let peakMiB = Double(Memory.peakMemory) / Double(1 << 20)
+            let line = String(
+                format: "prefill-motif-wavefront seed_ms=%.3f active_mib=%.1f cache_mib=%.1f peak_mib=%.1f\n",
+                elapsed * 1_000, activeMiB, cacheMiB, peakMiB
+            )
+            FileHandle.standardError.write(Data(line.utf8))
+            return output
+        }
+
         var hidden = embedTokens(inputs) * embedScale
 
         func layerCache(_ index: Int) -> KVCache? {
@@ -1233,6 +1285,30 @@ final class Gemma4FastEngine {
                     asyncEval(hidden)
                 }
             }
+
+            // Submit each complete five-sliding/one-full motif while Swift
+            // constructs the next one. The final motif is left to final-logit
+            // demand, avoiding a redundant frontier at the end of the tower.
+            if gemma4PrefillMotifWavefrontEnabled,
+               isPrefillCall,
+               layerNumber.isMultiple(of: 6),
+               layerNumber < layers.count
+            {
+                var frontier: [MLXArray] = [hidden]
+                if let normalizedInput {
+                    frontier.append(normalizedInput)
+                }
+                if let cache {
+                    let motifStart = max(0, index - 5)
+                    let motifEnd = min(index, cache.count - 1)
+                    if motifStart <= motifEnd {
+                        for cacheIndex in motifStart...motifEnd {
+                            frontier.append(contentsOf: cache[cacheIndex].innerState())
+                        }
+                    }
+                }
+                asyncEval(frontier)
+            }
         }
 
         if inputs.dim(1) == 1, let normalizedInput {
@@ -1256,7 +1332,7 @@ final class Gemma4FastEngine {
                     stockName: "embedTokens.asLinear + compiled softcap"
                 )
             }
-            return candidate
+            return finish(candidate)
         }
 
         let logits: MLXArray
@@ -1274,6 +1350,6 @@ final class Gemma4FastEngine {
         } else {
             logits = embedTokens.asLinear(hidden)
         }
-        return logitSoftcap(logits, cap)
+        return finish(logitSoftcap(logits, cap))
     }
 }
