@@ -88,6 +88,7 @@ public struct ExperimentalTrainedMTPOptions: Equatable {
     public let goldenPath: String
     public let maxBlockSize: Int
     public let totalTokenCount: Int
+    public let verificationMode: Gemma4MTPVerificationMode
     public let requireTrainedAssistant: Bool
 
     public init(
@@ -98,6 +99,7 @@ public struct ExperimentalTrainedMTPOptions: Equatable {
         goldenPath: String,
         maxBlockSize: Int = MLXFastConstants.experimentalMTPMaxBlockSize,
         totalTokenCount: Int = MLXFastConstants.experimentalMTPMaxTotalTokens,
+        verificationMode: Gemma4MTPVerificationMode = .exactPair,
         requireTrainedAssistant: Bool
     ) {
         self.sourceTargetPath = sourceTargetPath
@@ -107,6 +109,7 @@ public struct ExperimentalTrainedMTPOptions: Equatable {
         self.goldenPath = goldenPath
         self.maxBlockSize = maxBlockSize
         self.totalTokenCount = totalTokenCount
+        self.verificationMode = verificationMode
         self.requireTrainedAssistant = requireTrainedAssistant
     }
 }
@@ -130,7 +133,11 @@ public struct ExperimentalTrainedMTPReport: Codable, Equatable {
     public let seedTokenCount: Int
     public let decodeTokenCount: Int
     public let maxBlockSize: Int
+    public let targetVerificationMode: String
     public let blockRequestCount: Int
+    public let exactPairSegmentCount: Int
+    public let exactPairRollbackRowCount: Int
+    public let serialVerificationRowCount: Int
     public let proposedDraftTokenCount: Int
     public let acceptedDraftTokenCount: Int
     public let rejectedDraftTokenCount: Int
@@ -171,7 +178,11 @@ public struct ExperimentalTrainedMTPReport: Codable, Equatable {
         case seedTokenCount = "seed_token_count"
         case decodeTokenCount = "decode_token_count"
         case maxBlockSize = "max_block_size"
+        case targetVerificationMode = "target_verification_mode"
         case blockRequestCount = "block_request_count"
+        case exactPairSegmentCount = "exact_pair_segment_count"
+        case exactPairRollbackRowCount = "exact_pair_rollback_row_count"
+        case serialVerificationRowCount = "serial_verification_row_count"
         case proposedDraftTokenCount = "proposed_draft_token_count"
         case acceptedDraftTokenCount = "accepted_draft_token_count"
         case rejectedDraftTokenCount = "rejected_draft_token_count"
@@ -370,6 +381,10 @@ struct ExperimentalMTPDecodeMeasurement: Equatable {
     let meanBlockRequestSeconds: Double
     let p50BlockRequestSeconds: Double
     let maxBlockRequestSeconds: Double
+    let targetVerificationMode: String
+    let exactPairSegmentCount: Int
+    let exactPairRollbackRowCount: Int
+    let serialVerificationRowCount: Int
     let proposedDraftTokenCount: Int
     let acceptedDraftTokenCount: Int
     let rejectedDraftTokenCount: Int
@@ -391,6 +406,10 @@ struct ExperimentalMTPDecodeMeasurement: Equatable {
         meanBlockRequestSeconds: Double = 0,
         p50BlockRequestSeconds: Double = 0,
         maxBlockRequestSeconds: Double = 0,
+        targetVerificationMode: String = "",
+        exactPairSegmentCount: Int = 0,
+        exactPairRollbackRowCount: Int = 0,
+        serialVerificationRowCount: Int = 0,
         proposedDraftTokenCount: Int = 0,
         acceptedDraftTokenCount: Int = 0,
         rejectedDraftTokenCount: Int = 0,
@@ -411,6 +430,10 @@ struct ExperimentalMTPDecodeMeasurement: Equatable {
         self.meanBlockRequestSeconds = meanBlockRequestSeconds
         self.p50BlockRequestSeconds = p50BlockRequestSeconds
         self.maxBlockRequestSeconds = maxBlockRequestSeconds
+        self.targetVerificationMode = targetVerificationMode
+        self.exactPairSegmentCount = exactPairSegmentCount
+        self.exactPairRollbackRowCount = exactPairRollbackRowCount
+        self.serialVerificationRowCount = serialVerificationRowCount
         self.proposedDraftTokenCount = proposedDraftTokenCount
         self.acceptedDraftTokenCount = acceptedDraftTokenCount
         self.rejectedDraftTokenCount = rejectedDraftTokenCount
@@ -503,7 +526,8 @@ extension GemmaRuntime {
             weightsPath: options.targetWeightsPath,
             launch: .trainedMTP(
                 assistantPath: options.assistantPath,
-                contractPath: options.contractPath
+                contractPath: options.contractPath,
+                verificationMode: options.verificationMode
             )
         )
         defer {
@@ -513,13 +537,15 @@ extension GemmaRuntime {
             plan: plan,
             maxBlockSize: options.maxBlockSize,
             totalTokenCount: options.totalTokenCount,
+            verificationMode: options.verificationMode,
             worker: worker
         )
         return ExperimentalTrainedMTPReport(
             experimental: true,
             trackID: artifacts.trackID,
             protocolName: "trusted_mtp_block_v1",
-            generator: "google_gemma4_trained_mtp",
+            generator:
+                "google_gemma4_trained_mtp_\(measurement.targetVerificationMode)",
             usesTrainedDrafter: true,
             targetModelID: artifacts.targetModelID,
             targetRevision: artifacts.targetRevision,
@@ -532,7 +558,11 @@ extension GemmaRuntime {
             seedTokenCount: plan.seedTokens.count,
             decodeTokenCount: options.totalTokenCount,
             maxBlockSize: options.maxBlockSize,
+            targetVerificationMode: measurement.targetVerificationMode,
             blockRequestCount: measurement.blockRequestCount,
+            exactPairSegmentCount: measurement.exactPairSegmentCount,
+            exactPairRollbackRowCount: measurement.exactPairRollbackRowCount,
+            serialVerificationRowCount: measurement.serialVerificationRowCount,
             proposedDraftTokenCount: measurement.proposedDraftTokenCount,
             acceptedDraftTokenCount: measurement.acceptedDraftTokenCount,
             rejectedDraftTokenCount: measurement.rejectedDraftTokenCount,
@@ -581,6 +611,10 @@ extension GemmaRuntime {
                     + "use mtp-probe for the serial control"
             )
         }
+        // K=1 would never draft, so the trained-assistant report fields
+        // (generator, uses_trained_drafter) would be dishonest. The serial
+        // K=1 control is mtp-probe; block-size one remains valid only for
+        // the session's internal final-token tails.
         guard options.maxBlockSize >= 2,
               options.maxBlockSize
                   <= MLXFastConstants.experimentalMTPMaxBlockSize
@@ -605,6 +639,7 @@ extension GemmaRuntime {
         plan: ExperimentalMTPPromptPlan,
         maxBlockSize: Int,
         totalTokenCount: Int,
+        verificationMode: Gemma4MTPVerificationMode,
         worker: RuntimeWorkerClient
     ) throws -> ExperimentalMTPDecodeMeasurement {
         var validator = try ExperimentalMTPBlockValidator(
@@ -682,14 +717,45 @@ extension GemmaRuntime {
         let mlxActiveMemoryBytes = diagnostics.mlxActiveMemoryBytes ?? 0
         let mlxCacheMemoryBytes = diagnostics.mlxCacheMemoryBytes ?? 0
         let mlxPeakMemoryBytes = diagnostics.mlxPeakMemoryBytes ?? 0
+        let targetVerificationMode = diagnostics.targetVerificationMode ?? ""
+        let exactPairSegmentCount = diagnostics.exactPairSegmentCount ?? -1
+        let exactPairRollbackRowCount =
+            diagnostics.exactPairRollbackRowCount ?? -1
+        let serialVerificationRowCount =
+            diagnostics.serialVerificationRowCount ?? -1
         guard peakRamGB >= 0,
               mlxActiveMemoryBytes >= 0,
               mlxCacheMemoryBytes >= 0,
-              mlxPeakMemoryBytes >= 0
+              mlxPeakMemoryBytes >= 0,
+              targetVerificationMode == verificationMode.rawValue,
+              exactPairSegmentCount >= 0,
+              exactPairRollbackRowCount >= 0,
+              serialVerificationRowCount >= 0
         else {
             throw MLXFastError.invalidInput(
-                "trained MTP diagnostics returned a negative memory value"
+                "trained MTP diagnostics returned invalid verification or memory data"
             )
+        }
+        // Physical row accounting: each exact pair appends two target rows,
+        // each pair rollback removes one, and each serial row appends one.
+        // Committed rows must equal the parent-owned decode total exactly.
+        let physicalRowCount = 2 * exactPairSegmentCount
+            - exactPairRollbackRowCount
+            + serialVerificationRowCount
+        guard physicalRowCount == totalTokenCount else {
+            throw MLXFastError.invalidInput(
+                "trained MTP verification rows (\(physicalRowCount)) diverged "
+                    + "from the configured decode total (\(totalTokenCount))"
+            )
+        }
+        if verificationMode == .serial {
+            guard exactPairSegmentCount == 0,
+                  exactPairRollbackRowCount == 0
+            else {
+                throw MLXFastError.invalidInput(
+                    "serial MTP verification reported exact-pair segments"
+                )
+            }
         }
         return ExperimentalMTPDecodeMeasurement(
             elapsedSeconds: elapsedSeconds,
@@ -701,6 +767,10 @@ extension GemmaRuntime {
             meanBlockRequestSeconds: meanBlockRequestSeconds,
             p50BlockRequestSeconds: p50BlockRequestSeconds,
             maxBlockRequestSeconds: maxBlockRequestSeconds,
+            targetVerificationMode: targetVerificationMode,
+            exactPairSegmentCount: exactPairSegmentCount,
+            exactPairRollbackRowCount: exactPairRollbackRowCount,
+            serialVerificationRowCount: serialVerificationRowCount,
             proposedDraftTokenCount: acceptance.proposedDraftTokenCount,
             acceptedDraftTokenCount: acceptance.acceptedDraftTokenCount,
             rejectedDraftTokenCount: acceptance.rejectedDraftTokenCount,

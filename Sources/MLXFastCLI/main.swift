@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MLXFastCore
 import MLXFastHarness
+import MLXFastModel
 import MLXFastTransform
 import Tokenizers
 
@@ -433,6 +434,7 @@ private enum MLXFastCLI {
                 "--golden",
                 "--block-size",
                 "--tokens",
+                "--target-verification",
             ],
             flagOptions: ["--require-trained-assistant"]
         )
@@ -483,6 +485,17 @@ private enum MLXFastCLI {
             ),
             optionName: "--tokens"
         )
+        let verificationValue = options.value(
+            for: "--target-verification",
+            default: Gemma4MTPVerificationMode.exactPair.rawValue
+        ).lowercased()
+        guard let verificationMode = Gemma4MTPVerificationMode(
+            rawValue: verificationValue
+        ) else {
+            throw MLXFastError.invalidInput(
+                "--target-verification must be exact-pair or serial"
+            )
+        }
         guard let worker = try runtimeWorkerOptions(
             blockedGoldenPath: goldenPath
         ) else {
@@ -499,6 +512,7 @@ private enum MLXFastCLI {
                 goldenPath: goldenPath,
                 maxBlockSize: maxBlockSize,
                 totalTokenCount: totalTokenCount,
+                verificationMode: verificationMode,
                 requireTrainedAssistant: options.hasFlag(
                     "--require-trained-assistant"
                 )
@@ -1532,12 +1546,28 @@ private enum MLXFastCLI {
         _ options: ParsedOptions
     ) throws {
         try options.validate(
-            valueOptions: ["--weights", "--assistant", "--contract"],
+            valueOptions: [
+                "--weights",
+                "--assistant",
+                "--contract",
+                "--target-verification",
+            ],
             flagOptions: ["--require-trained-assistant"]
         )
         let weightsPath = options.value(for: "--weights", default: "")
         let assistantPath = options.value(for: "--assistant", default: "")
         let contractPath = options.value(for: "--contract", default: "")
+        let verificationValue = options.value(
+            for: "--target-verification",
+            default: Gemma4MTPVerificationMode.exactPair.rawValue
+        ).lowercased()
+        guard let verificationMode = Gemma4MTPVerificationMode(
+            rawValue: verificationValue
+        ) else {
+            throw MLXFastError.invalidInput(
+                "--target-verification must be exact-pair or serial"
+            )
+        }
         guard !weightsPath.isEmpty,
               !assistantPath.isEmpty,
               !contractPath.isEmpty
@@ -1550,6 +1580,7 @@ private enum MLXFastCLI {
             targetWeightsPath: weightsPath,
             assistantPath: assistantPath,
             contractPath: contractPath,
+            verificationMode: verificationMode,
             requireTrainedAssistant: options.hasFlag(
                 "--require-trained-assistant"
             )
@@ -1578,7 +1609,7 @@ private enum MLXFastCLI {
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--local-submit|--local-iterate] [--weights PATH] [--golden PATH] [--score-path PATH]
               mlxfast-swift mtp-probe --weights PATH --golden PATH [--block-size N] [--tokens N]
-              mlxfast-swift mtp-benchmark --target-source IT_SOURCE --weights IT_PATH --assistant PATH --contract PATH --golden IT_GOLDEN --require-trained-assistant [--block-size N] [--tokens N]
+              mlxfast-swift mtp-benchmark --target-source IT_SOURCE --weights IT_PATH --assistant PATH --contract PATH --golden IT_GOLDEN --require-trained-assistant [--block-size N] [--tokens N] [--target-verification exact-pair|serial]
               mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
               mlxfast-swift attach-free-run-gate [--golden PATH] [--weights PATH] [--output PATH] [--name NAME] [--steps N] [--allow-partial] [--case NAME | --prompt-file PATH [--tokenizer PATH]] [--exact-prefix N]
               mlxfast-swift generate-golden --prompt-file PATH [--weights PATH] [--tokenizer PATH] --output PATH --name NAME --steps N

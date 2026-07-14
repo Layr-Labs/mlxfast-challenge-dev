@@ -545,7 +545,11 @@ func trainedMTPMemoryDiagnosticsRemainNonScoringProtocolFields() throws {
         peakRamGB: 21.5,
         mlxActiveMemoryBytes: 20,
         mlxCacheMemoryBytes: 3,
-        mlxPeakMemoryBytes: 24
+        mlxPeakMemoryBytes: 24,
+        targetVerificationMode: "exact-pair",
+        exactPairSegmentCount: 31,
+        exactPairRollbackRowCount: 2,
+        serialVerificationRowCount: 1
     )
     let data = try JSONEncoder().encode(response)
     let object = try #require(
@@ -555,6 +559,10 @@ func trainedMTPMemoryDiagnosticsRemainNonScoringProtocolFields() throws {
     #expect(object["mlx_active_memory_bytes"] as? Int == 20)
     #expect(object["mlx_cache_memory_bytes"] as? Int == 3)
     #expect(object["mlx_peak_memory_bytes"] as? Int == 24)
+    #expect(object["target_verification_mode"] as? String == "exact-pair")
+    #expect(object["exact_pair_segment_count"] as? Int == 31)
+    #expect(object["exact_pair_rollback_row_count"] as? Int == 2)
+    #expect(object["serial_verification_row_count"] as? Int == 1)
     #expect(object["score"] == nil)
     #expect(object["seconds"] == nil)
 
@@ -563,6 +571,10 @@ func trainedMTPMemoryDiagnosticsRemainNonScoringProtocolFields() throws {
         from: data
     )
     #expect(decoded.mlxPeakMemoryBytes == 24)
+    #expect(decoded.targetVerificationMode == "exact-pair")
+    #expect(decoded.exactPairSegmentCount == 31)
+    #expect(decoded.exactPairRollbackRowCount == 2)
+    #expect(decoded.serialVerificationRowCount == 1)
 }
 
 @Test
@@ -638,6 +650,36 @@ func trainedMTPOptionsFailClosedWithoutAssistantRequirement() throws {
         requireTrainedAssistant: true
     )
     try GemmaRuntime.validateExperimentalTrainedMTPOptions(valid)
+    try GemmaRuntime.validateExperimentalTrainedMTPOptions(
+        ExperimentalTrainedMTPOptions(
+            sourceTargetPath: "source-target",
+            targetWeightsPath: "mtp-weights",
+            assistantPath: "assistant",
+            contractPath: "contract.json",
+            goldenPath: "it-golden.json",
+            maxBlockSize: 2,
+            totalTokenCount: 255,
+            verificationMode: .serial,
+            requireTrainedAssistant: true
+        )
+    )
+
+    // K=1 cannot draft, so the trained-assistant benchmark rejects it; the
+    // serial K=1 control remains mtp-probe.
+    #expect(throws: MLXFastError.self) {
+        try GemmaRuntime.validateExperimentalTrainedMTPOptions(
+            ExperimentalTrainedMTPOptions(
+                sourceTargetPath: "source-target",
+                targetWeightsPath: "mtp-weights",
+                assistantPath: "assistant",
+                contractPath: "contract.json",
+                goldenPath: "it-golden.json",
+                maxBlockSize: 1,
+                totalTokenCount: 255,
+                requireTrainedAssistant: true
+            )
+        )
+    }
 
     #expect(throws: MLXFastError.self) {
         try GemmaRuntime.validateExperimentalTrainedMTPOptions(
@@ -665,6 +707,7 @@ func trainedMTPTrackIsExplicitAndSerialBenchmarkRemainsUnchanged() throws {
     #expect(source.contains("case \"mtp-runtime-worker\":"))
     #expect(source.contains("--require-trained-assistant"))
     #expect(source.contains("[--block-size N] [--tokens N]"))
+    #expect(source.contains("[--target-verification exact-pair|serial]"))
     #expect(source.contains("mtp-benchmark requires --target-source PATH"))
     #expect(source.contains("mtp-benchmark requires --assistant PATH"))
 
@@ -682,10 +725,11 @@ func trainedMTPTrackIsExplicitAndSerialBenchmarkRemainsUnchanged() throws {
     #expect(!serialBenchmarkBody.contains("experimentalTrainedMTPBenchmark"))
     #expect(!serialBenchmarkBody.contains("--assistant"))
     #expect(!serialBenchmarkBody.contains("mtp_decode_block"))
+    #expect(!serialBenchmarkBody.contains("--target-verification"))
 }
 
 @Test
-func trainedMTPUsesSerialEquivalentTargetVerification() throws {
+func trainedMTPUsesExplicitExactPairVerificationAndSerialControl() throws {
     let adapter = try String(
         contentsOfFile: "Sources/MLXFastModel/Gemma4MTPRuntime.swift",
         encoding: .utf8
@@ -701,14 +745,33 @@ func trainedMTPUsesSerialEquivalentTargetVerification() throws {
     )
     #expect(adapter.contains("fastMTPForward(tokens, cache: cache)"))
     #expect(adapter.contains("newCache(parameters: parameters)"))
-    #expect(adapter.contains("for (position, inputToken) in verifyInputs.enumerated()"))
+    #expect(adapter.contains("case .exactPair:"))
+    #expect(adapter.contains("verifyWithExactPairs("))
+    #expect(adapter.contains("target.exactMTPPair("))
+    #expect(adapter.contains("Gemma4SharedKV.sliceTail("))
+    #expect(adapter.contains("case .serial:"))
+    #expect(adapter.contains("verifySerially("))
     #expect(!adapter.contains("replayRejectedRoundExactly"))
+    #expect(!adapter.contains("PromptLookup"))
     #expect(engine.contains("func forwardForMTP("))
+    #expect(engine.contains("func exactMTPPair("))
+    #expect(engine.contains("gemma4ExactTwoTokenAttention("))
+    #expect(engine.contains("exactTwoVectorPacked13Softcapped("))
     #expect(engine.contains("capturedSharedKV: Gemma4SharedKV("))
-    #expect(engine.contains("projectedHidden = inputs.dim(1) > 16"))
+    #expect(engine.contains("let preNorm = inputs.dim(1) > 16"))
     #expect(worker.contains("let warmupSession"))
     #expect(worker.contains("repeating: 2"))
-    #expect(worker.contains("later exact target rows cold"))
+    #expect(worker.contains("verificationMode: verificationMode"))
+    #expect(worker.contains("try target.warmMTPTargetKernels("))
+    #expect(
+        worker.contains("includeExactPair: verificationMode == .exactPair")
+    )
+    // The fixed warmup must not depend on assistant acceptance: four serial
+    // rows always, two exact pairs when selected, plus the deep 1,024-key
+    // sliding-attention switch.
+    #expect(adapter.contains("for _ in 0..<4"))
+    #expect(adapter.contains("for _ in 0..<2"))
+    #expect(adapter.contains("warmDeepSlidingDecodeAttention()"))
     let warmup = try #require(worker.range(of: "let warmupSession"))
     let protocolHello = try #require(
         worker.range(of: "let sessionNonce = generateRuntimeWorkerNonce()")

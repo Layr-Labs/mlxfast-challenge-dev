@@ -243,6 +243,7 @@ func gemma4CombinedCacheKeepsMultiTokenVerificationInCombinedStorage() throws {
     _ = cache.updateCombined(
         MLXArray([Float(2), 102], [2, 1, 1, 1, 1])
     )
+    #expect(cache.canAppendExactPair())
 
     let visible = cache.update(
         keys: MLXArray([Float(3), 4], [1, 1, 2, 1]),
@@ -256,10 +257,64 @@ func gemma4CombinedCacheKeepsMultiTokenVerificationInCombinedStorage() throws {
     #expect(visible.1.shape == [1, 1, 4, 1])
     #expect(visible.0.asArray(Float.self) == [1, 2, 3, 4])
     #expect(visible.1.asArray(Float.self) == [101, 102, 103, 104])
+    let prefix = cache.viewsExcludingNewest(1)
+    eval(prefix.0, prefix.1)
+    #expect(prefix.0.asArray(Float.self) == [1, 2, 3])
+    #expect(prefix.1.asArray(Float.self) == [101, 102, 103])
 
     #expect(cache.trim(1) == 1)
     #expect(cache.offset == 3)
     #expect(cache.state.allSatisfy { $0.dim(2) == 3 })
+    let overwritten = cache.updateCombined(
+        MLXArray([Float(9), 109], [2, 1, 1, 1, 1])
+    )
+    eval(overwritten.0, overwritten.1)
+    #expect(overwritten.0.asArray(Float.self) == [1, 2, 3, 9])
+    #expect(overwritten.1.asArray(Float.self) == [101, 102, 103, 109])
+
+    let rotating = Gemma4CombinedKVCache(
+        rotatingMaxSize: 4,
+        step: 4
+    )
+    _ = rotating.updateCombined(
+        MLXArray([Float(1), 101], [2, 1, 1, 1, 1])
+    )
+    _ = rotating.updateCombined(
+        MLXArray([Float(2), 102], [2, 1, 1, 1, 1])
+    )
+    #expect(rotating.canAppendExactPair())
+    _ = rotating.updateCombined(
+        MLXArray([Float(3), 4, 103, 104], [2, 1, 1, 2, 1])
+    )
+    #expect(rotating.offset == 4)
+    #expect(!rotating.canAppendExactPair())
+
+    // An odd offset one position before the window refuses a pair, and a
+    // post-wrap cursor (offset no longer equal to the rotating index)
+    // refuses pairs permanently.
+    let oddRotating = Gemma4CombinedKVCache(
+        rotatingMaxSize: 5,
+        step: 5
+    )
+    for value in 1...3 {
+        _ = oddRotating.updateCombined(
+            MLXArray([Float(value), Float(100 + value)], [2, 1, 1, 1, 1])
+        )
+    }
+    #expect(oddRotating.canAppendExactPair())
+    _ = oddRotating.updateCombined(
+        MLXArray([Float(4), 104], [2, 1, 1, 1, 1])
+    )
+    #expect(oddRotating.offset == 4)
+    #expect(!oddRotating.canAppendExactPair())
+    _ = oddRotating.updateCombined(
+        MLXArray([Float(5), 105], [2, 1, 1, 1, 1])
+    )
+    _ = oddRotating.updateCombined(
+        MLXArray([Float(6), 106], [2, 1, 1, 1, 1])
+    )
+    #expect(oddRotating.offset == 6)
+    #expect(!oddRotating.canAppendExactPair())
 }
 
 @Test

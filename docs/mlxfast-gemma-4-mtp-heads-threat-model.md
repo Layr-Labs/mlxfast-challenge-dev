@@ -14,11 +14,15 @@ each computation when malicious editable model code still returns correct
 oracle tokens, so hidden-independent prompts, static review, M5 telemetry, and
 manual audit remain necessary.
 
-The final public/synthetic M5 matrix achieved exact parity across 12
-variable-length pairs, but serial-equivalent target verification was slower
-than serial in every category (overall ratio-of-means 0.815x). This is a
-correctness-complete experimental control and must not be promoted as a
-rankable performance track until a bit-identical K-row target kernel exists.
+The serial-K=1-verifier matrix achieved exact parity across 12
+variable-length pairs but was slower than serial in every category (overall
+ratio-of-means 0.815x). The current default replaces it with MTP-only
+exact-pair kernels that share packed weight reads while preserving each row's
+K=1 accumulation order; runtime gates compare logits, pre-norm hidden, and
+physical KV bytes against serial forwards, including forced
+zero/partial/full/second-segment acceptance and deep growth/wrap seams. The
+serial K=1 verifier remains the explicit fail-closed control mode. Any future
+kernel change must rerun those parity gates before promotion.
 
 ## Scope and assumptions
 
@@ -70,8 +74,9 @@ multi-tenant or lower-memory deployment.
 - Sandboxed worker: loads target and assistant, executes the strict line-JSON
   protocol, and cannot write or use the network
   (`GemmaRuntimeMTPWorker.swift`, `main.swift` sandbox profile).
-- Editable MTP model: drafts, verifies, commits, and rolls back target/shared
-  KV state (`Gemma4MTPRuntime.swift`).
+- Editable MTP model: drafts, selects an explicit exact-pair or serial
+  verifier, commits, and rolls back target/shared KV state
+  (`Gemma4MTPRuntime.swift`, `Gemma4ExactTwo*.swift`).
 - Static review: chooses distinct serial or MTP policy from trusted track
   identity (`run-submission-static-review.sh`).
 - Future workflow/publisher: not implemented; must pair a trusted MTP
@@ -157,8 +162,9 @@ flowchart LR
 | Artifact directories | Target/assistant paths | Cache → parent/worker | Hash, size, links, inventory, config | `GemmaRuntimeMTPProvenance.swift` |
 | Worker request decoder | Private pipe JSON | Parent → worker | Unknown fields and bounds rejected | `GemmaRuntimeWorker.swift` |
 | Worker response decoder | Private pipe JSON | Worker → parent | Unknown timing/count fields rejected | `GemmaRuntimeWorker.swift` |
-| Draft/verify round | Editable Swift calls pinned MLX APIs | Worker → untrusted model | Internal computation not directly attestable | `Gemma4MTPRuntime.swift` |
-| KV rollback | Acceptance-dependent cache trim | Editable model state | Host offsets checked; physical semantics need runtime tests | `Gemma4MTPRuntime.swift` |
+| Draft/verify round | Editable Swift calls pinned MLX APIs | Worker → untrusted model | Verification mode is explicit; internal computation is not directly attestable | `Gemma4MTPRuntime.swift` |
+| Exact-pair kernels | Packed target weights and two hidden rows | Editable model → GPU | Weight reads are shared; each row must retain K=1 accumulation order | `Gemma4ExactTwoVector*.swift` |
+| KV rollback | Acceptance-dependent pair-row trim | Editable model state | Host offsets and exact physical bytes are runtime-tested | `Gemma4MTPRuntime.swift`, `Gemma4CombinedKVCache.swift` |
 | Static-review track ID | Trusted environment | Workflow → review service | Defaults to serial; unsupported IDs fail | `run-submission-static-review.sh` |
 | Provisioning download | HTTPS and local cache writes | Repository → operator cache | Resume plus exact SHA256; TOCTOU depends on ownership | `setup-mtp.sh` |
 
@@ -173,9 +179,10 @@ flowchart LR
 3. Unverified draft emission: editable code returns assistant tokens directly
    → any mismatch fails parent oracle; lookup that predicts exact hidden output
    remains a static/hidden-prompt concern.
-4. Rollback corruption: candidate verifies several rows but keeps rejected
-   physical KV state → later logits normally diverge and fail oracle; carefully
-   hidden stale buffers require cache instrumentation/manual review.
+4. Rollback corruption: candidate computes a pair, rejects row zero, but keeps
+   row one's physical KV state → exact cache-byte/offset tests catch the known
+   seam and later oracle tokens normally diverge; hidden stale buffers still
+   require instrumentation/manual review.
 5. Prompt specialization: candidate hashes the 512-token prompt and returns a
    known continuation → public prompt can be gamed → hidden,
    prompt-independent cases and static review are mandatory.
@@ -201,7 +208,7 @@ flowchart LR
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | TM-001 | Participant | Known or fingerprintable prompt | Lookup/hardcode exact continuation | Fake speed with correct output | Score, leaderboard | No future oracle; static policy; parent oracle | Public prompt remains known | Multiple hidden-independent prompts; diff review; reject large lookup data | Acceptance/block patterns and source-size anomalies | High | High | Critical |
 | TM-002 | Participant | Editable MTP round | Return drafts without target verification or use stale logits | Incorrect inference accepted if tokens happen to match | Score, model integrity | Parent checks every token; MTP static policy | Parent cannot observe internal target calls | Hidden near-tie/diverse prompts; manual target-call audit; optional trusted kernel counters outside editable code | Compare target execution telemetry to reference | Medium | High | High |
-| TM-003 | Participant | Partial/zero acceptance | Leave cache physically or logically over-advanced | Future logits corrupt or hidden work is reused | KV state, score | Every target row uses the exact serial K=1 reduction shape; verification stops at first rejection; host offset checks; poison on error | Future optimized K-row kernels would reopen shape-parity risk | Runtime-gated zero/partial/full and variable-tail parity tests | Cache-offset, physical-state, and oracle assertions | Medium | High | High |
+| TM-003 | Participant | Partial/zero acceptance | Leave cache physically or logically over-advanced | Future logits corrupt or hidden work is reused | KV state, score | Exact K=2 row arithmetic; row-zero rejection trims row one in every layer; no later pair after rejection; host offset checks; poison on error | Parent still cannot attest unused stale allocation bytes | Runtime-gated exact logits/hidden/KV bytes at multiple offsets; zero/partial/full and variable-tail parity tests | Cache-offset, physical-state, exact-byte, and oracle assertions | Medium | High | High |
 | TM-004 | Participant/local attacker | Writable artifact paths | Replace/add assistant or race path validation | Easier workload or malicious model | Model provenance, score | Exact ID/hash/size/config/inventory; no links; pre/post-load digest | Path loader is not descriptor-bound | Root-owned read-only cache; immutable volume; compare inode metadata around load | Provisioning audit and digest log | Low officially, medium locally | High | High |
 | TM-005 | Participant | Worker controls response behavior | Forge counts, seconds, nonce/ID, empty/oversized/partial blocks | Denominator or timing manipulation, hangs | Protocol, score, availability | Strict schema; nonce/ID; watchdog; bounds; fixed denominator | Deliberate slow responses still consume queue | Per-request and job timeout; response fuzz suite | Protocol-rejection counters | Medium | Medium | Medium |
 | TM-006 | Participant | Prompt supplied at begin | Precompute future tokens before timer or across requests | Uncharged work | Score | Timer before begin; fresh worker; no prompt before timer; allocator clear | Active background GPU allocations are not fully cleared/provable | Process isolation before prompt; active-memory baseline; GPU quiescence check | Metal/GPU activity before begin | Medium | High | High |
@@ -227,6 +234,8 @@ flowchart LR
 | Path | Why it matters | Related threats |
 | --- | --- | --- |
 | `Sources/MLXFastModel/Gemma4MTPRuntime.swift` | Editable draft/verify/rollback and persistent state | TM-001, TM-002, TM-003, TM-006, TM-007 |
+| `Sources/MLXFastModel/Gemma4ExactTwo*.swift` | Per-row arithmetic order and shared packed-weight traversal | TM-002, TM-003, TM-007 |
+| `Sources/MLXFastModel/Gemma4FastEngine.swift` | Exact-pair eligibility, causal pair composition, and MTP-only dispatch | TM-002, TM-003, TM-009 |
 | `Sources/MLXFastHarness/GemmaRuntimeMTP.swift` | Trusted timer, oracle, bounds, denominator | TM-001, TM-005, TM-006 |
 | `Sources/MLXFastHarness/GemmaRuntimeMTPWorker.swift` | MTP-only request state and poisoning | TM-003, TM-005, TM-008 |
 | `Sources/MLXFastHarness/GemmaRuntimeMTPProvenance.swift` | Artifact identity and TOCTOU checks | TM-004 |

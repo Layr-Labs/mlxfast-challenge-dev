@@ -108,9 +108,10 @@ The Package.resolved revision exposes:
 - target `rollbackSpeculativeCache`
 - `Gemma4MTPTokenIterator` and `runGemma4MTPRounds`
 
-`Gemma4RuntimeModel` now conforms to `Gemma4MTPTarget`. Its MTP-only forward
-uses the pinned library trunk's pre-norm/shared-KV capture hook. The ordinary
-serial forward and optimized fast engine are unchanged.
+`Gemma4RuntimeModel` conforms to `Gemma4MTPTarget`. Its MTP-only forward uses
+the pinned library trunk's pre-norm/shared-KV capture hook. The ordinary
+serial entry point is unchanged. The fast engine has a separate exact-pair
+entry point that is unreachable from serial `benchmark`.
 
 `Gemma4TrainedMTPBlockSession` persists, for one request:
 
@@ -120,33 +121,54 @@ serial forward and optimized fast engine are unchanged.
 - the last full-attention and sliding-attention shared K/V snapshots;
 - a host mirror of the target cache offset.
 
-For block size `K` (initially four), one round:
+Target verification is selected explicitly:
+
+- `--target-verification exact-pair` is the default trained-MTP path.
+- `--target-verification serial` is the K=1 control.
+
+An exact-pair session fails during construction if the target does not have
+all required packed metadata and kernels. It never catches a numerical
+mismatch and silently reruns that pair serially.
+
+For configured block size `K` in `2...4`, one round:
 
 1. Uses the trained assistant to draft `K - 1` tokens from the current target
    token, target hidden state, and shared K/V.
-2. Constructs one charged block verification graph from `K` exact serial-shape
-   target forwards over the committed token followed by drafts.
-3. Compares each draft to the corresponding target argmax in order.
+2. Verifies two target rows at a time when a pair is available. K=4 composes
+   two exact pairs; K=3 uses one pair plus an exact K=1 bonus tail; K=2 uses one
+   pair; K=1 is target-only.
+3. Compares each draft to the corresponding target argmax in order and starts
+   no later segment after the first rejection.
 4. Emits only the target-confirmed prefix plus the target token at the first
    rejection (between one and `K` tokens).
-5. Stops target execution at the first rejection, so no rejected physical KV
-   row is written; every retained hidden/K/V row uses the serial K=1 shape.
+5. If row zero of a pair rejects, removes row one's physical cache position
+   from every layer and slices the shared-KV view before returning. If row one
+   rejects, row zero's accepted input remains committed.
 6. Persists hidden/shared-KV state at the committed target position.
 7. Checks every target cache offset against the host mirror.
 
-The serial target shape is deliberate. The expanded M5 pilot proved that a
-single mathematical K-row target forward changes floating-point reduction
-order: retained layer-1 K/V diverged after the first full-acceptance block and
-a public prose continuation flipped argmax at decode step 48. Logical offsets
-were still identical. Verifying each supplied row through the K=1 target shape
-preserves exact token and physical-cache parity without hiding a fallback or
-discarding unvalidated work; it also means this prototype does not yet realize
-the target-compute amortization expected from production MTP.
+The exact-pair kernels share packed weight traversal while preserving each
+row's K=1 accumulation and reduction order. They cover sliding Q/K/V, full
+Q/K, attention output, gate/up activation, down projection, layer boundaries,
+and the tied packed13 vocabulary head. RMS normalization remains row-serial.
+Full D=512 attention remains two K=1 calls. Sliding D=256 attention uses one
+causal two-query dispatch only below the library's 1,024-key shape switch;
+otherwise it is row-serial. Row two therefore sees row one's K/V exactly as it
+does in serial decoding.
 
-Zero, partial, and full acceptance use the same charged path. If exactly one
-output remains, a target-only one-position tail step finishes the configured
-window; this is not an assistant fallback and cannot be selected for the main
-rounds.
+The expanded M5 pilot proved why an ordinary mathematical K-row target
+forward is insufficient: retained layer-1 K/V diverged after the first
+full-acceptance block and a public prose continuation flipped argmax at decode
+step 48, despite identical logical offsets. The exact-pair path is not that
+ordinary batched path. Its regression gate compares both pair rows against two
+K=1 forwards using exact logits, pre-norm hidden bits, every layer's physical
+K/V state, and rollback state at multiple offsets.
+
+Zero, partial, and full acceptance use the same charged path. A deterministic
+serial tail is used only when a block shape requires one row or a rotating
+cache reaches geometry where a prefix-preserving pair cannot be formed. These
+rows are counted in `serial_verification_row_count`; engine ineligibility
+fails closed rather than becoming a timed fallback.
 
 Any exception after a block begins poisons the worker session. The worker
 cannot continue from ambiguous cache state.
@@ -161,9 +183,12 @@ The trained worker accepts only:
 
 Block requests contain no expected token, future oracle token, accepted count,
 worker duration, score, denominator, prompt hash, or continuation history.
-Request IDs must be monotonic. Responses carry a nonce and a nonempty token
-block only. Unknown response fields such as `accepted_count`, `token_count`,
-`seconds`, or `future_tokens` are rejected by the parent decoder.
+Request IDs must be monotonic. Block responses carry a nonce and a nonempty
+token block only. The separate post-phase diagnostic response can report
+memory, selected verification mode, exact-pair segments, pair rollbacks, and
+serial geometry/tail rows; none has timing or score authority. Unknown fields
+such as `accepted_count`, `token_count`, `seconds`, or `future_tokens` are
+rejected by the parent decoder.
 
 The trusted parent:
 
@@ -248,13 +273,18 @@ decode step 48. Safe differential replay established:
 
 The root cause was shape-dependent floating-point target execution, not prompt
 lookup, assistant incompatibility, host offset arithmetic, or a missing trim.
-A K-row target graph is mathematically causal but is not bit-identical to K
-serial target graphs on this runtime. The fix verifies supplied target rows
-using the exact serial K=1 graph and stops at the first rejection, avoiding
-both divergent retained state and irreversible post-wrap rollback. A
-runtime-gated public parity test preserves the failing seam.
+An ordinary batched K-row target graph is mathematically causal but is not
+bit-identical to K serial target graphs on this runtime. The first fix
+verified supplied target rows using the exact serial K=1 graph. The current
+default replaces the ordinary batched graph with dedicated exact-pair kernels
+that keep each row's K=1 accumulation order while sharing packed weight
+traversal; the serial K=1 verifier is retained as the explicit control mode.
+Runtime-gated parity tests preserve the failing seam: exact logits, pre-norm
+hidden bits, and every layer's physical K/V bytes are compared against two
+serial forwards at multiple offsets, across forced zero/partial/full and
+second-segment acceptance, and across the deep growth/wrap boundaries.
 
-### Final public/synthetic matrix
+### Prior K=1-control public/synthetic matrix
 
 The corrected serial-equivalent verifier completed 12 thermal-gated M5 pairs:
 three each for copy (N=255), prose (N=256), code (N=257), and reasoning
@@ -262,8 +292,8 @@ three each for copy (N=255), prose (N=256), code (N=257), and reasoning
 zero draft acceptance plus one-token tails. Mean paired candidate/serial
 speedups were 0.741x copy, 0.798x prose, 0.860x code, and 0.883x reasoning;
 after the complete fixed K=1 warmup, a fresh copy triplet measured 0.860x.
-Exact verification is therefore a correctness-complete control, not a
-competitive target-amortizing MTP implementation.
+That K=1 verifier remains the explicit correctness control; these numbers do
+not describe the exact-pair implementation.
 
 Per-category paired CV was initially 7.8% copy, 1.9% prose, 4.0% code, and
 1.1% reasoning. Phase diagnostics showed copy's variation came from seed and
@@ -274,6 +304,35 @@ four deterministic K=1 target rows reduced a fresh three-pair copy run to 3.2%
 paired CV without retaining allocator buffers or using prompt-specific work.
 Across accepted runs, maximum temperature was 56.1C and minimum steady GPU
 frequency was 1604 MHz.
+
+### Exact-pair public/synthetic matrices
+
+The exact-pair verifier ran the same balanced thermal-gated protocol
+(paired `mtp-probe` serial control versus `mtp-benchmark`, K=4, alternating
+order, 512-token seeds, N=255/256/257) with every token matching the serial
+oracle and every cache-offset invariant passing:
+
+- First matrix, 12 pairs (3 per category): mean paired speedup 1.34x copy,
+  1.27x prose, 1.33x code, 1.26x reasoning; overall mean 1.30x,
+  ratio-of-means 1.28x.
+- Extended matrix, 20 pairs (5 per category) after acceptance-independent
+  pair warmup: mean 1.32x copy, 1.37x prose, 1.33x code, 1.30x reasoning;
+  overall mean 1.33x, ratio-of-means 1.31x; slowest single pair 1.04x.
+- Serial-control seconds per token were unchanged from the pre-exact-pair
+  baseline (about 0.03425 s/token), so the generalized boundary kernels did
+  not regress the K=1 path.
+
+Every category mean and median clears 1.10x by a wide margin. The remaining
+honesty gap is run-to-run spread: per-category paired CV ranged 2.4-13.1%
+(first matrix) and 6.3-14.0% (extended matrix). The spread comes from
+sporadic single-block stalls up to ~1.7s on the MTP side while p50 block
+latency stays at ~75ms and telemetry stays clean (max loaded temperature
+58.6C, minimum steady frequency 1612 MHz, peak RSS 47.5 GiB); no outliers
+were deleted. The stalls are not explained by kernel compilation (fixed
+warmup precedes the timer), thermal throttling, or frequency drops, and they
+appear in a minority of fresh processes. Until their source is isolated, the
+paired-CV<=5% pilot criterion is met only per-run-set, not universally, and
+scores from single pairs must not be quoted.
 
 Phase 1 emits diagnostic JSON with no `score` or `speedup`.
 
@@ -339,12 +398,17 @@ Then run the trained-assistant prototype:
   --golden /tmp/gemma4-31b-it-mtp-public.json \
   --block-size 4 \
   --tokens 128 \
+  --target-verification exact-pair \
   --require-trained-assistant
 ```
 
 `--tokens` defaults to 128 and accepts `1...512`; the selected golden must
 contain one seed token plus the requested number of decode tokens. The parent
 owns this total, validates every token, and uses it as the fixed denominator.
+`--block-size` accepts `2...4`. A one-position block is used only internally
+when the fixed parent-owned decode total leaves a final target-only tail; the
+trained-assistant command rejects configured `K=1` because it would never
+draft.
 
 For the opt-in model-backed validation:
 
@@ -353,6 +417,11 @@ MLXFAST_RUN_MTP_RUNTIME_TESTS=1 \
 MLXFAST_MTP_WEIGHTS_PATH="${PWD}/mtp-weights" \
 MLXFAST_MTP_ASSISTANT_DIR="${MLXFAST_MTP_ASSISTANT_DIR}" \
 swift test -c release --filter trainedMTPArtifactValidationRuntimeGate
+
+MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1 \
+MLXFAST_MTP_WEIGHTS_PATH="${PWD}/mtp-weights" \
+MLXFAST_MTP_PAIR_GOLDEN_PATH=/tmp/gemma4-31b-it-mtp-public.json \
+swift test --filter exactPairRuntimeMatchesTwoSerialRowsBitForBit
 ```
 
 Do not claim model-backed success unless these commands run with the pinned
@@ -363,9 +432,13 @@ weights and an IT-target oracle.
 - Public/synthetic IT-target M5 goldens have been exercised remotely, but no
   IT hidden behavior suite is checked in.
 - No paired MTP reference baseline or component floors exist.
-- Exact serial-shape target verification prioritizes correctness over target
-  compute amortization. A future fast path needs K-row kernels proven
-  bit-identical to K=1 hidden/KV and logits before it can replace this path.
+- The exact-pair kernels amortize dense weight traversal for two rows at a
+  time; they are proven bit-identical by runtime gates, not by construction.
+  Any future kernel change must rerun the exact-pair parity gates before it
+  can ship, and the serial K=1 mode remains the fail-closed control.
+- Decodes whose sliding offset crosses the 1,024-position window wrap lose
+  pair eligibility and serialize the remaining rows; within the current
+  512-seed/512-decode contract this affects only the final pair position.
 - The path-based upstream loader cannot atomically bind open descriptors;
   before/after hash validation plus read-only operator ownership mitigates
   TOCTOU, but official provisioning must enforce ownership and permissions.

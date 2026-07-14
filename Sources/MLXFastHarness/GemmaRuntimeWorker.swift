@@ -791,6 +791,10 @@ struct RuntimeWorkerResponse: Codable {
     let mlxActiveMemoryBytes: Int?
     let mlxCacheMemoryBytes: Int?
     let mlxPeakMemoryBytes: Int?
+    let targetVerificationMode: String?
+    let exactPairSegmentCount: Int?
+    let exactPairRollbackRowCount: Int?
+    let serialVerificationRowCount: Int?
 
     init(
         id: Int,
@@ -805,7 +809,11 @@ struct RuntimeWorkerResponse: Codable {
         peakRamGB: Double? = nil,
         mlxActiveMemoryBytes: Int? = nil,
         mlxCacheMemoryBytes: Int? = nil,
-        mlxPeakMemoryBytes: Int? = nil
+        mlxPeakMemoryBytes: Int? = nil,
+        targetVerificationMode: String? = nil,
+        exactPairSegmentCount: Int? = nil,
+        exactPairRollbackRowCount: Int? = nil,
+        serialVerificationRowCount: Int? = nil
     ) {
         self.id = id
         self.nonce = nonce
@@ -820,6 +828,10 @@ struct RuntimeWorkerResponse: Codable {
         self.mlxActiveMemoryBytes = mlxActiveMemoryBytes
         self.mlxCacheMemoryBytes = mlxCacheMemoryBytes
         self.mlxPeakMemoryBytes = mlxPeakMemoryBytes
+        self.targetVerificationMode = targetVerificationMode
+        self.exactPairSegmentCount = exactPairSegmentCount
+        self.exactPairRollbackRowCount = exactPairRollbackRowCount
+        self.serialVerificationRowCount = serialVerificationRowCount
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -872,6 +884,22 @@ struct RuntimeWorkerResponse: Codable {
             Int.self,
             forKey: .mlxPeakMemoryBytes
         )
+        targetVerificationMode = try container.decodeIfPresent(
+            String.self,
+            forKey: .targetVerificationMode
+        )
+        exactPairSegmentCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .exactPairSegmentCount
+        )
+        exactPairRollbackRowCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .exactPairRollbackRowCount
+        )
+        serialVerificationRowCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .serialVerificationRowCount
+        )
     }
 
     func encode(to encoder: Swift.Encoder) throws {
@@ -898,6 +926,22 @@ struct RuntimeWorkerResponse: Codable {
             mlxPeakMemoryBytes,
             forKey: .mlxPeakMemoryBytes
         )
+        try container.encodeIfPresent(
+            targetVerificationMode,
+            forKey: .targetVerificationMode
+        )
+        try container.encodeIfPresent(
+            exactPairSegmentCount,
+            forKey: .exactPairSegmentCount
+        )
+        try container.encodeIfPresent(
+            exactPairRollbackRowCount,
+            forKey: .exactPairRollbackRowCount
+        )
+        try container.encodeIfPresent(
+            serialVerificationRowCount,
+            forKey: .serialVerificationRowCount
+        )
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -914,6 +958,10 @@ struct RuntimeWorkerResponse: Codable {
         case mlxActiveMemoryBytes = "mlx_active_memory_bytes"
         case mlxCacheMemoryBytes = "mlx_cache_memory_bytes"
         case mlxPeakMemoryBytes = "mlx_peak_memory_bytes"
+        case targetVerificationMode = "target_verification_mode"
+        case exactPairSegmentCount = "exact_pair_segment_count"
+        case exactPairRollbackRowCount = "exact_pair_rollback_row_count"
+        case serialVerificationRowCount = "serial_verification_row_count"
     }
 }
 
@@ -1282,7 +1330,11 @@ func stopRuntimeWorkerProcess(
 
 enum RuntimeWorkerLaunch: Equatable {
     case serial
-    case trainedMTP(assistantPath: String, contractPath: String)
+    case trainedMTP(
+        assistantPath: String,
+        contractPath: String,
+        verificationMode: Gemma4MTPVerificationMode
+    )
 
     func arguments(weightsPath: String) -> [String] {
         switch self {
@@ -1292,7 +1344,11 @@ enum RuntimeWorkerLaunch: Equatable {
                 "--weights",
                 weightsPath,
             ]
-        case .trainedMTP(let assistantPath, let contractPath):
+        case .trainedMTP(
+            let assistantPath,
+            let contractPath,
+            let verificationMode
+        ):
             return [
                 "mtp-runtime-worker",
                 "--weights",
@@ -1301,6 +1357,8 @@ enum RuntimeWorkerLaunch: Equatable {
                 assistantPath,
                 "--contract",
                 contractPath,
+                "--target-verification",
+                verificationMode.rawValue,
                 "--require-trained-assistant",
             ]
         }

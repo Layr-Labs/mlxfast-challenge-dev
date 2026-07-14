@@ -13,6 +13,11 @@ private let gemma4MTPFastTargetEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+public enum Gemma4MTPVerificationMode: String, Sendable {
+    case exactPair = "exact-pair"
+    case serial
+}
+
 /// Make the challenge's weighted runtime tower usable by the exact
 /// `Gemma4MTPTarget` API pinned in Package.resolved.
 ///
@@ -80,6 +85,104 @@ extension Gemma4RuntimeModel: Gemma4MTPTarget {
         )
     }
 
+    /// Compile every timed MTP target shape with fixed BOS inputs and
+    /// throwaway state, independent of assistant acceptance behavior: the
+    /// 512-token seed prefill, four serial K=1 verification rows (K=1 blocks,
+    /// K=3 bonus rows, and geometry tails), the K=2 exact-pair segments used
+    /// by K=2/K=4 when requested, and the deep sliding-attention decode
+    /// shapes at the library's 1,024-key kernel switch. This is
+    /// input-independent pipeline warmup only: no prompt-derived tensor,
+    /// cache, token, or logit escapes the method.
+    public func warmMTPTargetKernels(includeExactPair: Bool) throws {
+        guard !includeExactPair || supportsExactMTPPair else {
+            throw MLXFastError.invalidInput(
+                "exact-pair MTP warmup is unavailable for this target"
+            )
+        }
+        let cache = mtpNewCache(parameters: nil)
+        let bos = Int32(2)
+        let prefill = forwardForMTP(
+            MLXArray(
+                Array(
+                    repeating: bos,
+                    count: MLXFastConstants.correctnessPromptTokens
+                ),
+                [1, MLXFastConstants.correctnessPromptTokens]
+            ),
+            cache: cache
+        )
+        eval(
+            prefill.logits,
+            prefill.lastHidden,
+            prefill.capturedSharedKV.fullAttention.0,
+            prefill.capturedSharedKV.fullAttention.1,
+            prefill.capturedSharedKV.slidingAttention.0,
+            prefill.capturedSharedKV.slidingAttention.1
+        )
+        // A fixed assistant draft may reject at the first position, so the
+        // drafter warmup round cannot guarantee later serial rows compiled.
+        // Warm all four possible K=4 serial row positions unconditionally.
+        for _ in 0..<4 {
+            let row = forwardForMTP(
+                MLXArray([bos], [1, 1]),
+                cache: cache
+            )
+            eval(
+                row.logits,
+                row.lastHidden,
+                row.capturedSharedKV.fullAttention.0,
+                row.capturedSharedKV.fullAttention.1,
+                row.capturedSharedKV.slidingAttention.0,
+                row.capturedSharedKV.slidingAttention.1
+            )
+        }
+        if includeExactPair {
+            let pairInput = MLXArray([bos, bos], [1, 2])
+            for _ in 0..<2 {
+                guard let pair = exactMTPPair(pairInput, cache: cache) else {
+                    throw MLXFastError.invalidInput(
+                        "exact-pair MTP warmup could not append a fixed pair"
+                    )
+                }
+                eval(
+                    pair.logits,
+                    pair.lastHidden,
+                    pair.capturedSharedKV.fullAttention.0,
+                    pair.capturedSharedKV.fullAttention.1,
+                    pair.capturedSharedKV.slidingAttention.0,
+                    pair.capturedSharedKV.slidingAttention.1
+                )
+            }
+        }
+        warmDeepSlidingDecodeAttention()
+    }
+
+    /// Long decodes cross the library's D=256 kernel switch at 1,024 keys,
+    /// where sliding attention changes to its two-pass kernel and the
+    /// exact-pair path serializes its rows. Warm those dispatches with fixed
+    /// zero tensors so the switch is not first compiled inside a timed block.
+    private func warmDeepSlidingDecodeAttention() {
+        let queries = MLXArray.zeros([1, 32, 1, 256], dtype: .bfloat16)
+        let keys = MLXArray.zeros([1, 16, 1_024, 256], dtype: .bfloat16)
+        let values = MLXArray.zeros([1, 16, 1_024, 256], dtype: .bfloat16)
+        let unmasked = MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: keys,
+            values: values,
+            scale: 1.0,
+            mask: .none
+        )
+        let windowMask = MLXArray.ones([1_024], dtype: .bool)
+        let masked = MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: keys,
+            values: values,
+            scale: 1.0,
+            mask: .array(windowMask)
+        )
+        eval(unmasked, masked)
+    }
+
     public func rollbackSpeculativeCache(
         _ caches: [KVCache],
         accepted: Gemma4AcceptCount,
@@ -112,6 +215,42 @@ public struct Gemma4MTPBlockResult: Equatable, Sendable {
     }
 }
 
+struct Gemma4ExactPairDecision: Equatable {
+    let acceptedDrafts: Int
+    let committedTokens: [Int]
+}
+
+func gemma4ExactPairDecision(
+    drafts: [Int],
+    targetTokens: [Int]
+) throws -> Gemma4ExactPairDecision {
+    guard (1...2).contains(drafts.count),
+          targetTokens.count == 2
+    else {
+        throw MLXFastError.invalidInput(
+            "exact MTP pair decision requires one or two drafts and two targets"
+        )
+    }
+    for index in drafts.indices where drafts[index] != targetTokens[index] {
+        return Gemma4ExactPairDecision(
+            acceptedDrafts: index,
+            committedTokens: Array(targetTokens[0...index])
+        )
+    }
+    let committedCount = drafts.count == 1 ? 2 : drafts.count
+    return Gemma4ExactPairDecision(
+        acceptedDrafts: drafts.count,
+        committedTokens: Array(targetTokens.prefix(committedCount))
+    )
+}
+
+struct Gemma4MTPVerifiedBlock {
+    let committedTokens: [Int]
+    let acceptedDrafts: Int
+    let hidden: MLXArray
+    let sharedKV: Gemma4SharedKV
+}
+
 /// Stateful, greedy Gemma 4 MTP block decoder.
 ///
 /// One instance owns one request. Target cache, target hidden state, shared
@@ -122,11 +261,16 @@ public struct Gemma4MTPBlockResult: Equatable, Sendable {
 /// amortizes assistant drafting and IPC, while shape-dependent target
 /// reductions cannot alter the serial oracle or retained physical K/V state.
 public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
-    public let implementationName = "google_gemma4_trained_mtp"
+    public var implementationName: String {
+        "google_gemma4_trained_mtp_\(verificationMode.rawValue)"
+    }
 
     private let target: Gemma4RuntimeModel
     private let drafter: Gemma4AssistantDraftModel
-    private var targetCache: [any KVCache] = []
+    public let verificationMode: Gemma4MTPVerificationMode
+    // Internal (not public) so runtime seam tests can compare this cache's
+    // physical bytes against an independent serial cache.
+    private(set) var targetCache: [any KVCache] = []
     private var hidden: MLXArray?
     private var sharedKV: Gemma4SharedKV?
     private var bonusToken: Int?
@@ -136,13 +280,25 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
     public private(set) var roundCount = 0
     public private(set) var acceptedDraftTokenCount = 0
     public private(set) var targetOnlyTailTokenCount = 0
+    public private(set) var exactPairSegmentCount = 0
+    public private(set) var exactPairRollbackRowCount = 0
+    public private(set) var serialVerificationRowCount = 0
 
     public init(
         target: Gemma4RuntimeModel,
-        drafter: Gemma4AssistantDraftModel
+        drafter: Gemma4AssistantDraftModel,
+        verificationMode: Gemma4MTPVerificationMode = .exactPair
     ) throws {
+        guard verificationMode != .exactPair
+                || target.supportsExactMTPPair
+        else {
+            throw MLXFastError.invalidInput(
+                "exact-pair MTP verification is unavailable for this target"
+            )
+        }
         self.target = target
         self.drafter = drafter
+        self.verificationMode = verificationMode
         try drafter.bind(target: target)
     }
 
@@ -186,6 +342,9 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
         roundCount = 0
         acceptedDraftTokenCount = 0
         targetOnlyTailTokenCount = 0
+        exactPairSegmentCount = 0
+        exactPairRollbackRowCount = 0
+        serialVerificationRowCount = 0
         return seedToken
     }
 
@@ -254,6 +413,7 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
         bonusToken = token
         hostCacheOffset += 1
         targetOnlyTailTokenCount += 1
+        serialVerificationRowCount += 1
         try requireCacheOffsets(hostCacheOffset, context: "trained MTP target-only tail")
         return Gemma4MTPBlockResult(
             tokens: [token],
@@ -309,76 +469,253 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
             )
         }
 
-        // Verify each supplied row through the exact serial target shape.
-        // A batched K-row target forward is mathematically equivalent but uses
-        // different attention/MLP reductions; on M5 the retained layer-1 K/V
-        // diverged after the first block and flipped a prose argmax at step 48.
-        // Sequential evaluation keeps physical cache state and logits
-        // identical to the serial oracle and stops at the first rejection, so
-        // no rejected physical row ever needs post-wrap rollback.
-        let verifyInputs = [previousToken] + draftValues
-        var committed: [Int] = []
-        var accepted = 0
-        var nextHidden: MLXArray?
-        var nextSharedKV: Gemma4SharedKV?
-        for (position, inputToken) in verifyInputs.enumerated() {
-            let output = target.forwardForMTP(
-                MLXArray([Int32(inputToken)], [1, 1]),
-                cache: targetCache
+        let verified: Gemma4MTPVerifiedBlock
+        switch verificationMode {
+        case .exactPair:
+            verified = try verifyWithExactPairs(
+                previousToken: previousToken,
+                drafts: draftValues
             )
-            let tokenArray = output.logits[
-                0..., -1, 0...
-            ].asType(.float32).argMax(axis: -1)
-            let outputHiddenLength = output.lastHidden.dim(1)
-            let outputHidden = output.lastHidden[
-                0...,
-                (outputHiddenLength - 1)..<outputHiddenLength,
-                0...
-            ]
-            let outputSharedKV = output.capturedSharedKV
-            eval(
-                tokenArray,
-                outputHidden,
-                outputSharedKV.fullAttention.0,
-                outputSharedKV.fullAttention.1,
-                outputSharedKV.slidingAttention.0,
-                outputSharedKV.slidingAttention.1
+        case .serial:
+            verified = try verifySerially(
+                previousToken: previousToken,
+                drafts: draftValues
             )
-            let token = Int(tokenArray.item(Int32.self))
-            committed.append(token)
-            nextHidden = outputHidden
-            nextSharedKV = outputSharedKV
-            if position < draftCount,
-               token == draftValues[position]
-            {
-                accepted += 1
-                continue
-            }
-            break
         }
 
-        guard committed.count == accepted + 1,
-              let nextHidden,
-              let nextSharedKV,
-              let nextBonus = committed.last
+        guard verified.committedTokens.count
+                == verified.acceptedDrafts + 1,
+              let nextBonus = verified.committedTokens.last
         else {
             throw MLXFastError.invalidInput(
                 "trained MTP exact verification produced an invalid block"
             )
         }
 
-        hidden = nextHidden
-        sharedKV = nextSharedKV
+        hidden = verified.hidden
+        sharedKV = verified.sharedKV
         bonusToken = nextBonus
         hostCacheOffset = targetCache[0].offset
         roundCount += 1
-        acceptedDraftTokenCount += accepted
+        acceptedDraftTokenCount += verified.acceptedDrafts
         try requireCacheOffsets(hostCacheOffset, context: "trained MTP commit/rollback")
         return Gemma4MTPBlockResult(
-            tokens: committed,
-            acceptedDraftTokenCount: accepted,
+            tokens: verified.committedTokens,
+            acceptedDraftTokenCount: verified.acceptedDrafts,
             targetCacheOffset: hostCacheOffset,
             usedDrafter: true
+        )
+    }
+
+    private func verifySerially(
+        previousToken: Int,
+        drafts: [Int]
+    ) throws -> Gemma4MTPVerifiedBlock {
+        let verifyInputs = [previousToken] + drafts
+        var committed: [Int] = []
+        var accepted = 0
+        var nextHidden: MLXArray?
+        var nextSharedKV: Gemma4SharedKV?
+        for (position, inputToken) in verifyInputs.enumerated() {
+            let row = runSerialTargetRow(inputToken)
+            committed.append(row.token)
+            nextHidden = row.hidden
+            nextSharedKV = row.sharedKV
+            if position < drafts.count,
+               row.token == drafts[position]
+            {
+                accepted += 1
+                continue
+            }
+            break
+        }
+        guard committed.count == accepted + 1,
+              let nextHidden,
+              let nextSharedKV
+        else {
+            throw MLXFastError.invalidInput(
+                "serial MTP verification produced an invalid block"
+            )
+        }
+        return Gemma4MTPVerifiedBlock(
+            committedTokens: committed,
+            acceptedDrafts: accepted,
+            hidden: nextHidden,
+            sharedKV: nextSharedKV
+        )
+    }
+
+    // Internal (not public) so runtime seam tests can force zero, partial,
+    // full, and second-segment acceptance deterministically without depending
+    // on assistant draft behavior.
+    func verifyWithExactPairs(
+        previousToken: Int,
+        drafts: [Int]
+    ) throws -> Gemma4MTPVerifiedBlock {
+        guard !drafts.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "exact-pair MTP verification requires at least one draft"
+            )
+        }
+        var draftIndex = 0
+        var currentInput = previousToken
+        var committed: [Int] = []
+        var accepted = 0
+
+        while draftIndex < drafts.count {
+            let pairInput = MLXArray(
+                [Int32(currentInput), Int32(drafts[draftIndex])],
+                [1, 2]
+            )
+            guard let output = target.exactMTPPair(
+                pairInput,
+                cache: targetCache
+            ) else {
+                // Only deterministic cache geometry may serialize: a rotating
+                // cache at its wrap boundary cannot retain the prefix view
+                // needed by exact-pair attention. Engine-level ineligibility
+                // was checked at session construction and must stay a hard
+                // failure, never a silent timed fallback.
+                guard target.supportsExactMTPPair else {
+                    throw MLXFastError.invalidInput(
+                        "exact-pair MTP engine support disappeared mid-session"
+                    )
+                }
+                let tail = try verifySerially(
+                    previousToken: currentInput,
+                    drafts: Array(drafts[draftIndex...])
+                )
+                return Gemma4MTPVerifiedBlock(
+                    committedTokens: committed + tail.committedTokens,
+                    acceptedDrafts: accepted + tail.acceptedDrafts,
+                    hidden: tail.hidden,
+                    sharedKV: tail.sharedKV
+                )
+            }
+            exactPairSegmentCount += 1
+
+            let tokenArray = output.logits
+                .asType(.float32)
+                .argMax(axis: -1)
+            let pairHidden = output.lastHidden
+            let pairSharedKV = output.capturedSharedKV
+            eval(
+                tokenArray,
+                pairHidden,
+                pairSharedKV.fullAttention.0,
+                pairSharedKV.fullAttention.1,
+                pairSharedKV.slidingAttention.0,
+                pairSharedKV.slidingAttention.1
+            )
+            let targets = tokenArray.asArray(Int32.self).map(Int.init)
+            guard targets.count == 2 else {
+                throw MLXFastError.invalidInput(
+                    "exact MTP pair returned an unexpected logits shape"
+                )
+            }
+            let remainingDraftCount = drafts.count - draftIndex
+            let pairDraftCount = min(2, remainingDraftCount)
+            let pairDrafts = Array(
+                drafts[draftIndex..<(draftIndex + pairDraftCount)]
+            )
+            let decision = try gemma4ExactPairDecision(
+                drafts: pairDrafts,
+                targetTokens: targets
+            )
+
+            if decision.acceptedDrafts == 0 {
+                for cache in targetCache {
+                    guard let combined = cache as? Gemma4CombinedKVCache,
+                          combined.trim(1) == 1
+                    else {
+                        throw MLXFastError.invalidInput(
+                            "exact MTP pair could not roll back rejected row one"
+                        )
+                    }
+                }
+                exactPairRollbackRowCount += 1
+                let rolledSharedKV = Gemma4SharedKV.sliceTail(
+                    from: pairSharedKV,
+                    rejected: 1
+                )
+                return Gemma4MTPVerifiedBlock(
+                    committedTokens: committed + decision.committedTokens,
+                    acceptedDrafts: accepted,
+                    hidden: pairHidden[0..., 0..<1, 0...],
+                    sharedKV: rolledSharedKV
+                )
+            }
+
+            committed.append(contentsOf: decision.committedTokens)
+            accepted += decision.acceptedDrafts
+            if decision.acceptedDrafts < pairDraftCount {
+                return Gemma4MTPVerifiedBlock(
+                    committedTokens: committed,
+                    acceptedDrafts: accepted,
+                    hidden: pairHidden[0..., 1..<2, 0...],
+                    sharedKV: pairSharedKV
+                )
+            }
+            if pairDraftCount == 1 {
+                return Gemma4MTPVerifiedBlock(
+                    committedTokens: committed,
+                    acceptedDrafts: accepted,
+                    hidden: pairHidden[0..., 1..<2, 0...],
+                    sharedKV: pairSharedKV
+                )
+            }
+
+            draftIndex += pairDraftCount
+            currentInput = drafts[draftIndex - 1]
+            if draftIndex == drafts.count {
+                // Both pair predictions were accepted, but row one contains
+                // only the first draft input. Consume the second draft once to
+                // obtain the required bonus token.
+                let bonus = runSerialTargetRow(currentInput)
+                committed.append(bonus.token)
+                return Gemma4MTPVerifiedBlock(
+                    committedTokens: committed,
+                    acceptedDrafts: accepted,
+                    hidden: bonus.hidden,
+                    sharedKV: bonus.sharedKV
+                )
+            }
+        }
+        throw MLXFastError.invalidInput(
+            "exact-pair MTP verification exhausted without a bonus token"
+        )
+    }
+
+    private func runSerialTargetRow(
+        _ inputToken: Int
+    ) -> (token: Int, hidden: MLXArray, sharedKV: Gemma4SharedKV) {
+        let output = target.forwardForMTP(
+            MLXArray([Int32(inputToken)], [1, 1]),
+            cache: targetCache
+        )
+        let tokenArray = output.logits[
+            0..., -1, 0...
+        ].asType(.float32).argMax(axis: -1)
+        let outputHiddenLength = output.lastHidden.dim(1)
+        let outputHidden = output.lastHidden[
+            0...,
+            (outputHiddenLength - 1)..<outputHiddenLength,
+            0...
+        ]
+        let outputSharedKV = output.capturedSharedKV
+        eval(
+            tokenArray,
+            outputHidden,
+            outputSharedKV.fullAttention.0,
+            outputSharedKV.fullAttention.1,
+            outputSharedKV.slidingAttention.0,
+            outputSharedKV.slidingAttention.1
+        )
+        serialVerificationRowCount += 1
+        return (
+            token: Int(tokenArray.item(Int32.self)),
+            hidden: outputHidden,
+            sharedKV: outputSharedKV
         )
     }
 

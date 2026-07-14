@@ -65,6 +65,7 @@ extension GemmaRuntime {
         targetWeightsPath: String,
         assistantPath: String,
         contractPath: String,
+        verificationMode: Gemma4MTPVerificationMode,
         requireTrainedAssistant: Bool
     ) throws {
         guard requireTrainedAssistant else {
@@ -105,7 +106,8 @@ extension GemmaRuntime {
         do {
             let warmupSession = try Gemma4TrainedMTPBlockSession(
                 target: target,
-                drafter: drafter
+                drafter: drafter,
+                verificationMode: verificationMode
             )
             let warmupSeed = try warmupSession.begin(
                 seedTokens: Array(
@@ -118,50 +120,17 @@ extension GemmaRuntime {
                 maxBlockSize: MLXFastConstants.experimentalMTPMaxBlockSize
             )
         }
-        // Assistant acceptance on the fixed BOS sequence may reject at the
-        // first position, which would leave later exact target rows cold. Warm
-        // four deterministic K=1 target steps explicitly so every possible
-        // K=4 block length has compiled before the protocol hello. These
-        // throwaway BOS-derived rows are input-independent; their free buffers
-        // are still cleared by the charged real begin request.
-        do {
-            let warmCache = target.mtpNewCache(parameters: nil)
-            let bosTokens = MLXArray(
-                Array(
-                    repeating: Int32(2),
-                    count: MLXFastConstants.correctnessPromptTokens
-                ),
-                [1, MLXFastConstants.correctnessPromptTokens]
-            )
-            let prefill = target.forwardForMTP(
-                bosTokens,
-                cache: warmCache
-            )
-            var warmToken = prefill.logits[
-                0..., -1, 0...
-            ].asType(.float32).argMax(axis: -1)
-            eval(warmToken)
-            for _ in 0..<MLXFastConstants.experimentalMTPMaxBlockSize {
-                let output = target.forwardForMTP(
-                    warmToken.reshaped([1, 1]),
-                    cache: warmCache
-                )
-                warmToken = output.logits[
-                    0..., -1, 0...
-                ].asType(.float32).argMax(axis: -1)
-                eval(
-                    warmToken,
-                    output.lastHidden,
-                    output.capturedSharedKV.fullAttention.0,
-                    output.capturedSharedKV.fullAttention.1,
-                    output.capturedSharedKV.slidingAttention.0,
-                    output.capturedSharedKV.slidingAttention.1
-                )
-            }
-        }
+        // The drafter round above is acceptance-dependent, so it cannot
+        // guarantee that every timed target shape compiled. Warm the serial
+        // rows, the exact-pair segments when selected, and the deep
+        // sliding-attention switch unconditionally on throwaway BOS state.
+        try target.warmMTPTargetKernels(
+            includeExactPair: verificationMode == .exactPair
+        )
         let session = try Gemma4TrainedMTPBlockSession(
             target: target,
-            drafter: drafter
+            drafter: drafter,
+            verificationMode: verificationMode
         )
 
         // The path-based upstream loader cannot consume already-open file
@@ -351,7 +320,11 @@ extension GemmaRuntime {
                 peakRamGB: peakResidentMemoryGB(),
                 mlxActiveMemoryBytes: Memory.activeMemory,
                 mlxCacheMemoryBytes: Memory.cacheMemory,
-                mlxPeakMemoryBytes: Memory.peakMemory
+                mlxPeakMemoryBytes: Memory.peakMemory,
+                targetVerificationMode: session.verificationMode.rawValue,
+                exactPairSegmentCount: session.exactPairSegmentCount,
+                exactPairRollbackRowCount: session.exactPairRollbackRowCount,
+                serialVerificationRowCount: session.serialVerificationRowCount
             )
 
         default:
