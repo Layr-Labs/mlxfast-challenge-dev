@@ -21,6 +21,8 @@ private let gemma4IndexedSlidingQKV = MLXFast.metalKernel(
             ? threadgroup_position_in_grid.y * 8 + projection * kRowsPerSIMD
             : threadgroup_position_in_grid.y * kRowsPerSIMD;
 
+        if (output_row >= (is_q ? 8192 : 4096)) { return; }
+
         const device uint* weight = is_q
             ? q_weight
             : (is_k ? k_weight : v_weight);
@@ -48,6 +50,7 @@ private let gemma4IndexedSlidingQKV = MLXFast.metalKernel(
             float values[8];
             const float input_sum = gemma4_qkv_load_values(input, values);
 
+            #pragma clang loop unroll(full)
             for (int row = 0; row < kRowsPerSIMD; ++row) {
                 const device uchar* row_weight =
                     weight_bytes + row * kWeightBytesPerRow;
@@ -66,6 +69,7 @@ private let gemma4IndexedSlidingQKV = MLXFast.metalKernel(
             input += 256;
         }
 
+        #pragma clang loop unroll(full)
         for (int row = 0; row < kRowsPerSIMD; ++row) {
             result[row] = simd_sum(result[row]);
             if (thread_index_in_simdgroup == 0) {
@@ -231,6 +235,8 @@ private let gemma4IndexedFullQK = MLXFast.metalKernel(
             ? threadgroup_position_in_grid.y * 32 + projection * kRowsPerSIMD
             : threadgroup_position_in_grid.y * kRowsPerSIMD;
 
+        if (output_row >= (is_q ? 16384 : 2048)) { return; }
+
         const device uint* weight = is_q ? q_weight : k_weight;
         const device ushort* indices = is_q ? q_indices : k_indices;
         const device uint* lut = is_q ? q_lut : k_lut;
@@ -250,6 +256,7 @@ private let gemma4IndexedFullQK = MLXFast.metalKernel(
             float values[8];
             const float input_sum = gemma4_full_qk_load_values(input, values);
 
+            #pragma clang loop unroll(full)
             for (int row = 0; row < kRowsPerSIMD; ++row) {
                 const device uchar* row_weight =
                     weight_bytes + row * kWeightBytesPerRow;
@@ -268,6 +275,7 @@ private let gemma4IndexedFullQK = MLXFast.metalKernel(
             input += 256;
         }
 
+        #pragma clang loop unroll(full)
         for (int row = 0; row < kRowsPerSIMD; ++row) {
             result[row] = simd_sum(result[row]);
             if (thread_index_in_simdgroup == 0) {
