@@ -435,6 +435,32 @@ appear in a minority of fresh processes. Until their source is isolated, the
 paired-CV<=5% pilot criterion is met only per-run-set, not universally, and
 scores from single pairs must not be quoted.
 
+### Committed-tip revalidation matrix (commit e71f2a9)
+
+The consolidated committed tip (separate MTP-only pair boundary kernels,
+serial K=1 boundary kernels restored byte-identical to the base; audit
+counter hardening) was rerun on the freed dev box (`m5-max-128gb-1`, drained
+from ranked serving) as a fresh 12-pair thermal-gated matrix, K=4,
+alternating order, 512-token seeds, N=255/256/257:
+
+- All four model-backed parity gates passed against the pinned IT target and
+  assistant (artifact validation, basic pair bit-for-bit, forced
+  zero/partial/full/second-segment acceptance seams, deep growth/wrap).
+- Every returned token matched the serial oracle across all 24 runs
+  (`parity_all_ok=true`), and every cache-offset invariant held.
+- Mean paired decode speedup: 1.29x copy, 1.22x prose, 1.23x code,
+  1.23x reasoning; overall mean 1.24x, median 1.29x, slowest single pair
+  1.03x, fastest 1.42x.
+- Serial-control seconds per token stayed at ~0.03425 s/token, confirming the
+  boundary-kernel split did not regress the K=1 path.
+- Telemetry clean: max loaded temperature 56.1C, minimum steady frequency
+  1612 MHz, peak process RSS 47.5 GiB.
+
+The sporadic single-block stall (max block up to ~1.7s while p50 stays ~75ms)
+persists in a minority of runs and remains the open CV item; it correlates
+with a single ~10s GPU-idle gap late in some processes, is not thermal or
+frequency throttling, and is the top pre-publication investigation target.
+
 Phase 1 emits diagnostic JSON with no `score` or `speedup`.
 
 Before publication, organizers must:
@@ -442,11 +468,16 @@ Before publication, organizers must:
 1. Freeze an IT-target public and hidden correctness set and serial oracle.
 2. Freeze a trusted MTP reference implementation at the same target,
    assistant, block size, prompt, token count, sandbox, and thermal policy.
-3. Measure candidate and reference back-to-back on `m5-bench`.
-4. Decide whether the separate track is decode-only or keeps the existing
-   decode/prefill weighting, then calibrate new component floors.
+3. Measure candidate and reference back-to-back on the ranked box.
+4. Adopt the decode-only paired score in the contract's `proposed_scoring`
+   (or override it), then calibrate the component floor from fresh gated
+   sessions.
 5. Add MTP-specific behavior and parity gates.
-6. Enable the track only through a distinct workflow/track ID.
+6. Enable the track only through a distinct workflow/track ID, and provision
+   the target + assistant on the ranked box (they currently live only on the
+   dev box cache).
+7. Investigate the sporadic single-block stall before quoting single-pair
+   scores; require the multi-pair alternating-order protocol above.
 
 The base leaderboard and its paired serial reference are never mixed with MTP
 results.
