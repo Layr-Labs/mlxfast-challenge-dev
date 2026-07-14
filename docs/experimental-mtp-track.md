@@ -300,9 +300,10 @@ Submissions change only `Sources/MLXFastModel/` (and
   attention restructuring, KV-cache handling, weight layout, scheduling.
 
 Improvement directions intentionally left open: higher drafter acceptance,
-fewer target dispatches per committed token, eliminating the sporadic
-block stalls, cheaper drafter execution, and deeper kernel fusion — all
-subject to the same oracle.
+fewer target dispatches per committed token, reducing the one-time
+seed-prefill first-touch cost, cheaper drafter execution, and deeper kernel
+fusion — all subject to the same oracle. (The first-block stall itself is
+already fixed; see "First-block stall: root cause and fix".)
 
 ### Why participants cannot cheat the measurement
 
@@ -350,7 +351,9 @@ score = mtp_decode_speedup          (decode-only; floor >= 1.0)
   headroom rather than a hard-to-move 1.0.
 - Scores publish only from at least three accepted thermal-gated pairs per
   session with alternating candidate/reference order; single-pair scores
-  are not publishable while the sporadic-stall CV question remains open.
+  are not publishable because a bounded one-time seed-prefill first-touch
+  (~1.5s run-to-run) still needs multi-pair averaging (see "First-block
+  stall: root cause and fix").
 - The leaderboard namespace is `gemma4-31b-it-mtp-v1`, fully separate from
   the serial leaderboard; `official_scoring_enabled` stays false until the
   operator freezes hidden IT-target goldens and calibrates floors from
@@ -433,7 +436,10 @@ were deleted. The stalls are not explained by kernel compilation (fixed
 warmup precedes the timer), thermal throttling, or frequency drops, and they
 appear in a minority of fresh processes. Until their source is isolated, the
 paired-CV<=5% pilot criterion is met only per-run-set, not universally, and
-scores from single pairs must not be quoted.
+scores from single pairs must not be quoted. (This "sporadic ~1.7s stall" was
+later root-caused as a deterministic block-0 first-touch after the trusted
+allocator clear and fixed; see "First-block stall: root cause and fix" below.
+The residual variance is a bounded one-time seed-prefill first-touch.)
 
 ### Committed-tip revalidation matrix (commit e71f2a9)
 
@@ -456,10 +462,58 @@ alternating order, 512-token seeds, N=255/256/257:
 - Telemetry clean: max loaded temperature 56.1C, minimum steady frequency
   1612 MHz, peak process RSS 47.5 GiB.
 
-The sporadic single-block stall (max block up to ~1.7s while p50 stays ~75ms)
-persists in a minority of runs and remains the open CV item; it correlates
-with a single ~10s GPU-idle gap late in some processes, is not thermal or
-frequency throttling, and is the top pre-publication investigation target.
+### First-block stall: root cause and fix
+
+The "sporadic ~1.7s single-block stall" was root-caused on the dev box and
+fixed. Per-block parent-side tracing showed it was not sporadic: it is
+deterministic on **block 0**, the first timed decode block, with a magnitude
+that varies 0.6-1.6s run to run (which is why per-run `max_block` sometimes
+looked like a mild 0.15-0.6s and sometimes 1.6s). Every later block is a flat
+~75ms.
+
+Localization:
+
+- An in-process driver (real drafter, real exact-pair verify, identical
+  warmup, but no IPC and no worker sandbox) never stalled: 396 blocks across
+  6 fresh processes held max 130ms once and ~77ms otherwise, flat allocator
+  memory. That ruled out block compute, the allocator growth path, kernel
+  JIT, and shape warmup coverage.
+- The real parent+worker path stalled only on block 0 (569-1592ms across
+  5 runs). Toggling the worker Seatbelt sandbox on/off made no difference,
+  ruling out the sandbox.
+- The one thing the worker does that the in-process driver did not is
+  `resetRuntimeWorkerAllocatorForPhaseStart()` at `mtp_decode_begin`, the
+  trusted anti-subsidy control that `clearCache()`es every free buffer the
+  untimed warmup allocated. The worker-internal split confirmed block 0's
+  cost is in the exact-pair `verify` `eval` (515-888ms) with host-side
+  bookkeeping ~0ms and the allocator free-cache dropping right before it: the
+  first timed exact-pair forward pays a one-time Metal buffer first-touch for
+  the whole 60-layer working set the clear had freed.
+
+Fix (`Gemma4TrainedMTPBlockSession.warmWorkingSetAfterAllocatorReset`, called
+by the worker after the trusted clear and before `begin`): re-touch the
+drafter and exact-pair working set on throwaway BOS state so those buffers are
+resident in the free pool before the first real block. It is charged (inside
+the timed window), input-independent (runs before any seed is applied, on
+throwaway caches, never touching the real session cache/hidden/shared-KV or
+any committed token), and only warms the allocator — the pinned pipelines were
+already compiled during untimed init. The trusted `clearCache()` is unchanged;
+the serial path and the #586 boundary are untouched. It skips the redundant
+512-token prefill warm because `begin`'s charged seed prefill reallocates that
+same working set immediately after.
+
+Result on the dev box (real `mtp-benchmark`, sandbox on): block 0 drops from
+0.6-1.6s to ~74-79ms, `max_block` from ~1.6s to <=79ms, every block uniform,
+token parity preserved (`all_tokens_matched=true`) in all runs, and mean
+decode spt improved slightly (the redundant prefill was removed). The one-time
+first-touch cost is not eliminated — it cannot be while the trusted clear
+stands — but it is relocated into the already-charged seed-prefill phase and
+made bounded, so the per-block decode distribution is now trustworthy for
+single-pass MTP timing. A residual run-to-run variation of ~1.5s in that
+one-time seed-prefill first-touch remains (a genuine Metal residency effect,
+not thermal/frequency, and present with or without inter-run cooldown); the
+multi-pair alternating-order protocol below averages it out, so single-pair
+totals still must not be quoted from one pair.
 
 Phase 1 emits diagnostic JSON with no `score` or `speedup`.
 
@@ -476,8 +530,10 @@ Before publication, organizers must:
 6. Enable the track only through a distinct workflow/track ID, and provision
    the target + assistant on the ranked box (they currently live only on the
    dev box cache).
-7. Investigate the sporadic single-block stall before quoting single-pair
-   scores; require the multi-pair alternating-order protocol above.
+7. The first-block stall is fixed (see "First-block stall: root cause and
+   fix"). A bounded one-time seed-prefill first-touch (~1.5s run-to-run)
+   remains, so still require the multi-pair alternating-order protocol above
+   before quoting single-pair scores.
 
 The base leaderboard and its paired serial reference are never mixed with MTP
 results.

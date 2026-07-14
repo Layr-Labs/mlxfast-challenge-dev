@@ -93,7 +93,10 @@ extension Gemma4RuntimeModel: Gemma4MTPTarget {
     /// shapes at the library's 1,024-key kernel switch. This is
     /// input-independent pipeline warmup only: no prompt-derived tensor,
     /// cache, token, or logit escapes the method.
-    public func warmMTPTargetKernels(includeExactPair: Bool) throws {
+    public func warmMTPTargetKernels(
+        includeExactPair: Bool,
+        includePrefill: Bool = true
+    ) throws {
         guard !includeExactPair || supportsExactMTPPair else {
             throw MLXFastError.invalidInput(
                 "exact-pair MTP warmup is unavailable for this target"
@@ -101,24 +104,30 @@ extension Gemma4RuntimeModel: Gemma4MTPTarget {
         }
         let cache = mtpNewCache(parameters: nil)
         let bos = Int32(2)
-        let prefill = forwardForMTP(
-            MLXArray(
-                Array(
-                    repeating: bos,
-                    count: MLXFastConstants.correctnessPromptTokens
+        // The 512-token prefill shape is only needed when this warms from cold.
+        // The post-allocator-reset re-warm skips it because the charged seed
+        // prefill in `begin` reallocates that exact working set immediately
+        // after, so warming it here twice would only add redundant timed cost.
+        if includePrefill {
+            let prefill = forwardForMTP(
+                MLXArray(
+                    Array(
+                        repeating: bos,
+                        count: MLXFastConstants.correctnessPromptTokens
+                    ),
+                    [1, MLXFastConstants.correctnessPromptTokens]
                 ),
-                [1, MLXFastConstants.correctnessPromptTokens]
-            ),
-            cache: cache
-        )
-        eval(
-            prefill.logits,
-            prefill.lastHidden,
-            prefill.capturedSharedKV.fullAttention.0,
-            prefill.capturedSharedKV.fullAttention.1,
-            prefill.capturedSharedKV.slidingAttention.0,
-            prefill.capturedSharedKV.slidingAttention.1
-        )
+                cache: cache
+            )
+            eval(
+                prefill.logits,
+                prefill.lastHidden,
+                prefill.capturedSharedKV.fullAttention.0,
+                prefill.capturedSharedKV.fullAttention.1,
+                prefill.capturedSharedKV.slidingAttention.0,
+                prefill.capturedSharedKV.slidingAttention.1
+            )
+        }
         // A fixed assistant draft may reject at the first position, so the
         // drafter warmup round cannot guarantee later serial rows compiled.
         // Warm all four possible K=4 serial row positions unconditionally.
@@ -300,6 +309,66 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
         self.drafter = drafter
         self.verificationMode = verificationMode
         try drafter.bind(target: target)
+    }
+
+    /// Re-populate the MLX allocator free pool with the drafter and exact-pair
+    /// target working set after the trusted phase-start cache clear, so the
+    /// first *timed* decode block does not absorb a one-time buffer
+    /// first-touch cost. Without this, every run spikes on block 0 (measured
+    /// 0.6-1.6s versus a ~75ms steady block) because
+    /// `resetRuntimeWorkerAllocatorForPhaseStart()` frees the buffers warmed
+    /// during untimed init; the first exact-pair `eval` then reallocates the
+    /// whole 60-layer working set inside the timed window.
+    ///
+    /// Safety: this runs fixed BOS shapes on throwaway caches and never reads,
+    /// writes, or advances the real session cache, hidden state, shared-KV, or
+    /// committed tokens, so it cannot change any returned token — the serial
+    /// oracle and bit-exact parity are unaffected. It must be called after the
+    /// trusted allocator reset and before `begin`; at that point no seed exists,
+    /// so it is structurally input-independent (it cannot depend on the prompt).
+    /// It only warms the allocator: the pinned pipelines were already compiled
+    /// during untimed init, so this pays allocation, not compilation.
+    public func warmWorkingSetAfterAllocatorReset() throws {
+        // Target working set: exact-pair segments, serial rows, and the deep
+        // sliding-attention kernel. This reuses the init warmup shapes so the
+        // same buffers the first block needs are resident in the free pool.
+        // The 512-token prefill working set is skipped here because `begin`'s
+        // charged seed prefill reallocates it immediately after this returns.
+        try target.warmMTPTargetKernels(
+            includeExactPair: verificationMode == .exactPair,
+            includePrefill: false
+        )
+        // Drafter working set: one throwaway K-1 draft chain on scratch
+        // shared-KV so the first block's drafting also reuses cached buffers.
+        let scratch = target.mtpNewCache(parameters: nil)
+        let seedForward = target.forwardForMTP(
+            MLXArray([Int32(2)], [1, 1]),
+            cache: scratch
+        )
+        let lastIndex = seedForward.lastHidden.dim(1) - 1
+        var draftHidden = seedForward.lastHidden[
+            0..., lastIndex..<(lastIndex + 1), 0...
+        ]
+        let sharedKV = seedForward.capturedSharedKV
+        var draftInput = MLXArray([Int32(2)], [1, 1])
+        for _ in 0..<(MLXFastConstants.experimentalMTPMaxBlockSize - 1) {
+            let embedding = target.embedTokensForDrafter(draftInput)
+            let assistantInput = concatenated(
+                [embedding, draftHidden],
+                axis: -1
+            )
+            let output = drafter(
+                inputsEmbeds: assistantInput,
+                sharedKV: sharedKV,
+                positionOffset: Gemma4.PositionOffset.scalar(1)
+            )
+            let draft = output.logits[0..., -1, 0...]
+                .argMax(axis: -1)
+                .reshaped([1, 1])
+            eval(draft, output.lastHidden)
+            draftInput = draft
+            draftHidden = output.lastHidden
+        }
     }
 
     public func begin(seedTokens: [Int]) throws -> Int {

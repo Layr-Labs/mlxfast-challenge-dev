@@ -233,6 +233,10 @@ extension GemmaRuntime {
             }
             try resetRuntimeWorkerAllocatorForPhaseStart()
             do {
+                // Charged, input-independent (no seed applied yet): re-warm the
+                // allocator working set the trusted clear just freed so the
+                // first timed block does not pay a one-time first-touch spike.
+                try session.warmWorkingSetAfterAllocatorReset()
                 let seedToken = try session.begin(seedTokens: seedTokens)
                 state.began = true
                 state.seedTokenCount = seedTokens.count
