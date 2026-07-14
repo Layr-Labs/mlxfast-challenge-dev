@@ -54,6 +54,13 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
         )
     }
 
+    func fastMTPForward(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) -> Gemma4MTPForward? {
+        fastEngine?.forwardForMTP(inputs, cache: cache)
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         if let fastEngine {
             return fastEngine(inputs, cache: cache)

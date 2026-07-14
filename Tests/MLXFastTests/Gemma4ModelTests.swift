@@ -229,6 +229,40 @@ func gemma4SerialDecodeAdvancesOneLogicalAndPhysicalPositionWithoutFutureKVState
 }
 
 @Test
+func gemma4CombinedCacheKeepsMultiTokenVerificationInCombinedStorage() throws {
+    guard ProcessInfo.processInfo.environment[
+        "MLXFAST_RUN_MLX_RUNTIME_TESTS"
+    ] == "1" else {
+        return
+    }
+
+    let cache = Gemma4CombinedKVCache(fullStep: 4)
+    _ = cache.updateCombined(
+        MLXArray([Float(1), 101], [2, 1, 1, 1, 1])
+    )
+    _ = cache.updateCombined(
+        MLXArray([Float(2), 102], [2, 1, 1, 1, 1])
+    )
+
+    let visible = cache.update(
+        keys: MLXArray([Float(3), 4], [1, 1, 2, 1]),
+        values: MLXArray([Float(103), 104], [1, 1, 2, 1])
+    )
+    eval(visible.0, visible.1)
+
+    #expect(cache.usesCombinedStorage)
+    #expect(cache.offset == 4)
+    #expect(visible.0.shape == [1, 1, 4, 1])
+    #expect(visible.1.shape == [1, 1, 4, 1])
+    #expect(visible.0.asArray(Float.self) == [1, 2, 3, 4])
+    #expect(visible.1.asArray(Float.self) == [101, 102, 103, 104])
+
+    #expect(cache.trim(1) == 1)
+    #expect(cache.offset == 3)
+    #expect(cache.state.allSatisfy { $0.dim(2) == 3 })
+}
+
+@Test
 func gemma4CachedForwardCommitsOnlyAfterValidationAndForwardSucceed() {
     let cache = makeGemma4ModelCacheFixture()
     var forwardRan = false

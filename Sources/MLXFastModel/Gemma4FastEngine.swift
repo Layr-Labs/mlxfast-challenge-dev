@@ -115,6 +115,7 @@ private let fastGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
 struct Gemma4FastLayerResult {
     let hidden: MLXArray
     let nextNormalized: MLXArray?
+    let keyValue: (MLXArray, MLXArray)
 }
 
 final class Gemma4FastLayer {
@@ -882,7 +883,8 @@ final class Gemma4FastLayer {
         }
         return Gemma4FastLayerResult(
             hidden: out,
-            nextNormalized: nextNormalized
+            nextNormalized: nextNormalized,
+            keyValue: (keys, values)
         )
     }
 }
@@ -1275,5 +1277,95 @@ final class Gemma4FastEngine {
             logits = embedTokens.asLinear(hidden)
         }
         return logitSoftcap(logits, cap)
+    }
+
+    /// Multi-position target verification for the trained Gemma 4 assistant.
+    ///
+    /// Unlike the ordinary runtime entry point, this preserves every verify
+    /// position and captures the last full/sliding K/V views. Long prompt
+    /// prefill still projects only its final position because the MTP session
+    /// consumes only the seed logit; K<=4 verification projects every row.
+    func forwardForMTP(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) -> Gemma4MTPForward {
+        precondition(inputs.dim(0) == 1)
+        var hidden = embedTokens(inputs) * embedScale
+
+        func layerCache(_ index: Int) -> KVCache? {
+            index < cache.count ? cache[index] : nil
+        }
+
+        let slidingIndex = layers.firstIndex(where: \.isSliding)
+        let fullIndex = layers.firstIndex(where: { !$0.isSliding })
+        let slidingMask = slidingIndex.map {
+            createAttentionMask(
+                h: hidden,
+                cache: layerCache($0),
+                windowSize: slidingWindow
+            )
+        }
+        let fullMask = fullIndex.map {
+            createAttentionMask(
+                h: hidden,
+                cache: layerCache($0),
+                windowSize: nil
+            )
+        }
+
+        var normalizedInput: MLXArray? = nil
+        var capturedFull: (MLXArray, MLXArray)?
+        var capturedSliding: (MLXArray, MLXArray)?
+        for (index, layer) in layers.enumerated() {
+            let mask = layer.isSliding
+                ? (slidingMask ?? .none)
+                : (fullMask ?? .none)
+            let result = layer(
+                hidden,
+                normalizedInput: normalizedInput,
+                mask: mask,
+                cache: layerCache(index)
+            )
+            hidden = result.hidden
+            normalizedInput = result.nextNormalized
+            if layer.isSliding {
+                capturedSliding = result.keyValue
+            } else {
+                capturedFull = result.keyValue
+            }
+        }
+
+        guard let capturedFull, let capturedSliding else {
+            preconditionFailure(
+                "Gemma 4 MTP verification requires full and sliding K/V"
+            )
+        }
+        let preNorm = hidden
+        let postNorm: MLXArray
+        if inputs.dim(1) == 1, let normalizedInput {
+            postNorm = normalizedInput
+        } else {
+            postNorm = MLXFast.rmsNorm(
+                preNorm,
+                weight: finalNormWeight,
+                eps: eps
+            )
+        }
+        let projectedHidden = inputs.dim(1) > 16
+            ? gemma4LastTokenHidden(postNorm)
+            : postNorm
+        let cap = MLXArray(softcap)
+        let logits = logitSoftcap(
+            embedTokens.asLinear(projectedHidden),
+            cap
+        )
+        return Gemma4MTPForward(
+            logits: logits,
+            lastHidden: preNorm,
+            capturedSharedKV: Gemma4SharedKV(
+                fullAttention: capturedFull,
+                slidingAttention: capturedSliding
+            )
+        )
     }
 }

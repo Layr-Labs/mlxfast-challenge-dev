@@ -142,6 +142,24 @@ final class Gemma4CombinedKVCache: KVCache {
         precondition(keys.dtype == values.dtype)
 
         if combinedStorage != nil {
+            let length = keys.dim(2)
+            let canUpdateCombined: Bool
+            switch kind {
+            case .full:
+                canUpdateCombined = length > 0
+            case .rotating(let maxSize, _, _):
+                canUpdateCombined =
+                    length > 0 && rotatingIndex + length <= maxSize
+            }
+            if canUpdateCombined {
+                let combined = stacked([keys, values], axis: 0)
+                switch kind {
+                case .full(let step):
+                    return updateFull(combined, step: step)
+                case .rotating:
+                    return updateRotating(combined)
+                }
+            }
             splitCache = makeUpstreamCache()
             combinedStorage = nil
         }
@@ -198,7 +216,7 @@ final class Gemma4CombinedKVCache: KVCache {
     private func updateFull(_ incoming: MLXArray, step: Int) -> (MLXArray, MLXArray) {
         let previous = offset
         let length = incoming.dim(3)
-        precondition(length == 1)
+        precondition(length > 0)
 
         if combinedStorage == nil || previous + length > combinedStorage!.dim(3) {
             let chunks = (step + length - 1) / step
@@ -228,12 +246,17 @@ final class Gemma4CombinedKVCache: KVCache {
         }
         let previous = offset
         let length = incoming.dim(3)
-        precondition(length == 1)
+        precondition(length > 0)
 
         if combinedStorage == nil
-            || (previous >= combinedStorage!.dim(3) && combinedStorage!.dim(3) < maxSize)
+            || (rotatingIndex + length > combinedStorage!.dim(3)
+                && combinedStorage!.dim(3) < maxSize)
         {
-            let newSize = min(rotatingStep, maxSize - previous)
+            let currentCapacity = combinedStorage?.dim(3) ?? 0
+            let newSize = min(
+                max(rotatingStep, length),
+                maxSize - currentCapacity
+            )
             precondition(newSize > 0)
             let newSpace = MLXArray.zeros(
                 [2, incoming.dim(1), incoming.dim(2), newSize, incoming.dim(4)],
