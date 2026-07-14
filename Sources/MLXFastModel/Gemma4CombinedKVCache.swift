@@ -2,6 +2,8 @@ import Foundation
 import MLX
 import MLXLMCommon
 
+private let gemma4DirectPrefillDecodeReserve = 128
+
 /// Gemma-specific eager cache that keeps K and V in one K/V-major allocation.
 ///
 /// Supported prompt prefills can install a K/V-major parent allocation
@@ -75,11 +77,10 @@ final class Gemma4CombinedKVCache: KVCache {
         combinedStorage != nil
     }
 
-    /// Capacity for a direct multi-token prefill. Exactly one ordinary growth
-    /// quantum is reserved so decode does not immediately copy the seed cache.
-    /// Using `length + step` rather than rounding first avoids disproportionate
-    /// zero-fill work for short hidden/GPQA prompts. Rotating caches remain
-    /// bounded by `maxSize`.
+    /// Capacity for a direct multi-token prefill. The production policy reserves
+    /// the 128 rows consumed by the charged serial decode; the rollback policy
+    /// retains one ordinary growth quantum. Rotating caches remain bounded by
+    /// `maxSize`.
     func directPrefillCapacity(for length: Int) -> Int? {
         guard length > 1, offset == 0, combinedStorage == nil else { return nil }
         if let splitCache, !splitCache.innerState().isEmpty { return nil }
@@ -96,7 +97,10 @@ final class Gemma4CombinedKVCache: KVCache {
             upperBound = maxSize
         }
 
-        let (reserved, reserveOverflow) = length.addingReportingOverflow(step)
+        let reserve = gemma4DirectPrefillReserve128FeatureEnabled
+            ? gemma4DirectPrefillDecodeReserve
+            : step
+        let (reserved, reserveOverflow) = length.addingReportingOverflow(reserve)
         guard !reserveOverflow else { return nil }
         let capacity = upperBound.map { min($0, reserved) } ?? reserved
         return capacity >= length ? capacity : nil
@@ -500,6 +504,15 @@ func gemma4CombinedKVPrefillEnabled() -> Bool {
 func gemma4VerifyCombinedKVPrefillBitsEnabled() -> Bool {
     gemma4VerifyCombinedKVPrefillBitsFeatureEnabled
 }
+
+private let gemma4DirectPrefillReserve128FeatureEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_DIRECT_PREFILL_RESERVE_128"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
 
 private let gemma4CombinedKVCacheFeatureEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_COMBINED_KV_CACHE"] else {
