@@ -13,14 +13,17 @@ public struct DenseTensorRecord: Equatable {
 public final class DenseTensorStore {
     public let weightsPath: String
     private let recordsByName: [String: DenseTensorRecord]
+    private let indexedNames: Set<String>
 
     public init(weightsPath: String) throws {
         self.weightsPath = weightsPath
-        self.recordsByName = try DenseTensorStore.loadRecords(weightsPath: weightsPath)
+        let loaded = try DenseTensorStore.loadRecords(weightsPath: weightsPath)
+        self.recordsByName = loaded.records
+        self.indexedNames = loaded.indexedNames
     }
 
     public var tensorNames: [String] {
-        recordsByName.keys.sorted()
+        indexedNames.sorted()
     }
 
     var shardNames: [String] {
@@ -28,7 +31,7 @@ public final class DenseTensorStore {
     }
 
     func tensorNames(inShard shard: String) -> Set<String> {
-        Set(recordsByName.values.lazy.filter { $0.shard == shard }.map(\.name))
+        Set(indexedNames.lazy.filter { self.recordsByName[$0]?.shard == shard })
     }
 
     public func record(named name: String) -> DenseTensorRecord? {
@@ -103,7 +106,9 @@ public final class DenseTensorStore {
         }
     }
 
-    private static func loadRecords(weightsPath: String) throws -> [String: DenseTensorRecord] {
+    private static func loadRecords(
+        weightsPath: String
+    ) throws -> (records: [String: DenseTensorRecord], indexedNames: Set<String>) {
         let weightsURL = URL(fileURLWithPath: weightsPath)
         try requireFile(
             weightsURL.appendingPathComponent("model.safetensors.index.json").path,
@@ -151,7 +156,28 @@ public final class DenseTensorStore {
         guard !records.isEmpty else {
             throw MLXFastError.invalidInput("dense tensor store contains no safetensors tensors")
         }
-        return records
+        let indexedNames = Set(records.keys)
+        // Publish virtual gate/up records as byte ranges into the single
+        // transform-authored combined tensors. They are intentionally omitted
+        // from tensorNames/shard inventory so safetensors loading sees only the
+        // real combined triplets.
+        for layer in 0..<60 {
+            let prefix = "language_model.model.layers.\(layer).mlp"
+            for (suffix, rowBytes) in [("weight", 672 * 4), ("scales", 84 * 2), ("biases", 84 * 2)] {
+                let combinedName = "\(prefix).gate_up_prefill.\(suffix)"
+                guard let combined = records[combinedName] else { continue }
+                let halfBytes = 21_504 * rowBytes
+                records["\(prefix).gate_proj.\(suffix)"] = DenseTensorRecord(
+                    name: "\(prefix).gate_proj.\(suffix)", shard: combined.shard,
+                    dtype: combined.dtype, shape: [21_504, suffix == "weight" ? 672 : 84],
+                    byteOffset: combined.byteOffset, byteLength: halfBytes)
+                records["\(prefix).up_proj.\(suffix)"] = DenseTensorRecord(
+                    name: "\(prefix).up_proj.\(suffix)", shard: combined.shard,
+                    dtype: combined.dtype, shape: [21_504, suffix == "weight" ? 672 : 84],
+                    byteOffset: combined.byteOffset + halfBytes, byteLength: halfBytes)
+            }
+        }
+        return (records, indexedNames)
     }
 
     private static func loadWeightMap(_ path: URL) throws -> [String: String] {

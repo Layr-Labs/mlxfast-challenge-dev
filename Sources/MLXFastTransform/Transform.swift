@@ -104,9 +104,6 @@ public enum SwiftTransform {
             throw MLXFastError.invalidInput("checkpoint index contains no text-tower tensors")
         }
 
-        let textKeysByShard = Dictionary(grouping: textKeys) { key in
-            index.weightMap[key] ?? ""
-        }
         var totalTensorByteCount = 0
         for key in textKeys.sorted() {
             guard let shardName = index.weightMap[key],
@@ -144,6 +141,18 @@ public enum SwiftTransform {
             }
         }
 
+        try beforeSidecarGeneration?()
+        let generatedCombinedGateUp = try CombinedGateUpCoding.writeSidecar(
+            sourceDirectory: referenceDirectory,
+            index: index,
+            sourceHeaders: validatedHeaders,
+            selectedKeys: textKeys,
+            destinationDirectory: stagingDirectory
+        )
+        let keptTextKeys = textKeys.subtracting(generatedCombinedGateUp.replacedKeys)
+        let textKeysByShard = Dictionary(grouping: keptTextKeys) { key in
+            index.weightMap[key] ?? ""
+        }
         var copiedTensors = 0
         var stagedHeaders: [String: SafetensorsHeader] = [:]
         for shardName in textKeysByShard.keys.sorted() {
@@ -161,23 +170,30 @@ public enum SwiftTransform {
             stagedHeaders[shardName] = try Safetensors.readHeader(destination)
         }
 
-        try beforeSidecarGeneration?()
         let generatedProjectionMetadata = try AffineMetadataCoding.writeProjectionSidecar(
-            sourceDirectory: stagingDirectory,
+            sourceDirectory: referenceDirectory,
             index: index,
-            sourceHeaders: stagedHeaders,
+            sourceHeaders: validatedHeaders,
             selectedKeys: textKeys,
             destinationDirectory: stagingDirectory
         )
         let generatedTiedHeadMetadata = try TiedHeadMetadataCoding.writeSidecar(
-            sourceDirectory: stagingDirectory,
+            sourceDirectory: referenceDirectory,
             index: index,
-            sourceHeaders: stagedHeaders,
+            sourceHeaders: validatedHeaders,
             selectedKeys: textKeys,
             destinationDirectory: stagingDirectory
         )
+        let replacedByteCount = generatedCombinedGateUp.replacedKeys.reduce(0) { total, key in
+            guard let shard = index.weightMap[key],
+                  let info = validatedHeaders[shard]?.tensors[key]
+            else { return total }
+            return total + info.byteCount
+        }
+        let physicalTensorBytes = totalTensorByteCount - replacedByteCount
+            + generatedCombinedGateUp.tensorByteCount
         let (projectionOutputByteCount, projectionSizeOverflow) =
-            totalTensorByteCount.addingReportingOverflow(
+            physicalTensorBytes.addingReportingOverflow(
                 generatedProjectionMetadata.tensorByteCount
             )
         let (outputTensorByteCount, tiedHeadSizeOverflow) =
@@ -187,16 +203,18 @@ public enum SwiftTransform {
         guard !projectionSizeOverflow, !tiedHeadSizeOverflow else {
             throw MLXFastError.invalidInput("transformed tensor byte count overflows Int")
         }
-        let generatedWeightMap = generatedProjectionMetadata.weightMap.merging(
-            generatedTiedHeadMetadata.weightMap
-        ) { _, _ in
-            preconditionFailure("generated metadata tensor names collide")
-        }
+        let generatedWeightMap = generatedCombinedGateUp.weightMap
+            .merging(generatedProjectionMetadata.weightMap) { _, _ in
+                preconditionFailure("generated tensor names collide")
+            }
+            .merging(generatedTiedHeadMetadata.weightMap) { _, _ in
+                preconditionFailure("generated metadata tensor names collide")
+            }
 
         try writeMetadataFiles(metadataSnapshot, to: stagingDirectory)
         try index.writeStripped(
             to: stagingDirectory.appendingPathComponent("model.safetensors.index.json"),
-            keeping: textKeys,
+            keeping: keptTextKeys,
             totalTensorByteCount: outputTensorByteCount,
             additionalWeightMap: generatedWeightMap
         )
@@ -244,9 +262,11 @@ public enum SwiftTransform {
             referencePath: referenceDirectory.path,
             outputPath: outputDirectory.path,
             denseTensorCount: copiedTensors
+                + generatedCombinedGateUp.tensorCount
                 + generatedProjectionMetadata.tensorCount
                 + generatedTiedHeadMetadata.tensorCount,
             denseShardCount: textKeysByShard.count
+                + generatedCombinedGateUp.shardCount
                 + generatedProjectionMetadata.shardCount
                 + generatedTiedHeadMetadata.shardCount,
             configPath: configPath.path,

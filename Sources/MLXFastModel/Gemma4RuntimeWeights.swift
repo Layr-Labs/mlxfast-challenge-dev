@@ -139,7 +139,8 @@ public final class Gemma4RuntimeWeightCache {
         // GPU command before FastEngine finishes its host-side preparation.
         try model.prepareFastEngine(
             indexedMetadata: partition.indexedMetadata,
-            tiedHeadPacked13Metadata: partition.tiedHeadPacked13Metadata
+            tiedHeadPacked13Metadata: partition.tiedHeadPacked13Metadata,
+            combinedGateUpPrefill: partition.combinedGateUpPrefill
         )
         return model
     }
@@ -301,6 +302,13 @@ struct RuntimeWeightPartition {
     let modelParameters: [String: MLXArray]
     let indexedMetadata: [String: IndexedAffineMetadata]
     let tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata?
+    let combinedGateUpPrefill: [String: CombinedGateUpPrefillWeights]
+}
+
+private struct RuntimeCombinedGateUpParts {
+    var weight: MLXArray?
+    var scales: MLXArray?
+    var biases: MLXArray?
 }
 
 private struct RuntimeIndexedMetadataParts {
@@ -337,6 +345,7 @@ func partitionRuntimeWeights(
     let lutSuffix = ".metadata_lut"
     var modelParameters: [String: MLXArray] = [:]
     var metadataParts: [String: RuntimeIndexedMetadataParts] = [:]
+    var combinedParts: [String: RuntimeCombinedGateUpParts] = [:]
     var tiedHeadPackedIndices: MLXArray?
     var tiedHeadLUT: MLXArray?
 
@@ -352,6 +361,15 @@ func partitionRuntimeWeights(
         } else if name.hasSuffix(lutSuffix) {
             let stem = String(name.dropLast(lutSuffix.count))
             metadataParts[stem, default: RuntimeIndexedMetadataParts()].lut = array
+        } else if name.contains(".mlp.gate_up_prefill.") {
+            let suffix = name.split(separator: ".").last.map(String.init) ?? ""
+            let stem = String(name.dropLast(suffix.count + 1))
+            switch suffix {
+            case "weight": combinedParts[stem, default: RuntimeCombinedGateUpParts()].weight = array
+            case "scales": combinedParts[stem, default: RuntimeCombinedGateUpParts()].scales = array
+            case "biases": combinedParts[stem, default: RuntimeCombinedGateUpParts()].biases = array
+            default: throw MLXFastError.invalidInput("unknown combined gate/up tensor \(name)")
+            }
         } else {
             modelParameters[name] = array
         }
@@ -394,11 +412,35 @@ func partitionRuntimeWeights(
         )
     }
 
+    var combinedGateUpPrefill: [String: CombinedGateUpPrefillWeights] = [:]
+    for (stem, parts) in combinedParts {
+        guard let weight = parts.weight, let scales = parts.scales, let biases = parts.biases,
+              weight.dtype == .uint32, weight.shape == [43_008, 672],
+              scales.dtype == .bfloat16, scales.shape == [43_008, 84],
+              biases.dtype == .bfloat16, biases.shape == [43_008, 84]
+        else { throw MLXFastError.invalidInput("malformed combined gate/up payload for \(stem)") }
+        let prefix = String(stem.dropLast("gate_up_prefill".count))
+        modelParameters["\(prefix)gate_proj.weight"] = weight[0..<21_504, 0...]
+        modelParameters["\(prefix)gate_proj.scales"] = scales[0..<21_504, 0...]
+        modelParameters["\(prefix)gate_proj.biases"] = biases[0..<21_504, 0...]
+        modelParameters["\(prefix)up_proj.weight"] = weight[21_504..<43_008, 0...]
+        modelParameters["\(prefix)up_proj.scales"] = scales[21_504..<43_008, 0...]
+        modelParameters["\(prefix)up_proj.biases"] = biases[21_504..<43_008, 0...]
+        combinedGateUpPrefill[stem] = CombinedGateUpPrefillWeights(
+            weight: weight, scales: scales, biases: biases)
+    }
+    if !combinedParts.isEmpty {
+        guard combinedParts.count == 60 else {
+            throw MLXFastError.invalidInput("combined gate/up transform is incomplete")
+        }
+    }
+
     guard !metadataParts.isEmpty else {
         return RuntimeWeightPartition(
             modelParameters: modelParameters,
             indexedMetadata: [:],
-            tiedHeadPacked13Metadata: tiedHeadPacked13Metadata
+            tiedHeadPacked13Metadata: tiedHeadPacked13Metadata,
+            combinedGateUpPrefill: combinedGateUpPrefill
         )
     }
     let actualStems = Set(metadataParts.keys)
@@ -456,7 +498,8 @@ func partitionRuntimeWeights(
     return RuntimeWeightPartition(
         modelParameters: modelParameters,
         indexedMetadata: indexedMetadata,
-        tiedHeadPacked13Metadata: tiedHeadPacked13Metadata
+        tiedHeadPacked13Metadata: tiedHeadPacked13Metadata,
+        combinedGateUpPrefill: combinedGateUpPrefill
     )
 }
 

@@ -148,6 +148,8 @@ final class Gemma4FastLayer {
 
     let rope: RoPELayer
     let fusedMLP: @Sendable (MLXArray) -> MLXArray
+    let combinedGateUpPrefill: CombinedGateUpPrefillProjection?
+    let combinedGateUpTail: (@Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray)?
     let fusedMLPTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let fusedGateUp: FusedGateUpProjection?
     let fusedGateUpPostTail: (@Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray)?
@@ -184,7 +186,8 @@ final class Gemma4FastLayer {
         vIndexedMetadata: IndexedAffineMetadata?,
         gateIndexedMetadata: IndexedAffineMetadata?,
         upIndexedMetadata: IndexedAffineMetadata?,
-        downIndexedMetadata: IndexedAffineMetadata?
+        downIndexedMetadata: IndexedAffineMetadata?,
+        combinedGateUpWeights: CombinedGateUpPrefillWeights?
     ) {
         self.isSliding = isSliding
         self.nHeads = nHeads
@@ -377,6 +380,23 @@ final class Gemma4FastLayer {
             compileEnabled = true
         }
         self.fusedMLP = compileEnabled ? compile(shapeless: true, body) : body
+        self.combinedGateUpPrefill = combinedGateUpWeights.flatMap {
+            CombinedGateUpPrefillProjection(weights: $0, gate: gateP, up: upP)
+        }
+        let combinedTailWeights = FastMLPTailWeights(
+            preNorm: preFfnNorm.weight,
+            postNorm: postFfnNorm.weight,
+            layerScalar: layerScalar
+        )
+        let combinedTailBody: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+            gateOutput, upOutput, residual in
+            let mlp = downP(gelu(gateOutput) * upOutput)
+            let postNormalized = MLXFast.rmsNorm(
+                mlp, weight: combinedTailWeights.postNorm, eps: eps)
+            return (residual + postNormalized) * combinedTailWeights.layerScalar
+        }
+        self.combinedGateUpTail = self.combinedGateUpPrefill != nil
+            ? compile(shapeless: true, combinedTailBody) : nil
 
         let tailWeights = FastMLPTailWeights(
             preNorm: preFfnNorm.weight,
@@ -871,6 +891,13 @@ final class Gemma4FastLayer {
                 let (gateOutput, upOutput) = fusedGateUp(normalized)
                 out = fusedGateUpPostTail(gateOutput, upOutput, residual2)
             }
+        } else if B == 1, L > 1,
+                  let combinedGateUpPrefill, let combinedGateUpTail
+        {
+            let normalized = MLXFast.rmsNorm(
+                out, weight: preFfnNormWeight, eps: eps)
+            let (gateOutput, upOutput) = combinedGateUpPrefill(normalized)
+            out = combinedGateUpTail(gateOutput, upOutput, residual2)
         } else if let fusedMLPTail {
             out = fusedMLPTail(out, residual2)
         } else {
@@ -974,7 +1001,8 @@ final class Gemma4FastEngine {
     init(
         model: Gemma4RuntimeModel,
         indexedMetadata: [String: IndexedAffineMetadata] = [:],
-        tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata? = nil
+        tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata? = nil,
+        combinedGateUpPrefill: [String: CombinedGateUpPrefillWeights] = [:]
     ) throws {
         let config = model.configuration
         self.embedScale = Float(config.hiddenSize).squareRoot()
@@ -1171,7 +1199,9 @@ final class Gemma4FastEngine {
                     vIndexedMetadata: indexedMetadata["\(prefix).self_attn.v_proj"],
                     gateIndexedMetadata: indexedMetadata["\(prefix).mlp.gate_proj"],
                     upIndexedMetadata: indexedMetadata["\(prefix).mlp.up_proj"],
-                    downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"]
+                    downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"],
+                    combinedGateUpWeights: combinedGateUpPrefill[
+                        "\(prefix).mlp.gate_up_prefill"]
                 )
             )
         }
