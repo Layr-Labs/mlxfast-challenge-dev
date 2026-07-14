@@ -41,6 +41,24 @@ private let gemma4VerifyStagedSlidingPrefillAttentionBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+private let gemma4TriangularSlidingPrefillQKEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_TRIANGULAR_SLIDING_PREFILL_QK"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4VerifyTriangularSlidingPrefillQKBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_TRIANGULAR_SLIDING_PREFILL_QK_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -769,8 +787,30 @@ final class Gemma4FastLayer {
             let candidate = gemma4StagedSlidingPrefill512(
                 queries: queries,
                 keys: keys,
-                values: values
+                values: values,
+                triangular: gemma4TriangularSlidingPrefillQKEnabled
             )
+            if gemma4VerifyTriangularSlidingPrefillQKBits {
+                let triangular = gemma4TriangularSlidingPrefillQKEnabled
+                    ? candidate
+                    : gemma4StagedSlidingPrefill512(
+                        queries: queries, keys: keys, values: values,
+                        triangular: true)
+                let retained = gemma4TriangularSlidingPrefillQKEnabled
+                    ? gemma4StagedSlidingPrefill512(
+                        queries: queries, keys: keys, values: values,
+                        triangular: false)
+                    : candidate
+                let matches = arrayEqual(
+                    triangular.view(dtype: .uint16),
+                    retained.view(dtype: .uint16)
+                )
+                eval(matches)
+                precondition(
+                    matches.item(Bool.self),
+                    "triangular staged QK differs from retained full-QK kernel"
+                )
+            }
             if gemma4VerifyStagedSlidingPrefillAttentionBits {
                 let reference = MLXFast.scaledDotProductAttention(
                     queries: queries,

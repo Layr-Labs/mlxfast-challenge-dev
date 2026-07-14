@@ -7,8 +7,12 @@ import MLX
 /// four-SIMD/4-read reduction topology as MLX's precise block softmax rewrites
 /// that tile in place, and PV consumes it without materializing either scores
 /// or probabilities in device memory.
-private let gemma4StagedSlidingPrefill512Kernel = MLXFast.metalKernel(
-    name: "gemma4_staged_sliding_prefill_16x512x256_mpp_v1",
+private func makeGemma4StagedSlidingPrefill512Kernel(
+    name: String,
+    qkBlockUpperBound: String
+) -> MLXFast.MLXFastKernel {
+    MLXFast.metalKernel(
+    name: name,
     inputNames: ["queries", "keys", "values"],
     outputNames: ["output"],
     source: """
@@ -29,6 +33,8 @@ private let gemma4StagedSlidingPrefill512Kernel = MLXFast.metalKernel(
         const uint query_head = threadgroup_position_in_grid.y;
         const uint query_block = threadgroup_position_in_grid.z;
         const uint query_start = query_block * kQueryRows;
+        const uint query_last = query_start + kQueryRows - 1;
+        const uint needed_key_blocks = query_last / 32 + 1;
         const uint kv_head = query_head / kGQAFactor;
 
         threadgroup bfloat scores[kQueryRows * kLength];
@@ -48,7 +54,7 @@ private let gemma4StagedSlidingPrefill512Kernel = MLXFast.metalKernel(
             + static_cast<int64_t>(query_head) * queries_strides[1]
             + static_cast<int64_t>(query_start) * queries_strides[2];
         for (uint key_block = simd_group;
-             key_block < kLength / 32;
+             key_block < \(qkBlockUpperBound);
              key_block += kSIMDGroups) {
             const uint key_start = key_block * 32;
             device bfloat* mutable_keys = const_cast<device bfloat*>(keys)
@@ -191,9 +197,24 @@ private let gemma4StagedSlidingPrefill512Kernel = MLXFast.metalKernel(
 
         """,
     ensureRowContiguous: false
-)
+    )
+}
 
-func gemma4StagedSlidingPrefill512(
+// Keep the full-QK primitive for rollback and raw-bit differential verification.
+private let gemma4StagedSlidingPrefill512ReferenceKernel =
+    makeGemma4StagedSlidingPrefill512Kernel(
+        name: "gemma4_staged_sliding_prefill_16x512x256_mpp_v1",
+        qkBlockUpperBound: "kLength / 32"
+    )
+
+private let gemma4StagedSlidingPrefill512TriangularKernel =
+    makeGemma4StagedSlidingPrefill512Kernel(
+        name: "gemma4_staged_sliding_prefill_16x512x256_mpp_causal_triangular_v1",
+        qkBlockUpperBound: "needed_key_blocks"
+    )
+
+private func runGemma4StagedSlidingPrefill512(
+    kernel: MLXFast.MLXFastKernel,
     queries: MLXArray,
     keys: MLXArray,
     values: MLXArray
@@ -205,11 +226,32 @@ func gemma4StagedSlidingPrefill512(
     precondition(keys.shape == [1, 16, 512, 256])
     precondition(values.shape == [1, 16, 512, 256])
 
-    return gemma4StagedSlidingPrefill512Kernel(
+    return kernel(
         [queries, keys, values],
         grid: (128, 32, 32),
         threadGroup: (128, 1, 1),
         outputShapes: [[1, 32, 512, 256]],
         outputDTypes: [.bfloat16]
     )[0]
+}
+
+func gemma4StagedSlidingPrefill512(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    triangular: Bool = true
+) -> MLXArray {
+    runGemma4StagedSlidingPrefill512(
+        kernel: triangular
+            ? gemma4StagedSlidingPrefill512TriangularKernel
+            : gemma4StagedSlidingPrefill512ReferenceKernel,
+        queries: queries,
+        keys: keys,
+        values: values
+    )
+}
+
+// Host-side qualification helper: no production-kernel atomics or counters.
+func gemma4StagedSlidingPrefill512QKTilesPerHead(triangular: Bool) -> Int {
+    triangular ? (0..<32).reduce(0) { $0 + $1 / 2 + 1 } : 32 * 16
 }
