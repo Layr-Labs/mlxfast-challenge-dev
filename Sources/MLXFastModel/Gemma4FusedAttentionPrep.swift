@@ -736,6 +736,163 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
     )
 }
 
+/// D=256 sliding-only specialization that packs two independent direct
+/// preparation rows into the four SIMD groups of one 128-thread threadgroup.
+/// Each 64-thread half retains the promoted single-row arithmetic topology.
+private func makeGemma4PairedSlidingCombinedQKVPrefillPreparationKernel(
+    name: String
+) -> MLXFast.MLXFastKernel {
+    MLXFast.metalKernel(
+        name: name,
+        inputNames: [
+            "raw_q", "raw_k", "raw_v", "q_weight", "k_weight",
+            "start_position", "valid_length", "capacity", "rope_cosines",
+            "rope_sines",
+        ],
+        outputNames: ["queries", "combined_kv"],
+        source: """
+            constexpr uint kHeadDim = 256;
+            constexpr uint kQHeads = 32;
+            constexpr uint kKVHeads = 16;
+            constexpr uint kKVRowsPerToken = 32;
+            constexpr uint kReads = 4;
+
+            const uint localThread = thread_position_in_threadgroup.x;
+            const uint rowSlot = localThread >> 6;
+            const uint rowThread = localThread & 63;
+            const uint combined_row =
+                2 * threadgroup_position_in_grid.y + rowSlot;
+            const uint rowSIMD = rowThread >> 5;
+            const uint lane = rowThread & 31;
+
+            const uint input_length = static_cast<uint>(valid_length);
+            const uint output_capacity = static_cast<uint>(capacity);
+            const uint query_rows = input_length * kQHeads;
+            const bool is_q = combined_row < query_rows;
+
+            uint token;
+            uint projection_head;
+            bool is_k;
+            if (is_q) {
+                token = combined_row / kQHeads;
+                projection_head = combined_row - token * kQHeads;
+                is_k = false;
+            } else {
+                const uint kv_row = combined_row - query_rows;
+                token = kv_row / kKVRowsPerToken;
+                const uint token_row = kv_row - token * kKVRowsPerToken;
+                is_k = token_row < kKVHeads;
+                projection_head = is_k
+                    ? token_row
+                    : token_row - kKVHeads;
+            }
+
+            const uint slab_elements =
+                kKVHeads * output_capacity * kHeadDim;
+            device bfloat* output = is_q
+                ? queries + (projection_head * input_length + token) * kHeadDim
+                : combined_kv
+                    + (is_k ? 0 : slab_elements)
+                    + (projection_head * output_capacity + token) * kHeadDim;
+            const bool valid_row = is_q || token < input_length;
+
+            const constant int64_t* input_strides = is_q
+                ? raw_q_strides
+                : (is_k ? raw_k_strides : raw_v_strides);
+            const int64_t dimension_stride = input_strides[2];
+            const device bfloat* input_base = is_q
+                ? raw_q
+                : (is_k ? raw_k : raw_v);
+            const uint source_token = valid_row ? token : 0;
+            const device bfloat* row_input = input_base
+                + static_cast<int64_t>(source_token) * input_strides[1]
+                + static_cast<int64_t>(projection_head * kHeadDim)
+                    * dimension_stride;
+            const device bfloat* input = row_input
+                + static_cast<int64_t>(rowThread * kReads) * dimension_stride;
+
+            float accumulator = 0;
+            if (valid_row) {
+                for (uint index = 0; index < kReads; ++index) {
+                    const float value = input[
+                        static_cast<int64_t>(index) * dimension_stride];
+                    accumulator += value * value;
+                }
+            }
+            accumulator = simd_sum(accumulator);
+
+            threadgroup float inverse_mean[2];
+            threadgroup float local_sums[2][32];
+            if (rowSIMD == 0) {
+                local_sums[rowSlot][lane] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+                local_sums[rowSlot][rowSIMD] = accumulator;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (rowSIMD == 0) {
+                accumulator = simd_sum(local_sums[rowSlot][lane]);
+                if (lane == 0) {
+                    inverse_mean[rowSlot] = metal::precise::rsqrt(
+                        accumulator / 256 + 1.0e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (!valid_row) {
+                for (uint index = 0; index < kReads; ++index) {
+                    const uint dimension = rowThread * kReads + index;
+                    output[dimension] = static_cast<bfloat>(0.0f);
+                }
+            } else if (!is_q && !is_k) {
+                for (uint index = 0; index < kReads; ++index) {
+                    const uint dimension = rowThread * kReads + index;
+                    const bfloat normalized = static_cast<bfloat>(
+                        input[static_cast<int64_t>(index) * dimension_stride]
+                            * inverse_mean[rowSlot]);
+                    output[dimension] =
+                        static_cast<bfloat>(1.0f) * normalized;
+                }
+            } else {
+                constexpr uint kPairs = kHeadDim / 2;
+                constexpr uint kThreads = kHeadDim / kReads;
+                const device bfloat* weight = is_q ? q_weight : k_weight;
+                for (uint pair = rowThread; pair < kPairs; pair += kThreads) {
+                    const bfloat normalized_left = static_cast<bfloat>(
+                        row_input[static_cast<int64_t>(pair) * dimension_stride]
+                            * inverse_mean[rowSlot]);
+                    const bfloat normalized_right = static_cast<bfloat>(
+                        row_input[static_cast<int64_t>(pair + kPairs)
+                            * dimension_stride] * inverse_mean[rowSlot]);
+                    const bfloat weighted_left =
+                        weight[pair] * normalized_left;
+                    const bfloat weighted_right =
+                        weight[pair + kPairs] * normalized_right;
+                    const uint rope_index =
+                        (static_cast<uint>(start_position) + token)
+                            * kPairs + pair;
+                    const float cosine = rope_cosines[rope_index];
+                    const float sine = rope_sines[rope_index];
+                    const float left = static_cast<float>(weighted_left);
+                    const float right = static_cast<float>(weighted_right);
+                    output[pair] = static_cast<bfloat>(
+                        left * cosine - right * sine);
+                    output[pair + kPairs] = static_cast<bfloat>(
+                        left * sine + right * cosine);
+                }
+            }
+            """,
+        header: "using namespace metal;",
+        ensureRowContiguous: false
+    )
+}
+
+private let gemma4PairedDirectSlidingCombinedQKVPrefillPreparation =
+    makeGemma4PairedSlidingCombinedQKVPrefillPreparationKernel(
+        name: "gemma4_paired_direct_sliding_combined_qkv_prefill_strided_256_v1"
+    )
+
 private let gemma4SlidingCombinedQKVPrefillPreparation =
     makeGemma4CombinedQKVPrefillPreparationKernel(
         name: "gemma4_sliding_combined_qkv_prefill_prep_strided_256_v1",
@@ -905,6 +1062,7 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
     let ropeCosines: MLXArray
     let ropeSines: MLXArray
     private let directPrefillRMSRoPE: Bool
+    private let pairedSlidingPrefillPreparation: Bool
     private let verifyDirectPrefillRMSRoPEBits: Bool
 
     init?(
@@ -941,6 +1099,11 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
             "DARKBLOOM_DIRECT_PREFILL_ATTENTION_RMS_ROPE",
             default: gemma4DirectPrefillAttentionRMSRoPEDefault
         )
+        self.pairedSlidingPrefillPreparation =
+            gemma4PrefillAttentionEnvironmentFlag(
+                "DARKBLOOM_PAIRED_SLIDING_PREFILL_PREP",
+                default: true
+            )
         self.verifyDirectPrefillRMSRoPEBits =
             gemma4PrefillAttentionEnvironmentFlag(
                 "DARKBLOOM_VERIFY_DIRECT_PREFILL_ATTENTION_RMS_ROPE_BITS",
@@ -1148,21 +1311,36 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
             positionViews[offset], MLXArray(Int32(length)),
             MLXArray(Int32(capacity)), ropeCosines, ropeSines,
         ]
-        let grid = (
-            threads,
-            length * 32 + capacity * kvRowsPerToken,
-            1
-        )
+        let totalRows = length * 32 + capacity * kvRowsPerToken
+        let grid = (threads, totalRows, 1)
         let shapes = [
             [1, 32, length, headDim],
             [2, 1, kvHeads, capacity, headDim],
         ]
-        let candidate: [MLXArray]?
-        if directPrefillRMSRoPE || verifyDirectPrefillRMSRoPEBits {
-            let candidateKernel = isSliding
+        let usePaired =
+            isSliding && directPrefillRMSRoPE
+                && pairedSlidingPrefillPreparation
+        let paired: [MLXArray]?
+        if usePaired || (isSliding && verifyDirectPrefillRMSRoPEBits) {
+            precondition(totalRows.isMultiple(of: 2))
+            paired = gemma4PairedDirectSlidingCombinedQKVPrefillPreparation(
+                inputs,
+                grid: (128, totalRows / 2, 1),
+                threadGroup: (128, 1, 1),
+                outputShapes: shapes,
+                outputDTypes: [.bfloat16, .bfloat16]
+            )
+        } else {
+            paired = nil
+        }
+        let direct: [MLXArray]?
+        if (directPrefillRMSRoPE && !usePaired)
+            || verifyDirectPrefillRMSRoPEBits
+        {
+            let directKernel = isSliding
                 ? gemma4DirectSlidingCombinedQKVPrefillPreparation
                 : gemma4DirectFullCombinedQKVPrefillPreparation
-            candidate = candidateKernel(
+            direct = directKernel(
                 inputs,
                 grid: grid,
                 threadGroup: (threads, 1, 1),
@@ -1170,14 +1348,14 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
                 outputDTypes: [.bfloat16, .bfloat16]
             )
         } else {
-            candidate = nil
+            direct = nil
         }
-        let reference: [MLXArray]?
+        let staged: [MLXArray]?
         if !directPrefillRMSRoPE || verifyDirectPrefillRMSRoPEBits {
-            let referenceKernel = isSliding
+            let stagedKernel = isSliding
                 ? gemma4SlidingCombinedQKVPrefillPreparation
                 : gemma4FullCombinedQKVPrefillPreparation
-            reference = referenceKernel(
+            staged = stagedKernel(
                 inputs,
                 grid: grid,
                 threadGroup: (threads, 1, 1),
@@ -1185,21 +1363,27 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
                 outputDTypes: [.bfloat16, .bfloat16]
             )
         } else {
-            reference = nil
+            staged = nil
         }
-        if verifyDirectPrefillRMSRoPEBits,
-           let candidate,
-           let reference
-        {
-            gemma4VerifyDirectPrefillAttentionRMSRoPEOutputs(
-                candidate: candidate,
-                reference: reference,
-                kind: isSliding ? "sliding_qkv" : "full_qkv"
-            )
+        if verifyDirectPrefillRMSRoPEBits, let direct {
+            if let paired {
+                gemma4VerifyDirectPrefillAttentionRMSRoPEOutputs(
+                    candidate: paired,
+                    reference: direct,
+                    kind: "paired_sliding_qkv_vs_direct"
+                )
+            }
+            if let staged {
+                gemma4VerifyDirectPrefillAttentionRMSRoPEOutputs(
+                    candidate: direct,
+                    reference: staged,
+                    kind: isSliding ? "direct_sliding_qkv_vs_staged" : "direct_full_qkv_vs_staged"
+                )
+            }
         }
-        let outputs = directPrefillRMSRoPE
-            ? (candidate ?? reference)
-            : (reference ?? candidate)
+        let outputs = usePaired
+            ? paired
+            : (directPrefillRMSRoPE ? direct : staged)
         guard let outputs else {
             preconditionFailure(
                 "combined Q/K/V prefill RMS/RoPE kernel was not selected"
