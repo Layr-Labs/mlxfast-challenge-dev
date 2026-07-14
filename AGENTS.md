@@ -60,6 +60,10 @@ scheduling — not disk I/O.
 
 Local machines need enough unified memory to hold the ~17 GB text tower plus
 KV cache and activation buffers; about 36 GB is a practical local minimum.
+Machines below 64 GiB automatically use a low-memory startup profile: retained
+co-tiled/combined weight layouts and compiled decode are disabled, the MLX
+allocator cache is capped at 6 GiB, and free warmup buffers are cleared before
+the worker protocol starts. The 128 GB ranked runner keeps the full profile.
 The ranked box has more headroom than that, but memory-hungry strategies
 tuned against a different machine still have to survive the paired
 measurement on the M5, and a kernel or layout strategy that helps on one
@@ -302,7 +306,9 @@ behaviors are expected, not bugs:
  ~17 GB RAM-resident text tower means two simultaneous model residencies
  (an overlapping second local run, or a new run started while an orphaned
  model-holding worker from an aborted run lingers) can out-of-memory a
- 36 GB machine. Local modes therefore take a per-user run lock and refuse
+ 36 GB machine. A single worker is separately protected by the automatic
+ low-memory startup profile described above. Local modes take a per-user run
+ lock and refuse
  to start while a model-holding mlxfast process is still alive, printing
  the offending pid/rss/command list. Read that list before reacting: a
  ppid of 1 is usually an orphan from an aborted run (verify, then
