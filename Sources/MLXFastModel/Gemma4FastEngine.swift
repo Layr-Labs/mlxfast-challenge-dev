@@ -23,6 +23,24 @@ private let gemma4VerifyCombinedQKVPrefillPreparationBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+private let gemma4RowParallelPrefillBoundariesEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROW_PARALLEL_PREFILL_BOUNDARIES"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+private let gemma4VerifyRowParallelPrefillBoundaryBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_ROW_PARALLEL_PREFILL_BOUNDARY_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 private let gemma4StagedSlidingPrefillAttentionEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_STAGED_SLIDING_PREFILL_ATTENTION"
@@ -512,9 +530,9 @@ final class Gemma4FastLayer {
         let residual = x
         let h: MLXArray
         if let normalizedInput {
-            precondition(x.dim(0) == 1 && x.dim(1) == 1)
+            precondition(x.dim(0) == 1)
             precondition(normalizedInput.shape == x.shape)
-            precondition(normalizedInput.dtype == .bfloat16)
+            precondition(normalizedInput.dtype == x.dtype && x.dtype == .bfloat16)
             h = normalizedInput
         } else {
             h = MLXFast.rmsNorm(x, weight: inputNormWeight, eps: eps)
@@ -822,6 +840,67 @@ final class Gemma4FastLayer {
         } else {
             attnOut = oProj(mergedAttention)
         }
+        // Multi-row prefill keeps the stock QMM/activation MLP, but replaces
+        // each generic RMS/residual boundary with one independent threadgroup
+        // per supplied row. The singleton path below remains unchanged.
+        if B == 1,
+           L > 1,
+           (gemma4RowParallelPrefillBoundariesEnabled
+                || gemma4VerifyRowParallelPrefillBoundaryBits),
+           let fusedAttentionToMLPBoundary,
+           let fusedMLPToNextBoundary
+        {
+            let attentionCandidate = fusedAttentionToMLPBoundary.callRows(
+                attentionOutput: attnOut,
+                residual: residual
+            )
+            let candidateMLP = fusedMLP(attentionCandidate.1)
+            let mlpCandidate = fusedMLPToNextBoundary.callRows(
+                mlpOutput: candidateMLP,
+                residual: attentionCandidate.0
+            )
+
+            if gemma4VerifyRowParallelPrefillBoundaryBits {
+                let referenceResidual = residual + MLXFast.rmsNorm(
+                    attnOut, weight: postAttnNormWeight, eps: eps)
+                let referenceNormalized = MLXFast.rmsNorm(
+                    referenceResidual, weight: preFfnNormWeight, eps: eps)
+                let referenceMLP = fusedMLP(referenceNormalized)
+                let referenceHidden = (referenceResidual + MLXFast.rmsNorm(
+                    referenceMLP, weight: postFfnNormWeight, eps: eps
+                )) * layerScalar
+                let referenceNext = MLXFast.rmsNorm(
+                    referenceHidden,
+                    weight: fusedMLPToNextBoundary.nextNormWeight,
+                    eps: eps
+                )
+                let comparisons = [
+                    arrayEqual(attentionCandidate.0.view(dtype: .uint16),
+                               referenceResidual.view(dtype: .uint16)),
+                    arrayEqual(attentionCandidate.1.view(dtype: .uint16),
+                               referenceNormalized.view(dtype: .uint16)),
+                    arrayEqual(mlpCandidate.0.view(dtype: .uint16),
+                               referenceHidden.view(dtype: .uint16)),
+                    arrayEqual(mlpCandidate.1.view(dtype: .uint16),
+                               referenceNext.view(dtype: .uint16)),
+                ]
+                eval(comparisons)
+                precondition(
+                    comparisons.allSatisfy { $0.item(Bool.self) },
+                    "row-parallel prefill boundary differs from generic expressions"
+                )
+                // Verifier diagnostics never propagate the candidate trace.
+                return Gemma4FastLayerResult(
+                    hidden: referenceHidden,
+                    nextNormalized: referenceNext
+                )
+            }
+            return Gemma4FastLayerResult(
+                hidden: mlpCandidate.0,
+                nextNormalized: mlpCandidate.1
+            )
+        }
+
         var out: MLXArray
         let residual2: MLXArray
         let fusedPreFFNNormalized: MLXArray?

@@ -1,12 +1,6 @@
 import MLX
 
-private let gemma4FusedAttentionToMLPBoundaryKernel = MLXFast.metalKernel(
-    name: "gemma4_fused_attention_to_mlp_boundary_5376_v1",
-    inputNames: [
-        "attention_output", "residual", "post_attention_weight", "pre_ffn_weight",
-    ],
-    outputNames: ["residual_output", "normalized_output"],
-    source: """
+private let gemma4FusedAttentionToMLPBoundarySource = """
         constexpr uint kWidth = 5376;
         constexpr uint kReads = 4;
         constexpr uint kThreads = 1024;
@@ -154,7 +148,32 @@ private let gemma4FusedAttentionToMLPBoundaryKernel = MLXFast.metalKernel(
                 }
             }
         }
-        """,
+        """
+
+private let gemma4FusedAttentionToMLPBoundaryKernel = MLXFast.metalKernel(
+    name: "gemma4_fused_attention_to_mlp_boundary_5376_v1",
+    inputNames: [
+        "attention_output", "residual", "post_attention_weight", "pre_ffn_weight",
+    ],
+    outputNames: ["residual_output", "normalized_output"],
+    source: gemma4FusedAttentionToMLPBoundarySource,
+    header: "using namespace metal;",
+    ensureRowContiguous: true
+)
+
+private let gemma4FusedAttentionToMLPBoundaryRowsKernel = MLXFast.metalKernel(
+    name: "gemma4_fused_attention_to_mlp_boundary_rows_5376_v1",
+    inputNames: [
+        "attention_output_base", "residual_base", "post_attention_weight", "pre_ffn_weight",
+    ],
+    outputNames: ["residual_output_base", "normalized_output_base"],
+    source: """
+        const uint row = threadgroup_position_in_grid.y;
+        device const bfloat* attention_output = attention_output_base + row * 5376;
+        device const bfloat* residual = residual_base + row * 5376;
+        device bfloat* residual_output = residual_output_base + row * 5376;
+        device bfloat* normalized_output = normalized_output_base + row * 5376;
+    """ + gemma4FusedAttentionToMLPBoundarySource,
     header: "using namespace metal;",
     ensureRowContiguous: true
 )
@@ -197,16 +216,28 @@ struct FusedAttentionToMLPBoundary: @unchecked Sendable {
         )
         return (outputs[0], outputs[1])
     }
+
+    func callRows(
+        attentionOutput: MLXArray,
+        residual: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        precondition(attentionOutput.ndim == 3 && attentionOutput.dim(0) == 1)
+        let rows = attentionOutput.dim(1)
+        precondition(rows > 1 && attentionOutput.shape == [1, rows, 5376])
+        precondition(residual.shape == attentionOutput.shape)
+        precondition(attentionOutput.dtype == .bfloat16 && residual.dtype == .bfloat16)
+        let outputs = gemma4FusedAttentionToMLPBoundaryRowsKernel(
+            [attentionOutput, residual, postAttentionWeight, preFFNWeight],
+            grid: (1024, rows, 1),
+            threadGroup: (1024, 1, 1),
+            outputShapes: [attentionOutput.shape, attentionOutput.shape],
+            outputDTypes: [.bfloat16, .bfloat16]
+        )
+        return (outputs[0], outputs[1])
+    }
 }
 
-private let gemma4FusedMLPToNextBoundaryKernel = MLXFast.metalKernel(
-    name: "gemma4_fused_mlp_to_next_boundary_5376_v1",
-    inputNames: [
-        "mlp_output", "residual", "post_ffn_weight", "layer_scalar",
-        "next_norm_weight",
-    ],
-    outputNames: ["hidden_output", "next_normalized_output"],
-    source: """
+private let gemma4FusedMLPToNextBoundarySource = """
         constexpr uint kWidth = 5376;
         constexpr uint kReads = 4;
         constexpr uint kThreads = 1024;
@@ -356,7 +387,34 @@ private let gemma4FusedMLPToNextBoundaryKernel = MLXFast.metalKernel(
                 }
             }
         }
-        """,
+        """
+
+private let gemma4FusedMLPToNextBoundaryKernel = MLXFast.metalKernel(
+    name: "gemma4_fused_mlp_to_next_boundary_5376_v1",
+    inputNames: [
+        "mlp_output", "residual", "post_ffn_weight", "layer_scalar",
+        "next_norm_weight",
+    ],
+    outputNames: ["hidden_output", "next_normalized_output"],
+    source: gemma4FusedMLPToNextBoundarySource,
+    header: "using namespace metal;",
+    ensureRowContiguous: true
+)
+
+private let gemma4FusedMLPToNextBoundaryRowsKernel = MLXFast.metalKernel(
+    name: "gemma4_fused_mlp_to_next_boundary_rows_5376_v1",
+    inputNames: [
+        "mlp_output_base", "residual_base", "post_ffn_weight", "layer_scalar",
+        "next_norm_weight",
+    ],
+    outputNames: ["hidden_output_base", "next_normalized_output_base"],
+    source: """
+        const uint row = threadgroup_position_in_grid.y;
+        device const bfloat* mlp_output = mlp_output_base + row * 5376;
+        device const bfloat* residual = residual_base + row * 5376;
+        device bfloat* hidden_output = hidden_output_base + row * 5376;
+        device bfloat* next_normalized_output = next_normalized_output_base + row * 5376;
+    """ + gemma4FusedMLPToNextBoundarySource,
     header: "using namespace metal;",
     ensureRowContiguous: true
 )
@@ -400,6 +458,25 @@ struct FusedMLPToNextBoundary: @unchecked Sendable {
             grid: (1024, 1, 1),
             threadGroup: (1024, 1, 1),
             outputShapes: [[1, 1, 5376], [1, 1, 5376]],
+            outputDTypes: [.bfloat16, .bfloat16]
+        )
+        return (outputs[0], outputs[1])
+    }
+
+    func callRows(
+        mlpOutput: MLXArray,
+        residual: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        precondition(mlpOutput.ndim == 3 && mlpOutput.dim(0) == 1)
+        let rows = mlpOutput.dim(1)
+        precondition(rows > 1 && mlpOutput.shape == [1, rows, 5376])
+        precondition(residual.shape == mlpOutput.shape)
+        precondition(mlpOutput.dtype == .bfloat16 && residual.dtype == .bfloat16)
+        let outputs = gemma4FusedMLPToNextBoundaryRowsKernel(
+            [mlpOutput, residual, postFFNWeight, layerScalar, nextNormWeight],
+            grid: (1024, rows, 1),
+            threadGroup: (1024, 1, 1),
+            outputShapes: [mlpOutput.shape, mlpOutput.shape],
             outputDTypes: [.bfloat16, .bfloat16]
         )
         return (outputs[0], outputs[1])
