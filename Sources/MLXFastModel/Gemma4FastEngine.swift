@@ -41,6 +41,26 @@ private let gemma4VerifyStagedSlidingPrefillAttentionBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+private let gemma4KVHeadMajorFullPrefillEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_KV_MAJOR_FULL_PREFILL"
+    ] else {
+        // Qualified against stock SDPA over all ten real full-prefill layers;
+        // the environment switch remains the process-start rollback.
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+private let gemma4VerifyKVHeadMajorFullPrefillBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_KV_MAJOR_FULL_PREFILL_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -794,6 +814,46 @@ final class Gemma4FastLayer {
             } else {
                 attention = candidate
             }
+        } else if B == 1
+            && L == 512
+            && offset == 0
+            && !isSliding
+            && useKEqV
+            && scale == 1.0
+            && queries.dtype == .bfloat16
+            && keys.dtype == .bfloat16
+            && values.dtype == .bfloat16
+            && queries.shape == [1, 32, 512, 512]
+            && keys.shape == [1, 4, 512, 512]
+            && values.shape == [1, 4, 512, 512]
+            && (gemma4KVHeadMajorFullPrefillEnabled
+                || gemma4VerifyKVHeadMajorFullPrefillBits)
+        {
+            let candidate = gemma4KVHeadMajorFullPrefillAttention(
+                queries: queries,
+                keys: keys,
+                values: values,
+                mask: attentionMask,
+                scale: scale
+            )
+            if gemma4VerifyKVHeadMajorFullPrefillBits {
+                let reference = MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    scale: scale,
+                    mask: attentionMask
+                )
+                gemma4VerifyKVHeadMajorFullPrefillRawBF16(
+                    candidate,
+                    reference: reference
+                )
+                attention = gemma4KVHeadMajorFullPrefillEnabled
+                    ? candidate
+                    : reference
+            } else {
+                attention = candidate
+            }
         } else if L > 1 && offset > 0 {
             attention = gemma4FastAttentionFallback(
                 queries: queries,
@@ -883,6 +943,31 @@ final class Gemma4FastLayer {
         return Gemma4FastLayerResult(
             hidden: out,
             nextNormalized: nextNormalized
+        )
+    }
+}
+
+private func gemma4VerifyKVHeadMajorFullPrefillRawBF16(
+    _ candidate: MLXArray,
+    reference: MLXArray
+) {
+    precondition(candidate.dtype == .bfloat16 && reference.dtype == .bfloat16)
+    precondition(candidate.shape == reference.shape)
+    let candidateBits = candidate.view(dtype: .uint16)
+    let referenceBits = reference.view(dtype: .uint16)
+    let matches = arrayEqual(candidateBits, referenceBits)
+    eval(matches)
+    guard matches.item(Bool.self) else {
+        let candidateWords = candidateBits.asArray(UInt16.self)
+        let referenceWords = referenceBits.asArray(UInt16.self)
+        let mismatch = zip(candidateWords, referenceWords)
+            .enumerated()
+            .first { $0.element.0 != $0.element.1 }
+        preconditionFailure(
+            "KV-head-major full prefill raw BF16 mismatch at flat index "
+                + "\(mismatch?.offset ?? -1): candidate="
+                + "\(mismatch?.element.0 ?? 0), reference="
+                + "\(mismatch?.element.1 ?? 0)"
         )
     }
 }
