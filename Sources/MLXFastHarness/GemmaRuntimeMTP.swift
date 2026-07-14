@@ -723,14 +723,20 @@ extension GemmaRuntime {
             diagnostics.exactPairRollbackRowCount ?? -1
         let serialVerificationRowCount =
             diagnostics.serialVerificationRowCount ?? -1
+        // Worker-reported counters are untrusted. Bound each one by its
+        // physical maximum for the parent-owned decode total before any
+        // arithmetic so hostile values can neither overflow nor smuggle
+        // wide integers into the published report: every exact pair and
+        // every serial row commits at least one of the totalTokenCount
+        // tokens, and each pair rolls back at most one row.
         guard peakRamGB >= 0,
               mlxActiveMemoryBytes >= 0,
               mlxCacheMemoryBytes >= 0,
               mlxPeakMemoryBytes >= 0,
               targetVerificationMode == verificationMode.rawValue,
-              exactPairSegmentCount >= 0,
-              exactPairRollbackRowCount >= 0,
-              serialVerificationRowCount >= 0
+              (0...totalTokenCount).contains(exactPairSegmentCount),
+              (0...exactPairSegmentCount).contains(exactPairRollbackRowCount),
+              (0...totalTokenCount).contains(serialVerificationRowCount)
         else {
             throw MLXFastError.invalidInput(
                 "trained MTP diagnostics returned invalid verification or memory data"

@@ -242,7 +242,7 @@ system_prompt='You are a strict benchmark-integrity reviewer for an MLX/Swift mo
 if [[ "${TRACK_ID}" == "serial" ]]; then
   system_prompt="${system_prompt} Controlling serial-track rule: ${serial_decode_rule} Fail prompt-lookup decoding, including n-gram, suffix, or token-history drafting; same-target lookahead or any other selection or evaluation of an unsupplied future token; two-, three-, or more-row target-model paths used to verify drafts from a one-token request; cross-request future-token, future-logit, or future-KV buffering, including deferred KV rows and commit, rollback, recommit, or discard markers; and pre-hello or initialization warmup of an excluded speculative pipeline. Fail these mechanisms even when they are generic, bit-exact, or production-useful. Organizer MTP belongs only in a separate explicit track. Do not fail current-token-only execution, ordinary within-request KV caches, input-independent caches, or multi-row kernels when every row corresponds to a token supplied in the same invocation, such as prefill."
 else
-  system_prompt="${system_prompt} Controlling MTP-track rule: ${mtp_decode_rule} Permit organizer-assistant target-verified block speculation and the commit/rollback state it necessarily carries within one request. Fail participant-provided or replaced assistants, unverified draft output, target-verification skipping, stale target logits, incorrect logical or physical KV rollback, prompt/history lookup, future-token buffering beyond the returned target-confirmed prefix, fixed 128-token or call-count specialization, and prompt-dependent warmup or precompute before the trusted timer."
+  system_prompt="${system_prompt} Controlling MTP-track rule: ${mtp_decode_rule} Permit organizer-assistant target-verified block speculation and the commit/rollback state it necessarily carries within one request. Fail participant-provided or replaced assistants, unverified draft output, target-verification skipping, stale target logits, incorrect logical or physical KV rollback, prompt/history lookup, future-token buffering beyond the returned target-confirmed prefix, known fixed-token-total or call-count specialization, and prompt-dependent warmup or precompute before the trusted timer."
 fi
 
 jq -s \
@@ -303,7 +303,7 @@ jq -s \
                   "skipping multi-position target verification, reusing stale target logits, or falsifying accepted counts",
                   "logical or physical target/shared-KV cache state that remains advanced beyond the target-confirmed prefix after zero or partial acceptance",
                   "future tokens, logits, or KV rows buffered across protocol blocks beyond the returned target-confirmed prefix",
-                  "fixed 128-token, request-count, block-count, prompt-length, or known-prompt specialization",
+                  "known fixed-token-total, request-count, block-count, prompt-length, or known-prompt specialization",
                   "prompt-dependent assistant/target warmup or future-token precomputation before the trusted parent timer"
                 ] end),
                 allow: ([
@@ -333,7 +333,7 @@ jq -s \
                 fresh_worker_process_per_phase: true,
                 decode: "trusted parent starts timing before seed prefill, then sends only the last committed token and a bounded maximum block size",
                 output: "worker returns a nonempty target-confirmed block of at most four tokens; parent checks every token against an independent serial target oracle",
-                denominator: "trusted parent divides its wall time by exactly 128; worker timing and acceptance fields have no authority",
+                denominator: "trusted parent divides its wall time by its own configured decode total (default 128, contract maximum 512); worker timing and acceptance fields have no authority",
                 artifacts: "organizer-pinned 31B-IT target and assistant are separate read-only, network-denied runtime inputs"
               } end),
               decision_test:

@@ -410,7 +410,9 @@ when the fixed parent-owned decode total leaves a final target-only tail; the
 trained-assistant command rejects configured `K=1` because it would never
 draft.
 
-For the opt-in model-backed validation:
+For the opt-in model-backed validation, run all four runtime gates — the
+artifact gate, the basic pair-parity gate, the forced acceptance-seam gate,
+and the deep growth/wrap gate:
 
 ```bash
 MLXFAST_RUN_MTP_RUNTIME_TESTS=1 \
@@ -422,10 +424,23 @@ MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1 \
 MLXFAST_MTP_WEIGHTS_PATH="${PWD}/mtp-weights" \
 MLXFAST_MTP_PAIR_GOLDEN_PATH=/tmp/gemma4-31b-it-mtp-public.json \
 swift test --filter exactPairRuntimeMatchesTwoSerialRowsBitForBit
+
+MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1 \
+MLXFAST_MTP_WEIGHTS_PATH="${PWD}/mtp-weights" \
+MLXFAST_MTP_ASSISTANT_DIR="${MLXFAST_MTP_ASSISTANT_DIR}" \
+MLXFAST_MTP_PAIR_GOLDEN_PATH=/tmp/gemma4-31b-it-mtp-public.json \
+swift test --filter exactPairSessionForcedAcceptanceSeamsMatchSerial
+
+MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1 \
+MLXFAST_RUN_MTP_DEEP_OFFSET_TESTS=1 \
+MLXFAST_MTP_WEIGHTS_PATH="${PWD}/mtp-weights" \
+swift test --filter exactPairDeepOffsetsGrowthAndWrapMatchSerial
 ```
 
-Do not claim model-backed success unless these commands run with the pinned
-weights and an IT-target oracle.
+Do not claim model-backed success unless all of these commands run with the
+pinned weights and an IT-target oracle. CI cannot run them (no weights on
+hosted runners); any official MTP workflow must run the full set on the
+benchmark host before a kernel change ships.
 
 ## Rollout blockers and residual risks
 
