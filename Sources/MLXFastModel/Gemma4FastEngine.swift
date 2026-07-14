@@ -41,6 +41,20 @@ private let gemma4VerifyStagedSlidingPrefillAttentionBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+private let gemma4StripedFullPrefillAttentionEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_STRIPED_FULL_PREFILL_ATTENTION"
+    ] else { return true }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+private let gemma4VerifyStripedFullPrefillAttentionBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_STRIPED_FULL_PREFILL_ATTENTION_BITS"
+    ] else { return false }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -123,6 +137,7 @@ final class Gemma4FastLayer {
     let nKvHeads: Int
     let headDim: Int
     let useKEqV: Bool
+    let layerIndex: Int
     let scale: Float = 1.0
     let eps: Float
 
@@ -157,6 +172,7 @@ final class Gemma4FastLayer {
     let useFusedGateUpActivation: Bool
 
     init(
+        layerIndex: Int,
         isSliding: Bool,
         nHeads: Int,
         nKvHeads: Int,
@@ -186,6 +202,7 @@ final class Gemma4FastLayer {
         upIndexedMetadata: IndexedAffineMetadata?,
         downIndexedMetadata: IndexedAffineMetadata?
     ) {
+        self.layerIndex = layerIndex
         self.isSliding = isSliding
         self.nHeads = nHeads
         self.nKvHeads = nKvHeads
@@ -794,6 +811,35 @@ final class Gemma4FastLayer {
             } else {
                 attention = candidate
             }
+        } else if gemma4CanUseStripedFullPrefill(
+            batch: B, length: L, offset: offset, isSliding: isSliding,
+            useKEqV: useKEqV, queries: queries, keys: keys, values: values
+        ) && (gemma4StripedFullPrefillAttentionEnabled
+            || gemma4VerifyStripedFullPrefillAttentionBits)
+        {
+            // This exact-shape route is causal by construction. The model's
+            // offset-zero full-prefill call supplies the ordinary causal mask.
+            let candidate = gemma4StripedFullPrefill512(
+                queries: queries, keys: keys, values: values)
+            if gemma4VerifyStripedFullPrefillAttentionBits {
+                let reference = gemma4StripedFullPrefill512Reference(
+                    queries: queries, keys: keys, values: values,
+                    mask: attentionMask)
+                eval(candidate, reference)
+                let candidateBits = candidate.view(dtype: .uint16).asArray(UInt16.self)
+                let referenceBits = reference.view(dtype: .uint16).asArray(UInt16.self)
+                if let mismatch = zip(candidateBits, referenceBits)
+                    .enumerated().first(where: { $0.element.0 != $0.element.1 })
+                {
+                    print("striped full prefill layer \(layerIndex) first mismatch "
+                        + "\(mismatch.offset): \(mismatch.element.0) != \(mismatch.element.1)")
+                    preconditionFailure("striped full prefill differs from stock SDPA")
+                }
+                attention = gemma4StripedFullPrefillAttentionEnabled
+                    ? candidate : reference
+            } else {
+                attention = candidate
+            }
         } else if L > 1 && offset > 0 {
             attention = gemma4FastAttentionFallback(
                 queries: queries,
@@ -1144,6 +1190,7 @@ final class Gemma4FastEngine {
 
             built.append(
                 Gemma4FastLayer(
+                    layerIndex: index,
                     isSliding: isSliding,
                     nHeads: config.numAttentionHeads,
                     nKvHeads: nKvHeads,
