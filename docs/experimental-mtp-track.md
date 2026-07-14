@@ -255,6 +255,107 @@ state coexist. This fits the 128 GiB runner but exceeds the base track's
 practical 36 GiB local budget; a public track needs its own documented memory
 minimum and host-enforced cap.
 
+## Participant surface and track design
+
+The MTP track is designed so participants can make block decode faster
+without being able to weaken the correctness or measurement guarantees.
+
+### Trusted surface (operator-owned, not submittable)
+
+These components define the measurement and cannot be changed by a
+submission; they live outside `benchmark.json` `editablePaths`:
+
+- `Sources/MLXFastHarness/GemmaRuntimeMTP.swift`: the trusted parent. It
+  owns the timer (started before the prompt-bearing begin request), the
+  serial-oracle validation of every returned token, the configured decode
+  total used as the fixed denominator, block-size bounds, and the bounded
+  diagnostics accounting.
+- `Sources/MLXFastHarness/GemmaRuntimeMTPWorker.swift`: the sandboxed worker
+  protocol shell. It validates artifacts before and after model load,
+  enforces the strict `mtp_decode_begin`/`mtp_decode_block` request schema,
+  monotonic request IDs, in-vocabulary bounded blocks, the cache-offset
+  ledger, and session poisoning after any failure.
+- `Sources/MLXFastHarness/GemmaRuntimeMTPProvenance.swift`,
+  `fixtures/gemma_4_31b_it_mtp_track.json`, and the SHA256 manifests: the
+  pinned target/assistant identity and architecture contract.
+- `Sources/MLXFastCLI/main.swift`: track dispatch and the worker Seatbelt
+  sandbox profile.
+- `setup-mtp.sh` and the organizer cache: artifact provisioning.
+- `.github/scripts/run-submission-static-review.sh`: the MTP-track
+  static-review policy.
+
+### Editable surface (what participants optimize)
+
+Submissions change only `Sources/MLXFastModel/` (and
+`Sources/MLXFastTransform/`), which contains the whole speculative strategy:
+
+- `Gemma4MTPRuntime.swift`: `Gemma4TrainedMTPBlockSession` — the drafting
+  loop, verification composition (exact pairs, serial tails), acceptance
+  handling, commit/rollback, and per-request state reuse.
+- `Gemma4ExactTwo*.swift` and the fast-engine pair path: the bit-exact
+  multi-row verification kernels. Participants may improve dispatch, extend
+  coverage (for example a four-row exact composition), or replace the
+  strategy entirely.
+- Everything the serial track already allows: quantized matmul dispatch,
+  attention restructuring, KV-cache handling, weight layout, scheduling.
+
+Improvement directions intentionally left open: higher drafter acceptance,
+fewer target dispatches per committed token, eliminating the sporadic
+block stalls, cheaper drafter execution, and deeper kernel fusion — all
+subject to the same oracle.
+
+### Why participants cannot cheat the measurement
+
+- The parent validates every returned token against a serial oracle golden
+  generated from the pinned reference; one divergent token fails the run.
+  Bit-exactness is therefore a hard gate, not a convention: a submission
+  that "wins" by degrading output cannot score.
+- The parent owns wall time and divides by its own configured decode total.
+  Worker-reported timing, acceptance, and counters have no score authority,
+  are bounded before use, and must satisfy the physical row-accounting
+  equation.
+- Blocks are capped at four positions; oversized, empty, out-of-vocabulary,
+  or overrun blocks are rejected; request IDs are monotonic; the worker sees
+  no future oracle tokens (requests carry only the last committed token).
+- The worker process receives the prompt only inside the timed window, runs
+  sandboxed (no network, no writes, no process spawning), and artifact
+  hashes are revalidated after model load, so assistant substitution and
+  pre-timer prompt work fail closed.
+- What the parent cannot prove (internal use of the assistant, real target
+  verification, physical rollback correctness when outputs still match) is
+  covered by the MTP static-review policy, hidden prompt-independent tests,
+  the cache-offset ledger, and the runtime parity gates that any kernel
+  change must rerun.
+
+### Proposed scoring (pending operator calibration)
+
+The contract's `proposed_scoring` block records the intended ranked form:
+
+```text
+mtp_decode_speedup = paired_serial_decode_sec_per_token / mtp_decode_sec_per_token
+score = mtp_decode_speedup          (decode-only; floor >= 1.0)
+```
+
+- The denominator authority is the trusted parent: wall time divided by the
+  parent-configured decode total.
+- The paired serial reference is the trusted serial K=1 target decode
+  (the `mtp-probe` path) over the same golden, measured in the same session
+  behind the same thermal gate on the same box — the same pairing discipline
+  the serial track uses, so host drift cancels.
+- Decode-only: the MTP protocol charges seed prefill inside the decode
+  measurement, so there is no separately scored prefill component.
+- The floor is 1.0: an MTP submission that is not actually faster than
+  serial decode does not rank. The unmodified reference implementation
+  measures about 1.2-1.3x on the M5, so the track starts with visible
+  headroom rather than a hard-to-move 1.0.
+- Scores publish only from at least three accepted thermal-gated pairs per
+  session with alternating candidate/reference order; single-pair scores
+  are not publishable while the sporadic-stall CV question remains open.
+- The leaderboard namespace is `gemma4-31b-it-mtp-v1`, fully separate from
+  the serial leaderboard; `official_scoring_enabled` stays false until the
+  operator freezes hidden IT-target goldens and calibrates floors from
+  fresh gated sessions.
+
 ## Scoring and rebaseline contract
 
 ### M5 parity incident and fix
@@ -417,6 +518,7 @@ and the deep growth/wrap gate:
 ```bash
 MLXFAST_RUN_MTP_RUNTIME_TESTS=1 \
 MLXFAST_MTP_WEIGHTS_PATH="${PWD}/mtp-weights" \
+MLXFAST_MTP_TARGET_DIR="${MLXFAST_MTP_TARGET_DIR}" \
 MLXFAST_MTP_ASSISTANT_DIR="${MLXFAST_MTP_ASSISTANT_DIR}" \
 swift test -c release --filter trainedMTPArtifactValidationRuntimeGate
 

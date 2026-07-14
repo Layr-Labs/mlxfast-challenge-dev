@@ -60,6 +60,17 @@
     "publication_allowed": false,
     "required_rebaseline_hardware": "m5-bench"
   },
+  "proposed_scoring": {
+    "status": "proposal_pending_operator_calibration",
+    "score": "mtp_decode_speedup = paired_serial_decode_sec_per_token / mtp_decode_sec_per_token",
+    "paired_serial_reference": "trusted serial K=1 target decode (mtp-probe path) over the same golden, same session, same thermal gate, same box",
+    "denominator_authority": "trusted parent wall time divided by the parent-configured decode total",
+    "component_floor": "mtp_decode_speedup >= 1.0",
+    "bit_exact_gate": "every returned token must match the parent-owned serial oracle; any mismatch fails the run before scoring",
+    "prefill_component": "none; seed prefill is charged inside the decode measurement",
+    "leaderboard": "separate gemma4-31b-it-mtp-v1 namespace, never mixed with the serial track",
+    "measurement_protocol": "minimum three accepted thermal-gated pairs per session with alternating order; single-pair scores are not publishable"
+  },
   "license": {
     "spdx": "Apache-2.0",
     "url": "https://ai.google.dev/gemma/docs/gemma_4_license"
