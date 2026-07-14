@@ -118,6 +118,7 @@ struct Gemma4FastLayerResult {
 }
 
 final class Gemma4FastLayer {
+    let profileLayerIndex: Int
     let isSliding: Bool
     let nHeads: Int
     let nKvHeads: Int
@@ -157,6 +158,7 @@ final class Gemma4FastLayer {
     let useFusedGateUpActivation: Bool
 
     init(
+        profileLayerIndex: Int,
         isSliding: Bool,
         nHeads: Int,
         nKvHeads: Int,
@@ -186,6 +188,7 @@ final class Gemma4FastLayer {
         upIndexedMetadata: IndexedAffineMetadata?,
         downIndexedMetadata: IndexedAffineMetadata?
     ) {
+        self.profileLayerIndex = profileLayerIndex
         self.isSliding = isSliding
         self.nHeads = nHeads
         self.nKvHeads = nKvHeads
@@ -507,7 +510,8 @@ final class Gemma4FastLayer {
         _ x: MLXArray,
         normalizedInput: MLXArray?,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: KVCache?
+        cache: KVCache?,
+        seedProfileRun: Gemma4SeedProfileRun? = nil
     ) -> Gemma4FastLayerResult {
         let residual = x
         let h: MLXArray
@@ -822,6 +826,15 @@ final class Gemma4FastLayer {
         } else {
             attnOut = oProj(mergedAttention)
         }
+        if let seedProfileRun, gemma4SeedProfileIsDetailLayer(profileLayerIndex) {
+            gemma4SeedProfileCheckpoint(
+                run: seedProfileRun,
+                boundary: "after_attention",
+                layer: profileLayerIndex,
+                active: [attnOut, residual],
+                cache: gemma4SeedProfileCacheRoots(cache)
+            )
+        }
         var out: MLXArray
         let residual2: MLXArray
         let fusedPreFFNNormalized: MLXArray?
@@ -844,6 +857,17 @@ final class Gemma4FastLayer {
                 attnOut, weight: postAttnNormWeight, eps: eps)
             residual2 = out
             fusedPreFFNNormalized = nil
+        }
+        if let seedProfileRun, gemma4SeedProfileIsDetailLayer(profileLayerIndex) {
+            var roots = [out, residual2]
+            if let fusedPreFFNNormalized { roots.append(fusedPreFFNNormalized) }
+            gemma4SeedProfileCheckpoint(
+                run: seedProfileRun,
+                boundary: "after_attention_mlp_boundary",
+                layer: profileLayerIndex,
+                active: roots,
+                cache: gemma4SeedProfileCacheRoots(cache)
+            )
         }
         if B == 1, L == 1, let fusedGateUp, let fusedGateUpPostTail {
             let normalized = fusedPreFFNNormalized ?? MLXFast.rmsNorm(
@@ -879,6 +903,17 @@ final class Gemma4FastLayer {
             out = MLXFast.rmsNorm(out, weight: postFfnNormWeight, eps: eps)
             out = residual2 + out
             out = out * layerScalar
+        }
+        if let seedProfileRun, gemma4SeedProfileIsDetailLayer(profileLayerIndex) {
+            var roots = [out]
+            if let nextNormalized { roots.append(nextNormalized) }
+            gemma4SeedProfileCheckpoint(
+                run: seedProfileRun,
+                boundary: "after_mlp",
+                layer: profileLayerIndex,
+                active: roots,
+                cache: gemma4SeedProfileCacheRoots(cache)
+            )
         }
         return Gemma4FastLayerResult(
             hidden: out,
@@ -1144,6 +1179,7 @@ final class Gemma4FastEngine {
 
             built.append(
                 Gemma4FastLayer(
+                    profileLayerIndex: index,
                     isSliding: isSliding,
                     nHeads: config.numAttentionHeads,
                     nKvHeads: nKvHeads,
@@ -1190,11 +1226,29 @@ final class Gemma4FastEngine {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let profileActive = inputs.shape == [1, 512] && layers.count == 60
+        let profileRun = profileActive ? Gemma4SeedProfileRun() : nil
+        let profileMode = gemma4SeedProfileCurrentMode()
         var hidden = embedTokens(inputs) * embedScale
 
         func layerCache(_ index: Int) -> KVCache? {
             guard let cache, index < cache.count else { return nil }
             return cache[index]
+        }
+
+        func profileRoots(_ index: Int, normalized: MLXArray?) -> [MLXArray] {
+            var roots = [hidden]
+            if let normalized { roots.append(normalized) }
+            return roots
+        }
+
+        if let profileRun, profileMode != .control {
+            gemma4SeedProfileCheckpoint(
+                run: profileRun,
+                boundary: "after_embedding",
+                layer: nil,
+                active: [hidden]
+            )
         }
 
         let slidingIndex = layers.firstIndex(where: \.isSliding)
@@ -1212,15 +1266,41 @@ final class Gemma4FastEngine {
 
         var normalizedInput: MLXArray? = nil
         for (index, layer) in layers.enumerated() {
+            if let profileRun,
+               (profileMode == .detailSliding && index == 58
+                    || profileMode == .detailFull && index == 59)
+            {
+                gemma4SeedProfileCheckpoint(
+                    run: profileRun,
+                    boundary: "before_layer",
+                    layer: index,
+                    active: profileRoots(index, normalized: normalizedInput),
+                    cache: gemma4SeedProfileCacheRoots(layerCache(index))
+                )
+            }
             let mask = layer.isSliding ? (slidingMask ?? .none) : (fullMask ?? .none)
             let result = layer(
                 hidden,
                 normalizedInput: normalizedInput,
                 mask: mask,
-                cache: layerCache(index)
+                cache: layerCache(index),
+                seedProfileRun: profileRun
             )
             hidden = result.hidden
             normalizedInput = result.nextNormalized
+            if let profileRun,
+               (profileMode == .coarse && (index == 29 || index == 59)
+                    || profileMode == .detailSliding && index == 58
+                    || profileMode == .detailFull && index == 59)
+            {
+                gemma4SeedProfileCheckpoint(
+                    run: profileRun,
+                    boundary: "after_layer",
+                    layer: index,
+                    active: profileRoots(index, normalized: normalizedInput),
+                    cache: gemma4SeedProfileCacheRoots(layerCache(index))
+                )
+            }
             let layerNumber = index + 1
             if inputs.dim(1) == 1,
                asyncLayerGroup > 0,
@@ -1241,6 +1321,33 @@ final class Gemma4FastEngine {
             hidden = gemma4LastTokenHidden(hidden)
             hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
         }
+        if let profileRun, profileMode != .control {
+            gemma4SeedProfileCheckpoint(
+                run: profileRun,
+                boundary: "after_final_norm",
+                layer: nil,
+                active: [hidden]
+            )
+        }
+        func profiledOutput(_ output: MLXArray) -> MLXArray {
+            guard let profileRun else { return output }
+            if profileMode == .control {
+                gemma4SeedProfileControlRecord(
+                    run: profileRun,
+                    boundary: "final_output",
+                    layer: nil,
+                    active: [output]
+                )
+            } else {
+                gemma4SeedProfileCheckpoint(
+                    run: profileRun,
+                    boundary: "final_output",
+                    layer: nil,
+                    active: [output]
+                )
+            }
+            return output
+        }
         let cap = MLXArray(softcap)
         if let tiedVocabularyHead, usePacked13TiedVocabularyHead {
             let candidate = tiedVocabularyHead.packed13Softcapped(
@@ -1256,7 +1363,7 @@ final class Gemma4FastEngine {
                     stockName: "embedTokens.asLinear + compiled softcap"
                 )
             }
-            return candidate
+            return profiledOutput(candidate)
         }
 
         let logits: MLXArray
@@ -1274,6 +1381,6 @@ final class Gemma4FastEngine {
         } else {
             logits = embedTokens.asLinear(hidden)
         }
-        return logitSoftcap(logits, cap)
+        return profiledOutput(logitSoftcap(logits, cap))
     }
 }
