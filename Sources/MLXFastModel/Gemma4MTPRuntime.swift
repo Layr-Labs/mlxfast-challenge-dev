@@ -118,7 +118,9 @@ public struct Gemma4MTPBlockResult: Equatable, Sendable {
 /// full/sliding K/V and the current bonus token persist across block calls.
 /// Every returned token came from a target argmax. Drafts are never returned
 /// directly: a draft is emitted only when it equals the corresponding
-/// multi-position target verification result.
+/// serial-equivalent K=1 target verification result. The block protocol still
+/// amortizes assistant drafting and IPC, while shape-dependent target
+/// reductions cannot alter the serial oracle or retained physical K/V state.
 public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
     public let implementationName = "google_gemma4_trained_mtp"
 
@@ -200,7 +202,8 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
             )
         }
         guard decodedTokenCount <=
-            MLXFastConstants.experimentalMTPMaxTotalTokens - maxBlockSize
+            MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens
+                - maxBlockSize
         else {
             throw MLXFastError.invalidInput(
                 "trained MTP block would exceed the fixed decode window"
@@ -294,69 +297,80 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
             draftHidden = assistantOutput.lastHidden
         }
 
-        let previousColumn = MLXArray([Int32(previousToken)], [1, 1])
-        let verifyInput = concatenated([previousColumn] + draftTokens, axis: 1)
-        let verifyOutput = target.forwardForMTP(
-            verifyInput,
-            cache: targetCache
-        )
-        let targetTokens = verifyOutput.logits
-            .asType(.float32)
-            .argMax(axis: -1)
         let draftConcat = concatenated(draftTokens, axis: 1)
-        eval(targetTokens, draftConcat)
-
-        let targetValues = targetTokens
-            .squeezed(axis: 0)
-            .asArray(Int32.self)
-            .map(Int.init)
+        eval(draftConcat)
         let draftValues = draftConcat
             .squeezed(axis: 0)
             .asArray(Int32.self)
             .map(Int.init)
-        guard targetValues.count == blockSize,
-              draftValues.count == draftCount
+        guard draftValues.count == draftCount else {
+            throw MLXFastError.invalidInput(
+                "trained MTP drafter returned an unexpected tensor shape"
+            )
+        }
+
+        // Verify each supplied row through the exact serial target shape.
+        // A batched K-row target forward is mathematically equivalent but uses
+        // different attention/MLP reductions; on M5 the retained layer-1 K/V
+        // diverged after the first block and flipped a prose argmax at step 48.
+        // Sequential evaluation keeps physical cache state and logits
+        // identical to the serial oracle and stops at the first rejection, so
+        // no rejected physical row ever needs post-wrap rollback.
+        let verifyInputs = [previousToken] + draftValues
+        var committed: [Int] = []
+        var accepted = 0
+        var nextHidden: MLXArray?
+        var nextSharedKV: Gemma4SharedKV?
+        for (position, inputToken) in verifyInputs.enumerated() {
+            let output = target.forwardForMTP(
+                MLXArray([Int32(inputToken)], [1, 1]),
+                cache: targetCache
+            )
+            let tokenArray = output.logits[
+                0..., -1, 0...
+            ].asType(.float32).argMax(axis: -1)
+            let outputHiddenLength = output.lastHidden.dim(1)
+            let outputHidden = output.lastHidden[
+                0...,
+                (outputHiddenLength - 1)..<outputHiddenLength,
+                0...
+            ]
+            let outputSharedKV = output.capturedSharedKV
+            eval(
+                tokenArray,
+                outputHidden,
+                outputSharedKV.fullAttention.0,
+                outputSharedKV.fullAttention.1,
+                outputSharedKV.slidingAttention.0,
+                outputSharedKV.slidingAttention.1
+            )
+            let token = Int(tokenArray.item(Int32.self))
+            committed.append(token)
+            nextHidden = outputHidden
+            nextSharedKV = outputSharedKV
+            if position < draftCount,
+               token == draftValues[position]
+            {
+                accepted += 1
+                continue
+            }
+            break
+        }
+
+        guard committed.count == accepted + 1,
+              let nextHidden,
+              let nextSharedKV,
+              let nextBonus = committed.last
         else {
             throw MLXFastError.invalidInput(
-                "trained MTP verification returned an unexpected tensor shape"
+                "trained MTP exact verification produced an invalid block"
             )
         }
-
-        var accepted = 0
-        while accepted < draftCount,
-              draftValues[accepted] == targetValues[accepted]
-        {
-            accepted += 1
-        }
-        let committed = Array(targetValues.prefix(accepted + 1))
-        if accepted < draftCount {
-            target.rollbackSpeculativeCache(
-                targetCache,
-                accepted: .scalar(accepted),
-                blockSize: blockSize
-            )
-        }
-
-        let rejected = draftCount - accepted
-        let nextHidden = verifyOutput.lastHidden[
-            0..., accepted..<(accepted + 1), 0...
-        ]
-        let nextSharedKV = Gemma4SharedKV.sliceTail(
-            from: verifyOutput.capturedSharedKV,
-            rejected: rejected
-        )
-        eval(
-            nextHidden,
-            nextSharedKV.fullAttention.0,
-            nextSharedKV.fullAttention.1,
-            nextSharedKV.slidingAttention.0,
-            nextSharedKV.slidingAttention.1
-        )
 
         hidden = nextHidden
         sharedKV = nextSharedKV
-        bonusToken = committed[committed.count - 1]
-        hostCacheOffset += committed.count
+        bonusToken = nextBonus
+        hostCacheOffset = targetCache[0].offset
         roundCount += 1
         acceptedDraftTokenCount += accepted
         try requireCacheOffsets(hostCacheOffset, context: "trained MTP commit/rollback")

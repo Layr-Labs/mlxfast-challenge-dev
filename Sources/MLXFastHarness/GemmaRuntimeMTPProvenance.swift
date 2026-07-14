@@ -104,6 +104,7 @@ struct ExperimentalMTPTrackContract: Decodable {
         let name: String
         let maximumBlockSize: Int
         let decodeTokens: Int
+        let maximumDecodeTokens: Int
         let parentOracleRequired: Bool
         let workerTimingIsAuthoritative: Bool
 
@@ -111,6 +112,7 @@ struct ExperimentalMTPTrackContract: Decodable {
             case name
             case maximumBlockSize = "maximum_block_size"
             case decodeTokens = "decode_tokens"
+            case maximumDecodeTokens = "maximum_decode_tokens"
             case parentOracleRequired = "parent_oracle_required"
             case workerTimingIsAuthoritative = "worker_timing_is_authoritative"
         }
@@ -448,6 +450,8 @@ extension GemmaRuntime {
                   == MLXFastConstants.experimentalMTPMaxBlockSize,
               contract.protocolContract.decodeTokens
                   == MLXFastConstants.experimentalMTPMaxTotalTokens,
+              contract.protocolContract.maximumDecodeTokens
+                  == MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens,
               contract.protocolContract.parentOracleRequired,
               !contract.protocolContract.workerTimingIsAuthoritative,
               contract.referenceBaseline.status == "not_established",

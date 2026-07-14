@@ -8,15 +8,18 @@ public struct ExperimentalMTPProbeOptions: Equatable {
     public let weightsPath: String
     public let goldenPath: String
     public let maxBlockSize: Int
+    public let totalTokenCount: Int
 
     public init(
         weightsPath: String,
         goldenPath: String,
-        maxBlockSize: Int = MLXFastConstants.experimentalMTPMaxBlockSize
+        maxBlockSize: Int = MLXFastConstants.experimentalMTPMaxBlockSize,
+        totalTokenCount: Int = MLXFastConstants.experimentalMTPMaxTotalTokens
     ) {
         self.weightsPath = weightsPath
         self.goldenPath = goldenPath
         self.maxBlockSize = maxBlockSize
+        self.totalTokenCount = totalTokenCount
     }
 }
 
@@ -84,6 +87,7 @@ public struct ExperimentalTrainedMTPOptions: Equatable {
     public let contractPath: String
     public let goldenPath: String
     public let maxBlockSize: Int
+    public let totalTokenCount: Int
     public let requireTrainedAssistant: Bool
 
     public init(
@@ -93,6 +97,7 @@ public struct ExperimentalTrainedMTPOptions: Equatable {
         contractPath: String,
         goldenPath: String,
         maxBlockSize: Int = MLXFastConstants.experimentalMTPMaxBlockSize,
+        totalTokenCount: Int = MLXFastConstants.experimentalMTPMaxTotalTokens,
         requireTrainedAssistant: Bool
     ) {
         self.sourceTargetPath = sourceTargetPath
@@ -101,6 +106,7 @@ public struct ExperimentalTrainedMTPOptions: Equatable {
         self.contractPath = contractPath
         self.goldenPath = goldenPath
         self.maxBlockSize = maxBlockSize
+        self.totalTokenCount = totalTokenCount
         self.requireTrainedAssistant = requireTrainedAssistant
     }
 }
@@ -197,8 +203,19 @@ struct ExperimentalMTPPromptPlan: Equatable {
     let expectedTokens: [Int]
     let oracleSource: String
 
-    static func make(from golden: GoldenFixture) throws -> ExperimentalMTPPromptPlan {
-        let requiredDecodeTokens = MLXFastConstants.experimentalMTPMaxTotalTokens
+    static func make(
+        from golden: GoldenFixture,
+        totalTokenCount: Int = MLXFastConstants.experimentalMTPMaxTotalTokens
+    ) throws -> ExperimentalMTPPromptPlan {
+        guard totalTokenCount > 0,
+              totalTokenCount
+                  <= MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens
+        else {
+            throw MLXFastError.invalidInput(
+                "experimental MTP total token count is outside the trusted limit"
+            )
+        }
+        let requiredDecodeTokens = totalTokenCount
         if let benchmark = golden.benchmark {
             guard benchmark.expectedDecodeTokens.count >= requiredDecodeTokens else {
                 throw MLXFastError.invalidInput(
@@ -252,7 +269,8 @@ struct ExperimentalMTPBlockValidator {
         protocolMaxBlockSize: Int = MLXFastConstants.experimentalMTPMaxBlockSize
     ) throws {
         guard totalTokenCount > 0,
-              totalTokenCount <= MLXFastConstants.experimentalMTPMaxTotalTokens
+              totalTokenCount
+                  <= MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens
         else {
             throw MLXFastError.invalidInput(
                 "experimental MTP total token count is outside the trusted limit"
@@ -473,7 +491,10 @@ extension GemmaRuntime {
             contractPath: options.contractPath
         )
         let golden = try loadGoldenFixture(from: options.goldenPath)
-        let plan = try ExperimentalMTPPromptPlan.make(from: golden)
+        let plan = try ExperimentalMTPPromptPlan.make(
+            from: golden,
+            totalTokenCount: options.totalTokenCount
+        )
 
         // Worker startup may load and hash only prompt-independent artifacts.
         // The trusted timer starts before the first prompt-bearing request.
@@ -491,6 +512,7 @@ extension GemmaRuntime {
         let measurement = try measureExperimentalTrainedMTPWorkerDecode(
             plan: plan,
             maxBlockSize: options.maxBlockSize,
+            totalTokenCount: options.totalTokenCount,
             worker: worker
         )
         return ExperimentalTrainedMTPReport(
@@ -508,7 +530,7 @@ extension GemmaRuntime {
             assistantArtifactBytes: artifacts.assistantByteCount,
             assistantArtifactSHA256: artifacts.assistantTreeSHA256,
             seedTokenCount: plan.seedTokens.count,
-            decodeTokenCount: MLXFastConstants.experimentalMTPMaxTotalTokens,
+            decodeTokenCount: options.totalTokenCount,
             maxBlockSize: options.maxBlockSize,
             blockRequestCount: measurement.blockRequestCount,
             proposedDraftTokenCount: measurement.proposedDraftTokenCount,
@@ -568,11 +590,13 @@ extension GemmaRuntime {
                     + "2...\(MLXFastConstants.experimentalMTPMaxBlockSize)"
             )
         }
-        guard MLXFastConstants.experimentalMTPMaxTotalTokens
-            == MLXFastConstants.benchmarkDecodeSteps
+        guard options.totalTokenCount > 0,
+              options.totalTokenCount
+                  <= MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens
         else {
             throw MLXFastError.invalidInput(
-                "trained MTP token window changed and requires a separate rebaseline"
+                "trained MTP --tokens must be in 1..."
+                    + "\(MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens)"
             )
         }
     }
@@ -580,16 +604,19 @@ extension GemmaRuntime {
     static func measureExperimentalTrainedMTPWorkerDecode(
         plan: ExperimentalMTPPromptPlan,
         maxBlockSize: Int,
+        totalTokenCount: Int,
         worker: RuntimeWorkerClient
     ) throws -> ExperimentalMTPDecodeMeasurement {
         var validator = try ExperimentalMTPBlockValidator(
-            expectedTokens: plan.expectedTokens
+            expectedTokens: plan.expectedTokens,
+            totalTokenCount: totalTokenCount
         )
 
         // This is the only timing authority. It charges prefill, drafting,
         // multi-position target verification, rejection/rollback, IPC and all
-        // final-short-block work. The denominator is the frozen parent-owned
-        // 128, never a count or duration reported by the worker.
+        // final-short-block work. The denominator is the configured,
+        // oracle-bounded parent-owned total, never a worker-reported count or
+        // duration.
         let phaseStart = DispatchTime.now().uptimeNanoseconds
         let beginResponse = try worker.beginTrainedMTPDecode(
             seedTokens: plan.seedTokens
@@ -667,7 +694,7 @@ extension GemmaRuntime {
         return ExperimentalMTPDecodeMeasurement(
             elapsedSeconds: elapsedSeconds,
             secondsPerToken: elapsedSeconds
-                / Double(MLXFastConstants.experimentalMTPMaxTotalTokens),
+                / Double(totalTokenCount),
             blockRequestCount: blockRequestCount,
             seedPrefillSeconds: seedPrefillSeconds,
             blockDecodeSeconds: blockDecodeSeconds,
@@ -698,7 +725,10 @@ extension GemmaRuntime {
             goldenPath: options.goldenPath
         )
         let golden = try loadGoldenFixture(from: options.goldenPath)
-        let plan = try ExperimentalMTPPromptPlan.make(from: golden)
+        let plan = try ExperimentalMTPPromptPlan.make(
+            from: golden,
+            totalTokenCount: options.totalTokenCount
+        )
 
         // Worker startup loads only prompt-independent model state. The first
         // prompt-dependent operation is decode_begin, inside the timer below.
@@ -712,6 +742,7 @@ extension GemmaRuntime {
         let measurement = try measureExperimentalMTPWorkerDecode(
             plan: plan,
             maxBlockSize: options.maxBlockSize,
+            totalTokenCount: options.totalTokenCount,
             worker: worker
         )
         let availability = Gemma4MTPAssistantAvailability.shippedCheckpoint
@@ -723,7 +754,7 @@ extension GemmaRuntime {
             assistantUnavailableReason: availability.reason,
             oracleSource: plan.oracleSource,
             seedTokenCount: plan.seedTokens.count,
-            decodeTokenCount: MLXFastConstants.experimentalMTPMaxTotalTokens,
+            decodeTokenCount: options.totalTokenCount,
             maxBlockSize: options.maxBlockSize,
             blockRequestCount: measurement.blockRequestCount,
             elapsedSeconds: measurement.elapsedSeconds,
@@ -758,11 +789,13 @@ extension GemmaRuntime {
                     + "1...\(MLXFastConstants.experimentalMTPMaxBlockSize)"
             )
         }
-        guard MLXFastConstants.experimentalMTPMaxTotalTokens
-            == MLXFastConstants.benchmarkDecodeSteps
+        guard options.totalTokenCount > 0,
+              options.totalTokenCount
+                  <= MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens
         else {
             throw MLXFastError.invalidInput(
-                "experimental MTP token window changed and must be explicitly rebaselined"
+                "experimental MTP --tokens must be in 1..."
+                    + "\(MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens)"
             )
         }
     }
@@ -770,10 +803,12 @@ extension GemmaRuntime {
     static func measureExperimentalMTPWorkerDecode(
         plan: ExperimentalMTPPromptPlan,
         maxBlockSize: Int,
+        totalTokenCount: Int,
         worker: RuntimeWorkerClient
     ) throws -> ExperimentalMTPDecodeMeasurement {
         var validator = try ExperimentalMTPBlockValidator(
-            expectedTokens: plan.expectedTokens
+            expectedTokens: plan.expectedTokens,
+            totalTokenCount: totalTokenCount
         )
 
         // Charge seed setup, target forwards, future drafting/verification and
@@ -832,10 +867,9 @@ extension GemmaRuntime {
             : sortedBlockSeconds[sortedBlockSeconds.count / 2]
         let maxBlockRequestSeconds = sortedBlockSeconds.last ?? 0
         let diagnostics = try worker.phaseDiagnostics()
-        let fixedTokenCount = MLXFastConstants.experimentalMTPMaxTotalTokens
         return ExperimentalMTPDecodeMeasurement(
             elapsedSeconds: elapsedSeconds,
-            secondsPerToken: elapsedSeconds / Double(fixedTokenCount),
+            secondsPerToken: elapsedSeconds / Double(totalTokenCount),
             blockRequestCount: blockRequestCount,
             seedPrefillSeconds: seedPrefillSeconds,
             blockDecodeSeconds: blockDecodeSeconds,

@@ -1355,10 +1355,28 @@ final class Gemma4FastEngine {
             ? gemma4LastTokenHidden(postNorm)
             : postNorm
         let cap = MLXArray(softcap)
-        let logits = logitSoftcap(
-            embedTokens.asLinear(projectedHidden),
-            cap
-        )
+        let logits: MLXArray
+        if let tiedVocabularyHead, usePacked13TiedVocabularyHead {
+            let positionLogits = (0..<projectedHidden.dim(1)).map {
+                positionIndex in
+                tiedVocabularyHead.packed13Softcapped(
+                    projectedHidden[
+                        0...,
+                        positionIndex..<(positionIndex + 1),
+                        0...
+                    ],
+                    cap: cap
+                )
+            }
+            logits = positionLogits.count == 1
+                ? positionLogits[0]
+                : concatenated(positionLogits, axis: 1)
+        } else {
+            logits = logitSoftcap(
+                embedTokens.asLinear(projectedHidden),
+                cap
+            )
+        }
         return Gemma4MTPForward(
             logits: logits,
             lastHidden: preNorm,

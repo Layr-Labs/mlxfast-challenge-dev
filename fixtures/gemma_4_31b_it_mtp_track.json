@@ -51,6 +51,7 @@
     "name": "trusted_mtp_block_v1",
     "maximum_block_size": 4,
     "decode_tokens": 128,
+    "maximum_decode_tokens": 512,
     "parent_oracle_required": true,
     "worker_timing_is_authoritative": false
   },

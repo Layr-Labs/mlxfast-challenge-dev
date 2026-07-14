@@ -7,11 +7,18 @@ without performing single-pass target-equivalent inference: prompt lookup,
 denominator/timing forgery, unverified draft emission, stale or incorrectly
 rolled-back KV state, assistant substitution, and prompt-dependent work moved
 before the timer. Phase 1 gives the trusted parent authority over tokens,
-elapsed time, and the fixed 128-token denominator; pins and revalidates the
+elapsed time, and an oracle-bounded configured denominator (default 128,
+maximum 512); pins and revalidates the
 assistant; and isolates the worker. It cannot prove the internal provenance of
 each computation when malicious editable model code still returns correct
 oracle tokens, so hidden-independent prompts, static review, M5 telemetry, and
 manual audit remain necessary.
+
+The final public/synthetic M5 matrix achieved exact parity across 12
+variable-length pairs, but serial-equivalent target verification was slower
+than serial in every category (overall ratio-of-means 0.815x). This is a
+correctness-complete experimental control and must not be promoted as a
+rankable performance track until a bit-identical K-row target kernel exists.
 
 ## Scope and assumptions
 
@@ -47,6 +54,11 @@ Open questions that affect rollout risk:
   decode/prefill weighting?
 - What active-memory and background-GPU telemetry thresholds will be enforced?
 
+Observed public M5 runs peaked near 47.6 GiB process RSS, 31.2 GiB MLX active
+memory, and 34.1 GiB MLX allocator peak. These measurements are below the
+128 GiB runner budget but require a separate MTP memory floor/cap before
+multi-tenant or lower-memory deployment.
+
 ## System model
 
 ### Primary components
@@ -77,7 +89,8 @@ Open questions that affect rollout risk:
   and within-request state; editable code is untrusted.
 - Worker → trusted parent: nonce-bound response ID plus token block; strict
   response schema and bounded line size.
-- Trusted oracle → parent only: expected seed and 128 target tokens; never sent
+- Trusted oracle → parent only: expected seed and the configured target tokens;
+  never sent
   in block requests.
 - Parent → future publisher: diagnostic data today; no score until a separate
   baseline and workflow are enabled.
@@ -152,7 +165,7 @@ flowchart LR
 ## Top abuse paths
 
 1. Denominator forgery: candidate returns fake token counts or elapsed seconds
-   → parent ignores/rejects fields → fixed 128 and parent wall clock prevent
+   → parent ignores/rejects fields → configured parent total and wall clock prevent
    score inflation.
 2. Oracle smuggling: candidate induces future-token fields in a request →
    strict request schema rejects unknown fields → worker sees only committed
@@ -164,7 +177,7 @@ flowchart LR
    physical KV state → later logits normally diverge and fail oracle; carefully
    hidden stale buffers require cache instrumentation/manual review.
 5. Prompt specialization: candidate hashes the 512-token prompt and returns a
-   known 128-token continuation → public prompt can be gamed → hidden,
+   known continuation → public prompt can be gamed → hidden,
    prompt-independent cases and static review are mandatory.
 6. Pre-timer work: candidate starts prompt-dependent drafting before the
    parent timer → worker receives no prompt before timed begin; background
@@ -188,11 +201,11 @@ flowchart LR
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | TM-001 | Participant | Known or fingerprintable prompt | Lookup/hardcode exact continuation | Fake speed with correct output | Score, leaderboard | No future oracle; static policy; parent oracle | Public prompt remains known | Multiple hidden-independent prompts; diff review; reject large lookup data | Acceptance/block patterns and source-size anomalies | High | High | Critical |
 | TM-002 | Participant | Editable MTP round | Return drafts without target verification or use stale logits | Incorrect inference accepted if tokens happen to match | Score, model integrity | Parent checks every token; MTP static policy | Parent cannot observe internal target calls | Hidden near-tie/diverse prompts; manual target-call audit; optional trusted kernel counters outside editable code | Compare target execution telemetry to reference | Medium | High | High |
-| TM-003 | Participant | Partial/zero acceptance | Leave cache physically or logically over-advanced | Future logits corrupt or hidden work is reused | KV state, score | Explicit trim; shared-KV slice; host offset checks; poison on error | Offset does not prove physical bytes/masks | Runtime-gated zero/partial/full tests; instrument cache lengths in trusted dependency | Cache-offset and memory-delta assertions | Medium | High | High |
+| TM-003 | Participant | Partial/zero acceptance | Leave cache physically or logically over-advanced | Future logits corrupt or hidden work is reused | KV state, score | Every target row uses the exact serial K=1 reduction shape; verification stops at first rejection; host offset checks; poison on error | Future optimized K-row kernels would reopen shape-parity risk | Runtime-gated zero/partial/full and variable-tail parity tests | Cache-offset, physical-state, and oracle assertions | Medium | High | High |
 | TM-004 | Participant/local attacker | Writable artifact paths | Replace/add assistant or race path validation | Easier workload or malicious model | Model provenance, score | Exact ID/hash/size/config/inventory; no links; pre/post-load digest | Path loader is not descriptor-bound | Root-owned read-only cache; immutable volume; compare inode metadata around load | Provisioning audit and digest log | Low officially, medium locally | High | High |
 | TM-005 | Participant | Worker controls response behavior | Forge counts, seconds, nonce/ID, empty/oversized/partial blocks | Denominator or timing manipulation, hangs | Protocol, score, availability | Strict schema; nonce/ID; watchdog; bounds; fixed denominator | Deliberate slow responses still consume queue | Per-request and job timeout; response fuzz suite | Protocol-rejection counters | Medium | Medium | Medium |
 | TM-006 | Participant | Prompt supplied at begin | Precompute future tokens before timer or across requests | Uncharged work | Score | Timer before begin; fresh worker; no prompt before timer; allocator clear | Active background GPU allocations are not fully cleared/provable | Process isolation before prompt; active-memory baseline; GPU quiescence check | Metal/GPU activity before begin | Medium | High | High |
-| TM-007 | Participant | Known fixed 128/block-four shape | Special-case call count, offset, prompt length, or final tail | Benchmark-only speedup | Score | Static MTP policy; hidden behavior gates planned | Shape itself is necessarily observable | Vary hidden prompt lengths while keeping score contract; manual branch audit | Timing discontinuities by shape | High | Medium | High |
+| TM-007 | Participant | Known token/block shape | Special-case call count, offset, prompt length, or final tail | Benchmark-only speedup | Score | Trusted totals up to 512; variable 255/256/257 tail tests; static MTP policy | Shape itself is necessarily observable | Rotate hidden lengths and prompts; manual branch audit | Timing discontinuities by shape | High | Medium | High |
 | TM-008 | Participant | Resource access in worker | Memory bomb, allocator-state subsidy, background threads | OOM, unfair cache state, runner DoS | M5 availability, score | Sandbox, orphan reaper, allocator clear, watchdog | No hard active-memory cap in Phase 1 | Peak/active memory cap; terminate unexpected threads/process activity; fresh runner | Memory/threads sampled at phase boundaries | Medium | High | High |
 | TM-009 | Integration error | Shared CLI/workflow | Enable MTP under serial track or compare to serial baseline | Corrupt existing leaderboard | Serial leaderboard | Separate commands/types/kinds; score disabled; static track default serial | Future workflow not implemented | Dedicated workflow and score namespace; contract tests; release approval | Assert serial source/path hashes and track ID | Low | High | Medium |
 | TM-010 | Submitted code | Error/log path sees hidden prompt | Exfiltrate prompt through stderr, DNS, files, or protocol framing | Private benchmark disclosure | Oracle/prompts/secrets | FD isolation, stderr redaction, DNS/network/write/process denial, line bounds | OS sandbox defects remain platform risk | Retain uid/PF/operator sandbox probes; no secret-bearing env | Sandbox probe and egress telemetry | Low | High | Medium |

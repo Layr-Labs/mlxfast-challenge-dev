@@ -372,7 +372,7 @@ private enum MLXFastCLI {
 
     private static func runExperimentalMTPProbe(_ options: ParsedOptions) throws {
         try options.validate(
-            valueOptions: ["--weights", "--golden", "--block-size"]
+            valueOptions: ["--weights", "--golden", "--block-size", "--tokens"]
         )
         let weightsPath = options.value(for: "--weights", default: "")
         guard !weightsPath.isEmpty else {
@@ -389,6 +389,13 @@ private enum MLXFastCLI {
             ),
             optionName: "--block-size"
         )
+        let totalTokenCount = try parsePositiveInt(
+            options.value(
+                for: "--tokens",
+                default: "\(MLXFastConstants.experimentalMTPMaxTotalTokens)"
+            ),
+            optionName: "--tokens"
+        )
         guard let worker = try runtimeWorkerOptions(
             blockedGoldenPath: goldenPath
         ) else {
@@ -400,7 +407,8 @@ private enum MLXFastCLI {
             ExperimentalMTPProbeOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
-                maxBlockSize: maxBlockSize
+                maxBlockSize: maxBlockSize,
+                totalTokenCount: totalTokenCount
             ),
             worker: worker
         )
@@ -424,6 +432,7 @@ private enum MLXFastCLI {
                 "--contract",
                 "--golden",
                 "--block-size",
+                "--tokens",
             ],
             flagOptions: ["--require-trained-assistant"]
         )
@@ -467,6 +476,13 @@ private enum MLXFastCLI {
             ),
             optionName: "--block-size"
         )
+        let totalTokenCount = try parsePositiveInt(
+            options.value(
+                for: "--tokens",
+                default: "\(MLXFastConstants.experimentalMTPMaxTotalTokens)"
+            ),
+            optionName: "--tokens"
+        )
         guard let worker = try runtimeWorkerOptions(
             blockedGoldenPath: goldenPath
         ) else {
@@ -482,6 +498,7 @@ private enum MLXFastCLI {
                 contractPath: contractPath,
                 goldenPath: goldenPath,
                 maxBlockSize: maxBlockSize,
+                totalTokenCount: totalTokenCount,
                 requireTrainedAssistant: options.hasFlag(
                     "--require-trained-assistant"
                 )
@@ -1560,8 +1577,8 @@ private enum MLXFastCLI {
               mlxfast-swift correctness-trace [--weights PATH] [--golden PATH] [--case NAME] --step N [--top-k N]
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--local-submit|--local-iterate] [--weights PATH] [--golden PATH] [--score-path PATH]
-              mlxfast-swift mtp-probe --weights PATH --golden PATH [--block-size N]
-              mlxfast-swift mtp-benchmark --target-source IT_SOURCE --weights IT_PATH --assistant PATH --contract PATH --golden IT_GOLDEN --require-trained-assistant [--block-size N]
+              mlxfast-swift mtp-probe --weights PATH --golden PATH [--block-size N] [--tokens N]
+              mlxfast-swift mtp-benchmark --target-source IT_SOURCE --weights IT_PATH --assistant PATH --contract PATH --golden IT_GOLDEN --require-trained-assistant [--block-size N] [--tokens N]
               mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
               mlxfast-swift attach-free-run-gate [--golden PATH] [--weights PATH] [--output PATH] [--name NAME] [--steps N] [--allow-partial] [--case NAME | --prompt-file PATH [--tokenizer PATH]] [--exact-prefix N]
               mlxfast-swift generate-golden --prompt-file PATH [--weights PATH] [--tokenizer PATH] --output PATH --name NAME --steps N

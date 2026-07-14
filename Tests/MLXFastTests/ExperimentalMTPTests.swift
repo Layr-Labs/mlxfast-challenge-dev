@@ -197,7 +197,8 @@ func decodeBlockRequestValidationFailsClosed() throws {
                 token: 12,
                 maxBlockSize: 2
             ),
-            decodedTokenCount: 127
+            decodedTokenCount:
+                MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens - 1
         )
     }
 }
@@ -215,6 +216,32 @@ func trustedMTPBlockValidatorAcceptsOnlyExactOrderedPrefix() throws {
 
     #expect(validator.committedTokenCount == 5)
     #expect(validator.remainingTokenCount == 0)
+}
+
+@Test
+func trustedMTPBlockValidatorExercisesConfiguredTailLengths() throws {
+    let expectedFinalRequests = [255: 3, 256: 4, 257: 1]
+    for totalTokenCount in [255, 256, 257] {
+        let expectedTokens = Array(0..<totalTokenCount)
+        var validator = try ExperimentalMTPBlockValidator(
+            expectedTokens: expectedTokens,
+            totalTokenCount: totalTokenCount,
+            protocolMaxBlockSize: 4
+        )
+        var finalRequest = 0
+        while validator.remainingTokenCount > 0 {
+            let requested = min(4, validator.remainingTokenCount)
+            let start = validator.committedTokenCount
+            try validator.accept(
+                Array(expectedTokens[start..<(start + requested)]),
+                requestedMaxBlockSize: requested
+            )
+            finalRequest = requested
+        }
+        try validator.requireComplete()
+        #expect(finalRequest == expectedFinalRequests[totalTokenCount]!)
+        #expect(validator.committedTokenCount == totalTokenCount)
+    }
 }
 
 @Test
@@ -262,9 +289,12 @@ func trustedMTPBlockValidatorRejectsOverrunAndMismatch() throws {
 }
 
 @Test
-func experimentalMTPUsesFixedFrozenLengthAndBoundedBlocks() throws {
+func experimentalMTPUsesTrustedConfigurableLengthAndBoundedBlocks() throws {
     #expect(MLXFastConstants.experimentalMTPMaxBlockSize == 4)
     #expect(MLXFastConstants.experimentalMTPMaxTotalTokens == 128)
+    #expect(
+        MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens == 512
+    )
     #expect(
         MLXFastConstants.experimentalMTPMaxTotalTokens
             == MLXFastConstants.benchmarkDecodeSteps
@@ -273,7 +303,8 @@ func experimentalMTPUsesFixedFrozenLengthAndBoundedBlocks() throws {
         ExperimentalMTPProbeOptions(
             weightsPath: "weights",
             goldenPath: "public.json",
-            maxBlockSize: 4
+            maxBlockSize: 4,
+            totalTokenCount: 257
         )
     )
     #expect(throws: MLXFastError.self) {
@@ -282,6 +313,17 @@ func experimentalMTPUsesFixedFrozenLengthAndBoundedBlocks() throws {
                 weightsPath: "weights",
                 goldenPath: "public.json",
                 maxBlockSize: 5
+            )
+        )
+    }
+    #expect(throws: MLXFastError.self) {
+        try GemmaRuntime.validateExperimentalMTPProbeOptions(
+            ExperimentalMTPProbeOptions(
+                weightsPath: "weights",
+                goldenPath: "public.json",
+                maxBlockSize: 4,
+                totalTokenCount:
+                    MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens + 1
             )
         )
     }
@@ -296,9 +338,10 @@ func experimentalMTPCLIIsExplicitAndDoesNotAlterBenchmarkCommand() throws {
     #expect(source.contains("case \"mtp-probe\":"))
     #expect(
         source.contains(
-            "mlxfast-swift mtp-probe --weights PATH --golden PATH [--block-size N]"
+            "mlxfast-swift mtp-probe --weights PATH --golden PATH [--block-size N] [--tokens N]"
         )
     )
+    #expect(source.contains("optionName: \"--tokens\""))
     #expect(source.contains("mtp-probe requires --weights PATH"))
     #expect(source.contains("mtp-probe requires --golden PATH"))
     #expect(!source.contains("MLXFAST_MTP"))
@@ -415,7 +458,8 @@ func trainedMTPBlockRequestRejectsOverrunAndCrossKindFields() throws {
                 token: 7,
                 maxBlockSize: 2
             ),
-            decodedTokenCount: 127
+            decodedTokenCount:
+                MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens - 1
         )
     }
     #expect(throws: MLXFastError.self) {
@@ -545,6 +589,8 @@ func trainedMTPContractPinsMatchedITPairAndDependency() throws {
     )
     #expect(!contract.officialScoringEnabled)
     #expect(contract.referenceBaseline.status == "not_established")
+    #expect(contract.protocolContract.decodeTokens == 128)
+    #expect(contract.protocolContract.maximumDecodeTokens == 512)
 }
 
 @Test
@@ -588,9 +634,25 @@ func trainedMTPOptionsFailClosedWithoutAssistantRequirement() throws {
         contractPath: "contract.json",
         goldenPath: "it-golden.json",
         maxBlockSize: 4,
+        totalTokenCount: 257,
         requireTrainedAssistant: true
     )
     try GemmaRuntime.validateExperimentalTrainedMTPOptions(valid)
+
+    #expect(throws: MLXFastError.self) {
+        try GemmaRuntime.validateExperimentalTrainedMTPOptions(
+            ExperimentalTrainedMTPOptions(
+                sourceTargetPath: "source-target",
+                targetWeightsPath: "mtp-weights",
+                assistantPath: "assistant",
+                contractPath: "contract.json",
+                goldenPath: "it-golden.json",
+                maxBlockSize: 4,
+                totalTokenCount: 513,
+                requireTrainedAssistant: true
+            )
+        )
+    }
 }
 
 @Test
@@ -602,6 +664,7 @@ func trainedMTPTrackIsExplicitAndSerialBenchmarkRemainsUnchanged() throws {
     #expect(source.contains("case \"mtp-benchmark\":"))
     #expect(source.contains("case \"mtp-runtime-worker\":"))
     #expect(source.contains("--require-trained-assistant"))
+    #expect(source.contains("[--block-size N] [--tokens N]"))
     #expect(source.contains("mtp-benchmark requires --target-source PATH"))
     #expect(source.contains("mtp-benchmark requires --assistant PATH"))
 
@@ -622,7 +685,7 @@ func trainedMTPTrackIsExplicitAndSerialBenchmarkRemainsUnchanged() throws {
 }
 
 @Test
-func trainedMTPUsesFastMultiPositionTargetVerification() throws {
+func trainedMTPUsesSerialEquivalentTargetVerification() throws {
     let adapter = try String(
         contentsOfFile: "Sources/MLXFastModel/Gemma4MTPRuntime.swift",
         encoding: .utf8
@@ -638,11 +701,14 @@ func trainedMTPUsesFastMultiPositionTargetVerification() throws {
     )
     #expect(adapter.contains("fastMTPForward(tokens, cache: cache)"))
     #expect(adapter.contains("newCache(parameters: parameters)"))
+    #expect(adapter.contains("for (position, inputToken) in verifyInputs.enumerated()"))
+    #expect(!adapter.contains("replayRejectedRoundExactly"))
     #expect(engine.contains("func forwardForMTP("))
     #expect(engine.contains("capturedSharedKV: Gemma4SharedKV("))
     #expect(engine.contains("projectedHidden = inputs.dim(1) > 16"))
     #expect(worker.contains("let warmupSession"))
     #expect(worker.contains("repeating: 2"))
+    #expect(worker.contains("later exact target rows cold"))
     let warmup = try #require(worker.range(of: "let warmupSession"))
     let protocolHello = try #require(
         worker.range(of: "let sessionNonce = generateRuntimeWorkerNonce()")
@@ -729,4 +795,49 @@ func trainedMTPArtifactValidationRuntimeGate() throws {
     #expect(report.trackID == "gemma4-31b-it-mtp-v1")
     #expect(report.assistantByteCount == 939_044_876)
     #expect(report.targetByteCount <= 20 * (1 << 30))
+}
+
+@Test
+func trainedMTPPublicParityRuntimeGate() throws {
+    let environment = ProcessInfo.processInfo.environment
+    guard environment["MLXFAST_RUN_MTP_PARITY_TESTS"] == "1" else {
+        return
+    }
+    let sourceTarget = try #require(
+        environment["MLXFAST_MTP_TARGET_DIR"]
+    )
+    let weights = try #require(
+        environment["MLXFAST_MTP_WEIGHTS_PATH"]
+    )
+    let assistant = try #require(
+        environment["MLXFAST_MTP_ASSISTANT_DIR"]
+    )
+    let golden = try #require(
+        environment["MLXFAST_MTP_PARITY_GOLDEN_PATH"]
+    )
+    let executable = environment["MLXFAST_MTP_EXECUTABLE"]
+        ?? ".build/release/mlxfast-swift"
+    let totalTokenCount = Int(
+        environment["MLXFAST_MTP_PARITY_TOKENS"] ?? "128"
+    ) ?? 128
+
+    let report = try GemmaRuntime.experimentalTrainedMTPBenchmark(
+        ExperimentalTrainedMTPOptions(
+            sourceTargetPath: sourceTarget,
+            targetWeightsPath: weights,
+            assistantPath: assistant,
+            contractPath: "fixtures/gemma_4_31b_it_mtp_track.json",
+            goldenPath: golden,
+            maxBlockSize: 4,
+            totalTokenCount: totalTokenCount,
+            requireTrainedAssistant: true
+        ),
+        worker: RuntimeWorkerOptions(
+            executablePath: executable,
+            helloTimeoutSeconds: 15 * 60,
+            requestTimeoutSeconds: 15 * 60
+        )
+    )
+    #expect(report.allTokensMatched)
+    #expect(report.decodeTokenCount == totalTokenCount)
 }

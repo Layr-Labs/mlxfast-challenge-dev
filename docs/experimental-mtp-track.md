@@ -58,7 +58,8 @@ review the license terms before enabling a public ranked track.
   `bc1c0ee67d15798343be17c9f8f61f7c0d977149`;
 - frozen Gemma 4 target and assistant architecture fields;
 - SHA256 manifest identities and artifact byte budgets;
-- block size four and exactly 128 parent-counted decode tokens;
+- block size four, a compatibility default of 128 parent-counted decode
+  tokens, and a hard trusted-parent cap of 512;
 - the missing-reference-baseline status.
 
 Byte manifests:
@@ -123,18 +124,27 @@ For block size `K` (initially four), one round:
 
 1. Uses the trained assistant to draft `K - 1` tokens from the current target
    token, target hidden state, and shared K/V.
-2. Runs one `K`-position target verification over the committed token followed
-   by drafts.
+2. Constructs one charged block verification graph from `K` exact serial-shape
+   target forwards over the committed token followed by drafts.
 3. Compares each draft to the corresponding target argmax in order.
 4. Emits only the target-confirmed prefix plus the target token at the first
    rejection (between one and `K` tokens).
-5. Trims rejected target KV rows and slices shared K/V to the same committed
-   prefix.
+5. Stops target execution at the first rejection, so no rejected physical KV
+   row is written; every retained hidden/K/V row uses the serial K=1 shape.
 6. Persists hidden/shared-KV state at the committed target position.
 7. Checks every target cache offset against the host mirror.
 
-Zero, partial, and full acceptance use the same path. If exactly one of the
-128 outputs remains, a target-only one-position tail step finishes the exact
+The serial target shape is deliberate. The expanded M5 pilot proved that a
+single mathematical K-row target forward changes floating-point reduction
+order: retained layer-1 K/V diverged after the first full-acceptance block and
+a public prose continuation flipped argmax at decode step 48. Logical offsets
+were still identical. Verifying each supplied row through the K=1 target shape
+preserves exact token and physical-cache parity without hiding a fallback or
+discarding unvalidated work; it also means this prototype does not yet realize
+the target-compute amortization expected from production MTP.
+
+Zero, partial, and full acceptance use the same charged path. If exactly one
+output remains, a target-only one-position tail step finishes the configured
 window; this is not an assistant fallback and cannot be selected for the main
 rounds.
 
@@ -164,8 +174,8 @@ The trusted parent:
 5. Rejects missing, empty, oversized, out-of-vocabulary, overrun, or
    mismatching blocks.
 6. Checks every returned token against an independent serial target oracle.
-7. Stops only after exactly 128 tokens.
-8. Divides its own wall time by the fixed constant 128.
+7. Stops only after the explicit trusted total (default 128, maximum 512).
+8. Divides its own wall time by that parent-owned total.
 
 All seed prefill, drafting, target verification, rejection, rollback, IPC, and
 final-tail work is charged. Worker-reported timing and acceptance have no
@@ -191,7 +201,7 @@ The MTP policy permits only organizer-assistant, target-verified block
 speculation and its within-request commit/rollback state. It still rejects:
 
 - prompt, suffix, n-gram, history, or prompt-hash lookup;
-- known 128-token or call-count specialization;
+- known fixed-token-total or call-count specialization;
 - participant-provided, replaced, tampered, or extra assistants;
 - unverified drafter tokens or skipped target verification;
 - fake timing, token counts, acceptance, artifact data, or scores;
@@ -212,14 +222,58 @@ Known on-disk bytes:
 - combined: 19,383,465,057 bytes (about 18.1 GiB).
 
 The assistant has 469,518,596 BF16 parameters according to its repository
-metadata. Runtime peak memory is higher than file size because target and
-assistant weights, target KV, shared K/V, verification logits/activations, MLX
-allocator state, and rollback buffers coexist. The expected “about 1 GB”
-assistant claim is therefore verified only for disk bytes, not peak unified
-memory. Peak active/cache memory must be measured on the ranked M5 before
-rollout.
+metadata. The M5 matrix measured up to 47.6 GiB peak process RSS,
+31.2 GiB MLX active memory, 3.4 GiB MLX cache memory, and 34.1 GiB MLX allocator
+peak. Runtime peak is higher than file size because target and assistant
+weights, target KV, shared K/V, verification logits/activations, and allocator
+state coexist. This fits the 128 GiB runner but exceeds the base track's
+practical 36 GiB local budget; a public track needs its own documented memory
+minimum and host-enforced cap.
 
 ## Scoring and rebaseline contract
+
+### M5 parity incident and fix
+
+The expanded public/synthetic pilot found a deterministic prose mismatch at
+decode step 48. Safe differential replay established:
+
+- the failing block was round 13 at target offset 560;
+- it rejected at its first draft position;
+- every logical target cache offset was 561 after that position;
+- an independent serial shadow cache had the same offsets;
+- real and serial physical K/V first diverged at layer 1 immediately after the
+  first K-row full-acceptance block (global decode step 4);
+- fast-vs-library target and combined-vs-split cache variants all failed at the
+  same step.
+
+The root cause was shape-dependent floating-point target execution, not prompt
+lookup, assistant incompatibility, host offset arithmetic, or a missing trim.
+A K-row target graph is mathematically causal but is not bit-identical to K
+serial target graphs on this runtime. The fix verifies supplied target rows
+using the exact serial K=1 graph and stops at the first rejection, avoiding
+both divergent retained state and irreversible post-wrap rollback. A
+runtime-gated public parity test preserves the failing seam.
+
+### Final public/synthetic matrix
+
+The corrected serial-equivalent verifier completed 12 thermal-gated M5 pairs:
+three each for copy (N=255), prose (N=256), code (N=257), and reasoning
+(N=256). All target tokens matched. The matrix exercised full, partial, and
+zero draft acceptance plus one-token tails. Mean paired candidate/serial
+speedups were 0.741x copy, 0.798x prose, 0.860x code, and 0.883x reasoning;
+after the complete fixed K=1 warmup, a fresh copy triplet measured 0.860x.
+Exact verification is therefore a correctness-complete control, not a
+competitive target-amortizing MTP implementation.
+
+Per-category paired CV was initially 7.8% copy, 1.9% prose, 4.0% code, and
+1.1% reasoning. Phase diagnostics showed copy's variation came from seed and
+first-block onset (up to 1.77s) while median block latency and thermal/frequency
+telemetry stayed stable. The fixed BOS warmup had not guaranteed all four exact
+target rows were compiled when the assistant rejected early. Explicitly warming
+four deterministic K=1 target rows reduced a fresh three-pair copy run to 3.2%
+paired CV without retaining allocator buffers or using prompt-specific work.
+Across accepted runs, maximum temperature was 56.1C and minimum steady GPU
+frequency was 1604 MHz.
 
 Phase 1 emits diagnostic JSON with no `score` or `speedup`.
 
@@ -270,7 +324,8 @@ Run the serial block control first:
 .build/release/mlxfast-swift mtp-probe \
   --weights mtp-weights \
   --golden /tmp/gemma4-31b-it-mtp-public.json \
-  --block-size 4
+  --block-size 4 \
+  --tokens 128
 ```
 
 Then run the trained-assistant prototype:
@@ -283,8 +338,13 @@ Then run the trained-assistant prototype:
   --contract fixtures/gemma_4_31b_it_mtp_track.json \
   --golden /tmp/gemma4-31b-it-mtp-public.json \
   --block-size 4 \
+  --tokens 128 \
   --require-trained-assistant
 ```
+
+`--tokens` defaults to 128 and accepts `1...512`; the selected golden must
+contain one seed token plus the requested number of decode tokens. The parent
+owns this total, validates every token, and uses it as the fixed denominator.
 
 For the opt-in model-backed validation:
 
@@ -300,10 +360,12 @@ weights and an IT-target oracle.
 
 ## Rollout blockers and residual risks
 
-- No IT-target M5 golden or hidden behavior suite is checked in.
+- Public/synthetic IT-target M5 goldens have been exercised remotely, but no
+  IT hidden behavior suite is checked in.
 - No paired MTP reference baseline or component floors exist.
-- The current MTP target capture path prioritizes correctness and integration,
-  not final performance tuning.
+- Exact serial-shape target verification prioritizes correctness over target
+  compute amortization. A future fast path needs K-row kernels proven
+  bit-identical to K=1 hidden/KV and logits before it can replace this path.
 - The path-based upstream loader cannot atomically bind open descriptors;
   before/after hash validation plus read-only operator ownership mitigates
   TOCTOU, but official provisioning must enforce ownership and permissions.

@@ -47,7 +47,8 @@ func validateExperimentalTrainedMTPBlockRequest(
     let (requestedTotal, overflow) =
         decodedTokenCount.addingReportingOverflow(maxBlockSize)
     guard !overflow,
-          requestedTotal <= MLXFastConstants.experimentalMTPMaxTotalTokens
+          requestedTotal
+              <= MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens
     else {
         throw MLXFastError.invalidInput(
             "trained MTP block request exceeds the fixed decode window"
@@ -116,6 +117,47 @@ extension GemmaRuntime {
                 previousCommittedToken: warmupSeed,
                 maxBlockSize: MLXFastConstants.experimentalMTPMaxBlockSize
             )
+        }
+        // Assistant acceptance on the fixed BOS sequence may reject at the
+        // first position, which would leave later exact target rows cold. Warm
+        // four deterministic K=1 target steps explicitly so every possible
+        // K=4 block length has compiled before the protocol hello. These
+        // throwaway BOS-derived rows are input-independent; their free buffers
+        // are still cleared by the charged real begin request.
+        do {
+            let warmCache = target.mtpNewCache(parameters: nil)
+            let bosTokens = MLXArray(
+                Array(
+                    repeating: Int32(2),
+                    count: MLXFastConstants.correctnessPromptTokens
+                ),
+                [1, MLXFastConstants.correctnessPromptTokens]
+            )
+            let prefill = target.forwardForMTP(
+                bosTokens,
+                cache: warmCache
+            )
+            var warmToken = prefill.logits[
+                0..., -1, 0...
+            ].asType(.float32).argMax(axis: -1)
+            eval(warmToken)
+            for _ in 0..<MLXFastConstants.experimentalMTPMaxBlockSize {
+                let output = target.forwardForMTP(
+                    warmToken.reshaped([1, 1]),
+                    cache: warmCache
+                )
+                warmToken = output.logits[
+                    0..., -1, 0...
+                ].asType(.float32).argMax(axis: -1)
+                eval(
+                    warmToken,
+                    output.lastHidden,
+                    output.capturedSharedKV.fullAttention.0,
+                    output.capturedSharedKV.fullAttention.1,
+                    output.capturedSharedKV.slidingAttention.0,
+                    output.capturedSharedKV.slidingAttention.1
+                )
+            }
         }
         let session = try Gemma4TrainedMTPBlockSession(
             target: target,
@@ -271,7 +313,7 @@ extension GemmaRuntime {
                 guard !overflow,
                       !offsetOverflow,
                       nextCount <=
-                          MLXFastConstants.experimentalMTPMaxTotalTokens,
+                          MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens,
                       result.targetCacheOffset == expectedCacheOffset
                 else {
                     throw MLXFastError.invalidInput(

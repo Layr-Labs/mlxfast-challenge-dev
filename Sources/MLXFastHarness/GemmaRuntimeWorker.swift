@@ -373,7 +373,8 @@ extension GemmaRuntime {
             let (nextDecodeStep, stepOverflow) =
                 state.decodeStep.addingReportingOverflow(tokens.count)
             guard !stepOverflow,
-                  nextDecodeStep <= MLXFastConstants.experimentalMTPMaxTotalTokens
+                  nextDecodeStep
+                      <= MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens
             else {
                 state.decodeCache = nil
                 throw MLXFastError.invalidInput(
@@ -754,7 +755,8 @@ func validateExperimentalDecodeBlockRequest(
     let (requestedTotal, overflow) =
         decodedTokenCount.addingReportingOverflow(maxBlockSize)
     guard !overflow,
-          requestedTotal <= MLXFastConstants.experimentalMTPMaxTotalTokens
+          requestedTotal
+              <= MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens
     else {
         throw MLXFastError.invalidInput(
             "runtime worker decode_block request exceeds the experimental token limit"
