@@ -21,6 +21,8 @@ private let gemma4IndexedSlidingQKV = MLXFast.metalKernel(
             ? threadgroup_position_in_grid.y * 8 + projection * kRowsPerSIMD
             : threadgroup_position_in_grid.y * kRowsPerSIMD;
 
+        if (output_row >= (is_q ? 8192 : 4096)) { return; }
+
         const device uint* weight = is_q
             ? q_weight
             : (is_k ? k_weight : v_weight);
@@ -230,6 +232,8 @@ private let gemma4IndexedFullQK = MLXFast.metalKernel(
         const int output_row = is_q
             ? threadgroup_position_in_grid.y * 32 + projection * kRowsPerSIMD
             : threadgroup_position_in_grid.y * kRowsPerSIMD;
+
+        if (output_row >= (is_q ? 16384 : 2048)) { return; }
 
         const device uint* weight = is_q ? q_weight : k_weight;
         const device ushort* indices = is_q ? q_indices : k_indices;
