@@ -1441,7 +1441,7 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: benchmark_prompts/timed_decode_lowsim_prose_v1.txt
+          MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1.txt
         run: |
           set -euo pipefail
           .github/scripts/download-r2-object.sh \

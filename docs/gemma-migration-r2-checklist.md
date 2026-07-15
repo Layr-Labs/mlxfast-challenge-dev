@@ -98,7 +98,7 @@ verify them) were regenerated.
 
 ## 4b. Private timed decode target (R2) — STAGED, not yet uploaded
 
-- **Object:** `benchmark_prompts/timed_decode_lowsim_prose_v1.txt` (the
+- **Object:** `correctness_prompts/timed_decode_lowsim_prose_v1.txt` (the
   independent timed prefill/decode target introduced by the timed-decode
   fairness change; see `docs/timed-decode-evaluation.md`).
 - **Pins:** `MLXFAST_TIMED_DECODE_PROMPT_SHA256` / `_BYTES` variables on the

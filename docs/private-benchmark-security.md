@@ -156,7 +156,7 @@ the private R2 bucket in trusted steps:
 `correctness_prompts/gpqa_reference_cases-gemma.json` (the hidden GPQA
 reference cases, merged into the golden as 5 behavior gates), followed after
 the correctness scrub by
-`benchmark_prompts/timed_decode_lowsim_prose_v1.txt` (the independent
+`correctness_prompts/timed_decode_lowsim_prose_v1.txt` (the independent
 timed prefill/decode target).
 Correctness-only dispatches (`run_benchmark=false`) fetch no private
 material at all. The correctness objects were regenerated from the Gemma 4 31B 4-bit
