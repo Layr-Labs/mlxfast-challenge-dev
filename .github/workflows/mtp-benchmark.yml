@@ -150,7 +150,10 @@ jobs:
       MLXFAST_JOB_WS: /Users/Shared/bench-jobs/mtp-ranked-current
       # --- Runner-only private material (0700 runner).
       MLXFAST_PRIVATE_DIR: /tmp/mlxfast-mtp-private-${{ github.run_id }}-${{ github.run_attempt }}
-      MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-mtp-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+      # Distinct from the serial track's artifact run root while satisfying
+      # stage-benchmark-artifacts.sh's /tmp/mlxfast-artifacts- prefix contract
+      # (run component "mtp-<run>-<attempt>").
+      MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-mtp-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_MEASURE_OUT: /tmp/mlxfast-mtp-measure-${{ github.run_id }}-${{ github.run_attempt }}
       # --- Track contract.
       MLXFAST_MTP_TRACK_ID: gemma4-31b-it-mtp-v1
@@ -1015,7 +1018,8 @@ jobs:
             .track_id == $track
             and .parity_all_ok == true
             and (.accepted_pair_count >= $min_pairs)
-            and (.pairs | type == "array" and length == .accepted_pair_count)
+            and ((.pairs | type) == "array")
+            and ((.pairs | length) == .accepted_pair_count)
             and (.aggregate.baseline_serial_seconds_per_token_mean | type == "number" and . > 0)
             and (.aggregate.candidate_mtp_seconds_per_token_mean | type == "number" and . > 0)
             and (.aggregate.mtp_decode_speedup_median | type == "number")
