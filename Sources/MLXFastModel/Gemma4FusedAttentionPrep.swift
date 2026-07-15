@@ -1118,6 +1118,76 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
         return outputs[0]
     }
 
+    /// Qualification-only direct K/V authority for the integrated audit. This
+    /// bypasses environment-selected staged rollback without changing the
+    /// promoted direct kernel or its zero-fill/capacity policy.
+    func callDirectCombinedKVPrefillForIntegratedAudit(
+        rawKeys: MLXArray,
+        rawValues: MLXArray?,
+        offset: Int,
+        length: Int,
+        capacity: Int
+    ) -> MLXArray {
+        precondition(isSliding && headDim == 256 && kvHeads == 16)
+        precondition(offset == 0 && length == 512 && capacity >= length)
+        let valueInput = rawValues ?? rawKeys
+        precondition(rawKeys.dtype == .bfloat16)
+        precondition(valueInput.dtype == .bfloat16)
+        precondition(rawKeys.shape == [1, length, kvHeads * headDim])
+        precondition(valueInput.shape == [1, length, kvHeads * headDim])
+        let threads = headDim / 4
+        return gemma4DirectSlidingCombinedKVPrefill(
+            [
+                rawKeys, valueInput, kNormWeight, positionViews[offset],
+                MLXArray(Int32(length)), MLXArray(Int32(capacity)),
+                ropeCosines, ropeSines,
+            ],
+            grid: (threads, capacity * 2 * kvHeads, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [[2, 1, kvHeads, capacity, headDim]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
+    /// Qualification-only authority for the real-model prepared-Q audit.
+    /// This deliberately bypasses the environment-controlled production
+    /// selector and always invokes the promoted direct combined Q/K/V kernel.
+    func callDirectCombinedQKVPrefillForPreparedQAudit(
+        rawQueries: MLXArray,
+        rawKeys: MLXArray,
+        rawValues: MLXArray?,
+        offset: Int,
+        length: Int,
+        capacity: Int
+    ) -> MLXArray {
+        precondition(isSliding && headDim == 256 && kvHeads == 16)
+        precondition(offset == 0 && length == 512 && capacity >= length)
+        precondition(rawQueries.dtype == .bfloat16)
+        precondition(rawQueries.shape == [1, length, 32 * headDim])
+        precondition(rawKeys.dtype == .bfloat16)
+        precondition(rawKeys.shape == [1, length, kvHeads * headDim])
+        let valueInput = rawValues ?? rawKeys
+        precondition(valueInput.dtype == .bfloat16)
+        precondition(valueInput.shape == [1, length, kvHeads * headDim])
+
+        let threads = headDim / 4
+        let outputs = gemma4DirectSlidingCombinedQKVPrefillPreparation(
+            [
+                rawQueries, rawKeys, valueInput, qNormWeight, kNormWeight,
+                positionViews[offset], MLXArray(Int32(length)),
+                MLXArray(Int32(capacity)), ropeCosines, ropeSines,
+            ],
+            grid: (threads, length * 32 + capacity * 2 * kvHeads, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [
+                [1, 32, length, headDim],
+                [2, 1, kvHeads, capacity, headDim],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16]
+        )
+        return outputs[0]
+    }
+
     /// Multi-token Q/K/V preparation. Queries are emitted as `[1,32,L,D]`
     /// after RMSNorm, transpose, and RoPE; K/V are emitted directly into the
     /// reserved combined-cache parent allocation.

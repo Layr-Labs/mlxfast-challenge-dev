@@ -23,6 +23,27 @@ private let gemma4VerifyCombinedQKVPrefillPreparationBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+/// Compile-time qualification selector. Candidate values are never propagated.
+/// Change this single literal only for a fresh, dedicated qualification build.
+let gemma4IntegratedQSDPARealModelAuditMode: Gemma4IntegratedAuditMode = .off
+
+/// Compile-time host-only checkpoint selector for a dedicated audit build.
+let gemma4IntegratedAuditCheckpointMode: Gemma4IntegratedAuditCheckpointMode = .off
+
+/// Compile-time returned-logits evaluation selector for a dedicated audit build.
+let gemma4IntegratedAuditReturnedLogitsEvalMode: Gemma4IntegratedAuditReturnedLogitsEvalMode = .off
+
+/// Qualification probe switch. Off by default; enable only for one real L512
+/// transformed-model audit with MLXFAST_PREPARED_Q_REAL_MODEL_AUDIT=1.
+private let gemma4PreparedQRealModelAuditEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "MLXFAST_PREPARED_Q_REAL_MODEL_AUDIT"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 private let gemma4StagedSlidingPrefillAttentionEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_STAGED_SLIDING_PREFILL_ATTENTION"
@@ -30,6 +51,18 @@ private let gemma4StagedSlidingPrefillAttentionEnabled: Bool = {
         return true
     }
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+/// Process-start rollback for the certified exact-shape sliding-prefill fusion.
+/// The production default is fused; explicit false-like values retain the
+/// prepared-Q producer followed by staged SDPA.
+private let gemma4FusedSlidingPrefillRawQEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_FUSED_SLIDING_PREFILL_RAW_Q"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
 private let gemma4VerifyStagedSlidingPrefillAttentionBits: Bool = {
@@ -119,6 +152,7 @@ struct Gemma4FastLayerResult {
 }
 
 final class Gemma4FastLayer {
+    let layerIndex: Int
     let isSliding: Bool
     let nHeads: Int
     let nKvHeads: Int
@@ -158,6 +192,7 @@ final class Gemma4FastLayer {
     let useFusedGateUpActivation: Bool
 
     init(
+        layerIndex: Int,
         isSliding: Bool,
         nHeads: Int,
         nKvHeads: Int,
@@ -187,6 +222,7 @@ final class Gemma4FastLayer {
         upIndexedMetadata: IndexedAffineMetadata?,
         downIndexedMetadata: IndexedAffineMetadata?
     ) {
+        self.layerIndex = layerIndex
         self.isSliding = isSliding
         self.nHeads = nHeads
         self.nKvHeads = nKvHeads
@@ -577,6 +613,33 @@ final class Gemma4FastLayer {
             && combinedAttentionPrefill != nil
             && (gemma4CombinedQKVPrefillPreparationEnabled
                 || gemma4VerifyCombinedQKVPrefillPreparationBits)
+        // Fail closed: only the all-layer-certified Gemma sliding seed shape may
+        // bypass prepared-Q production. Every unsupported case takes the
+        // existing combined Q/K/V preparation route below.
+        let usesFusedSlidingPrefillRawQ =
+            gemma4FusedSlidingPrefillRawQEnabled
+            && isSliding
+            && B == 1 && L == 512 && offset == 0
+            && h.dtype == .bfloat16
+            && rawQueries.dtype == .bfloat16
+            && rawQueries.shape == [1, 512, 8192]
+            && rawKeys.dtype == .bfloat16
+            && rawKeys.shape == [1, 512, 4096]
+            && (rawValues?.dtype ?? rawKeys.dtype) == .bfloat16
+            && (rawValues?.shape ?? rawKeys.shape) == [1, 512, 4096]
+            && nHeads == 32 && nKvHeads == 16 && headDim == 256
+            && combinedPrefillCapacity == 768
+            && usesCombinedQKVPrefillPreparation
+            && fusedAttentionRMS?.qNormWeight.dtype == .bfloat16
+            && fusedAttentionRMS?.qNormWeight.shape == [256]
+            && fusedAttentionRMS?.ropeCosines.dtype == .float32
+            && fusedAttentionRMS?.ropeCosines.shape.count == 2
+            && (fusedAttentionRMS?.ropeCosines.shape[0] ?? 0) >= 512
+            && fusedAttentionRMS?.ropeCosines.shape[1] == 128
+            && fusedAttentionRMS?.ropeSines.dtype == .float32
+            && fusedAttentionRMS?.ropeSines.shape.count == 2
+            && (fusedAttentionRMS?.ropeSines.shape[0] ?? 0) >= 512
+            && fusedAttentionRMS?.ropeSines.shape[1] == 128
         if usesCombinedKVDecodePreparation,
            let fusedAttentionRMS,
            let combinedCache
@@ -601,6 +664,37 @@ final class Gemma4FastLayer {
             queries = prepared.0
             keys = prepared.1
             values = prepared.2
+        } else if usesFusedSlidingPrefillRawQ,
+                  let fusedAttentionRMS,
+                  let combinedCache,
+                  let combinedPrefillCapacity
+        {
+            // Production fusion constructs only K/V preparation. Q remains the
+            // original strided projection view and is reconstructed on-chip by
+            // the staged SDPA consumer.
+            precondition(offset == 0)
+            precondition(rawQueries.dtype == .bfloat16)
+            precondition(rawQueries.shape == [1, 512, 8192])
+            precondition(fusedAttentionRMS.qNormWeight.shape == [256])
+            precondition(fusedAttentionRMS.ropeCosines.dtype == .float32)
+            precondition(fusedAttentionRMS.ropeSines.dtype == .float32)
+            precondition(fusedAttentionRMS.ropeCosines.shape.count == 2
+                && fusedAttentionRMS.ropeCosines.shape[0] >= 512
+                && fusedAttentionRMS.ropeCosines.shape[1] == 128)
+            precondition(fusedAttentionRMS.ropeSines.shape.count == 2
+                && fusedAttentionRMS.ropeSines.shape[0] >= 512
+                && fusedAttentionRMS.ropeSines.shape[1] == 128)
+            queries = rawQueries
+            let combined = fusedAttentionRMS.callCombinedPrefill(
+                rawKeys: rawKeys,
+                rawValues: rawValues,
+                offset: offset,
+                length: L,
+                capacity: combinedPrefillCapacity
+            )
+            let updated = combinedCache.adoptDirectPrefill(combined, length: L)
+            keys = updated.0
+            values = updated.1
         } else if usesCombinedQKVPrefillPreparation,
                   let fusedAttentionRMS,
                   let combinedCache,
@@ -763,7 +857,20 @@ final class Gemma4FastLayer {
             && queries.shape == [1, 32, 512, 256]
             && keys.shape == [1, 16, 512, 256]
             && values.shape == [1, 16, 512, 256]
-        if canUseStagedSlidingPrefill
+        if usesFusedSlidingPrefillRawQ, let fusedAttentionRMS {
+            precondition(keys.dtype == .bfloat16
+                && keys.shape == [1, 16, 512, 256])
+            precondition(values.dtype == .bfloat16
+                && values.shape == [1, 16, 512, 256])
+            attention = gemma4StagedSlidingPrefill512FromRawQ(
+                rawQueries: rawQueries,
+                keys: keys,
+                values: values,
+                qNormWeight: fusedAttentionRMS.qNormWeight,
+                ropeCosines: fusedAttentionRMS.ropeCosines,
+                ropeSines: fusedAttentionRMS.ropeSines
+            )
+        } else if canUseStagedSlidingPrefill
             && (gemma4StagedSlidingPrefillAttentionEnabled
                 || gemma4VerifyStagedSlidingPrefillAttentionBits)
         {
@@ -1316,6 +1423,7 @@ final class Gemma4FastEngine {
 
             built.append(
                 Gemma4FastLayer(
+                    layerIndex: index,
                     isSliding: isSliding,
                     nHeads: config.numAttentionHeads,
                     nKvHeads: nKvHeads,
