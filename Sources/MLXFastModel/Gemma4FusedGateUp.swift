@@ -222,6 +222,16 @@ private func gemma4GateUpEnvironmentFlag(
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }
 
+/// The promoted K=1 gate/up kernel always receives newly materialized,
+/// row-contiguous BF16 inputs and a U32 co-tiled weight payload. Its lane
+/// offsets are therefore aligned for bfloat4 input loads and U32 weight loads.
+/// Keep the scalar source as a process-level rollback while the wide-load
+/// schedule is measured on the ranked GPU.
+private let gemma4GateUpVectorLoadsEnabled = gemma4GateUpEnvironmentFlag(
+    "DARKBLOOM_GATE_UP_VECTOR_LOADS",
+    default: true
+)
+
 private struct Packed12GateUpMetadata: @unchecked Sendable {
     let bytes: MLXArray
 
@@ -796,7 +806,9 @@ private let gemma4Packed12IndexedFusedGateUpActivationQMV = MLXFast.metalKernel(
 )
 
 private let gemma4CoTiledFixed12FusedGateUpActivationQMV = MLXFast.metalKernel(
-    name: "gemma4_cotiled_fixed12_fused_gate_up_activation_qmv_5376_v1",
+    name: "gemma4_cotiled_fixed12_fused_gate_up_activation_qmv_5376_vec"
+        + (gemma4GateUpVectorLoadsEnabled ? "1" : "0")
+        + "_v2",
     inputNames: ["cotiled_payload", "gate_lut", "up_lut", "x"],
     outputNames: ["activated"],
     source: """
@@ -860,9 +872,8 @@ private let gemma4CoTiledFixed12FusedGateUpActivationQMV = MLXFast.metalKernel(
                     (middle >> 4) | (odd_high << 4);
                 const uint even_pair = lut[even_index];
                 odd_pairs[row] = lut[odd_index];
-                const device uchar* row_weight =
-                    reinterpret_cast<const device uchar*>(
-                        even_weight_words + row * kSIMDSize);
+                const device uint* row_weight =
+                    even_weight_words + row * kSIMDSize;
                 result[row] += gemma4_cotiled_gate_up_qdot_4bit(
                     row_weight,
                     even_values,
@@ -878,9 +889,8 @@ private let gemma4CoTiledFixed12FusedGateUpActivationQMV = MLXFast.metalKernel(
             #pragma clang loop unroll(full)
             for (int row = 0; row < kRowsPerSIMD; ++row) {
                 const uint odd_pair = odd_pairs[row];
-                const device uchar* row_weight =
-                    reinterpret_cast<const device uchar*>(
-                        odd_weight_words + row * kSIMDSize);
+                const device uint* row_weight =
+                    odd_weight_words + row * kSIMDSize;
                 result[row] += gemma4_cotiled_gate_up_qdot_4bit(
                     row_weight,
                     odd_values,
@@ -913,9 +923,8 @@ private let gemma4CoTiledFixed12FusedGateUpActivationQMV = MLXFast.metalKernel(
             const uint high = row_metadata[tail_lane_offset + 1];
             const uint metadata_index = low | (high << 8);
             const uint pair = lut[metadata_index];
-            const device uchar* row_weight =
-                reinterpret_cast<const device uchar*>(
-                    tail_weight_words + row * kSIMDSize);
+            const device uint* row_weight =
+                tail_weight_words + row * kSIMDSize;
             result[row] += gemma4_cotiled_gate_up_qdot_4bit(
                 row_weight,
                 tail_values,
@@ -974,33 +983,68 @@ private let gemma4CoTiledFixed12FusedGateUpActivationQMV = MLXFast.metalKernel(
             thread float* values
         ) {
             float sum = 0;
-            for (int index = 0; index < 8; index += 4) {
-                sum += input[index] + input[index + 1]
-                    + input[index + 2] + input[index + 3];
-                values[index] = input[index];
-                values[index + 1] = input[index + 1] / 16.0f;
-                values[index + 2] = input[index + 2] / 256.0f;
-                values[index + 3] = input[index + 3] / 4096.0f;
+            if (\(gemma4GateUpVectorLoadsEnabled ? "true" : "false")) {
+                const device bfloat4* input4 =
+                    reinterpret_cast<const device bfloat4*>(input);
+                const bfloat4 first = input4[0];
+                const bfloat4 second = input4[1];
+                sum += first[0] + first[1] + first[2] + first[3];
+                values[0] = first[0];
+                values[1] = first[1] / 16.0f;
+                values[2] = first[2] / 256.0f;
+                values[3] = first[3] / 4096.0f;
+                sum += second[0] + second[1] + second[2] + second[3];
+                values[4] = second[0];
+                values[5] = second[1] / 16.0f;
+                values[6] = second[2] / 256.0f;
+                values[7] = second[3] / 4096.0f;
+            } else {
+                for (int index = 0; index < 8; index += 4) {
+                    sum += input[index] + input[index + 1]
+                        + input[index + 2] + input[index + 3];
+                    values[index] = input[index];
+                    values[index + 1] = input[index + 1] / 16.0f;
+                    values[index + 2] = input[index + 2] / 256.0f;
+                    values[index + 3] = input[index + 3] / 4096.0f;
+                }
             }
             return sum;
         }
 
         inline float gemma4_cotiled_gate_up_qdot_4bit(
-            const device uchar* weight,
+            const device uint* weight,
             const thread float* values,
             float scale,
             float bias,
             float input_sum
         ) {
-            const device ushort* packed =
-                reinterpret_cast<const device ushort*>(weight);
             float accumulator = 0;
-            for (int index = 0; index < 2; ++index) {
+            if (\(gemma4GateUpVectorLoadsEnabled ? "true" : "false")) {
+                const uint packed_word = weight[0];
+                const ushort packed0 =
+                    static_cast<ushort>(packed_word);
+                const ushort packed1 =
+                    static_cast<ushort>(packed_word >> 16);
                 accumulator +=
-                    (values[4 * index] * (packed[index] & 0x000f)
-                    + values[4 * index + 1] * (packed[index] & 0x00f0)
-                    + values[4 * index + 2] * (packed[index] & 0x0f00)
-                    + values[4 * index + 3] * (packed[index] & 0xf000));
+                    (values[0] * (packed0 & 0x000f)
+                    + values[1] * (packed0 & 0x00f0)
+                    + values[2] * (packed0 & 0x0f00)
+                    + values[3] * (packed0 & 0xf000));
+                accumulator +=
+                    (values[4] * (packed1 & 0x000f)
+                    + values[5] * (packed1 & 0x00f0)
+                    + values[6] * (packed1 & 0x0f00)
+                    + values[7] * (packed1 & 0xf000));
+            } else {
+                const device ushort* packed =
+                    reinterpret_cast<const device ushort*>(weight);
+                for (int index = 0; index < 2; ++index) {
+                    accumulator +=
+                        (values[4 * index] * (packed[index] & 0x000f)
+                        + values[4 * index + 1] * (packed[index] & 0x00f0)
+                        + values[4 * index + 2] * (packed[index] & 0x0f00)
+                        + values[4 * index + 3] * (packed[index] & 0xf000));
+                }
             }
             return scale * accumulator + input_sum * bias;
         }
