@@ -938,6 +938,20 @@ METAL_FUNC void adjust_matrix_offsets(
   y += tid.z * output_stride;
 }
 
+METAL_FUNC bfloat16_t gemma4_paired_gelu_bf16(bfloat16_t gate) {
+  const bfloat16_t cubic0 = static_cast<bfloat16_t>(0.044715f) * gate;
+  const bfloat16_t cubic1 = cubic0 * gate;
+  const bfloat16_t cubic2 = cubic1 * gate;
+  const bfloat16_t inner0 = gate + cubic2;
+  const bfloat16_t inner1 =
+      static_cast<bfloat16_t>(0.7978845834732056f) * inner0;
+  const bfloat16_t tanh_value =
+      static_cast<bfloat16_t>(metal::precise::tanh(inner1));
+  const bfloat16_t shifted = static_cast<bfloat16_t>(1.0f) + tanh_value;
+  const bfloat16_t scaled = static_cast<bfloat16_t>(0.5f) * gate;
+  return scaled * shifted;
+}
+
 template <
     typename T,
     const int group_size,
@@ -994,6 +1008,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   wl += y_col * K_w;
   scales += y_col * K_g;
   biases += y_col * K_g;
+  device T* y_base = y;
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   // Make the weight loader
@@ -1067,6 +1082,44 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
         x += BK;
         loader_w.next();
+      }
+
+      constexpr bool gemma4_paired_gate_up =
+          metal::is_same_v<T, bfloat16_t> && group_size == 64 && bits == 4 &&
+          aligned_N && BM == 64 && BK == 64 && BN == 64 && WM == 2 && WN == 2;
+      if constexpr (gemma4_paired_gate_up) {
+        if (K == 5376 && N == 43008) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          const short2 fragment_coord = BaseNAXFrag::get_coord();
+          const_for_loop<0, TM, 1>([&](auto fragment_row) {
+            const_for_loop<0, TN, 1>([&](auto fragment_col) {
+              thread const auto& frag_values = Dtile.template frag_at<
+                  fragment_row.value, fragment_col.value>();
+              STEEL_PRAGMA_UNROLL
+              for (short element_row = 0; element_row < 2; ++element_row) {
+                const int row_local = tm + fragment_row.value * 16 +
+                    fragment_coord.y + element_row * 8;
+                const int row = y_row + row_local;
+                if (row < M) {
+                  STEEL_PRAGMA_UNROLL
+                  for (short pair = 0; pair < 2; ++pair) {
+                    const int element = element_row * 4 + pair * 2;
+                    const bfloat16_t gate =
+                        static_cast<bfloat16_t>(frag_values[element]);
+                    const bfloat16_t up =
+                        static_cast<bfloat16_t>(frag_values[element + 1]);
+                    const int col = int(tid.x) * 32 +
+                        (tn + fragment_col.value * 16 + fragment_coord.x) / 2 +
+                        pair;
+                    y_base[row * static_cast<int64_t>(21504) + col] =
+                        gemma4_paired_gelu_bf16(gate) * up;
+                  }
+                }
+              }
+            });
+          });
+          return;
+        }
       }
 
       // Store results to device memory
