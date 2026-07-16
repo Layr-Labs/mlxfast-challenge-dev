@@ -82,8 +82,11 @@ jobs:
       - name: Build release CLI and run unit tests without Metal runtime
         run: |
           mkdir -p .build/clang-module-cache
+          swift build -c release --product mlxfast-swift
+          swift build -c release --product mlxfast-runtime-worker
           swift test -c release
           test -x .build/release/mlxfast-swift
+          test -x .build/release/mlxfast-runtime-worker
 
       - name: Save SwiftPM cache
         if: steps.restore_swiftpm_cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
