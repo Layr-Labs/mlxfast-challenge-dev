@@ -1,12 +1,17 @@
 import Darwin
 import Foundation
+#if !MLXFAST_TRUSTED_HARNESS
 import MLX
+#endif
 import MLXFastCore
+#if !MLXFAST_TRUSTED_HARNESS
 import MLXFastModel
+#endif
 
 // GemmaRuntime is split across GemmaRuntime*.swift for auditability.
 // Generated split; behavior identical to the original single file.
 
+#if !MLXFAST_TRUSTED_HARNESS
 extension GemmaRuntime {
     public static func runWorker(weightsPath: String) throws {
         // The worker holds the ~17 GB model for its whole lifetime, so it must
@@ -82,9 +87,6 @@ extension GemmaRuntime {
         }
     }
 
-    /// One-shot structural validation used by the trusted `preflight` command.
-    /// Protocol stdout is isolated before any editable model code runs so
-    /// participant logging cannot forge the JSON result.
     public static func runPreflightWorker(weightsPath: String) throws {
         startRuntimeWorkerOrphanReaper()
         let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
@@ -481,6 +483,7 @@ extension GemmaRuntime {
     }
 
 }
+#endif
 
 private struct RuntimeWorkerPinnedConfiguration: Decodable {
     let modelType: String
@@ -853,14 +856,16 @@ func validateExperimentalDecodeBlockRequest(
     )
 }
 
-struct RuntimeWorkerState {
-    var correctnessCache: Gemma4ModelCache?
-    var correctnessPromptTokenCount = 0
-    var correctnessStep = 0
-    var decodeCache: Gemma4ModelCache?
-    var decodeSeedTokenCount = 0
-    var decodeStep = 0
-}
+#if !MLXFAST_TRUSTED_HARNESS
+    struct RuntimeWorkerState {
+        var correctnessCache: Gemma4ModelCache?
+        var correctnessPromptTokenCount = 0
+        var correctnessStep = 0
+        var decodeCache: Gemma4ModelCache?
+        var decodeSeedTokenCount = 0
+        var decodeStep = 0
+    }
+#endif
 
 struct RuntimeWorkerPreflightResponse: Codable, Equatable {
     let ok: Bool

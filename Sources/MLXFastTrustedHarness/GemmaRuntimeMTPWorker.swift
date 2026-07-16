@@ -1,3 +1,4 @@
+#if !MLXFAST_TRUSTED_HARNESS
 import Foundation
 import MLX
 import MLXFastCore
@@ -370,3 +371,4 @@ private func waitForExperimentalMTPAsync<T: Sendable>(
     }
     return try result.get()
 }
+#endif

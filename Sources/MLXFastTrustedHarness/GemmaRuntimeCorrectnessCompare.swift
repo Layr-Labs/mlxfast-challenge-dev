@@ -1,13 +1,20 @@
 import Foundation
+#if !MLXFAST_TRUSTED_HARNESS
 import MLX
+#endif
 import MLXFastCore
+#if !MLXFAST_TRUSTED_HARNESS
 import MLXFastModel
+#endif
 
 // GemmaRuntime is split across GemmaRuntime*.swift for auditability.
 // Generated split; behavior identical to the original single file.
 
 extension GemmaRuntime {
-    public static func traceCorrectness(_ options: CorrectnessTraceOptions) throws -> CorrectnessTraceReport {
+    public static func traceCorrectness(
+        _ options: CorrectnessTraceOptions,
+        worker workerOptions: RuntimeWorkerOptions? = nil
+    ) throws -> CorrectnessTraceReport {
         let golden = try loadGoldenFixture(from: options.goldenPath)
         let selectedCase: GoldenCase
         if let caseName = options.caseName, !caseName.isEmpty {
@@ -22,16 +29,164 @@ extension GemmaRuntime {
             selectedCase = first
         }
 
-        let config = try Gemma4Config.load(from: options.weightsPath)
-        let loader = try Gemma4WeightLoader(weightsPath: options.weightsPath)
-        let weightCache = Gemma4RuntimeWeightCache(loader: loader, config: config)
-        return try traceGreedyCached(
-            testCase: selectedCase,
-            step: options.step,
-            topK: options.topK,
-            weightCache: weightCache,
-            goldenHash: golden.sha256
-        )
+        guard options.step >= 0,
+              options.step < selectedCase.expectedTokens.count
+        else {
+            throw MLXFastError.invalidInput(
+                "trace step \(options.step) is outside expected token range "
+                    + "0..<\(selectedCase.expectedTokens.count)"
+            )
+        }
+        guard options.topK > 0 else {
+            throw MLXFastError.invalidInput("trace topK must be positive")
+        }
+
+        if let workerOptions {
+            let worker = try RuntimeWorkerClient(
+                options: workerOptions,
+                weightsPath: options.weightsPath
+            )
+            defer {
+                worker.close()
+            }
+            let tracedExpectedToken = selectedCase.expectedTokens[
+                options.step
+            ]
+            var response = try worker.beginTeacherForcedCorrectness(
+                promptTokens: selectedCase.promptTokens,
+                topK: options.step == 0 ? options.topK : nil,
+                expectedToken: options.step == 0
+                    ? tracedExpectedToken
+                    : nil
+            )
+            var generated: [Int] = []
+            generated.reserveCapacity(options.step + 1)
+            for currentStep in 0...options.step {
+                guard let token = response.token else {
+                    throw MLXFastError.invalidInput(
+                        "runtime worker trace response missing token"
+                    )
+                }
+                generated.append(token)
+                if currentStep == options.step {
+                    let logits = try validatedWorkerTopLogits(
+                        response.topLogits,
+                        actualToken: token,
+                        maximumCount: min(
+                            options.topK,
+                            MLXFastConstants.vocabSize
+                        )
+                    )
+                    let expectedToken = tracedExpectedToken
+                    let expectedLogit: Double
+                    let expectedRank: Int
+                    if let workerLogit = response.expectedTokenLogit,
+                       let workerRank = response.expectedTokenRank
+                    {
+                        guard workerLogit.isFinite,
+                              workerRank > 0,
+                              workerRank <= MLXFastConstants.vocabSize
+                        else {
+                            throw MLXFastError.invalidInput(
+                                "runtime worker trace returned invalid expected-token diagnostics"
+                            )
+                        }
+                        expectedLogit = workerLogit
+                        expectedRank = workerRank
+                        if workerRank <= logits.count {
+                            guard logits[workerRank - 1].token
+                                == expectedToken,
+                                  logits[workerRank - 1].logit
+                                    == workerLogit
+                            else {
+                                throw MLXFastError.invalidInput(
+                                    "runtime worker trace expected-token diagnostics disagree with top_logits"
+                                )
+                            }
+                        }
+                    } else {
+                        guard let expectedIndex = logits.firstIndex(
+                            where: { $0.token == expectedToken }
+                        ) else {
+                            throw MLXFastError.invalidInput(
+                                "runtime worker trace omitted expected-token diagnostics"
+                            )
+                        }
+                        expectedLogit = logits[expectedIndex].logit
+                        expectedRank = expectedIndex + 1
+                    }
+                    let actualLogit = logits[0].logit
+                    let topLogitMargin = response.topLogitMargin
+                        ?? (logits.count >= 2
+                            ? logits[0].logit - logits[1].logit
+                            : nil)
+                    if let topLogitMargin {
+                        guard topLogitMargin.isFinite,
+                              topLogitMargin >= 0
+                        else {
+                            throw MLXFastError.invalidInput(
+                                "runtime worker trace returned invalid top-logit margin"
+                            )
+                        }
+                    }
+                    return CorrectnessTraceReport(
+                        caseName: selectedCase.name,
+                        step: options.step,
+                        promptTokenCount: selectedCase.promptTokens.count,
+                        expectedToken: expectedToken,
+                        actualToken: token,
+                        matchedPrefixSteps: zip(
+                            generated,
+                            selectedCase.expectedTokens
+                        ).prefix { $0.0 == $0.1 }.count,
+                        generatedPrefix: generated,
+                        actualTokenLogit: actualLogit,
+                        expectedTokenLogit: expectedLogit,
+                        actualExpectedLogitDelta: actualLogit
+                            - expectedLogit,
+                        expectedTokenRank: expectedRank,
+                        topLogitMargin: topLogitMargin,
+                        topLogits: logits,
+                        goldenHash: golden.sha256
+                    )
+                }
+                let nextStep = currentStep + 1
+                response = try worker.teacherForcedCorrectnessStep(
+                    previousToken: token,
+                    topK: nextStep == options.step
+                        ? options.topK
+                        : nil,
+                    expectedToken: nextStep == options.step
+                        ? tracedExpectedToken
+                        : nil
+                )
+            }
+            throw MLXFastError.invalidInput(
+                "runtime worker trace failed to reach step \(options.step)"
+            )
+        }
+
+        #if !MLXFAST_TRUSTED_HARNESS
+            let config = try Gemma4Config.load(from: options.weightsPath)
+            let loader = try Gemma4WeightLoader(
+                weightsPath: options.weightsPath
+            )
+            let weightCache = Gemma4RuntimeWeightCache(
+                loader: loader,
+                config: config
+            )
+            return try traceGreedyCached(
+                testCase: selectedCase,
+                step: options.step,
+                topK: options.topK,
+                weightCache: weightCache,
+                goldenHash: golden.sha256
+            )
+        #else
+            throw MLXFastError.invalidInput(
+                "trusted correctness tracing requires the participant worker"
+            )
+        #endif
     }
 
     struct WorkerCorrectnessResult {
@@ -273,14 +428,15 @@ extension GemmaRuntime {
 
     static func validatedWorkerTopLogits(
         _ topLogits: [CorrectnessTraceLogit]?,
-        actualToken: Int
+        actualToken: Int,
+        maximumCount: Int = MLXFastConstants.correctnessTopLogits
     ) throws -> [CorrectnessTraceLogit] {
         guard let topLogits, !topLogits.isEmpty else {
             throw MLXFastError.invalidInput("runtime worker response missing top_logits")
         }
-        guard topLogits.count <= MLXFastConstants.correctnessTopLogits else {
+        guard maximumCount > 0, topLogits.count <= maximumCount else {
             throw MLXFastError.invalidInput(
-                "runtime worker returned \(topLogits.count) top_logits; maximum is \(MLXFastConstants.correctnessTopLogits)"
+                "runtime worker returned \(topLogits.count) top_logits; maximum is \(maximumCount)"
             )
         }
         guard topLogits[0].token == actualToken else {
@@ -322,7 +478,8 @@ extension GemmaRuntime {
         }
     }
 
-    static func compareTeacherForcedCached(
+    #if !MLXFAST_TRUSTED_HARNESS
+        static func compareTeacherForcedCached(
         testCase: GoldenCase,
         weightCache: Gemma4RuntimeWeightCache,
         steps: Int = MLXFastConstants.correctnessSteps,
@@ -426,7 +583,7 @@ extension GemmaRuntime {
         return compareFreeRunTokens(testCase: testCase, generated: generated)
     }
 
-    static func compareBehaviorCached(
+        static func compareBehaviorCached(
         testCase: GoldenBehaviorCase,
         weightCache: Gemma4RuntimeWeightCache
     ) throws -> CorrectnessTokenComparison {
@@ -452,7 +609,8 @@ extension GemmaRuntime {
             weightCache: weightCache
         )
         return compareBehaviorTokens(testCase: testCase, generated: generated)
-    }
+        }
+    #endif
 
     static func compareAnchorToken(
         anchor: GoldenAnchorCase,
@@ -580,7 +738,8 @@ extension GemmaRuntime {
         return expectedRank <= maxExpectedRank && expectedDelta <= maxDelta
     }
 
-    struct CorrectnessLogitDiagnostics {
+    #if !MLXFAST_TRUSTED_HARNESS
+        struct CorrectnessLogitDiagnostics {
         let topLogits: [CorrectnessTraceLogit]
         let expectedTokenLogit: Double?
         let expectedTokenRank: Int?
@@ -821,7 +980,7 @@ extension GemmaRuntime {
         )
     }
 
-    static func generateGreedyCached(
+        static func generateGreedyCached(
         promptTokens: [Int],
         steps: Int,
         weightCache: Gemma4RuntimeWeightCache,
@@ -866,6 +1025,7 @@ extension GemmaRuntime {
             token = try GemmaCorrectness.greedyToken(from: logits)
         }
         return generated
-    }
+        }
+    #endif
 
 }
