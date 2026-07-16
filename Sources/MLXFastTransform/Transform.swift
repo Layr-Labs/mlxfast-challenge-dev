@@ -176,20 +176,33 @@ public enum SwiftTransform {
             selectedKeys: textKeys,
             destinationDirectory: stagingDirectory
         )
+        let generatedCoTiledPayloads = try CoTiledAttentionPayloadCoding.writeSidecar(
+            stagingDirectory: stagingDirectory,
+            index: index,
+            stagedHeaders: stagedHeaders,
+            selectedKeys: textKeys,
+            destinationDirectory: stagingDirectory
+        )
         let (projectionOutputByteCount, projectionSizeOverflow) =
             totalTensorByteCount.addingReportingOverflow(
                 generatedProjectionMetadata.tensorByteCount
             )
-        let (outputTensorByteCount, tiedHeadSizeOverflow) =
+        let (tiedHeadOutputByteCount, tiedHeadSizeOverflow) =
             projectionOutputByteCount.addingReportingOverflow(
                 generatedTiedHeadMetadata.tensorByteCount
             )
-        guard !projectionSizeOverflow, !tiedHeadSizeOverflow else {
+        let (outputTensorByteCount, coTiledSizeOverflow) =
+            tiedHeadOutputByteCount.addingReportingOverflow(
+                generatedCoTiledPayloads.tensorByteCount
+            )
+        guard !projectionSizeOverflow, !tiedHeadSizeOverflow, !coTiledSizeOverflow else {
             throw MLXFastError.invalidInput("transformed tensor byte count overflows Int")
         }
         let generatedWeightMap = generatedProjectionMetadata.weightMap.merging(
             generatedTiedHeadMetadata.weightMap
         ) { _, _ in
+            preconditionFailure("generated metadata tensor names collide")
+        }.merging(generatedCoTiledPayloads.weightMap) { _, _ in
             preconditionFailure("generated metadata tensor names collide")
         }
 
@@ -245,10 +258,12 @@ public enum SwiftTransform {
             outputPath: outputDirectory.path,
             denseTensorCount: copiedTensors
                 + generatedProjectionMetadata.tensorCount
-                + generatedTiedHeadMetadata.tensorCount,
+                + generatedTiedHeadMetadata.tensorCount
+                + generatedCoTiledPayloads.tensorCount,
             denseShardCount: textKeysByShard.count
                 + generatedProjectionMetadata.shardCount
-                + generatedTiedHeadMetadata.shardCount,
+                + generatedTiedHeadMetadata.shardCount
+                + generatedCoTiledPayloads.shardCount,
             configPath: configPath.path,
             indexPath: indexPath.path
         )
