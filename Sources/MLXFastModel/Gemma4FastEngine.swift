@@ -153,6 +153,8 @@ final class Gemma4FastLayer {
     let fusedGateUp: FusedGateUpProjection?
     let fusedGateUpPostTail: (@Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray)?
     let fusedGateUpActivation: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+    let pairedGateUpPrefill: PairedGateUpPrefillProjection?
+    let mlpDownProjection: FastQuantizedProjection
     let indexedDown: IndexedDownProjection?
     let indexedDownPostTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let useFusedGateUpActivation: Bool
@@ -367,6 +369,11 @@ final class Gemma4FastLayer {
         let gateP = FastQuantizedProjection(gate)
         let upP = FastQuantizedProjection(up)
         let downP = FastQuantizedProjection(down)
+        self.pairedGateUpPrefill = PairedGateUpPrefillProjection(
+            gate: gateP,
+            up: upP
+        )
+        self.mlpDownProjection = downP
         let gelu = fastGeluApproximate
         let body: @Sendable (MLXArray) -> MLXArray = { x in
             downP(gelu(gateP(x)) * upP(x))
@@ -846,7 +853,23 @@ final class Gemma4FastLayer {
             residual2 = out
             fusedPreFFNNormalized = nil
         }
-        if B == 1, L == 1, let fusedGateUp, let fusedGateUpPostTail {
+        if B == 1,
+           L >= 12,
+           let pairedGateUpPrefill,
+           pairedGateUpPrefill.supports(out)
+        {
+            let normalized = fusedPreFFNNormalized ?? MLXFast.rmsNorm(
+                out, weight: preFfnNormWeight, eps: eps)
+            let activated = pairedGateUpPrefill(normalized)
+            let mlp = mlpDownProjection(activated)
+            // FusedMLPToNextBoundary is a decode/exact-pair kernel whose
+            // contract is [1, 1, 5_376].  Multi-row prefill retains the stock
+            // post-FFN norm/residual path and lets the next layer normalize
+            // its input normally.
+            out = MLXFast.rmsNorm(
+                mlp, weight: postFfnNormWeight, eps: eps)
+            out = (residual2 + out) * layerScalar
+        } else if B == 1, L == 1, let fusedGateUp, let fusedGateUpPostTail {
             let normalized = fusedPreFFNNormalized ?? MLXFast.rmsNorm(
                 out, weight: preFfnNormWeight, eps: eps)
             if let fusedGateUpActivation, let indexedDown, let indexedDownPostTail {
@@ -1195,10 +1218,14 @@ final class Gemma4FastEngine {
             ProcessInfo.processInfo.environment["DARKBLOOM_TIED_HEAD_QMV"]?
                 .lowercased() ?? "0"
         )
-        let verifyTiedHead = ["1", "true", "yes", "on"].contains(
-            ProcessInfo.processInfo.environment["DARKBLOOM_VERIFY_TIED_HEAD_BITS"]?
-                .lowercased() ?? "0"
-        )
+        let verifySoftcapLUT =
+            gemma4TiedHeadSoftcapLUTVerificationRequested()
+        let verifyTiedHead = verifySoftcapLUT
+            || ["1", "true", "yes", "on"].contains(
+                ProcessInfo.processInfo.environment[
+                    "DARKBLOOM_VERIFY_TIED_HEAD_BITS"
+                ]?.lowercased() ?? "0"
+            )
         let packed13Rollback: Bool
         if let rawPacked13 = ProcessInfo.processInfo.environment[
             "DARKBLOOM_TIED_HEAD_PACKED13"
@@ -1220,12 +1247,13 @@ final class Gemma4FastEngine {
             loadedEmbedTokens
         )
         self.usePacked13TiedVocabularyHead = productionTiedHead
-            && !packed13Rollback
+            && (!packed13Rollback || verifySoftcapLUT)
         self.verifyTiedVocabularyHead = verifyTiedHead
         if productionTiedHead || tiedHeadRequested || verifyTiedHead {
             guard let tiedVocabularyHead = Gemma4TiedVocabularyHead(
                 loadedEmbedTokens,
-                packed13Metadata: tiedHeadPacked13Metadata
+                packed13Metadata: tiedHeadPacked13Metadata,
+                softcap: config.finalLogitSoftcapping
             ) else {
                 throw MLXFastError.invalidInput(
                     "opt-in tied vocabulary head requires affine 4-bit "
@@ -1417,14 +1445,13 @@ final class Gemma4FastEngine {
             hidden = gemma4LastTokenHidden(hidden)
             hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
         }
-        let cap = MLXArray(softcap)
         if let tiedVocabularyHead, usePacked13TiedVocabularyHead {
-            let candidate = tiedVocabularyHead.packed13Softcapped(
-                hidden,
-                cap: cap
-            )
+            let candidate = tiedVocabularyHead.packed13Softcapped(hidden)
             if verifyTiedVocabularyHead {
-                let stock = logitSoftcap(embedTokens.asLinear(hidden), cap)
+                let stock = logitSoftcap(
+                    embedTokens.asLinear(hidden),
+                    tiedVocabularyHead.softcap
+                )
                 tiedVocabularyHead.verifyRawFloat32(
                     candidate,
                     stock: stock,
@@ -1450,7 +1477,7 @@ final class Gemma4FastEngine {
         } else {
             logits = embedTokens.asLinear(hidden)
         }
-        return logitSoftcap(logits, cap)
+        return logitSoftcap(logits, MLXArray(softcap))
     }
 
     func canRunExactMTPPair(cache: [KVCache]) -> Bool {
@@ -1527,8 +1554,7 @@ final class Gemma4FastEngine {
             preconditionFailure("exact MTP pair final state is unavailable")
         }
         let logits = tiedVocabularyHead.exactTwoVectorPacked13Softcapped(
-            normalizedInput,
-            cap: MLXArray(softcap)
+            normalizedInput
         )
         return Gemma4MTPForward(
             logits: logits.reshaped(1, 2, logits.dim(-1)),
@@ -1614,7 +1640,6 @@ final class Gemma4FastEngine {
                 eps: eps
             )
         }
-        let cap = MLXArray(softcap)
         let logits: MLXArray
         if let tiedVocabularyHead, usePacked13TiedVocabularyHead {
             let positionLogits = (0..<postNorm.dim(1)).map {
@@ -1624,8 +1649,7 @@ final class Gemma4FastEngine {
                         0...,
                         positionIndex..<(positionIndex + 1),
                         0...
-                    ],
-                    cap: cap
+                    ]
                 )
             }
             logits = positionLogits.count == 1
@@ -1634,7 +1658,7 @@ final class Gemma4FastEngine {
         } else {
             logits = logitSoftcap(
                 embedTokens.asLinear(postNorm),
-                cap
+                MLXArray(softcap)
             )
         }
         return Gemma4MTPForward(
