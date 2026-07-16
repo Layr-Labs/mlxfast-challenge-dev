@@ -66,11 +66,14 @@ jobs:
           set -euo pipefail
           while IFS= read -r -d '' script; do
             case "$(head -n 1 "${script}")" in
-              '#!/usr/bin/env bash')
+              '#!/usr/bin/env bash'|'#!/bin/bash')
                 bash -n "${script}"
                 ;;
-              '#!/usr/bin/env sh')
+              '#!/usr/bin/env sh'|'#!/bin/sh')
                 sh -n "${script}"
+                ;;
+              '#!/usr/bin/env zsh'|'#!/bin/zsh')
+                zsh -n "${script}"
                 ;;
               *)
                 echo "unsupported shell script interpreter: ${script}" >&2
