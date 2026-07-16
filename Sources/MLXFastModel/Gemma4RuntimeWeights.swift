@@ -112,11 +112,16 @@ public final class Gemma4RuntimeWeightCache {
 
         let validatedTiedHeadPacked13Metadata =
             try validateGemma4TiedHeadPacked13MetadataBytes(denseStore: denseStore)
+        // Raw-byte proof (no MLX, no GPU) that every transform-authored packed
+        // projection index stream reconstructs its stem's U16 index tensor.
+        let validatedPackedProjectionMetadata =
+            try validateGemma4PackedProjectionMetadataBytes(denseStore: denseStore)
         let loadedWeights = try loadRuntimeWeightArrays(denseStore: denseStore)
         let partition = try partitionRuntimeWeights(
             loadedWeights,
             expectedIndexedStems: expectedIndexedProjectionStems(config: config),
-            validatedTiedHeadPacked13Metadata: validatedTiedHeadPacked13Metadata
+            validatedTiedHeadPacked13Metadata: validatedTiedHeadPacked13Metadata,
+            validatedPackedProjectionMetadata: validatedPackedProjectionMetadata
         )
         let weights = partition.modelParameters
 
@@ -133,12 +138,16 @@ public final class Gemma4RuntimeWeightCache {
         // conversion pass is a no-op here and is intentionally omitted.
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
         eval(model)
-        eval(partition.indexedMetadata.values.flatMap { [$0.indices, $0.lut] })
+        eval(
+            partition.indexedMetadata.values.flatMap { [$0.indices, $0.lut] }
+                + partition.packedIndexMetadata.values.map(\.bytes)
+        )
         // The constructor's decode warmup consumes the packed head before the
         // worker handshake and materializes these arrays. Avoid a standalone
         // GPU command before FastEngine finishes its host-side preparation.
         try model.prepareFastEngine(
             indexedMetadata: partition.indexedMetadata,
+            packedIndexMetadata: partition.packedIndexMetadata,
             tiedHeadPacked13Metadata: partition.tiedHeadPacked13Metadata
         )
         return model
@@ -300,6 +309,7 @@ struct RuntimeWeightNameTracker {
 struct RuntimeWeightPartition {
     let modelParameters: [String: MLXArray]
     let indexedMetadata: [String: IndexedAffineMetadata]
+    let packedIndexMetadata: [String: Gemma4PackedQKVIndexMetadata]
     let tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata?
 }
 
@@ -328,15 +338,20 @@ func partitionRuntimeWeights(
     _ loaded: [String: MLXArray],
     expectedIndexedStems: Set<String>,
     validatedTiedHeadPacked13Metadata:
-        ValidatedGemma4TiedHeadPacked13Metadata? = nil
+        ValidatedGemma4TiedHeadPacked13Metadata? = nil,
+    validatedPackedProjectionMetadata:
+        [String: ValidatedGemma4PackedProjectionMetadata] = [:]
 ) throws -> RuntimeWeightPartition {
     let tiedHeadPackedIndicesName =
         "model.embed_tokens.tied_head_packed13_indices"
     let tiedHeadLUTName = "model.embed_tokens.tied_head_packed13_lut"
     let indicesSuffix = ".metadata_indices"
     let lutSuffix = ".metadata_lut"
+    let packedFixed12Suffix = Gemma4PackedProjectionMetadataLayout.fixed12Suffix
+    let packedFixed13Suffix = Gemma4PackedProjectionMetadataLayout.fixed13Suffix
     var modelParameters: [String: MLXArray] = [:]
     var metadataParts: [String: RuntimeIndexedMetadataParts] = [:]
+    var packedParts: [String: (array: MLXArray, indexBits: Int)] = [:]
     var tiedHeadPackedIndices: MLXArray?
     var tiedHeadLUT: MLXArray?
 
@@ -352,6 +367,20 @@ func partitionRuntimeWeights(
         } else if name.hasSuffix(lutSuffix) {
             let stem = String(name.dropLast(lutSuffix.count))
             metadataParts[stem, default: RuntimeIndexedMetadataParts()].lut = array
+        } else if name.hasSuffix(packedFixed12Suffix) {
+            let stem = String(name.dropLast(packedFixed12Suffix.count))
+            guard packedParts.updateValue((array, 12), forKey: stem) == nil else {
+                throw MLXFastError.invalidInput(
+                    "duplicate packed projection metadata formats for \(stem)"
+                )
+            }
+        } else if name.hasSuffix(packedFixed13Suffix) {
+            let stem = String(name.dropLast(packedFixed13Suffix.count))
+            guard packedParts.updateValue((array, 13), forKey: stem) == nil else {
+                throw MLXFastError.invalidInput(
+                    "duplicate packed projection metadata formats for \(stem)"
+                )
+            }
         } else {
             modelParameters[name] = array
         }
@@ -395,9 +424,15 @@ func partitionRuntimeWeights(
     }
 
     guard !metadataParts.isEmpty else {
+        guard packedParts.isEmpty, validatedPackedProjectionMetadata.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "packed projection metadata is present without indexed metadata"
+            )
+        }
         return RuntimeWeightPartition(
             modelParameters: modelParameters,
             indexedMetadata: [:],
+            packedIndexMetadata: [:],
             tiedHeadPacked13Metadata: tiedHeadPacked13Metadata
         )
     }
@@ -453,9 +488,54 @@ func partitionRuntimeWeights(
         )
         indexedMetadata[stem] = IndexedAffineMetadata(indices: indices, lut: lut)
     }
+
+    // Bind loaded packed index arrays to their raw-byte validation
+    // descriptors. Every packed array must have been validated (fail-closed),
+    // every validated stream must have loaded (no silent drops), and its
+    // logical geometry must match the stem's indexed metadata exactly.
+    var packedIndexMetadata: [String: Gemma4PackedQKVIndexMetadata] = [:]
+    packedIndexMetadata.reserveCapacity(packedParts.count)
+    for stem in packedParts.keys.sorted() {
+        guard let part = packedParts[stem] else { continue }
+        guard let validated = validatedPackedProjectionMetadata[stem],
+              validated.indexBits == part.indexBits
+        else {
+            throw MLXFastError.invalidInput(
+                "packed projection metadata was not validated from raw bytes for \(stem)"
+            )
+        }
+        guard let metadata = indexedMetadata[stem] else {
+            throw MLXFastError.invalidInput(
+                "packed projection metadata has no indexed companion for \(stem)"
+            )
+        }
+        guard part.array.dtype == .uint8,
+              part.array.shape == [validated.rows, validated.bytesPerRow],
+              metadata.indices.shape == [validated.rows, validated.groupsPerRow],
+              metadata.lut.size == validated.lutCount
+        else {
+            throw MLXFastError.invalidInput(
+                "packed projection metadata has invalid dtype or shape for \(stem)"
+            )
+        }
+        packedIndexMetadata[stem] = Gemma4PackedQKVIndexMetadata(
+            bytes: part.array,
+            indexBits: part.indexBits
+        )
+    }
+    let unloadedPacked = Set(validatedPackedProjectionMetadata.keys)
+        .subtracting(packedIndexMetadata.keys)
+        .sorted()
+    guard unloadedPacked.isEmpty else {
+        throw MLXFastError.invalidInput(
+            "validated packed projection metadata was not loaded: "
+                + unloadedPacked.joined(separator: ", ")
+        )
+    }
     return RuntimeWeightPartition(
         modelParameters: modelParameters,
         indexedMetadata: indexedMetadata,
+        packedIndexMetadata: packedIndexMetadata,
         tiedHeadPacked13Metadata: tiedHeadPacked13Metadata
     )
 }
