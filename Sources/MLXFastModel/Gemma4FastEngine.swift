@@ -754,7 +754,7 @@ final class Gemma4FastLayer {
             }
         }
 
-        let attention: MLXArray
+        let mergedAttention: MLXArray
         let canUseStagedSlidingPrefill = B == 1
             && L == 512
             && offset == 0
@@ -767,11 +767,23 @@ final class Gemma4FastLayer {
             && (gemma4StagedSlidingPrefillAttentionEnabled
                 || gemma4VerifyStagedSlidingPrefillAttentionBits)
         {
+            // Merges head-major [1, 32, 512, 256] attention into the
+            // token-major [1, 512, 32*256] layout o_proj consumes. The
+            // reshape of the transposed view materializes a copy.
+            func mergeHeadMajor(_ attention: MLXArray) -> MLXArray {
+                attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            }
+            // With token-major emission enabled the staged kernel already
+            // writes [1, 512, 32*256] directly (identical values, different
+            // addresses), so no transpose-reshape copy is needed here.
             let candidate = gemma4StagedSlidingPrefill512(
                 queries: queries,
                 keys: keys,
                 values: values
             )
+            let mergedCandidate = gemma4StagedPrefillTokenMajorOutputEnabled
+                ? candidate
+                : mergeHeadMajor(candidate)
             if gemma4VerifyStagedSlidingPrefillAttentionBits {
                 let reference = MLXFast.scaledDotProductAttention(
                     queries: queries,
@@ -780,43 +792,52 @@ final class Gemma4FastLayer {
                     scale: scale,
                     mask: attentionMask
                 )
+                // Compare raw bits in the staged kernel's own output layout.
+                // For token-major emission the reference is relaid out with
+                // the same transpose+reshape merge -- a bijective relayout,
+                // so every element is still compared exactly once.
+                let comparisonReference = gemma4StagedPrefillTokenMajorOutputEnabled
+                    ? mergeHeadMajor(reference)
+                    : reference
                 let matches = arrayEqual(
                     candidate.view(dtype: .uint16),
-                    reference.view(dtype: .uint16)
+                    comparisonReference.view(dtype: .uint16)
                 )
                 eval(matches)
                 precondition(
                     matches.item(Bool.self),
                     "staged sliding prefill attention differs from stock SDPA"
                 )
-                attention = gemma4StagedSlidingPrefillAttentionEnabled
-                    ? candidate
-                    : reference
+                mergedAttention = gemma4StagedSlidingPrefillAttentionEnabled
+                    ? mergedCandidate
+                    : mergeHeadMajor(reference)
             } else {
-                attention = candidate
+                mergedAttention = mergedCandidate
             }
-        } else if L > 1 && offset > 0 {
-            attention = gemma4FastAttentionFallback(
-                queries: queries,
-                keys: keys,
-                values: values,
-                scale: scale,
-                mask: attentionMask
-            )
         } else {
-            // Prefer library SDPA: D=256 sliding uses fused vector kernel;
-            // D=512 full uses its internal fallback. Compiling our own D=512
-            // fallback changes the public near-tie reduction order.
-            attention = MLXFast.scaledDotProductAttention(
-                queries: queries,
-                keys: keys,
-                values: values,
-                scale: scale,
-                mask: attentionMask
-            )
+            let attention: MLXArray
+            if L > 1 && offset > 0 {
+                attention = gemma4FastAttentionFallback(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    scale: scale,
+                    mask: attentionMask
+                )
+            } else {
+                // Prefer library SDPA: D=256 sliding uses fused vector kernel;
+                // D=512 full uses its internal fallback. Compiling our own D=512
+                // fallback changes the public near-tie reduction order.
+                attention = MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    scale: scale,
+                    mask: attentionMask
+                )
+            }
+            mergedAttention = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         }
-
-        let mergedAttention = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         let attnOut: MLXArray
         if B == 1, L == 1, let indexedOutput {
             attnOut = indexedOutput(mergedAttention)
