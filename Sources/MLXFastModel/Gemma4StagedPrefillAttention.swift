@@ -2,19 +2,22 @@ import MLX
 
 /// Exact-shape MPP prototype for Gemma 4 sliding prefill.
 ///
-/// One 128-thread threadgroup owns one `(query head, 16-query)` tile. QK
-/// writes a complete 16x512 BF16 score tile to threadgroup memory, the same
+/// One 128-thread threadgroup owns one `(query head, 32-query)` tile. QK
+/// writes a complete 32x512 BF16 score tile to threadgroup memory, the same
 /// four-SIMD/4-read reduction topology as MLX's precise block softmax rewrites
 /// that tile in place, and PV consumes it without materializing either scores
-/// or probabilities in device memory.
+/// or probabilities in device memory. The 32-row tile exactly occupies the
+/// M5's 32 KiB threadgroup-memory budget and matches Apple's recommended
+/// 32x32 MPP simdgroup tile starting point while halving threadgroup count and
+/// doubling K/V reuse versus the original 16-row implementation.
 private let gemma4StagedSlidingPrefill512Kernel = MLXFast.metalKernel(
-    name: "gemma4_staged_sliding_prefill_16x512x256_mpp_v1",
+    name: "gemma4_staged_sliding_prefill_32x512x256_mpp_v2",
     inputNames: ["queries", "keys", "values"],
     outputNames: ["output"],
     source: """
         constexpr uint kLength = 512;
         constexpr uint kHeadDim = 256;
-        constexpr uint kQueryRows = 16;
+        constexpr uint kQueryRows = 32;
         constexpr uint kQHeads = 32;
         constexpr uint kKVHeads = 16;
         constexpr uint kGQAFactor = 2;
@@ -40,7 +43,7 @@ private let gemma4StagedSlidingPrefill512Kernel = MLXFast.metalKernel(
         // Apple's MPP guidance recommends relying on cache instead of staging
         // GEMM sources through threadgroup memory.
         constexpr auto qk_descriptor = mpp::tensor_ops::matmul2d_descriptor(
-            16, 32, 256, false, true, false,
+            32, 32, 256, false, true, false,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
         mpp::tensor_ops::matmul2d<
             qk_descriptor, metal::execution_simdgroup> qk;
@@ -56,7 +59,7 @@ private let gemma4StagedSlidingPrefill512Kernel = MLXFast.metalKernel(
                 + static_cast<int64_t>(key_start) * keys_strides[2];
             auto q_tensor = metal::tensor(
                 mutable_queries,
-                metal::dextents<int, 2>{256, 16},
+                metal::dextents<int, 2>{256, 32},
                 metal::array<int64_t, 2>{
                     queries_strides[3], queries_strides[2]});
             auto k_tensor = metal::tensor(
@@ -65,7 +68,7 @@ private let gemma4StagedSlidingPrefill512Kernel = MLXFast.metalKernel(
                 metal::array<int64_t, 2>{keys_strides[3], keys_strides[2]});
             auto score_tensor = metal::tensor(
                 scores + key_start,
-                metal::dextents<int, 2>{32, 16},
+                metal::dextents<int, 2>{32, 32},
                 metal::array<int, 2>{1, 512});
             qk.run(q_tensor, k_tensor, score_tensor);
         }
@@ -154,9 +157,9 @@ private let gemma4StagedSlidingPrefill512Kernel = MLXFast.metalKernel(
 
         // Consume the on-chip BF16 probabilities directly. Four SIMDgroups
         // cover 32 output columns each, in two waves, and write only the final
-        // 16x256 attention output to device memory.
+        // 32x256 attention output to device memory.
         constexpr auto pv_descriptor = mpp::tensor_ops::matmul2d_descriptor(
-            16, 32, 512, false, false, false,
+            32, 32, 512, false, false, false,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
         mpp::tensor_ops::matmul2d<
             pv_descriptor, metal::execution_simdgroup> pv;
@@ -169,7 +172,7 @@ private let gemma4StagedSlidingPrefill512Kernel = MLXFast.metalKernel(
                 + static_cast<int64_t>(value_start) * values_strides[3];
             auto probability_tensor = metal::tensor(
                 scores,
-                metal::dextents<int, 2>{512, 16},
+                metal::dextents<int, 2>{512, 32},
                 metal::array<int, 2>{1, 512});
             auto value_tensor = metal::tensor(
                 mutable_values,
@@ -180,7 +183,7 @@ private let gemma4StagedSlidingPrefill512Kernel = MLXFast.metalKernel(
                 + value_start;
             auto output_tensor = metal::tensor(
                 output_tile,
-                metal::dextents<int, 2>{32, 16},
+                metal::dextents<int, 2>{32, 32},
                 metal::array<int, 2>{1, 256});
             pv.run(probability_tensor, value_tensor, output_tensor);
         }
@@ -207,7 +210,7 @@ func gemma4StagedSlidingPrefill512(
 
     return gemma4StagedSlidingPrefill512Kernel(
         [queries, keys, values],
-        grid: (128, 32, 32),
+        grid: (128, 32, 16),
         threadGroup: (128, 1, 1),
         outputShapes: [[1, 32, 512, 256]],
         outputDTypes: [.bfloat16]
