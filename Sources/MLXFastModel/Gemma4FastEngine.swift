@@ -614,16 +614,49 @@ final class Gemma4FastLayer {
            let fusedAttentionRMS,
            let combinedCache
         {
-            let prepared = fusedAttentionRMS.callCombined(
-                rawQueries: rawQueries,
-                rawKeys: rawKeys,
-                rawValues: rawValues,
-                offset: offset
-            )
-            queries = prepared.queries
-            let updated = combinedCache.updateCombined(prepared.combinedKV)
-            keys = updated.0
-            values = updated.1
+            if gemma4DecodeKVDirectWriteEnabled(),
+               let target = combinedCache.directDecodeWriteTarget()
+            {
+                // The preparation kernel writes the K/V rows straight into the
+                // combined slab at `target.position`; no slice update dispatch.
+                queries = fusedAttentionRMS.callCombinedDecodeDirect(
+                    rawQueries: rawQueries,
+                    rawKeys: rawKeys,
+                    rawValues: rawValues,
+                    offset: offset,
+                    cacheStorage: target.storage,
+                    writePosition: target.position,
+                    capacity: target.storage.dim(3)
+                )
+                let updated = combinedCache.adoptDirectDecodeWrite(
+                    position: target.position
+                )
+                keys = updated.0
+                values = updated.1
+                if gemma4VerifyDecodeKVDirectWriteBitsEnabled() {
+                    gemma4VerifyDecodeKVDirectWrite(
+                        queries: queries,
+                        cacheStorage: target.storage,
+                        position: target.position,
+                        fusedAttentionRMS: fusedAttentionRMS,
+                        rawQueries: rawQueries,
+                        rawKeys: rawKeys,
+                        rawValues: rawValues,
+                        offset: offset
+                    )
+                }
+            } else {
+                let prepared = fusedAttentionRMS.callCombined(
+                    rawQueries: rawQueries,
+                    rawKeys: rawKeys,
+                    rawValues: rawValues,
+                    offset: offset
+                )
+                queries = prepared.queries
+                let updated = combinedCache.updateCombined(prepared.combinedKV)
+                keys = updated.0
+                values = updated.1
+            }
         } else if usesFusedAttentionPreparation, let fusedAttentionRMS {
             let prepared = fusedAttentionRMS(
                 rawQueries: rawQueries,
