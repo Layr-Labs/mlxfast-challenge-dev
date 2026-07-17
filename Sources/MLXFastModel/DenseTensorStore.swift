@@ -38,6 +38,7 @@ public final class DenseTensorStore {
     /// beyond one tensor.
     func forEachMaterializedTensor(
         inShard shard: String,
+        including shouldMaterialize: (DenseTensorRecord) -> Bool = { _ in true },
         _ body: (DenseTensorRecord, MaterializedTensor) throws -> Void
     ) throws {
         let records = recordsByName.values
@@ -58,7 +59,7 @@ public final class DenseTensorStore {
         defer {
             try? handle.close()
         }
-        for record in records {
+        for record in records where shouldMaterialize(record) {
             try autoreleasepool {
                 let tensor = try materializeTensor(
                     name: record.name,

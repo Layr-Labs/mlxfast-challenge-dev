@@ -185,7 +185,8 @@ final class Gemma4FastLayer {
         vIndexedMetadata: IndexedAffineMetadata?,
         gateIndexedMetadata: IndexedAffineMetadata?,
         upIndexedMetadata: IndexedAffineMetadata?,
-        downIndexedMetadata: IndexedAffineMetadata?
+        downIndexedMetadata: IndexedAffineMetadata?,
+        coTiledAttentionPayload: Gemma4CoTiledAttentionPayload? = nil
     ) {
         self.isSliding = isSliding
         self.nHeads = nHeads
@@ -239,7 +240,10 @@ final class Gemma4FastLayer {
                 v: vProjection,
                 qMetadata: qIndexedMetadata,
                 kMetadata: kIndexedMetadata,
-                vMetadata: vIndexedMetadata
+                vMetadata: vIndexedMetadata,
+                coTiledPayload: coTiledAttentionPayload?.kind == .slidingQKV
+                    ? coTiledAttentionPayload
+                    : nil
             )
         } else {
             self.fusedQKV = nil
@@ -267,7 +271,10 @@ final class Gemma4FastLayer {
                 q: qProjection,
                 k: kProjection,
                 qMetadata: qIndexedMetadata,
-                kMetadata: kIndexedMetadata
+                kMetadata: kIndexedMetadata,
+                coTiledPayload: coTiledAttentionPayload?.kind == .fullQK
+                    ? coTiledAttentionPayload
+                    : nil
             )
         } else {
             self.fusedQK = nil
@@ -1146,6 +1153,7 @@ final class Gemma4FastEngine {
     init(
         model: Gemma4RuntimeModel,
         indexedMetadata: [String: IndexedAffineMetadata] = [:],
+        coTiledAttentionPayloads: [String: Gemma4CoTiledAttentionPayload] = [:],
         tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata? = nil
     ) throws {
         let config = model.configuration
@@ -1343,7 +1351,9 @@ final class Gemma4FastEngine {
                     vIndexedMetadata: indexedMetadata["\(prefix).self_attn.v_proj"],
                     gateIndexedMetadata: indexedMetadata["\(prefix).mlp.gate_proj"],
                     upIndexedMetadata: indexedMetadata["\(prefix).mlp.up_proj"],
-                    downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"]
+                    downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"],
+                    coTiledAttentionPayload:
+                        coTiledAttentionPayloads["\(prefix).self_attn"]
                 )
             )
         }
