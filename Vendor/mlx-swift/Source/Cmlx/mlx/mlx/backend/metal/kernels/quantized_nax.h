@@ -692,6 +692,89 @@ struct QuantizedBlockLoader {
   }
 };
 
+// Exact affine-4/group-64 loader used by Gemma 4's aligned BF16 NAX QMM.
+// Two adjacent SIMD lanes stage the low/high 32 values of one output row.
+// Broadcast the row's shared scale and bias from the even lane while keeping
+// the stock low/high-nibble dequantization and destination order unchanged.
+// Gemma's group-64 row stride and the lane's 16-byte half-row are both
+// 16-byte aligned, so one uint4 load replaces sixteen scalar device reads.
+template <short dst_ld>
+struct QuantizedBlockLoader<
+    bfloat16_t,
+    64,
+    64,
+    dst_ld,
+    1,
+    128,
+    64,
+    4> {
+  static_assert(dst_ld >= 64, "Gemma 4 BK=64 loader requires a full row");
+
+  const short row;
+  const ushort lane;
+  threadgroup bfloat16_t* dst;
+  const device uint8_t* src;
+  const device bfloat16_t* scales;
+  const device bfloat16_t* biases;
+
+  QuantizedBlockLoader(
+      const device uint8_t* src_,
+      const device bfloat16_t* scales_,
+      const device bfloat16_t* biases_,
+      const int src_ld_,
+      threadgroup bfloat16_t* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      : row((simd_group_id * 32 + simd_lane_id) / 2),
+        lane(simd_lane_id),
+        dst(dst_ + row * dst_ld + (simd_lane_id % 2) * 32),
+        src(src_ + row * src_ld_ / 2 + (simd_lane_id % 2) * 16),
+        scales(scales_ + row * src_ld_ / 64),
+        biases(biases_ + row * src_ld_ / 64) {}
+
+  void load_unsafe() const {
+    bfloat16_t scale = bfloat16_t(0);
+    bfloat16_t bias = bfloat16_t(0);
+    if ((lane & 1) == 0) {
+      scale = *scales;
+      bias = *biases;
+    }
+    const ushort leader = lane - (lane & 1);
+    scale = metal::simd_shuffle(scale, leader);
+    bias = metal::simd_shuffle(bias, leader);
+    const bfloat16_t half_scale =
+        scale / static_cast<bfloat16_t>(16.0f);
+    const uint4 packed =
+        *reinterpret_cast<const device uint4*>(src);
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < 16; ++i) {
+      const uint8_t byte = static_cast<uint8_t>(
+          (packed[i / 4] >> ((i % 4) * 8)) & 0xff);
+      dst[2 * i] = scale * (byte & 0x0f) + bias;
+      dst[2 * i + 1] = half_scale * (byte & 0xf0) + bias;
+    }
+  }
+
+  // Every Gemma projection N is 64-aligned, so ranked inference takes the
+  // unsafe path.  Keep the generic loader's tail contract for completeness.
+  void load_safe(short2 src_tile_dim) const {
+    if (row >= src_tile_dim.x) {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < 32; ++i) {
+        dst[i] = bfloat16_t(0);
+      }
+      return;
+    }
+    load_unsafe();
+  }
+
+  void next() {
+    src += 32;
+    scales++;
+    biases++;
+  }
+};
+
 template <
     typename T,
     short BROWS,
