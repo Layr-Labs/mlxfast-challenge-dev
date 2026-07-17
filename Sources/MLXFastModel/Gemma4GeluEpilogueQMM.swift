@@ -746,10 +746,46 @@ struct Gemma4PrefillGeluEpilogueMLPTail: @unchecked Sendable {
             self.bn32Gate = nil
             self.bn32NormalizationHead = nil
         }
-        self.tail = compile(shapeless: true) { act, residual in
-            let mlp = downP(act)
-            let postNormalized = MLXFast.rmsNorm(mlp, weight: postNormWeight, eps: eps)
-            return (residual + postNormalized) * layerScalar
+        // Our BN32 plain-qmm dispatch for the DOWN projection
+        // (DARKBLOOM_PREFILL_BN32_QMM, default on). The compiled tail splits
+        // at the qmm boundary for the same CustomKernel reason: the down qmm
+        // runs as an eager custom kernel, bit-exact against the stock
+        // quantizedMM it replaces, and the compiled postTail sees
+        // bit-identical inputs. The gate family is owned by the promoted
+        // BN32 gate route above (no double dispatch).
+        if gemma4PrefillBN32QMMEnabled, gemma4PrefillBN32QMMSupports(downP) {
+            let postTail = compile(shapeless: true) { mlp, residual in
+                let postNormalized = MLXFast.rmsNorm(mlp, weight: postNormWeight, eps: eps)
+                return (residual + postNormalized) * layerScalar
+            }
+            self.tail = { act, residual in
+                let rows = act.shape[act.ndim - 2]
+                let cols = act.shape[act.ndim - 1]
+                let mlp = gemma4PrefillBN32QMM(
+                    x: act.reshaped([rows, cols]),
+                    weight: downP.weight,
+                    scales: downP.scales,
+                    biases: downP.biases!
+                )
+                if gemma4VerifyPrefillBN32QMMBits {
+                    let reference = downP(act.reshaped([rows, cols]))
+                    let matches = arrayEqual(
+                        mlp.view(dtype: .uint16),
+                        reference.view(dtype: .uint16))
+                    eval(matches)
+                    precondition(
+                        matches.item(Bool.self),
+                        "prefill BN32 down QMM differs from stock quantizedMM")
+                }
+                return postTail(
+                    mlp.reshaped([1, rows, downP.weight.dim(0)]), residual)
+            }
+        } else {
+            self.tail = compile(shapeless: true) { act, residual in
+                let mlp = downP(act)
+                let postNormalized = MLXFast.rmsNorm(mlp, weight: postNormWeight, eps: eps)
+                return (residual + postNormalized) * layerScalar
+            }
         }
     }
 
