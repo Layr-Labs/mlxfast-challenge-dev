@@ -1016,7 +1016,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    const bool preoverwrite_rendezvous_only = false>
 METAL_FUNC void qmm_t_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1100,7 +1101,16 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
       for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // The exact Gemma BK=128 path only needs all SIMDgroups to finish
+        // consuming the previous staged tile before its storage is reused.
+        // Its fragment loads and MPP operation have already completed before
+        // control reaches this rendezvous, so no threadgroup-memory fence is
+        // required here. Generic instantiations retain their original fence.
+        if constexpr (preoverwrite_rendezvous_only) {
+          threadgroup_barrier(mem_flags::mem_none);
+        } else {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
@@ -1362,7 +1372,17 @@ template <
   }
   if constexpr (gemma4_bk128) {
     if (K == 5376 || K == 8192 || K == 16384 || K == 21504) {
-      qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, 128, BN, WM, WN>(
+      qmm_t_nax_tgp_impl<
+          T,
+          group_size,
+          bits,
+          aligned_N,
+          BM,
+          128,
+          BN,
+          WM,
+          WN,
+          true>(
           w, scales, biases, x, y, Ws, K, N, M, logical_tid, lid, simd_gid,
           simd_lid);
       return;
