@@ -1003,7 +1003,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    const bool pad_bk = true>
 METAL_FUNC void qmm_t_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1026,7 +1027,17 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  // Padding normally separates adjacent weight rows across threadgroup-memory
+  // banks.  The exact Gemma prefill path can instead trade that separation for
+  // a 16 KiB allocation, crossing the next resident-threadgroup threshold.
+  // Keep the compact form impossible for every other template instantiation.
+  static_assert(
+      pad_bk ||
+          (metal::is_same_v<T, bfloat16_t> && group_size == 64 && bits == 4 &&
+           aligned_N && BM == 64 && BK == 128 && BN == 64 && WM == 2 &&
+           WN == 2),
+      "Unpadded BK is restricted to Gemma 4's exact BK=128 prefill tile");
+  constexpr int BK_padded = BK + (pad_bk ? 16 / sizeof(T) : 0);
 
   using loader_w_t = QuantizedBlockLoader<
       T,
@@ -1301,8 +1312,12 @@ template <
       metal::is_same_v<T, bfloat16_t> && group_size == 64 && bits == 4 &&
       aligned_N && !batched && BM == 64 && BK == 64 && BN == 64 && WM == 2 &&
       WN == 2;
-  constexpr int scratch_bk = gemma4_bk128 ? 128 : BK;
-  constexpr int BK_padded = (scratch_bk + 16 / sizeof(T));
+  // This array determines pipeline occupancy even when a runtime branch uses
+  // less of it.  The exact Gemma pipeline therefore has no hidden 136-stride
+  // object: compact BK=128 consumes exactly 64 * 128 * 2 = 16,384 bytes, while
+  // its generic BK=64 fallback still uses its normal padded stride of 72.
+  constexpr int BK_padded =
+      gemma4_bk128 ? 128 : (BK + 16 / sizeof(T));
 
   threadgroup T Ws[BN * BK_padded];
 
@@ -1348,8 +1363,10 @@ template <
         tid);
   }
   if constexpr (gemma4_bk128) {
-    if (K == 5376 || K == 8192 || K == 16384 || K == 21504) {
-      qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, 128, BN, WM, WN>(
+    if (M == 512 &&
+        (K == 5376 || K == 8192 || K == 16384 || K == 21504)) {
+      qmm_t_nax_tgp_impl<
+          T, group_size, bits, aligned_N, BM, 128, BN, WM, WN, false>(
           w, scales, biases, x, y, Ws, K, N, M, logical_tid, lid, simd_gid,
           simd_lid);
       return;
