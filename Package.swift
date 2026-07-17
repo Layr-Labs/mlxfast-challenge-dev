@@ -55,8 +55,13 @@ let package = Package(
             ],
             path: "Sources/MLXFastHarness"
         ),
-        // TODO(security): Pin the trusted-harness source scope independently of
-        // participant-controlled package and source manifests.
+        // The trusted-harness source scope (this manifest, Package.resolved,
+        // Sources/MLXFastCLI, Sources/MLXFastTrustedHarness, and
+        // Sources/MLXFastCore) is pinned independently of participant-
+        // controlled manifests: the ranked workflows byte-verify it against
+        // trusted git content before every build via
+        // .github/scripts/verify-trusted-source-scope.sh, so a submission
+        // cannot expand or repoint the targets feeding the trusted binary.
         .target(
             name: "MLXFastHarness",
             dependencies: [

@@ -852,6 +852,196 @@ func pinTrustedHarnessScriptDetectsTamper() throws {
     #expect(try run("verify", "everything") == 2)
 }
 
+// The trusted-harness source scope (manifests + timer/gates/score sources) is
+// byte-verified against trusted git content in the trusted shell before every
+// ranked build, independently of the overlay and surface-enforcement scripts,
+// and the manifests are ACL-locked against bench writes.
+@Test
+func benchmarkWorkflowsPinTrustedSourceScopeBeforeBuilding() throws {
+    let script = try String(
+        contentsOfFile: ".github/scripts/verify-trusted-source-scope.sh",
+        encoding: .utf8
+    )
+    #expect(script.contains("\"Package.swift\""))
+    #expect(script.contains("\"Package.resolved\""))
+    #expect(script.contains("\"Sources/MLXFastCLI\""))
+    #expect(script.contains("\"Sources/MLXFastTrustedHarness\""))
+    #expect(script.contains("\"Sources/MLXFastCore\""))
+    // Sources/MLXFastTransform is participant-editable by contract and is
+    // deliberately outside the trusted scope pin.
+    #expect(script.contains("Sources/MLXFastTransform is deliberately OUT of scope"))
+    #expect(!script.contains("\"Sources/MLXFastTransform\""))
+    // Byte comparison against trusted git content, through the hardened git
+    // wrapper, plus inventory and non-regular-entry checks.
+    #expect(script.contains("hardened-git.sh"))
+    #expect(script.contains("cat-file blob \"HEAD:${rel}\" | cmp -s - \"${ws_path}\""))
+    #expect(script.contains("ls-tree -r --name-only \"HEAD\" --"))
+    #expect(script.contains("find \"${BENCH_WORKSPACE}/${dir}\" -mindepth 1 ! -type d ! -type f"))
+    // The editable contract comes from the trusted ref, never the work tree,
+    // and must not overlap the trusted scope.
+    #expect(script.contains("cat-file blob \"HEAD:benchmark.json\""))
+    #expect(script.contains("overlaps trusted scope path"))
+
+    // The manifest replaces the old TODO with a pointer at the enforcement.
+    let manifest = try String(contentsOfFile: "Package.swift", encoding: .utf8)
+    #expect(!manifest.contains("TODO(security): Pin the trusted-harness source scope"))
+    #expect(manifest.contains("verify-trusted-source-scope.sh"))
+
+    for workflowPath in [
+        ".github/workflows/benchmark.yml",
+        ".github/workflows/mtp-benchmark.yml",
+    ] {
+        let workflow = try String(contentsOfFile: workflowPath, encoding: .utf8)
+        let prepareRange = try #require(
+            workflow.range(of: "- name: Prepare bench workspace"),
+            "expected prepare step in \(workflowPath)"
+        )
+        let scopeRange = try #require(
+            workflow.range(of: "- name: Verify trusted source scope"),
+            "expected source-scope step in \(workflowPath)"
+        )
+        let buildRange = try #require(
+            workflow.range(of: "- name: Build trusted CLI in bench sandbox"),
+            "expected trusted build step in \(workflowPath)"
+        )
+        // After the workspace copy exists, before anything is compiled.
+        #expect(prepareRange.lowerBound < scopeRange.lowerBound)
+        #expect(scopeRange.lowerBound < buildRange.lowerBound)
+        #expect(workflow.contains(
+            ".github/scripts/verify-trusted-source-scope.sh \"${GITHUB_WORKSPACE}\" \"${MLXFAST_JOB_WS}\""
+        ))
+        // The frozen manifests are also bench-deny ACL-locked like the driver
+        // and the contract.
+        #expect(workflow.contains("\"${MLXFAST_JOB_WS}/Package.swift\""))
+        #expect(workflow.contains("\"${MLXFAST_JOB_WS}/Package.resolved\""))
+    }
+}
+
+@Test
+func verifyTrustedSourceScopeScriptDetectsScopeTamper() throws {
+    let fm = FileManager.default
+    let scriptPath = URL(fileURLWithPath: fm.currentDirectoryPath)
+        .appendingPathComponent(".github/scripts/verify-trusted-source-scope.sh").path
+
+    let root = try temporaryDirectory()
+    defer { try? fm.removeItem(at: root) }
+    let trusted = root.appendingPathComponent("trusted")
+    let ws = root.appendingPathComponent("ws")
+
+    func run(
+        _ argv: [String], cwd: String
+    ) throws -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = argv
+        process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+    for tool in ["git", "jq"] {
+        guard try run(["sh", "-c", "command -v \(tool)"], cwd: fm.currentDirectoryPath).status == 0
+        else { return }
+    }
+
+    @discardableResult
+    func git(_ args: [String]) throws -> String {
+        let result = try run(
+            ["git", "-c", "user.email=test@test", "-c", "user.name=test",
+             "-c", "commit.gpgsign=false"] + args,
+            cwd: trusted.path
+        )
+        #expect(result.status == 0, "git \(args.joined(separator: " ")): \(result.output)")
+        return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func write(_ relative: String, _ contents: String, under base: URL) throws {
+        let url = base.appendingPathComponent(relative)
+        try fm.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try contents.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    try fm.createDirectory(at: trusted, withIntermediateDirectories: true)
+    try write("Package.swift", "// manifest v1\n", under: trusted)
+    try write("Package.resolved", "{\"pins\":[]}\n", under: trusted)
+    try write(
+        "benchmark.json",
+        #"{"editablePaths":["Sources/MLXFastModel","Sources/MLXFastTransform"]}"#,
+        under: trusted)
+    try write("Sources/MLXFastCLI/main.swift", "// cli\n", under: trusted)
+    try write("Sources/MLXFastTrustedHarness/Runtime.swift", "// harness\n", under: trusted)
+    try write("Sources/MLXFastCore/Core.swift", "// core\n", under: trusted)
+    try write("Sources/MLXFastModel/Editable.swift", "// editable v1\n", under: trusted)
+    try git(["init", "-q"])
+    try git(["add", "."])
+    try git(["commit", "-q", "-m", "trusted base"])
+
+    func resetWorkspace() throws {
+        try? fm.removeItem(at: ws)
+        try fm.copyItem(at: trusted, to: ws)
+        try? fm.removeItem(at: ws.appendingPathComponent(".git"))
+    }
+    func verify() throws -> (status: Int32, output: String) {
+        try run(["bash", scriptPath, trusted.path, ws.path], cwd: fm.currentDirectoryPath)
+    }
+
+    // Clean copy passes; an overlaid EDITABLE path does not trip the check.
+    try resetWorkspace()
+    #expect(try verify().status == 0)
+    try write("Sources/MLXFastModel/Editable.swift", "// editable v2 overlay\n", under: ws)
+    #expect(try verify().status == 0)
+
+    // A mutated manifest fails.
+    try write("Package.swift", "// manifest TAMPERED\n", under: ws)
+    let manifestTamper = try verify()
+    #expect(manifestTamper.status != 0)
+    #expect(manifestTamper.output.contains("Package.swift"))
+
+    // A new source added under a trusted dir fails (scope expansion).
+    try resetWorkspace()
+    try write("Sources/MLXFastCore/Injected.swift", "// injected\n", under: ws)
+    let injected = try verify()
+    #expect(injected.status != 0)
+    #expect(injected.output.contains("file inventory under Sources/MLXFastCore differs"))
+
+    // A mutated trusted source fails.
+    try resetWorkspace()
+    try write("Sources/MLXFastCLI/main.swift", "// cli TAMPERED\n", under: ws)
+    #expect(try verify().status != 0)
+
+    // A symlink inside the trusted scope fails (redirection).
+    try resetWorkspace()
+    try fm.removeItem(at: ws.appendingPathComponent("Sources/MLXFastTrustedHarness/Runtime.swift"))
+    try fm.createSymbolicLink(
+        atPath: ws.appendingPathComponent("Sources/MLXFastTrustedHarness/Runtime.swift").path,
+        withDestinationPath: "../MLXFastModel/Editable.swift"
+    )
+    let symlinked = try verify()
+    #expect(symlinked.status != 0)
+    #expect(symlinked.output.contains("non-regular entry"))
+
+    // A trusted contract that exposes the trusted scope as editable fails,
+    // even when the workspace bytes all match.
+    try resetWorkspace()
+    try write(
+        "benchmark.json",
+        #"{"editablePaths":["Sources/MLXFastModel","Sources/MLXFastCore"]}"#,
+        under: trusted)
+    try git(["commit", "-q", "-am", "expose trusted scope"])
+    try write(
+        "benchmark.json",
+        #"{"editablePaths":["Sources/MLXFastModel","Sources/MLXFastCore"]}"#,
+        under: ws)
+    let exposed = try verify()
+    #expect(exposed.status != 0)
+    #expect(exposed.output.contains("overlaps trusted scope path"))
+}
+
 @Test
 func hashWeightsDirectoryRejectsHardlinks() throws {
     let hashScript = try String(

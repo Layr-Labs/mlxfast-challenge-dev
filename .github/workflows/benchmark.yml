@@ -647,8 +647,21 @@ jobs:
             "${MLXFAST_JOB_WS}/.ranked-src"
           /bin/chmod +a "user:bench deny write,append,writeattr,writeextattr,delete,chown" \
             "${MLXFAST_JOB_WS}/benchmark.sh" \
-            "${MLXFAST_JOB_WS}/benchmark.json"
+            "${MLXFAST_JOB_WS}/benchmark.json" \
+            "${MLXFAST_JOB_WS}/Package.swift" \
+            "${MLXFAST_JOB_WS}/Package.resolved"
           echo "benchmark: bench workspace ready at ${MLXFAST_JOB_WS} (trusted harness surfaces ACL-locked against bench writes)"
+
+      # Pin the trusted-harness source scope independently of the
+      # participant-controlled package and source manifests: before anything
+      # builds, the manifests (Package.swift/Package.resolved) and the source
+      # trees feeding the trusted timer/gates/score binary must be
+      # byte-identical to the trusted git content, and the trusted contract
+      # must not expose them as editable. This does not rely on the overlay
+      # or surface-enforcement scripts having been correct -- it re-verifies
+      # the actual bytes the trusted build will compile.
+      - name: Verify trusted source scope
+        run: .github/scripts/verify-trusted-source-scope.sh "${GITHUB_WORKSPACE}" "${MLXFAST_JOB_WS}"
 
       # Verify the bench uid's PF network-egress lockdown BEFORE any submitted
       # code runs (build is the first bench-exec invocation of submission-built
