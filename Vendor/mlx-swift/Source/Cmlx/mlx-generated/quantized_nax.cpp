@@ -1152,6 +1152,131 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   });
 }
 
+// Persistent two-M-tile path for the promoted Gemma 4 BK=128 kernel.
+//
+// The wrapper passes the M-major logical coordinate: x selects one N64
+// weight tile and y selects one M64 activation tile. An even logical y owns
+// its M64 tile plus the adjacent M64 tile, while the paired odd logical y
+// returns uniformly in the wrapper. The active group stages each K128xN64
+// affine4 weight tile once and feeds it to two independent accumulators. Each
+// accumulator retains the stock ascending k/kk1 matmul recurrence.
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const int BM = 64,
+    const int BK = 128,
+    const int BN = 64,
+    const int WM = 2,
+    const int WN = 2>
+METAL_FUNC void qmm_t_nax_persistent_m2_bk128_tgp_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    threadgroup T* Ws,
+    const constant int& K,
+    const constant int& N,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(BM == 64 && BK == 128 && BN == 64, "requires 64x128x64 tile");
+  static_assert(WM == 2 && WN == 2, "requires four SIMD groups");
+  static_assert(group_size == 64 && bits == 4, "requires affine4 group64");
+
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using loader_w_t = QuantizedBlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      1,
+      WM * WN * SIMD_SIZE,
+      group_size,
+      bits>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+
+  auto wl = (const device uint8_t*)w;
+  wl += y_col * K_w;
+  scales += y_col * K_g;
+  biases += y_col * K_g;
+  x += y_row * static_cast<int64_t>(K);
+  y += y_row * static_cast<int64_t>(N) + y_col;
+
+  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 64;
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  const short tm = SM * (simd_gid / WN);
+  const short tn = SN * (simd_gid % WN);
+
+  constexpr bool transpose_a = false;
+  constexpr bool transpose_b = true;
+
+  NAXTile<float, TM, TN> Dtile0;
+  NAXTile<float, TM, TN> Dtile1;
+  Dtile0.clear();
+  Dtile1.clear();
+
+  const device T* x0 = x + tm * K;
+  const device T* x1 = x0 + BM * static_cast<int64_t>(K);
+
+  for (int k = 0; k < K; k += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    loader_w.load_unsafe();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    STEEL_PRAGMA_NO_UNROLL
+    for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+      NAXTile<T, TM, TK> Atile0;
+      NAXTile<T, TN, TK> Btile;
+      volatile int compiler_barrier0;
+
+      Atile0.load(x0 + kk1, K);
+      Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+      tile_matmad_nax(
+          Dtile0,
+          Atile0,
+          metal::bool_constant<transpose_a>{},
+          Btile,
+          metal::bool_constant<transpose_b>{});
+      (void)compiler_barrier0;
+
+      NAXTile<T, TM, TK> Atile1;
+      volatile int compiler_barrier1;
+      Atile1.load(x1 + kk1, K);
+      tile_matmad_nax(
+          Dtile1,
+          Atile1,
+          metal::bool_constant<transpose_a>{},
+          Btile,
+          metal::bool_constant<transpose_b>{});
+      (void)compiler_barrier1;
+    }
+
+    x0 += BK;
+    x1 += BK;
+    loader_w.next();
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  Dtile0.store(y + tm * N + tn, N);
+  Dtile1.store(y + (BM + tm) * N + tn, N);
+}
+
 template <
     typename T,
     const int group_size,
@@ -1362,6 +1487,22 @@ template <
   }
   if constexpr (gemma4_bk128) {
     if (K == 5376 || K == 8192 || K == 16384 || K == 21504) {
+      if (M >= 2 * BM && M % (2 * BM) == 0) {
+        if (logical_tid.y & 1) {
+          return;
+        }
+        qmm_t_nax_persistent_m2_bk128_tgp_impl<
+            T,
+            group_size,
+            bits,
+            BM,
+            128,
+            BN,
+            WM,
+            WN>(
+            w, scales, biases, x, y, Ws, K, N, logical_tid, simd_gid, simd_lid);
+        return;
+      }
       qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, 128, BN, WM, WN>(
           w, scales, biases, x, y, Ws, K, N, M, logical_tid, lid, simd_gid,
           simd_lid);
