@@ -938,6 +938,255 @@ METAL_FUNC void adjust_matrix_offsets(
   y += tid.z * output_stride;
 }
 
+METAL_FUNC bfloat16_t gemma4_paired_gelu_bf16(bfloat16_t gate) {
+  const bfloat16_t cubic0 = static_cast<bfloat16_t>(0.044715f) * gate;
+  const bfloat16_t cubic1 = cubic0 * gate;
+  const bfloat16_t cubic2 = cubic1 * gate;
+  const bfloat16_t inner0 = gate + cubic2;
+  const bfloat16_t inner1 =
+      static_cast<bfloat16_t>(0.7978845834732056f) * inner0;
+  const bfloat16_t tanh_value =
+      static_cast<bfloat16_t>(metal::precise::tanh(inner1));
+  const bfloat16_t shifted = static_cast<bfloat16_t>(1.0f) + tanh_value;
+  const bfloat16_t scaled = static_cast<bfloat16_t>(0.5f) * gate;
+  return scaled * shifted;
+}
+
+// Experimental Gemma 4 paired-prefill loader.  The scored route consumes a
+// 32x32 B tile per SIMDgroup from a 4-bit affine [N,K] matrix.  Construct the
+// exact NAX register fragments directly from the packed device bytes, keeping
+// the stock BF16 dequantization spelling, instead of materializing the shared
+// 64x64 BF16 tile and synchronizing the whole threadgroup around it.
+template <typename T, short TN, short TK>
+METAL_FUNC void gemma4_load_direct_btile(
+    thread NAXTile<T, TN, TK>& Btile,
+    const device uint8_t* packed_weights,
+    const thread metal::vec<T, TN * 2>& row_scales,
+    const thread metal::vec<T, TN * 2>& row_scales_div16,
+    const thread metal::vec<T, TN * 2>& row_biases,
+    const int packed_row_stride,
+    const short tn,
+    const int k_base) {
+  static_assert(metal::is_same_v<T, bfloat16_t>);
+  const short2 fragment_coord = BaseNAXFrag::get_coord();
+  const int packed_k_base = k_base >> 1;
+
+  const_for_loop<0, TN, 1>([&](auto fragment_row) {
+    const_for_loop<0, TK, 1>([&](auto fragment_col) {
+      thread auto& values =
+          Btile.template frag_at<fragment_row.value, fragment_col.value>();
+      STEEL_PRAGMA_UNROLL
+      for (short element_row = 0; element_row < 2; ++element_row) {
+        constexpr short elements_per_row = 4;
+        const short parameter_slot = fragment_row.value * 2 + element_row;
+        const int n = tn + fragment_row.value * 16 + fragment_coord.y +
+            element_row * 8;
+        const int packed_k = packed_k_base + fragment_col.value * 8 +
+            (fragment_coord.x >> 1);
+        const device uint8_t* bytes =
+            packed_weights + n * packed_row_stride + packed_k;
+        STEEL_PRAGMA_UNROLL
+        for (short byte_index = 0; byte_index < 2; ++byte_index) {
+          const uint8_t packed = bytes[byte_index];
+          const short element = element_row * elements_per_row + byte_index * 2;
+          values[element] = row_scales[parameter_slot] * (packed & 0x0f) +
+              row_biases[parameter_slot];
+          values[element + 1] =
+              row_scales_div16[parameter_slot] * (packed & 0xf0) +
+              row_biases[parameter_slot];
+        }
+      }
+    });
+  });
+}
+
+template <typename T, short TN>
+METAL_FUNC void gemma4_load_direct_btile_parameters(
+    thread metal::vec<T, TN * 2>& row_scales,
+    thread metal::vec<T, TN * 2>& row_scales_div16,
+    thread metal::vec<T, TN * 2>& row_biases,
+    const device T* scales,
+    const device T* biases,
+    const int groups_per_row,
+    const short tn,
+    const int group,
+    const ushort simd_lid) {
+  static_assert(metal::is_same_v<T, bfloat16_t>);
+  const short2 fragment_coord = BaseNAXFrag::get_coord();
+  const ushort leader =
+      ushort(2 * (fragment_coord.y & 3) + 4 * (fragment_coord.y & 4));
+
+  const_for_loop<0, TN, 1>([&](auto fragment_row) {
+    STEEL_PRAGMA_UNROLL
+    for (short element_row = 0; element_row < 2; ++element_row) {
+      const short parameter_slot = fragment_row.value * 2 + element_row;
+      const int n = tn + fragment_row.value * 16 + fragment_coord.y +
+          element_row * 8;
+      ushort scale_bits = 0;
+      ushort bias_bits = 0;
+      if (simd_lid == leader) {
+        scale_bits = as_type<ushort>(scales[n * groups_per_row + group]);
+        bias_bits = as_type<ushort>(biases[n * groups_per_row + group]);
+      }
+      // Each lane selects the leader for its own fragment row.  Unlike
+      // simd_broadcast, simd_shuffle explicitly permits a different source
+      // lane per destination lane.
+      scale_bits = simd_shuffle(scale_bits, leader);
+      bias_bits = simd_shuffle(bias_bits, leader);
+      const T scale = as_type<T>(scale_bits);
+      row_scales[parameter_slot] = scale;
+      row_scales_div16[parameter_slot] = scale / static_cast<T>(16.0f);
+      row_biases[parameter_slot] = as_type<T>(bias_bits);
+    }
+  });
+}
+
+// Scratch-free affine QMM for the compile-time-isolated `_batch_1` Gemma
+// specialization.  It is deliberately correct for every aligned-N BF16
+// group-64/4-bit shape that can share that specialization.  Only the full
+// paired gate/up invariant selects the compact GELU-product epilogue; all
+// other shapes retain the ordinary batched QMM output contract.
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const bool aligned_N,
+    const int BM = 64,
+    const int BK = 64,
+    const int BN = 64,
+    const int WM = 2,
+    const int WN = 2>
+METAL_FUNC void qmm_t_nax_direct_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    device T* compact_y,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(metal::is_same_v<T, bfloat16_t>);
+  static_assert(group_size == 64 && bits == 4 && aligned_N);
+  static_assert(BM == 64 && BK == 64 && BN == 64 && WM == 2 && WN == 2);
+
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+  const short tm = SM * (simd_gid / WN);
+  const short tn = SN * (simd_gid % WN);
+  const short sgp_sm = min(int(SM), M - (y_row + tm));
+  const bool is_unaligned_sm = (sgp_sm != SM);
+
+  auto wl = (const device uint8_t*)w;
+  wl += y_col * K_w;
+  scales += y_col * K_g;
+  biases += y_col * K_g;
+  x += (y_row + tm) * static_cast<int64_t>(K);
+  y += y_row * static_cast<int64_t>(N) + y_col;
+
+  NAXTile<float, TM, TN> Dtile;
+  Dtile.clear();
+
+  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
+    for (int k = 0; k < K; k += BK) {
+      metal::vec<T, TN * 2> direct_scales;
+      metal::vec<T, TN * 2> direct_scales_div16;
+      metal::vec<T, TN * 2> direct_biases;
+      gemma4_load_direct_btile_parameters<T, TN>(
+          direct_scales,
+          direct_scales_div16,
+          direct_biases,
+          scales,
+          biases,
+          K_g,
+          tn,
+          k / group_size,
+          simd_lid);
+
+      STEEL_PRAGMA_NO_UNROLL
+      for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+        NAXTile<T, TM, TK> Atile;
+        NAXTile<T, TN, TK> Btile;
+        volatile int compiler_barrier;
+
+        if constexpr (kAlignedM.value) {
+          Atile.load(x + kk1, K);
+        } else {
+          Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+        }
+        gemma4_load_direct_btile<T, TN, TK>(
+            Btile,
+            wl,
+            direct_scales,
+            direct_scales_div16,
+            direct_biases,
+            K_w,
+            tn,
+            k + kk1);
+        tile_matmad_nax(
+            Dtile,
+            Atile,
+            metal::bool_constant<false>{},
+            Btile,
+            metal::bool_constant<true>{});
+        (void)compiler_barrier;
+      }
+      x += BK;
+    }
+
+    if (K == 5376 && N == 43008) {
+      const short2 fragment_coord = BaseNAXFrag::get_coord();
+      const_for_loop<0, TM, 1>([&](auto fragment_row) {
+        const_for_loop<0, TN, 1>([&](auto fragment_col) {
+          thread const auto& frag_values = Dtile.template frag_at<
+              fragment_row.value, fragment_col.value>();
+          STEEL_PRAGMA_UNROLL
+          for (short element_row = 0; element_row < 2; ++element_row) {
+            const int row_local = tm + fragment_row.value * 16 +
+                fragment_coord.y + element_row * 8;
+            const int row = y_row + row_local;
+            if (row < M) {
+              STEEL_PRAGMA_UNROLL
+              for (short pair = 0; pair < 2; ++pair) {
+                const int element = element_row * 4 + pair * 2;
+                const bfloat16_t gate =
+                    static_cast<bfloat16_t>(frag_values[element]);
+                const bfloat16_t up =
+                    static_cast<bfloat16_t>(frag_values[element + 1]);
+                const int col = int(tid.x) * 32 +
+                    (tn + fragment_col.value * 16 + fragment_coord.x) / 2 +
+                    pair;
+                const int64_t global_row =
+                    static_cast<int64_t>(tid.z) * M + row;
+                compact_y[global_row * 21504 + col] =
+                    gemma4_paired_gelu_bf16(gate) * up;
+              }
+            }
+          }
+        });
+      });
+    } else if constexpr (kAlignedM.value) {
+      Dtile.store(y + tm * N + tn, N);
+    } else {
+      Dtile.store_safe(y + tm * N + tn, N, short2(SN, sgp_sm));
+    }
+  });
+}
+
 template <
     typename T,
     const int group_size,
@@ -994,6 +1243,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   wl += y_col * K_w;
   scales += y_col * K_g;
   biases += y_col * K_g;
+  device T* y_base = y;
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   // Make the weight loader
@@ -1030,43 +1280,176 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if constexpr (kAlignedN.value) {
-          loader_w.load_unsafe();
+      constexpr bool gemma4_paired_gate_up =
+          metal::is_same_v<T, bfloat16_t> && group_size == 64 && bits == 4 &&
+          aligned_N && BM == 64 && BK == 64 && BN == 64 && WM == 2 && WN == 2;
+      if constexpr (gemma4_paired_gate_up) {
+        if (K == 5376 && N == 43008) {
+          for (int k = 0; k < K; k += BK) {
+            metal::vec<T, TN * 2> direct_scales;
+            metal::vec<T, TN * 2> direct_scales_div16;
+            metal::vec<T, TN * 2> direct_biases;
+            gemma4_load_direct_btile_parameters<T, TN>(
+                direct_scales,
+                direct_scales_div16,
+                direct_biases,
+                scales,
+                biases,
+                K_g,
+                tn,
+                k / group_size,
+                simd_lid);
+
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<T, TN, TK> Btile;
+
+              volatile int compiler_barrier;
+
+              if constexpr (kAlignedM.value) {
+                Atile.load(x + kk1, K);
+              } else {
+                Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+              }
+
+              gemma4_load_direct_btile<T, TN, TK>(
+                  Btile,
+                  wl,
+                  direct_scales,
+                  direct_scales_div16,
+                  direct_biases,
+                  K_w,
+                  tn,
+                  k + kk1);
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<transpose_a>{},
+                  Btile,
+                  metal::bool_constant<transpose_b>{});
+
+              (void)compiler_barrier;
+            }
+
+            x += BK;
+          }
         } else {
-          loader_w.load_safe(short2(BK, tgp_bn));
+          for (int k = 0; k < K; k += BK) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if constexpr (kAlignedN.value) {
+              loader_w.load_unsafe();
+            } else {
+              loader_w.load_safe(short2(BK, tgp_bn));
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<T, TN, TK> Btile;
+
+              volatile int compiler_barrier;
+
+              if constexpr (kAlignedM.value) {
+                Atile.load(x + kk1, K);
+              } else {
+                Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+              }
+
+              Btile.template load<T, BK_padded, 1>(
+                  Ws + tn * BK_padded + kk1);
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<transpose_a>{},
+                  Btile,
+                  metal::bool_constant<transpose_b>{});
+
+              (void)compiler_barrier;
+            }
+
+            x += BK;
+            loader_w.next();
+          }
         }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        STEEL_PRAGMA_NO_UNROLL
-        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-          NAXTile<T, TM, TK> Atile;
-          NAXTile<T, TN, TK> Btile;
-
-          volatile int compiler_barrier;
-
-          if constexpr (kAlignedM.value) {
-            Atile.load(x + kk1, K);
+      } else {
+        for (int k = 0; k < K; k += BK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if constexpr (kAlignedN.value) {
+            loader_w.load_unsafe();
           } else {
-            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            loader_w.load_safe(short2(BK, tgp_bn));
           }
 
-          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          tile_matmad_nax(
-              Dtile,
-              Atile,
-              metal::bool_constant<transpose_a>{},
-              Btile,
-              metal::bool_constant<transpose_b>{});
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
 
-          (void)compiler_barrier;
+            volatile int compiler_barrier;
+
+            if constexpr (kAlignedM.value) {
+              Atile.load(x + kk1, K);
+            } else {
+              Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            }
+
+            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
+
+            (void)compiler_barrier;
+          }
+
+          x += BK;
+          loader_w.next();
         }
+      }
 
-        x += BK;
-        loader_w.next();
+      if constexpr (gemma4_paired_gate_up) {
+        if (K == 5376 && N == 43008) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          const short2 fragment_coord = BaseNAXFrag::get_coord();
+          const_for_loop<0, TM, 1>([&](auto fragment_row) {
+            const_for_loop<0, TN, 1>([&](auto fragment_col) {
+              thread const auto& frag_values = Dtile.template frag_at<
+                  fragment_row.value, fragment_col.value>();
+              STEEL_PRAGMA_UNROLL
+              for (short element_row = 0; element_row < 2; ++element_row) {
+                const int row_local = tm + fragment_row.value * 16 +
+                    fragment_coord.y + element_row * 8;
+                const int row = y_row + row_local;
+                if (row < M) {
+                  STEEL_PRAGMA_UNROLL
+                  for (short pair = 0; pair < 2; ++pair) {
+                    const int element = element_row * 4 + pair * 2;
+                    const bfloat16_t gate =
+                        static_cast<bfloat16_t>(frag_values[element]);
+                    const bfloat16_t up =
+                        static_cast<bfloat16_t>(frag_values[element + 1]);
+                    const int col = int(tid.x) * 32 +
+                        (tn + fragment_col.value * 16 + fragment_coord.x) / 2 +
+                        pair;
+                    y_base[row * static_cast<int64_t>(21504) + col] =
+                        gemma4_paired_gelu_bf16(gate) * up;
+                  }
+                }
+              }
+            });
+          });
+          return;
+        }
       }
 
       // Store results to device memory
@@ -1238,11 +1621,16 @@ template <
     uint simd_lid [[thread_index_in_simdgroup]]) {
   (void)lid;
 
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr bool gemma4_direct_batched =
+      batched && metal::is_same_v<T, bfloat16_t> && group_size == 64 &&
+      bits == 4 && aligned_N && BM == 64 && BK == 64 && BN == 64 && WM == 2 &&
+      WN == 2;
 
-  threadgroup T Ws[BN * BK_padded];
-
-  if (batched) {
+  if constexpr (gemma4_direct_batched) {
+    // Preserve the global allocation base before batch offsetting.  The paired
+    // epilogue packs its compact rows into that prefix, while generic shapes
+    // continue to store through the ordinary per-batch output pointer.
+    device T* compact_y = y;
     adjust_matrix_offsets<T>(
         x,
         w,
@@ -1259,9 +1647,53 @@ template <
         s_strides,
         b_strides,
         tid);
+    qmm_t_nax_direct_impl<
+        T,
+        group_size,
+        bits,
+        aligned_N,
+        BM,
+        BK,
+        BN,
+        WM,
+        WN>(
+        w,
+        scales,
+        biases,
+        x,
+        y,
+        compact_y,
+        K,
+        N,
+        M,
+        tid,
+        simd_gid,
+        simd_lid);
+  } else {
+    constexpr int BK_padded = (BK + 16 / sizeof(T));
+    threadgroup T Ws[BN * BK_padded];
+
+    if constexpr (batched) {
+      adjust_matrix_offsets<T>(
+          x,
+          w,
+          scales,
+          biases,
+          y,
+          M * N,
+          x_batch_ndims,
+          x_shape,
+          x_strides,
+          w_batch_ndims,
+          w_shape,
+          w_strides,
+          s_strides,
+          b_strides,
+          tid);
+    }
+    qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
+        w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
   }
-  qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
-      w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
 template <
