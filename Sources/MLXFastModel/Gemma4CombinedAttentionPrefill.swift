@@ -23,6 +23,64 @@ private func supportsCombinedAttentionProjection(
         && metadataWidth.map { projection.scales.dim(1) == $0 } ?? true
 }
 
+/// Projection decomposition for the ranked final full-attention layer.
+///
+/// The promoted post-attention tail keeps supplied-token rows 448..<512, so
+/// only those rows need Q. K is still projected for all 512 supplied tokens:
+/// the layer uses shared K=V and decode must retain every cache row. This
+/// wrapper reuses the canonical resident q_proj/k_proj arrays; it creates no
+/// concatenated weights or transformed payloads.
+struct LastLayerTailPrefillProjection: @unchecked Sendable {
+    static let inputLength = 512
+    static let tailLength = 64
+    static let tailStart = inputLength - tailLength
+    static let inputWidth = 5_376
+    static let queryWidth = 16_384
+    static let keyWidth = 2_048
+
+    private let q: FastQuantizedProjection
+    private let k: FastQuantizedProjection
+
+    init?(q: FastQuantizedProjection, k: FastQuantizedProjection) {
+        guard supportsCombinedAttentionProjection(
+                  q,
+                  inputWidth: Self.inputWidth / 8,
+                  metadataWidth: Self.inputWidth / 64),
+              supportsCombinedAttentionProjection(
+                  k,
+                  inputWidth: Self.inputWidth / 8,
+                  metadataWidth: Self.inputWidth / 64),
+              q.groupSize == 64,
+              q.bits == 4,
+              k.groupSize == q.groupSize,
+              k.bits == q.bits,
+              q.weight.dim(0) == Self.queryWidth,
+              k.weight.dim(0) == Self.keyWidth
+        else {
+            return nil
+        }
+        self.q = q
+        self.k = k
+    }
+
+    func callAsFunction(
+        _ input: MLXArray
+    ) -> (queries: MLXArray, keys: MLXArray) {
+        precondition(input.dtype == .bfloat16)
+        precondition(input.shape == [1, Self.inputLength, Self.inputWidth])
+
+        // This is a view over 64 real supplied rows, not padding or a draft.
+        let tailInput = input[
+            0..., Self.tailStart..<Self.inputLength, 0...
+        ]
+        let queries = q(tailInput)
+        let keys = k(input)
+        precondition(queries.shape == [1, Self.tailLength, Self.queryWidth])
+        precondition(keys.shape == [1, Self.inputLength, Self.keyWidth])
+        return (queries, keys)
+    }
+}
+
 /// A prefill-only affine projection whose output rows are Q, K, then optional
 /// V. The source projections stay alive on `Gemma4FastLayer` for decode and
 /// rollback; these input-independent concatenations are materialized once in

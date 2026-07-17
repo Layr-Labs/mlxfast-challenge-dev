@@ -137,7 +137,8 @@ func gemma4DirectCombinedKVPrefillRMSRoPESource(
 /// Like the K/V-only variant, it changes no accumulation, SIMD reduction,
 /// reciprocal-square-root, or BF16 conversion boundary.
 func gemma4DirectCombinedQKVPrefillRMSRoPESource(
-    _ reference: String
+    _ reference: String,
+    queryPositionDelta: Int = 0
 ) -> String {
     var source = reference
 
@@ -151,6 +152,10 @@ func gemma4DirectCombinedQKVPrefillRMSRoPESource(
         preconditionFailure("missing staged combined Q/K/V prefill body")
     }
 
+    let ropePosition = queryPositionDelta == 0
+        ? "(static_cast<uint>(start_position) + token)"
+        : "(static_cast<uint>(start_position) + (is_q ? "
+            + "\(queryPositionDelta) : 0) + token)"
     let directBody = """
     const bool has_weight = is_q || is_k;
                 const device bfloat* weight = is_q ? q_weight : k_weight;
@@ -199,8 +204,7 @@ func gemma4DirectCombinedQKVPrefillRMSRoPESource(
                             ] = static_cast<bfloat>(1.0f) * normalized_right;
                         }
                         const uint rope_index =
-                            (static_cast<uint>(start_position) + token)
-                                * kPairs + pair;
+                            \(ropePosition) * kPairs + pair;
                         const float cosine = rope_cosines[rope_index];
                         const float sine = rope_sines[rope_index];
                         const float left = static_cast<float>(weighted_left);
@@ -678,10 +682,19 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
     headDim: Int,
     kvHeads: Int,
     sharesFullKVReduction: Bool,
-    directRMSRoPE: Bool = false
+    directRMSRoPE: Bool = false,
+    fixedQueryLength: Int? = nil,
+    queryPositionDelta: Int = 0
 ) -> MLXFast.MLXFastKernel {
     precondition(headDim == 256 || headDim == 512)
     precondition(kvHeads == 16 || kvHeads == 4)
+    precondition(fixedQueryLength == nil || fixedQueryLength! > 0)
+    precondition(queryPositionDelta >= 0)
+    let queryLength = fixedQueryLength.map { String($0) } ?? "input_length"
+    let ropePosition = queryPositionDelta == 0
+        ? "(static_cast<uint>(start_position) + token)"
+        : "(static_cast<uint>(start_position) + (is_q ? "
+            + "\(queryPositionDelta) : 0) + token)"
     let referenceSource = """
             constexpr uint kHeadDim = \(headDim);
             constexpr uint kQHeads = 32;
@@ -695,7 +708,7 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
             const uint combined_row = threadgroup_position_in_grid.y;
             const uint input_length = static_cast<uint>(valid_length);
             const uint output_capacity = static_cast<uint>(capacity);
-            const uint query_rows = input_length * kQHeads;
+            const uint query_rows = \(queryLength) * kQHeads;
             const bool is_q = combined_row < query_rows;
 
             uint token;
@@ -718,7 +731,7 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
             const uint slab_elements =
                 kKVHeads * output_capacity * kHeadDim;
             device bfloat* output = is_q
-                ? queries + (projection_head * input_length + token) * kHeadDim
+                ? queries + (projection_head * \(queryLength) + token) * kHeadDim
                 : combined_kv
                     + (is_k ? 0 : slab_elements)
                     + (projection_head * output_capacity + token) * kHeadDim;
@@ -826,8 +839,7 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
                      pair < kPairs;
                      pair += kThreads) {
                     const uint rope_index =
-                        (static_cast<uint>(start_position) + token)
-                            * kPairs + pair;
+                        \(ropePosition) * kPairs + pair;
                     const float cosine = rope_cosines[rope_index];
                     const float sine = rope_sines[rope_index];
                     const float left = static_cast<float>(normalized_row[pair]);
@@ -841,7 +853,10 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
             }
             """
     let source = directRMSRoPE
-        ? gemma4DirectCombinedQKVPrefillRMSRoPESource(referenceSource)
+        ? gemma4DirectCombinedQKVPrefillRMSRoPESource(
+            referenceSource,
+            queryPositionDelta: queryPositionDelta
+        )
         : referenceSource
     return MLXFast.metalKernel(
         name: name,
@@ -889,6 +904,21 @@ private let gemma4DirectFullCombinedQKVPrefillPreparation =
         kvHeads: 4,
         sharesFullKVReduction: true,
         directRMSRoPE: true
+    )
+
+/// Final-layer specialization: Q contains only supplied rows 448..<512,
+/// while shared K=V still spans all 512 supplied tokens and the complete
+/// reserved cache capacity. Absolute Q RoPE positions are restored by the
+/// fixed +448 delta; K positions remain offset-zero.
+private let gemma4DirectFullTail64CombinedQKVPrefillPreparation =
+    makeGemma4CombinedQKVPrefillPreparationKernel(
+        name: "gemma4_direct_full_tail64_combined_qkv_prefill_shared_512_v1",
+        headDim: 512,
+        kvHeads: 4,
+        sharesFullKVReduction: true,
+        directRMSRoPE: true,
+        fixedQueryLength: 64,
+        queryPositionDelta: 448
     )
 
 private struct Gemma4PreparedArray: @unchecked Sendable {
@@ -1129,6 +1159,22 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
         guard offset >= 0, length > 1 else { return false }
         let (end, overflow) = offset.addingReportingOverflow(length)
         return !overflow && end <= 4096
+    }
+
+    /// The tail specialization is a direct-normalization kernel. Keep the
+    /// public direct-prefill rollback authoritative: when it is disabled the
+    /// engine must retain the ordinary full-Q preparation route.
+    func supportsFullTail64CombinedQKVPrefill(
+        offset: Int,
+        length: Int
+    ) -> Bool {
+        directPrefillRMSRoPE
+            && !isSliding
+            && headDim == 512
+            && kvHeads == 4
+            && offset == 0
+            && length == 512
+            && supportsPrefill(offset: offset, length: length)
     }
 
     func callAsFunction(
@@ -1440,6 +1486,51 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
                 "combined Q/K/V prefill RMS/RoPE kernel was not selected"
             )
         }
+        return (outputs[0], outputs[1])
+    }
+
+    /// Final full-attention layer specialization for the ranked prefill.
+    /// Q contains only supplied rows 448..<512; shared K=V and the cache slab
+    /// retain all 512 supplied rows. One dispatch performs Q/K/V RMSNorm,
+    /// absolute-position RoPE, transpose/layout, and cache-capacity clearing.
+    func callFullTail64CombinedQKVPrefill(
+        rawQueries: MLXArray,
+        rawKeys: MLXArray,
+        offset: Int,
+        length: Int,
+        capacity: Int
+    ) -> (queries: MLXArray, combinedKV: MLXArray) {
+        precondition(supportsFullTail64CombinedQKVPrefill(
+            offset: offset,
+            length: length
+        ))
+        precondition(rawQueries.dtype == .bfloat16)
+        precondition(rawQueries.shape == [1, 64, 32 * headDim])
+        precondition(rawKeys.dtype == .bfloat16)
+        precondition(rawKeys.shape == [1, length, kvHeads * headDim])
+        precondition(capacity >= length)
+        precondition(supportsPrefill(offset: offset, length: length))
+
+        let threads = headDim / 4
+        let inputs = [
+            rawQueries, rawKeys, rawKeys, qNormWeight, kNormWeight,
+            positionViews[offset], MLXArray(Int32(length)),
+            MLXArray(Int32(capacity)), ropeCosines, ropeSines,
+        ]
+        let outputs = gemma4DirectFullTail64CombinedQKVPrefillPreparation(
+            inputs,
+            grid: (
+                threads,
+                64 * 32 + capacity * kvHeads,
+                1
+            ),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [
+                [1, 32, 64, headDim],
+                [2, 1, kvHeads, capacity, headDim],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16]
+        )
         return (outputs[0], outputs[1])
     }
 }
