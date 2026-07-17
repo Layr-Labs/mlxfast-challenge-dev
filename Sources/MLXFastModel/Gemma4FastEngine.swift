@@ -59,6 +59,24 @@ private let gemma4VerifyStagedFullPrefillAttentionBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+private let gemma4ExactFullDecodeAttentionEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_EXACT_FULL_DECODE_ATTENTION"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+private let gemma4VerifyExactFullDecodeAttentionBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_EXACT_FULL_DECODE_ATTENTION_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -911,28 +929,81 @@ final class Gemma4FastLayer {
                 mergedAttention = mergedCandidate
             }
         } else {
-            let attention: MLXArray
-            if L > 1 && offset > 0 {
-                attention = gemma4FastAttentionFallback(
-                    queries: queries,
-                    keys: keys,
-                    values: values,
-                    scale: scale,
-                    mask: attentionMask
-                )
+            let hasNoAttentionMask: Bool
+            if case .none = attentionMask {
+                hasNoAttentionMask = true
             } else {
-                // Prefer library SDPA: D=256 sliding uses fused vector kernel;
-                // D=512 full uses its internal fallback. Compiling our own D=512
-                // fallback changes the public near-tie reduction order.
-                attention = MLXFast.scaledDotProductAttention(
+                hasNoAttentionMask = false
+            }
+            let canUseExactFullDecode = B == 1
+                && L == 1
+                && !isSliding
+                && hasNoAttentionMask
+                && gemma4ExactFullDecodeAttentionShapeIsSupported(
                     queries: queries,
                     keys: keys,
                     values: values,
-                    scale: scale,
-                    mask: attentionMask
+                    scale: scale
                 )
+            if canUseExactFullDecode
+                && (gemma4ExactFullDecodeAttentionEnabled
+                    || gemma4VerifyExactFullDecodeAttentionBits)
+            {
+                let candidate = gemma4ExactFullDecodeAttention(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    scale: scale
+                )
+                if gemma4VerifyExactFullDecodeAttentionBits {
+                    let reference = MLXFast.scaledDotProductAttention(
+                        queries: queries,
+                        keys: keys,
+                        values: values,
+                        scale: scale,
+                        mask: attentionMask
+                    ).transposed(0, 2, 1, 3).reshaped(B, L, -1)
+                    let matches = arrayEqual(
+                        candidate.view(dtype: .uint16),
+                        reference.view(dtype: .uint16)
+                    )
+                    eval(matches)
+                    precondition(
+                        matches.item(Bool.self),
+                        "exact full decode attention differs from stock SDPA "
+                            + "at cache length \(keys.dim(2))"
+                    )
+                    mergedAttention = gemma4ExactFullDecodeAttentionEnabled
+                        ? candidate
+                        : reference
+                } else {
+                    mergedAttention = candidate
+                }
+            } else {
+                let attention: MLXArray
+                if L > 1 && offset > 0 {
+                    attention = gemma4FastAttentionFallback(
+                        queries: queries,
+                        keys: keys,
+                        values: values,
+                        scale: scale,
+                        mask: attentionMask
+                    )
+                } else {
+                    // Prefer library SDPA: D=256 sliding uses fused vector
+                    // kernel; unsupported D=512 shapes use its exact internal
+                    // fallback.
+                    attention = MLXFast.scaledDotProductAttention(
+                        queries: queries,
+                        keys: keys,
+                        values: values,
+                        scale: scale,
+                        mask: attentionMask
+                    )
+                }
+                mergedAttention = attention.transposed(0, 2, 1, 3)
+                    .reshaped(B, L, -1)
             }
-            mergedAttention = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         }
         let attnOut: MLXArray
         if B == 1, L == 1, let indexedOutput {
