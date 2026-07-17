@@ -1769,6 +1769,243 @@ func submissionStaticReviewDiffModeFailsClosedAndSendsOnlyChangedFiles() throws 
     #expect(deletionRequest.contains("prove the benchmark detects slower measured decode"))
 }
 
+// Mechanical byte budgets for the enlarged editable surface: the per-file cap
+// and the base-to-head growth cap must fail closed BEFORE any judge call, so
+// a submission cannot smuggle a lookup table under the total cap by touching
+// only a few files.
+@Test
+func submissionStaticReviewCapsFileSizeAndSurfaceGrowth() throws {
+    let fm = FileManager.default
+    let scriptPath = URL(fileURLWithPath: fm.currentDirectoryPath)
+        .appendingPathComponent(".github/scripts/run-submission-static-review.sh").path
+
+    let root = fm.temporaryDirectory
+        .appendingPathComponent("static-review-caps-\(UUID().uuidString)")
+    try fm.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: root) }
+    let repo = root.appendingPathComponent("repo").path
+    let privatePath = root.appendingPathComponent("private").path
+    try fm.createDirectory(atPath: repo, withIntermediateDirectories: true)
+
+    func run(
+        _ argv: [String], env extra: [String: String] = [:]
+    ) throws -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = argv
+        process.currentDirectoryURL = URL(fileURLWithPath: repo)
+        var env = ProcessInfo.processInfo.environment
+        let strayKeys = env.keys.filter {
+            $0.hasPrefix("MLXFAST_") || $0.hasPrefix("ANTHROPIC_")
+        }
+        for key in strayKeys { env.removeValue(forKey: key) }
+        env.merge(extra) { _, override in override }
+        process.environment = env
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+    for tool in ["git", "jq", "bash"] {
+        guard try run(["sh", "-c", "command -v \(tool)"]).status == 0 else { return }
+    }
+
+    @discardableResult
+    func git(_ args: [String]) throws -> String {
+        let result = try run(
+            ["git", "-c", "user.email=test@test", "-c", "user.name=test",
+             "-c", "commit.gpgsign=false"] + args)
+        #expect(result.status == 0, "git \(args.joined(separator: " ")): \(result.output)")
+        return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func review(
+        base: String, head: String, env extra: [String: String] = [:]
+    ) throws -> (status: Int32, output: String) {
+        var env: [String: String] = [
+            "ANTHROPIC_API_KEY": "test-key-never-sent",
+            "MLXFAST_PRIVATE_DIR": privatePath,
+            "HEAD_SHA": head,
+            "MLXFAST_SUBMISSION_REVIEW_BASE_SHA": base,
+        ]
+        env.merge(extra) { _, override in override }
+        return try run(["bash", scriptPath], env: env)
+    }
+
+    try git(["init", "-q"])
+    try #"{"editablePaths":["Sources/MLXFastModel"]}"#
+        .write(toFile: repo + "/benchmark.json", atomically: true, encoding: .utf8)
+    try fm.createDirectory(
+        atPath: repo + "/Sources/MLXFastModel", withIntermediateDirectories: true)
+    try "let base = 1\n".write(
+        toFile: repo + "/Sources/MLXFastModel/Kernel.swift", atomically: true, encoding: .utf8)
+    try git(["add", "."])
+    try git(["commit", "-q", "-m", "base"])
+    let baseSha = try git(["rev-parse", "HEAD"])
+
+    // Head adds ~300 KB of new "table" bytes inside one editable file.
+    let table = "// table\n" + String(repeating: "0123456789abcdef", count: 19_000)
+    try table.write(
+        toFile: repo + "/Sources/MLXFastModel/Kernel.swift", atomically: true, encoding: .utf8)
+    try git(["commit", "-q", "-am", "grow"])
+    let grownHead = try git(["rev-parse", "HEAD"])
+
+    // Default growth cap (256 KiB) rejects the ~300 KB addition before any
+    // network call (no curl shim exists; reaching curl would fail the test
+    // differently).
+    let growth = try review(base: baseSha, head: grownHead)
+    #expect(growth.status != 0)
+    #expect(growth.output.contains("above the growth limit"))
+
+    // With the growth cap raised, the per-file cap still rejects the file.
+    let perFile = try review(
+        base: baseSha, head: grownHead,
+        env: [
+            "MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_GROWTH_BYTES": "10000000",
+            "MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_FILE_BYTES": "200000",
+        ])
+    #expect(perFile.status != 0)
+    #expect(perFile.output.contains("above the per-file static review limit"))
+
+    // Malformed cap knobs fail closed.
+    let badKnob = try review(
+        base: baseSha, head: grownHead,
+        env: ["MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_GROWTH_BYTES": "lots"])
+    #expect(badKnob.status != 0)
+    #expect(badKnob.output.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_GROWTH_BYTES must be a positive integer"))
+}
+
+// The kernel-bypass policy for the enlarged (vendored-kernel) editable
+// surface reaches the judge, and the deterministic byte budgets are enforced
+// twice: in the review script and again at participant-worker launch in the
+// trusted CLI, with identical env knobs and defaults.
+@Test
+func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
+    let staticReview = try String(
+        contentsOfFile: ".github/scripts/run-submission-static-review.sh",
+        encoding: .utf8
+    )
+    // Mechanical caps: total, per-file, and base-to-head growth, all
+    // validated and enforced before any judge call.
+    #expect(staticReview.contains("MAX_FILE_BYTES=\"${MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_FILE_BYTES:-524288}\""))
+    #expect(staticReview.contains("MAX_GROWTH_BYTES=\"${MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_GROWTH_BYTES:-262144}\""))
+    #expect(staticReview.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_FILE_BYTES must be a positive integer"))
+    #expect(staticReview.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_GROWTH_BYTES must be a positive integer"))
+    #expect(staticReview.contains("above the per-file static review limit"))
+    #expect(staticReview.contains("git cat-file -s \"${review_base}:${changed_path}\""))
+    #expect(staticReview.contains("git cat-file -s \"${review_head}:${changed_path}\""))
+    #expect(staticReview.contains("surface_growth_bytes=$((head_surface_bytes - base_surface_bytes))"))
+    #expect(staticReview.contains("above the growth limit"))
+
+    // Kernel-bypass categories in both the system prompt and the structured
+    // fail_on policy, plus the matching allowances for real kernel work.
+    for category in [
+        "kernel or kernel-dispatch edits that special-case benchmark-shaped inputs",
+        "kernel edits that detect timed-versus-warmup execution",
+        "masked only for the public or golden shapes",
+        "runtime-effective JIT string (mlx-generated/*.cpp)",
+    ] {
+        #expect(
+            staticReview.components(separatedBy: category).count - 1 >= 2,
+            "kernel policy category must appear in system prompt and fail_on: \(category)"
+        )
+    }
+    #expect(staticReview.contains("Metal kernel tuning"))
+    #expect(staticReview.contains("M5 (_nax) kernel variants"))
+    #expect(staticReview.contains("matched edits applied consistently to a kernel AOT .metal/.h source and its JIT mlx-generated twin"))
+
+    // Launch-time backstop in the trusted CLI: same knobs, same defaults,
+    // official fail-closed, and the TODO marker resolved.
+    let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
+    #expect(!cli.contains("TODO(security)"))
+    #expect(cli.contains("try enforceEditableSurfaceByteBudget(officialRun: officialRun)"))
+    #expect(cli.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES"))
+    #expect(cli.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_FILE_BYTES"))
+    #expect(cli.contains(
+        "official benchmark runs require the editable-surface byte budget check"
+    ))
+    #expect(EditableSurfaceByteBudget.defaultMaxTotalBytes == 2_500_000)
+    #expect(EditableSurfaceByteBudget.defaultMaxFileBytes == 524_288)
+    #expect(staticReview.contains("MAX_BYTES=\"${MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES:-2500000}\""))
+
+    // The current editable surface must actually FIT the launch budget with
+    // the shipped defaults, or every official worker launch would fail.
+    let verdict = verifyEditableSurfaceByteBudget(
+        contractPath: "benchmark.json",
+        maxTotalBytes: EditableSurfaceByteBudget.defaultMaxTotalBytes,
+        maxFileBytes: EditableSurfaceByteBudget.defaultMaxFileBytes
+    )
+    guard case .verified(let totalBytes, let fileCount) = verdict else {
+        Issue.record("editable surface exceeds the shipped launch budget: \(verdict)")
+        return
+    }
+    #expect(totalBytes > 0)
+    #expect(fileCount > 0)
+}
+
+@Test
+func editableSurfaceByteBudgetEnforcesCapsAtWorkerLaunch() throws {
+    let fm = FileManager.default
+    let root = try temporaryDirectory()
+    defer { try? fm.removeItem(at: root) }
+    let contract = root.appendingPathComponent("benchmark.json")
+    let model = root.appendingPathComponent("Sources/MLXFastModel")
+    try fm.createDirectory(at: model, withIntermediateDirectories: true)
+    try #"{"editablePaths":["Sources/MLXFastModel","kernel.h"]}"#
+        .write(to: contract, atomically: true, encoding: .utf8)
+    try Data(repeating: 0x61, count: 100).write(to: model.appendingPathComponent("Engine.swift"))
+    try Data(repeating: 0x62, count: 50).write(to: root.appendingPathComponent("kernel.h"))
+    // A symlink never counts toward the budget.
+    try fm.createSymbolicLink(
+        atPath: model.appendingPathComponent("alias.swift").path,
+        withDestinationPath: "Engine.swift"
+    )
+
+    func verdict(maxTotal: Int, maxFile: Int) -> EditableSurfaceBudgetVerification {
+        verifyEditableSurfaceByteBudget(
+            contractPath: contract.path,
+            maxTotalBytes: maxTotal,
+            maxFileBytes: maxFile
+        )
+    }
+
+    #expect(verdict(maxTotal: 1000, maxFile: 500) == .verified(totalBytes: 150, fileCount: 2))
+
+    // Per-file cap.
+    guard case .exceeded(let perFileReason) = verdict(maxTotal: 1000, maxFile: 99) else {
+        Issue.record("expected per-file cap to fire")
+        return
+    }
+    #expect(perFileReason.contains("per-file static review limit"))
+
+    // Total cap.
+    guard case .exceeded(let totalReason) = verdict(maxTotal: 149, maxFile: 500) else {
+        Issue.record("expected total cap to fire")
+        return
+    }
+    #expect(totalReason.contains("static review limit"))
+
+    // Missing contract skips (the caller decides whether that is fatal);
+    // a malformed contract fails.
+    guard case .skipped = verifyEditableSurfaceByteBudget(
+        contractPath: root.appendingPathComponent("missing.json").path,
+        maxTotalBytes: 1000,
+        maxFileBytes: 500
+    ) else {
+        Issue.record("expected skipped without a contract")
+        return
+    }
+    try #"{"schemaVersion":1}"#.write(to: contract, atomically: true, encoding: .utf8)
+    guard case .exceeded(let malformedReason) = verdict(maxTotal: 1000, maxFile: 500) else {
+        Issue.record("expected a malformed contract to fail")
+        return
+    }
+    #expect(malformedReason.contains("no usable editablePaths"))
+}
+
 // Behavioral pin for run-semantic-gpqa-gate.sh's Opus 4.8 judge request and
 // its parse hardening, via a curl shim serving canned Opus-shaped responses
 // (thinking block first, verdict in the trailing text block). Covers the

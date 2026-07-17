@@ -1446,8 +1446,12 @@ private enum MLXFastCLI {
             workerExecutablePath: executablePath,
             officialRun: officialRun
         )
-        // TODO(security): Enforce the static-review byte cap and kernel-bypass
-        // policy before allowing this participant worker launch.
+        // The kernel-bypass POLICY half of the static review is the LLM
+        // judge in .github/scripts/run-submission-static-review.sh; the
+        // deterministic byte caps are re-enforced here so every ranked
+        // worker launch is bound by them even on dispatch paths that never
+        // ran the review step. Official runs fail closed; local runs warn.
+        try enforceEditableSurfaceByteBudget(officialRun: officialRun)
         var sandboxProfile = environmentValue("MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE", fallback: "")
         if sandboxProfile.isEmpty,
            environmentValue("MLXFAST_NO_SANDBOX", fallback: "0") != "1",
@@ -1516,6 +1520,62 @@ private enum MLXFastCLI {
                 ("mlxfast-swift: warning: " + reason + "\n").utf8
             ))
         }
+    }
+
+    /// Launch-time backstop for the static-review byte caps: the editable
+    /// surface in this workspace must fit the same total and per-file
+    /// budgets `.github/scripts/run-submission-static-review.sh` enforces
+    /// (identical env knobs, identical defaults).
+    private static func enforceEditableSurfaceByteBudget(officialRun: Bool) throws {
+        let contractPath = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(EditableSurfaceByteBudget.defaultContractRelativePath)
+            .path
+        let maxTotalBytes = try positiveIntEnvironmentValue(
+            "MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES",
+            fallback: EditableSurfaceByteBudget.defaultMaxTotalBytes
+        )
+        let maxFileBytes = try positiveIntEnvironmentValue(
+            "MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_FILE_BYTES",
+            fallback: EditableSurfaceByteBudget.defaultMaxFileBytes
+        )
+        switch verifyEditableSurfaceByteBudget(
+            contractPath: contractPath,
+            maxTotalBytes: maxTotalBytes,
+            maxFileBytes: maxFileBytes
+        ) {
+        case .verified:
+            return
+        case .skipped(let reason):
+            if officialRun {
+                throw MLXFastError.invalidInput(
+                    "official benchmark runs require the editable-surface byte budget check; "
+                        + reason
+                )
+            }
+        case .exceeded(let reason):
+            if officialRun {
+                throw MLXFastError.invalidInput(
+                    "refusing to spawn the participant worker: " + reason
+                )
+            }
+            FileHandle.standardError.write(Data(
+                ("mlxfast-swift: warning: " + reason + "\n").utf8
+            ))
+        }
+    }
+
+    private static func positiveIntEnvironmentValue(
+        _ name: String,
+        fallback: Int
+    ) throws -> Int {
+        let rawValue = environmentValue(name, fallback: "")
+        if rawValue.isEmpty {
+            return fallback
+        }
+        guard let value = Int(rawValue), value > 0 else {
+            throw MLXFastError.invalidInput("\(name) must be a positive integer")
+        }
+        return value
     }
 
     private static func siblingParticipantWorkerExecutablePath() throws -> String {
