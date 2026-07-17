@@ -95,6 +95,31 @@ let gemma4VerifyLastLayerTailPruneBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+/// Rollback switch for pruning the final full-attention layer's ranked
+/// prefill dispatch to the same 64 supplied queries retained by the promoted
+/// post-attention tail.  The route is additionally guarded by the exact
+/// B=1/L=512/offset=0/D=512 staged-full shape; every other shape falls back.
+let gemma4LastLayerQueryTailPruneEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LAST_LAYER_QUERY_TAIL_PRUNE"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+/// Raw-BF16 verifier for the last-layer query-tail dispatch.  It evaluates
+/// both staged kernels and requires the tail64 result to equal absolute rows
+/// 448..<512 of the full result before the post-attention chain consumes it.
+let gemma4VerifyLastLayerQueryTailPruneBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_LAST_LAYER_QUERY_TAIL_PRUNE_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -858,6 +883,7 @@ final class Gemma4FastLayer {
         }
 
         let mergedAttention: MLXArray
+        var unprunedMergedAttentionForVerification: MLXArray? = nil
         let canUseStagedSlidingPrefill = B == 1
             && L == 512
             && offset == 0
@@ -931,25 +957,81 @@ final class Gemma4FastLayer {
             }
         } else if canUseStagedFullPrefill
             && (gemma4StagedFullPrefillAttentionEnabled
-                || gemma4VerifyStagedFullPrefillAttentionBits)
+                || gemma4VerifyStagedFullPrefillAttentionBits
+                || (pruneTail && gemma4VerifyLastLayerQueryTailPruneBits))
         {
-            // Merges head-major [1, 32, 512, 512] attention into the
-            // token-major [1, 512, 32*512] layout o_proj consumes. The
-            // reshape of the transposed view materializes a copy.
-            func mergeHeadMajor(_ attention: MLXArray) -> MLXArray {
-                attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            // Merges either the full or tail head-major output into the
+            // corresponding token-major layout.  The production P3 route
+            // emits token-major directly, so the selected tail reaches
+            // o_proj as a contiguous [1,64,16384] Metal output without a
+            // full-width materialization or transpose copy.
+            func mergeHeadMajor(
+                _ attention: MLXArray,
+                length: Int
+            ) -> MLXArray {
+                attention.transposed(0, 2, 1, 3).reshaped(B, length, -1)
             }
-            // With token-major emission enabled the staged kernel already
-            // writes [1, 512, 32*512] directly (identical values, different
-            // addresses), so no transpose-reshape copy is needed here.
-            let candidate = gemma4StagedFullPrefill512(
-                queries: queries,
-                keys: keys,
-                values: values
-            )
-            let mergedCandidate = gemma4StagedPrefillTokenMajorOutputEnabled
-                ? candidate
-                : mergeHeadMajor(candidate)
+
+            var cachedFullCandidate: MLXArray? = nil
+            func fullCandidate() -> MLXArray {
+                if let cachedFullCandidate { return cachedFullCandidate }
+                let candidate = gemma4StagedFullPrefill512(
+                    queries: queries,
+                    keys: keys,
+                    values: values
+                )
+                cachedFullCandidate = candidate
+                return candidate
+            }
+            func mergedFullCandidate() -> MLXArray {
+                let candidate = fullCandidate()
+                return gemma4StagedPrefillTokenMajorOutputEnabled
+                    ? candidate
+                    : mergeHeadMajor(candidate, length: L)
+            }
+
+            let useQueryTail = pruneTail
+                && gemma4LastLayerQueryTailPruneEnabled
+                && gemma4StagedFullPrefillAttentionEnabled
+            let verifyQueryTail = pruneTail
+                && gemma4VerifyLastLayerQueryTailPruneBits
+            let buildQueryTail = useQueryTail
+                || verifyQueryTail
+            let selectedStaged: MLXArray
+            if buildQueryTail {
+                let tailCandidate = gemma4StagedFullPrefill512Tail64(
+                    queries: queries,
+                    keys: keys,
+                    values: values
+                )
+                let mergedTailCandidate = gemma4StagedPrefillTokenMajorOutputEnabled
+                    ? tailCandidate
+                    : mergeHeadMajor(tailCandidate, length: 64)
+                if verifyQueryTail {
+                    let full = fullCandidate()
+                    let referenceTail = gemma4StagedPrefillTokenMajorOutputEnabled
+                        ? full[0..., 448..<512, 0...]
+                        : full[0..., 0..., 448..<512, 0...]
+                    let matches = arrayEqual(
+                        tailCandidate.view(dtype: .uint16),
+                        referenceTail.view(dtype: .uint16)
+                    )
+                    eval(matches)
+                    precondition(
+                        matches.item(Bool.self),
+                        "last-layer query-tail attention differs from full staged rows"
+                    )
+                }
+                selectedStaged = useQueryTail
+                    ? mergedTailCandidate
+                    : mergedFullCandidate()
+                if useQueryTail && gemma4VerifyLastLayerTailPruneBits {
+                    unprunedMergedAttentionForVerification = mergedFullCandidate()
+                }
+            } else {
+                selectedStaged = mergedFullCandidate()
+            }
+
             if gemma4VerifyStagedFullPrefillAttentionBits {
                 let reference = MLXFast.scaledDotProductAttention(
                     queries: queries,
@@ -963,10 +1045,10 @@ final class Gemma4FastLayer {
                 // the same transpose+reshape merge -- a bijective relayout,
                 // so every element is still compared exactly once.
                 let comparisonReference = gemma4StagedPrefillTokenMajorOutputEnabled
-                    ? mergeHeadMajor(reference)
+                    ? mergeHeadMajor(reference, length: L)
                     : reference
                 let matches = arrayEqual(
-                    candidate.view(dtype: .uint16),
+                    fullCandidate().view(dtype: .uint16),
                     comparisonReference.view(dtype: .uint16)
                 )
                 eval(matches)
@@ -975,10 +1057,22 @@ final class Gemma4FastLayer {
                     "staged full prefill attention differs from stock SDPA"
                 )
                 mergedAttention = gemma4StagedFullPrefillAttentionEnabled
-                    ? mergedCandidate
-                    : mergeHeadMajor(reference)
+                    ? selectedStaged
+                    : mergeHeadMajor(reference, length: L)
+            } else if gemma4StagedFullPrefillAttentionEnabled {
+                mergedAttention = selectedStaged
             } else {
-                mergedAttention = mergedCandidate
+                // The branch can be entered solely for the query-tail
+                // verifier while staged full attention itself is rolled back.
+                // Preserve that rollback for the selected model path.
+                let reference = MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    scale: scale,
+                    mask: attentionMask
+                )
+                mergedAttention = mergeHeadMajor(reference, length: L)
             }
         } else {
             let attention: MLXArray
@@ -1018,9 +1112,18 @@ final class Gemma4FastLayer {
         // ops are per-row at any M. The retained rows are therefore
         // bit-identical to the full-width chain.
         let tailStart = pruneTail && B == 1 && L >= 128 ? L - 64 : 0
-        let chainAttention = tailStart > 0
-            ? mergedAttention[0..., tailStart..<L, 0...]
-            : mergedAttention
+        let chainAttention: MLXArray
+        if tailStart > 0 && mergedAttention.dim(1) == 64 {
+            // The last-layer staged-full sibling emitted the 64 retained rows
+            // directly in contiguous token-major order.  Do not slice or
+            // materialize a full-width attention output here.
+            chainAttention = mergedAttention
+        } else if tailStart > 0 {
+            precondition(mergedAttention.dim(1) == L)
+            chainAttention = mergedAttention[0..., tailStart..<L, 0...]
+        } else {
+            chainAttention = mergedAttention
+        }
         let chainResidual = tailStart > 0
             ? residual[0..., tailStart..<L, 0...]
             : residual
@@ -1091,9 +1194,13 @@ final class Gemma4FastLayer {
         if tailStart > 0 && gemma4VerifyLastLayerTailPruneBits {
             // Full-width reference over the identical post-attention ops:
             // the pruned output must bit-match its last 64 rows. The layer's
-            // KV slabs are upstream of the prune point (attention ran
-            // full-width), so they are identical by construction.
-            let referenceAttnOut = oProj(mergedAttention)
+            // full K/V preparation and cache writes are upstream of the
+            // query-tail attention dispatch, so those slabs remain identical
+            // by construction.
+            let unprunedAttention = unprunedMergedAttentionForVerification
+                ?? mergedAttention
+            precondition(unprunedAttention.dim(1) == L)
+            let referenceAttnOut = oProj(unprunedAttention)
             let referenceBoundary = residual + MLXFast.rmsNorm(
                 referenceAttnOut, weight: postAttnNormWeight, eps: eps)
             let referenceOut: MLXArray

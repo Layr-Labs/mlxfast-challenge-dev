@@ -430,6 +430,64 @@ let gemma4StagedFullPrefill512KernelSource: String = """
         }
         """
 
+/// Last-layer query-tail sibling of the staged full-prefill kernel.
+///
+/// The promoted last-layer post-attention prune consumes only supplied-token
+/// rows 448..<512, but the original staged attention still computes all 512
+/// query rows.  This source is derived mechanically from the promoted source:
+/// its four grid-z blocks retain the absolute query-block identities 28...31,
+/// while only their destination rows are rebased to 0...63.  Consequently QK,
+/// causal masking, precise softmax, and PV use exactly the same descriptors,
+/// lane/read mapping, key bounds, and ascending reductions as those four blocks
+/// in the full dispatch.  Full-width Q projection/preparation and all 512 K/V
+/// cache rows remain untouched.
+let gemma4StagedFullPrefill512Tail64KernelName: String =
+    "gemma4_staged_full_prefill_tail64_q448_16x512x512_mpp_v1"
+    + "_skip\(gemma4StagedPrefillCausalTileSkipEnabled ? 1 : 0)"
+    + "_tokmaj\(gemma4StagedPrefillTokenMajorOutputEnabled ? 1 : 0)"
+    + "_pvskip\(gemma4StagedPrefillPVTileSkipEnabled ? 1 : 0)"
+
+let gemma4StagedFullPrefill512Tail64KernelSource: String = {
+    let queryBlockNeedle =
+        "const uint query_block = threadgroup_position_in_grid.z;"
+    let queryBlockReplacement =
+        "const uint query_block = 28 + threadgroup_position_in_grid.z;"
+    let outputAddressNeedle = """
+        const uint output_tile_base = kTokenMajorOutput
+            ? query_start * (kQHeads * kHeadDim) + query_head * kHeadDim
+            : (query_head * kLength + query_start) * kHeadDim;
+        """
+    let outputAddressReplacement = """
+        constexpr uint kTailQueryStart = 448;
+        constexpr uint kTailLength = 64;
+        const uint output_query_start = query_start - kTailQueryStart;
+        const uint output_tile_base = kTokenMajorOutput
+            ? output_query_start * (kQHeads * kHeadDim) + query_head * kHeadDim
+            : (query_head * kTailLength + output_query_start) * kHeadDim;
+        """
+    precondition(
+        gemma4StagedFullPrefill512KernelSource.components(
+            separatedBy: queryBlockNeedle
+        ).count == 2,
+        "full-prefill tail source expected exactly one query-block expression"
+    )
+    precondition(
+        gemma4StagedFullPrefill512KernelSource.components(
+            separatedBy: outputAddressNeedle
+        ).count == 2,
+        "full-prefill tail source expected exactly one output-address expression"
+    )
+    return gemma4StagedFullPrefill512KernelSource
+        .replacingOccurrences(
+            of: queryBlockNeedle,
+            with: queryBlockReplacement
+        )
+        .replacingOccurrences(
+            of: outputAddressNeedle,
+            with: outputAddressReplacement
+        )
+}()
+
 /// Exact-shape MPP kernel for Gemma 4 FULL-attention prefill (P2).
 ///
 /// The ten full-attention layers previously ran MLX's unfused SDPA fallback
@@ -488,6 +546,19 @@ private let gemma4StagedFullPrefill512Kernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+private let gemma4StagedFullPrefill512Tail64Kernel = MLXFast.metalKernel(
+    name: gemma4StagedFullPrefill512Tail64KernelName,
+    inputNames: ["queries", "keys", "values"],
+    outputNames: ["output"],
+    source: gemma4StagedFullPrefill512Tail64KernelSource,
+    header: """
+        #include <metal_stdlib>
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+        """,
+    ensureRowContiguous: false
+)
+
 /// Runs the staged full-attention prefill kernel on the ranked shape.
 ///
 /// Returns `[1, 512, 32*512]` (token-major, already the merged layout
@@ -512,6 +583,33 @@ func gemma4StagedFullPrefill512(
     return gemma4StagedFullPrefill512Kernel(
         [queries, keys, values],
         grid: (128, 32, 32),
+        threadGroup: (128, 1, 1),
+        outputShapes: [outputShape],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+/// Computes only absolute full-attention query rows 448..<512 while retaining
+/// the complete 512-row K/V prefix.  The output contains 64 real supplied
+/// query rows, never padding or future rows.
+func gemma4StagedFullPrefill512Tail64(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray
+) -> MLXArray {
+    precondition(queries.dtype == .bfloat16)
+    precondition(keys.dtype == .bfloat16)
+    precondition(values.dtype == .bfloat16)
+    precondition(queries.shape == [1, 32, 512, 512])
+    precondition(keys.shape == [1, 4, 512, 512])
+    precondition(values.shape == [1, 4, 512, 512])
+
+    let outputShape: [Int] = gemma4StagedPrefillTokenMajorOutputEnabled
+        ? [1, 64, 32 * 512]
+        : [1, 32, 64, 512]
+    return gemma4StagedFullPrefill512Tail64Kernel(
+        [queries, keys, values],
+        grid: (128, 32, 4),
         threadGroup: (128, 1, 1),
         outputShapes: [outputShape],
         outputDTypes: [.bfloat16]
