@@ -764,13 +764,18 @@ func hashWeightsDirectoryRejectsHardlinks() throws {
     #expect(hashScript.contains("shasum -a 256"))
     #expect(hashScript.contains("LC_ALL=C sort -z"))
 
-    let preflight = try String(
-        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimePreflight.swift",
-        encoding: .utf8
-    )
-    #expect(preflight.contains("func requireSingleHardLink("))
-    #expect(preflight.contains("info.st_nlink != 1"))
-    #expect(preflight.contains("try requireSingleHardLink("))
+    // Both binaries ship a copy of this preflight (the trusted mlxfast-swift
+    // binary from Sources/MLXFastTrustedHarness, the sandboxed worker from
+    // Sources/MLXFastHarness); the hardlink guard must stay in both (#652).
+    for path in [
+        "Sources/MLXFastTrustedHarness/GemmaRuntimePreflight.swift",
+        "Sources/MLXFastHarness/GemmaRuntimePreflight.swift",
+    ] {
+        let preflight = try String(contentsOfFile: path, encoding: .utf8)
+        #expect(preflight.contains("func requireSingleHardLink("), "\(path)")
+        #expect(preflight.contains("info.st_nlink != 1"), "\(path)")
+        #expect(preflight.contains("try requireSingleHardLink("), "\(path)")
+    }
 
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }

@@ -31,16 +31,31 @@ struct BenchmarkSafetyTests {
             )
         )
 
-        let source = try String(
-            contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimePreflight.swift",
-            encoding: .utf8
-        )
-        let noCache = try #require(
-            source.range(of: "Darwin.fcntl(handle.fileDescriptor, F_NOCACHE, 1)")
-        )
-        let read = try #require(source.range(of: "handle.readData(ofLength: chunkSize)"))
-        #expect(noCache.lowerBound < read.lowerBound)
-        #expect(source.contains("let reachedEOF = autoreleasepool {"))
+        // Both binaries ship a copy of this digest path: the trusted
+        // `mlxfast-swift` binary builds module MLXFastHarness from
+        // Sources/MLXFastTrustedHarness (the copy exercised above), and the
+        // sandboxed runtime worker builds from Sources/MLXFastHarness. The
+        // uncached bounded read must stay in both; asserting only the worker
+        // copy let the trusted copy silently drop it once (#652).
+        for path in [
+            "Sources/MLXFastTrustedHarness/GemmaRuntimePreflight.swift",
+            "Sources/MLXFastHarness/GemmaRuntimePreflight.swift",
+        ] {
+            let source = try String(contentsOfFile: path, encoding: .utf8)
+            let noCache = try #require(
+                source.range(of: "Darwin.fcntl(handle.fileDescriptor, F_NOCACHE, 1)"),
+                "\(path) lost the uncached digest read (#636)"
+            )
+            let read = try #require(
+                source.range(of: "handle.readData(ofLength: chunkSize)"),
+                "\(path) lost the bounded digest read (#636)"
+            )
+            #expect(noCache.lowerBound < read.lowerBound)
+            #expect(
+                source.contains("let reachedEOF = autoreleasepool {"),
+                "\(path) lost the digest autoreleasepool (#636)"
+            )
+        }
     }
 
     @Test
