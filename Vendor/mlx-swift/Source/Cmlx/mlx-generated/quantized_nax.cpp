@@ -741,7 +741,7 @@ struct QuantizedBlockLoader<
       ushort simd_lane_id [[thread_index_in_simdgroup]])
       : row((simd_group_id * 32 + simd_lane_id) / 2),
         group((simd_group_id * 32 + simd_lane_id) % 2),
-        dst(dst_ + row * dst_ld + group * 64),
+        dst(dst_),
         src(src_ + row * src_ld_ / 2 + group * 32),
         scales(scales_ + row * src_ld_ / 64 + group),
         biases(biases_ + row * src_ld_ / 64 + group) {}
@@ -749,10 +749,32 @@ struct QuantizedBlockLoader<
   void load_unsafe() const {
     const bfloat16_t scale = *scales;
     const bfloat16_t bias = *biases;
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < 32; ++i) {
-      dequantize<bfloat16_t, 2, 4>(
-          src + i, scale, bias, dst + 2 * i);
+    if constexpr (dst_ld == 128) {
+      STEEL_PRAGMA_UNROLL
+      for (short chunk = 0; chunk < 8; ++chunk) {
+        // Compact BK=128 has no padding bytes to rotate the row's bank
+        // origin. XOR each 64-column quantization group by an 8-column
+        // fragment mask. It leaves each packed pair adjacent, is its own
+        // inverse, and permutes all 64 positions.
+        const short dst_chunk = (chunk ^ (row & 7)) << 3;
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < 4; ++i) {
+          dequantize<bfloat16_t, 2, 4>(
+              src + chunk * 4 + i,
+              scale,
+              bias,
+              dst + row * 128 + group * 64 + dst_chunk + 2 * i);
+        }
+      }
+    } else {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < 32; ++i) {
+        dequantize<bfloat16_t, 2, 4>(
+            src + i,
+            scale,
+            bias,
+            dst + row * dst_ld + group * 64 + 2 * i);
+      }
     }
   }
 
@@ -760,7 +782,12 @@ struct QuantizedBlockLoader<
     if (row >= src_tile_dim.x) {
       STEEL_PRAGMA_UNROLL
       for (short i = 0; i < 64; ++i) {
-        dst[i] = bfloat16_t(0);
+        if constexpr (dst_ld == 128) {
+          const short swizzle = (row & 7) << 3;
+          dst[row * 128 + group * 64 + (i ^ swizzle)] = bfloat16_t(0);
+        } else {
+          dst[row * dst_ld + group * 64 + i] = bfloat16_t(0);
+        }
       }
       return;
     }
@@ -1016,7 +1043,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    const bool pad_bk = true>
 METAL_FUNC void qmm_t_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1039,7 +1067,13 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  static_assert(
+      pad_bk ||
+          (metal::is_same_v<T, bfloat16_t> && group_size == 64 && bits == 4 &&
+           aligned_N && BM == 64 && BK == 128 && BN == 64 && WM == 2 &&
+           WN == 2),
+      "Compact BK is restricted to Gemma 4's exact BK=128 prefill tile");
+  constexpr int BK_padded = BK + (pad_bk ? 16 / sizeof(T) : 0);
 
   using loader_w_t = QuantizedBlockLoader<
       T,
@@ -1122,7 +1156,36 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
             Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
           }
 
-          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          if constexpr (pad_bk) {
+            Btile.template load<T, BK_padded, 1>(
+                Ws + tn * BK_padded + kk1);
+          } else {
+            // Match the compact loader's per-row involution. NAX assigns a
+            // lane two rows eight apart; those rows share the same low-three
+            // row bits and therefore the same XOR mask. Logical columns are
+            // four-wide and the mask is a multiple of eight, so each vector's
+            // four physical values remain consecutive.
+            static_assert(TN == 2 && TK == 4, "Unexpected Gemma NAX tile");
+            const short2 sc = BaseNAXFrag::get_coord();
+            const short swizzle = sc.y << 3;
+            const_for_loop<0, TN, 1>([&](auto idx_row) {
+              const_for_loop<0, TK, 1>([&](auto idx_col) {
+                thread auto& frag =
+                    Btile.template frag_at<idx_row.value, idx_col.value>();
+                const short col =
+                    (kk1 + idx_col.value * 16 + sc.x) ^ swizzle;
+                STEEL_PRAGMA_UNROLL
+                for (short i = 0; i < BaseNAXFrag::kElemRows; ++i) {
+                  const short row = tn + idx_row.value * 16 + sc.y + i * 8;
+                  const threadgroup T* src = Ws + row * 128 + col;
+                  STEEL_PRAGMA_UNROLL
+                  for (short j = 0; j < BaseNAXFrag::kElemCols; ++j) {
+                    frag[i * BaseNAXFrag::kElemCols + j] = src[j];
+                  }
+                }
+              });
+            });
+          }
 
           tile_matmad_nax(
               Dtile,
@@ -1314,8 +1377,10 @@ template <
       metal::is_same_v<T, bfloat16_t> && group_size == 64 && bits == 4 &&
       aligned_N && !batched && BM == 64 && BK == 64 && BN == 64 && WM == 2 &&
       WN == 2;
-  constexpr int scratch_bk = gemma4_bk128 ? 128 : BK;
-  constexpr int BK_padded = (scratch_bk + 16 / sizeof(T));
+  // The exact M=512 path stages a compact, bank-swizzled BK=128 tile in
+  // exactly 16 KiB. Every other shape retains the stock padded BK=64 tile.
+  constexpr int BK_padded =
+      gemma4_bk128 ? 128 : (BK + 16 / sizeof(T));
 
   threadgroup T Ws[BN * BK_padded];
 
@@ -1361,8 +1426,10 @@ template <
         tid);
   }
   if constexpr (gemma4_bk128) {
-    if (K == 5376 || K == 8192 || K == 16384 || K == 21504) {
-      qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, 128, BN, WM, WN>(
+    if (M == 512 &&
+        (K == 5376 || K == 8192 || K == 16384 || K == 21504)) {
+      qmm_t_nax_tgp_impl<
+          T, group_size, bits, aligned_N, BM, 128, BN, WM, WN, false>(
           w, scales, biases, x, y, Ws, K, N, M, logical_tid, lid, simd_gid,
           simd_lid);
       return;
