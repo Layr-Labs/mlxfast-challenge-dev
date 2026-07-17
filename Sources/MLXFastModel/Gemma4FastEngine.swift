@@ -95,6 +95,21 @@ let gemma4VerifyLastLayerTailPruneBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+/// Rollback and in-situ verifier for pruning dead final-layer query rows.
+let gemma4LastLayerQueryTailPruneEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LAST_LAYER_QUERY_TAIL_PRUNE"
+    ] else { return true }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+let gemma4VerifyLastLayerQueryTailPruneBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_LAST_LAYER_QUERY_TAIL_PRUNE_BITS"
+    ] else { return false }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -593,11 +608,21 @@ final class Gemma4FastLayer {
 
         let (B, L, _) = (h.dim(0), h.dim(1), h.dim(2))
         let offset = cache?.offset ?? 0
+        let pruneQueries = pruneTail
+            && gemma4LastLayerQueryTailPruneEnabled
+            && B == 1 && L == 512 && offset == 0
+            && !isSliding && h.dtype == .bfloat16
 
         let rawQueries: MLXArray
         let rawKeys: MLXArray
         let rawValues: MLXArray?
-        if B == 1, L == 1, let fusedQKV {
+        if pruneQueries, let combinedAttentionPrefill {
+            let projected = combinedAttentionPrefill.projectTailQueriesAndFullKV(
+                h, queryStart: 448)
+            rawQueries = projected.queries
+            rawKeys = projected.keys
+            rawValues = projected.values
+        } else if B == 1, L == 1, let fusedQKV {
             let projected = fusedQKV(h)
             rawQueries = projected.0
             rawKeys = projected.1
@@ -625,6 +650,7 @@ final class Gemma4FastLayer {
         var queries: MLXArray
         var keys: MLXArray
         var values: MLXArray
+        var queryPruneReferenceQueries: MLXArray? = nil
         let usesFusedAttentionPreparation = B == 1
             && L == 1
             && fusedAttentionRMS?.supports(offset: offset) == true
@@ -647,7 +673,51 @@ final class Gemma4FastLayer {
             && combinedAttentionPrefill != nil
             && (gemma4CombinedQKVPrefillPreparationEnabled
                 || gemma4VerifyCombinedQKVPrefillPreparationBits)
-        if usesCombinedKVDecodePreparation,
+        if pruneQueries,
+           usesCombinedQKVPrefillPreparation,
+           let fusedAttentionRMS,
+           let combinedCache,
+           let combinedPrefillCapacity
+        {
+            let candidate = fusedAttentionRMS.callTailQFullKVPrefill(
+                rawQueries: rawQueries,
+                rawKeys: rawKeys,
+                rawValues: rawValues,
+                capacity: combinedPrefillCapacity
+            )
+            queries = candidate.queries
+            let updated = combinedCache.adoptDirectPrefill(
+                candidate.combinedKV, length: L)
+            keys = updated.0
+            values = updated.1
+            if gemma4VerifyLastLayerQueryTailPruneBits {
+                guard let combinedAttentionPrefill else {
+                    preconditionFailure("query-tail verifier requires full projection")
+                }
+                let fullRaw = combinedAttentionPrefill(h)
+                let fullPrepared = fusedAttentionRMS.callCombinedQKVPrefill(
+                    rawQueries: fullRaw.queries,
+                    rawKeys: fullRaw.keys,
+                    rawValues: fullRaw.values,
+                    offset: 0,
+                    length: L,
+                    capacity: combinedPrefillCapacity
+                )
+                let qMatches = arrayEqual(
+                    candidate.queries.view(dtype: .uint16),
+                    fullPrepared.queries[0..., 0..., 448..<512, 0...]
+                        .view(dtype: .uint16))
+                let cacheMatches = arrayEqual(
+                    candidate.combinedKV.view(dtype: .uint16),
+                    fullPrepared.combinedKV.view(dtype: .uint16))
+                eval(qMatches, cacheMatches)
+                precondition(qMatches.item(Bool.self),
+                    "query-tail prepared Q differs in raw BF16")
+                precondition(cacheMatches.item(Bool.self),
+                    "query-tail complete cache slab differs in raw BF16")
+                queryPruneReferenceQueries = fullPrepared.queries
+            }
+        } else if usesCombinedKVDecodePreparation,
            let fusedAttentionRMS,
            let combinedCache
         {
@@ -858,6 +928,7 @@ final class Gemma4FastLayer {
         }
 
         let mergedAttention: MLXArray
+        var queryPruneReferenceAttention: MLXArray? = nil
         let canUseStagedSlidingPrefill = B == 1
             && L == 512
             && offset == 0
@@ -878,7 +949,30 @@ final class Gemma4FastLayer {
             && queries.shape == [1, 32, 512, 512]
             && keys.shape == [1, 4, 512, 512]
             && values.shape == [1, 4, 512, 512]
-        if canUseStagedSlidingPrefill
+        let canUseStagedFullTailPrefill = pruneQueries
+            && queries.shape == [1, 32, 64, 512]
+            && keys.shape == [1, 4, 512, 512]
+            && values.shape == [1, 4, 512, 512]
+        if canUseStagedFullTailPrefill {
+            let candidate = gemma4StagedFullPrefillTail64(
+                queries: queries, keys: keys, values: values)
+            if gemma4VerifyLastLayerQueryTailPruneBits {
+                guard let referenceQueries = queryPruneReferenceQueries else {
+                    preconditionFailure("query-tail verifier missing prepared Q")
+                }
+                let fullAttention = gemma4StagedFullPrefill512(
+                    queries: referenceQueries, keys: keys, values: values)
+                let referenceTail = fullAttention[0..., 448..<512, 0...]
+                let matches = arrayEqual(
+                    candidate.view(dtype: .uint16),
+                    referenceTail.view(dtype: .uint16))
+                eval(matches)
+                precondition(matches.item(Bool.self),
+                    "query-tail attention differs in raw BF16")
+                queryPruneReferenceAttention = fullAttention
+            }
+            mergedAttention = candidate
+        } else if canUseStagedSlidingPrefill
             && (gemma4StagedSlidingPrefillAttentionEnabled
                 || gemma4VerifyStagedSlidingPrefillAttentionBits)
         {
@@ -1018,7 +1112,7 @@ final class Gemma4FastLayer {
         // ops are per-row at any M. The retained rows are therefore
         // bit-identical to the full-width chain.
         let tailStart = pruneTail && B == 1 && L >= 128 ? L - 64 : 0
-        let chainAttention = tailStart > 0
+        let chainAttention = tailStart > 0 && mergedAttention.dim(1) == L
             ? mergedAttention[0..., tailStart..<L, 0...]
             : mergedAttention
         let chainResidual = tailStart > 0
@@ -1088,12 +1182,14 @@ final class Gemma4FastLayer {
             out = residual2 + out
             out = out * layerScalar
         }
-        if tailStart > 0 && gemma4VerifyLastLayerTailPruneBits {
+        if tailStart > 0 && (gemma4VerifyLastLayerTailPruneBits
+            || gemma4VerifyLastLayerQueryTailPruneBits) {
             // Full-width reference over the identical post-attention ops:
             // the pruned output must bit-match its last 64 rows. The layer's
             // KV slabs are upstream of the prune point (attention ran
             // full-width), so they are identical by construction.
-            let referenceAttnOut = oProj(mergedAttention)
+            let referenceAttention = queryPruneReferenceAttention ?? mergedAttention
+            let referenceAttnOut = oProj(referenceAttention)
             let referenceBoundary = residual + MLXFast.rmsNorm(
                 referenceAttnOut, weight: postAttnNormWeight, eps: eps)
             let referenceOut: MLXArray

@@ -678,7 +678,9 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
     headDim: Int,
     kvHeads: Int,
     sharesFullKVReduction: Bool,
-    directRMSRoPE: Bool = false
+    directRMSRoPE: Bool = false,
+    fixedQueryLength: Int? = nil,
+    queryPositionBase: Int = 0
 ) -> MLXFast.MLXFastKernel {
     precondition(headDim == 256 || headDim == 512)
     precondition(kvHeads == 16 || kvHeads == 4)
@@ -691,11 +693,15 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
             constexpr uint kReads = 4;
             constexpr uint kSIMDSize = 32;
             constexpr bool kSharesFullKVReduction = \(sharesFullKVReduction);
+            constexpr uint kFixedQueryLength = \(fixedQueryLength ?? 0);
+            constexpr uint kQueryPositionBase = \(queryPositionBase);
 
             const uint combined_row = threadgroup_position_in_grid.y;
             const uint input_length = static_cast<uint>(valid_length);
+            const uint query_length = kFixedQueryLength == 0
+                ? input_length : kFixedQueryLength;
             const uint output_capacity = static_cast<uint>(capacity);
-            const uint query_rows = input_length * kQHeads;
+            const uint query_rows = query_length * kQHeads;
             const bool is_q = combined_row < query_rows;
 
             uint token;
@@ -718,7 +724,7 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
             const uint slab_elements =
                 kKVHeads * output_capacity * kHeadDim;
             device bfloat* output = is_q
-                ? queries + (projection_head * input_length + token) * kHeadDim
+                ? queries + (projection_head * query_length + token) * kHeadDim
                 : combined_kv
                     + (is_k ? 0 : slab_elements)
                     + (projection_head * output_capacity + token) * kHeadDim;
@@ -825,9 +831,9 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
                 for (uint pair = thread_position_in_threadgroup.x;
                      pair < kPairs;
                      pair += kThreads) {
-                    const uint rope_index =
-                        (static_cast<uint>(start_position) + token)
-                            * kPairs + pair;
+                    const uint rope_position = static_cast<uint>(start_position)
+                        + token + (is_q ? kQueryPositionBase : 0);
+                    const uint rope_index = rope_position * kPairs + pair;
                     const float cosine = rope_cosines[rope_index];
                     const float sine = rope_sines[rope_index];
                     const float left = static_cast<float>(normalized_row[pair]);
@@ -889,6 +895,21 @@ private let gemma4DirectFullCombinedQKVPrefillPreparation =
         kvHeads: 4,
         sharesFullKVReduction: true,
         directRMSRoPE: true
+    )
+
+/// Distinct cache-safe pipeline: 64 local Q rows use absolute RoPE positions
+/// 448...511, while K/V retain all 512 rows and suffix-zero ownership.
+let gemma4TailQ64FullKV512PreparationKernelName =
+    "gemma4_tailq64_fullkv512_prep_shared_strided_512_v1"
+private let gemma4TailQ64FullKV512Preparation =
+    makeGemma4CombinedQKVPrefillPreparationKernel(
+        name: gemma4TailQ64FullKV512PreparationKernelName,
+        headDim: 512,
+        kvHeads: 4,
+        sharesFullKVReduction: true,
+        directRMSRoPE: true,
+        fixedQueryLength: 64,
+        queryPositionBase: 448
     )
 
 private struct Gemma4PreparedArray: @unchecked Sendable {
@@ -1351,6 +1372,42 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
             )
         }
         return outputs[0]
+    }
+
+    /// Final full-attention layer specialization. Q is local M=64 but uses
+    /// absolute positions 448...511; K/V and the complete cache slab remain
+    /// the ordinary 512-row prefill representation.
+    func callTailQFullKVPrefill(
+        rawQueries: MLXArray,
+        rawKeys: MLXArray,
+        rawValues: MLXArray?,
+        capacity: Int
+    ) -> (queries: MLXArray, combinedKV: MLXArray) {
+        precondition(!isSliding && headDim == 512 && kvHeads == 4)
+        precondition(rawQueries.dtype == .bfloat16)
+        precondition(rawQueries.shape == [1, 64, 32 * 512])
+        precondition(rawKeys.dtype == .bfloat16)
+        precondition(rawKeys.shape == [1, 512, 4 * 512])
+        let valueInput = rawValues ?? rawKeys
+        precondition(valueInput.shape == rawKeys.shape)
+        precondition(capacity >= 512)
+        precondition(supportsPrefill(offset: 0, length: 512))
+
+        let outputs = gemma4TailQ64FullKV512Preparation(
+            [
+                rawQueries, rawKeys, valueInput, qNormWeight, kNormWeight,
+                positionViews[0], MLXArray(Int32(512)),
+                MLXArray(Int32(capacity)), ropeCosines, ropeSines,
+            ],
+            grid: (128, 64 * 32 + capacity * 4, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [
+                [1, 32, 64, 512],
+                [2, 1, 4, capacity, 512],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16]
+        )
+        return (outputs[0], outputs[1])
     }
 
     /// Multi-token Q/K/V preparation. Queries are emitted as `[1,32,L,D]`

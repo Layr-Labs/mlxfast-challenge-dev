@@ -488,12 +488,68 @@ private let gemma4StagedFullPrefill512Kernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+let gemma4StagedFullPrefillTail64KernelName =
+    "gemma4_staged_full_prefill_tailq64_fullkv512_mpp_v1"
+
+/// Derive the tail specialization from the promoted source so QK, softmax,
+/// PV descriptors/reductions and casts cannot drift. Only independent query
+/// ownership and Q/output row addresses differ.
+private let gemma4StagedFullPrefillTail64KernelSource: String = {
+    var source = gemma4StagedFullPrefill512KernelSource
+    source = source.replacingOccurrences(
+        of: "const uint query_block = threadgroup_position_in_grid.z;\n        const uint query_start = query_block * kQueryRows;",
+        with: "const uint local_query_block = threadgroup_position_in_grid.z;\n        const uint query_block = 28 + local_query_block;\n        const uint query_start = query_block * kQueryRows;\n        const uint local_query_start = local_query_block * kQueryRows;"
+    )
+    source = source.replacingOccurrences(
+        of: "+ static_cast<int64_t>(query_start) * queries_strides[2];",
+        with: "+ static_cast<int64_t>(local_query_start) * queries_strides[2];"
+    )
+    source = source.replacingOccurrences(
+        of: "? query_start * (kQHeads * kHeadDim) + query_head * kHeadDim",
+        with: "? local_query_start * (kQHeads * kHeadDim) + query_head * kHeadDim"
+    )
+    precondition(source.contains("const uint query_block = 28 + local_query_block"))
+    precondition(source.contains("local_query_start * (kQHeads * kHeadDim)"))
+    return source
+}()
+
+private let gemma4StagedFullPrefillTail64Kernel = MLXFast.metalKernel(
+    name: gemma4StagedFullPrefillTail64KernelName,
+    inputNames: ["queries", "keys", "values"],
+    outputNames: ["output"],
+    source: gemma4StagedFullPrefillTail64KernelSource,
+    header: """
+        #include <metal_stdlib>
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+        """,
+    ensureRowContiguous: false
+)
+
 /// Runs the staged full-attention prefill kernel on the ranked shape.
 ///
 /// Returns `[1, 512, 32*512]` (token-major, already the merged layout
 /// `o_proj` consumes) when `gemma4StagedPrefillTokenMajorOutputEnabled`,
 /// otherwise the legacy head-major `[1, 32, 512, 512]` that the caller merges
 /// via `transposed(0, 2, 1, 3).reshaped(B, L, -1)`.
+func gemma4StagedFullPrefillTail64(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray
+) -> MLXArray {
+    precondition(gemma4StagedPrefillTokenMajorOutputEnabled)
+    precondition(queries.dtype == .bfloat16 && queries.shape == [1, 32, 64, 512])
+    precondition(keys.dtype == .bfloat16 && keys.shape == [1, 4, 512, 512])
+    precondition(values.dtype == .bfloat16 && values.shape == [1, 4, 512, 512])
+    return gemma4StagedFullPrefillTail64Kernel(
+        [queries, keys, values],
+        grid: (128, 32, 4),
+        threadGroup: (128, 1, 1),
+        outputShapes: [[1, 64, 32 * 512]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 func gemma4StagedFullPrefill512(
     queries: MLXArray,
     keys: MLXArray,

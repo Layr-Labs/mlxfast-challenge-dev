@@ -94,6 +94,47 @@ struct CombinedAttentionPrefillProjection: @unchecked Sendable {
         self.verifyBits = verifyBits
     }
 
+    /// Exact ranked-shape mixed-width projection used by the final-layer
+    /// query-tail prune. Q sees only the metadata-only final-row view while
+    /// K/V continue to see every supplied row.
+    func projectTailQueriesAndFullKV(
+        _ input: MLXArray,
+        queryStart: Int
+    ) -> (queries: MLXArray, keys: MLXArray, values: MLXArray?) {
+        precondition(input.dtype == .bfloat16)
+        precondition(input.shape == [1, 512, combined.weight.dim(1) * 8])
+        precondition(queryStart == 448)
+
+        let tailInput = input[0..., queryStart..<512, 0...]
+        let queries = q(tailInput)
+        let keys = k(input)
+        let values = v.map { $0(input) }
+
+        if gemma4VerifyLastLayerQueryTailPruneBits {
+            let fullQueries = q(input)
+            var comparisons = [
+                arrayEqual(
+                    queries.view(dtype: .uint16),
+                    fullQueries[0..., queryStart..<512, 0...]
+                        .view(dtype: .uint16)),
+                arrayEqual(
+                    keys.view(dtype: .uint16),
+                    k(input).view(dtype: .uint16)),
+            ]
+            if let v, let values {
+                comparisons.append(arrayEqual(
+                    values.view(dtype: .uint16),
+                    v(input).view(dtype: .uint16)))
+            }
+            eval(comparisons)
+            precondition(
+                comparisons.allSatisfy { $0.item(Bool.self) },
+                "last-layer mixed-width raw projection differs in raw BF16"
+            )
+        }
+        return (queries, keys, values)
+    }
+
     func callAsFunction(
         _ input: MLXArray
     ) -> (queries: MLXArray, keys: MLXArray, values: MLXArray?) {
