@@ -264,7 +264,7 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(workflow.contains(".build-worker/workspace-state.json"))
 
     let metalFingerprintStep = String(workflow[metalFingerprintRange.lowerBound..<restoreMetalCacheRange.lowerBound])
-    #expect(metalFingerprintStep.contains("mlx-metallib-m5-max-v1"))
+    #expect(metalFingerprintStep.contains("mlx-metallib-m5-max-v2"))
     #expect(metalFingerprintStep.contains("sysctl -n machdep.cpu.brand_string"))
     #expect(metalFingerprintStep.contains("sw_vers -buildVersion"))
     #expect(metalFingerprintStep.contains("xcodebuild -showComponent MetalToolchain"))
@@ -276,16 +276,35 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(metalFingerprintStep.contains("/opt/homebrew/bin/cmake /usr/local/bin/cmake"))
     #expect(metalFingerprintStep.contains("\"${cmake_bin}\" --version"))
     #expect(metalFingerprintStep.contains("shasum -a 256 Package.swift Package.resolved tools/build-mlx-metallib.sh"))
+    // The metallib cache key folds in the vendored kernel sources of THIS
+    // (post-overlay) work tree so a cached metallib can never mask
+    // participant edits to the AOT-served kernels; the build-products caches
+    // stay on the base fingerprint because llbuild rebuilds source changes
+    // incrementally.
+    #expect(metalFingerprintStep.contains(
+        "vendored_metal_fingerprint=\"$(tools/build-mlx-metallib.sh --print-fingerprint)\""
+    ))
+    #expect(metalFingerprintStep.contains("VENDORED_METAL_FINGERPRINT=%s"))
+    #expect(metalFingerprintStep.contains("BASE_FINGERPRINT=%s"))
+    #expect(metalFingerprintStep.contains("printf 'base_sha256=%s\\n' \"${base_fingerprint}\" >> \"${GITHUB_OUTPUT}\""))
 
     let restoreMetalCacheStep = String(workflow[restoreMetalCacheRange.lowerBound..<verifyMetalCacheRange.lowerBound])
-    #expect(restoreMetalCacheStep.contains("path: .mlxfast-cache/mlx.metallib"))
+    #expect(restoreMetalCacheStep.contains(".mlxfast-cache/mlx.metallib"))
+    #expect(restoreMetalCacheStep.contains(".mlxfast-cache/mlx.metallib.fingerprint"))
     #expect(!restoreMetalCacheStep.contains(".build/release"))
-    #expect(restoreMetalCacheStep.contains("key: mlx-metallib-m5-max-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
+    #expect(restoreMetalCacheStep.contains("key: mlx-metallib-m5-max-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
     let verifyMetalCacheStep = String(workflow[verifyMetalCacheRange.lowerBound..<prepareWorkspaceRange.lowerBound])
     #expect(verifyMetalCacheStep.contains("CACHE_HIT: ${{ steps.restore_mlx_metallib_cache.outputs.cache-hit }}"))
     #expect(verifyMetalCacheStep.contains("if [[ \"${CACHE_HIT}\" == \"true\" ]]"))
     #expect(verifyMetalCacheStep.contains("test -s .mlxfast-cache/mlx.metallib"))
-    #expect(verifyMetalCacheStep.contains("/bin/rm -f .mlxfast-cache/mlx.metallib"))
+    #expect(verifyMetalCacheStep.contains("test -s .mlxfast-cache/mlx.metallib.fingerprint"))
+    // A restored metallib whose recorded source fingerprint disagrees with
+    // the work tree is discarded, never trusted.
+    #expect(verifyMetalCacheStep.contains(
+        "expected_record=\"mlxfast-metallib-fingerprint-v1 $(tools/build-mlx-metallib.sh --print-fingerprint)\""
+    ))
+    #expect(verifyMetalCacheStep.contains("does not match the vendored Metal sources"))
+    #expect(verifyMetalCacheStep.contains("/bin/rm -f .mlxfast-cache/mlx.metallib .mlxfast-cache/mlx.metallib.fingerprint"))
 
     // Dependencies are pre-fetched in the trusted shell for both SwiftPM
     // roots; the trusted CLI and the participant worker build as separate
@@ -300,20 +319,24 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     let workerBuildStep = String(workflow[workerBuildRange.lowerBound..<stageMetalCacheRange.lowerBound])
     #expect(workerBuildStep.contains("sudo -n \"${MLXFAST_BENCH_EXEC}\""))
     #expect(workerBuildStep.contains("/usr/bin/swift build -c release --scratch-path .build-worker --product mlxfast-runtime-worker"))
-    #expect(workerBuildStep.contains("if [[ -s .mlxfast-cache/mlx.metallib ]]"))
+    #expect(workerBuildStep.contains("if [[ -s .mlxfast-cache/mlx.metallib && -s .mlxfast-cache/mlx.metallib.fingerprint ]]"))
     #expect(workerBuildStep.contains("/bin/cp .mlxfast-cache/mlx.metallib .build-worker/release/mlx.metallib"))
+    #expect(workerBuildStep.contains("/bin/cp .mlxfast-cache/mlx.metallib.fingerprint .build-worker/release/mlx.metallib.fingerprint"))
     #expect(workerBuildStep.contains("tools/build-mlx-metallib.sh"))
-    #expect(workerBuildStep.contains("/bin/chmod 0644 .build-worker/release/mlx.metallib"))
+    #expect(workerBuildStep.contains("/bin/chmod 0644 .build-worker/release/mlx.metallib .build-worker/release/mlx.metallib.fingerprint"))
+    #expect(workerBuildStep.contains("test -s \"${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib.fingerprint\""))
     #expect(!workflow.contains("TODO(security): Move trusted and participant products"))
 
     let stageMetalCacheStep = String(workflow[stageMetalCacheRange.lowerBound..<saveMetalCacheRange.lowerBound])
     #expect(stageMetalCacheStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
     #expect(stageMetalCacheStep.contains("/bin/cp \"${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib\" .mlxfast-cache/mlx.metallib"))
+    #expect(stageMetalCacheStep.contains("/bin/cp \"${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib.fingerprint\" .mlxfast-cache/mlx.metallib.fingerprint"))
     let saveMetalCacheStep = String(workflow[saveMetalCacheRange.lowerBound..<stageBuildProductsRange.lowerBound])
     #expect(saveMetalCacheStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
     #expect(saveMetalCacheStep.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
-    #expect(saveMetalCacheStep.contains("path: .mlxfast-cache/mlx.metallib"))
-    #expect(saveMetalCacheStep.contains("key: mlx-metallib-m5-max-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
+    #expect(saveMetalCacheStep.contains(".mlxfast-cache/mlx.metallib"))
+    #expect(saveMetalCacheStep.contains(".mlxfast-cache/mlx.metallib.fingerprint"))
+    #expect(saveMetalCacheStep.contains("key: mlx-metallib-m5-max-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
 
     // Build products caches: the workspace path must be STABLE across runs
     // (llbuild records absolute paths; a per-run path would force a full
@@ -331,11 +354,11 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     let restoreBuildProductsStep = String(workflow[restoreBuildProductsRange.lowerBound..<restoreWorkerBuildProductsRange.lowerBound])
     #expect(restoreBuildProductsStep.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
     #expect(restoreBuildProductsStep.contains("path: .mlxfast-cache/trusted-build"))
-    #expect(restoreBuildProductsStep.contains("key: bench-trusted-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
+    #expect(restoreBuildProductsStep.contains("key: bench-trusted-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}"))
     let restoreWorkerBuildProductsStep = String(workflow[restoreWorkerBuildProductsRange.lowerBound..<verifyBuildProductsRange.lowerBound])
     #expect(restoreWorkerBuildProductsStep.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
     #expect(restoreWorkerBuildProductsStep.contains("path: .mlxfast-cache/worker-build"))
-    #expect(restoreWorkerBuildProductsStep.contains("key: bench-worker-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
+    #expect(restoreWorkerBuildProductsStep.contains("key: bench-worker-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}"))
     let verifyBuildProductsStep = String(workflow[verifyBuildProductsRange.lowerBound..<prepareWorkspaceRange.lowerBound])
     #expect(verifyBuildProductsStep.contains("TRUSTED_CACHE_HIT: ${{ steps.restore_build_products_cache.outputs.cache-hit }}"))
     #expect(verifyBuildProductsStep.contains("WORKER_CACHE_HIT: ${{ steps.restore_worker_build_products_cache.outputs.cache-hit }}"))
@@ -357,7 +380,7 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(saveBuildProductsStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
     #expect(saveBuildProductsStep.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
     #expect(saveBuildProductsStep.contains("path: .mlxfast-cache/trusted-build"))
-    #expect(saveBuildProductsStep.contains("key: bench-trusted-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
+    #expect(saveBuildProductsStep.contains("key: bench-trusted-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}"))
     let stageWorkerBuildProductsStep = String(workflow[stageWorkerBuildProductsRange.lowerBound..<saveWorkerBuildProductsRange.lowerBound])
     #expect(stageWorkerBuildProductsStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
     #expect(stageWorkerBuildProductsStep.contains("/usr/bin/rsync -a \\"))
@@ -369,7 +392,7 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(saveWorkerBuildProductsStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
     #expect(saveWorkerBuildProductsStep.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
     #expect(saveWorkerBuildProductsStep.contains("path: .mlxfast-cache/worker-build"))
-    #expect(saveWorkerBuildProductsStep.contains("key: bench-worker-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
+    #expect(saveWorkerBuildProductsStep.contains("key: bench-worker-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}"))
 
     // Prepare must prove the stable workspace path is actually fresh (fail
     // closed on undeletable residue from a prior run) and seed the restored
@@ -2194,6 +2217,38 @@ func officialCorrectnessRunsEnforceWorkerSandboxThroughBenchExec() throws {
     // The direct benchmark invocation inside the gates pass keeps the official
     // contract markers so the CLI's fail-closed checks stay armed.
     #expect(workflow.contains("MLXFAST_OFFICIAL_BENCHMARK_RUN=1"))
+}
+
+// Before any participant worker is spawned, the trusted CLI re-verifies the
+// metallib the worker will load against the vendored Metal sources (the
+// published mlx.metallib.fingerprint sidecar): official runs fail closed on a
+// stale, missing, or unverifiable metallib so a cached artifact can never
+// mask kernel edits; local runs warn.
+@Test
+func cliVerifiesMetallibFingerprintBeforeWorkerLaunch() throws {
+    let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
+    #expect(!cli.contains("TODO(security): Fingerprint the metallib"))
+    #expect(!cli.contains("TODO(security): Separate trusted and participant build caches"))
+    #expect(cli.contains("try enforceMetallibFingerprint("))
+    #expect(cli.contains("VendoredMetalFingerprint.defaultCmlxRelativePath"))
+    #expect(cli.contains("verifyMetallibFingerprintRecord("))
+    #expect(cli.contains(
+        "official benchmark runs require the metallib fingerprint check"
+    ))
+    #expect(cli.contains("refusing to spawn the participant worker: "))
+    #expect(cli.contains("mlxfast-swift: warning: "))
+
+    let fingerprintSource = try String(
+        contentsOfFile: "Sources/MLXFastTrustedHarness/VendoredMetalFingerprint.swift",
+        encoding: .utf8
+    )
+    #expect(fingerprintSource.contains("recordPrefix = \"mlxfast-metallib-fingerprint-v1\""))
+    #expect(fingerprintSource.contains("fingerprintedSubtrees = [\"mlx\", \"mlx-generated\"]"))
+    #expect(fingerprintSource.contains("defaultCmlxRelativePath = \"Vendor/mlx-swift/Source/Cmlx\""))
+    // Byte-order path sort and shasum-format lines: the exact contract shared
+    // with tools/build-mlx-metallib.sh's compute_vendored_metal_fingerprint.
+    #expect(fingerprintSource.contains("lhs.utf8.lexicographicallyPrecedes(rhs.utf8)"))
+    #expect(fingerprintSource.contains("\\(hexEncoded(digest))  \\(relativePath)\\n"))
 }
 
 @Test

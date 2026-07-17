@@ -1437,10 +1437,15 @@ private enum MLXFastCLI {
                 "participant runtime worker is not executable at \(executablePath)"
             )
         }
-        // TODO(security): Fingerprint the metallib over every vendored Metal
-        // source before the participant worker is spawned.
-        // TODO(security): Separate trusted and participant build caches in the
-        // final launcher/build orchestration.
+        // The metallib the worker will load must correspond to the vendored
+        // Metal sources on disk: official runs fail closed on any stale or
+        // unverifiable metallib (a cached artifact must never mask kernel
+        // edits); local runs warn so an edit-loop checkout that predates the
+        // fingerprint sidecar keeps working until ./setup.sh is rerun.
+        try enforceMetallibFingerprint(
+            workerExecutablePath: executablePath,
+            officialRun: officialRun
+        )
         // TODO(security): Enforce the static-review byte cap and kernel-bypass
         // policy before allowing this participant worker launch.
         var sandboxProfile = environmentValue("MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE", fallback: "")
@@ -1469,6 +1474,48 @@ private enum MLXFastCLI {
             // content into CI logs.
             forwardsWorkerStderr: forwardsWorkerStderr && !officialRun
         )
+    }
+
+    /// Verify the metallib next to the participant worker against the
+    /// vendored Metal sources before any worker is spawned. Official runs
+    /// fail closed on a stale, missing, or unverifiable metallib; local runs
+    /// warn and continue (the sidecar may simply predate this check).
+    private static func enforceMetallibFingerprint(
+        workerExecutablePath: String,
+        officialRun: Bool
+    ) throws {
+        let configuredMetallib = environmentValue("MLXFAST_MLX_METALLIB", fallback: "")
+        let metallibPath = configuredMetallib.isEmpty
+            ? URL(fileURLWithPath: workerExecutablePath)
+                .deletingLastPathComponent()
+                .appendingPathComponent("mlx.metallib").path
+            : absolutePath(configuredMetallib)
+        let cmlxRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(VendoredMetalFingerprint.defaultCmlxRelativePath)
+            .path
+        switch verifyMetallibFingerprintRecord(
+            metallibPath: metallibPath,
+            cmlxRoot: cmlxRoot
+        ) {
+        case .verified:
+            return
+        case .skipped(let reason):
+            if officialRun {
+                throw MLXFastError.invalidInput(
+                    "official benchmark runs require the metallib fingerprint check; "
+                        + reason
+                )
+            }
+        case .mismatch(let reason):
+            if officialRun {
+                throw MLXFastError.invalidInput(
+                    "refusing to spawn the participant worker: " + reason
+                )
+            }
+            FileHandle.standardError.write(Data(
+                ("mlxfast-swift: warning: " + reason + "\n").utf8
+            ))
+        }
     }
 
     private static func siblingParticipantWorkerExecutablePath() throws -> String {

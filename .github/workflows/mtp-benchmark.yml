@@ -471,8 +471,14 @@ jobs:
             echo "::error::installed Metal toolchain (${metal_toolchain_identifier:-none}) does not match the ranked pin (${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}); update the pin or the box deliberately" >&2
             exit 1
           fi
-          fingerprint="$({
-            printf '%s\n' mlx-metallib-m5-max-v1
+          # Same two-fingerprint scheme as the serial pipeline: the vendored
+          # kernel sources of THIS (overlaid) work tree key the metallib
+          # cache so a cached mlx.metallib can never mask participant kernel
+          # edits; the base fingerprint keys the build-products caches.
+          vendored_metal_fingerprint="$(tools/build-mlx-metallib.sh --print-fingerprint)"
+          test "${#vendored_metal_fingerprint}" -eq 64
+          base_fingerprint="$({
+            printf '%s\n' mlx-metallib-m5-max-v2
             uname -m
             sysctl -n machdep.cpu.brand_string
             sw_vers -buildVersion
@@ -487,15 +493,23 @@ jobs:
             "${cmake_bin}" --version
             shasum -a 256 Package.swift Package.resolved tools/build-mlx-metallib.sh
           } | shasum -a 256 | awk '{print $1}')"
+          test "${#base_fingerprint}" -eq 64
+          fingerprint="$({
+            printf 'BASE_FINGERPRINT=%s\n' "${base_fingerprint}"
+            printf 'VENDORED_METAL_FINGERPRINT=%s\n' "${vendored_metal_fingerprint}"
+          } | shasum -a 256 | awk '{print $1}')"
           test "${#fingerprint}" -eq 64
           printf 'sha256=%s\n' "${fingerprint}" >> "${GITHUB_OUTPUT}"
+          printf 'base_sha256=%s\n' "${base_fingerprint}" >> "${GITHUB_OUTPUT}"
 
       - name: Restore trusted MLX Metal library cache
         id: restore_mlx_metallib_cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .mlxfast-cache/mlx.metallib
-          key: mlx-metallib-m5-max-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
+          path: |
+            .mlxfast-cache/mlx.metallib
+            .mlxfast-cache/mlx.metallib.fingerprint
+          key: mlx-metallib-m5-max-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
 
       - name: Verify restored MLX Metal library
         env:
@@ -504,8 +518,15 @@ jobs:
           set -euo pipefail
           if [[ "${CACHE_HIT}" == "true" ]]; then
             test -s .mlxfast-cache/mlx.metallib
+            test -s .mlxfast-cache/mlx.metallib.fingerprint
+            expected_record="mlxfast-metallib-fingerprint-v1 $(tools/build-mlx-metallib.sh --print-fingerprint)"
+            restored_record="$(cat .mlxfast-cache/mlx.metallib.fingerprint)"
+            if [[ "${restored_record}" != "${expected_record}" ]]; then
+              echo "::warning::restored mlx.metallib does not match the vendored Metal sources in this work tree; discarding it so the bench build recompiles"
+              /bin/rm -f .mlxfast-cache/mlx.metallib .mlxfast-cache/mlx.metallib.fingerprint
+            fi
           else
-            /bin/rm -f .mlxfast-cache/mlx.metallib
+            /bin/rm -f .mlxfast-cache/mlx.metallib .mlxfast-cache/mlx.metallib.fingerprint
           fi
 
       - name: Reset staged trusted build products
@@ -516,14 +537,14 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .mlxfast-cache/trusted-build
-          key: bench-trusted-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
+          key: bench-trusted-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}
 
       - name: Restore worker build products cache
         id: restore_worker_build_products_cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .mlxfast-cache/worker-build
-          key: bench-worker-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
+          key: bench-worker-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}
 
       - name: Verify restored build products
         env:
@@ -693,16 +714,18 @@ jobs:
               set -euo pipefail
               cd "${MJOB_WS}"
               /usr/bin/swift build -c release --scratch-path .build-worker --product mlxfast-runtime-worker
-              if [[ -s .mlxfast-cache/mlx.metallib ]]; then
+              if [[ -s .mlxfast-cache/mlx.metallib && -s .mlxfast-cache/mlx.metallib.fingerprint ]]; then
                 /bin/cp .mlxfast-cache/mlx.metallib .build-worker/release/mlx.metallib
+                /bin/cp .mlxfast-cache/mlx.metallib.fingerprint .build-worker/release/mlx.metallib.fingerprint
                 echo "mtp-benchmark: restored trusted MLX Metal library"
               else
                 tools/build-mlx-metallib.sh
               fi
-              /bin/chmod 0644 .build-worker/release/mlx.metallib
+              /bin/chmod 0644 .build-worker/release/mlx.metallib .build-worker/release/mlx.metallib.fingerprint
             '
           test -x "${MLXFAST_JOB_WS}/.build-worker/release/mlxfast-runtime-worker"
           test -s "${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib"
+          test -s "${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib.fingerprint"
           # Separate participant-worker attestation (TOCTOU defense): every
           # scored phase must execute exactly the worker binary and metallib
           # built from the reviewed source tree; the worker stays OUT of the
