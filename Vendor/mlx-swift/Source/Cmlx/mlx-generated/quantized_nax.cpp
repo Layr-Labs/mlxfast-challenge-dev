@@ -1320,24 +1320,25 @@ template <
   threadgroup T Ws[BN * BK_padded];
 
   // The host dispatches an (N tile, M tile, batch) grid with N in the
-  // physically contiguous x dimension.  For Gemma's aligned BF16 affine-4
-  // path, linearize that unchanged physical grid and decode it with M tiles
-  // as the minor coordinate.  Consecutive threadgroups then consume the same
-  // weight tile across all M tiles before advancing N, while the helper still
-  // receives the original logical (N tile, M tile, batch) coordinate shape.
-  constexpr bool gemma4_m_major = gemma4_bk128;
+  // physically contiguous x dimension.  On the scored eight-M-tile shape,
+  // decode each eight-group run as a Morton-local 2-M x 4-N microtile.  The
+  // local bit interleave keeps several N tiles close for activation reuse and
+  // both M tiles close for weight reuse without changing the physical grid.
+  constexpr bool gemma4_microtile = gemma4_bk128;
   uint3 logical_tid = tid;
-  if constexpr (gemma4_m_major) {
-    const uint m_tiles = (uint(M) + BM - 1) / BM;
-    const uint n_tiles = uint(N) / BN;
-    const uint physical_linear = tid.y * n_tiles + tid.x;
-    if (M == 512) {
-      // The scored prefill has exactly eight M tiles. Avoid an integer divide
-      // in every threadgroup on that hot shape.
-      logical_tid = uint3(physical_linear >> 3, physical_linear & 7, tid.z);
-    } else {
-      const uint logical_n = physical_linear / m_tiles;
-      const uint logical_m = physical_linear - logical_n * m_tiles;
+  if constexpr (gemma4_microtile) {
+    // Gemma's production N widths all contain a whole number of four-N
+    // microtiles.  Keep every other shape on the exact identity mapping.
+    if (M == 512 && (uint(N) & (4 * BN - 1)) == 0) {
+      const uint n_tiles = uint(N) >> 6;
+      const uint physical_linear = tid.y * n_tiles + tid.x;
+      const uint microtile = physical_linear >> 3;
+      const uint local = physical_linear & 7;
+
+      // Morton decode of local bits [m0, n0, n1]. Four consecutive
+      // microtiles cover the four two-M pairs before advancing four N tiles.
+      const uint logical_n = (microtile & ~3u) | (local >> 1);
+      const uint logical_m = ((microtile & 3) << 1) | (local & 1);
       logical_tid = uint3(logical_n, logical_m, tid.z);
     }
   }
