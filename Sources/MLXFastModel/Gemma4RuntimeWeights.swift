@@ -35,24 +35,22 @@ public final class Gemma4RuntimeWeightCache {
     public init(loader: Gemma4WeightLoader, config: Gemma4Config) {
         self.loader = loader
         self.config = config
-        let startupMemoryPolicy: Gemma4StartupMemoryPolicy?
+        // Bound the MLX buffer cache so resident memory stays near the ~17 GB
+        // checkpoint plus KV/activation buffers instead of growing without limit
+        // across a long decode run.
+        //
+        // The ranked M5 Max has enough headroom to retain more freed
+        // intermediate buffers for reuse. This is a soft allocator-cache cap,
+        // not a reservation; model weights remain active allocations.
         if config.numHiddenLayers >= 16 {
-            // Keep the ranked 128 GiB machine's full optimized layout, but
-            // protect local Macs from retaining ~14.5 GiB of alternate weight
-            // layouts on top of the ~16.9 GiB source model. The policy is
-            // selected before model loading so file-global feature switches are
-            // first observed after their low-memory defaults are installed;
-            // the defaults never overwrite flags the user set explicitly.
-            let policy = Gemma4StartupMemoryPolicy.resolve(
-                physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
-                requestedProfile: ProcessInfo.processInfo.environment[
-                    Gemma4StartupMemoryPolicy.profileOverrideEnvironmentName
-                ]
-            )
-            policy.apply()
-            startupMemoryPolicy = policy
-        } else {
-            startupMemoryPolicy = nil
+            // The MLX M5 Max default commits after referencing 50 MiB. Many
+            // 4-bit projections individually exceed that, so use a moderate
+            // limit that can group adjacent kernels without long command buffers.
+            setenv("MLX_MAX_MB_PER_BUFFER", "320", 1)
+            // Decode's explicit async-eval groups remain the outer command-
+            // buffer boundary; let the referenced-buffer budget govern within them.
+            setenv("MLX_MAX_OPS_PER_BUFFER", "128", 1)
+            Memory.cacheLimit = 32 << 30
         }
         do {
             libraryModel = try Gemma4RuntimeWeightCache.loadLibraryModel(
@@ -75,12 +73,6 @@ public final class Gemma4RuntimeWeightCache {
         // caches independent of this allocator pool.
         if let model = libraryModel, config.numHiddenLayers >= 16 {
             Self.warmLibraryModel(model)
-            if startupMemoryPolicy?.clearAllocatorCacheAfterWarmup == true {
-                // Pipeline state is process-lifetime state, while free warmup
-                // allocations are exactly the pressure a low-memory machine
-                // cannot afford to retain before the worker protocol hello.
-                Memory.clearCache()
-            }
         }
     }
 
@@ -102,10 +94,10 @@ public final class Gemma4RuntimeWeightCache {
 
     /// Construct and weight-load the mlx-swift-lm Gemma 4 text tower from the
     /// transformed `weights/` tree. Mirrors the library's `loadWeights`
-    /// (sanitize -> 4-bit affine quantize -> update -> eval), but streams each
-    /// tensor from its shard into MLX-owned storage while stripping the
-    /// checkpoint's `language_model.` text-tower prefix: our transform
-    /// preserves the source names (`language_model.model.layers...`), whereas `Gemma4TextModel`'s
+    /// (sanitize -> 4-bit affine quantize -> update -> eval), but reads the
+    /// safetensor shards in memory first so we can strip the checkpoint's
+    /// `language_model.` text-tower prefix: our transform preserves the source
+    /// names (`language_model.model.layers...`), whereas `Gemma4TextModel`'s
     /// parameter paths are `model.layers...`. Doing the rename here keeps the
     /// transform output and the harness's DenseTensorStore validation unchanged.
     private static func loadLibraryModel(
@@ -120,11 +112,34 @@ public final class Gemma4RuntimeWeightCache {
 
         let validatedTiedHeadPacked13Metadata =
             try validateGemma4TiedHeadPacked13MetadataBytes(denseStore: denseStore)
+        // Raw-byte proof (no MLX, no GPU) that the transform-authored
+        // co-tiled tied-head payload reconstructs the exact weight and
+        // packed13 metadata byte runs the co-tiled head kernel consumes.
+        let validatedTiedHeadCoTiledPayload =
+            try validateGemma4TiedHeadCoTiledPayloadBytes(
+                denseStore: denseStore,
+                validatedTiedHeadPacked13Metadata: validatedTiedHeadPacked13Metadata
+            )
+        // Raw-byte proof (no MLX, no GPU) that every transform-authored packed
+        // projection index stream reconstructs its stem's U16 index tensor.
+        let validatedPackedProjectionMetadata =
+            try validateGemma4PackedProjectionMetadataBytes(denseStore: denseStore)
+        // Raw-byte proof (no MLX, no GPU) that every transform-authored
+        // co-tiled attention payload reconstructs the exact weight and packed
+        // metadata byte runs the co-tiled decode kernels consume.
+        let validatedCoTiledAttentionPayloads =
+            try validateGemma4CoTiledAttentionPayloadBytes(
+                denseStore: denseStore,
+                validatedPackedProjectionMetadata: validatedPackedProjectionMetadata
+            )
         let loadedWeights = try loadRuntimeWeightArrays(denseStore: denseStore)
         let partition = try partitionRuntimeWeights(
             loadedWeights,
             expectedIndexedStems: expectedIndexedProjectionStems(config: config),
-            validatedTiedHeadPacked13Metadata: validatedTiedHeadPacked13Metadata
+            validatedTiedHeadPacked13Metadata: validatedTiedHeadPacked13Metadata,
+            validatedTiedHeadCoTiledPayload: validatedTiedHeadCoTiledPayload,
+            validatedPackedProjectionMetadata: validatedPackedProjectionMetadata,
+            validatedCoTiledAttentionPayloads: validatedCoTiledAttentionPayloads
         )
         let weights = partition.modelParameters
 
@@ -141,13 +156,20 @@ public final class Gemma4RuntimeWeightCache {
         // conversion pass is a no-op here and is intentionally omitted.
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
         eval(model)
-        eval(partition.indexedMetadata.values.flatMap { [$0.indices, $0.lut] })
+        eval(
+            partition.indexedMetadata.values.flatMap { [$0.indices, $0.lut] }
+                + partition.packedIndexMetadata.values.map(\.bytes)
+                + partition.coTiledAttentionPayloads.values.map(\.words)
+        )
         // The constructor's decode warmup consumes the packed head before the
         // worker handshake and materializes these arrays. Avoid a standalone
         // GPU command before FastEngine finishes its host-side preparation.
         try model.prepareFastEngine(
             indexedMetadata: partition.indexedMetadata,
-            tiedHeadPacked13Metadata: partition.tiedHeadPacked13Metadata
+            packedIndexMetadata: partition.packedIndexMetadata,
+            coTiledAttentionPayloads: partition.coTiledAttentionPayloads,
+            tiedHeadPacked13Metadata: partition.tiedHeadPacked13Metadata,
+            tiedHeadCoTiledPayload: partition.tiedHeadCoTiledPayload
         )
         return model
     }
@@ -210,21 +232,6 @@ public final class Gemma4RuntimeWeightCache {
 func loadRuntimeWeightArrays(
     denseStore: DenseTensorStore
 ) throws -> [String: MLXArray] {
-    let bridge = MLXArrayTensorBridge()
-    return try loadRuntimeWeightValues(denseStore: denseStore) { tensor in
-        try bridge.makeArray(from: tensor)
-    }
-}
-
-/// Materializes runtime weights one tensor at a time. `DenseTensorStore`
-/// drains the source buffer's autorelease pool before visiting the next
-/// tensor; only the detached value returned by `makeValue` remains resident.
-/// The production value is an `MLXArray`, whose Data initializer copies the
-/// bytes into MLX-owned storage.
-func loadRuntimeWeightValues<Value>(
-    denseStore: DenseTensorStore,
-    makeValue: (MaterializedTensor) throws -> Value
-) throws -> [String: Value] {
     let directory = URL(fileURLWithPath: denseStore.weightsPath)
     let entries = try FileManager.default.contentsOfDirectory(
         at: directory, includingPropertiesForKeys: nil
@@ -237,52 +244,24 @@ func loadRuntimeWeightValues<Value>(
         discoveredShards: discoveredShards
     )
 
-    var loadedWeights: [String: Value] = [:]
-    loadedWeights.reserveCapacity(denseStore.tensorNames.count)
+    var loadedWeights: [String: MLXArray] = [:]
     var expectedLoadedNames: Set<String> = []
     var nameTracker = RuntimeWeightNameTracker()
     for shardName in shardNames {
         let expectedNames = denseStore.tensorNames(inShard: shardName)
         expectedLoadedNames.formUnion(expectedNames)
         let shard = directory.appendingPathComponent(shardName)
-        let discoveredNames = Set(try Safetensors.readHeader(shard).tensors.keys)
-        try validateRuntimeTensorInventory(
-            shardName: shardName,
-            expectedNames: expectedNames,
-            discoveredNames: discoveredNames
-        )
-        try denseStore.forEachMaterializedTensor(inShard: shardName) { record, tensor in
+        for (key, value) in try loadArrays(url: shard) {
             let renamed = try nameTracker.register(
-                originalName: record.name,
+                originalName: key,
                 shardName: shardName,
                 expectedNames: expectedNames
             )
-            loadedWeights[renamed] = try makeValue(tensor)
+            loadedWeights[renamed] = value
         }
     }
     try nameTracker.validateComplete(expectedNames: expectedLoadedNames)
     return loadedWeights
-}
-
-func validateRuntimeTensorInventory(
-    shardName: String,
-    expectedNames: Set<String>,
-    discoveredNames: Set<String>
-) throws {
-    let missing = expectedNames.subtracting(discoveredNames).sorted()
-    guard missing.isEmpty else {
-        throw MLXFastError.invalidInput(
-            "safetensors shard \(shardName) is missing indexed tensors: "
-                + missing.joined(separator: ", ")
-        )
-    }
-    let unindexed = discoveredNames.subtracting(expectedNames).sorted()
-    guard unindexed.isEmpty else {
-        throw MLXFastError.invalidInput(
-            "safetensors shard \(shardName) contains unindexed or misplaced tensors: "
-                + unindexed.joined(separator: ", ")
-        )
-    }
 }
 
 func validateRuntimeShardInventory(
@@ -351,7 +330,11 @@ struct RuntimeWeightNameTracker {
 struct RuntimeWeightPartition {
     let modelParameters: [String: MLXArray]
     let indexedMetadata: [String: IndexedAffineMetadata]
+    let packedIndexMetadata: [String: Gemma4PackedQKVIndexMetadata]
+    /// Keyed by the layer's attention prefix (`model.layers.<i>.self_attn`).
+    let coTiledAttentionPayloads: [String: Gemma4CoTiledAttentionPayload]
     let tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata?
+    let tiedHeadCoTiledPayload: Gemma4TiedHeadCoTiledPayload?
 }
 
 private struct RuntimeIndexedMetadataParts {
@@ -379,17 +362,32 @@ func partitionRuntimeWeights(
     _ loaded: [String: MLXArray],
     expectedIndexedStems: Set<String>,
     validatedTiedHeadPacked13Metadata:
-        ValidatedGemma4TiedHeadPacked13Metadata? = nil
+        ValidatedGemma4TiedHeadPacked13Metadata? = nil,
+    validatedTiedHeadCoTiledPayload:
+        ValidatedGemma4TiedHeadCoTiledPayload? = nil,
+    validatedPackedProjectionMetadata:
+        [String: ValidatedGemma4PackedProjectionMetadata] = [:],
+    validatedCoTiledAttentionPayloads:
+        [String: ValidatedGemma4CoTiledAttentionPayload] = [:]
 ) throws -> RuntimeWeightPartition {
     let tiedHeadPackedIndicesName =
         "model.embed_tokens.tied_head_packed13_indices"
     let tiedHeadLUTName = "model.embed_tokens.tied_head_packed13_lut"
+    let tiedHeadCoTiledPayloadName =
+        "model.embed_tokens.tied_head_cotiled_payload"
     let indicesSuffix = ".metadata_indices"
     let lutSuffix = ".metadata_lut"
+    let packedFixed12Suffix = Gemma4PackedProjectionMetadataLayout.fixed12Suffix
+    let packedFixed13Suffix = Gemma4PackedProjectionMetadataLayout.fixed13Suffix
+    let coTiledSlidingSuffix = Gemma4CoTiledAttentionPayloadLayout.slidingSuffix
+    let coTiledFullSuffix = Gemma4CoTiledAttentionPayloadLayout.fullSuffix
     var modelParameters: [String: MLXArray] = [:]
     var metadataParts: [String: RuntimeIndexedMetadataParts] = [:]
+    var packedParts: [String: (array: MLXArray, indexBits: Int)] = [:]
+    var coTiledParts: [String: MLXArray] = [:]
     var tiedHeadPackedIndices: MLXArray?
     var tiedHeadLUT: MLXArray?
+    var tiedHeadCoTiledWords: MLXArray?
 
     for name in loaded.keys.sorted() {
         guard let array = loaded[name] else { continue }
@@ -397,12 +395,32 @@ func partitionRuntimeWeights(
             tiedHeadPackedIndices = array
         } else if name == tiedHeadLUTName {
             tiedHeadLUT = array
+        } else if name == tiedHeadCoTiledPayloadName {
+            tiedHeadCoTiledWords = array
         } else if name.hasSuffix(indicesSuffix) {
             let stem = String(name.dropLast(indicesSuffix.count))
             metadataParts[stem, default: RuntimeIndexedMetadataParts()].indices = array
         } else if name.hasSuffix(lutSuffix) {
             let stem = String(name.dropLast(lutSuffix.count))
             metadataParts[stem, default: RuntimeIndexedMetadataParts()].lut = array
+        } else if name.hasSuffix(packedFixed12Suffix) {
+            let stem = String(name.dropLast(packedFixed12Suffix.count))
+            guard packedParts.updateValue((array, 12), forKey: stem) == nil else {
+                throw MLXFastError.invalidInput(
+                    "duplicate packed projection metadata formats for \(stem)"
+                )
+            }
+        } else if name.hasSuffix(packedFixed13Suffix) {
+            let stem = String(name.dropLast(packedFixed13Suffix.count))
+            guard packedParts.updateValue((array, 13), forKey: stem) == nil else {
+                throw MLXFastError.invalidInput(
+                    "duplicate packed projection metadata formats for \(stem)"
+                )
+            }
+        } else if name.hasSuffix(coTiledSlidingSuffix)
+            || name.hasSuffix(coTiledFullSuffix)
+        {
+            coTiledParts[name] = array
         } else {
             modelParameters[name] = array
         }
@@ -445,11 +463,61 @@ func partitionRuntimeWeights(
         )
     }
 
+    // Bind the loaded co-tiled tied-head payload to its raw-byte validation
+    // descriptor. A loaded payload must have been validated (fail-closed), a
+    // validated payload must have loaded (no silent drops), and the packed13
+    // metadata that carries the LUT the co-tiled kernel indexes must be
+    // present.
+    let tiedHeadCoTiledPayload: Gemma4TiedHeadCoTiledPayload?
+    if let words = tiedHeadCoTiledWords {
+        guard tiedHeadPacked13Metadata != nil else {
+            throw MLXFastError.invalidInput(
+                "tied-head co-tiled payload is present without packed13 metadata"
+            )
+        }
+        guard let validatedTiedHeadCoTiledPayload else {
+            throw MLXFastError.invalidInput(
+                "tied-head co-tiled payload was not validated from raw bytes"
+            )
+        }
+        guard words.dtype == .uint32,
+              words.shape == [
+                  validatedTiedHeadCoTiledPayload.threadgroups,
+                  validatedTiedHeadCoTiledPayload.wordsPerThreadgroup,
+              ]
+        else {
+            throw MLXFastError.invalidInput(
+                "tied-head co-tiled payload has invalid dtype or shape"
+            )
+        }
+        tiedHeadCoTiledPayload = Gemma4TiedHeadCoTiledPayload(words: words)
+    } else {
+        guard validatedTiedHeadCoTiledPayload == nil else {
+            throw MLXFastError.invalidInput(
+                "validated tied-head co-tiled payload was not loaded"
+            )
+        }
+        tiedHeadCoTiledPayload = nil
+    }
+
     guard !metadataParts.isEmpty else {
+        guard packedParts.isEmpty, validatedPackedProjectionMetadata.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "packed projection metadata is present without indexed metadata"
+            )
+        }
+        guard coTiledParts.isEmpty, validatedCoTiledAttentionPayloads.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "co-tiled attention payloads are present without indexed metadata"
+            )
+        }
         return RuntimeWeightPartition(
             modelParameters: modelParameters,
             indexedMetadata: [:],
-            tiedHeadPacked13Metadata: tiedHeadPacked13Metadata
+            packedIndexMetadata: [:],
+            coTiledAttentionPayloads: [:],
+            tiedHeadPacked13Metadata: tiedHeadPacked13Metadata,
+            tiedHeadCoTiledPayload: tiedHeadCoTiledPayload
         )
     }
     let actualStems = Set(metadataParts.keys)
@@ -504,10 +572,138 @@ func partitionRuntimeWeights(
         )
         indexedMetadata[stem] = IndexedAffineMetadata(indices: indices, lut: lut)
     }
+
+    // Bind loaded packed index arrays to their raw-byte validation
+    // descriptors. Every packed array must have been validated (fail-closed),
+    // every validated stream must have loaded (no silent drops), and its
+    // logical geometry must match the stem's indexed metadata exactly.
+    var packedIndexMetadata: [String: Gemma4PackedQKVIndexMetadata] = [:]
+    packedIndexMetadata.reserveCapacity(packedParts.count)
+    for stem in packedParts.keys.sorted() {
+        guard let part = packedParts[stem] else { continue }
+        guard let validated = validatedPackedProjectionMetadata[stem],
+              validated.indexBits == part.indexBits
+        else {
+            throw MLXFastError.invalidInput(
+                "packed projection metadata was not validated from raw bytes for \(stem)"
+            )
+        }
+        guard let metadata = indexedMetadata[stem] else {
+            throw MLXFastError.invalidInput(
+                "packed projection metadata has no indexed companion for \(stem)"
+            )
+        }
+        guard part.array.dtype == .uint8,
+              part.array.shape == [validated.rows, validated.bytesPerRow],
+              metadata.indices.shape == [validated.rows, validated.groupsPerRow],
+              metadata.lut.size == validated.lutCount
+        else {
+            throw MLXFastError.invalidInput(
+                "packed projection metadata has invalid dtype or shape for \(stem)"
+            )
+        }
+        packedIndexMetadata[stem] = Gemma4PackedQKVIndexMetadata(
+            bytes: part.array,
+            indexBits: part.indexBits
+        )
+    }
+    let unloadedPacked = Set(validatedPackedProjectionMetadata.keys)
+        .subtracting(packedIndexMetadata.keys)
+        .sorted()
+    guard unloadedPacked.isEmpty else {
+        throw MLXFastError.invalidInput(
+            "validated packed projection metadata was not loaded: "
+                + unloadedPacked.joined(separator: ", ")
+        )
+    }
+
+    // Bind loaded co-tiled attention payload arrays to their raw-byte
+    // validation descriptors. Every payload must have been validated
+    // (fail-closed), every validated payload must have loaded (no silent
+    // drops), and the constituent projections' packed metadata must be
+    // loaded with the exact index widths the payload was validated against.
+    var coTiledAttentionPayloads: [String: Gemma4CoTiledAttentionPayload] = [:]
+    coTiledAttentionPayloads.reserveCapacity(coTiledParts.count)
+    for name in coTiledParts.keys.sorted() {
+        guard let array = coTiledParts[name] else { continue }
+        guard let validated = validatedCoTiledAttentionPayloads[name] else {
+            throw MLXFastError.invalidInput(
+                "co-tiled attention payload was not validated from raw bytes "
+                    + "for \(name)"
+            )
+        }
+        guard array.dtype == .uint32,
+              array.shape == [validated.threadgroups, validated.wordsPerThreadgroup]
+        else {
+            throw MLXFastError.invalidInput(
+                "co-tiled attention payload has invalid dtype or shape for \(name)"
+            )
+        }
+        let suffix: String
+        switch validated.kind {
+        case .slidingQKV:
+            suffix = Gemma4CoTiledAttentionPayloadLayout.slidingSuffix
+        case .fullQK:
+            suffix = Gemma4CoTiledAttentionPayloadLayout.fullSuffix
+        }
+        guard name.hasSuffix(suffix) else {
+            throw MLXFastError.invalidInput(
+                "co-tiled attention payload kind does not match its name: \(name)"
+            )
+        }
+        let attentionPrefix = String(name.dropLast(suffix.count)) + ".self_attn"
+        guard let qPacked = packedIndexMetadata["\(attentionPrefix).q_proj"],
+              qPacked.indexBits == validated.qBits,
+              let kPacked = packedIndexMetadata["\(attentionPrefix).k_proj"],
+              kPacked.indexBits == validated.kBits
+        else {
+            throw MLXFastError.invalidInput(
+                "co-tiled attention payload has no packed metadata companions "
+                    + "for \(name)"
+            )
+        }
+        if validated.kind == .slidingQKV {
+            guard let vBits = validated.vBits,
+                  let vPacked = packedIndexMetadata["\(attentionPrefix).v_proj"],
+                  vPacked.indexBits == vBits
+            else {
+                throw MLXFastError.invalidInput(
+                    "co-tiled attention payload has no packed metadata companions "
+                        + "for \(name)"
+                )
+            }
+        }
+        guard coTiledAttentionPayloads.updateValue(
+            Gemma4CoTiledAttentionPayload(
+                kind: validated.kind,
+                words: array,
+                qBits: validated.qBits,
+                kBits: validated.kBits,
+                vBits: validated.vBits
+            ),
+            forKey: attentionPrefix
+        ) == nil else {
+            throw MLXFastError.invalidInput(
+                "duplicate co-tiled attention payloads for \(attentionPrefix)"
+            )
+        }
+    }
+    let unloadedCoTiled = Set(validatedCoTiledAttentionPayloads.keys)
+        .subtracting(coTiledParts.keys)
+        .sorted()
+    guard unloadedCoTiled.isEmpty else {
+        throw MLXFastError.invalidInput(
+            "validated co-tiled attention payloads were not loaded: "
+                + unloadedCoTiled.joined(separator: ", ")
+        )
+    }
     return RuntimeWeightPartition(
         modelParameters: modelParameters,
         indexedMetadata: indexedMetadata,
-        tiedHeadPacked13Metadata: tiedHeadPacked13Metadata
+        packedIndexMetadata: packedIndexMetadata,
+        coTiledAttentionPayloads: coTiledAttentionPayloads,
+        tiedHeadPacked13Metadata: tiedHeadPacked13Metadata,
+        tiedHeadCoTiledPayload: tiedHeadCoTiledPayload
     )
 }
 
