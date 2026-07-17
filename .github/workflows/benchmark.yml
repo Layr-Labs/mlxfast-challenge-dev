@@ -649,8 +649,8 @@ jobs:
           mkdir -p "${MLXFAST_JOB_WS}/.ranked-src"
           # Resolve dependencies for both SwiftPM roots while still trusted
           # and networked (the bench uid has a PF egress block).
-          (cd "${MLXFAST_JOB_WS}" && swift package resolve)
-          (cd "${MLXFAST_JOB_WS}" && swift package resolve --scratch-path .build-worker)
+          (cd "${MLXFAST_JOB_WS}" && swift package resolve --force-resolved-versions)
+          (cd "${MLXFAST_JOB_WS}" && swift package resolve --force-resolved-versions --scratch-path .build-worker)
           # Functional grant: bench must read/execute the whole tree and write
           # its own build/transform/score outputs. bench OWNS everything it
           # creates (.build, weights, private, score files), so ownership -- not
@@ -833,7 +833,7 @@ jobs:
               MLXFAST_METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" /bin/bash -c '
               set -euo pipefail
               cd "${MJOB_WS}"
-              /usr/bin/swift build -c release --product mlxfast-swift
+              /usr/bin/swift build -c release --force-resolved-versions --product mlxfast-swift
             '
           test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-swift"
           # Pin the trusted timer/gates/score artifacts NOW, before the
@@ -863,7 +863,7 @@ jobs:
               MLXFAST_METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" /bin/bash -c '
               set -euo pipefail
               cd "${MJOB_WS}"
-              /usr/bin/swift build -c release --scratch-path .build-worker --product mlxfast-runtime-worker
+              /usr/bin/swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker
               if [[ -s .mlxfast-cache/mlx.metallib && -s .mlxfast-cache/mlx.metallib.fingerprint ]]; then
                 /bin/cp .mlxfast-cache/mlx.metallib .build-worker/release/mlx.metallib
                 /bin/cp .mlxfast-cache/mlx.metallib.fingerprint .build-worker/release/mlx.metallib.fingerprint

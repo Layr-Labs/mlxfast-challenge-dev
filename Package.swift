@@ -23,8 +23,14 @@ let package = Package(
         // mlx-swift-lm bc1c0ee67d15798343be17c9f8f61f7c0d977149
         .package(path: "Vendor/mlx-swift"),
         .package(path: "Vendor/mlx-swift-lm"),
-        // TODO(security): Assert the resolved dependency graph before either
-        // trusted-harness or participant-worker builds begin.
+        // The resolved dependency graph is frozen and asserted before either
+        // trusted-harness or participant-worker builds begin: setup.sh and
+        // benchmark.sh refuse to build over a Package.swift/Package.resolved
+        // that differs from the committed state, the ranked workflows
+        // byte-verify both against the trusted ref
+        // (.github/scripts/verify-trusted-source-scope.sh), and every build
+        // and resolve passes --force-resolved-versions so SwiftPM fails
+        // closed instead of silently re-resolving.
         .package(url: "https://github.com/huggingface/swift-transformers", exact: "1.3.3"),
     ],
     targets: [

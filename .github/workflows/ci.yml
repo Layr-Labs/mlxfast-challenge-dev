@@ -94,8 +94,8 @@ jobs:
           mkdir -p .build/clang-module-cache
           # Production build layout: trusted CLI in .build, participant
           # worker in its own .build-worker SwiftPM scratch root.
-          swift build -c release --product mlxfast-swift
-          swift build -c release --scratch-path .build-worker --product mlxfast-runtime-worker
+          swift build -c release --force-resolved-versions --product mlxfast-swift
+          swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker
           swift test -c release
           test -x .build/release/mlxfast-swift
           test -x .build-worker/release/mlxfast-runtime-worker

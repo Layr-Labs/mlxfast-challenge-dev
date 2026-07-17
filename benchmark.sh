@@ -1571,8 +1571,31 @@ swift_build_required() {
     || [[ "${USE_RUNTIME_WORKER}" == "1" && ! -x "${RUNTIME_WORKER_BIN}" ]]
 }
 
+# The dependency graph is frozen by challenge policy: before either build
+# begins, Package.swift and Package.resolved must match the committed state
+# (SwiftPM re-resolution, a submission, or local edits all show up as a
+# work-tree diff). Skips quietly where git is unavailable -- the ranked
+# workflows re-verify the manifests byte-for-byte against the trusted ref in
+# verify-trusted-source-scope.sh -- and --force-resolved-versions on the
+# builds below makes SwiftPM itself fail closed instead of silently
+# re-resolving an out-of-date graph.
+assert_frozen_dependency_graph() {
+  command -v git >/dev/null 2>&1 || return 0
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  local manifest
+  for manifest in Package.swift Package.resolved; do
+    git cat-file -e "HEAD:${manifest}" 2>/dev/null || return 0
+    if ! git diff --quiet HEAD -- "${manifest}" 2>/dev/null; then
+      echo "benchmark.sh: ${manifest} differs from the committed state; the dependency graph is frozen by challenge policy" >&2
+      echo "benchmark.sh: restore it (git checkout -- ${manifest}) and rerun" >&2
+      exit 1
+    fi
+  done
+}
+
 if [[ "${MLXFAST_IN_SANDBOX:-0}" != "1" ]] && swift_build_required; then
   echo "benchmark.sh: trusted CLI or participant runtime worker missing; building"
+  assert_frozen_dependency_graph
   # Independent SwiftPM build/cache roots: the trusted CLI builds in .build
   # and the participant worker (which compiles the vendored MLX forks) in
   # .build-worker, each with its own clang module cache, so a
@@ -1580,9 +1603,9 @@ if [[ "${MLXFAST_IN_SANDBOX:-0}" != "1" ]] && swift_build_required; then
   # An explicitly exported CLANG_MODULE_CACHE_PATH wins for both builds.
   mkdir -p .build/clang-module-cache .build-worker/clang-module-cache
   CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}" \
-    swift build -c release --product mlxfast-swift
+    swift build -c release --force-resolved-versions --product mlxfast-swift
   CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build-worker/clang-module-cache}" \
-    swift build -c release --scratch-path .build-worker --product mlxfast-runtime-worker
+    swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker
 fi
 
 # Preserve the legacy no-worker wrapper path under the whole-script sandbox

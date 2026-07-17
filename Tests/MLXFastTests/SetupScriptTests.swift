@@ -26,8 +26,8 @@ func setupScriptCoordinatesCacheAndMetallibState() throws {
     // colocates with the worker binary.
     #expect(setup.contains("RUNTIME_WORKER_BIN=\"${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-.build-worker/release/mlxfast-runtime-worker}\""))
     #expect(setup.contains("MLX_METALLIB=\"${MLXFAST_MLX_METALLIB:-$(dirname \"${RUNTIME_WORKER_BIN}\")/mlx.metallib}\""))
-    #expect(setup.contains("swift build -c release --product mlxfast-swift"))
-    #expect(setup.contains("swift build -c release --scratch-path .build-worker --product mlxfast-runtime-worker"))
+    #expect(setup.contains("swift build -c release --force-resolved-versions --product mlxfast-swift"))
+    #expect(setup.contains("swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker"))
     #expect(setup.contains("mkdir -p .build/clang-module-cache .build-worker/clang-module-cache"))
     #expect(setup.contains("CLANG_MODULE_CACHE_PATH=\"${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}\" \\"))
     #expect(setup.contains("CLANG_MODULE_CACHE_PATH=\"${CLANG_MODULE_CACHE_PATH:-${PWD}/.build-worker/clang-module-cache}\" \\"))
@@ -1912,6 +1912,86 @@ private func writeSetupVendoredFixture(at checkout: URL) throws {
         atomically: true,
         encoding: .utf8
     )
+}
+
+// The dependency graph is frozen by challenge policy: both build entrypoints
+// assert Package.swift/Package.resolved match the committed state before
+// building and pass --force-resolved-versions so SwiftPM fails closed instead
+// of silently re-resolving an out-of-date graph.
+@Test
+func buildEntrypointsAssertFrozenDependencyGraph() throws {
+    let setup = try String(contentsOfFile: "setup.sh", encoding: .utf8)
+    let benchmark = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    for script in [setup, benchmark] {
+        #expect(script.contains("assert_frozen_dependency_graph"))
+        #expect(script.contains("for manifest in Package.swift Package.resolved; do"))
+        #expect(script.contains("git diff --quiet HEAD -- \"${manifest}\""))
+        #expect(script.contains("the dependency graph is frozen by challenge policy"))
+    }
+    // benchmark.sh asserts before its fallback build; setup.sh inside
+    // build_swift_harness, before any swift build runs.
+    #expect(benchmark.contains("  assert_frozen_dependency_graph\n"))
+    #expect(setup.contains("  assert_frozen_dependency_graph || return 1\n"))
+
+    let manifest = try String(contentsOfFile: "Package.swift", encoding: .utf8)
+    #expect(!manifest.contains("TODO(security): Assert the resolved dependency graph"))
+    #expect(manifest.contains("--force-resolved-versions"))
+
+    // Every ranked resolve/build passes --force-resolved-versions too.
+    for workflowPath in [
+        ".github/workflows/benchmark.yml",
+        ".github/workflows/mtp-benchmark.yml",
+    ] {
+        let workflow = try String(contentsOfFile: workflowPath, encoding: .utf8)
+        #expect(
+            !workflow.contains("swift package resolve)"),
+            "\(workflowPath) must resolve with --force-resolved-versions"
+        )
+        #expect(
+            !workflow.contains("swift build -c release --product"),
+            "\(workflowPath) must build with --force-resolved-versions"
+        )
+    }
+}
+
+@Test
+func frozenDependencyGraphAssertionDetectsManifestDrift() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let repo = root.appendingPathComponent("repo")
+    try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+    try "// manifest\n".write(
+        to: repo.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+    try "{\"pins\":[]}\n".write(
+        to: repo.appendingPathComponent("Package.resolved"), atomically: true, encoding: .utf8)
+
+    let script = """
+    eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+    cd "${FIXTURE_REPO}"
+    git init -q
+    git -c user.email=t@t -c user.name=t -c commit.gpgsign=false add .
+    git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m base
+    # Clean tree passes.
+    assert_frozen_dependency_graph
+    # A drifted resolved file (e.g. SwiftPM silently re-resolving) fails.
+    printf '{"pins":["drift"]}\\n' > Package.resolved
+    drift_status=0
+    assert_frozen_dependency_graph || drift_status=$?
+    [[ "${drift_status}" != "0" ]]
+    git checkout -q -- Package.resolved
+    assert_frozen_dependency_graph
+    """
+    let result = try runSetupBash(
+        script,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "FIXTURE_REPO": repo.path,
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+        ]
+    )
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+    #expect(result.stderr.contains("dependency graph is frozen by challenge policy"))
 }
 
 // The bash fingerprint recipe in tools/build-mlx-metallib.sh and its Swift

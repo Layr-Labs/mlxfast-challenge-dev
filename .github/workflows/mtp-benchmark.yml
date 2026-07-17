@@ -596,8 +596,8 @@ jobs:
           mkdir -p "${MLXFAST_JOB_WS}/.mtp-ranked-src"
           # Resolve dependencies for both SwiftPM roots while still trusted
           # and networked (the bench uid has a PF egress block).
-          (cd "${MLXFAST_JOB_WS}" && swift package resolve)
-          (cd "${MLXFAST_JOB_WS}" && swift package resolve --scratch-path .build-worker)
+          (cd "${MLXFAST_JOB_WS}" && swift package resolve --force-resolved-versions)
+          (cd "${MLXFAST_JOB_WS}" && swift package resolve --force-resolved-versions --scratch-path .build-worker)
           /bin/chmod -R +a "user:bench allow list,search,readattr,readextattr,read,execute,add_file,add_subdirectory,delete_child,write,append,writeattr,writeextattr,file_inherit,directory_inherit" "${MLXFAST_JOB_WS}"
           /bin/chmod -R +a "user:bench deny write,append,writeattr,writeextattr,delete,delete_child,add_file,add_subdirectory,chown,file_inherit,directory_inherit" \
             "${MLXFAST_JOB_WS}/.github" \
@@ -690,7 +690,7 @@ jobs:
               MLXFAST_METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" /bin/bash -c '
               set -euo pipefail
               cd "${MJOB_WS}"
-              /usr/bin/swift build -c release --product mlxfast-swift
+              /usr/bin/swift build -c release --force-resolved-versions --product mlxfast-swift
             '
           test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-swift"
           # Pin the trusted timer/gates/score artifacts before the
@@ -713,7 +713,7 @@ jobs:
               MLXFAST_METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" /bin/bash -c '
               set -euo pipefail
               cd "${MJOB_WS}"
-              /usr/bin/swift build -c release --scratch-path .build-worker --product mlxfast-runtime-worker
+              /usr/bin/swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker
               if [[ -s .mlxfast-cache/mlx.metallib && -s .mlxfast-cache/mlx.metallib.fingerprint ]]; then
                 /bin/cp .mlxfast-cache/mlx.metallib .build-worker/release/mlx.metallib
                 /bin/cp .mlxfast-cache/mlx.metallib.fingerprint .build-worker/release/mlx.metallib.fingerprint

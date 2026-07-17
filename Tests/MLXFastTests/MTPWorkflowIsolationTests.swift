@@ -80,10 +80,10 @@ struct MTPWorkflowIsolationTests {
         #expect(enablement.lowerBound < build.lowerBound)
         #expect(build.lowerBound < workerBuild.lowerBound)
         #expect(workflow.contains(
-            "/usr/bin/swift build -c release --product mlxfast-swift"
+            "/usr/bin/swift build -c release --force-resolved-versions --product mlxfast-swift"
         ))
         #expect(workflow.contains(
-            "/usr/bin/swift build -c release --scratch-path .build-worker --product mlxfast-runtime-worker"
+            "/usr/bin/swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker"
         ))
         #expect(workflow.contains(
             "test -x \"${MLXFAST_JOB_WS}/.build-worker/release/mlxfast-runtime-worker\""
