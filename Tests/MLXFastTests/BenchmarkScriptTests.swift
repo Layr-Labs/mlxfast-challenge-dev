@@ -704,21 +704,46 @@ func benchmarkPinsAndVerifiesTrustedHarnessAcrossScoredPhases() throws {
         contentsOfFile: ".github/scripts/pin-trusted-harness.sh",
         encoding: .utf8
     )
-    #expect(pinScript.contains("TODO(security): Revisit this pin's scope"))
-    #expect(!pinScript.contains("\".build/release/mlxfast-runtime-worker\""))
+    // Two separately attested artifact sets: the trusted set carries only
+    // the driver + trusted CLI binary; the participant worker binary and
+    // metallib live in their own worker attestation and never inside the
+    // trusted pin.
+    #expect(!pinScript.contains("TODO(security)"))
+    #expect(pinScript.contains("ARTIFACT_SET=\"${4:-trusted}\""))
+    let trustedSetRange = try #require(pinScript.range(of: "  trusted)"))
+    let workerSetRange = try #require(pinScript.range(of: "  worker)"))
+    let trustedSet = String(pinScript[trustedSetRange.lowerBound..<workerSetRange.lowerBound])
+    #expect(trustedSet.contains("\"benchmark.sh\""))
+    #expect(trustedSet.contains("\".build/release/mlxfast-swift\""))
+    #expect(!trustedSet.contains("mlxfast-runtime-worker"))
+    #expect(!trustedSet.contains("mlx.metallib"))
+    let workerSet = String(pinScript[workerSetRange.lowerBound...])
+    #expect(workerSet.contains("\".build-worker/release/mlxfast-runtime-worker\""))
+    #expect(workerSet.contains("\".build-worker/release/mlx.metallib\""))
 
-    // Pin is captured at the END of the trusted build, before the submitted
-    // transform (the first bench step that can tamper), and re-verified before
-    // every phase that runs the binary as bench.
+    // The trusted pin is captured at the END of the trusted CLI build and
+    // BEFORE the participant worker build (worker-build-time code execution
+    // must not be able to tamper the trusted binary pre-pin); the worker
+    // attestation is captured at the end of the worker build, before the
+    // submitted transform. Both are re-verified before every phase that runs
+    // the binaries as bench.
     #expect(workflow.contains(
         ".github/scripts/pin-trusted-harness.sh write \\\n"
-            + "            \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256\""
+            + "            \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256\" trusted"
     ))
-    let verifyInvocation =
-        ".github/scripts/pin-trusted-harness.sh verify \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256\""
-    #expect(workflow.components(separatedBy: verifyInvocation).count - 1 == 3)
+    #expect(workflow.contains(
+        ".github/scripts/pin-trusted-harness.sh write \\\n"
+            + "            \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/participant-worker.sha256\" worker"
+    ))
+    let verifyTrustedInvocation =
+        ".github/scripts/pin-trusted-harness.sh verify \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256\" trusted"
+    let verifyWorkerInvocation =
+        ".github/scripts/pin-trusted-harness.sh verify \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/participant-worker.sha256\" worker"
+    #expect(workflow.components(separatedBy: verifyTrustedInvocation).count - 1 == 3)
+    #expect(workflow.components(separatedBy: verifyWorkerInvocation).count - 1 == 3)
 
-    let buildRange = try #require(workflow.range(of: "- name: Build participant worker in bench sandbox"))
+    let trustedBuildRange = try #require(workflow.range(of: "- name: Build trusted CLI in bench sandbox"))
+    let workerBuildRange = try #require(workflow.range(of: "- name: Build participant worker in bench sandbox"))
     let transformRange = try #require(workflow.range(of: "- name: Transform reference checkpoint in bench sandbox"))
     let verifyPublicRange = try #require(workflow.range(of: "- name: Verify trusted harness before public gate"))
     let publicGateRange = try #require(workflow.range(of: "- name: Public behavior gate"))
@@ -727,10 +752,15 @@ func benchmarkPinsAndVerifiesTrustedHarnessAcrossScoredPhases() throws {
     let verifyTimingRange = try #require(workflow.range(of: "- name: Verify trusted harness before timing"))
     let timingRange = try #require(workflow.range(of: "- name: Timed paired benchmark (measure-job)"))
 
-    // write happens inside the build step (before transform).
-    let writeRange = try #require(workflow.range(of: "pin-trusted-harness.sh write"))
-    #expect(buildRange.lowerBound < writeRange.lowerBound)
-    #expect(writeRange.lowerBound < transformRange.lowerBound)
+    // The trusted write happens inside the trusted build step, before the
+    // worker build; the worker write happens inside the worker build step,
+    // before the transform.
+    let trustedWriteRange = try #require(workflow.range(of: "trusted-harness.sha256\" trusted"))
+    let workerWriteRange = try #require(workflow.range(of: "participant-worker.sha256\" worker"))
+    #expect(trustedBuildRange.lowerBound < trustedWriteRange.lowerBound)
+    #expect(trustedWriteRange.lowerBound < workerBuildRange.lowerBound)
+    #expect(workerBuildRange.lowerBound < workerWriteRange.lowerBound)
+    #expect(workerWriteRange.lowerBound < transformRange.lowerBound)
     // Each verify immediately precedes the phase that executes the binary.
     #expect(transformRange.lowerBound < verifyPublicRange.lowerBound)
     #expect(verifyPublicRange.lowerBound < publicGateRange.lowerBound)
@@ -756,13 +786,18 @@ func pinTrustedHarnessScriptDetectsTamper() throws {
     try FileManager.default.createDirectory(at: workerReleaseDir, withIntermediateDirectories: true)
     try "driver\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
     try "BINARY".write(to: releaseDir.appendingPathComponent("mlxfast-swift"), atomically: true, encoding: .utf8)
+    try "WORKER".write(to: workerReleaseDir.appendingPathComponent("mlxfast-runtime-worker"), atomically: true, encoding: .utf8)
     try "METALLIB".write(to: workerReleaseDir.appendingPathComponent("mlx.metallib"), atomically: true, encoding: .utf8)
-    let pin = root.appendingPathComponent("trusted-harness.sha256")
+    let trustedPin = root.appendingPathComponent("trusted-harness.sha256")
+    let workerPin = root.appendingPathComponent("participant-worker.sha256")
 
-    func run(_ mode: String) throws -> Int32 {
+    func run(_ mode: String, _ artifactSet: String) throws -> Int32 {
+        let pin = artifactSet == "trusted" ? trustedPin : workerPin
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [".github/scripts/pin-trusted-harness.sh", mode, ws.path, pin.path]
+        process.arguments = [
+            ".github/scripts/pin-trusted-harness.sh", mode, ws.path, pin.path, artifactSet,
+        ]
         process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         process.standardError = Pipe()
         try process.run()
@@ -770,28 +805,51 @@ func pinTrustedHarnessScriptDetectsTamper() throws {
         return process.terminationStatus
     }
 
-    #expect(try run("write") == 0)
-    #expect(FileManager.default.fileExists(atPath: pin.path))
-    #expect(try run("verify") == 0)
+    #expect(try run("write", "trusted") == 0)
+    #expect(try run("write", "worker") == 0)
+    #expect(FileManager.default.fileExists(atPath: trustedPin.path))
+    #expect(FileManager.default.fileExists(atPath: workerPin.path))
+    #expect(try run("verify", "trusted") == 0)
+    #expect(try run("verify", "worker") == 0)
 
-    // A swapped binary fails the verify closed.
+    // A swapped trusted binary fails the trusted verify closed and leaves the
+    // worker attestation untouched (the sets are independent).
     try "EVIL".write(to: releaseDir.appendingPathComponent("mlxfast-swift"), atomically: true, encoding: .utf8)
-    #expect(try run("verify") != 0)
+    #expect(try run("verify", "trusted") != 0)
+    #expect(try run("verify", "worker") == 0)
 
     // A swapped driver fails too.
     try "BINARY".write(to: releaseDir.appendingPathComponent("mlxfast-swift"), atomically: true, encoding: .utf8)
     try "hacked\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
-    #expect(try run("verify") != 0)
+    #expect(try run("verify", "trusted") != 0)
+
+    // A swapped worker binary fails the worker attestation, not the trusted pin.
+    try "driver\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
+    #expect(try run("verify", "trusted") == 0)
+    try "EVILWORKER".write(
+        to: workerReleaseDir.appendingPathComponent("mlxfast-runtime-worker"),
+        atomically: true,
+        encoding: .utf8
+    )
+    #expect(try run("verify", "worker") != 0)
+    #expect(try run("verify", "trusted") == 0)
 
     // A symlinked artifact is rejected (never dereferenced).
-    try "driver\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
-    #expect(try run("verify") == 0)
+    try "WORKER".write(
+        to: workerReleaseDir.appendingPathComponent("mlxfast-runtime-worker"),
+        atomically: true,
+        encoding: .utf8
+    )
+    #expect(try run("verify", "worker") == 0)
     try FileManager.default.removeItem(at: workerReleaseDir.appendingPathComponent("mlx.metallib"))
     try FileManager.default.createSymbolicLink(
         atPath: workerReleaseDir.appendingPathComponent("mlx.metallib").path,
         withDestinationPath: "/etc/hosts"
     )
-    #expect(try run("verify") != 0)
+    #expect(try run("verify", "worker") != 0)
+
+    // An unknown artifact set is rejected.
+    #expect(try run("verify", "everything") == 2)
 }
 
 @Test

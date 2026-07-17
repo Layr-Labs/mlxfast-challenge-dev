@@ -664,6 +664,12 @@ jobs:
               /usr/bin/swift build -c release --product mlxfast-swift
             '
           test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-swift"
+          # Pin the trusted timer/gates/score artifacts before the
+          # participant worker build runs (same reasoning as the serial
+          # pipeline: worker-build-time code execution must not be able to
+          # alter the trusted binary between its build and its pin).
+          .github/scripts/pin-trusted-harness.sh write \
+            "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
 
       - name: Build participant worker in bench sandbox
         env:
@@ -689,10 +695,12 @@ jobs:
             '
           test -x "${MLXFAST_JOB_WS}/.build-worker/release/mlxfast-runtime-worker"
           test -s "${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib"
-          # Pin the trusted harness artifacts NOW (TOCTOU defense); every
-          # later phase that executes the binary as bench re-verifies.
+          # Separate participant-worker attestation (TOCTOU defense): every
+          # scored phase must execute exactly the worker binary and metallib
+          # built from the reviewed source tree; the worker stays OUT of the
+          # trusted pin.
           .github/scripts/pin-trusted-harness.sh write \
-            "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
+            "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
 
       # Transform the pinned 31B-IT target source (NOT the serial track's
       # base checkpoint) into the candidate's runtime weights.
@@ -818,9 +826,11 @@ jobs:
           echo "mtp-benchmark: hidden goldens verified (correctness ${correctness_hash}, benchmark ${bench_hash})"
 
       # TOCTOU guard: the submitted transform ran with workspace write access
-      # since the post-build pin.
+      # since the post-build pins.
       - name: Verify trusted harness before MTP correctness gate
-        run: .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
+        run: |
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
 
       # The untimed MTP correctness/parity gate: one full-length trained-MTP
       # pass over the hidden correctness golden. The trusted parent checks
@@ -1009,7 +1019,9 @@ jobs:
 
       - name: Verify trusted harness before timing
         if: ${{ inputs.run_benchmark }}
-        run: .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
+        run: |
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
 
       # THE TIMED MTP MEASUREMENT -- LAST, via the box-owned wrapper with the
       # fixed thermal contract. Per accepted pair, alternating order:

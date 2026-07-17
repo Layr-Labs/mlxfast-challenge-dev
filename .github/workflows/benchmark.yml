@@ -790,6 +790,15 @@ jobs:
               /usr/bin/swift build -c release --product mlxfast-swift
             '
           test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-swift"
+          # Pin the trusted timer/gates/score artifacts NOW, before the
+          # participant worker build runs: worker-build-time code execution
+          # (manifest evaluation, build plugins) happens as bench and must
+          # not be able to alter the trusted binary between its build and
+          # its pin. Every later phase that executes the driver/binary as
+          # bench re-verifies against this pin and fails closed on any
+          # change (TOCTOU defense).
+          .github/scripts/pin-trusted-harness.sh write \
+            "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
 
       # Same bridge/env contract as the trusted CLI build above; this
       # invocation compiles the participant-editable surface (MLXFastModel and
@@ -819,13 +828,14 @@ jobs:
             '
           test -x "${MLXFAST_JOB_WS}/.build-worker/release/mlxfast-runtime-worker"
           test -s "${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib"
-          # Pin the trusted harness artifacts NOW, at the end of the trusted-
-          # controlled build and before the submitted transform (the first
-          # bench step that could tamper with the workspace). Every later phase
-          # that executes the binary/driver as bench re-verifies against this
-          # pin and fails closed on any change (TOCTOU defense).
+          # Separate participant-worker attestation, captured at the end of
+          # the worker build and before the submitted transform (the first
+          # bench step that could tamper with the workspace): every scored
+          # phase must execute exactly the worker binary and metallib built
+          # from the reviewed source tree. The worker stays OUT of the
+          # trusted pin -- it is participant code with its own attestation.
           .github/scripts/pin-trusted-harness.sh write \
-            "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
+            "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
 
       - name: Stage trusted MLX Metal library cache
         if: steps.restore_mlx_metallib_cache.outputs.cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
@@ -937,10 +947,13 @@ jobs:
         run: .github/scripts/hash-weights-directory.sh "${MLXFAST_JOB_WS}/weights" weights.sha256
 
       # TOCTOU guard: the submitted transform just ran with workspace write
-      # access. Re-verify that the trusted driver + binary + metallib still
-      # match the post-build pin before executing the binary as bench again.
+      # access. Re-verify that the trusted driver + binary and the participant
+      # worker + metallib still match their post-build pins before executing
+      # them as bench again.
       - name: Verify trusted harness before public gate
-        run: .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
+        run: |
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
 
       # Public drift tripwire (issue #83 class): one independent 64-step
       # teacher-forced check against the checked-in public fixture, run BEFORE
@@ -1254,13 +1267,16 @@ jobs:
           echo "benchmark: using private GPQA-augmented correctness golden ${actual_hash} bytes=${actual_bytes}"
 
       # TOCTOU guard before the first --official invocation: attach-gpqa-gates
-      # and the public gate executed the binary as bench since the last check,
-      # so re-verify the trusted driver + binary + metallib against the
-      # post-build pin. A replaced benchmark.sh or binary here could otherwise
-      # forge the sealed gates score.
+      # and the public gate executed the binaries as bench since the last
+      # check, so re-verify the trusted driver + binary and the participant
+      # worker + metallib against their post-build pins. A replaced
+      # benchmark.sh or binary here could otherwise forge the sealed gates
+      # score.
       - name: Verify trusted harness before gates
         if: ${{ inputs.run_benchmark }}
-        run: .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
+        run: |
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
 
       # The single gates+base pass: ONE `mlxfast-swift benchmark` invocation
       # (via benchmark.sh --official) that teacher-forces the FULL 64-step
@@ -1564,14 +1580,16 @@ jobs:
 
       # TOCTOU guard before the second --official invocation: the gates pass
       # executed submitted model code since the last check, so re-verify the
-      # trusted driver + binary + metallib against the post-build pin before
-      # measure-job re-runs ./benchmark.sh and the binary for the scored timing.
-      # measure-job is box-owned and cannot be modified from the repo, so this
-      # trusted-shell check right before it is the repo-side integrity anchor
-      # for the timed phase.
+      # trusted driver + binary and the participant worker + metallib against
+      # their post-build pins before measure-job re-runs ./benchmark.sh and
+      # the binaries for the scored timing. measure-job is box-owned and
+      # cannot be modified from the repo, so this trusted-shell check right
+      # before it is the repo-side integrity anchor for the timed phase.
       - name: Verify trusted harness before timing
         if: ${{ inputs.run_benchmark }}
-        run: .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
+        run: |
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
 
       # THE TIMED MEASUREMENT -- LAST, via the validated clean path. measure-job
       # (trusted, runner-owned, fixed thermal contract) runs, in order: pinned
