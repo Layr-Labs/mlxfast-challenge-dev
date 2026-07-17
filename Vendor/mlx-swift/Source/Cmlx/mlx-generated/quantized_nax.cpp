@@ -774,6 +774,91 @@ struct QuantizedBlockLoader<
   }
 };
 
+// Gemma 4's BK=192 path stages three complete group-64 slices per output
+// row. Tasks are row-major: each thread owns task0, and the first 64 threads
+// additionally own task0+128, giving every (row, group) exactly one writer.
+template <short dst_ld>
+struct QuantizedBlockLoader<
+    bfloat16_t,
+    64,
+    192,
+    dst_ld,
+    1,
+    128,
+    64,
+    4> {
+  static_assert(dst_ld >= 192, "Gemma 4 BK=192 loader requires a full row");
+
+  const short task0;
+  const bool has_task1;
+  const int src_ld;
+  threadgroup bfloat16_t* dst;
+  const device uint8_t* src;
+  const device bfloat16_t* scales;
+  const device bfloat16_t* biases;
+
+  QuantizedBlockLoader(
+      const device uint8_t* src_,
+      const device bfloat16_t* scales_,
+      const device bfloat16_t* biases_,
+      const int src_ld_,
+      threadgroup bfloat16_t* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      : task0(simd_group_id * 32 + simd_lane_id),
+        has_task1(task0 < 64),
+        src_ld(src_ld_),
+        dst(dst_),
+        src(src_),
+        scales(scales_),
+        biases(biases_) {}
+
+  void load_task(short task) const {
+    const short row = task / 3;
+    const short group = task - row * 3;
+    threadgroup bfloat16_t* task_dst = dst + row * dst_ld + group * 64;
+    const device uint8_t* task_src = src + row * src_ld / 2 + group * 32;
+    const device bfloat16_t* task_scales =
+        scales + row * src_ld / 64 + group;
+    const device bfloat16_t* task_biases =
+        biases + row * src_ld / 64 + group;
+    const bfloat16_t scale = *task_scales;
+    const bfloat16_t bias = *task_biases;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < 32; ++i) {
+      dequantize<bfloat16_t, 2, 4>(
+          task_src + i, scale, bias, task_dst + 2 * i);
+    }
+  }
+
+  void load_unsafe() const {
+    load_task(task0);
+    if (has_task1) {
+      load_task(task0 + 128);
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    const short row0 = task0 / 3;
+    if (row0 < src_tile_dim.x) {
+      load_task(task0);
+    }
+    if (has_task1) {
+      const short task1 = task0 + 128;
+      const short row1 = task1 / 3;
+      if (row1 < src_tile_dim.x) {
+        load_task(task1);
+      }
+    }
+  }
+
+  void next() {
+    src += 96;
+    scales += 3;
+    biases += 3;
+  }
+};
+
 template <
     typename T,
     short BROWS,
@@ -1152,6 +1237,105 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   });
 }
 
+// One even logical-M threadgroup computes two adjacent row tiles while sharing
+// each staged weight tile. The two accumulators retain independent SK64 update
+// sequences and are never combined.
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const bool aligned_N,
+    const int BM = 64,
+    const int BK = 64,
+    const int BN = 64,
+    const int WM = 2,
+    const int WN = 2>
+METAL_FUNC void qmm_t_nax_tgp_impl_mpair(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    threadgroup T* Ws,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
+  static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
+  (void)lid;
+  (void)M;
+
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = BK + 16 / sizeof(T);
+  using loader_w_t = QuantizedBlockLoader<
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row0 = tid.y * BM;
+  const int y_row1 = y_row0 + BM;
+  const int y_col = tid.x * BN;
+  auto wl = (const device uint8_t*)w + y_col * K_w;
+  const device T* x0 = x + y_row0 * static_cast<int64_t>(K);
+  const device T* x1 = x + y_row1 * static_cast<int64_t>(K);
+  scales += y_col * K_g;
+  biases += y_col * K_g;
+  device T* y0 = y + y_row0 * static_cast<int64_t>(N) + y_col;
+  device T* y1 = y + y_row1 * static_cast<int64_t>(N) + y_col;
+
+  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 64;
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+  const short tm = SM * (simd_gid / WN);
+  const short tn = SN * (simd_gid % WN);
+
+  NAXTile<float, TM, TN> Dtile0;
+  NAXTile<float, TM, TN> Dtile1;
+  Dtile0.clear();
+  Dtile1.clear();
+  x0 += tm * K;
+  x1 += tm * K;
+
+  for (int k = 0; k < K; k += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    loader_w.load_unsafe();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    STEEL_PRAGMA_NO_UNROLL
+    for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+      NAXTile<T, TM, TK> Atile0;
+      NAXTile<T, TM, TK> Atile1;
+      NAXTile<T, TN, TK> Btile;
+      volatile int compiler_barrier;
+      Atile0.load(x0 + kk1, K);
+      Atile1.load(x1 + kk1, K);
+      Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+      tile_matmad_nax(
+          Dtile0, Atile0, metal::bool_constant<false>{}, Btile,
+          metal::bool_constant<true>{});
+      tile_matmad_nax(
+          Dtile1, Atile1, metal::bool_constant<false>{}, Btile,
+          metal::bool_constant<true>{});
+      (void)compiler_barrier;
+    }
+    x0 += BK;
+    x1 += BK;
+    loader_w.next();
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  Dtile0.store(y0 + tm * N + tn, N);
+  Dtile1.store(y1 + tm * N + tn, N);
+}
+
 template <
     typename T,
     const int group_size,
@@ -1307,14 +1491,15 @@ template <
     uint simd_lid [[thread_index_in_simdgroup]]) {
   (void)lid;
 
-  // Host dispatch and its pipeline key remain the stock BK=64 shape.  Only
-  // this exact Gemma instantiation reserves the larger staging tile; a
-  // uniform runtime K check below selects BK=128 for known production widths.
+  // Host dispatch and its pipeline key remain the stock BK=64 shape. Only
+  // this exact Gemma instantiation reserves the composed BK=192 staging tile.
   constexpr bool gemma4_bk128 =
       metal::is_same_v<T, bfloat16_t> && group_size == 64 && bits == 4 &&
       aligned_N && !batched && BM == 64 && BK == 64 && BN == 64 && WM == 2 &&
       WN == 2;
-  constexpr int scratch_bk = gemma4_bk128 ? 128 : BK;
+  constexpr bool gemma4_bk192_mpair_k5376 = true;
+  constexpr bool gemma4_bk192_mpair_k21504 = true;
+  constexpr int scratch_bk = gemma4_bk128 ? 192 : BK;
   constexpr int BK_padded = (scratch_bk + 16 / sizeof(T));
 
   threadgroup T Ws[BN * BK_padded];
@@ -1361,6 +1546,20 @@ template <
         tid);
   }
   if constexpr (gemma4_bk128) {
+    const bool gemma4_bk192_mpair =
+        M == 512 && ((gemma4_bk192_mpair_k5376 && K == 5376) ||
+                     (gemma4_bk192_mpair_k21504 && K == 21504));
+    if (gemma4_bk192_mpair) {
+      // Uniform whole-threadgroup return before the paired helper's barriers.
+      if ((logical_tid.y & 1) != 0) {
+        return;
+      }
+      qmm_t_nax_tgp_impl_mpair<
+          T, group_size, bits, aligned_N, BM, 192, BN, WM, WN>(
+          w, scales, biases, x, y, Ws, K, N, M, logical_tid, lid, simd_gid,
+          simd_lid);
+      return;
+    }
     if (K == 5376 || K == 8192 || K == 16384 || K == 21504) {
       qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, 128, BN, WM, WN>(
           w, scales, biases, x, y, Ws, K, N, M, logical_tid, lid, simd_gid,
