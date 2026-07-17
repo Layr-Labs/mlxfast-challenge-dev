@@ -208,13 +208,17 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     let verifyMetalCacheRange = try #require(workflow.range(of: "- name: Verify restored MLX Metal library"))
     let resetBuildProductsRange = try #require(workflow.range(of: "- name: Reset staged trusted build products"))
     let restoreBuildProductsRange = try #require(workflow.range(of: "- name: Restore trusted build products cache"))
+    let restoreWorkerBuildProductsRange = try #require(workflow.range(of: "- name: Restore worker build products cache"))
     let verifyBuildProductsRange = try #require(workflow.range(of: "- name: Verify restored build products"))
     let prepareWorkspaceRange = try #require(workflow.range(of: "- name: Prepare bench workspace"))
-    let buildRange = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
+    let trustedBuildRange = try #require(workflow.range(of: "- name: Build trusted CLI in bench sandbox"))
+    let workerBuildRange = try #require(workflow.range(of: "- name: Build participant worker in bench sandbox"))
     let stageMetalCacheRange = try #require(workflow.range(of: "- name: Stage trusted MLX Metal library cache"))
     let saveMetalCacheRange = try #require(workflow.range(of: "- name: Save trusted MLX Metal library cache"))
     let stageBuildProductsRange = try #require(workflow.range(of: "- name: Stage trusted build products cache"))
     let saveBuildProductsRange = try #require(workflow.range(of: "- name: Save trusted build products cache"))
+    let stageWorkerBuildProductsRange = try #require(workflow.range(of: "- name: Stage worker build products cache"))
+    let saveWorkerBuildProductsRange = try #require(workflow.range(of: "- name: Save worker build products cache"))
     let transformRange = try #require(workflow.range(of: "- name: Transform reference checkpoint in bench sandbox"))
     let publicGateRange = try #require(workflow.range(of: "- name: Public behavior gate"))
     let timedBenchmarkRange = try #require(workflow.range(of: "- name: Timed paired benchmark"))
@@ -227,14 +231,18 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(restoreMetalCacheRange.lowerBound < verifyMetalCacheRange.lowerBound)
     #expect(verifyMetalCacheRange.lowerBound < resetBuildProductsRange.lowerBound)
     #expect(resetBuildProductsRange.lowerBound < restoreBuildProductsRange.lowerBound)
-    #expect(restoreBuildProductsRange.lowerBound < verifyBuildProductsRange.lowerBound)
+    #expect(restoreBuildProductsRange.lowerBound < restoreWorkerBuildProductsRange.lowerBound)
+    #expect(restoreWorkerBuildProductsRange.lowerBound < verifyBuildProductsRange.lowerBound)
     #expect(verifyBuildProductsRange.lowerBound < prepareWorkspaceRange.lowerBound)
-    #expect(prepareWorkspaceRange.lowerBound < buildRange.lowerBound)
-    #expect(buildRange.lowerBound < stageMetalCacheRange.lowerBound)
+    #expect(prepareWorkspaceRange.lowerBound < trustedBuildRange.lowerBound)
+    #expect(trustedBuildRange.lowerBound < workerBuildRange.lowerBound)
+    #expect(workerBuildRange.lowerBound < stageMetalCacheRange.lowerBound)
     #expect(stageMetalCacheRange.lowerBound < saveMetalCacheRange.lowerBound)
     #expect(saveMetalCacheRange.lowerBound < stageBuildProductsRange.lowerBound)
     #expect(stageBuildProductsRange.lowerBound < saveBuildProductsRange.lowerBound)
-    #expect(saveBuildProductsRange.lowerBound < transformRange.lowerBound)
+    #expect(saveBuildProductsRange.lowerBound < stageWorkerBuildProductsRange.lowerBound)
+    #expect(stageWorkerBuildProductsRange.lowerBound < saveWorkerBuildProductsRange.lowerBound)
+    #expect(saveWorkerBuildProductsRange.lowerBound < transformRange.lowerBound)
     #expect(transformRange.lowerBound < hashWeightsRange.lowerBound)
     #expect(hashWeightsRange.lowerBound < publicGateRange.lowerBound)
     #expect(publicGateRange.lowerBound < timedBenchmarkRange.lowerBound)
@@ -250,7 +258,10 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(!workflow.contains("./setup.sh"))
     #expect(workflow.contains("- name: Restore trusted SwiftPM dependency cache"))
     #expect(workflow.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
-    #expect(workflow.contains("key: swiftpm-trusted-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}"))
+    #expect(workflow.contains("key: swiftpm-trusted-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}"))
+    // Both SwiftPM roots' dependency checkouts ride the same trusted cache.
+    #expect(workflow.contains(".build-worker/checkouts"))
+    #expect(workflow.contains(".build-worker/workspace-state.json"))
 
     let metalFingerprintStep = String(workflow[metalFingerprintRange.lowerBound..<restoreMetalCacheRange.lowerBound])
     #expect(metalFingerprintStep.contains("mlx-metallib-m5-max-v1"))
@@ -276,47 +287,62 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(verifyMetalCacheStep.contains("test -s .mlxfast-cache/mlx.metallib"))
     #expect(verifyMetalCacheStep.contains("/bin/rm -f .mlxfast-cache/mlx.metallib"))
 
-    // Dependencies are pre-fetched in the trusted shell; build and transform
-    // both execute as the bench uid through the bridge.
+    // Dependencies are pre-fetched in the trusted shell for both SwiftPM
+    // roots; the trusted CLI and the participant worker build as separate
+    // bench-exec invocations into independent scratch roots.
     #expect(workflow.contains("(cd \"${MLXFAST_JOB_WS}\" && swift package resolve)"))
-    let buildStep = String(workflow[buildRange.lowerBound..<stageMetalCacheRange.lowerBound])
-    #expect(buildStep.contains("sudo -n \"${MLXFAST_BENCH_EXEC}\""))
-    #expect(buildStep.contains("/usr/bin/swift build -c release --product mlxfast-swift"))
-    #expect(buildStep.contains("/usr/bin/swift build -c release --product mlxfast-runtime-worker"))
-    #expect(buildStep.contains("TODO(security): Move trusted and participant products"))
-    #expect(buildStep.contains("if [[ -s .mlxfast-cache/mlx.metallib ]]"))
-    #expect(buildStep.contains("/bin/cp .mlxfast-cache/mlx.metallib .build/release/mlx.metallib"))
-    #expect(buildStep.contains("tools/build-mlx-metallib.sh"))
-    #expect(buildStep.contains("/bin/chmod 0644 .build/release/mlx.metallib"))
+    #expect(workflow.contains("(cd \"${MLXFAST_JOB_WS}\" && swift package resolve --scratch-path .build-worker)"))
+    let trustedBuildStep = String(workflow[trustedBuildRange.lowerBound..<workerBuildRange.lowerBound])
+    #expect(trustedBuildStep.contains("sudo -n \"${MLXFAST_BENCH_EXEC}\""))
+    #expect(trustedBuildStep.contains("/usr/bin/swift build -c release --product mlxfast-swift"))
+    #expect(!trustedBuildStep.contains("--product mlxfast-runtime-worker"))
+    #expect(!trustedBuildStep.contains("cp .mlxfast-cache/mlx.metallib"))
+    let workerBuildStep = String(workflow[workerBuildRange.lowerBound..<stageMetalCacheRange.lowerBound])
+    #expect(workerBuildStep.contains("sudo -n \"${MLXFAST_BENCH_EXEC}\""))
+    #expect(workerBuildStep.contains("/usr/bin/swift build -c release --scratch-path .build-worker --product mlxfast-runtime-worker"))
+    #expect(workerBuildStep.contains("if [[ -s .mlxfast-cache/mlx.metallib ]]"))
+    #expect(workerBuildStep.contains("/bin/cp .mlxfast-cache/mlx.metallib .build-worker/release/mlx.metallib"))
+    #expect(workerBuildStep.contains("tools/build-mlx-metallib.sh"))
+    #expect(workerBuildStep.contains("/bin/chmod 0644 .build-worker/release/mlx.metallib"))
+    #expect(!workflow.contains("TODO(security): Move trusted and participant products"))
 
     let stageMetalCacheStep = String(workflow[stageMetalCacheRange.lowerBound..<saveMetalCacheRange.lowerBound])
     #expect(stageMetalCacheStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
-    #expect(stageMetalCacheStep.contains("/bin/cp \"${MLXFAST_JOB_WS}/.build/release/mlx.metallib\" .mlxfast-cache/mlx.metallib"))
+    #expect(stageMetalCacheStep.contains("/bin/cp \"${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib\" .mlxfast-cache/mlx.metallib"))
     let saveMetalCacheStep = String(workflow[saveMetalCacheRange.lowerBound..<stageBuildProductsRange.lowerBound])
     #expect(saveMetalCacheStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
     #expect(saveMetalCacheStep.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
     #expect(saveMetalCacheStep.contains("path: .mlxfast-cache/mlx.metallib"))
     #expect(saveMetalCacheStep.contains("key: mlx-metallib-m5-max-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
 
-    // Trusted build products cache: the workspace path must be STABLE across
-    // runs (llbuild records absolute paths; a per-run path would force a full
-    // recompile and make the cache useless), the staging area is wiped before
-    // restore (tar extraction never deletes stale files), submission runs
-    // seed .build from the restored products, and -- like the metallib --
-    // only main-ref dispatches may stage/save, so submission build output can
-    // never enter the trusted cache namespace.
+    // Build products caches: the workspace path must be STABLE across runs
+    // (llbuild records absolute paths; a per-run path would force a full
+    // recompile and make the caches useless), the staging areas are wiped
+    // before restore (tar extraction never deletes stale files), submission
+    // runs seed both roots from the restored products, and -- like the
+    // metallib -- only main-ref dispatches may stage/save, so submission
+    // build output can never enter the trusted cache namespaces. The trusted
+    // CLI root and the participant worker root are cached as two separate
+    // entries.
     #expect(workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-current"))
     #expect(!workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-${{"))
     let resetBuildProductsStep = String(workflow[resetBuildProductsRange.lowerBound..<restoreBuildProductsRange.lowerBound])
-    #expect(resetBuildProductsStep.contains("run: /bin/rm -rf .mlxfast-cache/trusted-build"))
-    let restoreBuildProductsStep = String(workflow[restoreBuildProductsRange.lowerBound..<verifyBuildProductsRange.lowerBound])
+    #expect(resetBuildProductsStep.contains("run: /bin/rm -rf .mlxfast-cache/trusted-build .mlxfast-cache/worker-build"))
+    let restoreBuildProductsStep = String(workflow[restoreBuildProductsRange.lowerBound..<restoreWorkerBuildProductsRange.lowerBound])
     #expect(restoreBuildProductsStep.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
     #expect(restoreBuildProductsStep.contains("path: .mlxfast-cache/trusted-build"))
-    #expect(restoreBuildProductsStep.contains("key: bench-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
+    #expect(restoreBuildProductsStep.contains("key: bench-trusted-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
+    let restoreWorkerBuildProductsStep = String(workflow[restoreWorkerBuildProductsRange.lowerBound..<verifyBuildProductsRange.lowerBound])
+    #expect(restoreWorkerBuildProductsStep.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
+    #expect(restoreWorkerBuildProductsStep.contains("path: .mlxfast-cache/worker-build"))
+    #expect(restoreWorkerBuildProductsStep.contains("key: bench-worker-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
     let verifyBuildProductsStep = String(workflow[verifyBuildProductsRange.lowerBound..<prepareWorkspaceRange.lowerBound])
-    #expect(verifyBuildProductsStep.contains("CACHE_HIT: ${{ steps.restore_build_products_cache.outputs.cache-hit }}"))
+    #expect(verifyBuildProductsStep.contains("TRUSTED_CACHE_HIT: ${{ steps.restore_build_products_cache.outputs.cache-hit }}"))
+    #expect(verifyBuildProductsStep.contains("WORKER_CACHE_HIT: ${{ steps.restore_worker_build_products_cache.outputs.cache-hit }}"))
     #expect(verifyBuildProductsStep.contains("test -d .mlxfast-cache/trusted-build/release"))
     #expect(verifyBuildProductsStep.contains("/bin/rm -rf .mlxfast-cache/trusted-build"))
+    #expect(verifyBuildProductsStep.contains("test -d .mlxfast-cache/worker-build/release"))
+    #expect(verifyBuildProductsStep.contains("/bin/rm -rf .mlxfast-cache/worker-build"))
     let stageBuildProductsStep = String(workflow[stageBuildProductsRange.lowerBound..<saveBuildProductsRange.lowerBound])
     #expect(stageBuildProductsStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
     // rsync with module-cache excludes: clang creates ModuleCache mode-700
@@ -327,20 +353,35 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(stageBuildProductsStep.contains("--exclude='clang-module-cache'"))
     #expect(stageBuildProductsStep.contains("\"${MLXFAST_JOB_WS}/.build/\" .mlxfast-cache/trusted-build/"))
     #expect(stageBuildProductsStep.contains("test -d .mlxfast-cache/trusted-build/release"))
-    let saveBuildProductsStep = String(workflow[saveBuildProductsRange.lowerBound..<transformRange.lowerBound])
+    let saveBuildProductsStep = String(workflow[saveBuildProductsRange.lowerBound..<stageWorkerBuildProductsRange.lowerBound])
     #expect(saveBuildProductsStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
     #expect(saveBuildProductsStep.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
     #expect(saveBuildProductsStep.contains("path: .mlxfast-cache/trusted-build"))
-    #expect(saveBuildProductsStep.contains("key: bench-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
+    #expect(saveBuildProductsStep.contains("key: bench-trusted-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
+    let stageWorkerBuildProductsStep = String(workflow[stageWorkerBuildProductsRange.lowerBound..<saveWorkerBuildProductsRange.lowerBound])
+    #expect(stageWorkerBuildProductsStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
+    #expect(stageWorkerBuildProductsStep.contains("/usr/bin/rsync -a \\"))
+    #expect(stageWorkerBuildProductsStep.contains("--exclude='ModuleCache'"))
+    #expect(stageWorkerBuildProductsStep.contains("--exclude='clang-module-cache'"))
+    #expect(stageWorkerBuildProductsStep.contains("\"${MLXFAST_JOB_WS}/.build-worker/\" .mlxfast-cache/worker-build/"))
+    #expect(stageWorkerBuildProductsStep.contains("test -d .mlxfast-cache/worker-build/release"))
+    let saveWorkerBuildProductsStep = String(workflow[saveWorkerBuildProductsRange.lowerBound..<transformRange.lowerBound])
+    #expect(saveWorkerBuildProductsStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
+    #expect(saveWorkerBuildProductsStep.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
+    #expect(saveWorkerBuildProductsStep.contains("path: .mlxfast-cache/worker-build"))
+    #expect(saveWorkerBuildProductsStep.contains("key: bench-worker-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
 
     // Prepare must prove the stable workspace path is actually fresh (fail
     // closed on undeletable residue from a prior run) and seed the restored
-    // trusted products as the bench build's starting .build.
-    let prepareStep = String(workflow[prepareWorkspaceRange.lowerBound..<buildRange.lowerBound])
+    // products as each root's starting build tree.
+    let prepareStep = String(workflow[prepareWorkspaceRange.lowerBound..<trustedBuildRange.lowerBound])
     #expect(prepareStep.contains("stale bench workspace at ${MLXFAST_JOB_WS} could not be fully removed"))
     #expect(prepareStep.contains("if [[ -d \"${MLXFAST_JOB_WS}/.mlxfast-cache/trusted-build/release\" ]]; then"))
     #expect(prepareStep.contains("rm -rf \"${MLXFAST_JOB_WS}/.build\""))
     #expect(prepareStep.contains("mv \"${MLXFAST_JOB_WS}/.mlxfast-cache/trusted-build\" \"${MLXFAST_JOB_WS}/.build\""))
+    #expect(prepareStep.contains("if [[ -d \"${MLXFAST_JOB_WS}/.mlxfast-cache/worker-build/release\" ]]; then"))
+    #expect(prepareStep.contains("rm -rf \"${MLXFAST_JOB_WS}/.build-worker\""))
+    #expect(prepareStep.contains("mv \"${MLXFAST_JOB_WS}/.mlxfast-cache/worker-build\" \"${MLXFAST_JOB_WS}/.build-worker\""))
     let transformStep = String(workflow[transformRange.lowerBound..<publicGateRange.lowerBound])
     #expect(transformStep.contains("sudo -n \"${MLXFAST_BENCH_EXEC}\""))
     #expect(transformStep.contains("exec .build/release/mlxfast-swift transform"))
@@ -361,7 +402,7 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(ci.contains("- name: Save SwiftPM cache"))
     #expect(ci.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
     #expect(ci.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
-    #expect(ci.contains("key: swiftpm-trusted-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}"))
+    #expect(ci.contains("key: swiftpm-trusted-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}"))
     #expect(ci.contains("github.ref == 'refs/heads/main'"))
     #expect(ci.contains(".build/checkouts"))
     #expect(ci.contains(".build/repositories"))
@@ -372,10 +413,10 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(ci.contains("\n                bash -n \"${script}\"\n"))
     #expect(ci.contains("\n                sh -n \"${script}\"\n"))
     #expect(ci.contains("swift build -c release --product mlxfast-swift"))
-    #expect(ci.contains("swift build -c release --product mlxfast-runtime-worker"))
+    #expect(ci.contains("swift build -c release --scratch-path .build-worker --product mlxfast-runtime-worker"))
     #expect(ci.contains("swift test -c release"))
     #expect(ci.contains("test -x .build/release/mlxfast-swift"))
-    #expect(ci.contains("test -x .build/release/mlxfast-runtime-worker"))
+    #expect(ci.contains("test -x .build-worker/release/mlxfast-runtime-worker"))
     #expect(!ci.contains("swift test --filter"))
 }
 
@@ -590,7 +631,7 @@ func benchmarkWorkspaceACLLocksTrustedSurfacesAgainstBench() throws {
         encoding: .utf8
     )
     let prepareRange = try #require(workflow.range(of: "- name: Prepare bench workspace"))
-    let buildRange = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
+    let buildRange = try #require(workflow.range(of: "- name: Build trusted CLI in bench sandbox"))
     let prepare = String(workflow[prepareRange.lowerBound..<buildRange.lowerBound])
 
     // The functional allow ACE still lets bench read/execute the tree and
@@ -677,7 +718,7 @@ func benchmarkPinsAndVerifiesTrustedHarnessAcrossScoredPhases() throws {
         ".github/scripts/pin-trusted-harness.sh verify \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256\""
     #expect(workflow.components(separatedBy: verifyInvocation).count - 1 == 3)
 
-    let buildRange = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
+    let buildRange = try #require(workflow.range(of: "- name: Build participant worker in bench sandbox"))
     let transformRange = try #require(workflow.range(of: "- name: Transform reference checkpoint in bench sandbox"))
     let verifyPublicRange = try #require(workflow.range(of: "- name: Verify trusted harness before public gate"))
     let publicGateRange = try #require(workflow.range(of: "- name: Public behavior gate"))
@@ -710,10 +751,12 @@ func pinTrustedHarnessScriptDetectsTamper() throws {
 
     let ws = root.appendingPathComponent("ws")
     let releaseDir = ws.appendingPathComponent(".build/release")
+    let workerReleaseDir = ws.appendingPathComponent(".build-worker/release")
     try FileManager.default.createDirectory(at: releaseDir, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: workerReleaseDir, withIntermediateDirectories: true)
     try "driver\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
     try "BINARY".write(to: releaseDir.appendingPathComponent("mlxfast-swift"), atomically: true, encoding: .utf8)
-    try "METALLIB".write(to: releaseDir.appendingPathComponent("mlx.metallib"), atomically: true, encoding: .utf8)
+    try "METALLIB".write(to: workerReleaseDir.appendingPathComponent("mlx.metallib"), atomically: true, encoding: .utf8)
     let pin = root.appendingPathComponent("trusted-harness.sha256")
 
     func run(_ mode: String) throws -> Int32 {
@@ -743,9 +786,9 @@ func pinTrustedHarnessScriptDetectsTamper() throws {
     // A symlinked artifact is rejected (never dereferenced).
     try "driver\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
     #expect(try run("verify") == 0)
-    try FileManager.default.removeItem(at: releaseDir.appendingPathComponent("mlx.metallib"))
+    try FileManager.default.removeItem(at: workerReleaseDir.appendingPathComponent("mlx.metallib"))
     try FileManager.default.createSymbolicLink(
-        atPath: releaseDir.appendingPathComponent("mlx.metallib").path,
+        atPath: workerReleaseDir.appendingPathComponent("mlx.metallib").path,
         withDestinationPath: "/etc/hosts"
     )
     #expect(try run("verify") != 0)
@@ -1879,7 +1922,8 @@ func officialCorrectnessRunsEnforceWorkerSandboxThroughBenchExec() throws {
 
     // Every step that executes submitted/branch code crosses the bridge.
     let benchExecSteps = [
-        "- name: Build harness in bench sandbox",
+        "- name: Build trusted CLI in bench sandbox",
+        "- name: Build participant worker in bench sandbox",
         "- name: Transform reference checkpoint in bench sandbox",
         "- name: Public behavior gate",
         "- name: Attach GPQA gates and verify augmented golden",
@@ -1919,7 +1963,7 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     #expect(benchmark.contains("MLXFAST_PRIVATE_DIR"))
     #expect(benchmark.contains("pwd -P"))
     #expect(benchmark.contains("cd -P"))
-    #expect(benchmark.contains("RUNTIME_WORKER_BIN=\"${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-$(dirname \"${SWIFT_BIN}\")/mlxfast-runtime-worker}\""))
+    #expect(benchmark.contains("RUNTIME_WORKER_BIN=\"${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-.build-worker/release/mlxfast-runtime-worker}\""))
     #expect(benchmark.contains("MLXFAST_RUNTIME_WORKER_EXECUTABLE=\"$(absolute_path \"${RUNTIME_WORKER_BIN}\")\""))
     #expect(benchmark.contains("export MLXFAST_RUNTIME_WORKER_EXECUTABLE"))
     #expect(benchmark.contains("export MLXFAST_REFERENCE_DIR=\"${REFERENCE_PATH}\""))
@@ -4446,7 +4490,7 @@ func cheapPreflightChecksRunBeforeExpensiveWork() throws {
     let checkoutRange = try #require(workflow.range(of: "uses: actions/checkout@"))
     let secretsCheckRange = try #require(workflow.range(of: "- name: Check private material present"))
     let prepareWorkspaceRange = try #require(workflow.range(of: "- name: Prepare bench workspace"))
-    let buildRange = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
+    let buildRange = try #require(workflow.range(of: "- name: Build trusted CLI in bench sandbox"))
 
     // Quarantined or drifted boxes fail before checkout or secrets.
     #expect(hostPreflightRange.lowerBound < checkoutRange.lowerBound)

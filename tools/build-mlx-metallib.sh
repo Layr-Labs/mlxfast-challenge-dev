@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Build mlx.metallib for the SwiftPM-linked MLX runtime and place it next to
-# the participant worker (and the sibling mlxfast-swift executable), where
-# Cmlx searches first.
+# the participant worker, where Cmlx searches first. The metallib is compiled
+# from participant-editable vendored Metal sources, so every default below
+# lives under the participant worker's build root (.build-worker), never
+# under the trusted CLI's .build tree.
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
@@ -17,9 +19,10 @@ repository_path() {
 }
 
 BUILD_CONFIGURATION="${MLXFAST_SWIFT_CONFIGURATION:-release}"
-SWIFT_BIN="$(repository_path "${MLXFAST_SWIFT_BIN:-.build/${BUILD_CONFIGURATION}/mlxfast-swift}")"
+RUNTIME_WORKER_BIN="$(repository_path \
+  "${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-.build-worker/${BUILD_CONFIGURATION}/mlxfast-runtime-worker}")"
 OUTPUT_PATH="$(repository_path \
-  "${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}")"
+  "${MLXFAST_MLX_METALLIB:-$(dirname "${RUNTIME_WORKER_BIN}")/mlx.metallib}")"
 
 MLX_SWIFT_VENDOR="${ROOT_DIR}/Vendor/mlx-swift"
 # TODO(security): Extend fingerprint/hash coverage over every vendored Metal
@@ -28,7 +31,7 @@ MLX_SOURCE="${MLX_SWIFT_VENDOR}/Source/Cmlx/mlx"
 METAL_CPP_SOURCE="${MLX_SWIFT_VENDOR}/Source/Cmlx/metal-cpp"
 JSON_SOURCE="${MLX_SWIFT_VENDOR}/Source/Cmlx/json"
 FMT_SOURCE="${MLX_SWIFT_VENDOR}/Source/Cmlx/fmt"
-CMAKE_BUILD_DIR="$(repository_path "${MLXFAST_MLX_METAL_BUILD_DIR:-.build/mlx-metal}")"
+CMAKE_BUILD_DIR="$(repository_path "${MLXFAST_MLX_METAL_BUILD_DIR:-.build-worker/mlx-metal}")"
 BUILD_LOCK_DIR="$(repository_path \
   "${MLXFAST_MLX_METAL_BUILD_LOCK_DIR:-${CMAKE_BUILD_DIR}.mlxfast-build.lock}")"
 BUILD_LOCK_TIMEOUT_SECONDS="${MLXFAST_MLX_METAL_BUILD_LOCK_TIMEOUT_SECONDS:-1800}"
@@ -41,7 +44,7 @@ BUILD_LOCK_INITIALIZING_DIR=""
 PUBLISH_TEMP_PATH=""
 export CLANG_MODULE_CACHE_PATH
 CLANG_MODULE_CACHE_PATH="$(repository_path \
-  "${CLANG_MODULE_CACHE_PATH:-.build/clang-module-cache}")"
+  "${CLANG_MODULE_CACHE_PATH:-.build-worker/clang-module-cache}")"
 mkdir -p "${CLANG_MODULE_CACHE_PATH}"
 METAL_COMPILER_HOME="$(repository_path \
   "${MLXFAST_METAL_COMPILER_HOME:-${CMAKE_BUILD_DIR}/.mlxfast-home}")"

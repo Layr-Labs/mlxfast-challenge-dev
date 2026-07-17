@@ -1472,8 +1472,32 @@ private enum MLXFastCLI {
     }
 
     private static func siblingParticipantWorkerExecutablePath() throws -> String {
-        URL(fileURLWithPath: try currentExecutablePath())
+        // The participant worker builds under its own SwiftPM scratch root, so
+        // a trusted binary at <root>/.build/<config>/mlxfast-swift finds its
+        // worker at <root>/.build-worker/<config>/mlxfast-runtime-worker. The
+        // worker-root twin wins over a same-directory sibling so a stale
+        // pre-split worker lingering next to the trusted binary is never
+        // silently preferred over the current worker build.
+        let executableDirectory = URL(fileURLWithPath: try currentExecutablePath())
             .deletingLastPathComponent()
+        var workerRootComponents = executableDirectory.pathComponents
+        if let buildIndex = workerRootComponents.lastIndex(of: ".build") {
+            workerRootComponents[buildIndex] = ".build-worker"
+            let workerTwin = URL(
+                fileURLWithPath: NSString.path(withComponents: workerRootComponents)
+            ).appendingPathComponent("mlxfast-runtime-worker").path
+            if FileManager.default.isExecutableFile(atPath: workerTwin) {
+                return workerTwin
+            }
+            let sibling = executableDirectory
+                .appendingPathComponent("mlxfast-runtime-worker").path
+            if FileManager.default.isExecutableFile(atPath: sibling) {
+                return sibling
+            }
+            // Neither exists; report the canonical worker-root location.
+            return workerTwin
+        }
+        return executableDirectory
             .appendingPathComponent("mlxfast-runtime-worker")
             .path
     }

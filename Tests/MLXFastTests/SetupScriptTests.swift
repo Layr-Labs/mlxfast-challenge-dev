@@ -18,15 +18,28 @@ func setupScriptCoordinatesCacheAndMetallibState() throws {
     #expect(setup.contains("mktemp \"${lock_path}.tmp.XXXXXX\""))
     #expect(setup.contains("metal_toolchain_identifier"))
     #expect(setup.contains("export TOOLCHAINS=\"${identifier}\""))
-    #expect(setup.contains("RUNTIME_WORKER_BIN=\"${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-$(dirname \"${SWIFT_BIN}\")/mlxfast-runtime-worker}\""))
+    // Independent SwiftPM build/cache roots: the trusted CLI builds in .build
+    // and the participant worker in its own .build-worker scratch root with
+    // its own clang module cache, so a participant-code build never writes
+    // into the trusted product tree. mlx.metallib (a participant artifact)
+    // colocates with the worker binary.
+    #expect(setup.contains("RUNTIME_WORKER_BIN=\"${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-.build-worker/release/mlxfast-runtime-worker}\""))
     #expect(setup.contains("MLX_METALLIB=\"${MLXFAST_MLX_METALLIB:-$(dirname \"${RUNTIME_WORKER_BIN}\")/mlx.metallib}\""))
     #expect(setup.contains("swift build -c release --product mlxfast-swift"))
-    #expect(setup.contains("swift build -c release --product mlxfast-runtime-worker"))
+    #expect(setup.contains("swift build -c release --scratch-path .build-worker --product mlxfast-runtime-worker"))
+    #expect(setup.contains("mkdir -p .build/clang-module-cache .build-worker/clang-module-cache"))
+    #expect(setup.contains("CLANG_MODULE_CACHE_PATH=\"${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}\" \\"))
+    #expect(setup.contains("CLANG_MODULE_CACHE_PATH=\"${CLANG_MODULE_CACHE_PATH:-${PWD}/.build-worker/clang-module-cache}\" \\"))
     #expect(setup.contains("participant runtime worker missing at ${RUNTIME_WORKER_BIN}"))
-    #expect(setup.contains("TODO(security): Give the trusted CLI and participant worker independent"))
+    #expect(!setup.contains("TODO(security): Give the trusted CLI and participant worker independent"))
     #expect(metallibBuilder.contains("-DMLX_BUILD_GGUF=OFF"))
     #expect(metallibBuilder.contains("export CLANG_MODULE_CACHE_PATH"))
     #expect(metallibBuilder.contains("CLANG_MODULE_CACHE_PATH=\"$(repository_path"))
+    // The metallib compiles participant-editable vendored Metal sources, so
+    // its build tree, module cache, and output live under the worker root.
+    #expect(metallibBuilder.contains("${CLANG_MODULE_CACHE_PATH:-.build-worker/clang-module-cache}"))
+    #expect(metallibBuilder.contains("${MLXFAST_MLX_METAL_BUILD_DIR:-.build-worker/mlx-metal}"))
+    #expect(metallibBuilder.contains("${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-.build-worker/${BUILD_CONFIGURATION}/mlxfast-runtime-worker}"))
     #expect(metallibBuilder.contains("HOME=\"${METAL_COMPILER_HOME}\" \"${CMAKE_BIN}\""))
 }
 

@@ -2,7 +2,7 @@
 # Capture or verify a content pin over the trusted harness artifacts that drive
 # the scored phases: the benchmark driver (benchmark.sh), the built CLI binary
 # (.build/release/mlxfast-swift), and the MLX metal library
-# (.build/release/mlx.metallib).
+# (.build-worker/release/mlx.metallib).
 #
 # Why: the submitted transform runs AFTER the trusted build with write access
 # to the bench workspace, and the correctness/gates and timed phases re-run
@@ -26,11 +26,13 @@ PIN_FILE="${3:?pin file path is required}"
 # TODO(security): Revisit this pin's scope when trusted and participant build
 # products have independent caches. The participant runtime worker must remain
 # outside the trusted-artifact pin unless it receives a separate attestation.
-# The trusted driver + built artifacts every scored phase depends on.
+# The trusted driver + built artifacts every scored phase depends on. The
+# mlx.metallib entry follows the participant worker's build root, where the
+# worker process loads it from.
 PINNED_RELATIVE_PATHS=(
   "benchmark.sh"
   ".build/release/mlxfast-swift"
-  ".build/release/mlx.metallib"
+  ".build-worker/release/mlx.metallib"
 )
 
 compute_pin() {

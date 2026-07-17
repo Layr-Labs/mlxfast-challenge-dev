@@ -177,7 +177,12 @@ else
   REFERENCE_PATH="${REFERENCE_DEFAULT_DIR}"
 fi
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
-RUNTIME_WORKER_BIN="${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-$(dirname "${SWIFT_BIN}")/mlxfast-runtime-worker}"
+# The participant runtime worker builds under its own SwiftPM scratch root
+# (.build-worker) so a participant-code build never writes into the trusted
+# CLI's build tree (.build). mlx.metallib is a participant artifact (compiled
+# from the participant-editable vendored Metal sources) and lives next to the
+# worker binary, where Cmlx searches first.
+RUNTIME_WORKER_BIN="${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-.build-worker/release/mlxfast-runtime-worker}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${RUNTIME_WORKER_BIN}")/mlx.metallib}"
 SANDBOX_PROFILE="${MLXFAST_SANDBOX_PROFILE:-tools/deny-network.sb}"
 SOURCE_HASH_PATH="${WEIGHTS_PATH}/.benchmark-source.sha256"
@@ -1568,12 +1573,16 @@ swift_build_required() {
 
 if [[ "${MLXFAST_IN_SANDBOX:-0}" != "1" ]] && swift_build_required; then
   echo "benchmark.sh: trusted CLI or participant runtime worker missing; building"
-  mkdir -p .build/clang-module-cache
-  export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}"
-  # TODO(security): Give the trusted CLI and participant worker independent
-  # SwiftPM build/cache roots instead of sharing .build.
-  swift build -c release --product mlxfast-swift
-  swift build -c release --product mlxfast-runtime-worker
+  # Independent SwiftPM build/cache roots: the trusted CLI builds in .build
+  # and the participant worker (which compiles the vendored MLX forks) in
+  # .build-worker, each with its own clang module cache, so a
+  # participant-code build can never write into the trusted product tree.
+  # An explicitly exported CLANG_MODULE_CACHE_PATH wins for both builds.
+  mkdir -p .build/clang-module-cache .build-worker/clang-module-cache
+  CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}" \
+    swift build -c release --product mlxfast-swift
+  CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build-worker/clang-module-cache}" \
+    swift build -c release --scratch-path .build-worker --product mlxfast-runtime-worker
 fi
 
 # Preserve the legacy no-worker wrapper path under the whole-script sandbox
