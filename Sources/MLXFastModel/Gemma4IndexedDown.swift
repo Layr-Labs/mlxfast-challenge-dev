@@ -255,7 +255,7 @@ private let gemma4Packed12IndexedDownQMV = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-private let gemma4CoTiledFixed12IndexedDownQMV = MLXFast.metalKernel(
+private let gemma4CoTiledFixed12ScalarIndexedDownQMV = MLXFast.metalKernel(
     name: "gemma4_cotiled_fixed12_indexed_down_qmv_21504_v1",
     inputNames: ["cotiled_payload", "lut", "x"],
     outputNames: ["output"],
@@ -373,6 +373,199 @@ private let gemma4CoTiledFixed12IndexedDownQMV = MLXFast.metalKernel(
                     + values[4 * index + 2] * (packed[index] & 0x0f00)
                     + values[4 * index + 3] * (packed[index] & 0xf000));
             }
+            return scale * accumulator + input_sum * bias;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Exact four-row spelling of the promoted fixed12 down QMV. Each float4
+/// component remains one independent output row and keeps the scalar qdot,
+/// K-block, SIMD reduction, and BF16 conversion order. The physical co-tiled
+/// payload is unchanged; this only removes the inner scalar row loop and packs
+/// the final four BF16 stores.
+private let gemma4CoTiledFixed12Float4IndexedDownQMV = MLXFast.metalKernel(
+    name: "gemma4_cotiled_fixed12_indexed_down_qmv_21504_float4_v2",
+    inputNames: ["cotiled_payload", "lut", "x"],
+    outputNames: ["output"],
+    source: """
+        constexpr int kInputWidth = 21504;
+        constexpr int kRowsPerSIMD = 4;
+        constexpr int kBlockSize = 512;
+        constexpr int kBlocks = 42;
+        constexpr int kWordsPerLane = 2;
+        constexpr int kWordsPerRow = 32 * kWordsPerLane;
+        constexpr int kWordsPerSIMD = kRowsPerSIMD * kWordsPerRow;
+        constexpr int kWeightWordsPerTile = 2 * kWordsPerSIMD;
+        constexpr int kMetadataBytesPerRow = 12;
+        constexpr int kMetadataWordsPerTile = 24;
+        constexpr int kPayloadWords =
+            kWeightWordsPerTile + kMetadataWordsPerTile;
+        constexpr int kWordsPerThreadgroup = kBlocks * kPayloadWords;
+
+        const int threadgroup_row = threadgroup_position_in_grid.y;
+        const int simd_group = simdgroup_index_in_threadgroup;
+        const int output_row =
+            threadgroup_row * 8 + simd_group * kRowsPerSIMD;
+        const uint lane_group = thread_index_in_simdgroup / 4;
+        const device bfloat* input = x + thread_index_in_simdgroup * 16;
+        const device uint* tile_words =
+            cotiled_payload + threadgroup_row * kWordsPerThreadgroup;
+
+        float4 result = float4(0.0f);
+        for (int block = 0; block < kInputWidth; block += kBlockSize) {
+            float values[16];
+            const float input_sum = gemma4_cotiled_down_float4_load_values(
+                input,
+                values);
+            const device uint* weight_words = tile_words
+                + simd_group * kWordsPerSIMD
+                + thread_index_in_simdgroup * kWordsPerLane;
+            const uint2 row0 =
+                reinterpret_cast<const device uint2*>(weight_words)[0];
+            const uint2 row1 = reinterpret_cast<const device uint2*>(
+                weight_words + kWordsPerRow)[0];
+            const uint2 row2 = reinterpret_cast<const device uint2*>(
+                weight_words + 2 * kWordsPerRow)[0];
+            const uint2 row3 = reinterpret_cast<const device uint2*>(
+                weight_words + 3 * kWordsPerRow)[0];
+
+            const device uchar* metadata_bytes =
+                reinterpret_cast<const device uchar*>(
+                    tile_words + kWeightWordsPerTile)
+                + simd_group * kRowsPerSIMD * kMetadataBytesPerRow;
+            const uint pair0 = lut[gemma4_cotiled_down_float4_index(
+                metadata_bytes,
+                lane_group)];
+            const uint pair1 = lut[gemma4_cotiled_down_float4_index(
+                metadata_bytes + kMetadataBytesPerRow,
+                lane_group)];
+            const uint pair2 = lut[gemma4_cotiled_down_float4_index(
+                metadata_bytes + 2 * kMetadataBytesPerRow,
+                lane_group)];
+            const uint pair3 = lut[gemma4_cotiled_down_float4_index(
+                metadata_bytes + 3 * kMetadataBytesPerRow,
+                lane_group)];
+
+            result += gemma4_cotiled_down_qdot_float4(
+                ushort4(
+                    static_cast<ushort>(row0[0]),
+                    static_cast<ushort>(row1[0]),
+                    static_cast<ushort>(row2[0]),
+                    static_cast<ushort>(row3[0])),
+                ushort4(
+                    static_cast<ushort>(row0[0] >> 16),
+                    static_cast<ushort>(row1[0] >> 16),
+                    static_cast<ushort>(row2[0] >> 16),
+                    static_cast<ushort>(row3[0] >> 16)),
+                ushort4(
+                    static_cast<ushort>(row0[1]),
+                    static_cast<ushort>(row1[1]),
+                    static_cast<ushort>(row2[1]),
+                    static_cast<ushort>(row3[1])),
+                ushort4(
+                    static_cast<ushort>(row0[1] >> 16),
+                    static_cast<ushort>(row1[1] >> 16),
+                    static_cast<ushort>(row2[1] >> 16),
+                    static_cast<ushort>(row3[1] >> 16)),
+                values,
+                float4(
+                    gemma4_cotiled_down_float4_pair_scale(pair0),
+                    gemma4_cotiled_down_float4_pair_scale(pair1),
+                    gemma4_cotiled_down_float4_pair_scale(pair2),
+                    gemma4_cotiled_down_float4_pair_scale(pair3)),
+                float4(
+                    gemma4_cotiled_down_float4_pair_bias(pair0),
+                    gemma4_cotiled_down_float4_pair_bias(pair1),
+                    gemma4_cotiled_down_float4_pair_bias(pair2),
+                    gemma4_cotiled_down_float4_pair_bias(pair3)),
+                input_sum);
+
+            tile_words += kPayloadWords;
+            input += kBlockSize;
+        }
+
+        const float4 reduced = float4(
+            simd_sum(result[0]),
+            simd_sum(result[1]),
+            simd_sum(result[2]),
+            simd_sum(result[3]));
+        if (thread_index_in_simdgroup == 0) {
+            reinterpret_cast<device bfloat4*>(output + output_row)[0] =
+                static_cast<bfloat4>(reduced);
+        }
+        """,
+    header: """
+        using namespace metal;
+
+        inline float gemma4_cotiled_down_float4_pair_scale(uint pair) {
+            return static_cast<float>(
+                as_type<bfloat>(static_cast<ushort>(pair)));
+        }
+
+        inline float gemma4_cotiled_down_float4_pair_bias(uint pair) {
+            return static_cast<float>(
+                as_type<bfloat>(static_cast<ushort>(pair >> 16)));
+        }
+
+        inline float gemma4_cotiled_down_float4_load_values(
+            const device bfloat* input,
+            thread float* values
+        ) {
+            float sum = 0;
+            for (int index = 0; index < 16; index += 4) {
+                sum += input[index] + input[index + 1]
+                    + input[index + 2] + input[index + 3];
+                values[index] = input[index];
+                values[index + 1] = input[index + 1] / 16.0f;
+                values[index + 2] = input[index + 2] / 256.0f;
+                values[index + 3] = input[index + 3] / 4096.0f;
+            }
+            return sum;
+        }
+
+        inline uint gemma4_cotiled_down_float4_index(
+            const device uchar* row_metadata,
+            uint lane_group
+        ) {
+            const uint low = row_metadata[lane_group];
+            const uint packed_high = row_metadata[8 + lane_group / 2];
+            const uint high =
+                (packed_high >> ((lane_group & 1) * 4)) & 0x0f;
+            return low | (high << 8);
+        }
+
+        inline float4 gemma4_cotiled_down_qdot_float4(
+            ushort4 packed0,
+            ushort4 packed1,
+            ushort4 packed2,
+            ushort4 packed3,
+            const thread float* values,
+            float4 scale,
+            float4 bias,
+            float input_sum
+        ) {
+            float4 accumulator = float4(0.0f);
+            accumulator +=
+                (values[0] * float4(packed0 & ushort4(0x000f))
+                + values[1] * float4(packed0 & ushort4(0x00f0))
+                + values[2] * float4(packed0 & ushort4(0x0f00))
+                + values[3] * float4(packed0 & ushort4(0xf000)));
+            accumulator +=
+                (values[4] * float4(packed1 & ushort4(0x000f))
+                + values[5] * float4(packed1 & ushort4(0x00f0))
+                + values[6] * float4(packed1 & ushort4(0x0f00))
+                + values[7] * float4(packed1 & ushort4(0xf000)));
+            accumulator +=
+                (values[8] * float4(packed2 & ushort4(0x000f))
+                + values[9] * float4(packed2 & ushort4(0x00f0))
+                + values[10] * float4(packed2 & ushort4(0x0f00))
+                + values[11] * float4(packed2 & ushort4(0xf000)));
+            accumulator +=
+                (values[12] * float4(packed3 & ushort4(0x000f))
+                + values[13] * float4(packed3 & ushort4(0x00f0))
+                + values[14] * float4(packed3 & ushort4(0x0f00))
+                + values[15] * float4(packed3 & ushort4(0xf000)));
             return scale * accumulator + input_sum * bias;
         }
         """,
@@ -664,6 +857,11 @@ private let gemma4DownCoTiledFixed12Enabled = environmentFlag(
     default: true
 )
 
+private let gemma4DownCoTiledFixed12Float4Enabled = environmentFlag(
+    "DARKBLOOM_DOWN_COTILED_FIXED12_FLOAT4",
+    default: true
+)
+
 private let gemma4VerifyDownCoTiledFixed12Bits = environmentFlag(
     "DARKBLOOM_VERIFY_DOWN_COTILED_FIXED12_BITS",
     default: false
@@ -846,13 +1044,24 @@ struct IndexedDownProjection: @unchecked Sendable {
 
         var verifiedPacked12: MLXArray?
         if let coTiledFixed12 {
-            let candidate = gemma4CoTiledFixed12IndexedDownQMV(
-                [coTiledFixed12.words, metadata.lut, input],
-                grid: (32, 1_344, 1),
-                threadGroup: (32, 2, 1),
-                outputShapes: [outputShape],
-                outputDTypes: [.bfloat16]
-            )[0]
+            let candidate: MLXArray
+            if gemma4DownCoTiledFixed12Float4Enabled {
+                candidate = gemma4CoTiledFixed12Float4IndexedDownQMV(
+                    [coTiledFixed12.words, metadata.lut, input],
+                    grid: (32, 1_344, 1),
+                    threadGroup: (32, 2, 1),
+                    outputShapes: [outputShape],
+                    outputDTypes: [.bfloat16]
+                )[0]
+            } else {
+                candidate = gemma4CoTiledFixed12ScalarIndexedDownQMV(
+                    [coTiledFixed12.words, metadata.lut, input],
+                    grid: (32, 1_344, 1),
+                    threadGroup: (32, 2, 1),
+                    outputShapes: [outputShape],
+                    outputDTypes: [.bfloat16]
+                )[0]
+            }
 
             if verifyCoTiledFixed12Bits {
                 guard let packed12 else {
