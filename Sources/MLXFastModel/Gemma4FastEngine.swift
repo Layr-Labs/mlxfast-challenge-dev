@@ -263,6 +263,8 @@ final class Gemma4FastLayer {
     let fusedMLP: @Sendable (MLXArray) -> MLXArray
     let fusedMLPTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let prefillGeluEpilogue: Gemma4PrefillGeluEpilogueMLPTail?
+    let pairedGateUpPrefill: PairedGateUpPrefillProjection?
+    let mlpDownProjection: FastQuantizedProjection
     let fusedGateUp: FusedGateUpProjection?
     let fusedGateUpPostTail: (@Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray)?
     let fusedGateUpActivation: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
@@ -495,6 +497,11 @@ final class Gemma4FastLayer {
         let gateP = FastQuantizedProjection(gate)
         let upP = FastQuantizedProjection(up)
         let downP = FastQuantizedProjection(down)
+        self.pairedGateUpPrefill = PairedGateUpPrefillProjection(
+            gate: gateP,
+            up: upP
+        )
+        self.mlpDownProjection = downP
         let gelu = fastGeluApproximate
         let body: @Sendable (MLXArray) -> MLXArray = { x in
             downP(gelu(gateP(x)) * upP(x))
@@ -1243,6 +1250,20 @@ final class Gemma4FastLayer {
                 let (gateOutput, upOutput) = fusedGateUp(normalized)
                 out = fusedGateUpPostTail(gateOutput, upOutput, residual2)
             }
+        } else if B == 1,
+                  let pairedGateUpPrefill,
+                  pairedGateUpPrefill.supports(out)
+        {
+            let normalized = fusedPreFFNNormalized ?? MLXFast.rmsNorm(
+                out, weight: preFfnNormWeight, eps: eps)
+            let activated = pairedGateUpPrefill(normalized)
+            let mlp = mlpDownProjection(activated)
+            // FusedMLPToNextBoundary is restricted to decode/exact-pair
+            // inputs. Multi-row prefill preserves the stock post-FFN
+            // norm/residual boundary and lets the next layer normalize.
+            out = MLXFast.rmsNorm(
+                mlp, weight: postFfnNormWeight, eps: eps)
+            out = (residual2 + out) * layerScalar
         } else if let fusedMLPTail {
             if let geluEpilogue = prefillGeluEpilogue, geluEpilogue.supports(B: B, L: L) {
                 if gemma4VerifyPrefillGeluEpilogueBits {
