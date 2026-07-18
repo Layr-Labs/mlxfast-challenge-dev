@@ -133,23 +133,23 @@ let gemma4VerifyLastLayerQPruneBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
-/// Prefill pipeline chunk size, in layers. Default 18.
+/// Prefill pipeline chunk size, in layers. Default 19.
 ///
 /// The ranked prefill is one lazy graph evaluated once at the head; the
 /// graph-end-to-final-eval boundary leaves dispatch bubbles. A
 /// scheduling-only `asyncEval` every N layers pulls GPU execution into the
-/// layer loop. Eighteen layers contain exactly three of Gemma 4's repeating
-/// five-sliding-plus-one-full attention motifs, making the first three chunks
-/// compute-balanced while preserving the promoted path's three intermediate
-/// evaluations. The computed values are unchanged -- same kernels, same
-/// accumulation order. Only engages for multi-token forwards (L > 1); decode
-/// is untouched. Set
+/// layer loop. Nineteen-layer boundaries at 19/38/57 make three equal compute
+/// regions that each contain three full-attention layers, preserve the
+/// promoted path's three intermediate evaluations, and leave only layers
+/// 58...60 plus the final norm/head in the final graph tail. The computed
+/// values are unchanged -- same kernels, same accumulation order. Only
+/// engages for multi-token forwards (L > 1); decode is untouched. Set
 /// `DARKBLOOM_PREFILL_CHUNK_EVAL=0` to restore the single-eval schedule.
 let gemma4PrefillChunkEvalLayers: Int = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_PREFILL_CHUNK_EVAL"
     ], let value = Int(raw) else {
-        return 18
+        return 19
     }
     return max(0, value)
 }()
@@ -1922,9 +1922,10 @@ final class Gemma4FastEngine {
             // bubbles between graph-end and the giant final eval. A
             // scheduling-only asyncEval every N layers pulls that GPU
             // execution into the layer loop and overlaps it with the
-            // remaining graph construction. The default 18-layer chunks each
-            // contain three complete 5-sliding + 1-full attention motifs;
-            // kernels and accumulation order are unchanged.
+            // remaining graph construction. Boundaries 19/38/57 make three
+            // equal regions with three full-attention layers apiece and a
+            // short final graph tail; kernels and accumulation order are
+            // unchanged.
             if gemma4PrefillChunkEvalLayers > 0,
                inputs.dim(1) > 1,
                layerNumber.isMultiple(of: gemma4PrefillChunkEvalLayers)
