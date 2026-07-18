@@ -85,7 +85,7 @@ let gemma4PrefillBN32QMMPlainImpl: String = #"""
     // N-aligned case is implemented: callers guarantee N % 64 == 0 and
     // K % 128 == 0. The gemma4_m_major logical decode from the stock entry
     // point is reproduced verbatim above the tile math.
-    template <const int BN, const int WN>
+    template <const int BM, const int BN, const int WM, const int WN>
     METAL_FUNC void gemma4_qmm_t_nax_plain_impl(
         const device uint32_t* w,
         const device bfloat16_t* scales,
@@ -102,12 +102,12 @@ let gemma4PrefillBN32QMMPlainImpl: String = #"""
       using T = bfloat16_t;
       constexpr int group_size = 64;
       constexpr int bits = 4;
-      constexpr int BM = 64;
       constexpr int BK = 128;
-      constexpr int WM = 2;
 
       static_assert(
-          (BN == 64 && WN == 2) || (BN == 32 && WN == 1),
+          (BM == 64 && BN == 64 && WM == 2 && WN == 2)
+              || (BM == 64 && BN == 32 && WM == 2 && WN == 1)
+              || (BM == 32 && BN == 32 && WM == 1 && WN == 1),
           "supported Gemma 4 plain-qmm geometries are BN64/WN2 and BN32/WN1");
 
       constexpr int pack_factor = get_pack_factor<bits, 8>();
@@ -115,13 +115,14 @@ let gemma4PrefillBN32QMMPlainImpl: String = #"""
 
       constexpr int BK_padded = (BK + 16 / sizeof(T));
 
+      constexpr int TGP_THREADS = BM == 32 ? 64 : WM * WN * SIMD_SIZE;
       using loader_w_t = QuantizedBlockLoader<
           T,
           BN,
           BK,
           BK_padded,
           1,
-          WM * WN * SIMD_SIZE,
+          TGP_THREADS,
           group_size,
           bits>;
 
@@ -198,29 +199,31 @@ let gemma4PrefillBN32QMMPlainImpl: String = #"""
           loader_w.load_unsafe();
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<T, TN, TK> Btile;
+          if (simd_gid < WM * WN) {
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<T, TN, TK> Btile;
 
-            volatile int compiler_barrier;
+              volatile int compiler_barrier;
 
-            if constexpr (kAlignedM.value) {
-              Atile.load(x + kk1, K);
-            } else {
-              Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+              if constexpr (kAlignedM.value) {
+                Atile.load(x + kk1, K);
+              } else {
+                Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+              }
+
+              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<transpose_a>{},
+                  Btile,
+                  metal::bool_constant<transpose_b>{});
+
+              (void)compiler_barrier;
             }
-
-            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<transpose_a>{},
-                Btile,
-                metal::bool_constant<transpose_b>{});
-
-            (void)compiler_barrier;
           }
 
           x += BK;
@@ -230,13 +233,15 @@ let gemma4PrefillBN32QMMPlainImpl: String = #"""
         // Store results to device memory
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if constexpr (kAlignedM.value) {
-          Dtile.store(y + tm * N + tn, N);
-        } else {
-          // kAlignedN is always true in this clone family, so the twin's
-          // store selection reduces to store_safe with (sgp_sn == SN,
-          // sgp_sm).
-          Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
+        if (simd_gid < WM * WN) {
+          if constexpr (kAlignedM.value) {
+            Dtile.store(y + tm * N + tn, N);
+          } else {
+            // kAlignedN is always true in this clone family, so the twin's
+            // store selection reduces to store_safe with (sgp_sn == SN,
+            // sgp_sm).
+            Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
+          }
         }
       });
     }
@@ -247,7 +252,27 @@ let gemma4PrefillBN32QMMPlainImpl: String = #"""
 /// 8,704 bytes (stock BN64: 17,408).
 private let gemma4PrefillBN32QMMSource: String = #"""
         threadgroup bfloat16_t Ws[32 * 136];
-        gemma4_qmm_t_nax_plain_impl<32, 1>(
+        gemma4_qmm_t_nax_plain_impl<64, 32, 2, 1>(
+            w,
+            scales,
+            biases,
+            x,
+            output,
+            Ws,
+            K,
+            N,
+            M,
+            threadgroup_position_in_grid,
+            simdgroup_index_in_threadgroup,
+            thread_index_in_simdgroup);
+        """#
+
+/// Final-tail BM32 body. The accumulator is exactly the promoted per-SIMD
+/// M32xN32 fragment; removing the empty second SIMDgroup changes scheduling
+/// and weight staging only, never an output element's K chain.
+private let gemma4PrefillBM32QMMSource: String = #"""
+        threadgroup bfloat16_t Ws[32 * 136];
+        gemma4_qmm_t_nax_plain_impl<32, 32, 1, 1>(
             w,
             scales,
             biases,
@@ -271,6 +296,18 @@ private let gemma4PrefillBN32QMMKernel = MLXFast.metalKernel(
     // newline; the separator keeps it from swallowing the loader's
     // `template <short dst_ld>` line (the gelu header is safe only because
     // its epilogue-function comment sits at that join).
+    header: gemma4GeluEpilogueNAXStack
+        + "\n"
+        + gemma4PrefillUpBN32QuantizedLoader
+        + gemma4PrefillBN32QMMPlainImpl,
+    ensureRowContiguous: true
+)
+
+private let gemma4PrefillBM32QMMKernel = MLXFast.metalKernel(
+    name: "gemma4_prefill_bm32_bn32_qmm_t_nax_bk128_v1",
+    inputNames: ["w", "scales", "biases", "x", "K", "N", "M"],
+    outputNames: ["output"],
+    source: gemma4PrefillBM32QMMSource,
     header: gemma4GeluEpilogueNAXStack
         + "\n"
         + gemma4PrefillUpBN32QuantizedLoader
@@ -305,9 +342,16 @@ func gemma4PrefillBN32QMM(
         weight, scales, biases, x,
         MLXArray(Int32(K)), MLXArray(Int32(N)), MLXArray(Int32(M)),
     ]
-    return gemma4PrefillBN32QMMKernel(
+    let kernel = M == 32
+        ? gemma4PrefillBM32QMMKernel
+        : gemma4PrefillBN32QMMKernel
+    return kernel(
         inputs,
-        grid: ((N / 32) * 32, (M + 63) / 64, 2),
+        grid: (
+            (N / 32) * 32,
+            M == 32 ? 1 : (M + 63) / 64,
+            2
+        ),
         threadGroup: (32, 1, 2),
         outputShapes: [[M, N]],
         outputDTypes: [.bfloat16]

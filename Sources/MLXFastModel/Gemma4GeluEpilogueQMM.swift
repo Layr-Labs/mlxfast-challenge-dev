@@ -266,6 +266,7 @@ let gemma4PrefillUpBN32QuantizedLoader: String = #"""
         biases += 2;
       }
     };
+
     """#
 
 /// The cloned aligned BK128 NAX qmm implementation with the fused store
@@ -290,7 +291,7 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
     // 0 stores the plain rounded up tile (twin behavior, ignores gate); 1
     // reads gate but stores the plain rounded up tile (isolates gate traffic
     // from GELU ALU in perf-attribution runs).
-    template <const int MODE, const int BN, const int WN>
+    template <const int MODE, const int BM, const int BN, const int WM, const int WN>
     METAL_FUNC void gemma4_qmm_t_nax_gelu_impl(
         const device uint32_t* w,
         const device bfloat16_t* scales,
@@ -309,12 +310,12 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
       using T = bfloat16_t;
       constexpr int group_size = 64;
       constexpr int bits = 4;
-      constexpr int BM = 64;
       constexpr int BK = 128;
-      constexpr int WM = 2;
 
       static_assert(
-          (BN == 64 && WN == 2) || (BN == 32 && WN == 1),
+          (BM == 64 && BN == 64 && WM == 2 && WN == 2)
+              || (BM == 64 && BN == 32 && WM == 2 && WN == 1)
+              || (BM == 32 && BN == 32 && WM == 1 && WN == 1),
           "supported Gemma 4 up-projection geometries are BN64/WN2 and BN32/WN1");
 
       constexpr int pack_factor = get_pack_factor<bits, 8>();
@@ -330,13 +331,14 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
           (BM - 1) * GATE_LD + (BN - 1) < BN * BK_padded,
           "the final gate element must remain inside the aliased weight stage");
 
+      constexpr int TGP_THREADS = BM == 32 ? 64 : WM * WN * SIMD_SIZE;
       using loader_w_t = QuantizedBlockLoader<
           T,
           BN,
           BK,
           BK_padded,
           1,
-          WM * WN * SIMD_SIZE,
+          TGP_THREADS,
           group_size,
           bits>;
 
@@ -406,25 +408,27 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
         loader_w.load_unsafe();
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        STEEL_PRAGMA_NO_UNROLL
-        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-          NAXTile<T, TM, TK> Atile;
-          NAXTile<T, TN, TK> Btile;
+        if (simd_gid < WM * WN) {
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
 
-          volatile int compiler_barrier;
+            volatile int compiler_barrier;
 
-          Atile.load(x + kk1, K);
+            Atile.load(x + kk1, K);
 
-          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
 
-          tile_matmad_nax(
-              Dtile,
-              Atile,
-              metal::bool_constant<transpose_a>{},
-              Btile,
-              metal::bool_constant<transpose_b>{});
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
 
-          (void)compiler_barrier;
+            (void)compiler_barrier;
+          }
         }
 
         x += BK;
@@ -454,7 +458,7 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
         // (y_row, y_col). N and BN are multiples of 8, so word addressing
         // (8 bf16 per uint4) is exact.
         const int word_row_stride = N / 8;
-        const int tgp_threads = WM * WN * SIMD_SIZE;
+        const int tgp_threads = TGP_THREADS;
         const int thread_idx = simd_gid * SIMD_SIZE + simd_lid;
         STEEL_PRAGMA_NO_UNROLL
         for (int chunk = thread_idx; chunk < BM * (BN / 8);
@@ -468,45 +472,47 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const short2 sc = BaseNAXFrag::get_coord();
-        device T* y_tile = y + tm * N + tn + sc.y * N + sc.x;
-        const threadgroup T* g_tile = Gs + tm * GATE_LD + tn
-            + sc.y * GATE_LD + sc.x;
-        STEEL_PRAGMA_UNROLL
-        for (short i = 0; i < TM; ++i) {
+        if (simd_gid < WM * WN) {
+          const short2 sc = BaseNAXFrag::get_coord();
+          device T* y_tile = y + tm * N + tn + sc.y * N + sc.x;
+          const threadgroup T* g_tile = Gs + tm * GATE_LD + tn
+              + sc.y * GATE_LD + sc.x;
           STEEL_PRAGMA_UNROLL
-          for (short j = 0; j < TN; ++j) {
-            thread auto& frag = Dtile.val_frags[i * TN + j];
+          for (short i = 0; i < TM; ++i) {
             STEEL_PRAGMA_UNROLL
-            for (short ii = 0; ii < 2; ++ii) {
-              const int r = i * 16 + ii * 8;
-              const int c = j * 16;
-              if constexpr (MODE == 2) {
-                // 4-wide lanes: same element map, one vector store per row.
-                const vec<T, 4> g4 = *reinterpret_cast<const threadgroup vec<T, 4>*>(
-                    g_tile + r * GATE_LD + c);
-                const vec<T, 4> u4 = vec<T, 4>(
-                    static_cast<T>(frag[ii * 4 + 0]),
-                    static_cast<T>(frag[ii * 4 + 1]),
-                    static_cast<T>(frag[ii * 4 + 2]),
-                    static_cast<T>(frag[ii * 4 + 3]));
-                *reinterpret_cast<device vec<T, 4>*>(y_tile + r * N + c) =
-                    gemma4_gelu_mul_bf16x4(g4, u4);
-              } else if constexpr (MODE == 3) {
-                const vec<T, 4> g4 = *reinterpret_cast<const threadgroup vec<T, 4>*>(
-                    g_tile + r * GATE_LD + c);
-                const vec<T, 4> u4 = vec<T, 4>(
-                    static_cast<T>(frag[ii * 4 + 0]),
-                    static_cast<T>(frag[ii * 4 + 1]),
-                    static_cast<T>(frag[ii * 4 + 2]),
-                    static_cast<T>(frag[ii * 4 + 3]));
-                *reinterpret_cast<device vec<T, 4>*>(y_tile + r * N + c) =
-                    gemma4_gelu_mul_bf16x4_lut(g4, u4, tanh_lut);
-              } else {
-                STEEL_PRAGMA_UNROLL
-                for (short jj = 0; jj < 4; ++jj) {
-                  const int cc = c + jj;
-                  y_tile[r * N + cc] = static_cast<T>(frag[ii * 4 + jj]);
+            for (short j = 0; j < TN; ++j) {
+              thread auto& frag = Dtile.val_frags[i * TN + j];
+              STEEL_PRAGMA_UNROLL
+              for (short ii = 0; ii < 2; ++ii) {
+                const int r = i * 16 + ii * 8;
+                const int c = j * 16;
+                if constexpr (MODE == 2) {
+                  // 4-wide lanes: same element map, one vector store per row.
+                  const vec<T, 4> g4 = *reinterpret_cast<const threadgroup vec<T, 4>*>(
+                      g_tile + r * GATE_LD + c);
+                  const vec<T, 4> u4 = vec<T, 4>(
+                      static_cast<T>(frag[ii * 4 + 0]),
+                      static_cast<T>(frag[ii * 4 + 1]),
+                      static_cast<T>(frag[ii * 4 + 2]),
+                      static_cast<T>(frag[ii * 4 + 3]));
+                  *reinterpret_cast<device vec<T, 4>*>(y_tile + r * N + c) =
+                      gemma4_gelu_mul_bf16x4(g4, u4);
+                } else if constexpr (MODE == 3) {
+                  const vec<T, 4> g4 = *reinterpret_cast<const threadgroup vec<T, 4>*>(
+                      g_tile + r * GATE_LD + c);
+                  const vec<T, 4> u4 = vec<T, 4>(
+                      static_cast<T>(frag[ii * 4 + 0]),
+                      static_cast<T>(frag[ii * 4 + 1]),
+                      static_cast<T>(frag[ii * 4 + 2]),
+                      static_cast<T>(frag[ii * 4 + 3]));
+                  *reinterpret_cast<device vec<T, 4>*>(y_tile + r * N + c) =
+                      gemma4_gelu_mul_bf16x4_lut(g4, u4, tanh_lut);
+                } else {
+                  STEEL_PRAGMA_UNROLL
+                  for (short jj = 0; jj < 4; ++jj) {
+                    const int cc = c + jj;
+                    y_tile[r * N + cc] = static_cast<T>(frag[ii * 4 + jj]);
+                  }
                 }
               }
             }
@@ -514,7 +520,9 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
         }
       } else {
         // MODE 0: the twin's plain aligned store (diagnostic baseline).
-        Dtile.store(y + tm * N + tn, N);
+        if (simd_gid < WM * WN) {
+          Dtile.store(y + tm * N + tn, N);
+        }
       }
     }
     """#
@@ -532,7 +540,7 @@ let gemma4PrefillUpGeluEpilogueHeader: String =
 /// gemma4_bk128 dispatch makes).
 private let gemma4PrefillUpGeluEpilogueBN64Source: String = #"""
         threadgroup bfloat16_t Ws[64 * 136];
-        gemma4_qmm_t_nax_gelu_impl<MODE, 64, 2>(
+        gemma4_qmm_t_nax_gelu_impl<MODE, 64, 64, 2, 2>(
             w,
             scales,
             biases,
@@ -554,7 +562,29 @@ private let gemma4PrefillUpGeluEpilogueBN64Source: String = #"""
 /// 8,704 bytes and is subsequently reused as a dense-stride 64x32 gate tile.
 private let gemma4PrefillUpGeluEpilogueBN32Source: String = #"""
         threadgroup bfloat16_t Ws[32 * 136];
-        gemma4_qmm_t_nax_gelu_impl<MODE, 32, 1>(
+        gemma4_qmm_t_nax_gelu_impl<MODE, 64, 32, 2, 1>(
+            w,
+            scales,
+            biases,
+            x,
+            gate,
+            tanh_lut,
+            output,
+            Ws,
+            K,
+            N,
+            M,
+            threadgroup_position_in_grid,
+            simdgroup_index_in_threadgroup,
+            thread_index_in_simdgroup);
+        """#
+
+/// Final-tail BM32 body: one SIMDgroup owns the same M32xN32 NAX fragment
+/// used by the promoted BM64 kernel, without computing a discarded second
+/// 32-row half tile.
+private let gemma4PrefillUpGeluEpilogueBM32Source: String = #"""
+        threadgroup bfloat16_t Ws[32 * 136];
+        gemma4_qmm_t_nax_gelu_impl<MODE, 32, 32, 1, 1>(
             w,
             scales,
             biases,
@@ -610,6 +640,15 @@ private let gemma4PrefillUpGeluEpilogueBN32Kernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+private let gemma4PrefillUpGeluEpilogueBM32Kernel = MLXFast.metalKernel(
+    name: "gemma4_prefill_up_gelu_epilogue_nax_bm32_bn32_bk128_v1",
+    inputNames: ["w", "scales", "biases", "x", "gate", "tanh_lut", "K", "N", "M"],
+    outputNames: ["output"],
+    source: gemma4PrefillUpGeluEpilogueBM32Source,
+    header: gemma4GeluEpilogueNAXStack + gemma4PrefillUpGeluEpilogueHeader,
+    ensureRowContiguous: true
+)
+
 /// Runs the fused up-projection + GELU(gate)*up epilogue.
 ///
 /// - Parameters:
@@ -634,7 +673,7 @@ func gemma4PrefillUpGeluEpilogue(
     let M = x.shape[0]
     let K = x.shape[1]
     let N = gate.shape[1]
-    precondition(M % 64 == 0 && N % 64 == 0 && K % 128 == 0)
+    precondition((M == 32 || M % 64 == 0) && N % 64 == 0 && K % 128 == 0)
     precondition(x.dtype == .bfloat16 && gate.dtype == .bfloat16)
     precondition(weight.dtype == .uint32 && weight.shape == [N, K / 8])
     precondition(scales.dtype == .bfloat16 && scales.shape == [N, K / 64])
@@ -645,6 +684,16 @@ func gemma4PrefillUpGeluEpilogue(
         weight, scales, biases, x, gate, gemma4TanhBFloat16LUT.table,
         MLXArray(Int32(K)), MLXArray(Int32(N)), MLXArray(Int32(M)),
     ]
+    if M == 32 {
+        return gemma4PrefillUpGeluEpilogueBM32Kernel(
+            inputs,
+            template: [("MODE", mode)],
+            grid: ((N / 32) * 32, 1, 2),
+            threadGroup: (32, 1, 2),
+            outputShapes: [[M, N]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
     if gemma4PrefillGeluEpilogueBN32Enabled && M == 512 {
         return gemma4PrefillUpGeluEpilogueBN32Kernel(
             inputs,
@@ -801,7 +850,7 @@ struct Gemma4PrefillGeluEpilogueMLPTail: @unchecked Sendable {
     /// True when a `[B, L, hidden]` prefill activation can take the fused
     /// path (aligned row count, standard layouts).
     func supports(B: Int, L: Int) -> Bool {
-        B == 1 && L > 1 && L % 64 == 0
+        B == 1 && (L == 32 || (L > 1 && L % 64 == 0))
     }
 
     func callAsFunction(_ x: MLXArray, _ residual: MLXArray) -> MLXArray {

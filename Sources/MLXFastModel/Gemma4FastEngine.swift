@@ -59,15 +59,15 @@ private let gemma4VerifyStagedFullPrefillAttentionBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
-/// Rollback switch for the last-layer M=64 tail prune.
+/// Rollback switch for the last-layer narrow tail prune.
 ///
 /// Default ON. At prefill lengths >= 128 the final transformer layer's
 /// post-attention chain (o_proj -> post-attn boundary -> gate/up -> gelu*mul
 /// -> down -> post-FFN boundary) influences only the last row's logits, so
-/// the chain runs on the last 64 supplied rows instead of all L. The
+/// the chain runs on the configured final rows instead of all L. The
 /// layer's qkv/prep/attention/KV-write stays full-width (decode needs KV at
 /// every position). Every dispatched op in the pruned chain is
-/// row-independent at M=64 vs M=512: the frozen host dispatch sends both to
+/// row-independent at M=32/64 vs M=512: the frozen host dispatch sends all to
 /// the identical `affine_qmm_t_nax` pipeline (qmm_splitk picks split_k=1
 /// for N=5376 and N=21504 at both M values, and the kernel has a strictly
 /// ascending per-element K chain with no cross-row reduction), and the
@@ -85,7 +85,7 @@ let gemma4LastLayerTailPruneEnabled: Bool = {
 
 /// Raw-bit verify switch for the last-layer tail prune. Default OFF. When
 /// enabled, the final layer additionally runs the unpruned full-width chain
-/// and preconditions that its last 64 rows bit-match the pruned output.
+/// and preconditions that its matching final rows equal the pruned output.
 let gemma4VerifyLastLayerTailPruneBits: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_VERIFY_LAST_LAYER_TAIL_PRUNE_BITS"
@@ -98,7 +98,7 @@ let gemma4VerifyLastLayerTailPruneBits: Bool = {
 /// Rollback switch for the last-layer Q-side prune.
 ///
 /// Default ON. At prefill lengths >= 128 the final layer (full attention,
-/// K==V shared) computes Q only for the last 64 supplied rows: the pruned
+/// K==V shared) computes Q only for the configured final supplied rows: the pruned
 /// post-attention chain consumes only those rows, Q is never cached, and
 /// logits are last-row only. K/V projection, K/V preparation, and the KV
 /// cache write stay full-width (decode needs KV at every position). The
@@ -107,7 +107,7 @@ let gemma4VerifyLastLayerTailPruneBits: Bool = {
 /// causal bound of the retained rows). Every dispatched op is
 /// row-independent: separate q/k QMMs preserve the combined projection's
 /// per-element K chains (the CombinedAttentionPrefillProjection.verifyBits
-/// invariant), qmm_splitk selects split_k=1 at both M=512 and M=64 for
+/// invariant), qmm_splitk selects split_k=1 at M=512, M=64, and M=32 for
 /// N=16384/2048, and the attention fallback does not split K at these
 /// shapes, so the retained rows are bit-identical to the full-width path.
 /// Set `DARKBLOOM_LAST_LAYER_Q_PRUNE=0` to restore full-width Q.
@@ -123,7 +123,7 @@ let gemma4LastLayerQPruneEnabled: Bool = {
 /// Raw-bit verify switch for the last-layer Q-side prune. Default OFF. When
 /// enabled, the final layer additionally runs the full-width stock-SDPA
 /// attention and chain, and preconditions that the pruned 64-row attention
-/// output and the pruned layer output bit-match its last 64 rows.
+/// output and the pruned layer output bit-match its retained final rows.
 let gemma4VerifyLastLayerQPruneBits: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_VERIFY_LAST_LAYER_Q_PRUNE_BITS"
@@ -131,6 +131,20 @@ let gemma4VerifyLastLayerQPruneBits: Bool = {
         return false
     }
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+/// Retained rows in the final prefill layer. Thirty-two is the smallest M5
+/// QMM batch that remains on the exact NAX matrix path for every Gemma 4
+/// projection shape. The BM32 kernels retain the promoted per-SIMD M32xN32
+/// accumulator and K order without computing a padded second half.
+/// Set `DARKBLOOM_LAST_LAYER_PRUNE_ROWS=64` for exact frontier rollback.
+let gemma4LastLayerPruneRows: Int = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LAST_LAYER_PRUNE_ROWS"
+    ], let value = Int(raw), value == 64 else {
+        return 32
+    }
+    return value
 }()
 
 /// Prefill pipeline chunk size, in layers. Default 18.
@@ -681,7 +695,7 @@ final class Gemma4FastLayer {
         // C1: last-layer Q-side prune. Only full-attention K==V layers at
         // prefill lengths >= 128, and only when the K/V-only combined
         // prefill path is available (the ranked prefill shape always has
-        // both). The retained Q rows are the last 64 supplied rows, at their
+        // both). The retained Q rows are the configured final supplied rows, at their
         // global RoPE offset.
         let qPruneCapacity = pruneTail
             && gemma4LastLayerQPruneEnabled
@@ -695,7 +709,7 @@ final class Gemma4FastLayer {
                 offset: offset, length: L) == true
             ? (cache as? Gemma4CombinedKVCache)?.directPrefillCapacity(for: L)
             : nil
-        let qPruneRows = qPruneCapacity != nil ? 64 : 0
+        let qPruneRows = qPruneCapacity != nil ? gemma4LastLayerPruneRows : 0
         let qPruneStart = L - qPruneRows
 
         let rawQueries: MLXArray
@@ -713,10 +727,10 @@ final class Gemma4FastLayer {
             rawValues = nil
         } else if qPruneRows > 0 {
             // K full-width (decode needs every row's KV); Q on the retained
-            // 64 rows only. Separate q/k QMMs preserve the combined
+            // configured final rows only. Separate q/k QMMs preserve the combined
             // projection's per-element K chains (the
             // CombinedAttentionPrefillProjection.verifyBits invariant), and
-            // qmm_splitk selects split_k=1 at both M=512 and M=64 for
+            // qmm_splitk selects split_k=1 at M=512, M=64, and M=32 for
             // N=16384 and N=2048, so the retained rows are bit-identical.
             // The BN32 clone dispatches are bit-identical to those stock
             // QMMs at both widths, so the invariant is preserved.
@@ -827,7 +841,7 @@ final class Gemma4FastLayer {
                   let combinedCache,
                   let qPruneCapacity
         {
-            // Q: stock eager path on the 64 retained rows at their global
+            // Q: stock eager path on the retained rows at their global
             // RoPE offset (rmsNorm and RoPE are row-independent, so these
             // rows are bit-identical to the full-width preparation).
             queries = rawQueries.reshaped(B, qPruneRows, nHeads, headDim)
@@ -1023,11 +1037,11 @@ final class Gemma4FastLayer {
             && keys.shape == [1, 4, 512, 512]
             && values.shape == [1, 4, 512, 512]
         if qPruneRows > 0 {
-            // Stock C++ SDPA fallback on the 64 retained query rows. Its
+            // Stock C++ SDPA fallback on the retained query rows. Its
             // `.causal` mask uses offset kL - qL = L - 64 (fast.cpp), which
             // is exactly the retained rows' global causal bound; every row's
             // QK/softmax/PV reduction is row-independent, so the output rows
-            // are bit-identical to the full-width attention's last 64 rows.
+            // are bit-identical to the full-width attention's final rows.
             let attention = MLXFast.scaledDotProductAttention(
                 queries: queries,
                 keys: keys,
@@ -1165,19 +1179,20 @@ final class Gemma4FastLayer {
         }
         // Last-layer tail prune: at prefill lengths >= 128 the post-attention
         // chain of the final layer influences only the last row's logits, so
-        // o_proj, the boundary, and the whole MLP tail run on the last 64
+        // o_proj, the boundary, and the whole MLP tail run on the configured final
         // supplied rows (a metadata-only view -- 64 real rows, no padding).
         // The qkv/prep/attention/KV-write above already ran full-width, so
         // decode keeps KV at every position. Every op in the pruned chain is
-        // row-independent at M=64 vs full width: the frozen host dispatch
+        // row-independent at M=32/64 vs full width: the frozen host dispatch
         // (QuantizedMatmul::eval_gpu -> qmm_splitk) selects split_k=1 for
-        // N=5376 and N=21504 at both M=512 and M=64 and forwards to the same
+        // N=5376 and N=21504 at M=512, M=64, and M=32 and forwards to the same
         // affine_qmm_t_nax pipeline, whose per-element K chain is strictly
         // ascending with no cross-row reduction; RMS norms and elementwise
         // ops are per-row at any M. The retained rows are therefore
         // bit-identical to the full-width chain.
         let tailStart = pruneTail && gemma4LastLayerTailPruneEnabled
-            && qPruneRows == 0 && B == 1 && L >= 128 ? L - 64 : 0
+            && qPruneRows == 0 && B == 1 && L >= 128
+            ? L - gemma4LastLayerPruneRows : 0
         let chainAttention = tailStart > 0
             ? mergedAttention[0..., tailStart..<L, 0...]
             : mergedAttention
@@ -1192,7 +1207,7 @@ final class Gemma4FastLayer {
         } else {
             // BN32 narrow-residency qmm clone
             // (DARKBLOOM_PREFILL_BN32_QMM, default on): bit-exact vs the
-            // stock o_proj quantizedMM at both full width and the M=64
+            // stock o_proj quantizedMM at both full width and the narrow
             // pruned tail.
             attnOut = gemma4PrefillBN32QMMDispatchIfSupported(
                 chainAttention, projection: oProj)
@@ -1305,7 +1320,7 @@ final class Gemma4FastLayer {
                 "last-layer Q-side prune attention differs from full-width"
             )
             // Chain-level reference: the full-width post-attention chain's
-            // last 64 rows must bit-match the pruned chain output. The
+            // retained final rows must bit-match the pruned chain output. The
             // fusedMLPTail reference is bit-identical to the production
             // chain (the GELU epilogue carries its own raw-bit contract
             // against fusedMLPTail).
@@ -1336,7 +1351,7 @@ final class Gemma4FastLayer {
         }
         if tailStart > 0 && gemma4VerifyLastLayerTailPruneBits {
             // Full-width reference over the identical post-attention ops:
-            // the pruned output must bit-match its last 64 rows. The layer's
+            // the pruned output must bit-match its retained final rows. The layer's
             // KV slabs are upstream of the prune point (attention ran
             // full-width), so they are identical by construction.
             let referenceAttnOut = oProj(mergedAttention)
