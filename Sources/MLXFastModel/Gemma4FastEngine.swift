@@ -1197,36 +1197,51 @@ final class Gemma4FastLayer {
         var out: MLXArray
         let residual2: MLXArray
         let fusedPreFFNNormalized: MLXArray?
+        let fusedPreFFNActivationSidecar: MLXArray?
         var nextNormalized: MLXArray? = nil
         if B == 1,
            L == 1,
-           fusedGateUp != nil,
+           let fusedGateUp,
            fusedGateUpPostTail != nil,
            let fusedAttentionToMLPBoundary
         {
             let prepared = fusedAttentionToMLPBoundary(
                 attentionOutput: attnOut,
-                residual: residual
+                residual: residual,
+                produceActivationSidecar: useFusedGateUpActivation
+                    && fusedGateUp.supportsDecodeActivationSidecar
             )
             out = prepared.0
             residual2 = prepared.0
             fusedPreFFNNormalized = prepared.1
+            fusedPreFFNActivationSidecar = prepared.2
         } else {
             out = chainResidual + MLXFast.rmsNorm(
                 attnOut, weight: postAttnNormWeight, eps: eps)
             residual2 = out
             fusedPreFFNNormalized = nil
+            fusedPreFFNActivationSidecar = nil
         }
         if B == 1, L == 1, let fusedGateUp, let fusedGateUpPostTail {
-            let normalized = fusedPreFFNNormalized ?? MLXFast.rmsNorm(
-                out, weight: preFfnNormWeight, eps: eps)
             if let fusedGateUpActivation, let indexedDown, let indexedDownPostTail {
                 let activated: MLXArray
-                if useFusedGateUpActivation {
-                    activated = fusedGateUp.activated(normalized)
+                if useFusedGateUpActivation,
+                   let fusedPreFFNActivationSidecar
+                {
+                    activated =
+                        fusedGateUp.activatedFromDecodeActivationSidecar(
+                            fusedPreFFNActivationSidecar,
+                            referenceInput: fusedPreFFNNormalized
+                        )
                 } else {
-                    let (gateOutput, upOutput) = fusedGateUp(normalized)
-                    activated = fusedGateUpActivation(gateOutput, upOutput)
+                    let normalized = fusedPreFFNNormalized ?? MLXFast.rmsNorm(
+                        out, weight: preFfnNormWeight, eps: eps)
+                    if useFusedGateUpActivation {
+                        activated = fusedGateUp.activated(normalized)
+                    } else {
+                        let (gateOutput, upOutput) = fusedGateUp(normalized)
+                        activated = fusedGateUpActivation(gateOutput, upOutput)
+                    }
                 }
                 let mlp = indexedDown(activated)
                 if let fusedMLPToNextBoundary {
@@ -1240,6 +1255,8 @@ final class Gemma4FastLayer {
                     out = indexedDownPostTail(mlp, residual2)
                 }
             } else {
+                let normalized = fusedPreFFNNormalized ?? MLXFast.rmsNorm(
+                    out, weight: preFfnNormWeight, eps: eps)
                 let (gateOutput, upOutput) = fusedGateUp(normalized)
                 out = fusedGateUpPostTail(gateOutput, upOutput, residual2)
             }
@@ -1474,8 +1491,11 @@ final class Gemma4FastLayer {
             attentionOutput: attentionOutput,
             residual: x
         )
+        guard let normalized = attentionBoundary.1 else {
+            preconditionFailure("exact MTP pair boundary omitted normalized output")
+        }
         let activated = fusedGateUp.exactTwoVectorActivated(
-            attentionBoundary.1
+            normalized
         )
         let mlp = indexedDown.exactTwoVector(activated)
         let mlpBoundary = fusedMLPToNextBoundary(
