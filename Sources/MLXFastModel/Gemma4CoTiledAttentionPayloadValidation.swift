@@ -15,8 +15,13 @@ import MLXFastCore
 ///   (slot-major, row-major, 128 bytes per row), odd-block weights, then the
 ///   packed fixed12/13 metadata pair tiles (slot-major, `indexBits` bytes
 ///   per row).
-/// - One tail tile of `136 S` words: block-20 weights, then 8 lane-major
-///   tail metadata bytes per row (32 bytes per slot).
+/// - One tail tile of `136 S` words (U16 tail) or `134 S` words (12-bit
+///   tail): block-20 weights, then the tail metadata — either 8 lane-major
+///   tail bytes per row (32 bytes per slot), or the same four indexes
+///   repacked at 12 bits (6 bytes per row, 24 bytes per slot; pair
+///   `(t0, t1)` as `t0 & 0xff`, `t1 & 0xff`, `(t0 >> 8) | ((t1 >> 8) << 4)`,
+///   the gate/up co-tile tail12 nibble order). The payload's declared
+///   `wordsPerThreadgroup` selects the layout, so one shard may mix both.
 ///
 /// `validateGemma4CoTiledAttentionPayloadBytes` reproduces the exact byte
 /// runs the co-tiled kernels in `Gemma4FusedQKV.swift` consume, so the
@@ -45,10 +50,10 @@ enum Gemma4CoTiledAttentionPayloadLayout {
         [Int](repeating: qBits, count: 8) + [kBits]
     }
 
-    /// U32 words per threadgroup for one slot-major index-bit list, or nil
-    /// for an unsupported width. Pinned against the transform-side
-    /// implementation by a CPU test.
-    static func wordsPerThreadgroup(slotIndexBits: [Int]) -> Int? {
+    /// U32 words per threadgroup for one slot-major index-bit list and tail
+    /// layout, or nil for an unsupported width. Pinned against the
+    /// transform-side implementation by a CPU test.
+    static func wordsPerThreadgroup(slotIndexBits: [Int], tail12: Bool) -> Int? {
         guard !slotIndexBits.isEmpty,
               slotIndexBits.allSatisfy({ $0 == 12 || $0 == 13 })
         else {
@@ -56,7 +61,8 @@ enum Gemma4CoTiledAttentionPayloadLayout {
         }
         let slots = slotIndexBits.count
         let pairMetadataBytes = slotIndexBits.reduce(0) { $0 + 4 * $1 }
-        return pairCount * (256 * slots + pairMetadataBytes / 4) + 136 * slots
+        return pairCount * (256 * slots + pairMetadataBytes / 4)
+            + (tail12 ? 134 : 136) * slots
     }
 }
 
@@ -88,14 +94,21 @@ struct ValidatedGemma4CoTiledAttentionPayload: Sendable {
     let qBits: Int
     let kBits: Int
     let vBits: Int?
+    /// True when the payload's tail tile packs the 21st block's four
+    /// indexes per row at 12 bits (6 B/row) instead of lane-major U16
+    /// (8 B/row). Declared by the payload's `wordsPerThreadgroup`.
+    let tail12: Bool
 }
 
 /// Exhaustively verifies one co-tiled payload against its ordered projection
 /// sources by walking the exact per-threadgroup tile stream the co-tiled
 /// kernels traverse: for every (threadgroup, pair tile, slot, row) the
-/// 128-byte even/odd/tail weight runs and the `indexBits`-byte (pair) or
-/// 8-byte (tail) metadata runs must equal the corresponding source-tensor
-/// runs. Any mismatch, and any geometry the kernels cannot address, throws.
+/// 128-byte even/odd/tail weight runs and the `indexBits`-byte (pair)
+/// metadata runs must equal the corresponding source-tensor runs, and the
+/// tail metadata run — 8 lane-major U16 bytes, or 6 bytes of 12-bit-packed
+/// indexes when the payload's byte length declares the tail12 layout —
+/// must decode to the source row's four tail indexes. Any mismatch, and any
+/// geometry the kernels cannot address, throws.
 func validateGemma4CoTiledAttentionPayloadBytes(
     payload: Data,
     projections: [Gemma4CoTiledPayloadProjectionSource],
@@ -169,15 +182,26 @@ func validateGemma4CoTiledAttentionPayloadBytes(
             * projections[slotProjection[slot]].indexBits
     }
     let pairTileBytes = 1_024 * slots + metadataCursor
-    let tailTileBytes = 544 * slots
-    let threadgroupBytes = Layout.pairCount * pairTileBytes + tailTileBytes
-    let (expectedPayloadBytes, payloadOverflow) = threadgroups
-        .multipliedReportingOverflow(by: threadgroupBytes)
-    guard !payloadOverflow, payload.count == expectedPayloadBytes else {
+    func threadgroupBytes(tail12: Bool) -> Int {
+        Layout.pairCount * pairTileBytes + (tail12 ? 536 : 544) * slots
+    }
+    let (expectedU16Bytes, u16Overflow) = threadgroups
+        .multipliedReportingOverflow(by: threadgroupBytes(tail12: false))
+    let (expectedTail12Bytes, tail12Overflow) = threadgroups
+        .multipliedReportingOverflow(by: threadgroupBytes(tail12: true))
+    // The payload's byte length declares its tail layout; the two
+    // candidates always differ (by `threadgroups * 8 * slots`).
+    let tail12: Bool
+    if !u16Overflow, payload.count == expectedU16Bytes {
+        tail12 = false
+    } else if !tail12Overflow, payload.count == expectedTail12Bytes {
+        tail12 = true
+    } else {
         throw MLXFastError.invalidInput(
             "co-tiled attention payload byte length is invalid for \(name)"
         )
     }
+    let threadgroupBytes = threadgroupBytes(tail12: tail12)
 
     func compareRun(
         _ payloadBytes: UnsafeRawBufferPointer,
@@ -196,6 +220,34 @@ func validateGemma4CoTiledAttentionPayloadBytes(
             sourceBase + sourceOffset,
             count
         ) == 0
+    }
+
+    /// Tail12 counterpart of `compareRun`: the payload carries six bytes —
+    /// pair `(t0, t1)` as `t0 & 0xff`, `t1 & 0xff`,
+    /// `(t0 >> 8) | ((t1 >> 8) << 4)`, then the same for `(t2, t3)` — and
+    /// the source carries the same four indexes as lane-major U16. The
+    /// extraction mirrors the co-tiled kernels' tail12 decode literally
+    /// (even index: low nibble of the shared byte; odd index: its HIGH
+    /// nibble, i.e. `t >> 8`), so equality here proves the kernel
+    /// reconstructs the source indexes.
+    func tailMetadataMatches(
+        _ payloadBytes: UnsafeRawBufferPointer,
+        _ sourceBytes: UnsafeRawBufferPointer,
+        payloadOffset: Int,
+        sourceOffset: Int
+    ) -> Bool {
+        for laneGroup in 0..<4 {
+            let sourceIndex = Int(sourceBytes[sourceOffset + 2 * laneGroup])
+                | (Int(sourceBytes[sourceOffset + 2 * laneGroup + 1]) << 8)
+            let pairBase = (laneGroup >> 1) * 3
+            let low = Int(payloadBytes[payloadOffset + pairBase + (laneGroup & 1)])
+            let middle = Int(payloadBytes[payloadOffset + pairBase + 2])
+            let payloadIndex = (laneGroup & 1) == 0
+                ? low | ((middle & 0x0f) << 8)
+                : low | ((middle >> 4) << 8)
+            guard payloadIndex == sourceIndex else { return false }
+        }
+        return true
     }
 
     try payload.withUnsafeBytes { (payloadBytes: UnsafeRawBufferPointer) in
@@ -260,16 +312,28 @@ func validateGemma4CoTiledAttentionPayloadBytes(
                                 + 2 * Layout.pairCount * Layout.blockBytes,
                             count: Layout.blockBytes
                         )
-                        let tailMetadataMatches = compareRun(
-                            payloadBytes,
-                            packedBuffers[projectionIndex],
-                            payloadOffset: tailBase + 512 * slots
-                                + 32 * slot + 8 * row,
-                            sourceOffset: packedRowBase
-                                + Layout.pairCount * projection.indexBits,
-                            count: 8
-                        )
-                        guard tailWeightMatches, tailMetadataMatches else {
+                        let tailRunMatches: Bool
+                        if tail12 {
+                            tailRunMatches = tailMetadataMatches(
+                                payloadBytes,
+                                packedBuffers[projectionIndex],
+                                payloadOffset: tailBase + 512 * slots
+                                    + 24 * slot + 6 * row,
+                                sourceOffset: packedRowBase
+                                    + Layout.pairCount * projection.indexBits
+                            )
+                        } else {
+                            tailRunMatches = compareRun(
+                                payloadBytes,
+                                packedBuffers[projectionIndex],
+                                payloadOffset: tailBase + 512 * slots
+                                    + 32 * slot + 8 * row,
+                                sourceOffset: packedRowBase
+                                    + Layout.pairCount * projection.indexBits,
+                                count: 8
+                            )
+                        }
+                        guard tailWeightMatches, tailRunMatches else {
                             throw MLXFastError.invalidInput(
                                 "co-tiled attention payload does not reconstruct "
                                     + "\(projection.stem) at threadgroup "
@@ -420,9 +484,25 @@ func validateGemma4CoTiledAttentionPayloadBytes(
                 kBits: indexBits[1]
             )
         }
-        guard let wordsPerThreadgroup = Layout.wordsPerThreadgroup(
-            slotIndexBits: slotIndexBits
-        ), payloadRecord.shape == [threadgroups, wordsPerThreadgroup] else {
+        // The payload's declared words-per-threadgroup selects its tail
+        // layout; the two candidates always differ (by `2 * slots`).
+        let u16Words = Layout.wordsPerThreadgroup(
+            slotIndexBits: slotIndexBits, tail12: false)
+        let tail12Words = Layout.wordsPerThreadgroup(
+            slotIndexBits: slotIndexBits, tail12: true)
+        let tail12: Bool
+        let wordsPerThreadgroup: Int
+        if let candidate = u16Words,
+           payloadRecord.shape == [threadgroups, candidate]
+        {
+            tail12 = false
+            wordsPerThreadgroup = candidate
+        } else if let candidate = tail12Words,
+                  payloadRecord.shape == [threadgroups, candidate]
+        {
+            tail12 = true
+            wordsPerThreadgroup = candidate
+        } else {
             throw MLXFastError.invalidInput(
                 "co-tiled attention payload shape does not match its metadata "
                     + "formats for \(name)"
@@ -445,7 +525,8 @@ func validateGemma4CoTiledAttentionPayloadBytes(
                 wordsPerThreadgroup: wordsPerThreadgroup,
                 qBits: indexBits[0],
                 kBits: indexBits[1],
-                vBits: kind == .slidingQKV ? indexBits[2] : nil
+                vBits: kind == .slidingQKV ? indexBits[2] : nil,
+                tail12: tail12
             ),
             forKey: runtimeName
         ) == nil else {

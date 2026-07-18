@@ -730,7 +730,8 @@ func partitionRuntimeWeights(
                 words: array,
                 qBits: validated.qBits,
                 kBits: validated.kBits,
-                vBits: validated.vBits
+                vBits: validated.vBits,
+                tail12: validated.tail12
             ),
             forKey: attentionPrefix
         ) == nil else {

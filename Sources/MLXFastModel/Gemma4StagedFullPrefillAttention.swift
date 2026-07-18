@@ -1,6 +1,26 @@
 import Foundation
 import MLX
 
+/// Rollback switch for the m32wcf full-attention staged prefill kernel.
+///
+/// Default ON: the full-attention staged prefill kernel runs the m32wcf
+/// geometry (32-row query tiles, 256 threads, fused causal mask via
+/// per-element select in the softmax read with a clamped tail, PV tile
+/// N=32) -- bit-exact against stock SDPA (verified per call by
+/// DARKBLOOM_VERIFY_STAGED_FULL_PREFILL_ATTENTION_BITS) and isolated ~1.53x
+/// on this silicon. The sliding staged kernel deliberately stays m16 (the
+/// sliding-m32w variant cost -0.42% prefill officially under BK128). Set
+/// `DARKBLOOM_STAGED_FULL_PREFILL_M32W=0` to restore the m16 kernel; the
+/// kernel name carries the variant so pipelines never alias.
+let gemma4StagedFullPrefillM32WEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_STAGED_FULL_PREFILL_M32W"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// CPU-side mirror of the staged FULL-attention prefill kernel's tile
 /// geometry.
 ///
@@ -23,8 +43,9 @@ enum Gemma4StagedFullPrefillGeometry {
     /// Per-head attention dimension of the full-attention layers
     /// (`global_head_dim`).
     static let headDim = 512
-    /// Query rows owned by one threadgroup (M tile).
-    static let queryRows = 16
+    /// Query rows owned by one threadgroup (M tile): 32 under m32wcf
+    /// (default), 16 under the m16 rollback.
+    static var queryRows: Int { gemma4StagedFullPrefillM32WEnabled ? 32 : 16 }
     /// Number of query heads.
     static let queryHeads = 32
     /// Number of KV heads (`num_global_key_value_heads`).
@@ -40,7 +61,7 @@ enum Gemma4StagedFullPrefillGeometry {
 
     /// Total 32-key QK tiles per query block.
     static var keyBlocksTotal: Int { length / keyTileColumns }
-    /// Total 16-query blocks per head.
+    /// Total query blocks per head (16 under m32wcf, 32 under m16).
     static var queryBlocksTotal: Int { length / queryRows }
 
     /// Mask keep predicate for the ranked staged full-attention shape.
@@ -61,24 +82,26 @@ enum Gemma4StagedFullPrefillGeometry {
         queryHead / gqaFactor
     }
 
-    /// P1 bound: number of leading 32-key QK tiles computed for the 16-query
-    /// tile `queryBlock`; every tile index at or beyond this bound is skipped.
+    /// P1 bound: number of leading 32-key QK tiles computed for the query
+    /// tile `queryBlock`; every tile index at or beyond this bound is
+    /// skipped.
     ///
-    /// Derivation (identical to the sliding staged kernel -- it depends only
-    /// on the 16-row/32-column tile shape, not the head dim): the tile
-    /// starting at `key_start = 32*keyBlock` is fully masked iff its smallest
-    /// key exceeds the tile's largest query position, i.e.
-    /// `32*keyBlock > 16*queryBlock + 15`, equivalently
-    /// `32*keyBlock >= 16*(queryBlock + 1)`, so the first fully-masked tile
-    /// index is `ceil((queryBlock + 1) / 2) == (queryBlock + 2) / 2` in
-    /// integer division. Must match the Metal-side `key_block_limit`.
+    /// Derivation (depends only on the row/32-column tile shape, not the
+    /// head dim): the tile starting at `key_start = 32*keyBlock` is fully
+    /// masked iff its smallest key exceeds the tile's largest query
+    /// position. Under m32wcf (32-row tiles) that is exactly
+    /// `queryBlock + 1`; under the m16 rollback (16-row tiles) it is
+    /// `(queryBlock + 2) / 2` (integer `ceil((queryBlock + 1) / 2)`). Must
+    /// match the Metal-side `key_block_limit`.
     static func computedKeyBlockCount(queryBlock: Int) -> Int {
-        (queryBlock + 2) / 2
+        gemma4StagedFullPrefillM32WEnabled
+            ? queryBlock + 1
+            : (queryBlock + 2) / 2
     }
 
     /// P5 bound: number of leading probability columns the PV stage consumes
-    /// for the 16-query tile `queryBlock`; every key column at or beyond this
-    /// bound is causally masked for all 16 rows of the tile, so its softmax
+    /// for the query tile `queryBlock`; every key column at or beyond this
+    /// bound is causally masked for all rows of the tile, so its softmax
     /// probability is exactly +0.0 bf16.
     ///
     /// Granularity: the PV matmul reduces over K with a single dynamic-K
@@ -107,9 +130,9 @@ enum Gemma4StagedFullPrefillGeometry {
 
     /// Mirrors the kernel's PV output tile addressing: linear offset written
     /// by tile coordinate (queryHead, queryStart, valueStart) at tile-local
-    /// (row, lane), where `row` indexes the 16 query rows and `lane` the 32
-    /// output columns. Must match the Metal-side `output_tile` base and the
-    /// output tensor strides (`{1, kOutputRowStride}`).
+    /// (row, lane), where `row` indexes the tile's query rows and `lane` the
+    /// 32 output columns. Must match the Metal-side `output_tile` base and
+    /// the output tensor strides (`{1, kOutputRowStride}`).
     static func outputTileElementOffset(
         tokenMajor: Bool,
         queryHead: Int,
@@ -134,7 +157,9 @@ enum Gemma4StagedFullPrefillGeometry {
 /// `_pvskip`); the suffix keeps differently-configured pipelines from
 /// aliasing in MLX's kernel cache.
 let gemma4StagedFullPrefill512KernelName: String =
-    "gemma4_staged_full_prefill_16x512x512_mpp_v1"
+    (gemma4StagedFullPrefillM32WEnabled
+        ? "gemma4_staged_full_prefill_32x512x512_mpp_v2_m32wcf"
+        : "gemma4_staged_full_prefill_16x512x512_mpp_v1")
     + "_skip\(gemma4StagedPrefillCausalTileSkipEnabled ? 1 : 0)"
     + "_tokmaj\(gemma4StagedPrefillTokenMajorOutputEnabled ? 1 : 0)"
     + "_pvskip\(gemma4StagedPrefillPVTileSkipEnabled ? 1 : 0)"
@@ -144,7 +169,7 @@ let gemma4StagedFullPrefill512KernelName: String =
 /// survives verbatim in the exact source string handed to MLX's Metal
 /// compiler (which disables fast math, so the compiler cannot elide
 /// `x + 0.0f` -- it is not an identity under IEEE signed zeros).
-let gemma4StagedFullPrefill512KernelSource: String = """
+let gemma4StagedFullPrefill512M16KernelSource: String = """
         constexpr uint kLength = 512;
         constexpr uint kHeadDim = 512;
         constexpr uint kQueryRows = 16;
@@ -430,6 +455,318 @@ let gemma4StagedFullPrefill512KernelSource: String = """
         }
         """
 
+/// Metal source of the m32wcf full prefill kernel (32-row query tiles,
+/// 256 threads, fused mask + clamped tail; bit-exact vs stock SDPA).
+let gemma4StagedFullPrefill512M32WKernelSource: String = """
+        constexpr uint kLength = 512;
+        constexpr uint kHeadDim = 512;
+        constexpr uint kQueryRows = 32;
+        constexpr uint kQHeads = 32;
+        constexpr uint kKVHeads = 4;
+        constexpr uint kGQAFactor = 8;
+        constexpr uint kThreads = 256;
+        constexpr uint kSIMDSize = 32;
+        constexpr uint kSIMDGroups = 8;
+        constexpr uint kVirtualGroups = 4;
+        constexpr uint kSoftmaxReads = 4;
+        constexpr uint kQKTileN = 32;
+        constexpr uint kPVTileN = 32;
+        constexpr bool kClampTail = true;
+        constexpr bool kFusedMask = true;
+        constexpr bool kCausalTileSkip =
+            \(gemma4StagedPrefillCausalTileSkipEnabled);
+        constexpr bool kTokenMajorOutput =
+            \(gemma4StagedPrefillTokenMajorOutputEnabled);
+        constexpr bool kPVTileSkip =
+            \(gemma4StagedPrefillPVTileSkipEnabled);
+
+        const uint thread_index = thread_position_in_threadgroup.x;
+        const uint simd_lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+        const uint query_head = threadgroup_position_in_grid.y;
+        const uint query_block = threadgroup_position_in_grid.z;
+        const uint query_start = query_block * kQueryRows;
+        const uint kv_head = query_head / kGQAFactor;
+
+        threadgroup bfloat scores[kQueryRows * kLength];
+
+        // Eight SIMDgroups cover 32-key column tiles of a 32-row query tile
+        // with contiguous per-group block ranges. MPP keeps the 512-wide
+        // head-dim reduction inside the tensor operation, and writes only
+        // BF16 scores to on-chip threadgroup storage. Gemma 4's attention
+        // scale is exactly 1.0, so Q can come directly from device memory;
+        // Apple's MPP guidance recommends relying on cache instead of
+        // staging GEMM sources through threadgroup memory.
+        //
+        // P1 causal tile skip: with 32 query rows per tile, the 32-key tile
+        // at key_start = 32*key_block is fully masked iff its smallest key
+        // exceeds this query tile's largest position, i.e.
+        // 32*key_block > query_start + 31, so the first fully-masked tile
+        // index is exactly query_block + 1. Tiles at or beyond that bound
+        // are never computed or loaded; their columns are masked by the
+        // fused select in the softmax read below (the fill pass is deleted),
+        // so the values entering softmax are bit-identical. Partially masked
+        // tiles keep the unchanged mask arithmetic.
+        const uint key_block_limit = kCausalTileSkip
+            ? (query_block + 1)
+            : (kLength / kQKTileN);
+        constexpr int kOutputRowStride = kTokenMajorOutput
+            ? int(kQHeads * kHeadDim)
+            : int(kHeadDim);
+        constexpr auto qk_descriptor = mpp::tensor_ops::matmul2d_descriptor(
+            32, 32, 512, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<
+            qk_descriptor, metal::execution_simdgroup> qk;
+        device bfloat* mutable_queries = const_cast<device bfloat*>(queries)
+            + static_cast<int64_t>(query_head) * queries_strides[1]
+            + static_cast<int64_t>(query_start) * queries_strides[2];
+        const uint qk_per_group =
+            (key_block_limit + kSIMDGroups - 1) / kSIMDGroups;
+        const uint qk_begin = simd_group * qk_per_group;
+        const uint qk_end = min(qk_begin + qk_per_group, key_block_limit);
+        for (uint key_block = qk_begin;
+             key_block < qk_end;
+             ++key_block) {
+            const uint key_start = key_block * kQKTileN;
+            device bfloat* mutable_keys = const_cast<device bfloat*>(keys)
+                + static_cast<int64_t>(kv_head) * keys_strides[1]
+                + static_cast<int64_t>(key_start) * keys_strides[2];
+            auto q_tensor = metal::tensor(
+                mutable_queries,
+                metal::dextents<int, 2>{512, 32},
+                metal::array<int64_t, 2>{
+                    queries_strides[3], queries_strides[2]});
+            auto k_tensor = metal::tensor(
+                mutable_keys,
+                metal::dextents<int, 2>{512, 32},
+                metal::array<int64_t, 2>{keys_strides[3], keys_strides[2]});
+            auto score_tensor = metal::tensor(
+                scores + key_start,
+                metal::dextents<int, 2>{32, 32},
+                metal::array<int, 2>{1, 512});
+            qk.run(q_tensor, k_tensor, score_tensor);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Reproduce MLX precise block_softmax for axis size 512 exactly while
+        // running eight rows concurrently. One physical SIMDgroup owns a row
+        // and emulates stock's four virtual SIMDgroups. Each virtual group
+        // retains the identical lane/read mapping and simd_max/simd_sum; the
+        // second reduction places its four partials in lanes 0...3 before the
+        // same SIMD intrinsic. This removes all softmax threadgroup barriers
+        // without changing reduction or cast order. Identical topology to
+        // the (raw-bit-verified) sliding staged kernel: full-attention score
+        // rows are the same 512 elements wide.
+        //
+        // The causal mask is fused into the read (kFusedMask): a column above
+        // the row's causal bound contributes bfloat lowest, the same value
+        // the deleted fill pass wrote, so the max/exp/normalizer arithmetic
+        // is unchanged (exp underflows to +0.0f there). The clamped tail
+        // (kClampTail) drops whole 4-read groups at or beyond live_cols;
+        // those columns are all causally masked, so their exp contribution
+        // is exactly +0.0f and skipping the reads is bit-identical.
+        const uint live_cols = kClampTail
+            ? key_block_limit * kQKTileN : kLength;
+        for (uint row_group = 0; row_group < kQueryRows;
+             row_group += kSIMDGroups) {
+            const uint row = row_group + simd_group;
+            const uint row_offset = row * kLength;
+            const uint causal_bound = query_start + row;
+            float loaded[kVirtualGroups][kSoftmaxReads];
+            float virtual_maxima[kVirtualGroups];
+
+            for (uint virtual_group = 0;
+                 virtual_group < kVirtualGroups;
+                 ++virtual_group) {
+                const uint read_offset =
+                    virtual_group * kSIMDSize * kSoftmaxReads
+                    + simd_lane * kSoftmaxReads;
+                const uint reads = read_offset >= live_cols
+                    ? 0 : min(kSoftmaxReads, live_cols - read_offset);
+                float maximum = metal::numeric_limits<float>::lowest();
+                for (uint read = 0; read < reads; ++read) {
+                    const uint column = read_offset + read;
+                    float value = static_cast<float>(
+                        scores[row_offset + column]);
+                    if (kFusedMask && column > causal_bound) {
+                        value = metal::numeric_limits<float>::lowest();
+                    }
+                    loaded[virtual_group][read] = value;
+                    maximum = maximum < value ? value : maximum;
+                }
+                virtual_maxima[virtual_group] = simd_max(maximum);
+            }
+
+            float maximum = simd_lane < kVirtualGroups
+                ? virtual_maxima[simd_lane]
+                : metal::numeric_limits<float>::lowest();
+            maximum = simd_max(maximum);
+
+            float virtual_normalizers[kVirtualGroups];
+            for (uint virtual_group = 0;
+                 virtual_group < kVirtualGroups;
+                 ++virtual_group) {
+                const uint read_offset =
+                    virtual_group * kSIMDSize * kSoftmaxReads
+                    + simd_lane * kSoftmaxReads;
+                const uint reads = read_offset >= live_cols
+                    ? 0 : min(kSoftmaxReads, live_cols - read_offset);
+                float normalizer = 0.0f;
+                for (uint read = 0; read < reads; ++read) {
+                    const float exponential = fast::exp(
+                        loaded[virtual_group][read] - maximum);
+                    loaded[virtual_group][read] = exponential;
+                    normalizer += exponential;
+                }
+                virtual_normalizers[virtual_group] = simd_sum(normalizer);
+            }
+            float normalizer = simd_lane < kVirtualGroups
+                ? virtual_normalizers[simd_lane]
+                : 0.0f;
+            normalizer = 1.0f / simd_sum(normalizer);
+
+            for (uint virtual_group = 0;
+                 virtual_group < kVirtualGroups;
+                 ++virtual_group) {
+                const uint read_offset =
+                    virtual_group * kSIMDSize * kSoftmaxReads
+                    + simd_lane * kSoftmaxReads;
+                const uint reads = read_offset >= live_cols
+                    ? 0 : min(kSoftmaxReads, live_cols - read_offset);
+                for (uint read = 0; read < reads; ++read) {
+                    scores[row_offset + read_offset + read] =
+                        static_cast<bfloat>(
+                            loaded[virtual_group][read] * normalizer);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Consume the on-chip BF16 probabilities directly. Eight SIMDgroups
+        // cover 32 output columns each, in two waves (kHeadDim / 32 = 16
+        // value tiles), and write only the final 32x512 attention output to
+        // device memory. The PV descriptor (32, 32, 512) is the identical
+        // MPP reduction the sliding staged kernel bit-verified.
+        //
+        // P3 token-major emission: element (row, lane) of the tile is the
+        // output for token (query_start + row), head query_head, dimension
+        // (value_start + lane). Token-major places it at
+        //   (query_start + row) * kQHeads * kHeadDim
+        //     + query_head * kHeadDim + value_start + lane
+        // (output shape [1, 512, 32*512], row stride 16384); head-major keeps
+        // the v1 addressing (output shape [1, 32, 512, 512], row stride 512).
+        // Identical computed values, different destination addresses only.
+        //
+        // P5 PV causal column skip: probability columns at or beyond
+        // pv_key_column_limit = 32 * (query_block + 1) are causally
+        // masked for every row of this query tile, so softmax wrote exactly
+        // +0.0 bf16 there (fast::exp underflows the masked bfloat lowest to
+        // +0.0f and +0.0f * normalizer stays +0.0f). In the full-width
+        // reduction each such column contributes acc += (+0.0) * v, and
+        // under IEEE-754 round-to-nearest a signed-zero term can only
+        // canonicalize a -0.0 accumulator to +0.0 (when the product is
+        // +0.0-signed) -- it can never change a nonzero accumulator. The
+        // truncated path reproduces that net effect exactly: it reduces only
+        // the causally live prefix into a +0.0f-initialized f32 cooperative
+        // accumulator (a +0.0-seeded round-to-nearest accumulation can never
+        // produce -0.0), applies the same trailing + 0.0f the skipped
+        // columns would have applied, and rounds once to bf16 via
+        // static_cast, the same final conversion the full-width run
+        // performs. Query blocks without a skipped tail (query_block >= 15)
+        // keep the untouched full-width run: the full loop applies no masked
+        // terms for them, so no canonicalization may be applied either. The
+        // bound derivation is head-dim independent and identical to the
+        // sliding staged kernel's. See
+        // notes/agent-p5-pv-skip-2026-07-15.md for the exactness argument,
+        // including chunk-granularity accumulation.
+        constexpr auto pv_descriptor = mpp::tensor_ops::matmul2d_descriptor(
+            32, 32, 512, false, false, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<
+            pv_descriptor, metal::execution_simdgroup> pv;
+        constexpr auto pv_truncated_descriptor =
+            mpp::tensor_ops::matmul2d_descriptor(
+                32, 32, static_cast<int>(metal::dynamic_extent),
+                false, false, false,
+                mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<
+            pv_truncated_descriptor, metal::execution_simdgroup> pv_truncated;
+        const uint pv_key_column_limit = kPVTileSkip
+            ? key_block_limit * kQKTileN
+            : kLength;
+        const uint output_tile_base = kTokenMajorOutput
+            ? query_start * (kQHeads * kHeadDim) + query_head * kHeadDim
+            : (query_head * kLength + query_start) * kHeadDim;
+        for (uint value_block = simd_group;
+             value_block < kHeadDim / kPVTileN;
+             value_block += kSIMDGroups) {
+            const uint value_start = value_block * kPVTileN;
+            device bfloat* mutable_values = const_cast<device bfloat*>(values)
+                + static_cast<int64_t>(kv_head) * values_strides[1]
+                + static_cast<int64_t>(value_start) * values_strides[3];
+            device bfloat* output_tile = output
+                + output_tile_base
+                + value_start;
+            \(gemma4StagedPrefillPVSkipGuardLine)
+                auto probability_tensor = metal::tensor(
+                    scores,
+                    metal::dextents<int, 2>{int(pv_key_column_limit), 32},
+                    metal::array<int, 2>{1, 512});
+                auto value_tensor = metal::tensor(
+                    mutable_values,
+                    metal::dextents<int, 2>{32, int(pv_key_column_limit)},
+                    metal::array<int64_t, 2>{
+                        values_strides[3], values_strides[2]});
+                auto accumulator =
+                    pv_truncated.get_destination_cooperative_tensor<
+                        decltype(probability_tensor),
+                        decltype(value_tensor),
+                        float>();
+                #pragma clang loop unroll(full)
+                for (uint16_t i = 0; i < accumulator.get_capacity(); ++i) {
+                    if (accumulator.is_valid_element(i)) {
+                        \(gemma4StagedPrefillPVSkipZeroInitializationLine)
+                    }
+                }
+                pv_truncated.run(
+                    probability_tensor, value_tensor, accumulator);
+                #pragma clang loop unroll(full)
+                for (uint16_t i = 0; i < accumulator.get_capacity(); ++i) {
+                    if (accumulator.is_valid_element(i)) {
+                        \(gemma4StagedPrefillPVSkipCanonicalizationLine)
+                        const auto coords =
+                            accumulator.get_multidimensional_index(i);
+                        output_tile[coords[0] + coords[1] * kOutputRowStride] =
+                            static_cast<bfloat>(canonicalized);
+                    }
+                }
+            } else {
+                auto probability_tensor = metal::tensor(
+                    scores,
+                    metal::dextents<int, 2>{512, 32},
+                    metal::array<int, 2>{1, 512});
+                auto value_tensor = metal::tensor(
+                    mutable_values,
+                    metal::dextents<int, 2>{32, 512},
+                    metal::array<int64_t, 2>{
+                        values_strides[3], values_strides[2]});
+                auto output_tensor = metal::tensor(
+                    output_tile,
+                    metal::dextents<int, 2>{32, 32},
+                    metal::array<int, 2>{1, kOutputRowStride});
+                pv.run(probability_tensor, value_tensor, output_tensor);
+            }
+        }
+        """
+
+/// The active staged full prefill kernel source: m32wcf by default,
+/// m16 when DARKBLOOM_STAGED_FULL_PREFILL_M32W=0.
+let gemma4StagedFullPrefill512KernelSource: String =
+    gemma4StagedFullPrefillM32WEnabled
+    ? gemma4StagedFullPrefill512M32WKernelSource
+    : gemma4StagedFullPrefill512M16KernelSource
+
 /// Exact-shape MPP kernel for Gemma 4 FULL-attention prefill (P2).
 ///
 /// The ten full-attention layers previously ran MLX's unfused SDPA fallback
@@ -509,10 +846,16 @@ func gemma4StagedFullPrefill512(
     let outputShape: [Int] = gemma4StagedPrefillTokenMajorOutputEnabled
         ? [1, 512, 32 * 512]
         : [1, 32, 512, 512]
+    let grid: (Int, Int, Int) = gemma4StagedFullPrefillM32WEnabled
+        ? (256, 32, 16)
+        : (128, 32, 32)
+    let threadGroup: (Int, Int, Int) = gemma4StagedFullPrefillM32WEnabled
+        ? (256, 1, 1)
+        : (128, 1, 1)
     return gemma4StagedFullPrefill512Kernel(
         [queries, keys, values],
-        grid: (128, 32, 32),
-        threadGroup: (128, 1, 1),
+        grid: grid,
+        threadGroup: threadGroup,
         outputShapes: [outputShape],
         outputDTypes: [.bfloat16]
     )[0]

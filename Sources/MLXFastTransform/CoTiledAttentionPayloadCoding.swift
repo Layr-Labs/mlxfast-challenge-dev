@@ -50,25 +50,42 @@ import MLXFastCore
 /// `M = sum over slots of 4 * indexBits` bytes (always a word multiple:
 /// 4 rows x 12 or 13 bytes = 48 or 52). `wordsPerPair = 256 S + M / 4`.
 ///
-/// The tail tile after the ten pairs (`136 S` words):
+/// The tail tile after the ten pairs (`136 S` words, or `134 S` with the
+/// 12-bit tail packing below):
 ///
 /// - `[0, 512 S)` bytes: block-20 weights, identical slot/row order.
-/// - `[512 S, 512 S + 32 S)` bytes: tail metadata, slot-major, 32 bytes per
-///   slot; row `r` at byte `8 r`: the eight lane-major tail bytes of the
-///   packed row (`row * packedBytesPerRow + 10 * indexBits`, two bytes per
-///   lane group). Row padding bytes of the packed stream are NOT copied; the
-///   payload carries only kernel-consumed bytes.
+/// - `[512 S, 512 S + T S)` bytes: tail metadata, slot-major, `T` bytes per
+///   slot; row `r` at byte `(T / 4) r`. With the lane-major U16 tail
+///   (`T = 32`): the eight lane-major tail bytes of the packed row
+///   (`row * packedBytesPerRow + 10 * indexBits`, two bytes per lane group).
+///   With the 12-bit tail packing (`T = 24`,
+///   `DARKBLOOM_QKV_COTILE_TAIL12`): the same four tail indexes repacked at
+///   12 bits — pair `(t0, t1)` as `t0 & 0xff`, `t1 & 0xff`,
+///   `(t0 >> 8) | ((t1 >> 8) << 4)`, then the same for `(t2, t3)` — the
+///   exact nibble extraction of the gate/up co-tile tail12 (C3). Row
+///   padding bytes of the packed stream are NOT copied; the payload carries
+///   only kernel-consumed bytes.
 ///
-/// `wordsPerThreadgroup = 10 * wordsPerPair + 136 S`. The payload tensor is
+/// The 12-bit tail is a lossless repack: it is authored only for a payload
+/// whose every tail index is below 4096 (a fixed13 stream whose tail
+/// indexes all fit keeps its 12/13-bit pair tiles and still gains the
+/// 6 B/row tail; a payload with any tail index >= 4096 keeps the U16
+/// tail). The payload's own `wordsPerThreadgroup` declares the layout —
+/// `136 S` vs `134 S` per threadgroup — so one shard may mix both layouts
+/// and the runtime gates on each tensor's declared shape.
+///
+/// `wordsPerThreadgroup = 10 * wordsPerPair + 136 S` (U16 tail) or
+/// `10 * wordsPerPair + 134 S` (12-bit tail). The payload tensor is
 /// dtype U32, shape `[threadgroups, wordsPerThreadgroup]`, written
 /// little-endian byte-for-byte from the source runs so no dtype-view
 /// ambiguity exists between authoring and the Metal kernel's `device uint*`.
 ///
 /// Production geometry: sliding — 1024 threadgroups, S = 4,
 /// `wordsPerPair = 1024 + (8 qBits + 4 kBits + 4 vBits) / 4`, all-fixed12
-/// `wordsPerThreadgroup = 11,264` (44 MiB per layer); full — 512
-/// threadgroups, S = 9, all-fixed12 `wordsPerThreadgroup = 25,344`
-/// (~49.5 MiB per layer).
+/// `wordsPerThreadgroup = 11,264` U16-tail / 11,256 tail12 (44 MiB per
+/// layer); full — 512 threadgroups, S = 9, all-fixed12
+/// `wordsPerThreadgroup = 25,344` U16-tail / 25,326 tail12 (~49.5 MiB per
+/// layer).
 enum CoTiledAttentionPayloadCoding {
     static let shardName = "mlxfast-attention-cotiled-payload.safetensors"
     static let slidingSuffix = ".self_attn.qkv_cotiled_payload"
@@ -81,6 +98,24 @@ enum CoTiledAttentionPayloadCoding {
     static let pairCount = 10
     static let rowsPerSlot = 4
 
+    /// Rollback switch for the 12-bit QKV co-tile tail packing.
+    ///
+    /// Default ON. A payload whose tail indexes all fit 12 bits stores the
+    /// 21st block's four tail indexes per row at 6 bytes/row instead of
+    /// lane-major U16 (8 bytes/row), saving 8 bytes per slot per
+    /// threadgroup (~1.36 MB/token over the 41 of 60 production layers
+    /// whose tails fit). The decoded LUT indexes are identical; only the
+    /// payload encoding changes. Set `DARKBLOOM_QKV_COTILE_TAIL12=0` to
+    /// author the U16 tail layout end to end.
+    static let tail12Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_QKV_COTILE_TAIL12"
+        ] else {
+            return true
+        }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }()
+
     /// One projection of a co-tiled attention payload: raw little-endian
     /// weight words, the projection's transform-authored fixed12/13 packed
     /// index stream, and how many simdgroup slots the kernel gives it.
@@ -92,12 +127,12 @@ enum CoTiledAttentionPayloadCoding {
         let slots: Int
     }
 
-    /// U32 words per threadgroup for one slot-major index-bit list, or nil
-    /// for an unsupported width. Mirrored by
+    /// U32 words per threadgroup for one slot-major index-bit list and tail
+    /// layout, or nil for an unsupported width. Mirrored by
     /// `Gemma4CoTiledAttentionPayloadLayout.wordsPerThreadgroup` in
     /// `Sources/MLXFastModel`; a CPU test pins the two implementations
     /// together.
-    static func wordsPerThreadgroup(slotIndexBits: [Int]) -> Int? {
+    static func wordsPerThreadgroup(slotIndexBits: [Int], tail12: Bool) -> Int? {
         guard !slotIndexBits.isEmpty,
               slotIndexBits.allSatisfy({ $0 == 12 || $0 == 13 })
         else {
@@ -105,7 +140,44 @@ enum CoTiledAttentionPayloadCoding {
         }
         let slots = slotIndexBits.count
         let pairMetadataBytes = slotIndexBits.reduce(0) { $0 + 4 * $1 }
-        return pairCount * (256 * slots + pairMetadataBytes / 4) + 136 * slots
+        return pairCount * (256 * slots + pairMetadataBytes / 4)
+            + (tail12 ? 134 : 136) * slots
+    }
+
+    /// Whether every 21st-block tail index of an ordered projection set fits
+    /// 12 bits (the packed row's eight lane-major tail bytes at
+    /// `pairCount * indexBits` decode to four U16 values, all < 4096). A
+    /// fixed13 stream qualifies when its tail values fit regardless of its
+    /// pair-tile width.
+    static func tailIndexesFit12Bits(projections: [ProjectionSource]) -> Bool {
+        for projection in projections {
+            guard let bytesPerRow = PackedProjectionMetadataCoding
+                .packedBytesPerRow(
+                    groupsPerRow: groupsPerRow,
+                    indexBits: projection.indexBits
+                ), projection.packed.count == projection.rows * bytesPerRow
+            else {
+                return false
+            }
+            let fits = projection.packed.withUnsafeBytes { bytes in
+                guard let base = bytes.baseAddress else { return false }
+                for row in 0..<projection.rows {
+                    let tail = base + row * bytesPerRow + pairCount * projection.indexBits
+                    for laneGroup in 0..<4 {
+                        let value = Int(tail.load(
+                            fromByteOffset: 2 * laneGroup, as: UInt8.self))
+                            | (Int(tail.load(
+                                fromByteOffset: 2 * laneGroup + 1, as: UInt8.self)) << 8)
+                        if value >= 4_096 {
+                            return false
+                        }
+                    }
+                }
+                return true
+            }
+            guard fits else { return false }
+        }
+        return true
     }
 
     /// Slot-major index-bit list for an ordered projection set.
@@ -135,13 +207,18 @@ enum CoTiledAttentionPayloadCoding {
         return threadgroups
     }
 
-    /// Build one co-tiled payload from an ordered projection set. nil is
-    /// fail-closed for malformed geometry or byte counts.
-    static func makePayload(projections: [ProjectionSource]) -> Data? {
+    /// Build one co-tiled payload from an ordered projection set. With
+    /// `tail12`, the tail tile carries the four 21st-block indexes per row
+    /// at 12 bits (6 bytes/row) instead of the lane-major U16 bytes; the
+    /// decoded indexes are identical. nil is fail-closed for malformed
+    /// geometry or byte counts, and for a `tail12` request whose tail
+    /// indexes do not all fit 12 bits.
+    static func makePayload(projections: [ProjectionSource], tail12: Bool) -> Data? {
         guard !projections.isEmpty,
               let threadgroups = threadgroupCount(projections: projections),
               let wordsPerThreadgroup = wordsPerThreadgroup(
-                  slotIndexBits: slotIndexBits(projections: projections)
+                  slotIndexBits: slotIndexBits(projections: projections),
+                  tail12: tail12
               )
         else {
             return nil
@@ -187,7 +264,8 @@ enum CoTiledAttentionPayloadCoding {
         }
         let pairMetadataBytes = metadataCursor
         let pairTileBytes = 1_024 * slots + pairMetadataBytes
-        let tailTileBytes = 512 * slots + 32 * slots
+        let tailMetadataBytesPerSlot = tail12 ? 24 : 32
+        let tailTileBytes = 512 * slots + tailMetadataBytesPerSlot * slots
         let threadgroupBytes = pairCount * pairTileBytes + tailTileBytes
         guard threadgroupBytes == wordsPerThreadgroup * 4 else {
             return nil
@@ -195,6 +273,11 @@ enum CoTiledAttentionPayloadCoding {
         let (payloadBytes, payloadOverflow) =
             threadgroups.multipliedReportingOverflow(by: threadgroupBytes)
         guard !payloadOverflow else {
+            return nil
+        }
+        // Fail closed before writing: a 12-bit tail cannot represent an
+        // index of 4096 or more, so such a payload keeps the U16 tail.
+        guard !tail12 || tailIndexesFit12Bits(projections: projections) else {
             return nil
         }
 
@@ -272,14 +355,53 @@ enum CoTiledAttentionPayloadCoding {
                                         + 2 * pairCount * blockBytes,
                                     byteCount: blockBytes
                                 )
-                            (outputBase + tailMetadataBase + 32 * slot + 8 * row)
-                                .copyMemory(
-                                    from: packedBase
-                                        + sourceRow
-                                        * packedBytesPerRow[projectionIndex]
-                                        + pairCount * projection.indexBits,
-                                    byteCount: 8
-                                )
+                            let sourceTail = packedBase
+                                + sourceRow
+                                * packedBytesPerRow[projectionIndex]
+                                + pairCount * projection.indexBits
+                            if tail12 {
+                                // 12-bit tail packing: four indexes per row
+                                // become six bytes, two per index pair with
+                                // the third carrying both high nibbles —
+                                // byte 2 = t0 >> 8 | (t1 >> 8) << 4 (the
+                                // odd index's HIGH bits, matching the
+                                // gate/up co-tile tail12 nibble order).
+                                var tail = [Int](repeating: 0, count: 4)
+                                for laneGroup in 0..<4 {
+                                    tail[laneGroup] = Int(sourceTail.load(
+                                        fromByteOffset: 2 * laneGroup,
+                                        as: UInt8.self))
+                                        | (Int(sourceTail.load(
+                                            fromByteOffset: 2 * laneGroup + 1,
+                                            as: UInt8.self)) << 8)
+                                }
+                                let destination = outputBase + tailMetadataBase
+                                    + 24 * slot + 6 * row
+                                destination.storeBytes(
+                                    of: UInt8(truncatingIfNeeded: tail[0]),
+                                    toByteOffset: 0, as: UInt8.self)
+                                destination.storeBytes(
+                                    of: UInt8(truncatingIfNeeded: tail[1]),
+                                    toByteOffset: 1, as: UInt8.self)
+                                destination.storeBytes(
+                                    of: UInt8((tail[0] >> 8) | ((tail[1] >> 8) << 4)),
+                                    toByteOffset: 2, as: UInt8.self)
+                                destination.storeBytes(
+                                    of: UInt8(truncatingIfNeeded: tail[2]),
+                                    toByteOffset: 3, as: UInt8.self)
+                                destination.storeBytes(
+                                    of: UInt8(truncatingIfNeeded: tail[3]),
+                                    toByteOffset: 4, as: UInt8.self)
+                                destination.storeBytes(
+                                    of: UInt8((tail[2] >> 8) | ((tail[3] >> 8) << 4)),
+                                    toByteOffset: 5, as: UInt8.self)
+                            } else {
+                                (outputBase + tailMetadataBase + 32 * slot + 8 * row)
+                                    .copyMemory(
+                                        from: sourceTail,
+                                        byteCount: 8
+                                    )
+                            }
                         }
                     }
                 }
@@ -326,6 +448,7 @@ enum CoTiledAttentionPayloadCoding {
         let rows: [Int]
         let threadgroups: Int
         let wordsPerThreadgroup: Int
+        let tail12: Bool
     }
 
     /// Authors one co-tiled payload tensor per eligible attention layer into
@@ -370,6 +493,7 @@ enum CoTiledAttentionPayloadCoding {
                 index: index,
                 stagedHeaders: stagedHeaders,
                 selectedKeys: selectedKeys,
+                metadataSidecarURL: metadataSidecarURL,
                 metadataHeader: metadataHeader
             ) else {
                 continue
@@ -387,7 +511,7 @@ enum CoTiledAttentionPayloadCoding {
         eligible.sort { $0.tensorName < $1.tensorName }
 
         var headerObject: [String: Any] = [
-            "__metadata__": ["format": "mlxfast-attention-cotiled-v1"]
+            "__metadata__": ["format": "mlxfast-attention-cotiled-v2"]
         ]
         var cursor = 0
         for layer in eligible {
@@ -450,8 +574,10 @@ enum CoTiledAttentionPayloadCoding {
                 )
             }
             // Fail-closed: the shard header already declared this payload.
-            guard let payload = makePayload(projections: projections),
-                  payload.count == layer.threadgroups * layer.wordsPerThreadgroup * 4
+            guard let payload = makePayload(
+                projections: projections,
+                tail12: layer.tail12
+            ), payload.count == layer.threadgroups * layer.wordsPerThreadgroup * 4
             else {
                 throw MLXFastError.invalidInput(
                     "co-tiled attention payload construction failed for \(layer.layerStem)"
@@ -475,11 +601,15 @@ enum CoTiledAttentionPayloadCoding {
     /// rows `8 : 1`, k rows a multiple of 4) map onto the nine-slot QK
     /// kernel. Every projection must be affine 4-bit with K = 5376 (672-word
     /// rows) and carry a transform-authored fixed12/13 packed index stream.
+    /// With `DARKBLOOM_QKV_COTILE_TAIL12` (default on), a layer whose tail
+    /// indexes all fit 12 bits is authored with the 6 B/row tail; any other
+    /// layer keeps the U16 tail.
     private static func eligibleLayer(
         layerStem: String,
         index: CheckpointIndex,
         stagedHeaders: [String: SafetensorsHeader],
         selectedKeys: Set<String>,
+        metadataSidecarURL: URL,
         metadataHeader: SafetensorsHeader
     ) throws -> EligibleLayer? {
         func weightInfo(_ stem: String) throws -> SafetensorInfo? {
@@ -587,8 +717,35 @@ enum CoTiledAttentionPayloadCoding {
                 contentsOf: [Int](repeating: indexBits[position], count: slots[position])
             )
         }
+        // The 12-bit tail needs every tail index below 4096; scan the
+        // packed streams' tail bytes (fail-open to the U16 tail otherwise).
+        var tail12 = false
+        if tail12Enabled {
+            var fits = true
+            for position in stems.indices {
+                let packed = try sidecarTensorBytes(
+                    named: packedNames[position],
+                    sidecarURL: metadataSidecarURL,
+                    header: metadataHeader
+                )
+                if !tailIndexesFit12Bits(projections: [
+                    ProjectionSource(
+                        weight: Data(),
+                        packed: packed,
+                        rows: rows[position],
+                        indexBits: indexBits[position],
+                        slots: slots[position]
+                    )
+                ]) {
+                    fits = false
+                    break
+                }
+            }
+            tail12 = fits
+        }
         guard let wordsPerThreadgroup = wordsPerThreadgroup(
-            slotIndexBits: slotIndexBits
+            slotIndexBits: slotIndexBits,
+            tail12: tail12
         ) else {
             return nil
         }
@@ -602,7 +759,8 @@ enum CoTiledAttentionPayloadCoding {
             slots: slots,
             rows: rows,
             threadgroups: threadgroups,
-            wordsPerThreadgroup: wordsPerThreadgroup
+            wordsPerThreadgroup: wordsPerThreadgroup,
+            tail12: tail12
         )
     }
 

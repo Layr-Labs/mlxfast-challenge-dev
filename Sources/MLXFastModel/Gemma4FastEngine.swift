@@ -762,6 +762,25 @@ final class Gemma4FastLayer {
             && combinedAttentionPrefill != nil
             && (gemma4CombinedQKVPrefillPreparationEnabled
                 || gemma4VerifyCombinedQKVPrefillPreparationBits)
+        // C-3 Q-preparation fusion: at the ranked sliding prefill shape the
+        // staged sliding attention kernel prepares its Q tile on-chip (RMS
+        // norm + RoPE, bit-identical to the preparation kernel's Q output),
+        // so the preparation runs its established K/V-only mode and the
+        // 16.8 MB/layer Q write+read disappears. Full-attention layers are
+        // never fused: the m32wcf full kernel's 32 KB score tile already
+        // fills the whole threadgroup budget (see
+        // Gemma4StagedPrefillQPrepFusion.swift).
+        let usePrefillQPrepFusion = usesCombinedQKVPrefillPreparation
+            && L == 512
+            && isSliding
+            && (gemma4StagedSlidingPrefillAttentionEnabled
+                || gemma4VerifyStagedSlidingPrefillAttentionBits)
+            && (gemma4PrefillQPrepFusionEnabled
+                || gemma4VerifyPrefillQPrepFusionBits)
+        // Hoisted for the attention branch's verify comparison: the
+        // production prepared Q, only computed in fusion verify/rollback
+        // mode.
+        var qPrepFusionProductionQueries: MLXArray? = nil
         if usesCombinedKVDecodePreparation,
            let fusedAttentionRMS,
            let combinedCache
@@ -841,6 +860,65 @@ final class Gemma4FastLayer {
                 capacity: qPruneCapacity
             )
             let updated = combinedCache.adoptDirectPrefill(combined, length: L)
+            keys = updated.0
+            values = updated.1
+        } else if usePrefillQPrepFusion,
+                  let fusedAttentionRMS,
+                  let combinedCache,
+                  let combinedPrefillCapacity
+        {
+            // Fused chain: K/V-only preparation; the raw Q slice is consumed
+            // directly by the fused staged attention kernel below. In verify
+            // mode (or with the fusion rolled back) the production combined
+            // Q/K/V preparation also runs for the bit comparison.
+            let fusedCombinedKV: MLXArray? =
+                (gemma4PrefillQPrepFusionEnabled
+                    || gemma4VerifyPrefillQPrepFusionBits)
+                ? fusedAttentionRMS.callCombinedPrefill(
+                    rawKeys: rawKeys,
+                    rawValues: rawValues,
+                    offset: offset,
+                    length: L,
+                    capacity: combinedPrefillCapacity
+                )
+                : nil
+            let productionPrep: (queries: MLXArray, combinedKV: MLXArray)? =
+                (!gemma4PrefillQPrepFusionEnabled
+                    || gemma4VerifyPrefillQPrepFusionBits)
+                ? fusedAttentionRMS.callCombinedQKVPrefill(
+                    rawQueries: rawQueries,
+                    rawKeys: rawKeys,
+                    rawValues: rawValues,
+                    offset: offset,
+                    length: L,
+                    capacity: combinedPrefillCapacity
+                )
+                : nil
+            if gemma4VerifyPrefillQPrepFusionBits,
+               let fusedCombinedKV,
+               let productionPrep
+            {
+                let kvMatch = arrayEqual(
+                    fusedCombinedKV[0..., 0..., 0..., 0..<L, 0...]
+                        .view(dtype: .uint16),
+                    productionPrep.combinedKV[0..., 0..., 0..., 0..<L, 0...]
+                        .view(dtype: .uint16)
+                )
+                eval(kvMatch)
+                precondition(
+                    kvMatch.item(Bool.self),
+                    "Q-prep fusion K/V-only cache differs from combined Q/K/V preparation"
+                )
+            }
+            qPrepFusionProductionQueries = productionPrep?.queries
+            queries = gemma4PrefillQPrepFusionEnabled
+                ? rawQueries
+                : productionPrep!.queries
+            let selectedCombinedKV = gemma4PrefillQPrepFusionEnabled
+                ? fusedCombinedKV!
+                : productionPrep!.combinedKV
+            let updated = combinedCache.adoptDirectPrefill(
+                selectedCombinedKV, length: L)
             keys = updated.0
             values = updated.1
         } else if usesCombinedQKVPrefillPreparation,
@@ -1034,6 +1112,54 @@ final class Gemma4FastLayer {
             )
             mergedAttention = attention.transposed(0, 2, 1, 3)
                 .reshaped(B, qPruneRows, -1)
+        } else if usePrefillQPrepFusion, let fusedAttentionRMS {
+            // C-3 fused path: the staged sliding kernel prepares its Q tile
+            // on-chip from the raw combined-projection Q slice (bit-identical
+            // to the preparation kernel's Q output).
+            func mergeHeadMajor(_ attention: MLXArray) -> MLXArray {
+                attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            }
+            let candidate = gemma4StagedSlidingPrefill512FusedQ(
+                rawQueries: rawQueries,
+                fusedAttentionRMS: fusedAttentionRMS,
+                offset: offset,
+                keys: keys,
+                values: values
+            )
+            let mergedCandidate = gemma4StagedPrefillTokenMajorOutputEnabled
+                ? candidate
+                : mergeHeadMajor(candidate)
+            if gemma4VerifyPrefillQPrepFusionBits {
+                precondition(
+                    qPrepFusionProductionQueries != nil,
+                    "Q-prep fusion verify needs the production prepared Q"
+                )
+                let reference = gemma4StagedSlidingPrefill512(
+                    queries: qPrepFusionProductionQueries!,
+                    keys: keys,
+                    values: values
+                )
+                // The reference staged runner and the fused kernel both emit
+                // the layout selected by the token-major flag, so their
+                // outputs are compared directly (no relayout merge -- that
+                // merge is only valid on the 4-dim head-major form and
+                // crashes on the 3-dim token-major form).
+                let comparisonReference = reference
+                let matches = arrayEqual(
+                    candidate.view(dtype: .uint16),
+                    comparisonReference.view(dtype: .uint16)
+                )
+                eval(matches)
+                precondition(
+                    matches.item(Bool.self),
+                    "fused-Q staged sliding prefill attention differs from prepared-Q staged attention"
+                )
+                mergedAttention = gemma4PrefillQPrepFusionEnabled
+                    ? mergedCandidate
+                    : comparisonReference
+            } else {
+                mergedAttention = mergedCandidate
+            }
         } else if canUseStagedSlidingPrefill
             && (gemma4StagedSlidingPrefillAttentionEnabled
                 || gemma4VerifyStagedSlidingPrefillAttentionBits)
