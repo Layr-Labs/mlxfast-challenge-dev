@@ -1044,14 +1044,19 @@ final class Gemma4FastLayer {
             func mergeHeadMajor(_ attention: MLXArray) -> MLXArray {
                 attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
             }
-            // With token-major emission enabled the staged kernel already
-            // writes [1, 512, 32*256] directly (identical values, different
-            // addresses), so no transpose-reshape copy is needed here.
-            let candidate = gemma4StagedSlidingPrefill512(
-                queries: queries,
-                keys: keys,
-                values: values
-            )
+            // Construct exactly one staged route. Both consume the same
+            // prepared Q/K/V and emit the same configured output layout.
+            let candidate = gemma4KVOwnedSlidingPrefillEnabled
+                ? gemma4KVOwnedStagedSlidingPrefill512(
+                    queries: queries,
+                    keys: keys,
+                    values: values
+                )
+                : gemma4StagedSlidingPrefill512(
+                    queries: queries,
+                    keys: keys,
+                    values: values
+                )
             let mergedCandidate = gemma4StagedPrefillTokenMajorOutputEnabled
                 ? candidate
                 : mergeHeadMajor(candidate)
@@ -1939,7 +1944,6 @@ final class Gemma4FastEngine {
                 }
             }
         }
-
         if inputs.dim(1) == 1, let normalizedInput {
             hidden = normalizedInput
         } else {

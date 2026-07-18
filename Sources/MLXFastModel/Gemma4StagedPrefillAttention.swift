@@ -555,3 +555,90 @@ func gemma4StagedSlidingPrefill512(
         outputDTypes: [.bfloat16]
     )[0]
 }
+
+/// Rollback switch for KV-head-owned exact-L512 sliding prefill attention.
+///
+/// Default ON. The candidate preserves each query head's arithmetic while one
+/// threadgroup serially executes the two query heads sharing a KV head. Set
+/// `DARKBLOOM_KV_OWNED_SLIDING_PREFILL=0` (also `false`, `no`, or `off`) to
+/// restore the promoted query-head-owned v15 route.
+let gemma4KVOwnedSlidingPrefillEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_KV_OWNED_SLIDING_PREFILL"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+let gemma4KVOwnedStagedSlidingPrefill512KernelName =
+    "gemma4_staged_sliding_prefill_kv_owned_16x512x256_mpp_v1"
+    + "_skip\(gemma4StagedPrefillCausalTileSkipEnabled ? 1 : 0)"
+    + "_tokmaj\(gemma4StagedPrefillTokenMajorOutputEnabled ? 1 : 0)"
+    + "_pvskip\(gemma4StagedPrefillPVTileSkipEnabled ? 1 : 0)"
+
+/// Builds the candidate from the exact v15 body with only the two ownership
+/// edits: grid Y becomes a KV head, and the unchanged per-query body executes
+/// serially for that KV head's two query heads.
+let gemma4KVOwnedStagedSlidingPrefill512KernelSource: String = {
+    let referenceOwnership = """
+        const uint query_head = threadgroup_position_in_grid.y;
+        const uint query_block = threadgroup_position_in_grid.z;
+        const uint query_start = query_block * kQueryRows;
+        const uint kv_head = query_head / kGQAFactor;
+
+        threadgroup bfloat scores[kQueryRows * kLength];
+        """
+    let candidateOwnership = """
+        const uint kv_head = threadgroup_position_in_grid.y;
+        const uint query_block = threadgroup_position_in_grid.z;
+        const uint query_start = query_block * kQueryRows;
+
+        threadgroup bfloat scores[kQueryRows * kLength];
+        for (uint query_in_group = 0; query_in_group < kGQAFactor;
+             ++query_in_group) {
+            const uint query_head = kGQAFactor * kv_head + query_in_group;
+        """
+    precondition(gemma4StagedSlidingPrefill512KernelSource.components(
+        separatedBy: referenceOwnership).count == 2)
+    return gemma4StagedSlidingPrefill512KernelSource.replacingOccurrences(
+        of: referenceOwnership, with: candidateOwnership) + "\n        }"
+}()
+
+private let gemma4KVOwnedStagedSlidingPrefill512Kernel = MLXFast.metalKernel(
+    name: gemma4KVOwnedStagedSlidingPrefill512KernelName,
+    inputNames: ["queries", "keys", "values"],
+    outputNames: ["output"],
+    source: gemma4KVOwnedStagedSlidingPrefill512KernelSource,
+    header: """
+        #include <metal_stdlib>
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+        """,
+    ensureRowContiguous: false
+)
+
+/// Runs the sliding KV-head-owned candidate at its collapsed 16x32 grid.
+func gemma4KVOwnedStagedSlidingPrefill512(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray
+) -> MLXArray {
+    precondition(queries.dtype == .bfloat16)
+    precondition(keys.dtype == .bfloat16)
+    precondition(values.dtype == .bfloat16)
+    precondition(queries.shape == [1, 32, 512, 256])
+    precondition(keys.shape == [1, 16, 512, 256])
+    precondition(values.shape == [1, 16, 512, 256])
+
+    let outputShape = gemma4StagedPrefillTokenMajorOutputEnabled
+        ? [1, 512, 32 * 256]
+        : [1, 32, 512, 256]
+    return gemma4KVOwnedStagedSlidingPrefill512Kernel(
+        [queries, keys, values],
+        grid: (128, 16, 32),
+        threadGroup: (128, 1, 1),
+        outputShapes: [outputShape],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
