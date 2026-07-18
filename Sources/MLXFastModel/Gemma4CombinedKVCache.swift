@@ -2,6 +2,12 @@ import Foundation
 import MLX
 import MLXLMCommon
 
+struct Gemma4CombinedKVSlidingDecodeSnapshot: @unchecked Sendable {
+    let storage: MLXArray
+    let length: Int
+    let capacity: Int
+}
+
 /// Gemma-specific eager cache that keeps K and V in one K/V-major allocation.
 ///
 /// Supported prompt prefills can install a K/V-major parent allocation
@@ -73,6 +79,35 @@ final class Gemma4CombinedKVCache: KVCache {
     /// True after the one-time split-to-combined conversion.
     var usesCombinedStorage: Bool {
         combinedStorage != nil
+    }
+
+    /// Parent-allocation view for the pre-wrap sliding decode path. The
+    /// split-paired fused consumer uses the same direct-write contract as the
+    /// promoted preparation kernel: it writes the supplied token at `length`
+    /// and then advances metadata through `adoptDirectDecodeWrite`.
+    func directSlidingDecodeSnapshot() -> Gemma4CombinedKVSlidingDecodeSnapshot? {
+        guard case .rotating(let maxSize, let keep, _) = kind,
+              maxSize == 1_024,
+              keep == 0,
+              offset > 0,
+              offset < maxSize - 1,
+              rotatingIndex == offset,
+              let combinedStorage,
+              combinedStorage.dtype == .bfloat16,
+              combinedStorage.ndim == 5,
+              combinedStorage.shape[0] == 2,
+              combinedStorage.shape[1] == 1,
+              combinedStorage.shape[2] == 16,
+              combinedStorage.shape[4] == 256,
+              offset <= combinedStorage.dim(3)
+        else {
+            return nil
+        }
+        return Gemma4CombinedKVSlidingDecodeSnapshot(
+            storage: combinedStorage,
+            length: offset,
+            capacity: combinedStorage.dim(3)
+        )
     }
 
     /// Capacity for a direct multi-token prefill. Exactly one ordinary growth

@@ -248,6 +248,7 @@ final class Gemma4FastLayer {
     let fusedQK: FusedFullQKProjection?
     let combinedAttentionPrefill: CombinedAttentionPrefillProjection?
     let fusedAttentionRMS: FusedAttentionRMSPreparation?
+    let fusedSlidingPrepSDPA: Gemma4FusedSlidingPrepSDPA?
     let fusedAttentionToMLPBoundary: FusedAttentionToMLPBoundary?
     let fusedMLPToNextBoundary: FusedMLPToNextBoundary?
 
@@ -437,7 +438,7 @@ final class Gemma4FastLayer {
         } else {
             fusedAttentionRMSEnabled = true
         }
-        self.fusedAttentionRMS = fusedAttentionRMSEnabled
+        let fusedAttentionRMS = fusedAttentionRMSEnabled
             ? FusedAttentionRMSPreparation(
                 isSliding: isSliding,
                 headDim: headDim,
@@ -447,6 +448,16 @@ final class Gemma4FastLayer {
                 eps: eps
             )
             : nil
+        self.fusedAttentionRMS = fusedAttentionRMS
+        if gemma4FusedSlidingPrepSDPAEnabled()
+            || gemma4FusedSlidingPrepSDPAVerificationEnabled()
+        {
+            self.fusedSlidingPrepSDPA = fusedAttentionRMS.flatMap {
+                Gemma4FusedSlidingPrepSDPA(preparation: $0)
+            }
+        } else {
+            self.fusedSlidingPrepSDPA = nil
+        }
         self.inputNormWeight = inputNorm.weight
         self.postAttnNormWeight = postAttnNorm.weight
         self.preFfnNormWeight = preFfnNorm.weight
@@ -737,10 +748,19 @@ final class Gemma4FastLayer {
             rawValues = vProj?(h)
         }
 
+        let directSlidingAttention = fusedSlidingPrepSDPAIfSupported(
+            rawQueries: rawQueries,
+            rawKeys: rawKeys,
+            rawValues: rawValues,
+            mask: mask,
+            cache: cache,
+            offset: offset
+        )
         var queries: MLXArray
         var keys: MLXArray
         var values: MLXArray
-        let usesFusedAttentionPreparation = B == 1
+        let usesFusedAttentionPreparation = directSlidingAttention == nil
+            && B == 1
             && L == 1
             && fusedAttentionRMS?.supports(offset: offset) == true
         let combinedCache = gemma4CombinedKVDirectEnabled()
@@ -762,7 +782,13 @@ final class Gemma4FastLayer {
             && combinedAttentionPrefill != nil
             && (gemma4CombinedQKVPrefillPreparationEnabled
                 || gemma4VerifyCombinedQKVPrefillPreparationBits)
-        if usesCombinedKVDecodePreparation,
+        if directSlidingAttention != nil {
+            // The fused path owns attention production plus the direct cache
+            // write/adoption. These bindings only satisfy definite initialization.
+            queries = rawQueries
+            keys = rawKeys
+            values = rawValues ?? rawKeys
+        } else if usesCombinedKVDecodePreparation,
            let fusedAttentionRMS,
            let combinedCache
         {
@@ -970,11 +996,15 @@ final class Gemma4FastLayer {
                 values, weight: MLXArray.mlxNone, eps: eps)
             values = values.transposed(0, 2, 1, 3)
         }
-        if !usesFusedAttentionPreparation && !usesCombinedKVPrefillPreparation {
+        if directSlidingAttention == nil
+            && !usesFusedAttentionPreparation
+            && !usesCombinedKVPrefillPreparation
+        {
             keys = rope(keys, offset: offset)
         }
 
-        if let cache,
+        if directSlidingAttention == nil,
+           let cache,
            !usesCombinedKVDecodePreparation,
            !usesCombinedKVPrefillPreparation
         {
@@ -983,15 +1013,23 @@ final class Gemma4FastLayer {
             values = updated.1
         }
 
-        if !usesFusedAttentionPreparation && !usesCombinedQKVPrefillPreparation {
+        if directSlidingAttention == nil
+            && !usesFusedAttentionPreparation
+            && !usesCombinedQKVPrefillPreparation
+        {
             queries = queries.transposed(0, 2, 1, 3)
         }
-        if !usesFusedAttentionPreparation && !usesCombinedQKVPrefillPreparation {
+        if directSlidingAttention == nil
+            && !usesFusedAttentionPreparation
+            && !usesCombinedQKVPrefillPreparation
+        {
             queries = rope(queries, offset: offset)
         }
 
         var attentionMask = mask
-        if case .array(let maskArray) = mask {
+        if directSlidingAttention == nil,
+           case .array(let maskArray) = mask
+        {
             let keysSeqLen = keys.dim(2)
             if maskArray.dim(-1) != keysSeqLen {
                 attentionMask = .array(maskArray[.ellipsis, 0..<keysSeqLen])
@@ -1019,7 +1057,11 @@ final class Gemma4FastLayer {
             && queries.shape == [1, 32, 512, 512]
             && keys.shape == [1, 4, 512, 512]
             && values.shape == [1, 4, 512, 512]
-        if qPruneRows > 0 {
+        if let directSlidingAttention {
+            mergedAttention = directSlidingAttention
+                .transposed(0, 2, 1, 3)
+                .reshaped(B, L, -1)
+        } else if qPruneRows > 0 {
             // Stock C++ SDPA fallback on the 64 retained query rows. Its
             // `.causal` mask uses offset kL - qL = L - 64 (fast.cpp), which
             // is exactly the retained rows' global causal bound; every row's
