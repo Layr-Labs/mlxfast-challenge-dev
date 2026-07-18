@@ -59,6 +59,33 @@ private let gemma4VerifyStagedFullPrefillAttentionBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+/// Rollback switch for the exact D=512 full-attention decode kernel.
+///
+/// Default ON. The specialized path is fail-closed to Gemma 4's exact
+/// single-token BF16 full-attention geometry, scale, and unmasked decode
+/// shape. It preserves the stock QK, precise-softmax, and PV arithmetic trees
+/// while scheduling PV in two waves of four stock-sized clusters. Set
+/// `DARKBLOOM_EXACT_FULL_DECODE_ATTENTION=0` to restore library SDPA.
+private let gemma4ExactFullDecodeAttentionEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_EXACT_FULL_DECODE_ATTENTION"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+/// Raw-BF16 verify switch for the exact D=512 decode kernel. Default OFF.
+/// When enabled, the stock SDPA result is evaluated and compared bit for bit.
+private let gemma4VerifyExactFullDecodeAttentionBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_EXACT_FULL_DECODE_ATTENTION_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Rollback switch for the last-layer M=64 tail prune.
 ///
 /// Default ON. At prefill lengths >= 128 the final transformer layer's
@@ -1137,28 +1164,82 @@ final class Gemma4FastLayer {
                 mergedAttention = mergedCandidate
             }
         } else {
-            let attention: MLXArray
-            if L > 1 && offset > 0 {
-                attention = gemma4FastAttentionFallback(
-                    queries: queries,
-                    keys: keys,
-                    values: values,
-                    scale: scale,
-                    mask: attentionMask
-                )
+            let hasNoAttentionMask: Bool
+            if case .none = attentionMask {
+                hasNoAttentionMask = true
             } else {
-                // Prefer library SDPA: D=256 sliding uses fused vector kernel;
-                // D=512 full uses its internal fallback. Compiling our own D=512
-                // fallback changes the public near-tie reduction order.
-                attention = MLXFast.scaledDotProductAttention(
+                hasNoAttentionMask = false
+            }
+            let canUseExactFullDecode = B == 1
+                && L == 1
+                && !isSliding
+                && hasNoAttentionMask
+                && gemma4ExactFullDecodeAttentionShapeIsSupported(
                     queries: queries,
                     keys: keys,
                     values: values,
-                    scale: scale,
-                    mask: attentionMask
+                    scale: scale
                 )
+            if canUseExactFullDecode
+                && (gemma4ExactFullDecodeAttentionEnabled
+                    || gemma4VerifyExactFullDecodeAttentionBits)
+            {
+                // The custom kernel emits the token-major shape consumed by
+                // the output projection directly.
+                let candidate = gemma4ExactFullDecodeAttention(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    scale: scale
+                )
+                if gemma4VerifyExactFullDecodeAttentionBits {
+                    let reference = MLXFast.scaledDotProductAttention(
+                        queries: queries,
+                        keys: keys,
+                        values: values,
+                        scale: scale,
+                        mask: attentionMask
+                    ).transposed(0, 2, 1, 3).reshaped(B, L, -1)
+                    let matches = arrayEqual(
+                        candidate.view(dtype: .uint16),
+                        reference.view(dtype: .uint16)
+                    )
+                    eval(matches)
+                    precondition(
+                        matches.item(Bool.self),
+                        "exact full decode attention differs from stock SDPA "
+                            + "at cache length \(keys.dim(2))"
+                    )
+                    mergedAttention = gemma4ExactFullDecodeAttentionEnabled
+                        ? candidate
+                        : reference
+                } else {
+                    mergedAttention = candidate
+                }
+            } else {
+                let attention: MLXArray
+                if L > 1 && offset > 0 {
+                    attention = gemma4FastAttentionFallback(
+                        queries: queries,
+                        keys: keys,
+                        values: values,
+                        scale: scale,
+                        mask: attentionMask
+                    )
+                } else {
+                    // Prefer library SDPA for sliding decode and all
+                    // unsupported D=512 full-attention shapes.
+                    attention = MLXFast.scaledDotProductAttention(
+                        queries: queries,
+                        keys: keys,
+                        values: values,
+                        scale: scale,
+                        mask: attentionMask
+                    )
+                }
+                mergedAttention = attention.transposed(0, 2, 1, 3)
+                    .reshaped(B, L, -1)
             }
-            mergedAttention = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         }
         // Last-layer tail prune: at prefill lengths >= 128 the post-attention
         // chain of the final layer influences only the last row's logits, so
