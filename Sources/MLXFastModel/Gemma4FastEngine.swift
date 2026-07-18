@@ -151,6 +151,51 @@ let gemma4PrefillChunkEvalLayers: Int = {
     return max(0, value)
 }()
 
+/// Gate-first row-sparse up projection for one-token serial decode.
+///
+/// It is enabled by default when the promoted fused gate/up layout is enabled,
+/// which is the ranked/full-memory profile, and stays off with that layout in
+/// the automatic low-memory profile. Set `DARKBLOOM_SPARSE_UP_DECODE=0` for an
+/// independent rollback. Multi-token prefill and every other layer retain the
+/// promoted fused gate/up kernel. This is ordinary current-token inference: it
+/// neither computes nor retains any future-token state.
+private let gemma4SparseUpDecodeEnabled: Bool = {
+    if let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_SPARSE_UP_DECODE"
+    ] {
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }
+    if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_GATE_UP"] {
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }
+    return true
+}()
+
+/// Raw-bit verifier for sparse-up decode. It evaluates the promoted
+/// fused gate/up activation and the sequential sparse candidate, feeds both through
+/// the same indexed down projection, and compares the complete BF16 down
+/// output.  The boundary intentionally follows down projection: an inactive
+/// row's exact product sign cannot be known without loading its up row, while
+/// +0 and -0 are mathematically equivalent inputs to the nonempty reduction.
+private let gemma4VerifySparseUpDecodeBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_SPARSE_UP_DECODE_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+private let gemma4SparseUpNeedsLayout = gemma4SparseUpDecodeEnabled
+    || gemma4VerifySparseUpDecodeBits
+
+/// Fixed layer policy selected from two independent prompt traces. Every layer
+/// remains behavior-exact; the policy only avoids branch overhead in layers
+/// whose gate activation did not show enough exact BF16 zeros to repay it.
+private let gemma4SparseUpDecodeLayers: Set<Int> = [
+    0, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 16, 17, 18, 21,
+]
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -269,8 +314,11 @@ final class Gemma4FastLayer {
     let indexedDown: IndexedDownProjection?
     let indexedDownPostTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let useFusedGateUpActivation: Bool
+    let useSparseUpDecode: Bool
+    let verifySparseUpDecodeBits: Bool
 
     init(
+        layerIndex: Int,
         isSliding: Bool,
         nHeads: Int,
         nKvHeads: Int,
@@ -552,7 +600,12 @@ final class Gemma4FastLayer {
         }
 
         let fusedGateUpEnabled: Bool
-        if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_GATE_UP"] {
+        if gemma4SparseUpNeedsLayout {
+            // The low-memory startup profile installs MLXFAST_FUSED_GATE_UP=0
+            // before this initializer. An explicit sparse opt-in or verifier
+            // requests the fused payload despite that default.
+            fusedGateUpEnabled = true
+        } else if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_GATE_UP"] {
             fusedGateUpEnabled = ["1", "true", "yes", "on"].contains(raw.lowercased())
         } else {
             fusedGateUpEnabled = true
@@ -594,7 +647,10 @@ final class Gemma4FastLayer {
             self.fusedGateUpPostTail = compile(shapeless: true, postTailBody)
 
             let indexedDownEnabled: Bool
-            if let raw = ProcessInfo.processInfo.environment["MLXFAST_INDEXED_DOWN"] {
+            if gemma4SparseUpNeedsLayout {
+                // Same explicit admission as fused gate/up.
+                indexedDownEnabled = true
+            } else if let raw = ProcessInfo.processInfo.environment["MLXFAST_INDEXED_DOWN"] {
                 indexedDownEnabled = ["1", "true", "yes", "on"].contains(
                     raw.lowercased())
             } else {
@@ -652,6 +708,12 @@ final class Gemma4FastLayer {
             self.indexedDownPostTail = nil
             self.useFusedGateUpActivation = false
         }
+        let sparseUpLayer = gemma4SparseUpDecodeLayers.contains(layerIndex)
+            && self.fusedGateUp?.supportsSparseUpDecode == true
+            && self.indexedDown != nil
+        self.useSparseUpDecode = sparseUpLayer && gemma4SparseUpDecodeEnabled
+        self.verifySparseUpDecodeBits = sparseUpLayer
+            && gemma4VerifySparseUpDecodeBits
     }
 
     func callAsFunction(
@@ -1221,14 +1283,37 @@ final class Gemma4FastLayer {
             let normalized = fusedPreFFNNormalized ?? MLXFast.rmsNorm(
                 out, weight: preFfnNormWeight, eps: eps)
             if let fusedGateUpActivation, let indexedDown, let indexedDownPostTail {
-                let activated: MLXArray
-                if useFusedGateUpActivation {
-                    activated = fusedGateUp.activated(normalized)
-                } else {
+                let productionActivated: () -> MLXArray = {
+                    if self.useFusedGateUpActivation {
+                        return fusedGateUp.activated(normalized)
+                    }
                     let (gateOutput, upOutput) = fusedGateUp(normalized)
-                    activated = fusedGateUpActivation(gateOutput, upOutput)
+                    return fusedGateUpActivation(gateOutput, upOutput)
                 }
-                let mlp = indexedDown(activated)
+                let mlp: MLXArray
+                if useSparseUpDecode || verifySparseUpDecodeBits {
+                    let candidate = fusedGateUp.sparseActivated(normalized)
+                    let candidateMLP = indexedDown(candidate)
+                    if verifySparseUpDecodeBits {
+                        let referenceMLP = indexedDown(productionActivated())
+                        let matches = arrayEqual(
+                            candidateMLP.view(dtype: .uint16),
+                            referenceMLP.view(dtype: .uint16)
+                        )
+                        eval(matches)
+                        precondition(
+                            matches.item(Bool.self),
+                            "sparse up decode differs at down projection"
+                        )
+                        mlp = useSparseUpDecode
+                            ? candidateMLP
+                            : referenceMLP
+                    } else {
+                        mlp = candidateMLP
+                    }
+                } else {
+                    mlp = indexedDown(productionActivated())
+                }
                 if let fusedMLPToNextBoundary {
                     let prepared = fusedMLPToNextBoundary(
                         mlpOutput: mlp,
@@ -1817,6 +1902,7 @@ final class Gemma4FastEngine {
 
             built.append(
                 Gemma4FastLayer(
+                    layerIndex: index,
                     isSliding: isSliding,
                     nHeads: config.numAttentionHeads,
                     nKvHeads: nKvHeads,

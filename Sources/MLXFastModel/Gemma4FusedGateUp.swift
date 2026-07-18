@@ -1508,6 +1508,374 @@ private let gemma4CoTiledFixed12FusedGateUpActivationQMV = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Gate-first sparse-up decode kernel. Each SIMDgroup owns the same
+/// four-row co-tile for both phases (the two SIMDgroups in a threadgroup own
+/// adjacent co-tiles).  Gate accumulators are reduced and rounded first; four
+/// lanes compute the exact BF16 GELU and broadcast its raw bits.  Only then do
+/// SIMD-uniform row branches enter the up projection. Active rows retain the
+/// promoted kernel's accumulation chain; zero rows issue no up weight,
+/// metadata, or LUT loads.
+private let gemma4CoTiledFixed12SequentialSparseGateUpActivationQMV =
+    MLXFast.metalKernel(
+        name: "gemma4_cotiled_fixed12_sequential_sparse_gate_up_qmv_5376"
+            + "_t12\(gemma4GateUpCoTileTail12Enabled ? 1 : 0)_v1",
+        inputNames: ["cotiled_payload", "gate_lut", "up_lut", "x"],
+        outputNames: ["activated"],
+        source: """
+            constexpr int kRowsPerSIMD = 4;
+            constexpr int kSIMDSize = 32;
+            constexpr int kWordsPerProjectionBlock =
+                kRowsPerSIMD * kSIMDSize;
+            constexpr int kWeightWordsPerPair =
+                4 * kWordsPerProjectionBlock;
+            constexpr int kMetadataBytesPerProjectionPair = 48;
+            constexpr int kWordsPerPair = 536;
+            constexpr int kPairCount = 10;
+            constexpr int kTailWeightWords =
+                2 * kWordsPerProjectionBlock;
+            constexpr bool kTail12 = \(gemma4GateUpCoTileTail12Enabled);
+            constexpr int kTailMetadataBytesPerProjection =
+                kTail12 ? 24 : 32;
+            constexpr int kWordsPerTail = kTail12 ? 268 : 272;
+            constexpr int kWordsPerThreadgroup =
+                kPairCount * kWordsPerPair + kWordsPerTail;
+
+            const uint lane = thread_index_in_simdgroup;
+            const uint lane_group = lane >> 3;
+            const int logical_group =
+                threadgroup_position_in_grid.y * 2
+                + simdgroup_index_in_threadgroup;
+            const int output_row = logical_group * kRowsPerSIMD;
+            const device uint* tile_base =
+                cotiled_payload + logical_group * kWordsPerThreadgroup;
+            const device uint* tile_words = tile_base;
+            const device bfloat* input = x + lane * 8;
+
+            // Phase 1: exact promoted gate chain.  Projection zero is gate in
+            // every paired/tail region of the fixed12 co-tile.
+            float result[kRowsPerSIMD] = {0};
+            for (int block_pair = 0; block_pair < kPairCount; ++block_pair) {
+                float even_values[8];
+                const float even_input_sum =
+                    gemma4_sparse_gate_up_load_values(input, even_values);
+                uint odd_pairs[kRowsPerSIMD];
+                const device uint* even_weight_words = tile_words + lane;
+                const device uint* odd_weight_words = tile_words
+                    + 2 * kWordsPerProjectionBlock + lane;
+                const device uchar* metadata_bytes =
+                    reinterpret_cast<const device uchar*>(
+                        tile_words + kWeightWordsPerPair);
+
+                #pragma clang loop unroll(full)
+                for (int row = 0; row < kRowsPerSIMD; ++row) {
+                    const device uchar* row_metadata =
+                        metadata_bytes + row * 12;
+                    const uint even_low = row_metadata[lane_group];
+                    const uint middle = row_metadata[4 + lane_group];
+                    const uint odd_high = row_metadata[8 + lane_group];
+                    const uint even_index =
+                        even_low | ((middle & 0x0f) << 8);
+                    const uint odd_index =
+                        (middle >> 4) | (odd_high << 4);
+                    const uint even_pair = gate_lut[even_index];
+                    odd_pairs[row] = gate_lut[odd_index];
+                    const device uchar* row_weight =
+                        reinterpret_cast<const device uchar*>(
+                            even_weight_words + row * kSIMDSize);
+                    result[row] += gemma4_sparse_gate_up_qdot_4bit(
+                        row_weight,
+                        even_values,
+                        gemma4_sparse_gate_up_pair_scale(even_pair),
+                        gemma4_sparse_gate_up_pair_bias(even_pair),
+                        even_input_sum);
+                }
+
+                input += 256;
+                float odd_values[8];
+                const float odd_input_sum =
+                    gemma4_sparse_gate_up_load_values(input, odd_values);
+                #pragma clang loop unroll(full)
+                for (int row = 0; row < kRowsPerSIMD; ++row) {
+                    const uint odd_pair = odd_pairs[row];
+                    const device uchar* row_weight =
+                        reinterpret_cast<const device uchar*>(
+                            odd_weight_words + row * kSIMDSize);
+                    result[row] += gemma4_sparse_gate_up_qdot_4bit(
+                        row_weight,
+                        odd_values,
+                        gemma4_sparse_gate_up_pair_scale(odd_pair),
+                        gemma4_sparse_gate_up_pair_bias(odd_pair),
+                        odd_input_sum);
+                }
+
+                input += 256;
+                tile_words += kWordsPerPair;
+            }
+
+            float tail_values[8];
+            const float tail_input_sum =
+                gemma4_sparse_gate_up_load_values(input, tail_values);
+            const device uint* tail_weight_words = tile_words + lane;
+            const device uchar* tail_metadata =
+                reinterpret_cast<const device uchar*>(
+                    tile_words + kTailWeightWords);
+            const uint tail_lane_offset = lane_group << 1;
+            #pragma clang loop unroll(full)
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                uint metadata_index;
+                if (kTail12) {
+                    const device uchar* row_metadata =
+                        tail_metadata + row * 6;
+                    const uint pair_base = (lane_group >> 1) * 3;
+                    const uint low =
+                        row_metadata[pair_base + (lane_group & 1)];
+                    const uint middle = row_metadata[pair_base + 2];
+                    metadata_index = (lane_group & 1) == 0
+                        ? low | ((middle & 0x0f) << 8)
+                        : low | ((middle >> 4) << 8);
+                } else {
+                    const device uchar* row_metadata =
+                        tail_metadata + row * 8;
+                    const uint low = row_metadata[tail_lane_offset];
+                    const uint high = row_metadata[tail_lane_offset + 1];
+                    metadata_index = low | (high << 8);
+                }
+                const uint pair = gate_lut[metadata_index];
+                const device uchar* row_weight =
+                    reinterpret_cast<const device uchar*>(
+                        tail_weight_words + row * kSIMDSize);
+                result[row] += gemma4_sparse_gate_up_qdot_4bit(
+                    row_weight,
+                    tail_values,
+                    gemma4_sparse_gate_up_pair_scale(pair),
+                    gemma4_sparse_gate_up_pair_bias(pair),
+                    tail_input_sum);
+            }
+
+            // One lane per row performs the BF16 boundary and precise GELU.
+            // Its raw result is then broadcast, making every sparse branch
+            // uniform across the SIMDgroup.
+            ushort lane_gelu_bits = 0;
+            #pragma clang loop unroll(full)
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                result[row] = simd_sum(result[row]);
+                if (lane == uint(row)) {
+                    const bfloat gate = static_cast<bfloat>(result[row]);
+                    lane_gelu_bits = as_type<ushort>(
+                        gemma4_sparse_gate_up_gelu(gate));
+                }
+            }
+            uint active_mask = 0;
+            #pragma clang loop unroll(full)
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                const bool row_active =
+                    (simd_broadcast(lane_gelu_bits, ushort(row)) & 0x7fff)
+                    != 0;
+                active_mask |= row_active ? (1u << uint(row)) : 0u;
+            }
+            if (lane < kRowsPerSIMD
+                && (active_mask & (1u << lane)) == 0
+            ) {
+                activated[output_row + lane] = static_cast<bfloat>(0.0f);
+            }
+            if (active_mask == 0) {
+                return;
+            }
+
+            // Reuse the accumulator registers for phase 2.  All up weight,
+            // metadata, and LUT loads are lexically inside an active[row]
+            // branch; inactive rows cannot issue those loads.
+            #pragma clang loop unroll(full)
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                result[row] = 0;
+            }
+            input = x + lane * 8;
+            tile_words = tile_base;
+            for (int block_pair = 0; block_pair < kPairCount; ++block_pair) {
+                float even_values[8];
+                const float even_input_sum =
+                    gemma4_sparse_gate_up_load_values(input, even_values);
+                uint odd_pairs[kRowsPerSIMD] = {0};
+                const device uint* even_weight_words = tile_words
+                    + kWordsPerProjectionBlock + lane;
+                const device uint* odd_weight_words = tile_words
+                    + 3 * kWordsPerProjectionBlock + lane;
+                const device uchar* metadata_bytes =
+                    reinterpret_cast<const device uchar*>(
+                        tile_words + kWeightWordsPerPair)
+                    + kMetadataBytesPerProjectionPair;
+
+                #pragma clang loop unroll(full)
+                for (int row = 0; row < kRowsPerSIMD; ++row) {
+                    if ((active_mask & (1u << uint(row))) != 0) {
+                        const device uchar* row_metadata =
+                            metadata_bytes + row * 12;
+                        const uint even_low = row_metadata[lane_group];
+                        const uint middle = row_metadata[4 + lane_group];
+                        const uint odd_high = row_metadata[8 + lane_group];
+                        const uint even_index =
+                            even_low | ((middle & 0x0f) << 8);
+                        const uint odd_index =
+                            (middle >> 4) | (odd_high << 4);
+                        const uint even_pair = up_lut[even_index];
+                        odd_pairs[row] = up_lut[odd_index];
+                        const device uchar* row_weight =
+                            reinterpret_cast<const device uchar*>(
+                                even_weight_words + row * kSIMDSize);
+                        result[row] += gemma4_sparse_gate_up_qdot_4bit(
+                            row_weight,
+                            even_values,
+                            gemma4_sparse_gate_up_pair_scale(even_pair),
+                            gemma4_sparse_gate_up_pair_bias(even_pair),
+                            even_input_sum);
+                    }
+                }
+
+                input += 256;
+                float odd_values[8];
+                const float odd_input_sum =
+                    gemma4_sparse_gate_up_load_values(input, odd_values);
+                #pragma clang loop unroll(full)
+                for (int row = 0; row < kRowsPerSIMD; ++row) {
+                    if ((active_mask & (1u << uint(row))) != 0) {
+                        const uint odd_pair = odd_pairs[row];
+                        const device uchar* row_weight =
+                            reinterpret_cast<const device uchar*>(
+                                odd_weight_words + row * kSIMDSize);
+                        result[row] += gemma4_sparse_gate_up_qdot_4bit(
+                            row_weight,
+                            odd_values,
+                            gemma4_sparse_gate_up_pair_scale(odd_pair),
+                            gemma4_sparse_gate_up_pair_bias(odd_pair),
+                            odd_input_sum);
+                    }
+                }
+
+                input += 256;
+                tile_words += kWordsPerPair;
+            }
+
+            const float sparse_tail_input_sum =
+                gemma4_sparse_gate_up_load_values(input, tail_values);
+            tail_weight_words = tile_words
+                + kWordsPerProjectionBlock + lane;
+            tail_metadata = reinterpret_cast<const device uchar*>(
+                    tile_words + kTailWeightWords)
+                + kTailMetadataBytesPerProjection;
+            #pragma clang loop unroll(full)
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                if ((active_mask & (1u << uint(row))) != 0) {
+                    uint metadata_index;
+                    if (kTail12) {
+                        const device uchar* row_metadata =
+                            tail_metadata + row * 6;
+                        const uint pair_base = (lane_group >> 1) * 3;
+                        const uint low =
+                            row_metadata[pair_base + (lane_group & 1)];
+                        const uint middle = row_metadata[pair_base + 2];
+                        metadata_index = (lane_group & 1) == 0
+                            ? low | ((middle & 0x0f) << 8)
+                            : low | ((middle >> 4) << 8);
+                    } else {
+                        const device uchar* row_metadata =
+                            tail_metadata + row * 8;
+                        const uint low = row_metadata[tail_lane_offset];
+                        const uint high = row_metadata[tail_lane_offset + 1];
+                        metadata_index = low | (high << 8);
+                    }
+                    const uint pair = up_lut[metadata_index];
+                    const device uchar* row_weight =
+                        reinterpret_cast<const device uchar*>(
+                            tail_weight_words + row * kSIMDSize);
+                    result[row] += gemma4_sparse_gate_up_qdot_4bit(
+                        row_weight,
+                        tail_values,
+                        gemma4_sparse_gate_up_pair_scale(pair),
+                        gemma4_sparse_gate_up_pair_bias(pair),
+                        sparse_tail_input_sum);
+                }
+            }
+
+            #pragma clang loop unroll(full)
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                if ((active_mask & (1u << uint(row))) != 0) {
+                    result[row] = simd_sum(result[row]);
+                    if (lane == uint(row)) {
+                        const bfloat gelu = as_type<bfloat>(lane_gelu_bits);
+                        const bfloat up = static_cast<bfloat>(result[row]);
+                        activated[output_row + row] = gelu * up;
+                    }
+                }
+            }
+            """,
+        header: gemma4SequentialSparseGateUpHeader,
+        ensureRowContiguous: true
+    )
+
+private let gemma4SequentialSparseGateUpHeader = """
+    using namespace metal;
+
+    inline float gemma4_sparse_gate_up_pair_scale(uint pair) {
+        return static_cast<float>(
+            as_type<bfloat>(static_cast<ushort>(pair)));
+    }
+
+    inline float gemma4_sparse_gate_up_pair_bias(uint pair) {
+        return static_cast<float>(
+            as_type<bfloat>(static_cast<ushort>(pair >> 16)));
+    }
+
+    inline float gemma4_sparse_gate_up_load_values(
+        const device bfloat* input,
+        thread float* values
+    ) {
+        float sum = 0;
+        for (int index = 0; index < 8; index += 4) {
+            sum += input[index] + input[index + 1]
+                + input[index + 2] + input[index + 3];
+            values[index] = input[index];
+            values[index + 1] = input[index + 1] / 16.0f;
+            values[index + 2] = input[index + 2] / 256.0f;
+            values[index + 3] = input[index + 3] / 4096.0f;
+        }
+        return sum;
+    }
+
+    inline float gemma4_sparse_gate_up_qdot_4bit(
+        const device uchar* weight,
+        const thread float* values,
+        float scale,
+        float bias,
+        float input_sum
+    ) {
+        const device ushort* packed =
+            reinterpret_cast<const device ushort*>(weight);
+        float accumulator = 0;
+        for (int index = 0; index < 2; ++index) {
+            accumulator +=
+                (values[4 * index] * (packed[index] & 0x000f)
+                + values[4 * index + 1] * (packed[index] & 0x00f0)
+                + values[4 * index + 2] * (packed[index] & 0x0f00)
+                + values[4 * index + 3] * (packed[index] & 0xf000));
+        }
+        return scale * accumulator + input_sum * bias;
+    }
+
+    inline bfloat gemma4_sparse_gate_up_gelu(bfloat gate) {
+        const bfloat cubic0 = static_cast<bfloat>(0.044715f) * gate;
+        const bfloat cubic1 = cubic0 * gate;
+        const bfloat cubic2 = cubic1 * gate;
+        const bfloat inner0 = gate + cubic2;
+        const bfloat inner1 =
+            static_cast<bfloat>(0.7978845834732056f) * inner0;
+        const bfloat tanh_value =
+            static_cast<bfloat>(metal::precise::tanh(inner1));
+        const bfloat shifted = static_cast<bfloat>(1.0f) + tanh_value;
+        const bfloat scaled = static_cast<bfloat>(0.5f) * gate;
+        return scaled * shifted;
+    }
+    """
+
 private let gemma4IndexedFusedGateUpActivationQMV = MLXFast.metalKernel(
     name: "gemma4_indexed_fused_gate_up_activation_qmv_5376_v1",
     inputNames: [
@@ -1993,6 +2361,54 @@ struct FusedGateUpProjection: @unchecked Sendable {
             preconditionFailure("gate/up activation kernel was not selected")
         }
         return promotedOutput
+    }
+
+    /// Whether this projection can run gate-first sparse-up decode.
+    /// The path deliberately admits only the already-promoted fixed12
+    /// co-tile so both phases retain one frozen payload and one exact metadata
+    /// coding.  Wide fallback layers remain on the fused production kernel.
+    var supportsSparseUpDecode: Bool {
+        metadataMode == .indexed
+            && indexedGate != nil
+            && indexedUp != nil
+            && coTiledFixed12GateUp != nil
+            && useCoTiledFixed12GateUp
+            && !verifyCoTiledFixed12GateUpBits
+            && !verifyPacked12IndexedBits
+            && !verifyPackedWideGateUpBits
+    }
+
+    /// Exact gate phase followed by a row-sparse up phase inside one launch.
+    /// Two SIMDgroups own adjacent four-row payload groups. Relative to the
+    /// promoted gate/up-parallel kernel this halves threadgroups/SIMDgroups;
+    /// each SIMD serializes its gate phase before the conditional up phase.
+    /// Active up rows retain the promoted per-row accumulation order.
+    func sparseActivated(_ input: MLXArray) -> MLXArray {
+        precondition(supportsGemma4FusedGateUpInput(input))
+        precondition(supportsSparseUpDecode)
+        guard let coTiledFixed12GateUp,
+              let indexedGate,
+              let indexedUp
+        else {
+            preconditionFailure("sparse up fixed12 payload is unavailable")
+        }
+        var outputShape = input.shape
+        let outputWidth = gate.weight.dim(0)
+        outputShape[outputShape.count - 1] = outputWidth
+        let grid = (32, outputWidth / 4, 1)
+        let threadGroup = (32, 2, 1)
+        return gemma4CoTiledFixed12SequentialSparseGateUpActivationQMV(
+            [
+                coTiledFixed12GateUp.words,
+                indexedGate.lut,
+                indexedUp.lut,
+                input,
+            ],
+            grid: grid,
+            threadGroup: threadGroup,
+            outputShapes: [outputShape],
+            outputDTypes: [.bfloat16]
+        )[0]
     }
 
     private var exactTwoVectorMode: Gemma4ExactTwoVectorGateUpMode? {
