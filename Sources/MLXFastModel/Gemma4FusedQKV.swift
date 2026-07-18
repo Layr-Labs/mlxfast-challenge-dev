@@ -79,6 +79,22 @@ private let gemma4VerifyCoTiledFullQKBits = gemma4QKVEnvironmentFlag(
     default: false
 )
 
+/// Rollback switch for the 12-bit QKV co-tile tail packing.
+///
+/// Default ON. A transform-authored co-tiled attention payload whose
+/// declared words-per-threadgroup matches the tail12 geometry carries the
+/// 21st block's four tail indexes per row at 12 bits (6 B/row) instead of
+/// lane-major U16 (8 B/row); the decoded LUT indexes are identical. The
+/// layout is gated per payload on its declared shape, so one checkpoint
+/// may mix both layouts and older U16-tail checkpoints keep working.
+/// Set `DARKBLOOM_QKV_COTILE_TAIL12=0` to refuse tail12 payloads (they
+/// fail open to the packed/U16 kernels) and — together with the
+/// transform-side flag — restore the U16 tail end to end.
+let gemma4QKVCoTileTail12Enabled = gemma4QKVEnvironmentFlag(
+    "DARKBLOOM_QKV_COTILE_TAIL12",
+    default: true
+)
+
 /// One transform-authored co-tiled attention decode payload
 /// (`<layer>.self_attn.qkv_cotiled_payload` / `..._qk_cotiled_payload`),
 /// already validated byte-for-byte against the layer's separate weight and
@@ -92,6 +108,10 @@ struct Gemma4CoTiledAttentionPayload: @unchecked Sendable {
     let qBits: Int
     let kBits: Int
     let vBits: Int?
+    /// True when the payload's tail tile packs the 21st block's four
+    /// indexes per row at 12 bits (6 B/row) instead of lane-major U16
+    /// (8 B/row), as declared by the payload's words-per-threadgroup.
+    let tail12: Bool
 }
 
 func supportsGemma4CoTiledSlidingQKVPayload(
@@ -102,6 +122,7 @@ func supportsGemma4CoTiledSlidingQKVPayload(
 ) -> Bool {
     guard payload.kind == .slidingQKV,
           let vBits = payload.vBits,
+          !payload.tail12 || gemma4QKVCoTileTail12Enabled,
           let qMaximumLUTCount = Gemma4PackedProjectionMetadataLayout
               .maximumLUTCount(indexBits: payload.qBits),
           let kMaximumLUTCount = Gemma4PackedProjectionMetadataLayout
@@ -115,7 +136,8 @@ func supportsGemma4CoTiledSlidingQKVPayload(
                           qBits: payload.qBits,
                           kBits: payload.kBits,
                           vBits: vBits
-                      )
+                      ),
+                  tail12: payload.tail12
               )
     else {
         return false
@@ -134,6 +156,7 @@ func supportsGemma4CoTiledFullQKPayload(
 ) -> Bool {
     guard payload.kind == .fullQK,
           payload.vBits == nil,
+          !payload.tail12 || gemma4QKVCoTileTail12Enabled,
           let qMaximumLUTCount = Gemma4PackedProjectionMetadataLayout
               .maximumLUTCount(indexBits: payload.qBits),
           let kMaximumLUTCount = Gemma4PackedProjectionMetadataLayout
@@ -144,7 +167,8 @@ func supportsGemma4CoTiledFullQKPayload(
                       .fullSlotIndexBits(
                           qBits: payload.qBits,
                           kBits: payload.kBits
-                      )
+                      ),
+                  tail12: payload.tail12
               )
     else {
         return false
@@ -461,6 +485,22 @@ struct Gemma4PackedFullQKFormats: Hashable {
     let kBits: Int
 }
 
+/// Co-tiled kernel variants additionally key on the payload's declared tail
+/// layout: one checkpoint may mix U16-tail and 12-bit-tail payloads per
+/// layer, so both decode paths are registered per width combination.
+struct Gemma4CoTiledSlidingQKVFormats: Hashable {
+    let qBits: Int
+    let kBits: Int
+    let vBits: Int
+    let tail12: Bool
+}
+
+struct Gemma4CoTiledFullQKFormats: Hashable {
+    let qBits: Int
+    let kBits: Int
+    let tail12: Bool
+}
+
 /// Every per-projection width combination is pre-registered; only the
 /// variants the loaded checkpoint actually selects are compiled by Metal
 /// (pipeline creation is lazy on first dispatch).
@@ -528,8 +568,9 @@ private let gemma4PackedIndexedFullQKKernels:
 /// Shared decode loops for the co-tiled QKV/QK kernel bodies. The traversal
 /// consumes one forward-contiguous per-threadgroup tile stream: ten pair
 /// tiles of `[even-block weights | odd-block weights | packed metadata]`
-/// followed by one tail tile of `[block-20 weights | lane-major tail
-/// metadata]` (layout in `Gemma4CoTiledAttentionPayloadValidation.swift`).
+/// followed by one tail tile of `[block-20 weights | tail metadata]` —
+/// lane-major U16, or 12-bit-packed when the body's `kTail12` is set
+/// (layout in `Gemma4CoTiledAttentionPayloadValidation.swift`).
 /// The arithmetic, LUT index reconstruction, per-row accumulation order
 /// (block 2p, then 2p+1, then the tail block 20), reductions, and BF16
 /// output boundary are identical to the packed fixed12/13 kernels above —
@@ -603,8 +644,9 @@ private func gemma4CoTiledQKVDecodeLoops(functionPrefix: String) -> String {
         }
 
         // The 21st block is the unpaired tail tile: block-20 weights for
-        // every slot, then two lane-major bytes per index (32 bytes per
-        // slot, no padding bytes).
+        // every slot, then the tail metadata — two lane-major bytes per
+        // index (32 bytes per slot), or the same four indexes per row
+        // packed at 12 bits (24 bytes per slot) when kTail12.
         float tail_values[8];
         const float tail_input_sum =
             \(functionPrefix)_load_values(input, tail_values);
@@ -613,14 +655,30 @@ private func gemma4CoTiledQKVDecodeLoops(functionPrefix: String) -> String {
         const device uchar* tail_metadata =
             reinterpret_cast<const device uchar*>(
                 tile_words + kBlockWeightWords)
-            + projection * 32;
+            + projection * (kTail12 ? 24 : 32);
         const uint tail_lane_offset = lane_group << 1;
         #pragma clang loop unroll(full)
         for (int row = 0; row < kRowsPerSIMD; ++row) {
-            const device uchar* row_tail = tail_metadata + row * 8;
-            const uint low = row_tail[tail_lane_offset];
-            const uint high = row_tail[tail_lane_offset + 1];
-            const uint metadata_index = low | (high << 8);
+            uint metadata_index;
+            if (kTail12) {
+                // Four tail indexes per row packed at 12 bits: three bytes
+                // per index pair, two pairs per row. The shared byte's low
+                // nibble carries the even index's high bits, its high
+                // nibble the odd index's high bits (t >> 8) — the gate/up
+                // co-tile tail12 nibble order.
+                const device uchar* row_metadata = tail_metadata + row * 6;
+                const uint pair_base = (lane_group >> 1) * 3;
+                const uint low = row_metadata[pair_base + (lane_group & 1)];
+                const uint middle = row_metadata[pair_base + 2];
+                metadata_index = (lane_group & 1) == 0
+                    ? low | ((middle & 0x0f) << 8)
+                    : low | ((middle >> 4) << 8);
+            } else {
+                const device uchar* row_tail = tail_metadata + row * 8;
+                const uint low = row_tail[tail_lane_offset];
+                const uint high = row_tail[tail_lane_offset + 1];
+                metadata_index = low | (high << 8);
+            }
             const uint pair = lut[metadata_index];
             const device uchar* row_weight =
                 reinterpret_cast<const device uchar*>(
@@ -645,7 +703,8 @@ private func gemma4CoTiledQKVDecodeLoops(functionPrefix: String) -> String {
 private func gemma4CoTiledSlidingQKVBody(
     qBits: Int,
     kBits: Int,
-    vBits: Int
+    vBits: Int,
+    tail12: Bool
 ) -> String {
     """
         constexpr int kRowsPerSIMD = 4;
@@ -662,12 +721,13 @@ private func gemma4CoTiledSlidingQKVBody(
         constexpr bool kQHasTopBits = \(qBits == 13 ? "true" : "false");
         constexpr bool kKHasTopBits = \(kBits == 13 ? "true" : "false");
         constexpr bool kVHasTopBits = \(vBits == 13 ? "true" : "false");
+        constexpr bool kTail12 = \(tail12);
         constexpr int kPairMetadataBytes =
             8 * kQPairStride + 4 * kKPairStride + 4 * kVPairStride;
         constexpr int kWordsPerPair =
             kPairWeightWords + kPairMetadataBytes / 4;
         constexpr int kWordsPerTail =
-            kBlockWeightWords + 8 * kSlotsPerThreadgroup;
+            kBlockWeightWords + (kTail12 ? 6 : 8) * kSlotsPerThreadgroup;
         constexpr int kWordsPerThreadgroup =
             kPairCount * kWordsPerPair + kWordsPerTail;
 
@@ -706,7 +766,7 @@ private func gemma4CoTiledSlidingQKVBody(
         """
 }
 
-private func gemma4CoTiledFullQKBody(qBits: Int, kBits: Int) -> String {
+private func gemma4CoTiledFullQKBody(qBits: Int, kBits: Int, tail12: Bool) -> String {
     """
         constexpr int kRowsPerSIMD = 4;
         constexpr int kSIMDSize = 32;
@@ -720,12 +780,13 @@ private func gemma4CoTiledFullQKBody(qBits: Int, kBits: Int) -> String {
         constexpr int kKPairStride = \(kBits);
         constexpr bool kQHasTopBits = \(qBits == 13 ? "true" : "false");
         constexpr bool kKHasTopBits = \(kBits == 13 ? "true" : "false");
+        constexpr bool kTail12 = \(tail12);
         constexpr int kPairMetadataBytes =
             32 * kQPairStride + 4 * kKPairStride;
         constexpr int kWordsPerPair =
             kPairWeightWords + kPairMetadataBytes / 4;
         constexpr int kWordsPerTail =
-            kBlockWeightWords + 8 * kSlotsPerThreadgroup;
+            kBlockWeightWords + (kTail12 ? 6 : 8) * kSlotsPerThreadgroup;
         constexpr int kWordsPerThreadgroup =
             kPairCount * kWordsPerPair + kWordsPerTail;
 
@@ -757,33 +818,38 @@ private func gemma4CoTiledFullQKBody(qBits: Int, kBits: Int) -> String {
 /// variants the loaded checkpoint actually selects are compiled by Metal
 /// (pipeline creation is lazy on first dispatch).
 private let gemma4CoTiledIndexedSlidingQKVKernels:
-    [Gemma4PackedSlidingQKVFormats: MLXFast.MLXFastKernel] = {
-        var kernels = [Gemma4PackedSlidingQKVFormats: MLXFast.MLXFastKernel]()
+    [Gemma4CoTiledSlidingQKVFormats: MLXFast.MLXFastKernel] = {
+        var kernels = [Gemma4CoTiledSlidingQKVFormats: MLXFast.MLXFastKernel]()
         for qBits in [12, 13] {
             for kBits in [12, 13] {
                 for vBits in [12, 13] {
-                    let formats = Gemma4PackedSlidingQKVFormats(
-                        qBits: qBits,
-                        kBits: kBits,
-                        vBits: vBits
-                    )
-                    kernels[formats] = MLXFast.metalKernel(
-                        name: "gemma4_cotiled_indexed_sliding_qkv_qmv_5376"
-                            + "_q\(qBits)_k\(kBits)_v\(vBits)_v1",
-                        inputNames: [
-                            "cotiled_payload", "q_lut", "k_lut", "v_lut", "x",
-                        ],
-                        outputNames: ["q_output", "k_output", "v_output"],
-                        source: gemma4CoTiledSlidingQKVBody(
+                    for tail12 in [false, true] {
+                        let formats = Gemma4CoTiledSlidingQKVFormats(
                             qBits: qBits,
                             kBits: kBits,
-                            vBits: vBits
-                        ),
-                        header: gemma4PackedQKVHelperHeader(
-                            functionPrefix: "gemma4_cotiled_qkv"
-                        ),
-                        ensureRowContiguous: true
-                    )
+                            vBits: vBits,
+                            tail12: tail12
+                        )
+                        kernels[formats] = MLXFast.metalKernel(
+                            name: "gemma4_cotiled_indexed_sliding_qkv_qmv_5376"
+                                + "_q\(qBits)_k\(kBits)_v\(vBits)"
+                                + "_t12\(tail12 ? 1 : 0)_v1",
+                            inputNames: [
+                                "cotiled_payload", "q_lut", "k_lut", "v_lut", "x",
+                            ],
+                            outputNames: ["q_output", "k_output", "v_output"],
+                            source: gemma4CoTiledSlidingQKVBody(
+                                qBits: qBits,
+                                kBits: kBits,
+                                vBits: vBits,
+                                tail12: tail12
+                            ),
+                            header: gemma4PackedQKVHelperHeader(
+                                functionPrefix: "gemma4_cotiled_qkv"
+                            ),
+                            ensureRowContiguous: true
+                        )
+                    }
                 }
             }
         }
@@ -791,24 +857,35 @@ private let gemma4CoTiledIndexedSlidingQKVKernels:
     }()
 
 private let gemma4CoTiledIndexedFullQKKernels:
-    [Gemma4PackedFullQKFormats: MLXFast.MLXFastKernel] = {
-        var kernels = [Gemma4PackedFullQKFormats: MLXFast.MLXFastKernel]()
+    [Gemma4CoTiledFullQKFormats: MLXFast.MLXFastKernel] = {
+        var kernels = [Gemma4CoTiledFullQKFormats: MLXFast.MLXFastKernel]()
         for qBits in [12, 13] {
             for kBits in [12, 13] {
-                let formats = Gemma4PackedFullQKFormats(qBits: qBits, kBits: kBits)
-                kernels[formats] = MLXFast.metalKernel(
-                    name: "gemma4_cotiled_indexed_full_qk_qmv_5376"
-                        + "_q\(qBits)_k\(kBits)_v1",
-                    inputNames: [
-                        "cotiled_payload", "q_lut", "k_lut", "x",
-                    ],
-                    outputNames: ["q_output", "k_output"],
-                    source: gemma4CoTiledFullQKBody(qBits: qBits, kBits: kBits),
-                    header: gemma4PackedQKVHelperHeader(
-                        functionPrefix: "gemma4_cotiled_full_qk"
-                    ),
-                    ensureRowContiguous: true
-                )
+                for tail12 in [false, true] {
+                    let formats = Gemma4CoTiledFullQKFormats(
+                        qBits: qBits,
+                        kBits: kBits,
+                        tail12: tail12
+                    )
+                    kernels[formats] = MLXFast.metalKernel(
+                        name: "gemma4_cotiled_indexed_full_qk_qmv_5376"
+                            + "_q\(qBits)_k\(kBits)"
+                            + "_t12\(tail12 ? 1 : 0)_v1",
+                        inputNames: [
+                            "cotiled_payload", "q_lut", "k_lut", "x",
+                        ],
+                        outputNames: ["q_output", "k_output"],
+                        source: gemma4CoTiledFullQKBody(
+                            qBits: qBits,
+                            kBits: kBits,
+                            tail12: tail12
+                        ),
+                        header: gemma4PackedQKVHelperHeader(
+                            functionPrefix: "gemma4_cotiled_full_qk"
+                        ),
+                        ensureRowContiguous: true
+                    )
+                }
             }
         }
         return kernels
@@ -1003,7 +1080,7 @@ struct FusedSlidingQKVProjection: @unchecked Sendable {
 
     private struct CoTiledPayload {
         let words: MLXArray
-        let formats: Gemma4PackedSlidingQKVFormats
+        let formats: Gemma4CoTiledSlidingQKVFormats
     }
 
     init(
@@ -1073,10 +1150,11 @@ struct FusedSlidingQKVProjection: @unchecked Sendable {
         {
             self.coTiled = CoTiledPayload(
                 words: coTiledPayload.words,
-                formats: Gemma4PackedSlidingQKVFormats(
+                formats: Gemma4CoTiledSlidingQKVFormats(
                     qBits: coTiledPayload.qBits,
                     kBits: coTiledPayload.kBits,
-                    vBits: vBits
+                    vBits: vBits,
+                    tail12: coTiledPayload.tail12
                 )
             )
         } else {
@@ -1370,7 +1448,7 @@ struct FusedFullQKProjection: @unchecked Sendable {
 
     private struct CoTiledPayload {
         let words: MLXArray
-        let formats: Gemma4PackedFullQKFormats
+        let formats: Gemma4CoTiledFullQKFormats
     }
 
     init(
@@ -1426,9 +1504,10 @@ struct FusedFullQKProjection: @unchecked Sendable {
         {
             self.coTiled = CoTiledPayload(
                 words: coTiledPayload.words,
-                formats: Gemma4PackedFullQKFormats(
+                formats: Gemma4CoTiledFullQKFormats(
                     qBits: coTiledPayload.qBits,
-                    kBits: coTiledPayload.kBits
+                    kBits: coTiledPayload.kBits,
+                    tail12: coTiledPayload.tail12
                 )
             )
         } else {

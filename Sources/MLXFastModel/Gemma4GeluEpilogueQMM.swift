@@ -762,11 +762,20 @@ struct Gemma4PrefillGeluEpilogueMLPTail: @unchecked Sendable {
                 return (normalized, gateP(normalized))
             }
         }
+        // Post-FFN residual boundary (DARKBLOOM_PREFILL_BOUNDARY_EPILOGUE,
+        // default on): the rmsNorm -> residual add -> layerScalar tail runs
+        // as one fused single-reduction epilogue kernel, bit-exact against
+        // this compiled postTail, which stays as the fallback reference.
+        let postFFNEpilogue: Gemma4PrefillBoundaryEpilogue? =
+            gemma4PrefillBoundaryEpilogueEnabled
+                ? Gemma4PrefillBoundaryEpilogue(
+                    weight: postNormWeight, layerScalar: layerScalar, eps: eps)
+                : nil
+        let compiledPostTail = compile(shapeless: true) { mlp, residual in
+            let postNormalized = MLXFast.rmsNorm(mlp, weight: postNormWeight, eps: eps)
+            return (residual + postNormalized) * layerScalar
+        }
         if gemma4PrefillBN32QMMEnabled, gemma4PrefillBN32QMMSupports(downP) {
-            let postTail = compile(shapeless: true) { mlp, residual in
-                let postNormalized = MLXFast.rmsNorm(mlp, weight: postNormWeight, eps: eps)
-                return (residual + postNormalized) * layerScalar
-            }
             self.tail = { act, residual in
                 let rows = act.shape[act.ndim - 2]
                 let cols = act.shape[act.ndim - 1]
@@ -786,8 +795,16 @@ struct Gemma4PrefillGeluEpilogueMLPTail: @unchecked Sendable {
                         matches.item(Bool.self),
                         "prefill BN32 down QMM differs from stock quantizedMM")
                 }
-                return postTail(
-                    mlp.reshaped([1, rows, downP.weight.dim(0)]), residual)
+                let mlp3 = mlp.reshaped([1, rows, downP.weight.dim(0)])
+                return postFFNEpilogue?(x: mlp3, residual: residual)
+                    ?? compiledPostTail(mlp3, residual)
+            }
+        } else if let postFFNEpilogue {
+            let downHead = compile(shapeless: true) { act in downP(act) }
+            self.tail = { act, residual in
+                let mlp = downHead(act)
+                return postFFNEpilogue(x: mlp, residual: residual)
+                    ?? compiledPostTail(mlp, residual)
             }
         } else {
             self.tail = compile(shapeless: true) { act, residual in

@@ -250,6 +250,7 @@ final class Gemma4FastLayer {
     let fusedAttentionRMS: FusedAttentionRMSPreparation?
     let fusedAttentionToMLPBoundary: FusedAttentionToMLPBoundary?
     let fusedMLPToNextBoundary: FusedMLPToNextBoundary?
+    let postAttnBoundaryEpilogue: Gemma4PrefillBoundaryEpilogue?
 
     let qNormWeight: MLXArray
     let kNormWeight: MLXArray?
@@ -487,6 +488,17 @@ final class Gemma4FastLayer {
                 )
             }
             : nil
+        // Fused prefill residual-boundary epilogues
+        // (DARKBLOOM_PREFILL_BOUNDARY_EPILOGUE, default on): single-reduction
+        // rms_looped clones whose store phase additionally emits the residual
+        // add (and post-FFN layer-scalar multiply), bit-exactly. Prefill only
+        // (L > 1); the decode boundaries keep their existing fusions.
+        self.postAttnBoundaryEpilogue = gemma4PrefillBoundaryEpilogueEnabled
+            ? Gemma4PrefillBoundaryEpilogue(
+                weight: postAttnNorm.weight,
+                eps: eps
+            )
+            : nil
         self.rope = rope
 
         // Fuse the gated MLP into one compiled closure: collapses gate/up/GELU/
@@ -527,7 +539,37 @@ final class Gemma4FastLayer {
             // reduction path while removing four MLP-side graph boundaries.
             tailEnabled = compileEnabled
         }
-        self.fusedMLPTail = tailEnabled ? compile(shapeless: true, tailBody) : nil
+        let stockCompiledMLPTail = tailEnabled ? compile(shapeless: true, tailBody) : nil
+        let postFFNBoundaryEpilogue = gemma4PrefillBoundaryEpilogueEnabled
+            ? Gemma4PrefillBoundaryEpilogue(
+                weight: postFfnNorm.weight,
+                layerScalar: tailWeights.layerScalar,
+                eps: eps
+            )
+            : nil
+        if let stockTail = stockCompiledMLPTail, let postFFNBoundaryEpilogue {
+            // Prefill rows route the post-FFN boundary through the fused
+            // single-reduction epilogue kernel; the compiled head keeps its
+            // stock fusion boundaries (preNorm -> gate/up qmms -> gelu·mul ->
+            // down qmm), and the epilogue is bit-exact against the compiled
+            // rmsNorm -> add -> layerScalar tail it replaces. L == 1 (decode)
+            // and ineligible shapes keep the untouched stock compiled tail.
+            let tailHead: @Sendable (MLXArray) -> MLXArray = compile(shapeless: true) { x in
+                let normalized = MLXFast.rmsNorm(x, weight: tailWeights.preNorm, eps: eps)
+                return downP(gelu(gateP(normalized)) * upP(normalized))
+            }
+            self.fusedMLPTail = { x, residual in
+                if x.dim(x.ndim - 2) > 1 {
+                    let mlp = tailHead(x)
+                    if let fused = postFFNBoundaryEpilogue(x: mlp, residual: residual) {
+                        return fused
+                    }
+                }
+                return stockTail(x, residual)
+            }
+        } else {
+            self.fusedMLPTail = stockCompiledMLPTail
+        }
 
         // Fused prefill up-projection with GELU(gate)*up store epilogue
         // (DARKBLOOM_PREFILL_GELU_EPILOGUE, default on): replaces the stock
@@ -536,7 +578,7 @@ final class Gemma4FastLayer {
         // bit-exactly. Requires the stock compiled tail as the verify
         // reference and the standard affine g64/b4 projection layouts;
         // anything else keeps the stock tail.
-        if gemma4PrefillGeluEpilogueEnabled, let stockTail = self.fusedMLPTail {
+        if gemma4PrefillGeluEpilogueEnabled, let stockTail = stockCompiledMLPTail {
             self.prefillGeluEpilogue = Gemma4PrefillGeluEpilogueMLPTail(
                 gate: gateP,
                 up: upP,
@@ -1211,6 +1253,18 @@ final class Gemma4FastLayer {
             out = prepared.0
             residual2 = prepared.0
             fusedPreFFNNormalized = prepared.1
+        } else if L > 1,
+                  let fusedBoundary = postAttnBoundaryEpilogue?(
+                      x: attnOut, residual: chainResidual)
+        {
+            // Prefill post-attention boundary: single fused rms+residual
+            // kernel, bit-exact against the stock eager chain below. Covers
+            // the M=64 last-layer tail prune (chainResidual is a
+            // row-contiguous slice) at any M >= 2. Decode stays on the stock
+            // or L==1-fused paths.
+            out = fusedBoundary
+            residual2 = out
+            fusedPreFFNNormalized = nil
         } else {
             out = chainResidual + MLXFast.rmsNorm(
                 attnOut, weight: postAttnNormWeight, eps: eps)
