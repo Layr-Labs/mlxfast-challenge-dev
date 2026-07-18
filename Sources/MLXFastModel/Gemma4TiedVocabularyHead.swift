@@ -23,10 +23,18 @@ private let gemma4VerifyTiedHeadCoTiledBits = gemma4TiedHeadEnvironmentFlag(
     default: false
 )
 
-private let gemma4TiedHeadEightSIMDGroups = gemma4TiedHeadEnvironmentFlag(
-    "DARKBLOOM_TIED_HEAD_EIGHT_SIMDGROUPS",
-    default: true
-)
+/// Launch topology for the co-tiled decode head. SIMDgroups are independent:
+/// changing this value only changes how the fixed 65,536 groups are bundled
+/// into threadgroups. Eight is the promoted rollback; sixteen halves the
+/// threadgroup count again without changing payload addresses or arithmetic.
+private let gemma4TiedHeadSIMDGroups: Int = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_TIED_HEAD_SIMDGROUPS"
+    ], let value = Int(raw), [4, 8, 16].contains(value) else {
+        return 16
+    }
+    return value
+}()
 
 private let gemma4TiedVocabularyHeadQMV = MLXFast.metalKernel(
     name: "gemma4_tied_vocabulary_head_qmv_262144x5376_v1",
@@ -697,11 +705,10 @@ struct Gemma4TiedVocabularyHead: @unchecked Sendable {
         payload: Gemma4TiedHeadCoTiledPayload,
         metadata: Gemma4TiedHeadPacked13Metadata
     ) -> MLXArray {
-        let simdGroups = gemma4TiedHeadEightSIMDGroups ? 8 : 4
         return gemma4CoTiledTiedVocabularyHeadPacked13SoftcapQMV(
             [payload.words, metadata.lut, input, cap],
             grid: (32, 65_536, 1),
-            threadGroup: (32, simdGroups, 1),
+            threadGroup: (32, gemma4TiedHeadSIMDGroups, 1),
             outputShapes: [[1, 1, 262_144]],
             outputDTypes: [.float32]
         )[0]
