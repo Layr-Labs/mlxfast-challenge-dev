@@ -73,6 +73,32 @@ let gemma4VerifyPrefillBN32QMMBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+/// Persistent-cooperative-accumulator specialization. Default-on after
+/// production-weighted qualification; an explicit `=0` preserves the
+/// exact-tip BN32 kernel as the rollback path and comparator. Engagement is
+/// intentionally limited to the already-proven aligned M512 geometry; every
+/// other shape continues through the exact-tip kernel.
+let gemma4PrefillPersistentNAXAccumulatorEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_PERSISTENT_NAX_ACCUMULATOR"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+/// Debug-only candidate-vs-exact-tip raw-bit verifier. This is separate from
+/// `DARKBLOOM_VERIFY_PREFILL_BN32_QMM_BITS`, which compares the selected BN32
+/// result with stock MLX quantizedMM.
+let gemma4VerifyPrefillPersistentNAXAccumulatorBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_PREFILL_PERSISTENT_NAX_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// The cloned aligned BK128 NAX plain-qmm implementation. Requires the full
 /// gemma4GeluEpilogueNAXStack header environment plus the trusted
 /// gemma4PrefillUpBN32QuantizedLoader. Textually the store epilogue of the
@@ -85,7 +111,7 @@ let gemma4PrefillBN32QMMPlainImpl: String = #"""
     // N-aligned case is implemented: callers guarantee N % 64 == 0 and
     // K % 128 == 0. The gemma4_m_major logical decode from the stock entry
     // point is reproduced verbatim above the tile math.
-    template <const int BN, const int WN>
+    template <const int BN, const int WN, bool PERSISTENT_ACCUMULATOR>
     METAL_FUNC void gemma4_qmm_t_nax_plain_impl(
         const device uint32_t* w,
         const device bfloat16_t* scales,
@@ -109,6 +135,9 @@ let gemma4PrefillBN32QMMPlainImpl: String = #"""
       static_assert(
           (BN == 64 && WN == 2) || (BN == 32 && WN == 1),
           "supported Gemma 4 plain-qmm geometries are BN64/WN2 and BN32/WN1");
+      static_assert(
+          !PERSISTENT_ACCUMULATOR || (BN == 32 && WN == 1),
+          "persistent accumulator is qualified only for BN32/WN1");
 
       constexpr int pack_factor = get_pack_factor<bits, 8>();
       constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
@@ -188,43 +217,133 @@ let gemma4PrefillBN32QMMPlainImpl: String = #"""
       using AccumType = float;
 
       NAXTile<AccumType, TM, TN> Dtile;
-      Dtile.clear();
-
       x += tm * K;
 
       dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
-        for (int k = 0; k < K; k += BK) {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          loader_w.load_unsafe();
-          threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (PERSISTENT_ACCUMULATOR) {
+          static_assert(TM == 2 && TN == 2 && TK == 4);
+          constexpr short elems = BaseNAXFrag::kElemsPerFrag;
+          constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(
+              16,
+              32,
+              16,
+              false,
+              true,
+              true,
+              mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+          mpp::tensor_ops::matmul2d<
+              descriptor, metal::execution_simdgroup> operation;
 
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<T, TN, TK> Btile;
+          auto cooperative_a = operation
+              .template get_left_input_cooperative_tensor<T, T, float>();
+          auto cooperative_b = operation
+              .template get_right_input_cooperative_tensor<T, T, float>();
+          auto cooperative_c0 = operation
+              .template get_destination_cooperative_tensor<
+                  decltype(cooperative_a), decltype(cooperative_b), float>();
+          auto cooperative_c1 = operation
+              .template get_destination_cooperative_tensor<
+                  decltype(cooperative_a), decltype(cooperative_b), float>();
 
-            volatile int compiler_barrier;
-
-            if constexpr (kAlignedM.value) {
-              Atile.load(x + kk1, K);
-            } else {
-              Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
-            }
-
-            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<transpose_a>{},
-                Btile,
-                metal::bool_constant<transpose_b>{});
-
-            (void)compiler_barrier;
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < 2 * elems; ++i) {
+            cooperative_c0[i] = 0.0f;
+            cooperative_c1[i] = 0.0f;
           }
 
-          x += BK;
-          loader_w.next();
+          for (int k = 0; k < K; k += BK) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            loader_w.load_unsafe();
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<T, TN, TK> Btile;
+              volatile int compiler_barrier;
+
+              if constexpr (kAlignedM.value) {
+                Atile.load(x + kk1, K);
+              } else {
+                Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+              }
+              Btile.template load<T, BK_padded, 1>(
+                  Ws + tn * BK_padded + kk1);
+
+              constexpr auto ta = metal::bool_constant<transpose_a>{};
+              constexpr auto tb = metal::bool_constant<transpose_b>{};
+              STEEL_PRAGMA_UNROLL
+              for (short kk = 0; kk < TK; ++kk) {
+                STEEL_PRAGMA_UNROLL
+                for (short i = 0; i < elems; ++i) {
+                  cooperative_b[i] = Btile.frag_at(kk, 0, tb)[i];
+                  cooperative_b[elems + i] =
+                      Btile.frag_at(kk, 1, tb)[i];
+                }
+
+                STEEL_PRAGMA_UNROLL
+                for (short i = 0; i < elems; ++i) {
+                  cooperative_a[i] = Atile.frag_at(0, kk, ta)[i];
+                }
+                operation.run(cooperative_a, cooperative_b, cooperative_c0);
+
+                STEEL_PRAGMA_UNROLL
+                for (short i = 0; i < elems; ++i) {
+                  cooperative_a[i] = Atile.frag_at(1, kk, ta)[i];
+                }
+                operation.run(cooperative_a, cooperative_b, cooperative_c1);
+              }
+              (void)compiler_barrier;
+            }
+
+            x += BK;
+            loader_w.next();
+          }
+
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < elems; ++i) {
+            Dtile.frag_at(0, 0)[i] = cooperative_c0[i];
+            Dtile.frag_at(0, 1)[i] = cooperative_c0[elems + i];
+            Dtile.frag_at(1, 0)[i] = cooperative_c1[i];
+            Dtile.frag_at(1, 1)[i] = cooperative_c1[elems + i];
+          }
+        } else {
+          Dtile.clear();
+
+          for (int k = 0; k < K; k += BK) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            loader_w.load_unsafe();
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<T, TN, TK> Btile;
+
+              volatile int compiler_barrier;
+
+              if constexpr (kAlignedM.value) {
+                Atile.load(x + kk1, K);
+              } else {
+                Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+              }
+
+              Btile.template load<T, BK_padded, 1>(
+                  Ws + tn * BK_padded + kk1);
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<transpose_a>{},
+                  Btile,
+                  metal::bool_constant<transpose_b>{});
+
+              (void)compiler_barrier;
+            }
+
+            x += BK;
+            loader_w.next();
+          }
         }
 
         // Store results to device memory
@@ -247,7 +366,27 @@ let gemma4PrefillBN32QMMPlainImpl: String = #"""
 /// 8,704 bytes (stock BN64: 17,408).
 private let gemma4PrefillBN32QMMSource: String = #"""
         threadgroup bfloat16_t Ws[32 * 136];
-        gemma4_qmm_t_nax_plain_impl<32, 1>(
+        gemma4_qmm_t_nax_plain_impl<32, 1, false>(
+            w,
+            scales,
+            biases,
+            x,
+            output,
+            Ws,
+            K,
+            N,
+            M,
+            threadgroup_position_in_grid,
+            simdgroup_index_in_threadgroup,
+            thread_index_in_simdgroup);
+        """#
+
+/// Exact frozen persistent-cooperative-accumulator specialization. Geometry,
+/// loader, descriptor, K order, and store path are shared with the comparator;
+/// only the cooperative A/B/C wrapper lifetime changes.
+private let gemma4PrefillBN32QMMPersistentSource: String = #"""
+        threadgroup bfloat16_t Ws[32 * 136];
+        gemma4_qmm_t_nax_plain_impl<32, 1, true>(
             w,
             scales,
             biases,
@@ -271,6 +410,18 @@ private let gemma4PrefillBN32QMMKernel = MLXFast.metalKernel(
     // newline; the separator keeps it from swallowing the loader's
     // `template <short dst_ld>` line (the gelu header is safe only because
     // its epilogue-function comment sits at that join).
+    header: gemma4GeluEpilogueNAXStack
+        + "\n"
+        + gemma4PrefillUpBN32QuantizedLoader
+        + gemma4PrefillBN32QMMPlainImpl,
+    ensureRowContiguous: true
+)
+
+private let gemma4PrefillBN32QMMPersistentKernel = MLXFast.metalKernel(
+    name: "gemma4_prefill_bn32_qmm_t_nax_bk128_persistent_v1",
+    inputNames: ["w", "scales", "biases", "x", "K", "N", "M"],
+    outputNames: ["output"],
+    source: gemma4PrefillBN32QMMPersistentSource,
     header: gemma4GeluEpilogueNAXStack
         + "\n"
         + gemma4PrefillUpBN32QuantizedLoader
@@ -305,13 +456,43 @@ func gemma4PrefillBN32QMM(
         weight, scales, biases, x,
         MLXArray(Int32(K)), MLXArray(Int32(N)), MLXArray(Int32(M)),
     ]
-    return gemma4PrefillBN32QMMKernel(
-        inputs,
-        grid: ((N / 32) * 32, (M + 63) / 64, 2),
-        threadGroup: (32, 1, 2),
-        outputShapes: [[M, N]],
-        outputDTypes: [.bfloat16]
-    )[0]
+    let grid = ((N / 32) * 32, (M + 63) / 64, 2)
+    let usePersistent = gemma4PrefillPersistentNAXAccumulatorEnabled
+        && M == 512
+    let output: MLXArray
+    if usePersistent {
+        output = gemma4PrefillBN32QMMPersistentKernel(
+            inputs,
+            grid: grid,
+            threadGroup: (32, 1, 2),
+            outputShapes: [[M, N]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    } else {
+        output = gemma4PrefillBN32QMMKernel(
+            inputs,
+            grid: grid,
+            threadGroup: (32, 1, 2),
+            outputShapes: [[M, N]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+    if usePersistent && gemma4VerifyPrefillPersistentNAXAccumulatorBits {
+        let reference = gemma4PrefillBN32QMMKernel(
+            inputs,
+            grid: grid,
+            threadGroup: (32, 1, 2),
+            outputShapes: [[M, N]],
+            outputDTypes: [.bfloat16]
+        )[0]
+        let matches = arrayEqual(
+            output.view(dtype: .uint16), reference.view(dtype: .uint16))
+        eval(matches)
+        precondition(
+            matches.item(Bool.self),
+            "persistent prefill BN32 QMM differs from exact-tip BN32 QMM")
+    }
+    return output
 }
 
 /// True when a projection has the standard affine 4-bit group-64 layout with

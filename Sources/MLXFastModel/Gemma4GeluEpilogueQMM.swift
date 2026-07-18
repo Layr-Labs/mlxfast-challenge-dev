@@ -290,7 +290,11 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
     // 0 stores the plain rounded up tile (twin behavior, ignores gate); 1
     // reads gate but stores the plain rounded up tile (isolates gate traffic
     // from GELU ALU in perf-attribution runs).
-    template <const int MODE, const int BN, const int WN>
+    template <
+        const int MODE,
+        const int BN,
+        const int WN,
+        bool PERSISTENT_ACCUMULATOR>
     METAL_FUNC void gemma4_qmm_t_nax_gelu_impl(
         const device uint32_t* w,
         const device bfloat16_t* scales,
@@ -316,6 +320,9 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
       static_assert(
           (BN == 64 && WN == 2) || (BN == 32 && WN == 1),
           "supported Gemma 4 up-projection geometries are BN64/WN2 and BN32/WN1");
+      static_assert(
+          !PERSISTENT_ACCUMULATOR || (BN == 32 && WN == 1),
+          "persistent accumulator is qualified only for BN32/WN1");
 
       constexpr int pack_factor = get_pack_factor<bits, 8>();
       constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
@@ -397,38 +404,124 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
       using AccumType = float;
 
       NAXTile<AccumType, TM, TN> Dtile;
-      Dtile.clear();
-
       x += tm * K;
 
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_w.load_unsafe();
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      if constexpr (PERSISTENT_ACCUMULATOR) {
+        static_assert(TM == 2 && TN == 2 && TK == 4);
+        constexpr short elems = BaseNAXFrag::kElemsPerFrag;
+        constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(
+            16,
+            32,
+            16,
+            false,
+            true,
+            true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<
+            descriptor, metal::execution_simdgroup> operation;
 
-        STEEL_PRAGMA_NO_UNROLL
-        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-          NAXTile<T, TM, TK> Atile;
-          NAXTile<T, TN, TK> Btile;
+        auto cooperative_a = operation
+            .template get_left_input_cooperative_tensor<T, T, float>();
+        auto cooperative_b = operation
+            .template get_right_input_cooperative_tensor<T, T, float>();
+        auto cooperative_c0 = operation
+            .template get_destination_cooperative_tensor<
+                decltype(cooperative_a), decltype(cooperative_b), float>();
+        auto cooperative_c1 = operation
+            .template get_destination_cooperative_tensor<
+                decltype(cooperative_a), decltype(cooperative_b), float>();
 
-          volatile int compiler_barrier;
-
-          Atile.load(x + kk1, K);
-
-          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-
-          tile_matmad_nax(
-              Dtile,
-              Atile,
-              metal::bool_constant<transpose_a>{},
-              Btile,
-              metal::bool_constant<transpose_b>{});
-
-          (void)compiler_barrier;
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < 2 * elems; ++i) {
+          cooperative_c0[i] = 0.0f;
+          cooperative_c1[i] = 0.0f;
         }
 
-        x += BK;
-        loader_w.next();
+        for (int k = 0; k < K; k += BK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          loader_w.load_unsafe();
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
+            volatile int compiler_barrier;
+
+            Atile.load(x + kk1, K);
+            Btile.template load<T, BK_padded, 1>(
+                Ws + tn * BK_padded + kk1);
+
+            constexpr auto ta = metal::bool_constant<transpose_a>{};
+            constexpr auto tb = metal::bool_constant<transpose_b>{};
+            STEEL_PRAGMA_UNROLL
+            for (short kk = 0; kk < TK; ++kk) {
+              STEEL_PRAGMA_UNROLL
+              for (short i = 0; i < elems; ++i) {
+                cooperative_b[i] = Btile.frag_at(kk, 0, tb)[i];
+                cooperative_b[elems + i] =
+                    Btile.frag_at(kk, 1, tb)[i];
+              }
+
+              STEEL_PRAGMA_UNROLL
+              for (short i = 0; i < elems; ++i) {
+                cooperative_a[i] = Atile.frag_at(0, kk, ta)[i];
+              }
+              operation.run(cooperative_a, cooperative_b, cooperative_c0);
+
+              STEEL_PRAGMA_UNROLL
+              for (short i = 0; i < elems; ++i) {
+                cooperative_a[i] = Atile.frag_at(1, kk, ta)[i];
+              }
+              operation.run(cooperative_a, cooperative_b, cooperative_c1);
+            }
+            (void)compiler_barrier;
+          }
+
+          x += BK;
+          loader_w.next();
+        }
+
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < elems; ++i) {
+          Dtile.frag_at(0, 0)[i] = cooperative_c0[i];
+          Dtile.frag_at(0, 1)[i] = cooperative_c0[elems + i];
+          Dtile.frag_at(1, 0)[i] = cooperative_c1[i];
+          Dtile.frag_at(1, 1)[i] = cooperative_c1[elems + i];
+        }
+      } else {
+        Dtile.clear();
+
+        for (int k = 0; k < K; k += BK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          loader_w.load_unsafe();
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
+
+            volatile int compiler_barrier;
+
+            Atile.load(x + kk1, K);
+
+            Btile.template load<T, BK_padded, 1>(
+                Ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
+
+            (void)compiler_barrier;
+          }
+
+          x += BK;
+          loader_w.next();
+        }
       }
 
       // Store results to device memory with the fused GELU(gate)*up epilogue.
@@ -532,7 +625,7 @@ let gemma4PrefillUpGeluEpilogueHeader: String =
 /// gemma4_bk128 dispatch makes).
 private let gemma4PrefillUpGeluEpilogueBN64Source: String = #"""
         threadgroup bfloat16_t Ws[64 * 136];
-        gemma4_qmm_t_nax_gelu_impl<MODE, 64, 2>(
+        gemma4_qmm_t_nax_gelu_impl<MODE, 64, 2, false>(
             w,
             scales,
             biases,
@@ -554,7 +647,29 @@ private let gemma4PrefillUpGeluEpilogueBN64Source: String = #"""
 /// 8,704 bytes and is subsequently reused as a dense-stride 64x32 gate tile.
 private let gemma4PrefillUpGeluEpilogueBN32Source: String = #"""
         threadgroup bfloat16_t Ws[32 * 136];
-        gemma4_qmm_t_nax_gelu_impl<MODE, 32, 1>(
+        gemma4_qmm_t_nax_gelu_impl<MODE, 32, 1, false>(
+            w,
+            scales,
+            biases,
+            x,
+            gate,
+            tanh_lut,
+            output,
+            Ws,
+            K,
+            N,
+            M,
+            threadgroup_position_in_grid,
+            simdgroup_index_in_threadgroup,
+            thread_index_in_simdgroup);
+        """#
+
+/// Exact frozen persistent-cooperative-accumulator specialization. The fused
+/// gate staging, BF16 GELU/LUT sequence, and output stores stay in the shared
+/// implementation below the accumulator branch.
+private let gemma4PrefillUpGeluEpilogueBN32PersistentSource: String = #"""
+        threadgroup bfloat16_t Ws[32 * 136];
+        gemma4_qmm_t_nax_gelu_impl<MODE, 32, 1, true>(
             w,
             scales,
             biases,
@@ -610,6 +725,15 @@ private let gemma4PrefillUpGeluEpilogueBN32Kernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+private let gemma4PrefillUpGeluEpilogueBN32PersistentKernel = MLXFast.metalKernel(
+    name: "gemma4_prefill_up_gelu_epilogue_nax_bn32_bk128_persistent_v1",
+    inputNames: ["w", "scales", "biases", "x", "gate", "tanh_lut", "K", "N", "M"],
+    outputNames: ["output"],
+    source: gemma4PrefillUpGeluEpilogueBN32PersistentSource,
+    header: gemma4GeluEpilogueNAXStack + gemma4PrefillUpGeluEpilogueHeader,
+    ensureRowContiguous: true
+)
+
 /// Runs the fused up-projection + GELU(gate)*up epilogue.
 ///
 /// - Parameters:
@@ -646,14 +770,46 @@ func gemma4PrefillUpGeluEpilogue(
         MLXArray(Int32(K)), MLXArray(Int32(N)), MLXArray(Int32(M)),
     ]
     if gemma4PrefillGeluEpilogueBN32Enabled && M == 512 {
-        return gemma4PrefillUpGeluEpilogueBN32Kernel(
-            inputs,
-            template: [("MODE", mode)],
-            grid: ((N / 32) * 32, (M / 64), 2),
-            threadGroup: (32, 1, 2),
-            outputShapes: [[M, N]],
-            outputDTypes: [.bfloat16]
-        )[0]
+        let grid = ((N / 32) * 32, (M / 64), 2)
+        let usePersistent = gemma4PrefillPersistentNAXAccumulatorEnabled
+            && mode == 3
+        let output: MLXArray
+        if usePersistent {
+            output = gemma4PrefillUpGeluEpilogueBN32PersistentKernel(
+                inputs,
+                template: [("MODE", mode)],
+                grid: grid,
+                threadGroup: (32, 1, 2),
+                outputShapes: [[M, N]],
+                outputDTypes: [.bfloat16]
+            )[0]
+        } else {
+            output = gemma4PrefillUpGeluEpilogueBN32Kernel(
+                inputs,
+                template: [("MODE", mode)],
+                grid: grid,
+                threadGroup: (32, 1, 2),
+                outputShapes: [[M, N]],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
+        if usePersistent && gemma4VerifyPrefillPersistentNAXAccumulatorBits {
+            let reference = gemma4PrefillUpGeluEpilogueBN32Kernel(
+                inputs,
+                template: [("MODE", mode)],
+                grid: grid,
+                threadGroup: (32, 1, 2),
+                outputShapes: [[M, N]],
+                outputDTypes: [.bfloat16]
+            )[0]
+            let matches = arrayEqual(
+                output.view(dtype: .uint16), reference.view(dtype: .uint16))
+            eval(matches)
+            precondition(
+                matches.item(Bool.self),
+                "persistent fused up/GELU differs from exact-tip BN32 fused kernel")
+        }
+        return output
     }
     return gemma4PrefillUpGeluEpilogueBN64Kernel(
         inputs,
