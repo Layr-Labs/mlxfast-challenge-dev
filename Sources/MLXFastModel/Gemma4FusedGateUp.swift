@@ -1508,6 +1508,332 @@ private let gemma4CoTiledFixed12FusedGateUpActivationQMV = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Exact fixed12 co-tiled consumer for the boundary-authored FP32 activation
+/// sidecar. Only the input-load helper changes: qdot expressions, affine
+/// correction placement, per-block accumulation order, SIMD reduction,
+/// BF16 projection casts, GELU/product epilogue, dispatch geometry, and TGM
+/// allocation are intentionally byte-for-byte equivalent to the stock path.
+private let gemma4CoTiledFixed12SidecarFusedGateUpActivationQMV =
+    MLXFast.metalKernel(
+        name: "gemma4_cotiled_fixed12_sidecar_fused_gate_up_activation_qmv_5376"
+            + "_t12\(gemma4GateUpCoTileTail12Enabled ? 1 : 0)_v1",
+        inputNames: [
+            "cotiled_payload", "gate_lut", "up_lut", "activation_sidecar",
+        ],
+        outputNames: ["activated"],
+        source: """
+            constexpr int kInputWidth = 5376;
+            constexpr int kInputGroups = kInputWidth / 8;
+            constexpr int kRowsPerSIMD = 4;
+            constexpr int kSIMDSize = 32;
+            constexpr int kWordsPerProjectionBlock =
+                kRowsPerSIMD * kSIMDSize;
+            constexpr int kWeightWordsPerPair =
+                4 * kWordsPerProjectionBlock;
+            constexpr int kMetadataBytesPerProjectionPair = 48;
+            constexpr int kWordsPerPair = 536;
+            constexpr int kPairCount = 10;
+            constexpr int kTailWeightWords =
+                2 * kWordsPerProjectionBlock;
+            constexpr bool kTail12 = \(gemma4GateUpCoTileTail12Enabled);
+            constexpr int kTailMetadataBytesPerProjection =
+                kTail12 ? 24 : 32;
+            constexpr int kWordsPerTail = kTail12 ? 268 : 272;
+            constexpr int kWordsPerThreadgroup =
+                kPairCount * kWordsPerPair + kWordsPerTail;
+
+            const bool is_up = simdgroup_index_in_threadgroup == 1;
+            const int threadgroup_row = threadgroup_position_in_grid.y;
+            const int output_row = threadgroup_row * kRowsPerSIMD;
+            const uint lane = thread_index_in_simdgroup;
+            const uint lane_group = lane >> 3;
+            const device uint* tile_words =
+                cotiled_payload + threadgroup_row * kWordsPerThreadgroup;
+            const device float* input_values = activation_sidecar + lane * 8;
+            const device float* input_sums =
+                activation_sidecar + kInputWidth + lane;
+            const device uint* lut = is_up ? up_lut : gate_lut;
+
+            float result[kRowsPerSIMD] = {0};
+            for (int block_pair = 0; block_pair < kPairCount; ++block_pair) {
+                float even_values[8];
+                gemma4_cotiled_gate_up_load_sidecar_values(
+                    input_values, even_values);
+                const float even_input_sum = input_sums[0];
+                uint odd_pairs[kRowsPerSIMD];
+
+                const device uint* even_weight_words = tile_words
+                    + (is_up ? kWordsPerProjectionBlock : 0)
+                    + lane;
+                const device uint* odd_weight_words = tile_words
+                    + 2 * kWordsPerProjectionBlock
+                    + (is_up ? kWordsPerProjectionBlock : 0)
+                    + lane;
+                const device uchar* metadata_bytes =
+                    reinterpret_cast<const device uchar*>(
+                        tile_words + kWeightWordsPerPair)
+                    + (is_up ? kMetadataBytesPerProjectionPair : 0);
+
+                #pragma clang loop unroll(full)
+                for (int row = 0; row < kRowsPerSIMD; ++row) {
+                    const device uchar* row_metadata = metadata_bytes + row * 12;
+                    const uint even_low = row_metadata[lane_group];
+                    const uint middle = row_metadata[4 + lane_group];
+                    const uint odd_high = row_metadata[8 + lane_group];
+                    const uint even_index =
+                        even_low | ((middle & 0x0f) << 8);
+                    const uint odd_index =
+                        (middle >> 4) | (odd_high << 4);
+                    const uint even_pair = lut[even_index];
+                    odd_pairs[row] = lut[odd_index];
+                    const device uchar* row_weight =
+                        reinterpret_cast<const device uchar*>(
+                            even_weight_words + row * kSIMDSize);
+                    result[row] += gemma4_cotiled_gate_up_sidecar_qdot_4bit(
+                        row_weight,
+                        even_values,
+                        gemma4_cotiled_gate_up_sidecar_pair_scale(even_pair),
+                        gemma4_cotiled_gate_up_sidecar_pair_bias(even_pair),
+                        even_input_sum);
+                }
+
+                input_values += 256;
+                input_sums += 32;
+                float odd_values[8];
+                gemma4_cotiled_gate_up_load_sidecar_values(
+                    input_values, odd_values);
+                const float odd_input_sum = input_sums[0];
+                #pragma clang loop unroll(full)
+                for (int row = 0; row < kRowsPerSIMD; ++row) {
+                    const uint odd_pair = odd_pairs[row];
+                    const device uchar* row_weight =
+                        reinterpret_cast<const device uchar*>(
+                            odd_weight_words + row * kSIMDSize);
+                    result[row] += gemma4_cotiled_gate_up_sidecar_qdot_4bit(
+                        row_weight,
+                        odd_values,
+                        gemma4_cotiled_gate_up_sidecar_pair_scale(odd_pair),
+                        gemma4_cotiled_gate_up_sidecar_pair_bias(odd_pair),
+                        odd_input_sum);
+                }
+
+                input_values += 256;
+                input_sums += 32;
+                tile_words += kWordsPerPair;
+            }
+
+            float tail_values[8];
+            gemma4_cotiled_gate_up_load_sidecar_values(
+                input_values, tail_values);
+            const float tail_input_sum = input_sums[0];
+            const device uint* tail_weight_words = tile_words
+                + (is_up ? kWordsPerProjectionBlock : 0)
+                + lane;
+            const device uchar* tail_metadata =
+                reinterpret_cast<const device uchar*>(
+                    tile_words + kTailWeightWords)
+                + (is_up ? kTailMetadataBytesPerProjection : 0);
+            const uint tail_lane_offset = lane_group << 1;
+            #pragma clang loop unroll(full)
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                uint metadata_index;
+                if (kTail12) {
+                    const device uchar* row_metadata = tail_metadata + row * 6;
+                    const uint pair_base = (lane_group >> 1) * 3;
+                    const uint low = row_metadata[pair_base + (lane_group & 1)];
+                    const uint middle = row_metadata[pair_base + 2];
+                    metadata_index = (lane_group & 1) == 0
+                        ? low | ((middle & 0x0f) << 8)
+                        : low | ((middle >> 4) << 8);
+                } else {
+                    const device uchar* row_metadata = tail_metadata + row * 8;
+                    const uint low = row_metadata[tail_lane_offset];
+                    const uint high = row_metadata[tail_lane_offset + 1];
+                    metadata_index = low | (high << 8);
+                }
+                const uint pair = lut[metadata_index];
+                const device uchar* row_weight =
+                    reinterpret_cast<const device uchar*>(
+                        tail_weight_words + row * kSIMDSize);
+                result[row] += gemma4_cotiled_gate_up_sidecar_qdot_4bit(
+                    row_weight,
+                    tail_values,
+                    gemma4_cotiled_gate_up_sidecar_pair_scale(pair),
+                    gemma4_cotiled_gate_up_sidecar_pair_bias(pair),
+                    tail_input_sum);
+            }
+
+            threadgroup bfloat projections[2][kRowsPerSIMD];
+            #pragma clang loop unroll(full)
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                result[row] = simd_sum(result[row]);
+                if (thread_index_in_simdgroup == 0) {
+                    projections[is_up ? 1 : 0][row] =
+                        static_cast<bfloat>(result[row]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (simdgroup_index_in_threadgroup == 0
+                && thread_index_in_simdgroup < kRowsPerSIMD
+            ) {
+                const int row = thread_index_in_simdgroup;
+                const bfloat gate = projections[0][row];
+                const bfloat up = projections[1][row];
+
+                const bfloat cubic0 = static_cast<bfloat>(0.044715f) * gate;
+                const bfloat cubic1 = cubic0 * gate;
+                const bfloat cubic2 = cubic1 * gate;
+                const bfloat inner0 = gate + cubic2;
+                const bfloat inner1 =
+                    static_cast<bfloat>(0.7978845834732056f) * inner0;
+                const bfloat tanh_value =
+                    static_cast<bfloat>(metal::precise::tanh(inner1));
+                const bfloat shifted = static_cast<bfloat>(1.0f) + tanh_value;
+                const bfloat scaled = static_cast<bfloat>(0.5f) * gate;
+                const bfloat gelu = scaled * shifted;
+                activated[output_row + row] = gelu * up;
+            }
+            """,
+        header: """
+            using namespace metal;
+
+            inline float gemma4_cotiled_gate_up_sidecar_pair_scale(uint pair) {
+                return static_cast<float>(
+                    as_type<bfloat>(static_cast<ushort>(pair)));
+            }
+
+            inline float gemma4_cotiled_gate_up_sidecar_pair_bias(uint pair) {
+                return static_cast<float>(
+                    as_type<bfloat>(static_cast<ushort>(pair >> 16)));
+            }
+
+            inline void gemma4_cotiled_gate_up_load_sidecar_values(
+                const device float* input,
+                thread float* values
+            ) {
+                #pragma clang loop unroll(full)
+                for (int index = 0; index < 8; ++index) {
+                    values[index] = input[index];
+                }
+            }
+
+            inline float gemma4_cotiled_gate_up_sidecar_qdot_4bit(
+                const device uchar* weight,
+                const thread float* values,
+                float scale,
+                float bias,
+                float input_sum
+            ) {
+                const device ushort* packed =
+                    reinterpret_cast<const device ushort*>(weight);
+                float accumulator = 0;
+                for (int index = 0; index < 2; ++index) {
+                    accumulator +=
+                        (values[4 * index] * (packed[index] & 0x000f)
+                        + values[4 * index + 1] * (packed[index] & 0x00f0)
+                        + values[4 * index + 2] * (packed[index] & 0x0f00)
+                        + values[4 * index + 3] * (packed[index] & 0xf000));
+                }
+                return scale * accumulator + input_sum * bias;
+            }
+            """,
+        ensureRowContiguous: true
+    )
+
+/// Test-only seam around the exact production fixed12 gate/up Metal kernels.
+/// A single four-row threadgroup is sufficient to exercise every paired input
+/// block, the tail block, both projection streams, and both SIMDgroups while
+/// keeping the qualification independent of the 31B model residency.
+func gemma4DecodeActivationStockGateUpGraph(
+    payload: MLXArray,
+    gateLUT: MLXArray,
+    upLUT: MLXArray,
+    normalizedInput: MLXArray,
+    outputRows: Int
+) -> MLXArray {
+    let payloadWords = gemma4GateUpCoTileTail12Enabled ? 5_628 : 5_632
+    precondition(outputRows > 0 && outputRows.isMultiple(of: 4))
+    precondition(payload.dtype == .uint32)
+    precondition(payload.shape == [outputRows / 4, payloadWords])
+    precondition(gateLUT.dtype == .uint32)
+    precondition(gateLUT.shape == [4_096])
+    precondition(upLUT.dtype == .uint32)
+    precondition(upLUT.shape == [4_096])
+    precondition(supportsGemma4FusedGateUpInput(normalizedInput))
+
+    return gemma4CoTiledFixed12FusedGateUpActivationQMV(
+        [payload, gateLUT, upLUT, normalizedInput],
+        grid: (32, outputRows / 2, 1),
+        threadGroup: (32, 2, 1),
+        outputShapes: [[1, 1, outputRows]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+func gemma4DecodeActivationSidecarGateUpGraph(
+    payload: MLXArray,
+    gateLUT: MLXArray,
+    upLUT: MLXArray,
+    activationSidecar: MLXArray,
+    outputRows: Int
+) -> MLXArray {
+    let payloadWords = gemma4GateUpCoTileTail12Enabled ? 5_628 : 5_632
+    precondition(outputRows > 0 && outputRows.isMultiple(of: 4))
+    precondition(payload.dtype == .uint32)
+    precondition(payload.shape == [outputRows / 4, payloadWords])
+    precondition(gateLUT.dtype == .uint32)
+    precondition(gateLUT.shape == [4_096])
+    precondition(upLUT.dtype == .uint32)
+    precondition(upLUT.shape == [4_096])
+    precondition(gemma4DecodeActivationSidecarShapeIsSupported(
+        normalizedShape: [1, 1, gemma4DecodeActivationWidth],
+        normalizedDType: .bfloat16,
+        sidecarShape: activationSidecar.shape,
+        sidecarDType: activationSidecar.dtype
+    ))
+
+    return gemma4CoTiledFixed12SidecarFusedGateUpActivationQMV(
+        [payload, gateLUT, upLUT, activationSidecar],
+        grid: (32, outputRows / 2, 1),
+        threadGroup: (32, 2, 1),
+        outputShapes: [[1, 1, outputRows]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+struct Gemma4DecodeActivationGateUpKernelOutputs: @unchecked Sendable {
+    let candidateActivated: MLXArray
+    let referenceActivated: MLXArray
+}
+
+func gemma4DecodeActivationGateUpKernelOutputs(
+    payload: MLXArray,
+    gateLUT: MLXArray,
+    upLUT: MLXArray,
+    normalizedInput: MLXArray,
+    activationSidecar: MLXArray
+) -> Gemma4DecodeActivationGateUpKernelOutputs {
+    let candidate = gemma4DecodeActivationSidecarGateUpGraph(
+        payload: payload,
+        gateLUT: gateLUT,
+        upLUT: upLUT,
+        activationSidecar: activationSidecar,
+        outputRows: 4
+    )
+    let reference = gemma4DecodeActivationStockGateUpGraph(
+        payload: payload,
+        gateLUT: gateLUT,
+        upLUT: upLUT,
+        normalizedInput: normalizedInput,
+        outputRows: 4
+    )
+    return Gemma4DecodeActivationGateUpKernelOutputs(
+        candidateActivated: candidate,
+        referenceActivated: reference
+    )
+}
+
 private let gemma4IndexedFusedGateUpActivationQMV = MLXFast.metalKernel(
     name: "gemma4_indexed_fused_gate_up_activation_qmv_5376_v1",
     inputNames: [
@@ -1657,6 +1983,8 @@ struct FusedGateUpProjection: @unchecked Sendable {
     private let verifyCoTiledFixed12GateUpBits: Bool
     private let usePackedWideGateUp: Bool
     private let verifyPackedWideGateUpBits: Bool
+    private let useDecodeActivationSidecar: Bool
+    private let verifyDecodeActivationSidecarBits: Bool
 
     init(
         gate: QuantizedLinear,
@@ -1708,6 +2036,16 @@ struct FusedGateUpProjection: @unchecked Sendable {
             "DARKBLOOM_VERIFY_GATE_UP_PACKED13_BITS",
             default: false
         )
+        let useDecodeActivationSidecar =
+            gemma4DecodeActivationSidecarEnvironmentFlag(
+                "DARKBLOOM_DECODE_ACTIVATION_SIDECAR",
+                default: true
+            )
+        let verifyDecodeActivationSidecarBits =
+            gemma4DecodeActivationSidecarEnvironmentFlag(
+                "DARKBLOOM_VERIFY_DECODE_ACTIVATION_SIDECAR_BITS",
+                default: false
+            )
         var packed12IndexedGateUp: Packed12GateUpMetadataPair?
         var coTiledFixed12GateUp: CoTiledFixed12GateUpPayload?
         var packedWideGateUp: PackedWideGateUpMetadataPair?
@@ -1787,6 +2125,9 @@ struct FusedGateUpProjection: @unchecked Sendable {
             verifyCoTiledFixed12GateUpBits
         self.usePackedWideGateUp = usePackedWideGateUp
         self.verifyPackedWideGateUpBits = verifyPackedWideGateUpBits
+        self.useDecodeActivationSidecar = useDecodeActivationSidecar
+        self.verifyDecodeActivationSidecarBits =
+            verifyDecodeActivationSidecarBits
     }
 
     func callAsFunction(_ input: MLXArray) -> (MLXArray, MLXArray) {
@@ -1827,6 +2168,86 @@ struct FusedGateUpProjection: @unchecked Sendable {
             )
         }
         return (outputs[0], outputs[1])
+    }
+
+    /// True only for the serial fixed12 co-tiled activation path. Keeping the
+    /// eligibility decision here guarantees the boundary never replaces its
+    /// normalized BF16 output unless this exact consumer will use the sidecar.
+    var supportsDecodeActivationSidecar: Bool {
+        (useDecodeActivationSidecar || verifyDecodeActivationSidecarBits)
+            && metadataMode == .indexed
+            && coTiledFixed12GateUp != nil
+            && useCoTiledFixed12GateUp
+            && !verifyPacked12IndexedBits
+            && !verifyCoTiledFixed12GateUpBits
+            && !verifyPackedWideGateUpBits
+    }
+
+    func activatedFromDecodeActivationSidecar(
+        _ sidecar: MLXArray,
+        referenceInput: MLXArray?
+    ) -> MLXArray {
+        precondition(supportsDecodeActivationSidecar)
+        precondition(gemma4DecodeActivationSidecarShapeIsSupported(
+            normalizedShape: [1, 1, gemma4DecodeActivationWidth],
+            normalizedDType: .bfloat16,
+            sidecarShape: sidecar.shape,
+            sidecarDType: sidecar.dtype
+        ))
+        guard let coTiledFixed12GateUp,
+              let indexedGate,
+              let indexedUp
+        else {
+            preconditionFailure("decode activation sidecar payload is unavailable")
+        }
+
+        var outputShape = [1, 1, gate.weight.dim(0)]
+        let candidate =
+            gemma4CoTiledFixed12SidecarFusedGateUpActivationQMV(
+                [
+                    coTiledFixed12GateUp.words,
+                    indexedGate.lut, indexedUp.lut, sidecar,
+                ],
+                grid: (32, gate.weight.dim(0) / 2, 1),
+                threadGroup: (32, 2, 1),
+                outputShapes: [outputShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+
+        if verifyDecodeActivationSidecarBits {
+            guard let referenceInput else {
+                preconditionFailure(
+                    "decode activation sidecar verifier requires stock normalized input"
+                )
+            }
+            precondition(supportsGemma4FusedGateUpInput(referenceInput))
+            outputShape = referenceInput.shape
+            outputShape[outputShape.count - 1] = gate.weight.dim(0)
+            let reference = gemma4CoTiledFixed12FusedGateUpActivationQMV(
+                [
+                    coTiledFixed12GateUp.words,
+                    indexedGate.lut, indexedUp.lut, referenceInput,
+                ],
+                grid: (32, gate.weight.dim(0) / 2, 1),
+                threadGroup: (32, 2, 1),
+                outputShapes: [outputShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+            let matches = arrayEqual(
+                candidate.view(dtype: .uint16),
+                reference.view(dtype: .uint16)
+            )
+            eval(matches)
+            precondition(
+                matches.item(Bool.self),
+                "decode activation sidecar changed gate/up activation bits"
+            )
+            if !useDecodeActivationSidecar {
+                // Verifier-only mode is observationally stock.
+                return reference
+            }
+        }
+        return candidate
     }
 
     func activated(_ input: MLXArray) -> MLXArray {

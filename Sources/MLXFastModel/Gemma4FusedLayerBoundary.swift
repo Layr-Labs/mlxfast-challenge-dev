@@ -1,4 +1,34 @@
+import Foundation
 import MLX
+
+let gemma4DecodeActivationWidth = 5_376
+let gemma4DecodeActivationGroupWidth = 8
+let gemma4DecodeActivationGroupCount =
+    gemma4DecodeActivationWidth / gemma4DecodeActivationGroupWidth
+let gemma4DecodeActivationSidecarElementCount =
+    gemma4DecodeActivationWidth + gemma4DecodeActivationGroupCount
+
+func gemma4DecodeActivationSidecarEnvironmentFlag(
+    _ name: String,
+    default defaultValue: Bool
+) -> Bool {
+    guard let raw = ProcessInfo.processInfo.environment[name] else {
+        return defaultValue
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}
+
+func gemma4DecodeActivationSidecarShapeIsSupported(
+    normalizedShape: [Int],
+    normalizedDType: DType,
+    sidecarShape: [Int],
+    sidecarDType: DType
+) -> Bool {
+    normalizedShape == [1, 1, gemma4DecodeActivationWidth]
+        && normalizedDType == .bfloat16
+        && sidecarShape == [1, 1, gemma4DecodeActivationSidecarElementCount]
+        && sidecarDType == .float32
+}
 
 private let gemma4FusedAttentionToMLPBoundaryKernel = MLXFast.metalKernel(
     name: "gemma4_fused_attention_to_mlp_boundary_5376_v1",
@@ -158,6 +188,354 @@ private let gemma4FusedAttentionToMLPBoundaryKernel = MLXFast.metalKernel(
     header: "using namespace metal;",
     ensureRowContiguous: true
 )
+
+/// Serial-decode boundary variant that authors the exact activation
+/// representation consumed by the fixed12 co-tiled gate/up QMV instead of
+/// materializing the intermediate BF16 normalized row.
+/// The first 5,376 FP32 elements are the BF16-normalized activations scaled
+/// by [1, 2^-4, 2^-8, 2^-12] within each four-value word. The final 672
+/// elements are the stock left-associated sums of each consecutive eight
+/// BF16 activations. The local `bfloat normalized` preserves the original
+/// rounding boundary before widening to FP32. Output binding count remains
+/// two: residual BF16 plus this sidecar.
+private let gemma4FusedAttentionToMLPBoundaryActivationSidecarKernel =
+    MLXFast.metalKernel(
+        name: "gemma4_fused_attention_to_mlp_boundary_5376_sidecar_v1",
+        inputNames: [
+            "attention_output", "residual", "post_attention_weight",
+            "pre_ffn_weight",
+        ],
+        outputNames: ["residual_output", "activation_sidecar"],
+        source: """
+            constexpr uint kWidth = 5376;
+            constexpr uint kReads = 4;
+            constexpr uint kThreads = 1024;
+            constexpr uint kSIMDSize = 32;
+
+            const uint thread_index = thread_position_in_threadgroup.x;
+            const uint simd_lane = thread_index_in_simdgroup;
+            const uint simd_group = simdgroup_index_in_threadgroup;
+
+            threadgroup float inverse_mean[1];
+            threadgroup float local_sums[kSIMDSize];
+            threadgroup bfloat residual_row[kWidth];
+
+            float accumulator = 0;
+            for (uint row_offset = 0;
+                 row_offset < kWidth;
+                 row_offset += kThreads * kReads) {
+                const uint base = row_offset + thread_index * kReads;
+                if (base + kReads <= kWidth) {
+                    for (uint index = 0; index < kReads; ++index) {
+                        const float value = attention_output[base + index];
+                        accumulator += value * value;
+                    }
+                } else {
+                    for (uint index = 0; index < kReads; ++index) {
+                        if (base + index < kWidth) {
+                            const float value = attention_output[base + index];
+                            accumulator += value * value;
+                        }
+                    }
+                }
+            }
+            accumulator = simd_sum(accumulator);
+
+            if (simd_group == 0) {
+                local_sums[simd_lane] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane == 0) {
+                local_sums[simd_group] = accumulator;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group == 0) {
+                accumulator = simd_sum(local_sums[simd_lane]);
+                if (simd_lane == 0) {
+                    inverse_mean[0] = metal::precise::rsqrt(
+                        accumulator / kWidth + 1.0e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint row_offset = 0;
+                 row_offset < kWidth;
+                 row_offset += kThreads * kReads) {
+                const uint base = row_offset + thread_index * kReads;
+                if (base + kReads <= kWidth) {
+                    for (uint index = 0; index < kReads; ++index) {
+                        const uint dimension = base + index;
+                        const bfloat unit_normalized = static_cast<bfloat>(
+                            attention_output[dimension] * inverse_mean[0]);
+                        const bfloat post_normalized =
+                            post_attention_weight[dimension] * unit_normalized;
+                        const bfloat combined =
+                            residual[dimension] + post_normalized;
+                        residual_row[dimension] = combined;
+                        residual_output[dimension] = combined;
+                    }
+                } else {
+                    for (uint index = 0; index < kReads; ++index) {
+                        const uint dimension = base + index;
+                        if (dimension < kWidth) {
+                            const bfloat unit_normalized = static_cast<bfloat>(
+                                attention_output[dimension] * inverse_mean[0]);
+                            const bfloat post_normalized =
+                                post_attention_weight[dimension] * unit_normalized;
+                            const bfloat combined =
+                                residual[dimension] + post_normalized;
+                            residual_row[dimension] = combined;
+                            residual_output[dimension] = combined;
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            accumulator = 0;
+            for (uint row_offset = 0;
+                 row_offset < kWidth;
+                 row_offset += kThreads * kReads) {
+                const uint base = row_offset + thread_index * kReads;
+                if (base + kReads <= kWidth) {
+                    for (uint index = 0; index < kReads; ++index) {
+                        const float value = residual_row[base + index];
+                        accumulator += value * value;
+                    }
+                } else {
+                    for (uint index = 0; index < kReads; ++index) {
+                        if (base + index < kWidth) {
+                            const float value = residual_row[base + index];
+                            accumulator += value * value;
+                        }
+                    }
+                }
+            }
+            accumulator = simd_sum(accumulator);
+
+            if (simd_group == 0) {
+                local_sums[simd_lane] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane == 0) {
+                local_sums[simd_group] = accumulator;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group == 0) {
+                accumulator = simd_sum(local_sums[simd_lane]);
+                if (simd_lane == 0) {
+                    inverse_mean[0] = metal::precise::rsqrt(
+                        accumulator / kWidth + 1.0e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint row_offset = 0;
+                 row_offset < kWidth;
+                 row_offset += kThreads * kReads) {
+                const uint base = row_offset + thread_index * kReads;
+                // kWidth is divisible by both four and eight. Therefore every
+                // live producer owns four values and every adjacent lane pair
+                // owns one complete affine-quantization group.
+                if (base + kReads <= kWidth) {
+                    bfloat normalized_values[kReads];
+                    float values[kReads];
+                    for (uint index = 0; index < kReads; ++index) {
+                        const uint dimension = base + index;
+                        const bfloat unit_normalized = static_cast<bfloat>(
+                            residual_row[dimension] * inverse_mean[0]);
+                        const bfloat normalized =
+                            pre_ffn_weight[dimension] * unit_normalized;
+                        normalized_values[index] = normalized;
+                        values[index] = static_cast<float>(normalized);
+                    }
+
+                    activation_sidecar[base] = values[0];
+                    activation_sidecar[base + 1] = values[1] / 16.0f;
+                    activation_sidecar[base + 2] = values[2] / 256.0f;
+                    activation_sidecar[base + 3] = values[3] / 4096.0f;
+
+                    // Match `sum += x0 + x1 + x2 + x3` twice. XOR-1 pairs
+                    // exactly the adjacent four-value producers; only the
+                    // even lane performs the final ordered addition/store.
+                    const bfloat partial_bf16 =
+                        normalized_values[0]
+                        + normalized_values[1]
+                        + normalized_values[2]
+                        + normalized_values[3];
+                    const float partial = static_cast<float>(partial_bf16);
+                    const float paired = simd_shuffle_xor(
+                        partial, static_cast<ushort>(1));
+                    if ((simd_lane & 1) == 0) {
+                        float group_sum = 0;
+                        group_sum += partial;
+                        group_sum += paired;
+                        activation_sidecar[kWidth + (base >> 3)] = group_sum;
+                    }
+                }
+            }
+            """,
+        header: "using namespace metal;",
+        ensureRowContiguous: true
+    )
+
+/// Verifier-only oracle: preprocess the stock boundary's materialized BF16
+/// normalized row with the stock gate/up load helper's exact expression tree.
+private let gemma4DecodeActivationSidecarReferenceKernel = MLXFast.metalKernel(
+    name: "gemma4_decode_activation_sidecar_reference_5376_v1",
+    inputNames: ["normalized_input"],
+    outputNames: ["activation_sidecar"],
+    source: """
+        constexpr uint kWidth = 5376;
+        constexpr uint kGroupWidth = 8;
+        constexpr uint kGroupCount = kWidth / kGroupWidth;
+
+        const uint group = thread_position_in_grid.x;
+        if (group < kGroupCount) {
+            const uint base = group * kGroupWidth;
+            bfloat normalized_values[kGroupWidth];
+            float values[kGroupWidth];
+            #pragma clang loop unroll(full)
+            for (uint index = 0; index < kGroupWidth; ++index) {
+                normalized_values[index] = normalized_input[base + index];
+                values[index] = static_cast<float>(normalized_values[index]);
+            }
+
+            activation_sidecar[base] = values[0];
+            activation_sidecar[base + 1] = values[1] / 16.0f;
+            activation_sidecar[base + 2] = values[2] / 256.0f;
+            activation_sidecar[base + 3] = values[3] / 4096.0f;
+            activation_sidecar[base + 4] = values[4];
+            activation_sidecar[base + 5] = values[5] / 16.0f;
+            activation_sidecar[base + 6] = values[6] / 256.0f;
+            activation_sidecar[base + 7] = values[7] / 4096.0f;
+
+            float sum = 0;
+            sum += normalized_values[0]
+                + normalized_values[1]
+                + normalized_values[2]
+                + normalized_values[3];
+            sum += normalized_values[4]
+                + normalized_values[5]
+                + normalized_values[6]
+                + normalized_values[7];
+            activation_sidecar[kWidth + group] = sum;
+        }
+        """,
+    header: "using namespace metal;",
+    ensureRowContiguous: true
+)
+
+/// Test-only seam around the exact production Metal kernels used by the
+/// decode activation-sidecar path. Keeping this in the production source file
+/// prevents the qualification harness from drifting into copied kernel text.
+/// The function is internal so only `@testable` clients can reach it.
+func gemma4DecodeActivationStockBoundaryGraph(
+    attentionOutput: MLXArray,
+    residual: MLXArray,
+    postAttentionWeight: MLXArray,
+    preFFNWeight: MLXArray
+) -> (residual: MLXArray, normalized: MLXArray) {
+    let rowShape = [1, 1, gemma4DecodeActivationWidth]
+    precondition(attentionOutput.dtype == .bfloat16)
+    precondition(attentionOutput.shape == rowShape)
+    precondition(residual.dtype == .bfloat16)
+    precondition(residual.shape == rowShape)
+    precondition(postAttentionWeight.dtype == .bfloat16)
+    precondition(postAttentionWeight.shape == [gemma4DecodeActivationWidth])
+    precondition(preFFNWeight.dtype == .bfloat16)
+    precondition(preFFNWeight.shape == [gemma4DecodeActivationWidth])
+
+    let outputs = gemma4FusedAttentionToMLPBoundaryKernel(
+        [
+            attentionOutput, residual,
+            postAttentionWeight, preFFNWeight,
+        ],
+        grid: (1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [rowShape, rowShape],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
+func gemma4DecodeActivationSidecarBoundaryGraph(
+    attentionOutput: MLXArray,
+    residual: MLXArray,
+    postAttentionWeight: MLXArray,
+    preFFNWeight: MLXArray
+) -> (residual: MLXArray, sidecar: MLXArray) {
+    let rowShape = [1, 1, gemma4DecodeActivationWidth]
+    precondition(attentionOutput.dtype == .bfloat16)
+    precondition(attentionOutput.shape == rowShape)
+    precondition(residual.dtype == .bfloat16)
+    precondition(residual.shape == rowShape)
+    precondition(postAttentionWeight.dtype == .bfloat16)
+    precondition(postAttentionWeight.shape == [gemma4DecodeActivationWidth])
+    precondition(preFFNWeight.dtype == .bfloat16)
+    precondition(preFFNWeight.shape == [gemma4DecodeActivationWidth])
+
+    let outputs =
+        gemma4FusedAttentionToMLPBoundaryActivationSidecarKernel(
+            [
+                attentionOutput, residual,
+                postAttentionWeight, preFFNWeight,
+            ],
+            grid: (1024, 1, 1),
+            threadGroup: (1024, 1, 1),
+            outputShapes: [
+                rowShape,
+                [1, 1, gemma4DecodeActivationSidecarElementCount],
+            ],
+            outputDTypes: [.bfloat16, .float32]
+        )
+    return (outputs[0], outputs[1])
+}
+
+struct Gemma4DecodeActivationBoundaryKernelOutputs: @unchecked Sendable {
+    let candidateResidual: MLXArray
+    let referenceResidual: MLXArray
+    let candidateSidecar: MLXArray
+    let referenceSidecar: MLXArray
+    let referenceNormalized: MLXArray
+}
+
+func gemma4DecodeActivationBoundaryKernelOutputs(
+    attentionOutput: MLXArray,
+    residual: MLXArray,
+    postAttentionWeight: MLXArray,
+    preFFNWeight: MLXArray
+) -> Gemma4DecodeActivationBoundaryKernelOutputs {
+    let candidate = gemma4DecodeActivationSidecarBoundaryGraph(
+        attentionOutput: attentionOutput,
+        residual: residual,
+        postAttentionWeight: postAttentionWeight,
+        preFFNWeight: preFFNWeight
+    )
+    let reference = gemma4DecodeActivationStockBoundaryGraph(
+        attentionOutput: attentionOutput,
+        residual: residual,
+        postAttentionWeight: postAttentionWeight,
+        preFFNWeight: preFFNWeight
+    )
+    let referenceSidecar = gemma4DecodeActivationSidecarReferenceKernel(
+        [reference.normalized],
+        grid: (gemma4DecodeActivationGroupCount, 1, 1),
+        threadGroup: (gemma4DecodeActivationGroupCount, 1, 1),
+        outputShapes: [[
+            1, 1, gemma4DecodeActivationSidecarElementCount,
+        ]],
+        outputDTypes: [.float32]
+    )[0]
+
+    return Gemma4DecodeActivationBoundaryKernelOutputs(
+        candidateResidual: candidate.residual,
+        referenceResidual: reference.residual,
+        candidateSidecar: candidate.sidecar,
+        referenceSidecar: referenceSidecar,
+        referenceNormalized: reference.normalized
+    )
+}
 
 /// MTP-only two-row variant. Each grid-y threadgroup normalizes one token row
 /// with the same loop structure, accumulation order, and reduction tree as
@@ -331,6 +709,8 @@ private let gemma4FusedAttentionToMLPBoundaryPairKernel = MLXFast.metalKernel(
 struct FusedAttentionToMLPBoundary: @unchecked Sendable {
     let postAttentionWeight: MLXArray
     let preFFNWeight: MLXArray
+    private let useActivationSidecar: Bool
+    private let verifyActivationSidecarBits: Bool
 
     init?(
         postAttentionWeight: MLXArray,
@@ -347,16 +727,96 @@ struct FusedAttentionToMLPBoundary: @unchecked Sendable {
         }
         self.postAttentionWeight = postAttentionWeight
         self.preFFNWeight = preFFNWeight
+        self.useActivationSidecar =
+            gemma4DecodeActivationSidecarEnvironmentFlag(
+                "DARKBLOOM_DECODE_ACTIVATION_SIDECAR",
+                default: true
+            )
+        self.verifyActivationSidecarBits =
+            gemma4DecodeActivationSidecarEnvironmentFlag(
+                "DARKBLOOM_VERIFY_DECODE_ACTIVATION_SIDECAR_BITS",
+                default: false
+            )
     }
 
     func callAsFunction(
         attentionOutput: MLXArray,
-        residual: MLXArray
-    ) -> (MLXArray, MLXArray) {
+        residual: MLXArray,
+        produceActivationSidecar: Bool = false
+    ) -> (MLXArray, MLXArray?, MLXArray?) {
         precondition(attentionOutput.dtype == .bfloat16)
         precondition(residual.dtype == .bfloat16)
         precondition(residual.shape == attentionOutput.shape)
         if attentionOutput.shape == [1, 1, 5376] {
+            if produceActivationSidecar {
+                precondition(useActivationSidecar || verifyActivationSidecarBits)
+                let candidate =
+                    gemma4FusedAttentionToMLPBoundaryActivationSidecarKernel(
+                        [
+                            attentionOutput, residual,
+                            postAttentionWeight, preFFNWeight,
+                        ],
+                        grid: (1024, 1, 1),
+                        threadGroup: (1024, 1, 1),
+                        outputShapes: [
+                            [1, 1, 5376],
+                            [1, 1, gemma4DecodeActivationSidecarElementCount],
+                        ],
+                        outputDTypes: [.bfloat16, .float32]
+                    )
+                precondition(gemma4DecodeActivationSidecarShapeIsSupported(
+                    normalizedShape: [1, 1, 5376],
+                    normalizedDType: .bfloat16,
+                    sidecarShape: candidate[1].shape,
+                    sidecarDType: candidate[1].dtype
+                ))
+                if verifyActivationSidecarBits {
+                    let reference = gemma4FusedAttentionToMLPBoundaryKernel(
+                        [
+                            attentionOutput, residual,
+                            postAttentionWeight, preFFNWeight,
+                        ],
+                        grid: (1024, 1, 1),
+                        threadGroup: (1024, 1, 1),
+                        outputShapes: [[1, 1, 5376], [1, 1, 5376]],
+                        outputDTypes: [.bfloat16, .bfloat16]
+                    )
+                    let referenceSidecar =
+                        gemma4DecodeActivationSidecarReferenceKernel(
+                            [reference[1]],
+                            grid: (gemma4DecodeActivationGroupCount, 1, 1),
+                            threadGroup: (
+                                gemma4DecodeActivationGroupCount, 1, 1),
+                            outputShapes: [[
+                                1, 1,
+                                gemma4DecodeActivationSidecarElementCount,
+                            ]],
+                            outputDTypes: [.float32]
+                        )[0]
+                    let residualMatches = arrayEqual(
+                        candidate[0].view(dtype: .uint16),
+                        reference[0].view(dtype: .uint16)
+                    )
+                    let sidecarMatches = arrayEqual(
+                        candidate[1].view(dtype: .uint32),
+                        referenceSidecar.view(dtype: .uint32)
+                    )
+                    eval(residualMatches, sidecarMatches)
+                    precondition(
+                        residualMatches.item(Bool.self)
+                            && sidecarMatches.item(Bool.self),
+                        "activation-sidecar boundary changed residual or sidecar bits"
+                    )
+                    // The stock normalized row is verifier-only input for the
+                    // stock gate/up oracle. It is absent from the timed path.
+                    return (
+                        useActivationSidecar ? candidate[0] : reference[0],
+                        reference[1],
+                        candidate[1]
+                    )
+                }
+                return (candidate[0], nil, candidate[1])
+            }
             let outputs = gemma4FusedAttentionToMLPBoundaryKernel(
                 [attentionOutput, residual, postAttentionWeight, preFFNWeight],
                 grid: (1024, 1, 1),
@@ -364,8 +824,9 @@ struct FusedAttentionToMLPBoundary: @unchecked Sendable {
                 outputShapes: [[1, 1, 5376], [1, 1, 5376]],
                 outputDTypes: [.bfloat16, .bfloat16]
             )
-            return (outputs[0], outputs[1])
+            return (outputs[0], outputs[1], nil)
         }
+        precondition(!produceActivationSidecar)
         precondition(attentionOutput.shape == [2, 5376])
         let outputs = gemma4FusedAttentionToMLPBoundaryPairKernel(
             [attentionOutput, residual, postAttentionWeight, preFFNWeight],
@@ -374,7 +835,7 @@ struct FusedAttentionToMLPBoundary: @unchecked Sendable {
             outputShapes: [[2, 5376], [2, 5376]],
             outputDTypes: [.bfloat16, .bfloat16]
         )
-        return (outputs[0], outputs[1])
+        return (outputs[0], outputs[1], nil)
     }
 }
 
