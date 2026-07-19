@@ -13,6 +13,15 @@ private let gemma4MTPFastTargetEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+private let gemma4MTPFastPrefillEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_FAST_PREFILL"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 public enum Gemma4MTPVerificationMode: String, Sendable {
     case exactPair = "exact-pair"
     case serial
@@ -44,7 +53,14 @@ extension Gemma4RuntimeModel: Gemma4MTPTarget {
         _ tokens: MLXArray,
         cache: [KVCache]
     ) -> Gemma4MTPForward {
+        // The MTP track uses the instruction-tuned target, while the serial
+        // frontier's specialized multi-token prefill kernels were qualified
+        // against the base checkpoint. Keep fast singleton verification rows,
+        // but seed MTP from the pinned library path so its initial token,
+        // hidden state, shared K/V, and physical cache bytes match the trusted
+        // IT serial oracle before exact-pair verification begins.
         if gemma4MTPFastTargetEnabled,
+           (tokens.dim(1) == 1 || gemma4MTPFastPrefillEnabled),
            let fast = fastMTPForward(tokens, cache: cache)
         {
             return fast
