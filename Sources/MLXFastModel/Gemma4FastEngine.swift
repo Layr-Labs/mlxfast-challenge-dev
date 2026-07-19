@@ -5,6 +5,27 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 
+private func gemma4FastEngineEnvironmentFlag(
+    _ name: String,
+    default defaultValue: Bool
+) -> Bool {
+    guard let raw = ProcessInfo.processInfo.environment[name] else {
+        return defaultValue
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}
+
+private let gemma4DecodeFullSDPAElideEnabled = gemma4FastEngineEnvironmentFlag(
+    "DARKBLOOM_DECODE_FULL_SDPA_ELIDE",
+    default: true
+)
+
+private let gemma4VerifyDecodeSDPAElide = gemma4FastEngineEnvironmentFlag(
+    "DARKBLOOM_VERIFY_DECODE_SDPA_ELIDE",
+    default: false
+)
+
+
 private let gemma4CombinedQKVPrefillPreparationEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_COMBINED_QKV_PREFILL_PREP"
@@ -1149,10 +1170,45 @@ final class Gemma4FastLayer {
                     scale: scale,
                     mask: attentionMask
                 )
+            } else if B == 1,
+                      L == 1,
+                      !isSliding,
+                      scale == 1.0,
+                      case .none = attentionMask,
+                      (gemma4DecodeFullSDPAElideEnabled
+                        || gemma4VerifyDecodeSDPAElide)
+            {
+                // The gate elides only q*1: bf16(f32(x)*1.0f)==x for finite/inf/signed-zero.
+                let candidate = gemma4DecodeFullSDPAElide(
+                    queries: queries,
+                    keys: keys,
+                    values: values
+                )
+                if gemma4VerifyDecodeSDPAElide {
+                    let reference = MLXFast.scaledDotProductAttention(
+                        queries: queries,
+                        keys: keys,
+                        values: values,
+                        scale: scale,
+                        mask: attentionMask
+                    )
+                    let matches = arrayEqual(
+                        candidate.view(dtype: .uint16),
+                        reference.view(dtype: .uint16)
+                    )
+                    eval(matches)
+                    precondition(
+                        matches.item(Bool.self),
+                        "decode full SDPA scale elide differs from stock SDPA"
+                    )
+                }
+                attention = candidate
             } else {
                 // Prefer library SDPA: D=256 sliding uses fused vector kernel;
                 // D=512 full uses its internal fallback. Compiling our own D=512
-                // fallback changes the public near-tie reduction order.
+                // fallback changes the public near-tie reduction order. (The
+                // elide branch above is not a compile: it replays the fallback's
+                // exact op sequence minus the scale==1.0 identity multiply.)
                 attention = MLXFast.scaledDotProductAttention(
                     queries: queries,
                     keys: keys,
@@ -1538,6 +1594,33 @@ private func gemma4SerializedTwoRowRMSNorm(
         eps: eps
     )
     return concatenated([first, second], axis: 1).reshaped(2, 5_376)
+}
+
+private func gemma4DecodeFullSDPAElide(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray
+) -> MLXArray {
+    let nQHeads = queries.dim(1)
+    let nKVHeads = keys.dim(1)
+    let repeats = nQHeads / nKVHeads
+
+    var q = queries
+    var k = keys
+    var v = values
+    if repeats > 1 {
+        q = unflatten(q, axis: 1, shape: [nKVHeads, repeats])
+        k = expandedDimensions(k, axis: 2)
+        v = expandedDimensions(v, axis: 2)
+    }
+
+    var scores = matmul(q, k.swappedAxes(-1, -2))
+    scores = softmax(scores, axes: [-1], precise: true)
+    var output = matmul(scores, v)
+    if repeats > 1 {
+        output = flatten(output, startAxis: 1, endAxis: 2)
+    }
+    return output
 }
 
 /// Manual attention fallback matching the library's batched/ragged path.
