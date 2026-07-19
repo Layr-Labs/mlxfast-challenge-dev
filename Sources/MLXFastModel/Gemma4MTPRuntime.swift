@@ -58,6 +58,15 @@ private let gemma4MTPSecondaryMarginSelectorEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+private let gemma4MTPTertiaryMarginSelectorEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_TERTIARY_MARGIN_SELECTOR"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private let gemma4MTPTopTwoMarginKernel = MLXFast.metalKernel(
     name: "gemma4_mtp_top_two_margin_262144_v1",
     inputNames: ["logits"],
@@ -146,7 +155,8 @@ func gemma4MTPShouldUseExactFour(
     draftMargins: [Float],
     threshold: Float,
     leadingMarginSelectorEnabled: Bool = true,
-    secondaryMarginSelectorEnabled: Bool = true
+    secondaryMarginSelectorEnabled: Bool = true,
+    tertiaryMarginSelectorEnabled: Bool = true
 ) -> Bool {
     guard draftMargins.count == 3 else {
         return false
@@ -168,10 +178,21 @@ func gemma4MTPShouldUseExactFour(
     // second margin is moderate but the first and third are both strong.
     // This selects the same bit-exact four-row verifier; it cannot alter the
     // draft tokens or acceptance decision.
-    return secondaryMarginSelectorEnabled
+    if secondaryMarginSelectorEnabled
         && draftMargins[0] >= 7.125
         && draftMargins[1] >= 3.25
         && draftMargins[2] >= 6.0
+    {
+        return true
+    }
+    // A conservative third region covers a low-to-moderate second margin
+    // only when both surrounding margins are strongly separated. It is
+    // disjoint from the secondary rule and remained false-route-free after
+    // expanding the corpus from seven to ten independent contexts.
+    return tertiaryMarginSelectorEnabled
+        && draftMargins[0] >= 7.75
+        && draftMargins[1] >= 1.0
+        && draftMargins[2] >= 11.0
 }
 
 public enum Gemma4MTPVerificationMode: String, Sendable {
@@ -745,7 +766,9 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
                         leadingMarginSelectorEnabled:
                             gemma4MTPLeadingMarginSelectorEnabled,
                         secondaryMarginSelectorEnabled:
-                            gemma4MTPSecondaryMarginSelectorEnabled
+                            gemma4MTPSecondaryMarginSelectorEnabled,
+                        tertiaryMarginSelectorEnabled:
+                            gemma4MTPTertiaryMarginSelectorEnabled
                     )
             )
         case .serial:
