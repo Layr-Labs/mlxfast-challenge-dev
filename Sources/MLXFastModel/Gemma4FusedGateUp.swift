@@ -108,18 +108,19 @@ func gemma4Pack12BitGateUpIndexWords(
 
 /// Rollback switch for the 12-bit gate/up co-tile tail packing (C3).
 ///
-/// Default ON. The 21st block's four tail indexes per row are stored at 12
+/// Default OFF on the MTP-default benchmark base while tail12 is requalified
+/// against the instruction-tuned target. The 21st block's four tail indexes per row are stored at 12
 /// bits (6 bytes/row) instead of lane-major U16 (8 bytes/row), saving
 /// 2 B/row/projection across the co-tiled gate/up payload (~4.8 MB/token
 /// over 56 layers). The decoded LUT indexes are identical; only the
 /// payload encoding changes (runtime-side repack from the same packed12
-/// stream; no transform change). Set `DARKBLOOM_GATEUP_COTILE_TAIL12=0`
-/// to restore the U16 tail layout.
+/// stream; no transform change). Set `DARKBLOOM_GATEUP_COTILE_TAIL12=1`
+/// to restore the promoted tail12 layout.
 let gemma4GateUpCoTileTail12Enabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GATEUP_COTILE_TAIL12"
     ] else {
-        return true
+        return false
     }
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
