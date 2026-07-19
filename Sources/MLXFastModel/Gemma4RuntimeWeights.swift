@@ -70,7 +70,20 @@ public final class Gemma4RuntimeWeightCache {
         // forward happen HERE, outside every scored window, instead of inside
         // the first scored prefill.
         if let model = libraryModel, config.numHiddenLayers >= 16 {
-            Self.warmLibraryModel(model)
+            var warmObjects: (cache: [KVCache], outputs: [MLXArray])? =
+                Self.warmLibraryModel(model)
+            if startupMemoryPolicy?.clearAllocatorCacheAfterWarmup == false,
+               Self.firstForwardWarmAllocationLeaseEnabled,
+               let warmObjects
+            {
+                model.installWarmAllocationLease(
+                    cache: warmObjects.cache,
+                    evaluatedOutputs: warmObjects.outputs
+                )
+            }
+            // Drop the caller's ownership before either allocator drain. The
+            // model holder is the sole remaining owner in the enabled arm.
+            warmObjects = nil
             if startupMemoryPolicy?.clearAllocatorCacheAfterWarmup == true {
                 // Pipeline state is process-lifetime state, while free warmup
                 // allocations are exactly the pressure a low-memory machine
@@ -93,6 +106,17 @@ public final class Gemma4RuntimeWeightCache {
         }
     }
 
+    /// Default-on process-start A/B switch. Disabling installation preserves
+    /// the promoted lifetime: warmup locals die before the init-end drain.
+    private static let firstForwardWarmAllocationLeaseEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_FIRST_FORWARD_WARM_ALLOCATION_LEASE"
+        ] else {
+            return true
+        }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }()
+
     /// A/B toggle for the init-end allocator drain above; default on. Off
     /// reproduces the historical behavior (retain the init free-pool and let
     /// the trusted phase-start clear deallocate it inside the timed window).
@@ -106,19 +130,27 @@ public final class Gemma4RuntimeWeightCache {
     }()
 
     /// One prefill-shaped forward (512 tokens) and one single-token decode
-    /// step against a throwaway cache, evaluated and discarded. Inputs are
-    /// constant BOS tokens, so this is prompt-independent and cannot affect
-    /// model output; freed warmup buffers remain eligible for allocator reuse.
-    private static func warmLibraryModel(_ model: Gemma4RuntimeModel) {
+    /// step against a throwaway cache. On the full profile, retain only the
+    /// evaluated cache and logits as a one-shot allocation lease; values are
+    /// never read by a real request.
+    private static func warmLibraryModel(
+        _ model: Gemma4RuntimeModel
+    ) -> (cache: [KVCache], outputs: [MLXArray]) {
         let bosToken = Int32(2)
         let warmupCache = model.newCache(parameters: nil)
         let prefillTokens = MLXArray(
             Array(repeating: bosToken, count: 512),
             [1, 512]
         )
-        eval(model(prefillTokens, cache: warmupCache))
+        let prefillLogits = model(prefillTokens, cache: warmupCache)
+        eval(prefillLogits)
         let decodeToken = MLXArray([bosToken], [1, 1])
-        eval(model(decodeToken, cache: warmupCache))
+        let decodeLogits = model(decodeToken, cache: warmupCache)
+        eval(decodeLogits)
+        // Evaluating logits realizes their complete dependency graphs,
+        // including all cache updates. The caller either installs references
+        // or drops this tuple before the allocator drain.
+        return (warmupCache, [prefillLogits, decodeLogits])
     }
 
     /// Construct and weight-load the mlx-swift-lm Gemma 4 text tower from the
