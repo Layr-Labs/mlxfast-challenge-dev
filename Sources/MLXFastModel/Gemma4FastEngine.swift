@@ -133,23 +133,24 @@ let gemma4VerifyLastLayerQPruneBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
-/// Prefill pipeline chunk size, in layers. Default 18.
+/// Prefill pipeline chunk size, in layers. Default 15.
 ///
 /// The ranked prefill is one lazy graph evaluated once at the head; the
 /// graph-end-to-final-eval boundary leaves dispatch bubbles. A
 /// scheduling-only `asyncEval` every N layers pulls GPU execution into the
-/// layer loop. Eighteen layers contain exactly three of Gemma 4's repeating
-/// five-sliding-plus-one-full attention motifs, making the first three chunks
-/// compute-balanced while preserving the promoted path's three intermediate
-/// evaluations. The computed values are unchanged -- same kernels, same
-/// accumulation order. Only engages for multi-token forwards (L > 1); decode
-/// is untouched. Set
-/// `DARKBLOOM_PREFILL_CHUNK_EVAL=0` to restore the single-eval schedule.
+/// layer loop. Fifteen-layer boundaries retain three intermediate evaluations
+/// while balancing the 60-layer tower into four equal regions. The final
+/// boundary is omitted so the last region, final norm, and vocabulary head
+/// remain one dependency chain. The computed values are unchanged -- same
+/// kernels, same accumulation order. Only engages for multi-token forwards
+/// (L > 1); decode is untouched. Set
+/// `DARKBLOOM_PREFILL_CHUNK_EVAL=18` to restore the promoted schedule, or `0`
+/// to restore the single-eval schedule.
 let gemma4PrefillChunkEvalLayers: Int = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_PREFILL_CHUNK_EVAL"
     ], let value = Int(raw) else {
-        return 18
+        return 15
     }
     return max(0, value)
 }()
@@ -1922,11 +1923,14 @@ final class Gemma4FastEngine {
             // bubbles between graph-end and the giant final eval. A
             // scheduling-only asyncEval every N layers pulls that GPU
             // execution into the layer loop and overlaps it with the
-            // remaining graph construction. The default 18-layer chunks each
-            // contain three complete 5-sliding + 1-full attention motifs;
-            // kernels and accumulation order are unchanged.
+            // remaining graph construction. The default 15-layer boundaries
+            // retain three commits while dividing the tower into four equal
+            // layer regions. Skip the final boundary so the last region,
+            // final norm, and head remain one dependency chain; kernels and
+            // accumulation order are unchanged.
             if gemma4PrefillChunkEvalLayers > 0,
                inputs.dim(1) > 1,
+               layerNumber < layers.count,
                layerNumber.isMultiple(of: gemma4PrefillChunkEvalLayers)
             {
                 asyncEval(hidden)
