@@ -451,10 +451,12 @@ private enum MLXFastCLI {
                 "--block-size",
                 "--tokens",
                 "--target-verification",
+                "--audit-reference-workspace",
             ],
             flagOptions: [
                 "--require-trained-assistant",
                 "--deny-worker-file-writes",
+                "--audit-committed-state",
             ]
         )
         let sourceTargetPath = options.value(
@@ -526,6 +528,15 @@ private enum MLXFastCLI {
                 "mtp-benchmark requires the sandboxed runtime worker"
             )
         }
+        // Untimed committed-KV audit (WARN-ONLY): requested only by the
+        // workflow's untimed gate step. An empty reference workspace value
+        // simply disables the reference-replay comparison; the audit itself
+        // never fails the run.
+        let auditCommittedState = options.hasFlag("--audit-committed-state")
+        let auditReferenceWorkspacePath = options.value(
+            for: "--audit-reference-workspace",
+            default: ""
+        )
         let report = try GemmaRuntime.experimentalTrainedMTPBenchmark(
             ExperimentalTrainedMTPOptions(
                 sourceTargetPath: sourceTargetPath,
@@ -538,7 +549,9 @@ private enum MLXFastCLI {
                 verificationMode: verificationMode,
                 requireTrainedAssistant: options.hasFlag(
                     "--require-trained-assistant"
-                )
+                ),
+                auditCommittedState: auditCommittedState,
+                auditReferenceWorkspacePath: auditReferenceWorkspacePath
             ),
             worker: worker
         )
@@ -2097,7 +2110,7 @@ private enum MLXFastCLI {
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--local-submit|--local-iterate] [--weights PATH] [--golden PATH] [--score-path PATH]
               mlxfast-swift mtp-probe --weights PATH --golden PATH [--block-size N] [--tokens N]
-              mlxfast-swift mtp-benchmark --target-source IT_SOURCE --weights IT_PATH --assistant PATH --contract PATH --golden IT_GOLDEN --require-trained-assistant [--deny-worker-file-writes] [--block-size N] [--tokens N] [--target-verification exact-pair|serial]
+              mlxfast-swift mtp-benchmark --target-source IT_SOURCE --weights IT_PATH --assistant PATH --contract PATH --golden IT_GOLDEN --require-trained-assistant [--deny-worker-file-writes] [--block-size N] [--tokens N] [--target-verification exact-pair|serial] [--audit-committed-state] [--audit-reference-workspace PATH]
               mlxfast-swift mtp-generate-gpqa-answers --target-source IT_SOURCE --weights IT_PATH --assistant PATH --contract PATH --tokenizer PATH --gpqa PATH --output PATH --require-trained-assistant [--block-size N] [--case-count N] [--max-new-tokens N]
               mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
               mlxfast-swift attach-free-run-gate [--golden PATH] [--weights PATH] [--output PATH] [--name NAME] [--steps N] [--allow-partial] [--case NAME | --prompt-file PATH [--tokenizer PATH]] [--exact-prefix N]

@@ -31,6 +31,7 @@ func validateExperimentalTrainedMTPBlockRequest(
           request.steps == nil,
           request.topK == nil,
           request.expectedToken == nil,
+          request.replayTokens == nil,
           let previousToken = request.token,
           previousToken >= 0,
           previousToken < MLXFastConstants.vocabSize,
@@ -184,6 +185,7 @@ extension GemmaRuntime {
                     response = try handleExperimentalMTPWorkerRequest(
                         request,
                         sessionNonce: sessionNonce,
+                        target: target,
                         session: session,
                         state: &state
                     )
@@ -210,6 +212,7 @@ extension GemmaRuntime {
     static func handleExperimentalMTPWorkerRequest(
         _ request: RuntimeWorkerRequest,
         sessionNonce: String,
+        target: Gemma4RuntimeModel,
         session: Gemma4TrainedMTPBlockSession,
         state: inout ExperimentalTrainedMTPWorkerState
     ) throws -> RuntimeWorkerResponse {
@@ -230,7 +233,8 @@ extension GemmaRuntime {
                   request.steps == nil,
                   request.maxBlockSize == nil,
                   request.topK == nil,
-                  request.expectedToken == nil
+                  request.expectedToken == nil,
+                  request.replayTokens == nil
             else {
                 throw MLXFastError.invalidInput(
                     "trained MTP begin request is repeated or malformed"
@@ -318,7 +322,8 @@ extension GemmaRuntime {
                   request.steps == nil,
                   request.maxBlockSize == nil,
                   request.topK == nil,
-                  request.expectedToken == nil
+                  request.expectedToken == nil,
+                  request.replayTokens == nil
             else {
                 throw MLXFastError.invalidInput(
                     "trained MTP diagnostics request is malformed or before begin"
@@ -336,6 +341,41 @@ extension GemmaRuntime {
                 exactPairSegmentCount: session.exactPairSegmentCount,
                 exactPairRollbackRowCount: session.exactPairRollbackRowCount,
                 serialVerificationRowCount: session.serialVerificationRowCount
+            )
+
+        case "mtp_committed_state_audit":
+            // Untimed candidate-side committed-state digest for the trusted
+            // committed-KV audit. Issued by the parent only AFTER it has
+            // captured elapsedSeconds; the digest reads the session's ACTUAL
+            // committed cache, then issues one terminal next-decision probe
+            // forward (which advances the cache past the audited state --
+            // the session is never used again after this request).
+            guard state.began,
+                  request.promptTokens == nil,
+                  request.seedTokens == nil,
+                  request.token == nil,
+                  request.steps == nil,
+                  request.maxBlockSize == nil,
+                  request.topK == nil,
+                  request.expectedToken == nil,
+                  request.replayTokens == nil
+            else {
+                throw MLXFastError.invalidInput(
+                    "trained MTP committed-state audit request is malformed or before begin"
+                )
+            }
+            let auditDigest = try computeCommittedStateDigest(
+                target: target,
+                caches: session.auditableTargetCache,
+                committedTokenCount: session.decodedTokenCount,
+                cacheOffset: session.auditableHostCacheOffset,
+                lastCommittedToken: session.auditableLastCommittedToken
+            )
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                committedStateAudit: auditDigest
             )
 
         default:

@@ -90,6 +90,14 @@ public struct ExperimentalTrainedMTPOptions: Equatable {
     public let totalTokenCount: Int
     public let verificationMode: Gemma4MTPVerificationMode
     public let requireTrainedAssistant: Bool
+    /// Untimed committed-KV audit (WARN-ONLY first release): when enabled,
+    /// the parent requests the candidate's committed-state digest and, when
+    /// `auditReferenceWorkspacePath` names a runnable pinned baseline tree,
+    /// a reference serial replay -- both strictly AFTER elapsedSeconds is
+    /// captured. Passed only by the untimed workflow gate step; the timed
+    /// measure-mtp-job never sets it.
+    public let auditCommittedState: Bool
+    public let auditReferenceWorkspacePath: String
 
     public init(
         sourceTargetPath: String,
@@ -100,7 +108,9 @@ public struct ExperimentalTrainedMTPOptions: Equatable {
         maxBlockSize: Int = MLXFastConstants.experimentalMTPMaxBlockSize,
         totalTokenCount: Int = MLXFastConstants.experimentalMTPMaxTotalTokens,
         verificationMode: Gemma4MTPVerificationMode = .exactPair,
-        requireTrainedAssistant: Bool
+        requireTrainedAssistant: Bool,
+        auditCommittedState: Bool = false,
+        auditReferenceWorkspacePath: String = ""
     ) {
         self.sourceTargetPath = sourceTargetPath
         self.targetWeightsPath = targetWeightsPath
@@ -111,6 +121,8 @@ public struct ExperimentalTrainedMTPOptions: Equatable {
         self.totalTokenCount = totalTokenCount
         self.verificationMode = verificationMode
         self.requireTrainedAssistant = requireTrainedAssistant
+        self.auditCommittedState = auditCommittedState
+        self.auditReferenceWorkspacePath = auditReferenceWorkspacePath
     }
 }
 
@@ -159,6 +171,10 @@ public struct ExperimentalTrainedMTPReport: Codable, Equatable {
     public let mlxPeakMemoryBytes: Int
     public let allTokensMatched: Bool
     public let referenceBaselineStatus: String
+    /// Present only when the untimed gate passed --audit-committed-state;
+    /// the timed measurement never sets it, so the timed report shape is
+    /// byte-identical to the pre-audit schema.
+    public let committedStateAudit: MTPCommittedStateAuditReport?
     public let officialScoreProduced: Bool
 
     enum CodingKeys: String, CodingKey {
@@ -204,6 +220,7 @@ public struct ExperimentalTrainedMTPReport: Codable, Equatable {
         case mlxPeakMemoryBytes = "mlx_peak_memory_bytes"
         case allTokensMatched = "all_tokens_matched"
         case referenceBaselineStatus = "reference_baseline_status"
+        case committedStateAudit = "committed_state_audit"
         case officialScoreProduced = "official_score_produced"
     }
 }
@@ -552,6 +569,24 @@ extension GemmaRuntime {
                 verificationMode: options.verificationMode,
                 worker: worker
             )
+            // UNTIMED committed-KV audit: sequenced strictly AFTER the
+            // measurement above returned (elapsedSeconds is already
+            // captured inside it), while the candidate worker is still
+            // alive inside the confirmed-termination guard. WARN-ONLY: the
+            // driver never throws; its findings ride in the report for the
+            // workflow to surface.
+            var committedStateAudit: MTPCommittedStateAuditReport?
+            if options.auditCommittedState {
+                committedStateAudit =
+                    runExperimentalTrainedMTPCommittedStateAudit(
+                        plan: plan,
+                        totalTokenCount: options.totalTokenCount,
+                        candidateWorker: worker,
+                        referenceWorkspacePath:
+                            options.auditReferenceWorkspacePath,
+                        workerOptions: workerOptions
+                    )
+            }
             return ExperimentalTrainedMTPReport(
             experimental: true,
             trackID: artifacts.trackID,
@@ -599,6 +634,7 @@ extension GemmaRuntime {
             mlxPeakMemoryBytes: measurement.mlxPeakMemoryBytes,
             allTokensMatched: true,
             referenceBaselineStatus: artifacts.referenceBaselineStatus,
+            committedStateAudit: committedStateAudit,
             // This CLI invocation never emits the official score even on the
             // enabled track: the trusted workflow computes the paired score
             // from measure-mtp-job's sealed results, never from this report.

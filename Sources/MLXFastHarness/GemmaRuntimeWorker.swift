@@ -197,6 +197,11 @@ extension GemmaRuntime {
                 "runtime worker max_block_size is valid only for decode_block"
             )
         }
+        if request.kind != "mtp_audit_serial_replay", request.replayTokens != nil {
+            throw MLXFastError.invalidInput(
+                "runtime worker replay_tokens is valid only for mtp_audit_serial_replay"
+            )
+        }
         let carriesTraceDiagnostics =
             request.topK != nil || request.expectedToken != nil
         if carriesTraceDiagnostics {
@@ -218,6 +223,37 @@ extension GemmaRuntime {
             }
         }
         switch request.kind {
+        case "mtp_audit_serial_replay":
+            // Untimed reference-side committed-state replay for the trusted
+            // committed-KV audit: seed prefill plus one teacher-forced K=1
+            // forward per replay token into a FRESH cache, then the same
+            // digest schema the candidate emits. Never dispatched by any
+            // timed or serial-track parent; the serial ranked pipeline does
+            // not send this kind.
+            guard let seedTokens = request.seedTokens,
+                  let replayTokens = request.replayTokens,
+                  request.promptTokens == nil,
+                  request.token == nil,
+                  request.steps == nil,
+                  request.topK == nil,
+                  request.expectedToken == nil
+            else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker mtp_audit_serial_replay request is malformed"
+                )
+            }
+            let replayDigest = try runAuditSerialReplay(
+                weightCache: weightCache,
+                seedTokens: seedTokens,
+                replayTokens: replayTokens
+            )
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                committedStateAudit: replayDigest
+            )
+
         case "correctness":
             guard let promptTokens = request.promptTokens, let steps = request.steps else {
                 throw MLXFastError.invalidInput("runtime worker correctness request missing prompt_tokens or steps")
@@ -681,6 +717,7 @@ struct RuntimeWorkerRequest: Codable {
     let maxBlockSize: Int?
     let topK: Int?
     let expectedToken: Int?
+    let replayTokens: [Int]?
 
     init(
         id: Int,
@@ -691,7 +728,8 @@ struct RuntimeWorkerRequest: Codable {
         steps: Int? = nil,
         maxBlockSize: Int? = nil,
         topK: Int? = nil,
-        expectedToken: Int? = nil
+        expectedToken: Int? = nil,
+        replayTokens: [Int]? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -702,6 +740,7 @@ struct RuntimeWorkerRequest: Codable {
         self.maxBlockSize = maxBlockSize
         self.topK = topK
         self.expectedToken = expectedToken
+        self.replayTokens = replayTokens
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -743,6 +782,10 @@ struct RuntimeWorkerRequest: Codable {
             Int.self,
             forKey: .expectedToken
         )
+        replayTokens = try container.decodeIfPresent(
+            [Int].self,
+            forKey: .replayTokens
+        )
     }
 
     func encode(to encoder: Swift.Encoder) throws {
@@ -756,6 +799,7 @@ struct RuntimeWorkerRequest: Codable {
         try container.encodeIfPresent(maxBlockSize, forKey: .maxBlockSize)
         try container.encodeIfPresent(topK, forKey: .topK)
         try container.encodeIfPresent(expectedToken, forKey: .expectedToken)
+        try container.encodeIfPresent(replayTokens, forKey: .replayTokens)
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -768,6 +812,7 @@ struct RuntimeWorkerRequest: Codable {
         case maxBlockSize = "max_block_size"
         case topK = "top_k"
         case expectedToken = "expected_token"
+        case replayTokens = "replay_tokens"
     }
 }
 
@@ -809,7 +854,8 @@ func validateExperimentalDecodeBlockRequest(
           request.seedTokens == nil,
           request.steps == nil,
           request.topK == nil,
-          request.expectedToken == nil
+          request.expectedToken == nil,
+          request.replayTokens == nil
     else {
         throw MLXFastError.invalidInput(
             "runtime worker decode_block request contains fields for another request kind"
@@ -893,6 +939,7 @@ struct RuntimeWorkerResponse: Codable {
     let exactPairSegmentCount: Int?
     let exactPairRollbackRowCount: Int?
     let serialVerificationRowCount: Int?
+    let committedStateAudit: MTPCommittedStateDigest?
 
     init(
         id: Int,
@@ -914,7 +961,8 @@ struct RuntimeWorkerResponse: Codable {
         targetVerificationMode: String? = nil,
         exactPairSegmentCount: Int? = nil,
         exactPairRollbackRowCount: Int? = nil,
-        serialVerificationRowCount: Int? = nil
+        serialVerificationRowCount: Int? = nil,
+        committedStateAudit: MTPCommittedStateDigest? = nil
     ) {
         self.id = id
         self.nonce = nonce
@@ -936,6 +984,7 @@ struct RuntimeWorkerResponse: Codable {
         self.exactPairSegmentCount = exactPairSegmentCount
         self.exactPairRollbackRowCount = exactPairRollbackRowCount
         self.serialVerificationRowCount = serialVerificationRowCount
+        self.committedStateAudit = committedStateAudit
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -1016,6 +1065,10 @@ struct RuntimeWorkerResponse: Codable {
             Int.self,
             forKey: .serialVerificationRowCount
         )
+        committedStateAudit = try container.decodeIfPresent(
+            MTPCommittedStateDigest.self,
+            forKey: .committedStateAudit
+        )
     }
 
     func encode(to encoder: Swift.Encoder) throws {
@@ -1070,6 +1123,10 @@ struct RuntimeWorkerResponse: Codable {
             serialVerificationRowCount,
             forKey: .serialVerificationRowCount
         )
+        try container.encodeIfPresent(
+            committedStateAudit,
+            forKey: .committedStateAudit
+        )
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -1093,6 +1150,7 @@ struct RuntimeWorkerResponse: Codable {
         case exactPairSegmentCount = "exact_pair_segment_count"
         case exactPairRollbackRowCount = "exact_pair_rollback_row_count"
         case serialVerificationRowCount = "serial_verification_row_count"
+        case committedStateAudit = "committed_state_audit"
     }
 }
 
@@ -1850,6 +1908,26 @@ final class RuntimeWorkerClient {
         try send(kind: "mtp_phase_diagnostics")
     }
 
+    /// Untimed committed-state audit request against the trained-MTP worker.
+    /// Issued only after the trusted parent has captured elapsedSeconds.
+    func trainedMTPCommittedStateAudit() throws -> RuntimeWorkerResponse {
+        try send(kind: "mtp_committed_state_audit")
+    }
+
+    /// Untimed teacher-forced serial replay against the reference worker:
+    /// seed prefill plus one K=1 forward per replay token into a fresh
+    /// cache, returning the same committed-state digest schema.
+    func auditSerialReplay(
+        seedTokens: [Int],
+        replayTokens: [Int]
+    ) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "mtp_audit_serial_replay",
+            seedTokens: seedTokens,
+            replayTokens: replayTokens
+        )
+    }
+
     func phaseDiagnostics() throws -> RuntimeWorkerResponse {
         try send(kind: "phase_diagnostics")
     }
@@ -1862,7 +1940,8 @@ final class RuntimeWorkerClient {
         steps: Int? = nil,
         maxBlockSize: Int? = nil,
         topK: Int? = nil,
-        expectedToken: Int? = nil
+        expectedToken: Int? = nil,
+        replayTokens: [Int]? = nil
     ) throws -> RuntimeWorkerResponse {
         guard process.isRunning else {
             throw MLXFastError.invalidInput("runtime worker exited before request \(kind): \(workerExitDiagnostic())")
@@ -1878,7 +1957,8 @@ final class RuntimeWorkerClient {
             steps: steps,
             maxBlockSize: maxBlockSize,
             topK: topK,
-            expectedToken: expectedToken
+            expectedToken: expectedToken,
+            replayTokens: replayTokens
         )
         var data = try encoder.encode(request)
         guard data.count <= BufferedFileLineReader.defaultMaximumLineByteCount else {

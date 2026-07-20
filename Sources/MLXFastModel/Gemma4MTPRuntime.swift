@@ -468,6 +468,18 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
     public private(set) var exactPairSegmentCount = 0
     public private(set) var exactPairRollbackRowCount = 0
     public private(set) var serialVerificationRowCount = 0
+
+    /// Read-only committed-state access for the trusted, UNTIMED post-timing
+    /// committed-KV audit (see the harness's committed-state audit). These
+    /// expose the live cache objects and the host mirrors without copying or
+    /// mutating anything; the audit reads committed rows only after the
+    /// trusted parent has captured its elapsed time, then issues one
+    /// terminal probe forward through the ordinary target path. Keep these
+    /// accessors read-only: they are not on any timed path and must never
+    /// gain side effects.
+    public var auditableTargetCache: [any KVCache] { targetCache }
+    public var auditableHostCacheOffset: Int { hostCacheOffset }
+    public var auditableLastCommittedToken: Int? { bonusToken }
     // Test-visible branch evidence; public accounting remains pair-equivalent
     // (`exactPairSegmentCount += 2`) for one direct four-row invocation.
     private(set) var directExactFourInvocationCount = 0

@@ -383,7 +383,7 @@ func experimentalMTPUsesTrustedConfigurableLengthAndBoundedBlocks() throws {
     #expect(MLXFastConstants.experimentalMTPMaxBlockSize == 4)
     #expect(MLXFastConstants.experimentalMTPMaxTotalTokens == 128)
     #expect(
-        MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens == 512
+        MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens == 1_536
     )
     #expect(
         MLXFastConstants.experimentalMTPMaxTotalTokens
@@ -1128,12 +1128,13 @@ func trainedMTPContractPinsMatchedITPairAndDependency() throws {
     // ranked-box reference baseline against the QAT 4-bit assistant. The
     // ranked decode window (512) is owned by the
     // workflow env; the contract's decode_tokens stays the 128-token
-    // compatibility default with a 512 trusted-parent maximum.
+    // compatibility default with a 1,536 trusted-parent maximum reserved for
+    // untimed correctness legs (sliding-window-wrap coverage).
     #expect(contract.officialScoringEnabled)
     #expect(contract.referenceBaseline.status == "established")
     #expect(contract.referenceBaseline.publicationAllowed)
     #expect(contract.protocolContract.decodeTokens == 128)
-    #expect(contract.protocolContract.maximumDecodeTokens == 512)
+    #expect(contract.protocolContract.maximumDecodeTokens == 1_536)
 
     let raw = try #require(
         JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -1230,7 +1231,7 @@ func trainedMTPOptionsFailClosedWithoutAssistantRequirement() throws {
                 contractPath: "contract.json",
                 goldenPath: "it-golden.json",
                 maxBlockSize: 4,
-                totalTokenCount: 513,
+                totalTokenCount: 1_537,
                 requireTrainedAssistant: true
             )
         )

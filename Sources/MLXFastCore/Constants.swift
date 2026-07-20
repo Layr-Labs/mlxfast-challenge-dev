@@ -89,7 +89,57 @@ public enum MLXFastConstants {
     public static let experimentalMTPMaxTotalTokens = 128
     // Trusted-parent configured experimental runs may exercise longer tail
     // boundaries when the selected oracle contains enough tokens.
-    public static let experimentalMTPMaxConfiguredTotalTokens = 512
+    //
+    // 1,536 (was 512): with the fixed 512-token seed, a 512-token decode ends
+    // at final offset exactly 1,024 — the sliding-window cache never wraps on
+    // the ranked path, so the ring-buffer wrap regime was structurally
+    // untested by the untimed correctness gate. 1,536 decode tokens reach
+    // final offset 2,048, crossing the 1,024-position wrap with a full
+    // post-wrap tail. This cap bounds only UNTIMED gate configurations; the
+    // ranked timed decode window stays owned by the workflow env
+    // (MLXFAST_MTP_DECODE_TOKENS, currently 512) and the contract fixture's
+    // proposed_scoring, and changing the timed window would force baseline
+    // recalibration. The parent-side reachability-DP diagnostics validator is
+    // O(tokens^2)-ish in its bitset rows and runs strictly after timing, so
+    // the larger cap only grows an untimed post-elapsed allocation.
+    public static let experimentalMTPMaxConfiguredTotalTokens = 1_536
+    // COMMITTED-KV FAITHFULNESS AUDIT (experimental MTP track; untimed,
+    // gate-only, runs strictly after the trusted parent captured
+    // elapsedSeconds; see MTPCommittedStateAudit.swift). SHIPPING WARN-ONLY:
+    // the audit's would-fail verdict is reported and logged but never fails
+    // a run until the operator flips the workflow's enforcement knob after
+    // calibrating these placeholder envelopes.
+    //
+    // OPERATOR CALIBRATION PROCEDURE (run on the M5 dev box before
+    // enforcement):
+    //   1. Capture reference-vs-reference audit runs across the LEGITIMATE
+    //      spread of the reference's own reduction variants: serial K=1 vs
+    //      exact-pair vs direct-four verification, fast-engine vs library
+    //      target path, across the public and operator-held goldens
+    //      (including a >1,024-final-offset wrap decode).
+    //   2. Set each envelope to the observed legitimate maximum times a
+    //      safety factor (2x recommended), floored at the BF16 unit-scale
+    //      epsilon 7.8125e-3 for absolute terms.
+    //   3. Negative controls MUST fail the calibrated envelopes: the
+    //      documented M5 step-48 incident kernel (ordinary batched K-row
+    //      target forward) and a deliberately-approximate kernel (e.g. a
+    //      truncated-accumulation matmul).
+    //   4. Record the calibration runs, update these constants, and flip the
+    //      workflow's audit enforcement in the same reviewed change.
+    //
+    // The placeholders below reuse the local exact-pair KV heuristic
+    // (rtol 1e-2) with the BF16 epsilon absolute floor; they are deliberately
+    // conservative-loose so the warn-only phase surfaces real spread data
+    // without noise.
+    public static let mtpCommittedStateAuditSchemaVersion = 1
+    public static let mtpCommittedStateAuditRelativeTolerance = 1e-2
+    public static let mtpCommittedStateAuditAbsoluteTolerance = 7.8125e-3
+    // Strided raw-row anti-tamper sample: every Nth layer (plus the final
+    // layer) and up to this many positions per sampled layer, spread evenly
+    // over the retained window. Bounded so the digest stays far below the
+    // 4 MiB worker protocol line cap even at head-dim 256 x 16 KV heads.
+    public static let mtpCommittedStateAuditRowSampleLayerStride = 15
+    public static let mtpCommittedStateAuditRowSamplePositionCount = 4
     public static let localIterateBenchmarkDecodeSteps = 16
     // Local submit uses a longer public fixture so the Yukon pre-submit hook
     // exercises one continuous decode trajectory for about ten minutes instead
