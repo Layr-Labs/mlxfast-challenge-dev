@@ -138,7 +138,7 @@
     "paired_serial_reference": "trusted serial K=1 target decode (mtp-probe path) over the same golden, same session, same thermal gate, same box",
     "denominator_authority": "trusted parent wall time divided by the parent-configured decode total",
     "component_floor": "aggregate mtp_decode_speedup >= 1.0 (floor applies to the ratio-of-means aggregate, not per pair)",
-    "bit_exact_gate": "every returned token must match the parent-owned serial oracle; any mismatch fails the run before scoring",
+    "bit_exact_gate": "legacy schema name applying only to returned token IDs: every returned token must exactly match the parent-owned serial oracle; intermediate tensors are outside this ranked gate and provisional heuristic numeric envelopes apply only to trusted/local regression",
     "stall_guardrail": "a run whose max block latency exceeds 4x its p50 block latency is rejected as measurement-invalid with one gated retry",
     "prefill_component": "none; seed prefill is charged inside the decode measurement",
     "leaderboard": "separate gemma4-31b-it-mtp-v1 namespace, never mixed with the serial track",

@@ -166,8 +166,8 @@ func gemma4MTPShouldUseExactFour(
     }
     // A second, disjoint high-confidence region recovers cases where the
     // second margin is moderate but the first and third are both strong.
-    // This selects the same bit-exact four-row verifier; it cannot alter the
-    // draft tokens or acceptance decision.
+    // This selects the same four-row target verifier; it cannot alter the
+    // exact draft-token acceptance decision.
     return secondaryMarginSelectorEnabled
         && draftMargins[0] >= 7.125
         && draftMargins[1] >= 3.25
@@ -440,9 +440,10 @@ struct Gemma4MTPVerifiedBlock {
 /// full/sliding K/V and the current bonus token persist across block calls.
 /// Every returned token came from a target argmax. Drafts are never returned
 /// directly: a draft is emitted only when it equals the corresponding
-/// serial-equivalent K=1 target verification result. The block protocol still
-/// amortizes assistant drafting and IPC, while shape-dependent target
-/// reductions cannot alter the serial oracle or retained physical K/V state.
+/// multi-row target-verification argmax, and the trusted parent independently
+/// checks every returned ID against its serial oracle. Floating intermediates
+/// may differ within trusted regression envelopes; protocol/cache geometry
+/// and committed token IDs remain exact.
 public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
     public var implementationName: String {
         "google_gemma4_trained_mtp_\(verificationMode.rawValue)"
@@ -451,8 +452,9 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
     private let target: Gemma4RuntimeModel
     private let drafter: Gemma4AssistantDraftModel
     public let verificationMode: Gemma4MTPVerificationMode
-    // Internal (not public) so runtime seam tests can compare this cache's
-    // physical bytes against an independent serial cache.
+    // Internal (not public) so trusted/local seam tests can compare exact
+    // metadata and geometry plus numerically bounded state against a serial
+    // cache without exposing tensor checks to the ranked parent.
     private(set) var targetCache: [any KVCache] = []
     private var hidden: MLXArray?
     private var sharedKV: Gemma4SharedKV?
@@ -466,6 +468,9 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
     public private(set) var exactPairSegmentCount = 0
     public private(set) var exactPairRollbackRowCount = 0
     public private(set) var serialVerificationRowCount = 0
+    // Test-visible branch evidence; public accounting remains pair-equivalent
+    // (`exactPairSegmentCount += 2`) for one direct four-row invocation.
+    private(set) var directExactFourInvocationCount = 0
 
     public init(
         target: Gemma4RuntimeModel,
@@ -497,9 +502,10 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
     /// Safety: this runs fixed BOS shapes on throwaway caches and never reads,
     /// writes, or advances the real session cache, hidden state, shared-KV, or
     /// committed tokens, so it cannot change any returned token — the serial
-    /// oracle and bit-exact parity are unaffected. It must be called after the
-    /// trusted allocator reset and before `begin`; at that point no seed exists,
-    /// so it is structurally input-independent (it cannot depend on the prompt).
+    /// oracle and exact returned-token parity are unaffected. It must be called
+    /// after the trusted allocator reset and before `begin`; at that point no
+    /// seed exists, so it is structurally input-independent (it cannot depend on
+    /// the prompt).
     /// It only warms the allocator: the pinned pipelines were already compiled
     /// during untimed init, so this pays allocation, not compilation.
     public func warmWorkingSetAfterAllocatorReset() throws {
@@ -591,6 +597,7 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
         exactPairSegmentCount = 0
         exactPairRollbackRowCount = 0
         serialVerificationRowCount = 0
+        directExactFourInvocationCount = 0
         return seedToken
     }
 
@@ -840,6 +847,7 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
                 fourInput,
                 cache: targetCache
             ) {
+                directExactFourInvocationCount += 1
                 exactPairSegmentCount += 2
                 let tokenArray = output.logits
                     .asType(.float32)

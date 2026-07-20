@@ -10,13 +10,12 @@ private let gemma4MTPExactFourAttentionEnabled: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
-/// Runs both sliding-attention queries in one causal vector-attention dispatch
-/// while both rows use the one-pass MLX kernel. Its causal branch skips the
-/// draft key for token zero, preserving the promoted one-query arithmetic and
-/// reduction order. Full D=512 attention stays serialized because its fallback
-/// matmuls can change reduction order when the key length changes. The final
-/// sliding pre-wrap pair also stays serialized because MLX switches D=256 to
-/// its two-pass kernel at 1,024 keys while token zero's reference does not.
+/// Runs both sliding-attention queries in one causal vector-attention dispatch.
+/// Its causal branch hides the draft key from token zero. Full D=512 attention
+/// and the final sliding pre-wrap pair currently stay serialized around MLX
+/// shape-dependent algorithm switches. That is an implementation choice, not
+/// a serial-reduction-order contract: a fused or reassociated replacement is
+/// valid when exact token decisions, numeric envelopes, and cache geometry pass.
 func gemma4ExactTwoTokenAttention(
     queries: MLXArray,
     keysBeforeDraft: MLXArray,
@@ -65,7 +64,7 @@ func gemma4ExactTwoTokenAttention(
 
 /// Four serial-causal attention rows. Sliding D=256 uses one native causal
 /// vector dispatch while it remains on the one-pass kernel; other geometries
-/// compose the proven exact-two primitive to preserve established arithmetic.
+/// currently reuse two exact-two calls as an implementation detail.
 func gemma4ExactFourTokenAttention(
     queries: MLXArray,
     keysThroughRow0: MLXArray,
@@ -87,10 +86,10 @@ func gemma4ExactFourTokenAttention(
     precondition(keysThroughRow2.dim(2) == keysThroughRow1.dim(2) + 1)
     precondition(keysThroughRow3.dim(2) == keysThroughRow2.dim(2) + 1)
 
-    // The D=256 vector kernel evaluates each query row independently. One
-    // four-query causal launch therefore preserves the serial row arithmetic
-    // while eliminating the second exact-two dispatch and concatenation. Stay
-    // below the 1,024-key switch where MLX changes to its two-pass algorithm.
+    // The D=256 vector kernel evaluates four causally masked query rows in one
+    // launch, eliminating the second exact-two dispatch and concatenation.
+    // Stay below the 1,024-key switch where MLX changes to its two-pass
+    // algorithm; alternatives may cross it if the behavior gates still pass.
     if gemma4MTPExactFourAttentionEnabled,
        queries.dim(3) == 256,
        keysThroughRow3.dim(2) < 1_024

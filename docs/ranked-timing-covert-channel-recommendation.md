@@ -5,8 +5,7 @@ scoring-**backend** publishing-policy change (what precision the platform
 exposes to participants), not something the in-repo harness can fully fix.
 
 **Audience:** the Yukon/Darkbloom scoring backend that ingests each ranked
-run's `score.json` and audit artifacts and publishes a result to the
-participant.
+run's minimized `score.json` and publishes a result to the participant.
 
 ## The channel
 
@@ -17,14 +16,18 @@ participant is a readout the model can drive — a covert channel. Its bandwidth
 is set by how many *distinguishable* timing values the participant can observe
 per submission, i.e. by the **precision** of the published numbers.
 
-Today the ranked result publishes the following at **full IEEE-754 double
-precision**:
+The archived serial ranked result publishes the following at **full IEEE-754
+double precision**:
 
 - `metrics.decode_seconds_per_token`
 - `metrics.prefill_seconds_per_token`
 - `metrics.decode_speedup`
 - `metrics.prefill_speedup`
 - the top-level `score` (`decode_speedup^0.75 * prefill_speedup^0.25`)
+
+The default MTP artifact is narrower: it omits per-side seconds and publishes
+the full-precision ratio-of-means `score` plus fixed contract/gate fields. That
+single score remains model-influenceable timing feedback.
 
 This is deliberate in the harness: these are the ranking- and floor-critical
 fields, so `ScoreMetrics.withCoarsenedPublicDiagnostics()` in
@@ -43,12 +46,12 @@ acknowledged in
 channel": pass/fail, score, timing, and repeated attempts are a low-bandwidth
 covert channel).
 
-The same full-precision copies also travel in the **audit artifact**
-`paired-results.json` (staged by the workflow's "Stage audit artifacts" step
-from measure-job's `results.json`): `candidate.decode_seconds_per_token`,
-`candidate.prefill_seconds_per_token`, the matching `baseline.*`, and the
-`paired.*` speedups. Coarsening only `score.json` while `paired-results.json`
-keeps full precision would leave the channel open through the audit path.
+The default MTP workflow now keeps measure-job `results.json`/verdicts
+runner-private, deletes them immediately after constructing and validating the
+minimized score, and publishes no timing audit artifact. That closes the
+duplicate audit path in-repository. The remaining MTP channel is the score and
+aggregate gate feedback itself; archived serial-track publication is a
+separate contract.
 
 ## Why this is a backend decision
 
@@ -59,7 +62,7 @@ precision and then expose a coarsened result to the participant is the backend
 that owns the published result and the audit-artifact retention policy. The
 repository boundary is exactly the ranking-field carve-out in
 `withCoarsenedPublicDiagnostics()` — everything downstream of the sealed
-`score.json` / `paired-results.json` is backend territory.
+minimized `score.json` is backend territory.
 
 ## Recommendation
 
@@ -76,10 +79,10 @@ internally**, and **publish only coarsely-quantized** values to participants:
    (e.g. 2–3), so the participant sees a rank-usable number without a
    high-resolution timing readout. Rank and break ties on the full-precision
    values server-side; publish only the rounded values.
-3. **Apply the same quantization to `paired-results.json`** before it is
-   exposed to (or downloadable by) the participant, or restrict that audit
-   artifact to operators. It currently carries the same full-precision
-   candidate/baseline seconds and paired speedups.
+3. **Keep raw paired results operator-only.** The default MTP workflow now does
+   this and deletes its runner-private copy before artifact staging; retain
+   equivalent minimization for any other ranked track that exposes an audit
+   artifact.
 4. **Keep the coarsening monotone** so it cannot invert an ordering the scoring
    relies on (the harness already uses `roundedToSignificantFigures`, which is
    monotone and never rounds a positive value to zero — a good model to reuse).

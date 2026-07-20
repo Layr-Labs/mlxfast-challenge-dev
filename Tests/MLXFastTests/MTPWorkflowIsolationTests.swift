@@ -53,7 +53,7 @@ struct MTPWorkflowIsolationTests {
         #expect(serialScript.contains("WORKFLOW_PATH=\".github/workflows/serial-benchmark.yml\""))
     }
 
-    // THE ENABLEMENT GATE (post-go-live shape): the track is enabled on the
+    // THE LIVE ENABLEMENT INTERLOCK: the track is enabled on the
     // trusted contract and the hidden-golden pins are filled with the frozen
     // values, while the gate itself remains standing and fail-closed — it
     // still refuses a reverted contract, an emptied pin, or a dispatch
@@ -99,10 +99,10 @@ struct MTPWorkflowIsolationTests {
         #expect(gate.contains("confirm_track_enabled=true"))
         #expect(gate.contains("MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256"))
         #expect(gate.contains("MLXFAST_MTP_BENCH_GOLDEN_SHA256"))
-        #expect(gate.contains("is empty; freeze the IT-target goldens"))
+        #expect(gate.contains("restore the validated operator pin"))
 
-        // The pins carry the frozen 2026-07-15 golden identities (pending
-        // box-2 replay confirmation; re-pinned there on any divergence).
+        // The pins carry the validated frozen 2026-07-15 golden identities;
+        // serving-stack rotations re-pin them before accepting submissions.
         #expect(workflow.contains(
             "MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256: d4fff3fe015123c395be68cb19401709ec288e44a04e52c2ea36c32220356862"
         ))
@@ -144,13 +144,15 @@ struct MTPWorkflowIsolationTests {
         let workflow = try mtpWorkflow()
 
         #expect(workflow.contains("MLXFAST_MTP_TRACK_ID: gemma4-31b-it-mtp-v1"))
+        #expect(workflow.contains("validated for the"))
+        #expect(workflow.contains("live default MTP workflow"))
         #expect(workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/mtp-ranked-current"))
         #expect(workflow.contains("group: mlxfast-mtp-ranked-"))
         #expect(workflow.contains("MLXFAST_MTP_BASELINE_WS: /opt/bench-runner/mtp-baseline/current"))
         #expect(workflow.contains("MLXFAST_MTP_BASELINE_CALIBRATION: /opt/bench-runner/state/mtp-baseline-calibration.json"))
         #expect(workflow.contains("name: benchmark-results-"))
         #expect(workflow.contains("name: mtp-correctness-results-"))
-        #expect(workflow.contains("name: mtp-benchmark-audit-"))
+        #expect(!workflow.contains("name: mtp-benchmark-audit-"))
         #expect(workflow.contains("track_id: $track"))
         #expect(workflow.contains("> score.json"))
 
@@ -176,6 +178,9 @@ struct MTPWorkflowIsolationTests {
         let track = try #require(try JSONSerialization.jsonObject(with: registration) as? [String: Any])
         #expect(track["trackId"] as? String == "gemma4-31b-it-mtp-v1")
         #expect(track["name"] as? String == "mlxfast-challenge-dev-mtp")
+        let description = try #require(track["description"] as? String)
+        #expect(description.contains("behavior-preserving multi-row verification"))
+        #expect(description.contains("returned token ID must exactly match"))
         let runner = try #require(track["runner"] as? [String: Any])
         #expect(runner["workflow"] as? String == "benchmark.yml")
         #expect(track["scorePath"] as? String == "score.json")
@@ -190,6 +195,10 @@ struct MTPWorkflowIsolationTests {
         let leaderboard = try #require(track["leaderboard"] as? [String: Any])
         #expect(leaderboard["namespace"] as? String == "gemma4-31b-it-mtp-v1")
         #expect(leaderboard["separateFromSerialTrack"] as? Bool == true)
+        let scoring = try #require(track["scoring"] as? [String: Any])
+        // Preserve the public schema key while pinning its token-only scope in
+        // the surrounding contract wording.
+        #expect(scoring["bitExactTokenGate"] as? Bool == true)
         #expect(
             registration
                 == (try Data(contentsOf: URL(fileURLWithPath: "benchmark.mtp.json"))),
@@ -257,12 +266,12 @@ struct MTPWorkflowIsolationTests {
     // Decode-only paired scoring per the adopted 2026-07-14 decision memo:
     // 512-token decode window, ratio-of-means aggregation computed in the
     // trusted shell from the sealed per-side means, floor 1.0 on that
-    // aggregate, minimum 3 / target 4 accepted pairs, and the hard bit-exact
-    // parity gate across every timed run. The hidden benchmark golden
-    // reaches the workspace only inside measure-job's timed sides, and the
-    // correctness golden is scrubbed before timing.
+    // aggregate, minimum 3 / target 4 accepted pairs, and the hard exact
+    // returned-token parity gate across every timed run. The hidden benchmark
+    // golden reaches the workspace only inside measure-job's timed sides, and
+    // the correctness golden is scrubbed before timing.
     @Test
-    func mtpScoringEnforcesBitExactGateMinimumPairsAndFloor() throws {
+    func mtpScoringEnforcesExactTokenParityMinimumPairsAndFloor() throws {
         let workflow = try mtpWorkflow()
 
         #expect(workflow.contains("MLXFAST_MTP_DECODE_TOKENS: \"512\""))
@@ -288,6 +297,24 @@ struct MTPWorkflowIsolationTests {
         #expect(score.contains("aggregation: \"ratio_of_means\""))
         #expect(score.contains("mtp_decode_speedup_ratio_of_means"))
         #expect(!score.contains("score: $results[0].aggregate.mtp_decode_speedup_mean"))
+        #expect(!score.contains("--arg commit"))
+        #expect(!score.contains("--arg weights_hash"))
+        #expect(!score.contains("mtp_decode_speedup_median:"))
+        #expect(!score.contains("mtp_decode_speedup_min:"))
+        #expect(!score.contains("baseline_serial_seconds_per_token_mean:"))
+        #expect(!score.contains("candidate_mtp_seconds_per_token_mean:"))
+        #expect(!score.contains("mtp_weights_hash:"))
+        let minimizedValidation = try #require(
+            score.range(of: ".github/scripts/deny-private-artifacts.sh score.json")
+        )
+        let privateResultsDelete = try #require(
+            score.range(
+                of: "\"${MLXFAST_MEASURE_OUT}/results.json\"",
+                range: minimizedValidation.upperBound..<score.endIndex
+            )
+        )
+        #expect(minimizedValidation.lowerBound < privateResultsDelete.lowerBound)
+        #expect(score.contains("\"${MLXFAST_MEASURE_OUT}/verdict.txt\""))
 
         // Ordering: correctness gate -> scrub -> reap -> quiescence ->
         // harness re-verify -> timed measurement -> score.
@@ -317,6 +344,22 @@ struct MTPWorkflowIsolationTests {
         #expect(gateBody.contains(".official_score_produced == false"))
         #expect(gateBody.contains("BENCH_GOLDEN_PATH"))
         #expect(gateBody.contains("--require-trained-assistant"))
+        #expect(gateBody.contains("trap 'rm -f -- \"${raw_stdout}\" \"${gates_log}\"' EXIT"))
+        #expect(gateBody.contains("schema_version: 1"))
+        #expect(gateBody.contains("gate_passed: true"))
+        #expect(gateBody.contains("mtp-correctness-verdict.json"))
+        #expect(!gateBody.contains("cp \"${raw_stdout}\""))
+
+        // Hidden goldens go only through the trusted parent/worker protocol.
+        // Candidate-linked XCTest tensor regressions are never invoked or
+        // given a hidden oracle path by the ranked workflow.
+        #expect(!workflow.contains("MLXFAST_RUN_MTP_EXACT_PAIR_TESTS"))
+        #expect(!workflow.contains("MLXFAST_MTP_PAIR_GOLDEN_PATH"))
+        #expect(
+            !workflow.contains(
+                "exactPairAndFourRuntimePreserveTokensWithinNumericEnvelope"
+            )
+        )
 
         // The R2 object keys are scoped to the one trusted download step,
         // never job-level env (same discipline as the serial pipeline).
@@ -340,7 +383,37 @@ struct MTPWorkflowIsolationTests {
             to: "- name: Reap lingering bench processes before timing"
         )
         #expect(scrubBody.contains("rm -f \"${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json\""))
+        #expect(scrubBody.contains("\"${MLXFAST_PRIVATE_DIR}/mtp-gates-stdout.raw\""))
+        #expect(scrubBody.contains("\"${MLXFAST_PRIVATE_DIR}/mtp-gates-private.log\""))
+        #expect(scrubBody.contains("mtp-gates-report.json"))
         #expect(scrubBody.contains("hash-weights-directory.sh \"${MLXFAST_JOB_WS}/mtp-weights\""))
         #expect(scrubBody.contains("transformed MTP weights changed before timing"))
+
+        let correctnessArtifacts = try stepBody(
+            workflow,
+            from: "- name: Stage MTP correctness artifacts",
+            to: "- name: Upload MTP correctness artifacts"
+        )
+        #expect(correctnessArtifacts.contains("MLXFAST_ARTIFACT_PROFILE=mtp-correctness"))
+        #expect(
+            correctnessArtifacts.contains(
+                "mtp-correctness-verdict.json=mtp-correctness-verdict.json"
+            )
+        )
+        #expect(!correctnessArtifacts.contains("candidate.sha="))
+        #expect(!correctnessArtifacts.contains("mtp-weights.sha256="))
+
+        let benchmarkArtifacts = try stepBody(
+            workflow,
+            from: "- name: Stage MTP benchmark artifacts",
+            to: "- name: Upload MTP benchmark artifacts"
+        )
+        #expect(benchmarkArtifacts.contains("MLXFAST_ARTIFACT_PROFILE=mtp-score"))
+        #expect(benchmarkArtifacts.contains("score.json=score.json"))
+        #expect(!benchmarkArtifacts.contains("candidate.sha="))
+        #expect(!benchmarkArtifacts.contains("score.sha256="))
+        #expect(!benchmarkArtifacts.contains("mtp-gates-report.json="))
+        #expect(!workflow.contains("- name: Stage MTP audit artifacts"))
+        #expect(!workflow.contains("- name: Upload MTP audit artifacts"))
     }
 }

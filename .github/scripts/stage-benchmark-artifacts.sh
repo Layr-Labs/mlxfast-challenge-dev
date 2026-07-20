@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Copy already-validated benchmark outputs into a single upload directory.
+# Stage validated benchmark outputs into a single upload directory. Strict MTP
+# profiles reconstruct canonical JSON instead of copying source bytes.
 set -euo pipefail
 
 if [[ "$#" -lt 2 ]]; then
@@ -97,10 +98,52 @@ for mapping in "$@"; do
     exit 1
   fi
 
-  # `--` terminates option parsing so a source path that begins with '-'
-  # cannot be reinterpreted as a cp flag. The mappings here are trusted
-  # workflow constants today; this keeps the copy safe if that ever changes.
-  cp -- "${source_path}" "${dest}/${name}"
+  # Validate the source before staging. MTP public profiles reconstruct a
+  # canonical object from exact allowlisted fields so duplicate keys, extra
+  # documents, whitespace, and other original byte choices never reach upload.
+  .github/scripts/deny-private-artifacts.sh "${source_path}"
+  destination="${dest}/${name}"
+  case "${MLXFAST_ARTIFACT_PROFILE:-default}" in
+    mtp-correctness)
+      jq -cS '
+        {
+          schema_version: .schema_version,
+          track_id: .track_id,
+          gate_passed: .gate_passed,
+          token_count: .token_count
+        }
+      ' "${source_path}" > "${destination}"
+      ;;
+    mtp-score)
+      jq -cS '
+        {
+          score: .score,
+          passed: .passed,
+          track_id: .track_id,
+          metrics: {
+            mode: .metrics.mode,
+            aggregation: .metrics.aggregation,
+            decode_tokens: .metrics.decode_tokens,
+            decode_speedup_floor: .metrics.decode_speedup_floor,
+            accepted_pair_count: .metrics.accepted_pair_count,
+            target_pair_count: .metrics.target_pair_count,
+            parity_all_ok: .metrics.parity_all_ok,
+            mtp_decode_speedup_ratio_of_means:
+              .metrics.mtp_decode_speedup_ratio_of_means
+          }
+        }
+      ' "${source_path}" > "${destination}"
+      ;;
+    default)
+      # `--` terminates option parsing so a source path that begins with '-'
+      # cannot be reinterpreted as a cp flag.
+      cp -- "${source_path}" "${destination}"
+      ;;
+    *)
+      echo "unknown MLXFAST_ARTIFACT_PROFILE=${MLXFAST_ARTIFACT_PROFILE}" >&2
+      exit 2
+      ;;
+  esac
 done
 
 .github/scripts/deny-private-artifacts.sh "${dest}"

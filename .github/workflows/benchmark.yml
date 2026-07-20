@@ -28,9 +28,9 @@ name: benchmark
 #   - stall guardrail: a run with max block latency > 4x its p50 is rejected
 #     as measurement-invalid, with one gated retry (owned by measure-mtp-job,
 #     same class as its throttle rejection);
-#   - hard bit-exact token gate across every timed run (parity_all_ok).
+#   - hard exact returned-token-ID gate across every timed run (parity_all_ok).
 #
-# WHAT A LIVE RUN DOES (after go-live):
+# WHAT A LIVE RUN DOES:
 #   1. Verifies the operator-provisioned 31B-IT target + assistant caches
 #      against the checked-in byte manifests (every file, every run).
 #   2. Builds the candidate through the bench-exec bridge and transforms the
@@ -58,7 +58,7 @@ name: benchmark
 #              = mean(serial s/tok over accepted pairs)
 #                / mean(mtp s/tok over accepted pairs)   [ratio-of-means]
 #        floor >= 1.0 on that aggregate, hard;
-#        bit-exact gate: parity_all_ok must be true across every timed run.
+#        exact-token gate: parity_all_ok must be true across every timed run.
 #      There is no prefill component: the MTP protocol charges seed prefill
 #      inside the decode measurement.
 #
@@ -75,8 +75,8 @@ name: benchmark
 #       here, never from the candidate workspace, so a submission cannot
 #       slow the reference to inflate its ratio.
 #   MLXFAST_MTP_BASELINE_CALIBRATION
-#       Operator calibration (fresh gated sessions, authored per the go-live
-#       runbook at a ref containing the block-0 stall fix) with sanity bands
+#       Operator calibration (fresh gated sessions, recorded by the validated
+#       operator procedure at a ref containing the block-0 stall fix) with sanity bands
 #       for the serial denominator.
 #   MLXFAST_MTP_MEASURE_JOB
 #       Box-owned timing wrapper (sibling of measure-job.sh) with the same
@@ -167,13 +167,13 @@ jobs:
       MLXFAST_MTP_MIN_ACCEPTED_PAIRS: "3"
       MLXFAST_MTP_TARGET_PAIRS: "4"
       # Hidden IT-target golden pins, frozen 2026-07-15 on M5 silicon from the
-      # pinned IT target at the post-stall-fix tip (go-live runbook step B;
-      # capture record in the operator private store). PENDING box-2 replay
-      # confirmation: if the serving box's stack diverges on any near-tie
-      # argmax, the goldens are regenerated there and these pins updated
-      # before this change merges. The enablement gate fails closed if any
-      # pin is emptied. (The R2 object KEYS are deliberately scoped to the
-      # one trusted download step, exactly like the serial pipeline.)
+      # pinned IT target at the post-stall-fix tip (validated freeze record in
+      # the operator private store) and validated for the
+      # live default MTP workflow. If a future serving-stack rotation changes
+      # a near-tie argmax, operators regenerate the goldens and update these
+      # pins before serving submissions. The enablement gate fails closed if
+      # any pin is emptied. (The R2 object KEYS are deliberately scoped to
+      # the one trusted download step, exactly like the serial pipeline.)
       MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256: d4fff3fe015123c395be68cb19401709ec288e44a04e52c2ea36c32220356862
       MLXFAST_MTP_CORRECTNESS_GOLDEN_BYTES: "14683"
       MLXFAST_MTP_BENCH_GOLDEN_SHA256: a472d6e40c3bada936fa39535753fec609d836e709db03274222a4a303ae6f58
@@ -189,7 +189,7 @@ jobs:
     steps:
       # Fail fast if the box is quarantined or the isolation stack is missing,
       # before any checkout or secret use. MTP-specific host paths are only
-      # asserted after the enablement gate (they do not exist until go-live).
+      # asserted after the standing enablement interlock.
       - name: Host preflight
         run: |
           set -euo pipefail
@@ -204,7 +204,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           # Submission branches contribute editable paths only; trusted main
-          # is the harness/workflow/contract base (including the enablement
+          # is the harness/workflow/contract base (including the standing
           # fixture read below). Main, baseline/*, and yukon/baseline/* run
           # their exact SHA.
           ref: ${{ startsWith(github.ref, 'refs/heads/submissions/') && 'main' || github.sha }}
@@ -230,7 +230,7 @@ jobs:
           scoring_enabled="$(jq -r '.official_scoring_enabled' "${MLXFAST_MTP_CONTRACT_PATH}")"
           publication_allowed="$(jq -r '.reference_baseline.publication_allowed' "${MLXFAST_MTP_CONTRACT_PATH}")"
           if [[ "${scoring_enabled}" != "true" || "${publication_allowed}" != "true" ]]; then
-            echo "::error::MTP track ${MLXFAST_MTP_TRACK_ID} is NOT enabled (official_scoring_enabled=${scoring_enabled}, reference_baseline.publication_allowed=${publication_allowed}). This workflow is deliberately inert until the operator completes docs/mtp-track-golive-runbook.md and flips both trusted-contract fields on main." >&2
+            echo "::error::MTP track ${MLXFAST_MTP_TRACK_ID} live contract is disabled or inconsistent (official_scoring_enabled=${scoring_enabled}, reference_baseline.publication_allowed=${publication_allowed}); restore both trusted fields on main before serving submissions" >&2
             exit 1
           fi
           for pin_name in \
@@ -239,7 +239,7 @@ jobs:
             MLXFAST_MTP_BENCH_GOLDEN_SHA256 \
             MLXFAST_MTP_BENCH_GOLDEN_BYTES; do
             if [[ -z "${!pin_name}" ]]; then
-              echo "::error::hidden MTP golden pin ${pin_name} is empty; freeze the IT-target goldens (go-live runbook step B) and pin them here before enabling the track" >&2
+              echo "::error::hidden MTP golden pin ${pin_name} is empty; restore the validated operator pin before serving submissions" >&2
               exit 1
             fi
           done
@@ -249,7 +249,7 @@ jobs:
           fi
           echo "mtp-benchmark: track ${MLXFAST_MTP_TRACK_ID} enablement verified"
 
-      # MTP-specific host contract, asserted only once the track is live.
+      # MTP-specific host contract, asserted after the standing interlock.
       - name: MTP host preflight
         run: |
           set -euo pipefail
@@ -875,6 +875,9 @@ jobs:
           set -euo pipefail
           raw_stdout="${MLXFAST_PRIVATE_DIR}/mtp-gates-stdout.raw"
           gates_log="${MLXFAST_PRIVATE_DIR}/mtp-gates-private.log"
+          verdict="mtp-correctness-verdict.json"
+          rm -f -- "${verdict}"
+          trap 'rm -f -- "${raw_stdout}" "${gates_log}"' EXIT
           started="${SECONDS}"
           status=0
           # shellcheck disable=SC2024  # trusted shell owns the capture files
@@ -927,7 +930,15 @@ jobs:
               echo "::error::MTP correctness gate report failed validation (exit=${status})" >&2
               exit 1
             }
-          cp "${raw_stdout}" mtp-gates-report.json
+          jq -n \
+            --arg track "${MLXFAST_MTP_TRACK_ID}" \
+            --argjson token_count "${MLXFAST_MTP_CORRECTNESS_TOKENS}" \
+            '{
+              schema_version: 1,
+              track_id: $track,
+              gate_passed: true,
+              token_count: $token_count
+            }' > "${verdict}"
           echo "mtp-benchmark: correctness/parity gate passed in $((SECONDS - started))s (exit=${status})"
           exit "${status}"
 
@@ -937,16 +948,14 @@ jobs:
         if: ${{ !inputs.run_benchmark }}
         run: |
           set -euo pipefail
-          test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"
+          export MLXFAST_ARTIFACT_PROFILE=mtp-correctness
+          export MLXFAST_EXPECTED_TRACK_ID="${MLXFAST_MTP_TRACK_ID}"
+          export MLXFAST_EXPECTED_TOKEN_COUNT="${MLXFAST_MTP_CORRECTNESS_TOKENS}"
           .github/scripts/deny-private-artifacts.sh \
-            candidate.sha \
-            mtp-gates-report.json \
-            mtp-weights.sha256
+            mtp-correctness-verdict.json
           .github/scripts/stage-benchmark-artifacts.sh \
             "${MLXFAST_ARTIFACT_ROOT}/mtp-correctness-results" \
-            candidate.sha=candidate.sha \
-            mtp-gates-report.json=mtp-gates-report.json \
-            mtp-weights.sha256=mtp-weights.sha256
+            mtp-correctness-verdict.json=mtp-correctness-verdict.json
 
       - name: Upload MTP correctness artifacts
         if: always() && steps.stage_mtp_correctness_artifacts.outcome == 'success'
@@ -967,6 +976,11 @@ jobs:
         run: |
           set -euo pipefail
           rm -f "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json"
+          rm -f \
+            "${MLXFAST_PRIVATE_DIR}/mtp-gates-stdout.raw" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-gates-private.log" \
+            mtp-correctness-verdict.json \
+            mtp-gates-report.json
           rm -rf "${MLXFAST_JOB_WS}/private"
           mkdir -p "${MLXFAST_JOB_WS}/private"
           sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
@@ -1010,6 +1024,15 @@ jobs:
             echo "::error::hidden-material scrub left candidates behind: ${leftovers}" >&2
             exit 1
           fi
+          for raw_report in \
+            "${MLXFAST_PRIVATE_DIR}/mtp-gates-stdout.raw" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-gates-private.log" \
+            mtp-gates-report.json; do
+            if [[ -e "${raw_report}" || -L "${raw_report}" ]]; then
+              echo "::error::hidden-material scrub left raw MTP report: ${raw_report}" >&2
+              exit 1
+            fi
+          done
           echo "mtp-benchmark: bench workspace restored to pre-hidden snapshot before timing"
 
       - name: Reap lingering bench processes before timing
@@ -1078,10 +1101,10 @@ jobs:
               --tag "mtp-ranked-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
               --out "${MLXFAST_MEASURE_OUT}"
           test -s "${MLXFAST_MEASURE_OUT}/results.json"
-          jq -c '{mode, accepted_pair_count, parity_all_ok}' "${MLXFAST_MEASURE_OUT}/results.json"
+          echo "mtp-benchmark: sealed paired measurement completed"
 
       # Decode-only score contract (adopted 2026-07-14 memo), applied in the
-      # trusted shell from the sealed paired results: hard bit-exact gate,
+      # trusted shell from the sealed paired results: hard returned-token gate,
       # minimum accepted pairs, RATIO-OF-MEANS aggregation computed HERE from
       # the sealed per-side seconds/token means (never trusted from a
       # pre-aggregated field), and the 1.0 floor on that aggregate. The
@@ -1108,7 +1131,7 @@ jobs:
             and (.aggregate.mtp_decode_speedup_median | type == "number")
             and (.aggregate.mtp_decode_speedup_min | type == "number")
             ' "${results}" >/dev/null || {
-              echo "::error::paired MTP results failed validation (bit-exact gate, pair count, or schema)" >&2
+              echo "::error::paired MTP results failed validation (returned-token parity gate, pair count, or schema)" >&2
               exit 1
             }
           # Ratio-of-means: mean serial s/tok over accepted pairs divided by
@@ -1122,8 +1145,6 @@ jobs:
           fi
           jq -n \
             --arg track "${MLXFAST_MTP_TRACK_ID}" \
-            --arg commit "${MLXFAST_CANDIDATE_SHA}" \
-            --arg weights_hash "$(tr -d '[:space:]' < mtp-weights.sha256)" \
             --argjson score "${speedup}" \
             --argjson floor "${MLXFAST_MTP_DECODE_SPEEDUP_FLOOR}" \
             --argjson decode_tokens "${MLXFAST_MTP_DECODE_TOKENS}" \
@@ -1137,48 +1158,62 @@ jobs:
               metrics: {
                 mode: "mtp-paired-decode-only",
                 aggregation: "ratio_of_means",
-                commit: $commit,
                 decode_tokens: $decode_tokens,
                 decode_speedup_floor: $floor,
                 accepted_pair_count: $results[0].accepted_pair_count,
                 target_pair_count: $target_pairs,
                 parity_all_ok: $results[0].parity_all_ok,
-                mtp_decode_speedup_ratio_of_means: $score,
-                mtp_decode_speedup_median: $results[0].aggregate.mtp_decode_speedup_median,
-                mtp_decode_speedup_min: $results[0].aggregate.mtp_decode_speedup_min,
-                baseline_serial_seconds_per_token_mean: $results[0].aggregate.baseline_serial_seconds_per_token_mean,
-                candidate_mtp_seconds_per_token_mean: $results[0].aggregate.candidate_mtp_seconds_per_token_mean,
-                mtp_weights_hash: $weights_hash
+                mtp_decode_speedup_ratio_of_means: $score
               }
             }
             ' > score.json
-          shasum -a 256 score.json | awk '{print $1}' > score.json.sha256
+          export MLXFAST_ARTIFACT_PROFILE=mtp-score
+          export MLXFAST_EXPECTED_TRACK_ID="${MLXFAST_MTP_TRACK_ID}"
+          export MLXFAST_EXPECTED_TOKEN_COUNT="${MLXFAST_MTP_DECODE_TOKENS}"
+          export MLXFAST_EXPECTED_SCORE_FLOOR="${MLXFAST_MTP_DECODE_SPEEDUP_FLOOR}"
+          export MLXFAST_EXPECTED_MIN_PAIRS="${MLXFAST_MTP_MIN_ACCEPTED_PAIRS}"
+          export MLXFAST_EXPECTED_TARGET_PAIRS="${MLXFAST_MTP_TARGET_PAIRS}"
+          .github/scripts/deny-private-artifacts.sh score.json
+          rm -f -- \
+            "${MLXFAST_MEASURE_OUT}/results.json" \
+            "${MLXFAST_MEASURE_OUT}/verdict.txt"
+          for private_result in \
+            "${MLXFAST_MEASURE_OUT}/results.json" \
+            "${MLXFAST_MEASURE_OUT}/verdict.txt"; do
+            if [[ -e "${private_result}" || -L "${private_result}" ]]; then
+              echo "::error::could not delete runner-private MTP result before artifact staging: ${private_result}" >&2
+              exit 1
+            fi
+          done
           jq -c '{track_id, score, passed}' score.json
 
       - name: Check MTP benchmark artifact paths
         if: ${{ inputs.run_benchmark }}
         run: |
           set -euo pipefail
-          test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"
+          export MLXFAST_ARTIFACT_PROFILE=mtp-score
+          export MLXFAST_EXPECTED_TRACK_ID="${MLXFAST_MTP_TRACK_ID}"
+          export MLXFAST_EXPECTED_TOKEN_COUNT="${MLXFAST_MTP_DECODE_TOKENS}"
+          export MLXFAST_EXPECTED_SCORE_FLOOR="${MLXFAST_MTP_DECODE_SPEEDUP_FLOOR}"
+          export MLXFAST_EXPECTED_MIN_PAIRS="${MLXFAST_MTP_MIN_ACCEPTED_PAIRS}"
+          export MLXFAST_EXPECTED_TARGET_PAIRS="${MLXFAST_MTP_TARGET_PAIRS}"
           .github/scripts/deny-private-artifacts.sh \
-            candidate.sha \
-            score.json \
-            score.json.sha256 \
-            mtp-gates-report.json \
-            mtp-weights.sha256
+            score.json
 
       - name: Stage MTP benchmark artifacts
         id: stage_mtp_benchmark_artifacts
         if: ${{ inputs.run_benchmark }}
         run: |
           set -euo pipefail
+          export MLXFAST_ARTIFACT_PROFILE=mtp-score
+          export MLXFAST_EXPECTED_TRACK_ID="${MLXFAST_MTP_TRACK_ID}"
+          export MLXFAST_EXPECTED_TOKEN_COUNT="${MLXFAST_MTP_DECODE_TOKENS}"
+          export MLXFAST_EXPECTED_SCORE_FLOOR="${MLXFAST_MTP_DECODE_SPEEDUP_FLOOR}"
+          export MLXFAST_EXPECTED_MIN_PAIRS="${MLXFAST_MTP_MIN_ACCEPTED_PAIRS}"
+          export MLXFAST_EXPECTED_TARGET_PAIRS="${MLXFAST_MTP_TARGET_PAIRS}"
           .github/scripts/stage-benchmark-artifacts.sh \
             "${MLXFAST_ARTIFACT_ROOT}/benchmark-results" \
-            candidate.sha=candidate.sha \
-            score.json=score.json \
-            score.sha256=score.json.sha256 \
-            mtp-gates-report.json=mtp-gates-report.json \
-            mtp-weights.sha256=mtp-weights.sha256
+            score.json=score.json
 
       - name: Upload MTP benchmark artifacts
         if: ${{ inputs.run_benchmark && steps.stage_mtp_benchmark_artifacts.outcome == 'success' }}
@@ -1189,42 +1224,8 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
-      # Timing provenance for audit/disputes: sealed paired results (paths,
-      # commit ids, timings, telemetry aggregates only) and the measure
-      # verdict. Content-vetted by deny-private-artifacts.
-      - name: Stage MTP audit artifacts
-        id: stage_mtp_audit_artifacts
-        if: ${{ always() && inputs.run_benchmark }}
-        run: |
-          set -euo pipefail
-          staged=()
-          if [[ -s "${MLXFAST_MEASURE_OUT}/results.json" ]]; then
-            cp "${MLXFAST_MEASURE_OUT}/results.json" mtp-paired-results.json
-            staged+=(mtp-paired-results.json=mtp-paired-results.json)
-          fi
-          if [[ -s "${MLXFAST_MEASURE_OUT}/verdict.txt" ]]; then
-            cp "${MLXFAST_MEASURE_OUT}/verdict.txt" mtp-measure-verdict.txt
-            staged+=(mtp-measure-verdict.txt=mtp-measure-verdict.txt)
-          fi
-          if [[ -s mtp-weights.sha256 ]]; then
-            staged+=(mtp-weights.sha256=mtp-weights.sha256)
-          fi
-          if [[ "${#staged[@]}" -eq 0 ]]; then
-            echo "mtp-benchmark: no audit artifacts to stage"
-            exit 0
-          fi
-          .github/scripts/stage-benchmark-artifacts.sh \
-            "${MLXFAST_ARTIFACT_ROOT}/mtp-benchmark-audit" \
-            "${staged[@]}"
-
-      - name: Upload MTP audit artifacts
-        if: ${{ always() && inputs.run_benchmark && steps.stage_mtp_audit_artifacts.outcome == 'success' }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: mtp-benchmark-audit-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/mtp-benchmark-audit
-          if-no-files-found: ignore
-          retention-days: 90
+      # Sealed measure results and free-form verdict text remain runner-private
+      # until the always-run cleanup below. They are never copied or uploaded.
 
       - name: Cleanup bench workspace
         if: always()

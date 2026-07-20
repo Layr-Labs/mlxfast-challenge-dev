@@ -448,6 +448,18 @@ struct ExperimentalMTPDecodeMeasurement: Equatable {
     }
 }
 
+struct ExperimentalMTPBlockObservation: Equatable, Sendable {
+    let startingLogicalTargetOffset: Int
+    let requestedMaxBlockSize: Int
+    let returnedTokenCount: Int
+}
+
+struct ExperimentalMTPVerificationDelta: Equatable, Sendable {
+    let exactPairSegmentCount: Int
+    let exactPairRollbackRowCount: Int
+    let serialVerificationRowCount: Int
+}
+
 struct ExperimentalMTPAcceptanceAccumulator: Equatable {
     private(set) var proposedDraftTokenCount = 0
     private(set) var acceptedDraftTokenCount = 0
@@ -638,6 +650,258 @@ extension GemmaRuntime {
         }
     }
 
+    static func experimentalMTPVerificationDeltas(
+        for observation: ExperimentalMTPBlockObservation,
+        verificationMode: Gemma4MTPVerificationMode
+    ) throws -> [ExperimentalMTPVerificationDelta] {
+        let k = observation.requestedMaxBlockSize
+        let c = observation.returnedTokenCount
+        guard observation.startingLogicalTargetOffset >= 0,
+              (1...MLXFastConstants.experimentalMTPMaxBlockSize).contains(k),
+              (1...k).contains(c)
+        else {
+            throw MLXFastError.invalidInput(
+                "trained MTP diagnostics contain an invalid block observation"
+            )
+        }
+
+        if verificationMode == .serial {
+            return [
+                ExperimentalMTPVerificationDelta(
+                    exactPairSegmentCount: 0,
+                    exactPairRollbackRowCount: 0,
+                    serialVerificationRowCount: c
+                )
+            ]
+        }
+
+        func delta(_ segments: Int, _ rollbacks: Int, _ serial: Int)
+            -> ExperimentalMTPVerificationDelta
+        {
+            ExperimentalMTPVerificationDelta(
+                exactPairSegmentCount: segments,
+                exactPairRollbackRowCount: rollbacks,
+                serialVerificationRowCount: serial
+            )
+        }
+
+        let serialFallback = [delta(0, 0, c)]
+        if k == 1 {
+            return serialFallback
+        }
+
+        // The ranked track's rotating cache has a 1,024-token window.
+        // canAppendExactRows(2) requires offset + 2 <= 1,024 before the first
+        // wrap; direct-four/two-pair composition requires offset + 4 <= 1,024.
+        // Engine ineligibility is fail-closed, so geometry is the only legal
+        // exact-pair-mode serial fallback.
+        let offset = observation.startingLogicalTargetOffset
+        let firstPairFits = offset <= 1_022
+        let fullFourRowsFit = offset <= 1_020
+        if !firstPairFits {
+            return serialFallback
+        }
+
+        switch (k, c) {
+        case (2, 1), (3, 1):
+            return [delta(1, 1, 0)]
+        case (2, 2), (3, 2):
+            return [delta(1, 0, 0)]
+        case (3, 3):
+            return [delta(1, 0, 1)]
+        case (4, 1):
+            return fullFourRowsFit
+                ? [delta(1, 1, 0), delta(2, 3, 0)]
+                : [delta(1, 1, 0)]
+        case (4, 2):
+            return fullFourRowsFit
+                ? [delta(1, 0, 0), delta(2, 2, 0)]
+                : [delta(1, 0, 0)]
+        case (4, 3):
+            return fullFourRowsFit
+                ? [delta(2, 1, 0)]
+                : [delta(1, 0, 1)]
+        case (4, 4):
+            return fullFourRowsFit
+                ? [delta(2, 0, 0)]
+                : [delta(1, 0, 2)]
+        default:
+            throw MLXFastError.invalidInput(
+                "trained MTP diagnostics contain an unsupported block observation"
+            )
+        }
+    }
+
+    static func validateExperimentalMTPVerificationDiagnostics(
+        totalTokenCount: Int,
+        verificationMode: Gemma4MTPVerificationMode,
+        observedBlocks: [ExperimentalMTPBlockObservation],
+        exactPairSegmentCount: Int,
+        exactPairRollbackRowCount: Int,
+        serialVerificationRowCount: Int
+    ) throws {
+        guard totalTokenCount > 0,
+              totalTokenCount
+                  <= MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens
+        else {
+            throw MLXFastError.invalidInput(
+                "trained MTP diagnostics received an invalid token total"
+            )
+        }
+
+        // Cheap overflow-safe bounds and the exact physical-row equation run
+        // before allocating the bounded reachability workspace.
+        let maximumPairSegments = 2 * totalTokenCount
+        let maximumRollbackRows = 3 * totalTokenCount
+        guard (0...maximumPairSegments).contains(exactPairSegmentCount),
+              (0...maximumRollbackRows).contains(exactPairRollbackRowCount),
+              (0...totalTokenCount).contains(serialVerificationRowCount)
+        else {
+            throw MLXFastError.invalidInput(
+                "trained MTP diagnostics returned invalid verification data"
+            )
+        }
+        let maximumRollbackRowsForSegments =
+            exactPairSegmentCount + exactPairSegmentCount / 2
+        guard exactPairRollbackRowCount <= maximumRollbackRowsForSegments else {
+            throw MLXFastError.invalidInput(
+                "trained MTP diagnostics returned impossible rollback accounting"
+            )
+        }
+        let physicalRowCount = 2 * exactPairSegmentCount
+            - exactPairRollbackRowCount
+            + serialVerificationRowCount
+        guard physicalRowCount == totalTokenCount else {
+            throw MLXFastError.invalidInput(
+                "trained MTP verification rows (\(physicalRowCount)) diverged "
+                    + "from the configured decode total (\(totalTokenCount))"
+            )
+        }
+
+        // The observations are trusted parent history. Enforce final-request
+        // truncation and prepare the exact per-block alternatives.
+        guard !observedBlocks.isEmpty,
+              observedBlocks.count <= totalTokenCount
+        else {
+            throw MLXFastError.invalidInput(
+                "trained MTP diagnostics have invalid block history length"
+            )
+        }
+        var remainingTokenCount = totalTokenCount
+        var expectedStartingOffset =
+            observedBlocks[0].startingLogicalTargetOffset
+        var alternatives: [[ExperimentalMTPVerificationDelta]] = []
+        alternatives.reserveCapacity(observedBlocks.count)
+        for observation in observedBlocks {
+            guard observation.startingLogicalTargetOffset == expectedStartingOffset,
+                  observation.requestedMaxBlockSize <= remainingTokenCount
+            else {
+                throw MLXFastError.invalidInput(
+                    "trained MTP block history violates parent offset or truncation"
+                )
+            }
+            let deltas = try experimentalMTPVerificationDeltas(
+                for: observation,
+                verificationMode: verificationMode
+            )
+            alternatives.append(deltas)
+            remainingTokenCount -= observation.returnedTokenCount
+            let (nextOffset, offsetOverflow) =
+                expectedStartingOffset.addingReportingOverflow(
+                    observation.returnedTokenCount
+                )
+            guard !offsetOverflow else {
+                throw MLXFastError.invalidInput(
+                    "trained MTP block history offset overflowed"
+                )
+            }
+            expectedStartingOffset = nextOffset
+        }
+        guard remainingTokenCount == 0 else {
+            throw MLXFastError.invalidInput(
+                "trained MTP block history does not reach the configured total"
+            )
+        }
+
+        // Every legal delta satisfies c = 2*S - R + V. Since the observed c
+        // values sum to totalTokenCount and the reported tuple passed the same
+        // equation, matching (S,R) also proves the exact reported V.
+        //
+        // Bitset DP complexity:
+        // O(blocks * alternatives * targetS * ceil((targetR + 1) / 64))
+        // time and O(targetS * ceil((targetR + 1) / 64)) memory. At the
+        // protocol caps this is about 40M UInt64 operations and two 205 KiB
+        // buffers, allocated only after timing has stopped.
+        let targetSegments = exactPairSegmentCount
+        let targetRollbacks = exactPairRollbackRowCount
+        let wordsPerRow = targetRollbacks / 64 + 1
+        let rowCount = targetSegments + 1
+        let wordCount = rowCount * wordsPerRow
+        var reachable = [UInt64](repeating: 0, count: wordCount)
+        var next = [UInt64](repeating: 0, count: wordCount)
+        reachable[0] = 1
+        let validBitsInLastWord = targetRollbacks % 64 + 1
+        let lastWordMask =
+            validBitsInLastWord == 64
+            ? UInt64.max
+            : (UInt64(1) << UInt64(validBitsInLastWord)) - 1
+
+        for blockAlternatives in alternatives {
+            for index in next.indices {
+                next[index] = 0
+            }
+            for delta in blockAlternatives {
+                let segmentDelta = delta.exactPairSegmentCount
+                let rollbackDelta = delta.exactPairRollbackRowCount
+                guard segmentDelta <= targetSegments,
+                      rollbackDelta <= targetRollbacks
+                else {
+                    continue
+                }
+                let rollbackWordShift = rollbackDelta / 64
+                let rollbackBitShift = rollbackDelta % 64
+                for sourceSegments in 0...(targetSegments - segmentDelta) {
+                    let sourceBase = sourceSegments * wordsPerRow
+                    let destinationBase =
+                        (sourceSegments + segmentDelta) * wordsPerRow
+                    for sourceWord in 0..<wordsPerRow {
+                        let bits = reachable[sourceBase + sourceWord]
+                        if bits == 0 { continue }
+                        let destinationWord = sourceWord + rollbackWordShift
+                        if destinationWord >= wordsPerRow { continue }
+                        next[destinationBase + destinationWord] |=
+                            bits << UInt64(rollbackBitShift)
+                        if rollbackBitShift > 0,
+                           destinationWord + 1 < wordsPerRow
+                        {
+                            next[destinationBase + destinationWord + 1] |=
+                                bits >> UInt64(64 - rollbackBitShift)
+                        }
+                    }
+                }
+            }
+            if lastWordMask != UInt64.max {
+                for segments in 0...targetSegments {
+                    next[(segments + 1) * wordsPerRow - 1] &= lastWordMask
+                }
+            }
+            guard next.contains(where: { $0 != 0 }) else {
+                throw MLXFastError.invalidInput(
+                    "trained MTP diagnostics are unreachable from block history"
+                )
+            }
+            swap(&reachable, &next)
+        }
+
+        let targetWord = targetRollbacks / 64
+        let targetBit = UInt64(1) << UInt64(targetRollbacks % 64)
+        guard reachable[targetSegments * wordsPerRow + targetWord] & targetBit != 0 else {
+            throw MLXFastError.invalidInput(
+                "trained MTP diagnostics are unreachable from block history"
+            )
+        }
+    }
+
     static func measureExperimentalTrainedMTPWorkerDecode(
         plan: ExperimentalMTPPromptPlan,
         maxBlockSize: Int,
@@ -649,6 +913,12 @@ extension GemmaRuntime {
             expectedTokens: plan.expectedTokens,
             totalTokenCount: totalTokenCount
         )
+        // Reserve trusted bookkeeping before timing. Appends remain inside the
+        // measured parent loop, but cannot grow either backing allocation.
+        var observedBlocks: [ExperimentalMTPBlockObservation] = []
+        observedBlocks.reserveCapacity(totalTokenCount)
+        var blockRequestSeconds: [Double] = []
+        blockRequestSeconds.reserveCapacity(totalTokenCount)
 
         // This is the only timing authority. It charges prefill, drafting,
         // multi-position target verification, rejection/rollback, IPC and all
@@ -674,13 +944,17 @@ extension GemmaRuntime {
 
         var previousCommittedToken = seedToken
         var blockRequestCount = 0
-        var blockRequestSeconds: [Double] = []
         var acceptance = ExperimentalMTPAcceptanceAccumulator()
         while validator.remainingTokenCount > 0 {
             let requestedMaxBlockSize = min(
                 maxBlockSize,
                 validator.remainingTokenCount
             )
+            // Seed prefill has already materialized seedTokens.count target
+            // rows. Every previously returned token commits exactly one more.
+            let startingLogicalTargetOffset =
+                plan.seedTokens.count
+                + (totalTokenCount - validator.remainingTokenCount)
             let blockStart = DispatchTime.now().uptimeNanoseconds
             let response = try worker.trainedMTPDecodeBlock(
                 previousToken: previousCommittedToken,
@@ -695,6 +969,13 @@ extension GemmaRuntime {
             try validator.accept(
                 tokens,
                 requestedMaxBlockSize: requestedMaxBlockSize
+            )
+            observedBlocks.append(
+                ExperimentalMTPBlockObservation(
+                    startingLogicalTargetOffset: startingLogicalTargetOffset,
+                    requestedMaxBlockSize: requestedMaxBlockSize,
+                    returnedTokenCount: tokens.count
+                )
             )
             try acceptance.record(
                 requestedMaxBlockSize: requestedMaxBlockSize,
@@ -726,46 +1007,24 @@ extension GemmaRuntime {
             diagnostics.exactPairRollbackRowCount ?? -1
         let serialVerificationRowCount =
             diagnostics.serialVerificationRowCount ?? -1
-        // Worker-reported counters are untrusted. Bound each one by its
-        // physical maximum for the parent-owned decode total before any
-        // arithmetic so hostile values can neither overflow nor smuggle
-        // wide integers into the published report: every exact pair and
-        // every serial row commits at least one of the totalTokenCount
-        // tokens, and each pair rolls back at most one row.
         guard peakRamGB >= 0,
               mlxActiveMemoryBytes >= 0,
               mlxCacheMemoryBytes >= 0,
               mlxPeakMemoryBytes >= 0,
-              targetVerificationMode == verificationMode.rawValue,
-              (0...totalTokenCount).contains(exactPairSegmentCount),
-              (0...exactPairSegmentCount).contains(exactPairRollbackRowCount),
-              (0...totalTokenCount).contains(serialVerificationRowCount)
+              targetVerificationMode == verificationMode.rawValue
         else {
             throw MLXFastError.invalidInput(
                 "trained MTP diagnostics returned invalid verification or memory data"
             )
         }
-        // Physical row accounting: each exact pair appends two target rows,
-        // each pair rollback removes one, and each serial row appends one.
-        // Committed rows must equal the parent-owned decode total exactly.
-        let physicalRowCount = 2 * exactPairSegmentCount
-            - exactPairRollbackRowCount
-            + serialVerificationRowCount
-        guard physicalRowCount == totalTokenCount else {
-            throw MLXFastError.invalidInput(
-                "trained MTP verification rows (\(physicalRowCount)) diverged "
-                    + "from the configured decode total (\(totalTokenCount))"
-            )
-        }
-        if verificationMode == .serial {
-            guard exactPairSegmentCount == 0,
-                  exactPairRollbackRowCount == 0
-            else {
-                throw MLXFastError.invalidInput(
-                    "serial MTP verification reported exact-pair segments"
-                )
-            }
-        }
+        try validateExperimentalMTPVerificationDiagnostics(
+            totalTokenCount: totalTokenCount,
+            verificationMode: verificationMode,
+            observedBlocks: observedBlocks,
+            exactPairSegmentCount: exactPairSegmentCount,
+            exactPairRollbackRowCount: exactPairRollbackRowCount,
+            serialVerificationRowCount: serialVerificationRowCount
+        )
         return ExperimentalMTPDecodeMeasurement(
             elapsedSeconds: elapsedSeconds,
             secondsPerToken: elapsedSeconds

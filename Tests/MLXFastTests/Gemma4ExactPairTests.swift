@@ -8,6 +8,37 @@ import MLXLMCommon
 import MLXNN
 import Testing
 
+private struct ExactPairNumericTolerance: Sendable {
+    let relative: Double
+    let absolute: Double
+}
+
+// Provisional heuristic regression envelopes: MLX reports unit-scale
+// epsilons of 9.77e-4 for Float16 and 7.8125e-3 for BF16. Existing tests in
+// this repository use rtol=1e-5/atol=1e-5 for Gemma 4 logits and
+// rtol=1e-2/atol=2e-3 for BF16 attention outputs. KV keeps the BF16-relative
+// allowance with a smaller absolute heuristic to increase sensitivity near
+// zero; it does not guarantee detection of every stale or shifted value. These
+// values are local/trusted regression heuristics, not ranked submission gates
+// or M5-calibrated optimization limits. Reassociated kernels must be calibrated
+// on M5 before relying on or loosening any envelope.
+private let exactPairLogitsTolerance = ExactPairNumericTolerance(
+    relative: 1e-5,
+    absolute: 1e-5
+)
+private let exactPairHiddenStateTolerance = ExactPairNumericTolerance(
+    relative: 1e-2,
+    absolute: 2e-3
+)
+private let exactPairKVTolerance = ExactPairNumericTolerance(
+    relative: 1e-2,
+    absolute: 1e-3
+)
+private let exactPairAttentionTolerance = ExactPairNumericTolerance(
+    relative: 1e-2,
+    absolute: 2e-3
+)
+
 @Test
 func exactPairDecisionCoversFullPartialAndZeroAcceptance() throws {
     #expect(
@@ -70,33 +101,54 @@ func exactPairDecisionCoversFullPartialAndZeroAcceptance() throws {
 }
 
 @Test
-func exactPairEligibilityRequiresEveryBitExactComponent() {
+func exactPairEligibilityRequiresEveryVerificationComponent() {
+    struct Components {
+        var hasQKV = true
+        var hasAttentionPreparation = true
+        var hasAttentionBoundary = true
+        var hasNextBoundary = true
+        var hasOutput = true
+        var hasGateUp = true
+        var hasDown = true
+        var usesFusedActivation = true
+
+        var isEligible: Bool {
+            gemma4ExactTwoVectorLayerIsEligible(
+                hasQKV: hasQKV,
+                hasAttentionPreparation: hasAttentionPreparation,
+                hasAttentionBoundary: hasAttentionBoundary,
+                hasNextBoundary: hasNextBoundary,
+                hasOutput: hasOutput,
+                hasGateUp: hasGateUp,
+                hasDown: hasDown,
+                usesFusedActivation: usesFusedActivation
+            )
+        }
+    }
+
     #expect(gemma4ExactTwoVectorShapeIsSupported([2, 5_376], width: 5_376))
     #expect(!gemma4ExactTwoVectorShapeIsSupported([1, 2, 5_376], width: 5_376))
-    #expect(
-        gemma4ExactTwoVectorLayerIsEligible(
-            hasQKV: true,
-            hasAttentionPreparation: true,
-            hasAttentionBoundary: true,
-            hasNextBoundary: true,
-            hasOutput: true,
-            hasGateUp: true,
-            hasDown: true,
-            usesFusedActivation: true
+    let complete = Components()
+    #expect(complete.isEligible)
+
+    let dependencies: [(String, WritableKeyPath<Components, Bool>)] = [
+        ("QKV", \.hasQKV),
+        ("attention preparation", \.hasAttentionPreparation),
+        ("attention boundary", \.hasAttentionBoundary),
+        ("next boundary", \.hasNextBoundary),
+        ("output", \.hasOutput),
+        ("gate/up", \.hasGateUp),
+        ("down", \.hasDown),
+        ("fused activation", \.usesFusedActivation),
+    ]
+    for (name, dependency) in dependencies {
+        var missing = complete
+        missing[keyPath: dependency] = false
+        #expect(
+            !missing.isEligible,
+            Comment(rawValue: "eligibility unexpectedly ignored \(name)")
         )
-    )
-    #expect(
-        !gemma4ExactTwoVectorLayerIsEligible(
-            hasQKV: true,
-            hasAttentionPreparation: true,
-            hasAttentionBoundary: true,
-            hasNextBoundary: true,
-            hasOutput: true,
-            hasGateUp: false,
-            hasDown: true,
-            usesFusedActivation: true
-        )
-    )
+    }
 }
 
 @Test
@@ -154,10 +206,10 @@ func exactPairAttentionMatchesSerialRowsAcrossSlidingDispatchBoundary() {
             scale: 1.0,
             mask: .none
         )
-        expectExactBits(
+        expectActivationNumericParity(
             candidate,
             concatenated([serialFirst, serialSecond], axis: 2),
-            dtype: .uint16,
+            expectedShape: [1, 1, 2, headDimension],
             context:
                 "attention D=\(headDimension) keys=\(keyCount)"
         )
@@ -165,7 +217,7 @@ func exactPairAttentionMatchesSerialRowsAcrossSlidingDispatchBoundary() {
 }
 
 @Test
-func exactPairRuntimeMatchesTwoSerialRowsBitForBit() throws {
+func exactPairAndFourRuntimePreserveTokensWithinNumericEnvelope() throws {
     let environment = ProcessInfo.processInfo.environment
     guard environment["MLXFAST_RUN_MTP_EXACT_PAIR_TESTS"] == "1" else {
         return
@@ -189,11 +241,14 @@ func exactPairRuntimeMatchesTwoSerialRowsBitForBit() throws {
         config: config
     )
     let model = try weightCache.requireLibraryModel()
+    let tensorConfiguration = model.configuration
 
     let pairCache = model.newCache(parameters: nil)
     let serialCache = model.newCache(parameters: nil)
     let rollbackCache = model.newCache(parameters: nil)
     let serialPrefixCache = model.newCache(parameters: nil)
+    let fourCache = model.newCache(parameters: nil)
+    let serialFourCache = model.newCache(parameters: nil)
     let prompt = MLXArray(
         testCase.promptTokens.map(Int32.init),
         [1, testCase.promptTokens.count]
@@ -202,6 +257,8 @@ func exactPairRuntimeMatchesTwoSerialRowsBitForBit() throws {
     let serialPrefill = try #require(model.fastMTPForward(prompt, cache: serialCache))
     _ = try #require(model.fastMTPForward(prompt, cache: rollbackCache))
     _ = try #require(model.fastMTPForward(prompt, cache: serialPrefixCache))
+    _ = try #require(model.fastMTPForward(prompt, cache: fourCache))
+    _ = try #require(model.fastMTPForward(prompt, cache: serialFourCache))
     let seedArray = pairPrefill.logits[
         0..., -1, 0...
     ].asType(.float32).argMax(axis: -1)
@@ -212,6 +269,99 @@ func exactPairRuntimeMatchesTwoSerialRowsBitForBit() throws {
     let seed = Int(seedArray.item(Int32.self))
     #expect(seed == testCase.expectedTokens[0])
     #expect(seedArray.item(Int32.self) == serialSeedArray.item(Int32.self))
+
+    // exactMTPFour is a distinct four-row forward with dedicated QKV,
+    // projection, MLP, and vocabulary-head kernels. It is not implemented as
+    // two exactMTPPair calls, so cover its tensors directly.
+    let fourInputs = Array(testCase.expectedTokens[0..<4])
+    let four = try #require(
+        model.exactMTPFour(
+            MLXArray(fourInputs.map(Int32.init), [1, 4]),
+            cache: fourCache
+        )
+    )
+    var serialFourRows: [Gemma4MTPForward] = []
+    for token in fourInputs {
+        serialFourRows.append(
+            try #require(
+                model.fastMTPForward(
+                    MLXArray([Int32(token)], [1, 1]),
+                    cache: serialFourCache
+                )
+            )
+        )
+    }
+    let serialFourLogits = concatenated(
+        serialFourRows.map(\.logits),
+        axis: 1
+    )
+    let serialFourHidden = concatenated(
+        serialFourRows.map(\.lastHidden),
+        axis: 1
+    )
+    let fourTokens = four.logits.asType(.float32).argMax(axis: -1)
+    eval(fourTokens)
+    #expect(
+        fourTokens.asArray(Int32.self).map(Int.init)
+            == Array(testCase.expectedTokens[1...4])
+    )
+    expectLogitBehaviorParity(
+        four.logits,
+        serialFourLogits,
+        expectedRows: 4,
+        vocabularySize: tensorConfiguration.vocabSize,
+        context: "exact-four logits"
+    )
+    expectHiddenStateNumericParity(
+        four.lastHidden,
+        serialFourHidden,
+        expectedRows: 4,
+        hiddenSize: tensorConfiguration.hiddenSize,
+        context: "exact-four pre-norm hidden"
+    )
+    let fourOffset = testCase.promptTokens.count + 4
+    expectCacheGeometryAndNumericParity(
+        fourCache,
+        serialFourCache,
+        configuration: tensorConfiguration,
+        expectedOffset: fourOffset,
+        context: "exact-four full commit"
+    )
+    let serialFourLast = try #require(serialFourRows.last)
+    let fullSharedShape = expectedKVShape(
+        configuration: tensorConfiguration,
+        layerType: Gemma4LayerType.full.rawValue,
+        offset: fourOffset
+    )
+    let slidingSharedShape = expectedKVShape(
+        configuration: tensorConfiguration,
+        layerType: Gemma4LayerType.sliding.rawValue,
+        offset: fourOffset
+    )
+    expectKVNumericParity(
+        four.capturedSharedKV.fullAttention.0,
+        serialFourLast.capturedSharedKV.fullAttention.0,
+        expectedShape: fullSharedShape,
+        context: "exact-four shared full-attention keys"
+    )
+    expectKVNumericParity(
+        four.capturedSharedKV.fullAttention.1,
+        serialFourLast.capturedSharedKV.fullAttention.1,
+        expectedShape: fullSharedShape,
+        context: "exact-four shared full-attention values"
+    )
+    expectKVNumericParity(
+        four.capturedSharedKV.slidingAttention.0,
+        serialFourLast.capturedSharedKV.slidingAttention.0,
+        expectedShape: slidingSharedShape,
+        context: "exact-four shared sliding-attention keys"
+    )
+    expectKVNumericParity(
+        four.capturedSharedKV.slidingAttention.1,
+        serialFourLast.capturedSharedKV.slidingAttention.1,
+        expectedShape: slidingSharedShape,
+        context: "exact-four shared sliding-attention values"
+    )
 
     let firstDraft = testCase.expectedTokens[1]
     let pairInputs = MLXArray(
@@ -249,33 +399,39 @@ func exactPairRuntimeMatchesTwoSerialRowsBitForBit() throws {
             == Array(testCase.expectedTokens[1...2])
     )
 
-    expectExactBits(
+    expectLogitBehaviorParity(
         pair.logits[0..., 0..<1, 0...],
         serial0.logits,
-        dtype: .uint32,
+        expectedRows: 1,
+        vocabularySize: tensorConfiguration.vocabSize,
         context: "row-0 logits"
     )
-    expectExactBits(
+    expectLogitBehaviorParity(
         pair.logits[0..., 1..<2, 0...],
         serial1.logits,
-        dtype: .uint32,
+        expectedRows: 1,
+        vocabularySize: tensorConfiguration.vocabSize,
         context: "row-1 logits"
     )
-    expectExactBits(
+    expectHiddenStateNumericParity(
         pair.lastHidden[0..., 0..<1, 0...],
         serial0.lastHidden,
-        dtype: .uint16,
+        expectedRows: 1,
+        hiddenSize: tensorConfiguration.hiddenSize,
         context: "row-0 pre-norm hidden"
     )
-    expectExactBits(
+    expectHiddenStateNumericParity(
         pair.lastHidden[0..., 1..<2, 0...],
         serial1.lastHidden,
-        dtype: .uint16,
+        expectedRows: 1,
+        hiddenSize: tensorConfiguration.hiddenSize,
         context: "row-1 pre-norm hidden"
     )
-    expectExactCacheState(
+    expectCacheGeometryAndNumericParity(
         pairCache,
         serialCache,
+        configuration: tensorConfiguration,
+        expectedOffset: testCase.promptTokens.count + 2,
         context: "full pair commit"
     )
 
@@ -307,33 +463,39 @@ func exactPairRuntimeMatchesTwoSerialRowsBitForBit() throws {
         nextPairTokens.asArray(Int32.self).map(Int.init)
             == Array(testCase.expectedTokens[3...4])
     )
-    expectExactBits(
+    expectLogitBehaviorParity(
         pairAtNextOffset.logits[0..., 0..<1, 0...],
         serial2.logits,
-        dtype: .uint32,
+        expectedRows: 1,
+        vocabularySize: tensorConfiguration.vocabSize,
         context: "next-offset row-0 logits"
     )
-    expectExactBits(
+    expectLogitBehaviorParity(
         pairAtNextOffset.logits[0..., 1..<2, 0...],
         serial3.logits,
-        dtype: .uint32,
+        expectedRows: 1,
+        vocabularySize: tensorConfiguration.vocabSize,
         context: "next-offset row-1 logits"
     )
-    expectExactBits(
+    expectHiddenStateNumericParity(
         pairAtNextOffset.lastHidden[0..., 0..<1, 0...],
         serial2.lastHidden,
-        dtype: .uint16,
+        expectedRows: 1,
+        hiddenSize: tensorConfiguration.hiddenSize,
         context: "next-offset row-0 pre-norm hidden"
     )
-    expectExactBits(
+    expectHiddenStateNumericParity(
         pairAtNextOffset.lastHidden[0..., 1..<2, 0...],
         serial3.lastHidden,
-        dtype: .uint16,
+        expectedRows: 1,
+        hiddenSize: tensorConfiguration.hiddenSize,
         context: "next-offset row-1 pre-norm hidden"
     )
-    expectExactCacheState(
+    expectCacheGeometryAndNumericParity(
         pairCache,
         serialCache,
+        configuration: tensorConfiguration,
+        expectedOffset: testCase.promptTokens.count + 4,
         context: "next-offset full pair commit"
     )
 
@@ -344,33 +506,46 @@ func exactPairRuntimeMatchesTwoSerialRowsBitForBit() throws {
         from: rollbackPair.capturedSharedKV,
         rejected: 1
     )
-    expectExactBits(
+    let rollbackOffset = testCase.promptTokens.count + 1
+    let rollbackFullShape = expectedKVShape(
+        configuration: tensorConfiguration,
+        layerType: Gemma4LayerType.full.rawValue,
+        offset: rollbackOffset
+    )
+    let rollbackSlidingShape = expectedKVShape(
+        configuration: tensorConfiguration,
+        layerType: Gemma4LayerType.sliding.rawValue,
+        offset: rollbackOffset
+    )
+    expectKVNumericParity(
         rolledShared.fullAttention.0,
         serialPrefix0.capturedSharedKV.fullAttention.0,
-        dtype: .uint16,
+        expectedShape: rollbackFullShape,
         context: "rolled full-attention keys"
     )
-    expectExactBits(
+    expectKVNumericParity(
         rolledShared.fullAttention.1,
         serialPrefix0.capturedSharedKV.fullAttention.1,
-        dtype: .uint16,
+        expectedShape: rollbackFullShape,
         context: "rolled full-attention values"
     )
-    expectExactBits(
+    expectKVNumericParity(
         rolledShared.slidingAttention.0,
         serialPrefix0.capturedSharedKV.slidingAttention.0,
-        dtype: .uint16,
+        expectedShape: rollbackSlidingShape,
         context: "rolled sliding-attention keys"
     )
-    expectExactBits(
+    expectKVNumericParity(
         rolledShared.slidingAttention.1,
         serialPrefix0.capturedSharedKV.slidingAttention.1,
-        dtype: .uint16,
+        expectedShape: rollbackSlidingShape,
         context: "rolled sliding-attention values"
     )
-    expectExactCacheState(
+    expectCacheGeometryAndNumericParity(
         rollbackCache,
         serialPrefixCache,
+        configuration: tensorConfiguration,
+        expectedOffset: rollbackOffset,
         context: "zero-acceptance rollback"
     )
     let resumedAfterRollback = try #require(
@@ -385,29 +560,184 @@ func exactPairRuntimeMatchesTwoSerialRowsBitForBit() throws {
             cache: serialPrefixCache
         )
     )
-    expectExactBits(
+    expectLogitBehaviorParity(
         resumedAfterRollback.logits,
         serialAfterPrefix.logits,
-        dtype: .uint32,
+        expectedRows: 1,
+        vocabularySize: tensorConfiguration.vocabSize,
         context: "post-rollback continuation logits"
     )
-    expectExactBits(
+    expectHiddenStateNumericParity(
         resumedAfterRollback.lastHidden,
         serialAfterPrefix.lastHidden,
-        dtype: .uint16,
+        expectedRows: 1,
+        hiddenSize: tensorConfiguration.hiddenSize,
         context: "post-rollback continuation hidden"
     )
-    expectExactCacheState(
+    expectCacheGeometryAndNumericParity(
         rollbackCache,
         serialPrefixCache,
+        configuration: tensorConfiguration,
+        expectedOffset: testCase.promptTokens.count + 2,
         context: "post-rollback continuation cache"
+    )
+}
+
+/// Forces the distinct direct-four session branch through full, zero, and
+/// partial acceptance. The dedicated counter proves the branch did not fall
+/// back to pair composition; pair-segment and rollback counters retain their
+/// pair-equivalent physical-row accounting semantics.
+@Test
+func exactFourSessionCountersCoverFullZeroAndPartialAcceptance() async throws {
+    let environment = ProcessInfo.processInfo.environment
+    guard environment["MLXFAST_RUN_MTP_EXACT_PAIR_TESTS"] == "1" else {
+        return
+    }
+    let weightsPath = try #require(
+        environment["MLXFAST_MTP_WEIGHTS_PATH"]
+    )
+    let assistantPath = try #require(
+        environment["MLXFAST_MTP_ASSISTANT_DIR"]
+    )
+    let goldenPath = try #require(
+        environment["MLXFAST_MTP_PAIR_GOLDEN_PATH"]
+    )
+    let golden = try loadGoldenFixture(
+        from: goldenPath,
+        requiredSteps: 11,
+        requiredPromptTokens: MLXFastConstants.correctnessPromptTokens
+    )
+    let testCase = try #require(golden.cases.first)
+    let expected = testCase.expectedTokens
+    let config = try Gemma4Config.load(from: weightsPath)
+    let loader = try Gemma4WeightLoader(weightsPath: weightsPath)
+    let weightCache = Gemma4RuntimeWeightCache(
+        loader: loader,
+        config: config
+    )
+    let model = try weightCache.requireLibraryModel()
+    let tensorConfiguration = model.configuration
+    let drafter = try await Gemma4AssistantDraftModel.load(
+        from: URL(fileURLWithPath: assistantPath)
+    )
+    let session = try Gemma4TrainedMTPBlockSession(
+        target: model,
+        drafter: drafter,
+        verificationMode: .exactPair
+    )
+    let seed = try session.begin(seedTokens: testCase.promptTokens)
+    #expect(seed == expected[0])
+
+    let serialCache = model.newCache(parameters: nil)
+    _ = try #require(
+        model.fastMTPForward(
+            MLXArray(
+                testCase.promptTokens.map(Int32.init),
+                [1, testCase.promptTokens.count]
+            ),
+            cache: serialCache
+        )
+    )
+    var committedInputRows = 0
+    func forwardSerial(_ tokens: [Int]) throws {
+        for token in tokens {
+            _ = try #require(
+                model.fastMTPForward(
+                    MLXArray([Int32(token)], [1, 1]),
+                    cache: serialCache
+                )
+            )
+            committedInputRows += 1
+        }
+    }
+    func mismatching(_ token: Int) -> Int {
+        token == 0 ? 1 : 0
+    }
+    func expectDirectAccounting(_ context: String) {
+        #expect(
+            2 * session.exactPairSegmentCount
+                - session.exactPairRollbackRowCount
+                + session.serialVerificationRowCount
+                == committedInputRows,
+            Comment(rawValue: context)
+        )
+        expectCacheGeometryAndNumericParity(
+            session.targetCache,
+            serialCache,
+            configuration: tensorConfiguration,
+            expectedOffset: testCase.promptTokens.count + committedInputRows,
+            context: context
+        )
+    }
+
+    let full = try session.verifyWithExactPairs(
+        previousToken: seed,
+        drafts: Array(expected[1...3]),
+        preferExactFour: true
+    )
+    #expect(full.committedTokens == Array(expected[1...4]))
+    #expect(full.acceptedDrafts == 3)
+    #expect(session.directExactFourInvocationCount == 1)
+    #expect(session.exactPairSegmentCount == 2)
+    #expect(session.exactPairRollbackRowCount == 0)
+    #expect(session.serialVerificationRowCount == 0)
+    try forwardSerial(Array(expected[0...3]))
+    expectDirectAccounting("direct-four full acceptance")
+
+    let zero = try session.verifyWithExactPairs(
+        previousToken: expected[4],
+        drafts: [
+            mismatching(expected[5]),
+            mismatching(expected[6]),
+            mismatching(expected[7]),
+        ],
+        preferExactFour: true
+    )
+    #expect(zero.committedTokens == [expected[5]])
+    #expect(zero.acceptedDrafts == 0)
+    #expect(session.directExactFourInvocationCount == 2)
+    #expect(session.exactPairSegmentCount == 4)
+    #expect(session.exactPairRollbackRowCount == 3)
+    #expect(session.serialVerificationRowCount == 0)
+    try forwardSerial([expected[4]])
+    expectDirectAccounting("direct-four zero acceptance")
+
+    let partial = try session.verifyWithExactPairs(
+        previousToken: expected[5],
+        drafts: [
+            expected[6],
+            mismatching(expected[7]),
+            mismatching(expected[8]),
+        ],
+        preferExactFour: true
+    )
+    #expect(partial.committedTokens == Array(expected[6...7]))
+    #expect(partial.acceptedDrafts == 1)
+    #expect(session.directExactFourInvocationCount == 3)
+    #expect(session.exactPairSegmentCount == 6)
+    #expect(session.exactPairRollbackRowCount == 5)
+    #expect(session.serialVerificationRowCount == 0)
+    try forwardSerial(Array(expected[5...6]))
+    expectDirectAccounting("direct-four partial acceptance")
+
+    let restartedSeed = try session.begin(seedTokens: testCase.promptTokens)
+    #expect(restartedSeed == expected[0])
+    #expect(session.directExactFourInvocationCount == 0)
+    #expect(session.exactPairSegmentCount == 0)
+    #expect(session.exactPairRollbackRowCount == 0)
+    #expect(session.serialVerificationRowCount == 0)
+    #expect(
+        session.targetCache.allSatisfy {
+            $0.offset == testCase.promptTokens.count
+        }
     )
 }
 
 /// Forces zero, partial, full, and second-segment acceptance through the real
 /// session verifier with fabricated drafts, so the seams do not depend on
-/// assistant draft behavior. Every committed token, counter, and physical
-/// cache byte must match an independent teacher-forced serial cache.
+/// assistant draft behavior. Every committed token, counter, cache offset,
+/// state count, and physical tensor shape must match an independent
+/// teacher-forced serial cache; floating KV values use the documented envelope.
 @Test
 func exactPairSessionForcedAcceptanceSeamsMatchSerial() async throws {
     let environment = ProcessInfo.processInfo.environment
@@ -437,6 +767,7 @@ func exactPairSessionForcedAcceptanceSeamsMatchSerial() async throws {
         config: config
     )
     let model = try weightCache.requireLibraryModel()
+    let tensorConfiguration = model.configuration
     let drafter = try await Gemma4AssistantDraftModel.load(
         from: URL(fileURLWithPath: assistantPath)
     )
@@ -487,16 +818,19 @@ func exactPairSessionForcedAcceptanceSeamsMatchSerial() async throws {
     #expect(session.exactPairSegmentCount == 0)
     #expect(session.serialVerificationRowCount == 1)
     try forwardSerial([seed])
-    expectExactCacheState(
+    expectCacheGeometryAndNumericParity(
         session.targetCache,
         serialCache,
+        configuration: tensorConfiguration,
+        expectedOffset: testCase.promptTokens.count + serialInputs.count,
         context: "session target-only tail"
     )
 
     // Round A: K=2 full acceptance is exactly one two-row segment.
     let k2Block = try session.verifyWithExactPairs(
         previousToken: expected[1],
-        drafts: [expected[2]]
+        drafts: [expected[2]],
+        preferExactFour: false
     )
     #expect(k2Block.committedTokens == Array(expected[2...3]))
     #expect(k2Block.acceptedDrafts == 1)
@@ -504,16 +838,20 @@ func exactPairSessionForcedAcceptanceSeamsMatchSerial() async throws {
     #expect(session.exactPairRollbackRowCount == 0)
     #expect(session.serialVerificationRowCount == 1)
     try forwardSerial(Array(expected[1...2]))
-    expectExactCacheState(
+    expectCacheGeometryAndNumericParity(
         session.targetCache,
         serialCache,
+        configuration: tensorConfiguration,
+        expectedOffset: testCase.promptTokens.count + serialInputs.count,
         context: "session K=2 full acceptance"
     )
 
-    // Round B: K=4 full acceptance composes two exact-pair segments.
+    // Round B: force K=4 through two exact-pair segments so the cumulative
+    // segment counters below describe pair composition only.
     let fullBlock = try session.verifyWithExactPairs(
         previousToken: expected[3],
-        drafts: Array(expected[4...6])
+        drafts: Array(expected[4...6]),
+        preferExactFour: false
     )
     #expect(fullBlock.committedTokens == Array(expected[4...7]))
     #expect(fullBlock.acceptedDrafts == 3)
@@ -521,9 +859,11 @@ func exactPairSessionForcedAcceptanceSeamsMatchSerial() async throws {
     #expect(session.exactPairRollbackRowCount == 0)
     #expect(session.serialVerificationRowCount == 1)
     try forwardSerial(Array(expected[3...6]))
-    expectExactCacheState(
+    expectCacheGeometryAndNumericParity(
         session.targetCache,
         serialCache,
+        configuration: tensorConfiguration,
+        expectedOffset: testCase.promptTokens.count + serialInputs.count,
         context: "session full acceptance"
     )
 
@@ -535,16 +875,19 @@ func exactPairSessionForcedAcceptanceSeamsMatchSerial() async throws {
             mismatching(expected[8]),
             mismatching(expected[9]),
             mismatching(expected[10]),
-        ]
+        ],
+        preferExactFour: false
     )
     #expect(zeroBlock.committedTokens == [expected[8]])
     #expect(zeroBlock.acceptedDrafts == 0)
     #expect(session.exactPairSegmentCount == 4)
     #expect(session.exactPairRollbackRowCount == 1)
     try forwardSerial([expected[7]])
-    expectExactCacheState(
+    expectCacheGeometryAndNumericParity(
         session.targetCache,
         serialCache,
+        configuration: tensorConfiguration,
+        expectedOffset: testCase.promptTokens.count + serialInputs.count,
         context: "session zero acceptance rollback"
     )
 
@@ -556,7 +899,8 @@ func exactPairSessionForcedAcceptanceSeamsMatchSerial() async throws {
             expected[9],
             expected[10],
             mismatching(expected[11]),
-        ]
+        ],
+        preferExactFour: false
     )
     #expect(
         secondSegmentBlock.committedTokens == Array(expected[9...11])
@@ -565,9 +909,11 @@ func exactPairSessionForcedAcceptanceSeamsMatchSerial() async throws {
     #expect(session.exactPairSegmentCount == 6)
     #expect(session.exactPairRollbackRowCount == 2)
     try forwardSerial(Array(expected[8...10]))
-    expectExactCacheState(
+    expectCacheGeometryAndNumericParity(
         session.targetCache,
         serialCache,
+        configuration: tensorConfiguration,
+        expectedOffset: testCase.promptTokens.count + serialInputs.count,
         context: "session second-segment rejection"
     )
 
@@ -579,7 +925,8 @@ func exactPairSessionForcedAcceptanceSeamsMatchSerial() async throws {
             expected[12],
             mismatching(expected[13]),
             mismatching(expected[14]),
-        ]
+        ],
+        preferExactFour: false
     )
     #expect(partialBlock.committedTokens == Array(expected[12...13]))
     #expect(partialBlock.acceptedDrafts == 1)
@@ -587,16 +934,19 @@ func exactPairSessionForcedAcceptanceSeamsMatchSerial() async throws {
     #expect(session.exactPairRollbackRowCount == 2)
     #expect(session.serialVerificationRowCount == 1)
     try forwardSerial(Array(expected[11...12]))
-    expectExactCacheState(
+    expectCacheGeometryAndNumericParity(
         session.targetCache,
         serialCache,
+        configuration: tensorConfiguration,
+        expectedOffset: testCase.promptTokens.count + serialInputs.count,
         context: "session row-one rejection"
     )
 
     // Round F: K=3 uses one exact pair plus one serial bonus row.
     let k3TailBlock = try session.verifyWithExactPairs(
         previousToken: expected[13],
-        drafts: Array(expected[14...15])
+        drafts: Array(expected[14...15]),
+        preferExactFour: false
     )
     #expect(k3TailBlock.committedTokens == Array(expected[14...16]))
     #expect(k3TailBlock.acceptedDrafts == 2)
@@ -604,9 +954,11 @@ func exactPairSessionForcedAcceptanceSeamsMatchSerial() async throws {
     #expect(session.exactPairRollbackRowCount == 2)
     #expect(session.serialVerificationRowCount == 2)
     try forwardSerial(Array(expected[13...15]))
-    expectExactCacheState(
+    expectCacheGeometryAndNumericParity(
         session.targetCache,
         serialCache,
+        configuration: tensorConfiguration,
+        expectedOffset: testCase.promptTokens.count + serialInputs.count,
         context: "session K=3 serial bonus tail"
     )
 
@@ -636,8 +988,9 @@ func exactPairSessionForcedAcceptanceSeamsMatchSerial() async throws {
 /// serial mirror across the deep decode seams: the 768-position combined
 /// cache growth, the odd-offset sliding refusal before the 1,024 wrap, the
 /// library's 1,024-key sliding kernel switch, and post-wrap serial decode.
-/// Inputs are constant, so this is pure physical/logit parity, not a language
-/// test, and it needs no golden fixture.
+/// Inputs are constant, so this isolates exact cache geometry, exact token
+/// decisions, and numeric tensor parity rather than language quality, and it
+/// needs no golden fixture.
 @Test
 func exactPairDeepOffsetsGrowthAndWrapMatchSerial() throws {
     let environment = ProcessInfo.processInfo.environment
@@ -656,6 +1009,7 @@ func exactPairDeepOffsetsGrowthAndWrapMatchSerial() throws {
         config: config
     )
     let model = try weightCache.requireLibraryModel()
+    let tensorConfiguration = model.configuration
 
     let bos = Int32(2)
     let seedLength = MLXFastConstants.correctnessPromptTokens
@@ -696,22 +1050,26 @@ func exactPairDeepOffsetsGrowthAndWrapMatchSerial() throws {
         )
         let serial = try serialRowPair()
         offset += 2
-        expectExactBits(
+        expectLogitBehaviorParity(
             pair.logits[0..., 0..<1, 0...],
             serial.0.logits,
-            dtype: .uint32,
+            expectedRows: 1,
+            vocabularySize: tensorConfiguration.vocabSize,
             context: "deep row-0 logits offset \(offset)"
         )
-        expectExactBits(
+        expectLogitBehaviorParity(
             pair.logits[0..., 1..<2, 0...],
             serial.1.logits,
-            dtype: .uint32,
+            expectedRows: 1,
+            vocabularySize: tensorConfiguration.vocabSize,
             context: "deep row-1 logits offset \(offset)"
         )
         if checkpointOffsets.contains(offset) {
-            expectExactCacheState(
+            expectCacheGeometryAndNumericParity(
                 pairCache,
                 serialCache,
+                configuration: tensorConfiguration,
+                expectedOffset: offset,
                 context: "deep checkpoint offset \(offset)"
             )
         }
@@ -727,10 +1085,11 @@ func exactPairDeepOffsetsGrowthAndWrapMatchSerial() throws {
         model.fastMTPForward(singleInput, cache: serialCache)
     )
     offset += 1
-    expectExactBits(
+    expectLogitBehaviorParity(
         oddRow.logits,
         oddSerial.logits,
-        dtype: .uint32,
+        expectedRows: 1,
+        vocabularySize: tensorConfiguration.vocabSize,
         context: "odd serial row logits offset \(offset)"
     )
     let pairBeforeWrap = try #require(
@@ -739,11 +1098,19 @@ func exactPairDeepOffsetsGrowthAndWrapMatchSerial() throws {
     let serialBeforeWrap = try serialRowPair()
     offset += 2
     #expect(offset == slidingWindow - 1)
-    expectExactBits(
+    expectLogitBehaviorParity(
         pairBeforeWrap.logits[0..., 1..<2, 0...],
         serialBeforeWrap.1.logits,
-        dtype: .uint32,
+        expectedRows: 1,
+        vocabularySize: tensorConfiguration.vocabSize,
         context: "pre-wrap pair row-1 logits"
+    )
+    expectCacheGeometryAndNumericParity(
+        pairCache,
+        serialCache,
+        configuration: tensorConfiguration,
+        expectedOffset: offset,
+        context: "pre-wrap cache cursor"
     )
 
     // The sliding caches can no longer retain a prefix view for a pair.
@@ -758,60 +1125,315 @@ func exactPairDeepOffsetsGrowthAndWrapMatchSerial() throws {
             model.fastMTPForward(singleInput, cache: serialCache)
         )
         offset += 1
-        expectExactBits(
+        expectLogitBehaviorParity(
             row.logits,
             serialRow.logits,
-            dtype: .uint32,
+            expectedRows: 1,
+            vocabularySize: tensorConfiguration.vocabSize,
             context: "post-wrap serial logits step \(step) offset \(offset)"
         )
     }
-    expectExactCacheState(
+    expectCacheGeometryAndNumericParity(
         pairCache,
         serialCache,
+        configuration: tensorConfiguration,
+        expectedOffset: offset,
         context: "post-wrap cache state"
     )
     // The pair path stays unavailable after the wrap.
     #expect(model.exactMTPPair(pairInput, cache: pairCache) == nil)
 }
 
-private func expectExactBits(
+private func expectNumericParity(
     _ candidate: MLXArray,
     _ reference: MLXArray,
-    dtype: DType,
+    expectedShape: [Int],
+    expectedDType: DType,
+    tolerance: ExactPairNumericTolerance,
     context: String
 ) {
-    #expect(candidate.shape == reference.shape, Comment(rawValue: context))
-    #expect(candidate.dtype == reference.dtype, Comment(rawValue: context))
-    let equal = arrayEqual(
-        candidate.view(dtype: dtype),
-        reference.view(dtype: dtype)
+    let shapeMatches =
+        candidate.shape == expectedShape && reference.shape == expectedShape
+    let dtypeMatches =
+        candidate.dtype == expectedDType && reference.dtype == expectedDType
+    #expect(
+        shapeMatches,
+        Comment(
+            rawValue:
+                "\(context) canonical shape \(expectedShape); "
+                + "candidate=\(candidate.shape) reference=\(reference.shape)"
+        )
     )
-    eval(equal)
-    #expect(equal.item(Bool.self), Comment(rawValue: context))
+    #expect(
+        dtypeMatches,
+        Comment(
+            rawValue:
+                "\(context) canonical dtype \(expectedDType); "
+                + "candidate=\(candidate.dtype) reference=\(reference.dtype)"
+        )
+    )
+    guard shapeMatches, dtypeMatches else {
+        return
+    }
+
+    let candidateFloat = candidate.asType(.float32)
+    let referenceFloat = reference.asType(.float32)
+    let candidateFiniteArray = all(MLX.isFinite(candidateFloat))
+    let referenceFiniteArray = all(MLX.isFinite(referenceFloat))
+    eval(candidateFiniteArray, referenceFiniteArray)
+    let candidateFinite = candidateFiniteArray.item(Bool.self)
+    let referenceFinite = referenceFiniteArray.item(Bool.self)
+    #expect(candidateFinite, Comment(rawValue: "\(context) candidate finiteness"))
+    #expect(referenceFinite, Comment(rawValue: "\(context) reference finiteness"))
+    guard candidateFinite, referenceFinite else {
+        return
+    }
+
+    let close = allClose(
+        candidateFloat,
+        referenceFloat,
+        rtol: tolerance.relative,
+        atol: tolerance.absolute
+    )
+    eval(close)
+    let isClose = close.item(Bool.self)
+    if !isClose {
+        let maxAbsoluteError = MLX.abs(candidateFloat - referenceFloat)
+            .max()
+            .item(Float.self)
+        #expect(
+            isClose,
+            Comment(
+                rawValue:
+                    "\(context) numeric envelope "
+                    + "(rtol=\(tolerance.relative), atol=\(tolerance.absolute), "
+                    + "max_abs_error=\(maxAbsoluteError))"
+            )
+        )
+    }
 }
 
-private func expectExactCacheState(
-    _ candidate: [KVCache],
-    _ reference: [KVCache],
+private func expectLogitBehaviorParity(
+    _ candidate: MLXArray,
+    _ reference: MLXArray,
+    expectedRows: Int,
+    vocabularySize: Int,
     context: String
 ) {
-    #expect(candidate.count == reference.count, Comment(rawValue: context))
+    expectNumericParity(
+        candidate,
+        reference,
+        expectedShape: [1, expectedRows, vocabularySize],
+        expectedDType: .float32,
+        tolerance: exactPairLogitsTolerance,
+        context: context
+    )
+    guard candidate.shape == reference.shape else {
+        return
+    }
+    let candidateTokens = candidate.asType(.float32).argMax(axis: -1)
+    let referenceTokens = reference.asType(.float32).argMax(axis: -1)
+    let tokensEqual = arrayEqual(candidateTokens, referenceTokens)
+    eval(tokensEqual)
+    #expect(
+        tokensEqual.item(Bool.self),
+        Comment(rawValue: "\(context) exact argmax token IDs")
+    )
+}
+
+private func expectHiddenStateNumericParity(
+    _ candidate: MLXArray,
+    _ reference: MLXArray,
+    expectedRows: Int,
+    hiddenSize: Int,
+    context: String
+) {
+    expectNumericParity(
+        candidate,
+        reference,
+        expectedShape: [1, expectedRows, hiddenSize],
+        expectedDType: .bfloat16,
+        tolerance: exactPairHiddenStateTolerance,
+        context: context
+    )
+}
+
+private func expectKVNumericParity(
+    _ candidate: MLXArray,
+    _ reference: MLXArray,
+    expectedShape: [Int],
+    context: String
+) {
+    expectNumericParity(
+        candidate,
+        reference,
+        expectedShape: expectedShape,
+        expectedDType: .bfloat16,
+        tolerance: exactPairKVTolerance,
+        context: context
+    )
+}
+
+private func expectActivationNumericParity(
+    _ candidate: MLXArray,
+    _ reference: MLXArray,
+    expectedShape: [Int],
+    context: String
+) {
+    expectNumericParity(
+        candidate,
+        reference,
+        expectedShape: expectedShape,
+        expectedDType: .bfloat16,
+        tolerance: exactPairAttentionTolerance,
+        context: context
+    )
+}
+
+private func expectedKVShape(
+    configuration: Gemma4TextConfiguration,
+    layerType: String,
+    offset: Int
+) -> [Int] {
+    let isFull = layerType == Gemma4LayerType.full.rawValue
+    let heads =
+        isFull && configuration.attentionKeqV
+        ? (configuration.numGlobalKeyValueHeads
+            ?? configuration.numKeyValueHeads)
+        : configuration.numKeyValueHeads
+    let headDimension =
+        isFull ? configuration.globalHeadDim : configuration.headDim
+    let retainedLength =
+        isFull ? offset : min(offset, configuration.slidingWindow)
+    return [1, heads, retainedLength, headDimension]
+}
+
+private func expectedRotatingIndex(
+    offset: Int,
+    keep: Int,
+    maxSize: Int
+) -> Int {
+    precondition(keep >= 0 && keep < maxSize)
+    // Gemma4CombinedKVCache advances the cursor with every write. Before the
+    // first wrap it equals the logical offset; at maxSize the next write resets
+    // it to keep. Exact full-span boundaries leave the cursor at maxSize until
+    // the following write performs that reset.
+    if offset <= maxSize {
+        return offset
+    }
+    let rotatingSpan = maxSize - keep
+    let remainder = (offset - maxSize) % rotatingSpan
+    return remainder == 0 ? maxSize : keep + remainder
+}
+
+private func expectCacheGeometryAndNumericParity(
+    _ candidate: [KVCache],
+    _ reference: [KVCache],
+    configuration: Gemma4TextConfiguration,
+    expectedOffset: Int,
+    context: String
+) {
+    let expectedCacheCount =
+        configuration.numHiddenLayers - configuration.numKvSharedLayers
+    #expect(
+        configuration.layerTypes.count == configuration.numHiddenLayers,
+        Comment(rawValue: "\(context) canonical layer-type count")
+    )
+    #expect(
+        candidate.count == expectedCacheCount,
+        Comment(rawValue: "\(context) canonical candidate cache count")
+    )
+    #expect(
+        reference.count == expectedCacheCount,
+        Comment(rawValue: "\(context) canonical reference cache count")
+    )
+    guard configuration.layerTypes.count == configuration.numHiddenLayers,
+          candidate.count == expectedCacheCount,
+          reference.count == expectedCacheCount
+    else {
+        return
+    }
     for index in candidate.indices {
-        #expect(
-            candidate[index].offset == reference[index].offset,
-            Comment(rawValue: "\(context) layer \(index) offset")
+        let layerType = configuration.layerTypes[index]
+        let isFull = layerType == Gemma4LayerType.full.rawValue
+        let expectedShape = expectedKVShape(
+            configuration: configuration,
+            layerType: layerType,
+            offset: expectedOffset
         )
+        #expect(
+            candidate[index].offset == expectedOffset,
+            Comment(rawValue: "\(context) layer \(index) candidate offset")
+        )
+        #expect(
+            reference[index].offset == expectedOffset,
+            Comment(rawValue: "\(context) layer \(index) reference offset")
+        )
+        #expect(
+            candidate[index].maxSize
+                == (isFull ? nil : configuration.slidingWindow),
+            Comment(rawValue: "\(context) layer \(index) candidate max size")
+        )
+        #expect(
+            reference[index].maxSize
+                == (isFull ? nil : configuration.slidingWindow),
+            Comment(rawValue: "\(context) layer \(index) reference max size")
+        )
+
+        let candidateMetadata = candidate[index].metaState
+        let referenceMetadata = reference[index].metaState
+        #expect(
+            candidateMetadata == referenceMetadata,
+            Comment(rawValue: "\(context) layer \(index) metadata")
+        )
+        if isFull {
+            #expect(
+                candidateMetadata == [""],
+                Comment(rawValue: "\(context) layer \(index) full metadata")
+            )
+        } else {
+            #expect(
+                candidateMetadata.count == 5,
+                Comment(rawValue: "\(context) layer \(index) rotating metadata count")
+            )
+            if candidateMetadata.count == 5 {
+                #expect(candidateMetadata[0] == "0")
+                #expect(Int(candidateMetadata[1]) == configuration.slidingWindow)
+                #expect(Int(candidateMetadata[2]) == 256)
+                #expect(Int(candidateMetadata[3]) == expectedOffset)
+                #expect(
+                    Int(candidateMetadata[4])
+                        == expectedRotatingIndex(
+                            offset: expectedOffset,
+                            keep: 0,
+                            maxSize: configuration.slidingWindow
+                        ),
+                    Comment(
+                        rawValue:
+                            "\(context) layer \(index) canonical rotating index"
+                    )
+                )
+            }
+        }
+
         let candidateState = candidate[index].state
         let referenceState = reference[index].state
         #expect(
-            candidateState.count == referenceState.count,
-            Comment(rawValue: "\(context) layer \(index) state count")
+            candidateState.count == 2,
+            Comment(rawValue: "\(context) layer \(index) canonical candidate state count")
         )
+        #expect(
+            referenceState.count == 2,
+            Comment(rawValue: "\(context) layer \(index) canonical reference state count")
+        )
+        guard candidateState.count == 2, referenceState.count == 2 else {
+            continue
+        }
         for stateIndex in candidateState.indices {
-            expectExactBits(
+            expectKVNumericParity(
                 candidateState[stateIndex],
                 referenceState[stateIndex],
-                dtype: .uint16,
+                expectedShape: expectedShape,
                 context: "\(context) layer \(index) state \(stateIndex)"
             )
         }

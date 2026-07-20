@@ -156,9 +156,10 @@ swift build -c release
   --block-size 4 --tokens 512 \
   --target-verification exact-pair --require-trained-assistant
 
-# 3) the four model-backed parity gates (artifact, pair bit-for-bit,
-#    forced acceptance seams, deep growth/wrap) — commands as documented in
-#    docs/experimental-mtp-track.md "Local/operator workflow"
+# 3) trusted model-backed regressions (artifact, pair/four numeric behavior,
+#    forced acceptance seams, deep growth/wrap) use public/synthetic inputs
+#    only. Never pass either hidden golden path to candidate-linked test code.
+#    Commands are in docs/experimental-mtp-track.md "Local/operator workflow".
 ```
 
 ### B.4 Freeze + upload
@@ -432,10 +433,12 @@ preconditions in C are complete. It contains:
    same commit. The calibrated serial-denominator stats live in the box's
    `mtp-baseline-calibration.json` (C.5/B.6), not the fixture.
 2. `.github/workflows/benchmark.yml`: the four golden pins filled from
-   the freeze record (`MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256/BYTES`,
-   `MLXFAST_MTP_BENCH_GOLDEN_SHA256/BYTES` — pending box-2 replay
-   confirmation; re-pin if box 2 diverges), `MLXFAST_MTP_DECODE_TOKENS=512`,
-   `MLXFAST_MTP_TARGET_PAIRS=4`, and the ratio-of-means score computation.
+   the validated live freeze record
+   (`MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256/BYTES`,
+   `MLXFAST_MTP_BENCH_GOLDEN_SHA256/BYTES`), with re-pinning required on a
+   future serving-stack rotation that changes a near-tie argmax;
+   `MLXFAST_MTP_DECODE_TOKENS=512`, `MLXFAST_MTP_TARGET_PAIRS=4`, and the
+   ratio-of-means score computation.
 3. The tests that deliberately pinned the disabled state updated to pin the
    enabled state instead
    (`ExperimentalMTPTests.trainedMTPContractPinsMatchedITPairAndDependency`,
@@ -452,7 +455,10 @@ preconditions in C are complete. It contains:
 Validation ladder after merge (each step must pass before the next):
 
 1. Dispatch `benchmark.yml` on `main`, `confirm_track_enabled=true`,
-   `run_benchmark=false` — correctness/parity gate only.
+   `run_benchmark=false` — parent-owned exact token and logical
+   protocol/report-consistency gate; candidate worker/model offset checks,
+   track-aware static review, and hidden behavior controls remain in force.
+   The ranked workflow does not invoke candidate-linked tensor parity tests.
 2. Same on `main` with `run_benchmark=true` — full timed run; expect
    reference-vs-reference score ~1.2-1.3x, floor cleared, artifacts sealed,
    janitor clean.

@@ -577,6 +577,439 @@ func trainedMTPMemoryDiagnosticsRemainNonScoringProtocolFields() throws {
     #expect(decoded.serialVerificationRowCount == 1)
 }
 
+private func mtpObservation(
+    _ k: Int,
+    _ c: Int,
+    offset: Int = 0
+) -> ExperimentalMTPBlockObservation {
+    ExperimentalMTPBlockObservation(
+        startingLogicalTargetOffset: offset,
+        requestedMaxBlockSize: k,
+        returnedTokenCount: c
+    )
+}
+
+private func mtpDelta(
+    _ segments: Int,
+    _ rollbacks: Int,
+    _ serial: Int
+) -> ExperimentalMTPVerificationDelta {
+    ExperimentalMTPVerificationDelta(
+        exactPairSegmentCount: segments,
+        exactPairRollbackRowCount: rollbacks,
+        serialVerificationRowCount: serial
+    )
+}
+
+@Test
+func exactPairVerificationDeltaTableIsExhaustive() throws {
+    let cases: [
+        (
+            observation: ExperimentalMTPBlockObservation,
+            deltas: [ExperimentalMTPVerificationDelta]
+        )
+    ] = [
+        (mtpObservation(1, 1), [mtpDelta(0, 0, 1)]),
+        (mtpObservation(2, 1), [mtpDelta(1, 1, 0)]),
+        (mtpObservation(2, 2), [mtpDelta(1, 0, 0)]),
+        (mtpObservation(3, 1), [mtpDelta(1, 1, 0)]),
+        (mtpObservation(3, 2), [mtpDelta(1, 0, 0)]),
+        (mtpObservation(3, 3), [mtpDelta(1, 0, 1)]),
+        (
+            mtpObservation(4, 1),
+            [mtpDelta(1, 1, 0), mtpDelta(2, 3, 0)]
+        ),
+        (
+            mtpObservation(4, 2),
+            [mtpDelta(1, 0, 0), mtpDelta(2, 2, 0)]
+        ),
+        (mtpObservation(4, 3), [mtpDelta(2, 1, 0)]),
+        (mtpObservation(4, 4), [mtpDelta(2, 0, 0)]),
+    ]
+
+    for item in cases {
+        #expect(
+            try GemmaRuntime.experimentalMTPVerificationDeltas(
+                for: item.observation,
+                verificationMode: .exactPair
+            ) == item.deltas
+        )
+    }
+    for k in 1...4 {
+        for c in 1...k {
+            #expect(
+                try GemmaRuntime.experimentalMTPVerificationDeltas(
+                    for: mtpObservation(k, c),
+                    verificationMode: .serial
+                ) == [mtpDelta(0, 0, c)]
+            )
+        }
+    }
+}
+
+@Test
+func exactPairVerificationGeometryTransitionsCoverWindowBoundary() throws {
+    #expect(
+        try GemmaRuntime.experimentalMTPVerificationDeltas(
+            for: mtpObservation(4, 1, offset: 1_020),
+            verificationMode: .exactPair
+        ) == [mtpDelta(1, 1, 0), mtpDelta(2, 3, 0)]
+    )
+    #expect(
+        try GemmaRuntime.experimentalMTPVerificationDeltas(
+            for: mtpObservation(4, 2, offset: 1_020),
+            verificationMode: .exactPair
+        ) == [mtpDelta(1, 0, 0), mtpDelta(2, 2, 0)]
+    )
+    #expect(
+        try GemmaRuntime.experimentalMTPVerificationDeltas(
+            for: mtpObservation(4, 3, offset: 1_020),
+            verificationMode: .exactPair
+        ) == [mtpDelta(2, 1, 0)]
+    )
+    for offset in [1_021, 1_022] {
+        #expect(
+            try GemmaRuntime.experimentalMTPVerificationDeltas(
+                for: mtpObservation(4, 1, offset: offset),
+                verificationMode: .exactPair
+            ) == [mtpDelta(1, 1, 0)]
+        )
+        #expect(
+            try GemmaRuntime.experimentalMTPVerificationDeltas(
+                for: mtpObservation(4, 2, offset: offset),
+                verificationMode: .exactPair
+            ) == [mtpDelta(1, 0, 0)]
+        )
+        #expect(
+            try GemmaRuntime.experimentalMTPVerificationDeltas(
+                for: mtpObservation(4, 3, offset: offset),
+                verificationMode: .exactPair
+            ) == [mtpDelta(1, 0, 1)]
+        )
+        #expect(
+            try GemmaRuntime.experimentalMTPVerificationDeltas(
+                for: mtpObservation(4, 4, offset: offset),
+                verificationMode: .exactPair
+            ) == [mtpDelta(1, 0, 2)]
+        )
+    }
+    for offset in [1_020, 1_021, 1_022] {
+        #expect(
+            try GemmaRuntime.experimentalMTPVerificationDeltas(
+                for: mtpObservation(2, 1, offset: offset),
+                verificationMode: .exactPair
+            ) == [mtpDelta(1, 1, 0)]
+        )
+        #expect(
+            try GemmaRuntime.experimentalMTPVerificationDeltas(
+                for: mtpObservation(3, 3, offset: offset),
+                verificationMode: .exactPair
+            ) == [mtpDelta(1, 0, 1)]
+        )
+    }
+
+    for offset in [1_023, 1_024, 1_025, 2_048] {
+        for k in 2...4 {
+            for c in 1...k {
+                #expect(
+                    try GemmaRuntime.experimentalMTPVerificationDeltas(
+                        for: mtpObservation(k, c, offset: offset),
+                        verificationMode: .exactPair
+                    ) == [mtpDelta(0, 0, c)]
+                )
+            }
+        }
+    }
+
+    #expect(
+        try GemmaRuntime.experimentalMTPVerificationDeltas(
+            for: mtpObservation(4, 4, offset: 1_020),
+            verificationMode: .exactPair
+        ) == [mtpDelta(2, 0, 0)]
+    )
+}
+
+@Test
+func trustedParentAcceptsFirstBlockDirectFourHistories() throws {
+    let cases: [
+        (
+            name: String,
+            history: [ExperimentalMTPBlockObservation],
+            counters: ExperimentalMTPVerificationDelta
+        )
+    ] = [
+        (
+            "full",
+            [mtpObservation(4, 4, offset: 512)],
+            mtpDelta(2, 0, 0)
+        ),
+        (
+            "zero",
+            [
+                mtpObservation(4, 1, offset: 512),
+                mtpObservation(3, 3, offset: 513),
+            ],
+            mtpDelta(3, 3, 1)
+        ),
+        (
+            "partial",
+            [
+                mtpObservation(4, 2, offset: 512),
+                mtpObservation(2, 2, offset: 514),
+            ],
+            mtpDelta(3, 2, 0)
+        ),
+    ]
+    for item in cases {
+        let total = item.history.reduce(0) { $0 + $1.returnedTokenCount }
+        try GemmaRuntime.validateExperimentalMTPVerificationDiagnostics(
+            totalTokenCount: total,
+            verificationMode: .exactPair,
+            observedBlocks: item.history,
+            exactPairSegmentCount: item.counters.exactPairSegmentCount,
+            exactPairRollbackRowCount: item.counters.exactPairRollbackRowCount,
+            serialVerificationRowCount: item.counters.serialVerificationRowCount
+        )
+        #expect(
+            2 * item.counters.exactPairSegmentCount
+                - item.counters.exactPairRollbackRowCount
+                + item.counters.serialVerificationRowCount == total,
+            Comment(rawValue: "invalid direct-four \(item.name) fixture")
+        )
+    }
+}
+
+@Test
+func trustedParentRejectsEquationValidButUnreachableDiagnostics() {
+    let history = [
+        mtpObservation(4, 2, offset: 512),
+        mtpObservation(2, 2, offset: 514),
+    ]
+    #expect(throws: MLXFastError.self) {
+        try GemmaRuntime.validateExperimentalMTPVerificationDiagnostics(
+            totalTokenCount: 4,
+            verificationMode: .exactPair,
+            observedBlocks: history,
+            exactPairSegmentCount: 2,
+            exactPairRollbackRowCount: 3,
+            serialVerificationRowCount: 3
+        )
+    }
+    #expect(throws: MLXFastError.self) {
+        try GemmaRuntime.validateExperimentalMTPVerificationDiagnostics(
+            totalTokenCount: 2,
+            verificationMode: .exactPair,
+            observedBlocks: [mtpObservation(2, 2, offset: 512)],
+            exactPairSegmentCount: 2,
+            exactPairRollbackRowCount: 4,
+            serialVerificationRowCount: 2
+        )
+    }
+}
+
+@Test
+func trustedParentRejectsPrewrapSerialFallback() {
+    let history = [
+        mtpObservation(4, 1, offset: 512),
+        mtpObservation(3, 3, offset: 513),
+    ]
+    #expect(throws: MLXFastError.self) {
+        try GemmaRuntime.validateExperimentalMTPVerificationDiagnostics(
+            totalTokenCount: 4,
+            verificationMode: .exactPair,
+            observedBlocks: history,
+            exactPairSegmentCount: 0,
+            exactPairRollbackRowCount: 0,
+            serialVerificationRowCount: 4
+        )
+    }
+}
+
+@Test
+func trustedParentAcceptsBoundaryGeometryFallbacks() throws {
+    try GemmaRuntime.validateExperimentalMTPVerificationDiagnostics(
+        totalTokenCount: 4,
+        verificationMode: .exactPair,
+        observedBlocks: [
+            mtpObservation(4, 3, offset: 1_021),
+            mtpObservation(1, 1, offset: 1_024),
+        ],
+        exactPairSegmentCount: 1,
+        exactPairRollbackRowCount: 0,
+        serialVerificationRowCount: 2
+    )
+    try GemmaRuntime.validateExperimentalMTPVerificationDiagnostics(
+        totalTokenCount: 4,
+        verificationMode: .exactPair,
+        observedBlocks: [
+            mtpObservation(4, 1, offset: 1_023),
+            mtpObservation(3, 3, offset: 1_024),
+        ],
+        exactPairSegmentCount: 0,
+        exactPairRollbackRowCount: 0,
+        serialVerificationRowCount: 4
+    )
+}
+
+@Test
+func trustedParentAcceptsMixedVerificationHistory() throws {
+    let history = [
+        mtpObservation(4, 2, offset: 512),
+        mtpObservation(4, 3, offset: 514),
+        mtpObservation(1, 1, offset: 517),
+    ]
+    try GemmaRuntime.validateExperimentalMTPVerificationDiagnostics(
+        totalTokenCount: 6,
+        verificationMode: .exactPair,
+        observedBlocks: history,
+        exactPairSegmentCount: 4,
+        exactPairRollbackRowCount: 3,
+        serialVerificationRowCount: 1
+    )
+}
+
+@Test
+func trustedParentRejectsTruncatedK4Histories() {
+    for (total, observation, counters) in [
+        (1, mtpObservation(4, 1, offset: 512), mtpDelta(2, 3, 0)),
+        (2, mtpObservation(4, 2, offset: 512), mtpDelta(2, 2, 0)),
+    ] {
+        #expect(throws: MLXFastError.self) {
+            try GemmaRuntime.validateExperimentalMTPVerificationDiagnostics(
+                totalTokenCount: total,
+                verificationMode: .exactPair,
+                observedBlocks: [observation],
+                exactPairSegmentCount: counters.exactPairSegmentCount,
+                exactPairRollbackRowCount: counters.exactPairRollbackRowCount,
+                serialVerificationRowCount: counters.serialVerificationRowCount
+            )
+        }
+    }
+}
+
+@Test
+func trustedParentSerialDiagnosticsFollowObservedHistory() throws {
+    let history = [
+        mtpObservation(4, 2, offset: 512),
+        mtpObservation(2, 2, offset: 514),
+    ]
+    try GemmaRuntime.validateExperimentalMTPVerificationDiagnostics(
+        totalTokenCount: 4,
+        verificationMode: .serial,
+        observedBlocks: history,
+        exactPairSegmentCount: 0,
+        exactPairRollbackRowCount: 0,
+        serialVerificationRowCount: 4
+    )
+    #expect(throws: MLXFastError.self) {
+        try GemmaRuntime.validateExperimentalMTPVerificationDiagnostics(
+            totalTokenCount: 4,
+            verificationMode: .serial,
+            observedBlocks: history,
+            exactPairSegmentCount: 1,
+            exactPairRollbackRowCount: 0,
+            serialVerificationRowCount: 2
+        )
+    }
+}
+
+@Test
+func trustedParentValidatorHandlesMaximumBlockHistory() throws {
+    var history: [ExperimentalMTPBlockObservation] = []
+    history.reserveCapacity(512)
+    for index in 0..<509 {
+        history.append(mtpObservation(4, 1, offset: 512 + index))
+    }
+    history.append(mtpObservation(3, 1, offset: 1_021))
+    history.append(mtpObservation(2, 1, offset: 1_022))
+    history.append(mtpObservation(1, 1, offset: 1_023))
+
+    try GemmaRuntime.validateExperimentalMTPVerificationDiagnostics(
+        totalTokenCount: 512,
+        verificationMode: .exactPair,
+        observedBlocks: history,
+        exactPairSegmentCount: 1_020,
+        exactPairRollbackRowCount: 1_529,
+        serialVerificationRowCount: 1
+    )
+}
+
+@Test
+func trustedAndWorkerMTPDiagnosticValidatorsStayMirrored() throws {
+    func validatorSource(_ path: String) throws -> String {
+        let source = try String(contentsOfFile: path, encoding: .utf8)
+        let start = try #require(
+            source.range(
+                of: "    static func experimentalMTPVerificationDeltas("
+            )
+        )
+        let end = try #require(
+            source.range(
+                of: "    static func measureExperimentalTrainedMTPWorkerDecode(",
+                range: start.upperBound..<source.endIndex
+            )
+        )
+        return String(source[start.lowerBound..<end.lowerBound])
+    }
+
+    let worker = try validatorSource(
+        "Sources/MLXFastHarness/GemmaRuntimeMTP.swift"
+    )
+    let trusted = try validatorSource(
+        "Sources/MLXFastTrustedHarness/GemmaRuntimeMTP.swift"
+    )
+    #expect(worker == trusted)
+}
+
+@Test
+func trustedMTPHistoryValidationRunsAfterElapsedCapture() throws {
+    let source = try String(
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeMTP.swift",
+        encoding: .utf8
+    )
+    let start = try #require(
+        source.range(
+            of: "    static func measureExperimentalTrainedMTPWorkerDecode("
+        )
+    )
+    let body = source[start.lowerBound...]
+    let reserve = try #require(
+        body.range(of: "observedBlocks.reserveCapacity(totalTokenCount)")
+    )
+    let timingReserve = try #require(
+        body.range(of: "blockRequestSeconds.reserveCapacity(totalTokenCount)")
+    )
+    let timer = try #require(
+        body.range(of: "let phaseStart = DispatchTime.now().uptimeNanoseconds")
+    )
+    let append = try #require(
+        body.range(of: "observedBlocks.append(")
+    )
+    let elapsed = try #require(
+        body.range(of: "let elapsedSeconds = secondsSince(phaseStart)")
+    )
+    let validate = try #require(
+        body.range(of: "try validateExperimentalMTPVerificationDiagnostics(")
+    )
+    let loopStart = try #require(
+        body.range(of: "while validator.remainingTokenCount > 0")
+    )
+    let loopEnd = try #require(
+        body.range(
+            of: "try validator.requireComplete()",
+            range: loopStart.upperBound..<body.endIndex
+        )
+    )
+    let timedLoop = body[loopStart.lowerBound..<loopEnd.lowerBound]
+    #expect(reserve.lowerBound < timer.lowerBound)
+    #expect(timingReserve.lowerBound < timer.lowerBound)
+    #expect(timer.lowerBound < append.lowerBound)
+    #expect(append.lowerBound < elapsed.lowerBound)
+    #expect(elapsed.lowerBound < validate.lowerBound)
+    #expect(!timedLoop.contains("reserveCapacity"))
+    #expect(timedLoop.contains("startingLogicalTargetOffset"))
+}
+
 @Test
 func trainedMTPContractPinsMatchedITPairAndDependency() throws {
     let data = try Data(
@@ -601,9 +1034,9 @@ func trainedMTPContractPinsMatchedITPairAndDependency() throws {
         contract.mlxSwiftLMRevision
             == "bc1c0ee67d15798343be17c9f8f61f7c0d977149"
     )
-    // QAT-assistant re-enablement: official scoring is ON with the
-    // reference baseline re-established on the ranked box against the QAT
-    // 4-bit assistant. The ranked decode window (512) is owned by the
+    // Live QAT-assistant track: official scoring is ON with the established
+    // ranked-box reference baseline against the QAT 4-bit assistant. The
+    // ranked decode window (512) is owned by the
     // workflow env; the contract's decode_tokens stays the 128-token
     // compatibility default with a 512 trusted-parent maximum.
     #expect(contract.officialScoringEnabled)
@@ -611,6 +1044,15 @@ func trainedMTPContractPinsMatchedITPairAndDependency() throws {
     #expect(contract.referenceBaseline.publicationAllowed)
     #expect(contract.protocolContract.decodeTokens == 128)
     #expect(contract.protocolContract.maximumDecodeTokens == 512)
+
+    let raw = try #require(
+        JSONSerialization.jsonObject(with: data) as? [String: Any]
+    )
+    let scoring = try #require(raw["proposed_scoring"] as? [String: Any])
+    let legacyTokenGate = try #require(scoring["bit_exact_gate"] as? String)
+    #expect(legacyTokenGate.contains("applying only to returned token IDs"))
+    #expect(legacyTokenGate.contains("outside this ranked gate"))
+    #expect(legacyTokenGate.contains("trusted/local regression"))
 }
 
 @Test
@@ -752,7 +1194,7 @@ func trainedMTPTrackIsExplicitAndSerialBenchmarkRemainsUnchanged() throws {
 }
 
 @Test
-func trainedMTPUsesExplicitExactPairVerificationAndSerialControl() throws {
+func trainedMTPUsesExplicitMultiRowVerificationAndSerialControl() throws {
     let adapter = try String(
         contentsOfFile: "Sources/MLXFastModel/Gemma4MTPRuntime.swift",
         encoding: .utf8
@@ -771,13 +1213,18 @@ func trainedMTPUsesExplicitExactPairVerificationAndSerialControl() throws {
     #expect(adapter.contains("case .exactPair:"))
     #expect(adapter.contains("verifyWithExactPairs("))
     #expect(adapter.contains("target.exactMTPPair("))
+    #expect(adapter.contains("target.exactMTPFour("))
     #expect(adapter.contains("Gemma4SharedKV.sliceTail("))
+    #expect(adapter.contains("directExactFourInvocationCount = 0"))
     #expect(adapter.contains("case .serial:"))
     #expect(adapter.contains("verifySerially("))
     #expect(!adapter.contains("replayRejectedRoundExactly"))
     #expect(!adapter.contains("PromptLookup"))
     #expect(engine.contains("func forwardForMTP("))
     #expect(engine.contains("func exactMTPPair("))
+    #expect(engine.contains("func exactMTPFour("))
+    #expect(engine.contains("fusedQKV.exactFourVector("))
+    #expect(engine.contains("exactFourVectorPacked13Softcapped("))
     #expect(engine.contains("gemma4ExactTwoTokenAttention("))
     #expect(engine.contains("exactTwoVectorPacked13Softcapped("))
     #expect(engine.contains("capturedSharedKV: Gemma4SharedKV("))
@@ -823,6 +1270,12 @@ func mtpProvisioningIsPinnedResumableAndSeparate() throws {
     #expect(script.contains("shasum -a 256"))
     #expect(script.contains("must not be hardlinked"))
     #expect(script.contains("must not be a symlink"))
+    #expect(
+        script.contains(
+            "official scoring: enabled in the default paired-M5 MTP workflow (floor 1.0)"
+        )
+    )
+    #expect(!script.contains("official score: disabled"))
 
     let normalSetup = try String(
         contentsOfFile: "setup.sh",

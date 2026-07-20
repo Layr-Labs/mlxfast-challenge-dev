@@ -131,7 +131,7 @@ Focus on:
 
 - Reducing scored MTP seconds per committed token.
 - Increasing safe draft acceptance and reducing target verification work
- without changing the serial K=1 accumulation order.
+ while preserving exact target-confirmed token behavior and cache geometry.
 - Optimizing the vendored Metal kernels on the decode and exact-pair paths.
 - Optimizing kernels and hot-path MLX operations used by attention (both the
  sliding-window and full-attention layer types), the gated MLP, KV-cache
@@ -147,7 +147,8 @@ Focus on:
 The target is Gemma 4 31B-IT, dense, 4-bit, text tower only (vision/audio are
 out of scope and are never loaded). The frozen target checkpoint is about
 18.4 GB across 4 safetensors shards; `setup-mtp.sh` also provisions the
-matched ~939 MB assistant and verifies both against pinned manifests. The
+matched 264,144,321-byte (~252 MiB) assistant and verifies both against pinned
+manifests. The
 transformed `mtp-weights/` tree holds only the text-tower tensors
 (everything under the source checkpoint's `language_model.` prefix) plus a
 runtime-authored `config.json`; it is an overlay/runtime artifact, not a
@@ -206,9 +207,11 @@ acceptance; the pinned reference is measured the same way on the same box in
 the same session. At least three pairs must pass parity, stall, thermal, and
 telemetry validation.
 
-Diagnostic fields such as memory and read timings are recorded for audit and
-future guardrails, but are not the primary score unless the benchmark contract
-changes. There is no expert/weight-streaming bandwidth to report for this
+Detailed memory, timing, acceptance, and worker diagnostics remain
+runner-private for trusted validation and are not uploaded. The public payload
+is strictly allowlisted to the scoring contract and parent-owned aggregate gate
+values; the score itself retains residual low-bandwidth timing feedback. There
+is no expert/weight-streaming bandwidth to report for this
 dense model: `bandwidth_gb_per_token` is always `0` with
 `bandwidth_source=ram_resident_model`. Do not optimize for that diagnostic
 field as a standalone target; optimize changes that reduce the measured
@@ -434,8 +437,20 @@ machine. The hidden correctness and benchmark prompts are different from the
 public local fixtures, and official scoring happens on the single self-hosted
 M5 runner. Kernel edits are bound by the same correctness gates as model
 edits: keep them prompt-independent and model-general for Gemma 4, and be
-conservative with numeric reassociation — a changed accumulation order can
-flip near-tie greedy argmaxes on the M5 and fail the exact-token gates.
+free to reassociate reductions, fuse operations, or use alternate reduction
+strategies. Such changes must keep finite intermediates inside the documented
+numeric envelopes and preserve the exact-token gates; near-tie argmaxes can
+still make a numerically small change fail behavior parity.
+The envelopes are provisional trusted/local/upstream regression heuristics
+informed by existing tests and FP16/BF16 quantization behavior; they do not
+guarantee every stale value is detected. Calibrate them on M5 before relying on
+or loosening them for a kernel change. Ranked candidate-linked code never
+receives hidden oracle paths for tensor parity. The trusted parent directly
+enforces exact returned token IDs and validates logical protocol/report
+consistency. Cache offsets, physical rollback/geometry, and numerical state
+are checked inside the candidate worker/model plus trusted implementation
+tests, track-aware static review, hidden behavioral controls, and
+manual/operator validation.
 
 ## Avoid These Wrong Strategies
 
@@ -526,19 +541,37 @@ optimization within this serial track.
 The Yukon-default ranked surface has track ID
 `gemma4-31b-it-mtp-v1`; `docs/experimental-mtp-track.md` is its detailed
 contract. An organizer-pinned Gemma 4 31B-IT target is
-paired with Google's matched trained assistant (~939 MB organizer-provisioned
-sidecar); a trusted parent drives a block protocol (`mtp_decode_begin`, then
+paired with Google's matched trained assistant (264,144,321-byte,
+organizer-provisioned sidecar); a trusted parent drives a block protocol
+(`mtp_decode_begin`, then
 `mtp_decode_block` carrying only the last committed token and a max block
 size of 4), owns the timer and an independent serial-oracle check of every
 returned token, and divides its own wall time by its configured decode total
-(`--tokens`, default 128, max 512). The participant surface is the drafting
+(`--tokens` has a 128 compatibility default and 512 maximum; ranked workflow
+fixes 512). The participant surface is the drafting
 and verification strategy inside `Sources/MLXFastModel/` — the
-`Gemma4TrainedMTPBlockSession` block decoder and the bit-exact exact-pair
-verification kernels (`Gemma4ExactTwo*.swift`), which verify two target rows
-per dispatch while preserving each row's serial K=1 accumulation order so
-accepted tokens are bit-identical to serial decode. Bit-exactness is a hard
-gate: one token diverging from the parent oracle fails the run, so the track
-cannot be won by degrading output. Scoring is decode-only
+`Gemma4TrainedMTPBlockSession` block decoder, behavior-exact pair kernels
+(`Gemma4ExactTwo*.swift`), and the distinct direct four-row kernels
+(`Gemma4ExactFour*.swift`). The four-row forward is not just two pair calls;
+production dispatch additionally requires adaptive margin-selector approval
+and four-row engine/cache geometry, otherwise K=4 composes pairs (with serial
+tails only at deterministic rotating-cache geometry).
+They may reassociate, fuse, or replace floating-point reduction strategies
+when intermediate tensors remain finite and inside the numeric regression
+envelopes. Those envelopes are provisional local/trusted checks, not ranked
+candidate gates, and require M5 calibration before an optimization relies on
+or loosens them. The implementation contract keeps target argmax and returned
+token IDs, cache geometry, commit/rollback, and physical row accounting exact,
+but does not require bit-identical intermediate logits, hidden state, KV
+tensors, or serial K=1 reduction order. The legacy `bitExactTokenGate`
+manifest key applies only to returned token IDs: one token diverging from the
+parent oracle fails the run, so the track cannot be won by degrading output.
+Candidate-linked ranked tests do not receive hidden golden paths for tensor
+comparisons. The parent observes token IDs and validates logical
+protocol/report consistency. Cache offsets and physical rollback/state are
+checked inside the candidate worker/model; static review, hidden behavior
+gates, trusted implementation tests, and manual validation cover what the
+parent cannot independently observe. Scoring is decode-only
 paired speedup versus the trusted serial K=1 reference in the same session,
 with a floor of 1.0. The archived serial rules above still apply to explicit
 serial-track submissions only.

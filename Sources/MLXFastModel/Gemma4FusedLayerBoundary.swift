@@ -159,10 +159,10 @@ private let gemma4FusedAttentionToMLPBoundaryKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// MTP-only two-row variant. Each grid-y threadgroup normalizes one token row
-/// with the same loop structure, accumulation order, and reduction tree as
-/// the serial kernel above, so per-row results are bit-identical to two
-/// serial dispatches. The serial kernel itself is untouched.
+/// MTP-only two-row variant. Each grid-y threadgroup currently normalizes one
+/// token row while sharing a dispatch. The serial kernel itself is untouched.
+/// Alternate fusion or reduction trees are valid when exact token decisions,
+/// finite numeric envelopes, and cache geometry continue to pass.
 private let gemma4FusedAttentionToMLPBoundaryPairKernel = MLXFast.metalKernel(
     name: "gemma4_fused_attention_to_mlp_boundary_pair_5376_mtp_v1",
     inputNames: [

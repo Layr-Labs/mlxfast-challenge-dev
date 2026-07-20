@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "name": "mlxfast-challenge-dev-mtp",
   "trackId": "gemma4-31b-it-mtp-v1",
-  "description": "Gemma 4 31B-IT MTP track: optimize organizer-assistant, target-verified block decode (drafting strategy and bit-exact multi-row verification kernels in the editable surface) against the trusted serial K=1 oracle. Decode-only paired scoring; every returned token must match the parent-owned serial oracle.",
+  "description": "Gemma 4 31B-IT MTP track: optimize organizer-assistant, target-verified block decode (drafting strategy and behavior-preserving multi-row verification kernels in the editable surface) against the trusted serial K=1 oracle. Decode-only paired scoring; every returned token ID must exactly match the parent-owned serial oracle.",
   "category": "swift",
   "direction": "+",
   "editablePaths": [

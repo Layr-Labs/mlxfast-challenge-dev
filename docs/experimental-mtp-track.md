@@ -53,14 +53,14 @@ The MLX target conversion is pinned independently:
 The target model cards declare Apache-2.0 and link the Gemma license at
 <https://ai.google.dev/gemma/docs/gemma_4_license>; the QAT assistant
 conversion's card declares the Gemma license and derives from Google's
-Apache-2.0 QAT drafter. Operators must still review the license terms before
-enabling a public ranked track.
+Apache-2.0 QAT drafter. The live ranked track remains subject to those model
+license terms.
 
 ## Provenance contract
 
 `fixtures/gemma_4_31b_it_mtp_track.json` binds:
 
-- track identity and disabled-scoring state;
+- track identity and enabled official-scoring state;
 - target and assistant model IDs plus immutable repository revisions;
 - the exact pinned `mlx-swift-lm` revision
   `bc1c0ee67d15798343be17c9f8f61f7c0d977149`;
@@ -68,7 +68,7 @@ enabling a public ranked track.
 - SHA256 manifest identities and artifact byte budgets;
 - block size four, a compatibility default of 128 parent-counted decode
   tokens, and a hard trusted-parent cap of 512;
-- the missing-reference-baseline status.
+- the established paired-reference baseline and publication status.
 
 Byte manifests:
 
@@ -139,13 +139,60 @@ An exact-pair session fails during construction if the target does not have
 all required packed metadata and kernels. It never catches a numerical
 mismatch and silently reruns that pair serially.
 
+In this track, `exact` means exact target argmax/returned-token verification
+and logical protocol/report consistency at the ranked boundary.
+It does not require serial K=1 accumulation order or bit-identical logits,
+hidden state, or KV tensors. Reassociation, fusion, and alternate reduction
+strategies are allowed when intermediates are finite and stay inside the
+regression suite's separately named logits, hidden-state, and KV numeric
+envelopes. Tensor shapes, relevant dtypes, cache offsets and lengths, state
+counts, commit/rollback, physical row accounting, and target token decisions
+remain exact implementation contracts.
+
+The model-backed suite is a trusted/local/upstream development regression. It
+uses public or operator-controlled non-hidden inputs, casts both sides to
+float32, and applies `allClose` with these provisional heuristic envelopes:
+
+- logits: `rtol=1e-5`, `atol=1e-5`, plus exact argmax token IDs;
+- pre-norm hidden state: `rtol=1e-2`, `atol=2e-3`;
+- physical/shared KV values: `rtol=1e-2`, `atol=1e-3`;
+- attention activations: `rtol=1e-2`, `atol=2e-3`.
+
+MLX reports unit-scale epsilon near `9.77e-4` for Float16 and `7.8125e-3`
+for BF16. Existing repository tests use `rtol=1e-5`, `atol=1e-5` for Gemma 4
+logits and `rtol=1e-2`, `atol=2e-3` for BF16 attention parity. The KV
+near-zero absolute tolerance is a heuristic intended to increase sensitivity;
+it cannot guarantee every stale or shifted value fails. All values above are
+provisional regression heuristics informed by those tests and quantization
+behavior, not representation-derived bounds. An optimization must calibrate
+on M5 before relying on or loosening them.
+
+These tensor checks are not ranked submission gates. Candidate-linked test
+code never receives hidden correctness or benchmark oracle paths. Ranked
+enforcement combines parent-owned exact returned token IDs and logical
+protocol/report-consistency validation (`all_tokens_matched` and
+`parity_all_ok`) with track-aware static review and hidden behavioral checks.
+Cache offsets, physical rollback/geometry, and numerical state are checked
+inside the candidate worker/model plus trusted implementation regressions and
+manual/operator validation, not independently observed by the parent.
+
 For configured block size `K` in `2...4`, one round:
 
 1. Uses the trained assistant to draft `K - 1` tokens from the current target
    token, target hidden state, and shared K/V.
-2. Verifies two target rows at a time when a pair is available. K=4 composes
-   two exact pairs; K=3 uses one pair plus an exact K=1 bonus tail; K=2 uses one
-   pair; K=1 is target-only.
+2. For K=4, the direct `exactMTPFour` forward is attempted only when exact-four
+   is enabled, the adaptive draft-margin selector approves it (or adaptation is
+   disabled), and every layer/cache reports four-row eligibility at the current
+   geometry. If the margin selector declines or four-row engine/cache geometry
+   is unavailable, verification falls back to pair composition; deterministic
+   rotating-cache wrap geometry may then force the existing serial tail. With
+   the pinned 1,024-token window, four rows fit through starting offset 1,020,
+   one pair fits through 1,022, F1 applies at 1,021–1,022 after one accepted
+   pair, and F0 applies from 1,023 onward (including post-wrap). There is no
+   ranked non-geometry serial fallback: engine ineligibility fails closed. K=3
+   uses one pair plus an exact K=1 bonus tail; K=2 uses one pair; K=1 is
+   target-only. Diagnostics count one direct four-row forward as two
+   pair-equivalent segments.
 3. Compares each draft to the corresponding target argmax in order and starts
    no later segment after the first rejection.
 4. Emits only the target-confirmed prefix plus the target token at the first
@@ -156,22 +203,33 @@ For configured block size `K` in `2...4`, one round:
 6. Persists hidden/shared-KV state at the committed target position.
 7. Checks every target cache offset against the host mirror.
 
-The exact-pair kernels share packed weight traversal while preserving each
-row's K=1 accumulation and reduction order. They cover sliding Q/K/V, full
-Q/K, attention output, gate/up activation, down projection, layer boundaries,
-and the tied packed13 vocabulary head. RMS normalization remains row-serial.
-Full D=512 attention remains two K=1 calls. Sliding D=256 attention uses one
+The current exact-pair kernels share packed weight traversal across sliding
+Q/K/V, full Q/K, attention output, gate/up activation, down projection, layer
+boundaries, and the tied packed13 vocabulary head. RMS normalization and full
+D=512 attention currently remain row-serial. Sliding D=256 attention uses one
 causal two-query dispatch only below the library's 1,024-key shape switch;
-otherwise it is row-serial. Row two therefore sees row one's K/V exactly as it
-does in serial decoding.
+otherwise it is row-serial. Those are implementation choices, not mandated
+reduction boundaries. Any replacement must keep causality—row two sees row
+one's committed K/V—and pass the behavior and local numeric regressions above.
+
+`exactMTPFour` is not implemented entirely as two exact-pair calls: it uses
+dedicated four-row QKV, output, gate/up, down, and vocabulary-head kernels
+(with some current attention/boundary fallbacks split into two-row pieces).
+The model-backed regression therefore compares its four logits, pre-norm
+hidden rows, shared K/V, every physical cache state, and exact metadata against
+four serial rows directly. Pair-level envelopes cover pair segments; forced
+K=4 session tests separately retain exact token, rollback, and physical-row
+accounting.
 
 The expanded M5 pilot proved why an ordinary mathematical K-row target
 forward is insufficient: retained layer-1 K/V diverged after the first
 full-acceptance block and a public prose continuation flipped argmax at decode
 step 48, despite identical logical offsets. The exact-pair path is not that
 ordinary batched path. Its regression gate compares both pair rows against two
-K=1 forwards using exact logits, pre-norm hidden bits, every layer's physical
-K/V state, and rollback state at multiple offsets.
+K=1 forwards using float32 numeric envelopes for logits, pre-norm hidden
+state, and every layer's physical K/V values while keeping token decisions,
+tensor geometry, cache offsets/state counts, and rollback state exact at
+multiple offsets.
 
 Zero, partial, and full acceptance use the same charged path. A deterministic
 serial tail is used only when a block shape requires one row or a rotating
@@ -198,6 +256,30 @@ memory, selected verification mode, exact-pair segments, pair rollbacks, and
 serial geometry/tail rows; none has timing or score authority. Unknown fields
 such as `accepted_count`, `token_count`, `seconds`, or `future_tokens` are
 rejected by the parent decoder.
+
+The parent preallocates a private `(starting logical target offset, requested
+max block size, returned token count)` history before timing and appends one
+entry per accepted block. After the elapsed time is captured, it validates that
+the final `(pair segments, rollback rows, serial rows)` diagnostic tuple is
+exactly reachable from that history under the geometry-aware
+pair/direct-four/serial-fallback transition table. This adds no timed wire
+fields. The preallocated append is bounded trusted bookkeeping inside the
+parent wall-time measurement, so its small optimized overhead is charged to
+MTP; only the final reachability DP runs after elapsed time is captured.
+
+Raw gate reports, worker diagnostics, sealed paired results, private logs, and
+free-form measure verdicts can carry hidden-prompt-influenced data. Gate
+stdout/logs are removed by the gate-step trap and verified absent by the
+pre-timing scrub. Ranked sealed results/verdicts are deleted immediately after
+the minimized score is constructed and schema-validated, before staging; the
+always-run cleanup remains defense in depth. A correctness-only run publishes
+only a canonically reconstructed fixed-schema trusted verdict containing
+schema version, track ID, a passed boolean, and the fixed token count. A ranked
+run publishes only a canonically reconstructed minimized Yukon score payload.
+The score and its
+parent-measured timing basis remain an unavoidable low-bandwidth feedback
+channel; artifact minimization removes avoidable candidate-controlled fields
+but does not claim to eliminate that timing/score side channel.
 
 The trusted parent:
 
@@ -302,10 +384,10 @@ Submissions change only `Sources/MLXFastModel/` (and
 - `Gemma4MTPRuntime.swift`: `Gemma4TrainedMTPBlockSession` — the drafting
   loop, verification composition (exact pairs, serial tails), acceptance
   handling, commit/rollback, and per-request state reuse.
-- `Gemma4ExactTwo*.swift` and the fast-engine pair path: the bit-exact
-  multi-row verification kernels. Participants may improve dispatch, extend
-  coverage (for example a four-row exact composition), or replace the
-  strategy entirely.
+- `Gemma4ExactTwo*.swift` and the fast-engine pair path: behavior-exact,
+  numerically bounded multi-row verification kernels. Participants may
+  reassociate or fuse reductions, improve dispatch, extend coverage (for
+  example the direct four-row path), or replace the strategy entirely.
 - Everything the serial track already allows: quantized matmul dispatch,
   attention restructuring, KV-cache handling, weight layout, scheduling.
 
@@ -319,8 +401,10 @@ already fixed; see "First-block stall: root cause and fix".)
 
 - The parent validates every returned token against a serial oracle golden
   generated from the pinned reference; one divergent token fails the run.
-  Bit-exactness is therefore a hard gate, not a convention: a submission
-  that "wins" by degrading output cannot score.
+  Exact returned-token parity is therefore a hard gate, not a convention: a
+  submission that "wins" by degrading output cannot score. The legacy
+  `bitExactTokenGate`/`bit_exact_gate` schema names apply only to returned
+  token IDs, not floating-point intermediates.
 - The parent owns wall time and divides by its own configured decode total.
   Worker-reported timing, acceptance, and counters have no score authority,
   are bounded before use, and must satisfy the physical row-accounting
@@ -335,10 +419,10 @@ already fixed; see "First-block stall: root cause and fix".)
 - What the parent cannot prove (internal use of the assistant, real target
   verification, physical rollback correctness when outputs still match) is
   covered by the MTP static-review policy, hidden prompt-independent tests,
-  the cache-offset ledger, and the runtime parity gates that any kernel
-  change must rerun.
+  and the cache-offset ledger. Trusted/local/upstream tensor regressions add
+  development coverage without exposing hidden oracle paths to candidate code.
 
-### Proposed scoring (pending operator calibration)
+### Adopted scoring
 
 The contract's `proposed_scoring` block records the adopted ranked form:
 
@@ -386,16 +470,17 @@ decode step 48. Safe differential replay established:
 
 The root cause was shape-dependent floating-point target execution, not prompt
 lookup, assistant incompatibility, host offset arithmetic, or a missing trim.
-An ordinary batched K-row target graph is mathematically causal but is not
-bit-identical to K serial target graphs on this runtime. The first fix
-verified supplied target rows using the exact serial K=1 graph. The current
-default replaces the ordinary batched graph with dedicated exact-pair kernels
-that keep each row's K=1 accumulation order while sharing packed weight
-traversal; the serial K=1 verifier is retained as the explicit control mode.
-Runtime-gated parity tests preserve the failing seam: exact logits, pre-norm
-hidden bits, and every layer's physical K/V bytes are compared against two
-serial forwards at multiple offsets, across forced zero/partial/full and
-second-segment acceptance, and across the deep growth/wrap boundaries.
+An ordinary batched K-row target graph was mathematically causal but differed
+enough from K serial target graphs to flip a returned token. The first fix
+verified supplied target rows with the serial K=1 graph. The current default
+uses dedicated exact-pair kernels that share packed weight traversal; the
+serial K=1 verifier remains the explicit control mode. Trusted/local
+model-backed regressions preserve the failing seam with exact target token
+decisions and exact cache geometry plus finite float32 numeric envelopes for
+logits, pre-norm hidden state, and every layer's physical K/V values. They use
+non-hidden inputs and cover multiple offsets, forced zero/partial/full and
+second-segment acceptance, and deep growth/wrap boundaries without mandating a
+reduction order.
 
 ### Prior K=1-control public/synthetic matrix
 
@@ -453,14 +538,16 @@ The residual variance is a bounded one-time seed-prefill first-touch.)
 ### Committed-tip revalidation matrix (commit e71f2a9)
 
 The consolidated committed tip (separate MTP-only pair boundary kernels,
-serial K=1 boundary kernels restored byte-identical to the base; audit
+serial K=1 boundary kernels restored unchanged from the base; audit
 counter hardening) was rerun on the freed dev box (`m5-max-128gb-1`, drained
 from ranked serving) as a fresh 12-pair thermal-gated matrix, K=4,
 alternating order, 512-token seeds, N=255/256/257:
 
-- All four model-backed parity gates passed against the pinned IT target and
-  assistant (artifact validation, basic pair bit-for-bit, forced
-  zero/partial/full/second-segment acceptance seams, deep growth/wrap).
+- All four trusted model-backed regressions passed against the pinned IT target
+  and assistant on public/synthetic inputs (artifact validation, basic pair
+  numeric/behavior parity, forced zero/partial/full/second-segment acceptance
+  seams, deep growth/wrap). They were operator development checks, not
+  candidate-linked ranked tests with hidden paths.
 - Every returned token matched the serial oracle across all 24 runs
   (`parity_all_ok=true`), and every cache-offset invariant held.
 - Mean paired decode speedup: 1.29x copy, 1.22x prose, 1.23x code,
@@ -524,31 +611,13 @@ not thermal/frequency, and present with or without inter-run cooldown); the
 multi-pair alternating-order protocol below averages it out, so single-pair
 totals still must not be quoted from one pair.
 
-Phase 1 emits diagnostic JSON with no `score` or `speedup`.
-
-Before publication, organizers must:
-
-1. Freeze an IT-target public and hidden correctness set and serial oracle.
-2. Freeze a trusted MTP reference implementation at the same target,
-   assistant, block size, prompt, token count, sandbox, and thermal policy.
-3. Measure candidate and reference back-to-back on the ranked box.
-4. Adopt the decode-only paired score in the contract's `proposed_scoring`
-   (or override it), then calibrate the component floor from fresh gated
-   sessions.
-5. Add MTP-specific behavior and parity gates.
-6. Enable the track only through a distinct workflow/track ID, and provision
-   the target + assistant on the ranked box (they currently live only on the
-   dev box cache).
-7. The first-block stall is fixed (see "First-block stall: root cause and
-   fix"). A bounded one-time seed-prefill first-touch (~1.5s run-to-run)
-   remains, so still require the multi-pair alternating-order protocol above
-   before quoting single-pair scores.
-
-Items 1–7 are complete. The live default workflow is
+The publication checklist is complete. The live default workflow is
 `.github/workflows/benchmark.yml`; the contract has
-`official_scoring_enabled=true` and the hidden pins are populated. The
-historical operator procedure is retained in
-`docs/mtp-track-golive-runbook.md`.
+`official_scoring_enabled=true`, the paired serial baseline and 1.0 floor are
+established, and hidden pins are populated. Ranked runs publish the adopted
+ratio-of-means score only after parent-owned token/protocol gates and the
+multi-pair thermal/telemetry checks pass. Historical enablement procedure is
+retained in `docs/mtp-track-golive-runbook.md`.
 
 The archived serial configuration remains separate from MTP results.
 
@@ -612,9 +681,10 @@ when the fixed parent-owned decode total leaves a final target-only tail; the
 trained-assistant command rejects configured `K=1` because it would never
 draft.
 
-For the opt-in model-backed validation, run all four runtime gates — the
-artifact gate, the basic pair-parity gate, the forced acceptance-seam gate,
-and the deep growth/wrap gate:
+For opt-in trusted/local/upstream model-backed validation, run the following
+regressions — artifact loading, direct pair/four numeric parity, direct-four
+accounting, forced pair-composition seams, and deep growth/wrap — using only
+the public/generated non-hidden oracle:
 
 ```bash
 MLXFAST_RUN_MTP_RUNTIME_TESTS=1 \
@@ -626,7 +696,13 @@ swift test -c release --filter trainedMTPArtifactValidationRuntimeGate
 MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1 \
 MLXFAST_MTP_WEIGHTS_PATH="${PWD}/mtp-weights" \
 MLXFAST_MTP_PAIR_GOLDEN_PATH=/tmp/gemma4-31b-it-mtp-public.json \
-swift test --filter exactPairRuntimeMatchesTwoSerialRowsBitForBit
+swift test --filter exactPairAndFourRuntimePreserveTokensWithinNumericEnvelope
+
+MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1 \
+MLXFAST_MTP_WEIGHTS_PATH="${PWD}/mtp-weights" \
+MLXFAST_MTP_ASSISTANT_DIR="${MLXFAST_MTP_ASSISTANT_DIR}" \
+MLXFAST_MTP_PAIR_GOLDEN_PATH=/tmp/gemma4-31b-it-mtp-public.json \
+swift test --filter exactFourSessionCountersCoverFullZeroAndPartialAcceptance
 
 MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1 \
 MLXFAST_MTP_WEIGHTS_PATH="${PWD}/mtp-weights" \
@@ -640,33 +716,45 @@ MLXFAST_MTP_WEIGHTS_PATH="${PWD}/mtp-weights" \
 swift test --filter exactPairDeepOffsetsGrowthAndWrapMatchSerial
 ```
 
-Do not claim model-backed success unless all of these commands run with the
-pinned weights and an IT-target oracle. CI cannot run them (no weights on
-hosted runners); any official MTP workflow must run the full set on the
-benchmark host before a kernel change ships.
+Do not claim model-backed success unless all commands run with pinned weights
+and a public or operator-controlled non-hidden IT-target oracle. Hosted CI
+cannot run them because it has no weights. The ranked workflow deliberately
+does not invoke candidate-linked tensor tests or pass hidden oracle paths to
+them. Its controls are parent-owned exact token IDs and logical
+protocol/report-consistency validation, track-aware static review, and hidden
+behavior checks. Cache offsets, physical rollback/geometry, and numerical
+state remain checked inside the candidate worker/model plus trusted
+implementation tests and manual/operator validation. Before relying on or
+loosening an envelope for a kernel change, run a separate trusted M5 calibration
+that is not linked into submission code.
 
-## Rollout blockers and residual risks
+## Residual risks
 
-- Public/synthetic IT-target M5 goldens have been exercised remotely, but no
-  IT hidden behavior suite is checked in.
-- No paired MTP reference baseline or component floors exist.
+- Public/synthetic IT-target M5 goldens have been exercised remotely; hidden
+  correctness and benchmark goldens remain operator-owned and are intentionally
+  not exposed to tensor regression tests.
+- The paired serial reference and aggregate 1.0 component floor are established
+  in the live workflow/fixture.
 - The exact-pair kernels amortize dense weight traversal for two rows at a
-  time; they are proven bit-identical by runtime gates, not by construction.
-  Any future kernel change must rerun the exact-pair parity gates before it
-  can ship, and the serial K=1 mode remains the fail-closed control.
+  time, while the direct exact-four path uses dedicated four-row kernels.
+  Trusted/local regressions require exact token behavior/cache geometry and
+  bounded finite intermediates, not a particular reduction order. They require
+  M5 calibration before an optimization relies on or loosens the provisional
+  envelopes; the serial K=1 mode remains the fail-closed development control.
 - Decodes whose sliding offset crosses the 1,024-position window wrap lose
   pair eligibility and serialize the remaining rows; within the current
   512-seed/512-decode contract this affects only the final pair position.
 - The path-based upstream loader cannot atomically bind open descriptors;
   before/after hash validation plus read-only operator ownership mitigates
-  TOCTOU, but official provisioning must enforce ownership and permissions.
+  TOCTOU, so official provisioning must continue enforcing ownership and
+  permissions.
 - The parent can prove returned-token parity, bounds, nonce/ID behavior, wall
   time, and denominator. It cannot directly prove that editable model code
   internally used the assistant, ran target verification, or rolled every
   physical buffer correctly when outputs still match. Static review,
-  prompt-independent hidden tests, cache-offset checks, memory telemetry, and
-  manual frontier audit are still required.
+  prompt-independent hidden tests, candidate-worker cache-offset checks, memory
+  telemetry, and manual frontier audit are still required.
 - Seatbelt does not prove absence of already-running background GPU work.
   Fresh workers, allocator reset, no prompt before the timer, process reaping,
   and operator telemetry are required; active-allocation accounting remains a
-  rollout item.
+  tracked hardening item.

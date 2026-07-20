@@ -429,5 +429,5 @@ setup-mtp.sh: MTP artifacts ready
   target:    ${TARGET_DIR}
   assistant: ${ASSISTANT_DIR}
   source bytes: target=18444420181 assistant=264144321
-  official score: disabled until a paired M5 rebaseline is established
+  official scoring: enabled in the default paired-M5 MTP workflow (floor 1.0)
 EOF

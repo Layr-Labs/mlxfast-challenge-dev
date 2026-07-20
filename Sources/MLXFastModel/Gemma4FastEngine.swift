@@ -934,9 +934,10 @@ final class Gemma4FastLayer {
             ) == true
     }
 
-    /// Two MTP target rows with the same per-row accumulation order as K=1.
-    /// Dense projections share each packed-weight traversal; normalization and
-    /// attention retain serial row boundaries.
+    /// Two causally ordered MTP target rows. Dense projections may share,
+    /// fuse, or reassociate packed-weight work; "exact" requires exact target
+    /// token decisions plus the regression suite's finite numeric envelopes
+    /// and exact cache geometry, not serial K=1 intermediate bits.
     func exactMTPPair(
         _ x: MLXArray,
         normalizedInput: MLXArray?,
@@ -1034,9 +1035,10 @@ final class Gemma4FastLayer {
         )
     }
 
-    /// Four serial-arithmetic MTP rows. Quantized projections consume all four
-    /// rows per dispatch; normalization, attention, and residual boundaries
-    /// retain the already-proven exact-two arithmetic in two row pairs.
+    /// Four causally ordered MTP rows. Dedicated quantized projections consume
+    /// all four rows per dispatch; some current normalization/attention/
+    /// residual implementations happen to use two-row boundaries. Neither
+    /// those boundaries nor their reduction order are part of the contract.
     func exactMTPFour(
         _ x: MLXArray,
         normalizedInput: MLXArray?,
@@ -1662,8 +1664,9 @@ final class Gemma4FastEngine {
         }
     }
 
-    /// MTP-only exact pair target forward. It shares packed weight reads while
-    /// retaining K=1 arithmetic independently for each row.
+    /// MTP-only exact-pair target forward. "Exact" describes target-confirmed
+    /// token decisions and cache/protocol behavior; implementations may share,
+    /// fuse, or reassociate arithmetic within the numeric regression envelope.
     func exactMTPPair(
         _ inputs: MLXArray,
         cache: [KVCache]
@@ -1674,9 +1677,10 @@ final class Gemma4FastEngine {
             $0 as? Gemma4CombinedKVCache
         }
 
-        // Preserve the serial gather/scaling boundary. Weight-sharing begins
-        // only at the dense projections where the exact kernels retain each
-        // row's K=1 reduction order.
+        // The current implementation keeps separate gather/scaling boundaries
+        // before sharing dense-projection work. This layout is not a contract:
+        // alternate fusion and reduction strategies are allowed when exact
+        // token decisions, numeric envelopes, and cache geometry still pass.
         let first = embedTokens(inputs[0..., 0..<1]) * embedScale
         let second = embedTokens(inputs[0..., 1..<2]) * embedScale
         var hidden = concatenated([first, second], axis: 1)

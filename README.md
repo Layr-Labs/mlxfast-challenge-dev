@@ -84,6 +84,28 @@ builds and transforms submitted code in the sandbox, and replays a hidden
 trusted parent accepts only a target-confirmed prefix and compares every
 returned token with its serial K=1 oracle.
 
+Here, `exact-pair` means exact returned-token verification and exact logical
+protocol, offset, and counter accounting. It does not require bit-identical
+logits, hidden states, KV values, or serial K=1 reduction order.
+Reassociation, fusion, and alternate reduction strategies are allowed when
+finite intermediate tensors stay inside the documented numeric regression
+envelopes and implementation-level cache/rollback tests pass.
+The mode also includes a distinct direct four-row forward with dedicated
+four-row kernels; it is not implemented solely as two pair calls. Production
+uses it only when the adaptive draft-margin selector and current engine/cache
+geometry approve; otherwise K=4 falls back to pair composition, with serial
+tails reserved for deterministic rotating-cache geometry.
+Those provisional tensor envelopes are trusted/local/upstream heuristic
+regressions informed by existing tests and FP16/BF16 quantization behavior,
+not ranked checks. They do not prove every stale value will fail. Calibrate
+them on M5 before an optimization relies on or loosens them. Candidate-linked
+test code never receives hidden oracle paths. The ranked parent directly
+enforces exact returned token IDs and validates logical protocol/report
+consistency. Cache offsets, physical rollback/geometry, and numerical state are
+checked within the candidate worker/model plus trusted implementation tests,
+track-aware static review, hidden behavioral outputs, and manual/operator
+validation rather than independent parent observation.
+
 Timing runs last. At least three alternating candidate/reference pairs run
 behind the fixed 40C thermal gate. The published decode-only score is:
 
@@ -91,8 +113,9 @@ behind the fixed 40C thermal gate. The published decode-only score is:
 score = mean(serial_K1_seconds_per_token) / mean(MTP_seconds_per_token)
 ```
 
-The hard floor is `1.0`; parity failure, invalid cache rollback, throttling,
-or invalid telemetry fails the run. `score.json` carries
+The hard floor is `1.0`; token/logical-accounting failure, physical rollback
+corruption detected by the trusted review/regression controls, throttling, or
+invalid telemetry fails the run. `score.json` carries
 `track_id=gemma4-31b-it-mtp-v1`. See
 [`docs/experimental-mtp-track.md`](docs/experimental-mtp-track.md) for the
 protocol and [`docs/private-benchmark-security.md`](docs/private-benchmark-security.md)
@@ -146,7 +169,7 @@ kernels it runs on. The authoritative list is `editablePaths` in
 
 | Path | What it controls |
 |---|---|
-| `Sources/MLXFastModel/` | Gemma 4 31B-IT target runtime, trained-assistant block session, exact-pair verification, MLX Swift array bridge, attention, and KV-cache logic. **Primary target.** |
+| `Sources/MLXFastModel/` | Gemma 4 31B-IT target runtime, trained-assistant block session, pair/direct-four verification, MLX Swift array bridge, attention, and KV-cache logic. **Primary target.** |
 | `Sources/MLXFastTransform/` | Offline target transform into benchmark-ready `mtp-weights/`. |
 | `Vendor/mlx-swift-lm/Libraries/` (listed files) | The vendored Gemma 4 model implementation (`MLXLLM/Models/Gemma4Text.swift`, `Gemma4MTP.swift`, `Gemma4MTPTarget.swift`) plus the `MLXLMCommon` plumbing it uses directly (KV caches, RoPE utilities/application, compiled decode, evaluation). |
 | `Vendor/mlx-swift/Source/Cmlx/` (listed files) | The MLX Metal kernels Gemma 4 dispatches — SDPA/`sdpa_vector`, affine-quantized matmul (incl. `_nax`), `steel/gemm`, `gemv`, `rope`, `rms_norm`, `softmax`, `copy`, elementwise, `arg_reduce`, gather indexing — as AOT `.metal`/`.h` sources and their JIT `mlx-generated/*.cpp` twins. |
@@ -174,8 +197,16 @@ frozen, and the rest of the vendored forks (other model families, shared
 factory/tokenizer plumbing, kernels Gemma 4 does not dispatch such as
 `steel/attn`) stay non-editable. Kernel changes are bound by the same
 hidden correctness gates as model changes: keep them prompt-independent and
-model-general, and be conservative with numeric reassociation, which can
-flip near-tie greedy argmaxes on the M5.
+model-general. Numeric reassociation, fusion, and alternate reduction
+strategies are explicitly permitted; they still must remain inside the
+intermediate numeric envelopes and preserve exact returned-token decisions.
+Near-tie argmaxes make that token gate stricter than approximate tensor parity.
+The numeric checks use public/local fixtures or trusted upstream validation;
+ranked candidate code is checked by parent-owned exact token and logical
+protocol/report-consistency gates, track-aware static review, and hidden
+behavioral checks—not by receiving a hidden golden in a tensor-parity test.
+Cache offsets and physical layout/state remain candidate worker/model,
+implementation-test, and manual-validation concerns.
 
 The repository is Swift-only (no Python): setup, transform, correctness,
 and benchmark all run through the Swift package, plus the
@@ -258,15 +289,17 @@ The trusted parent owns the timer and divides wall time by its configured
 decode count. Seed prefill is charged to decode. Each block may return at most
 four tokens, and every token must match the parent-owned serial oracle before
 it is committed. The whole target is RAM-resident with no weight streaming.
-`bandwidth_gb_per_token=0`. RAM and phase-timing metrics are still reported
-for operator review and future guardrails; they are not primary score factors.
+`bandwidth_gb_per_token=0`. Detailed RAM, phase timing, acceptance, and worker
+diagnostics remain runner-private for trusted validation and are not uploaded.
 Correctness is a hard gate. See TASK.md for the full correctness specification.
 The ranked correctness replay runs before timing in a fresh worker. The
 benchmark golden is distinct from the correctness golden and is installed
-only by the trusted measurement wrapper. The score payload publishes aggregate
-pair counts, parity status, serial and MTP seconds/token means, speedup
-statistics, and the transformed-weights digest; prompts, token IDs, and
-per-case hidden outputs remain private.
+only by the trusted measurement wrapper. The public score payload is strictly
+allowlisted to score/pass/track and the fixed scoring contract fields, pair
+count/parity gate outcomes, and ratio-of-means score. It excludes per-side
+timings, acceptance patterns, memory, hashes, raw reports, diagnostics, and
+free-form strings. The score itself still provides residual low-bandwidth
+timing feedback; prompts, token IDs, and per-case hidden outputs remain private.
 
 ## Architecture
 

@@ -4834,6 +4834,275 @@ func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
     #expect(process.terminationStatus != 0)
 }
 
+private func runPrivateArtifactGuard(
+    _ paths: [URL],
+    environment: [String: String] = [:]
+) throws -> Int32 {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = [
+        ".github/scripts/deny-private-artifacts.sh",
+    ] + paths.map(\.path)
+    process.currentDirectoryURL = URL(
+        fileURLWithPath: FileManager.default.currentDirectoryPath
+    )
+    process.environment = ProcessInfo.processInfo.environment.merging(
+        ["MLXFAST_GITHUB_ANNOTATIONS": "0"].merging(environment) { _, new in new }
+    ) { _, new in new }
+    process.standardOutput = Pipe()
+    process.standardError = Pipe()
+    try process.run()
+    process.waitUntilExit()
+    return process.terminationStatus
+}
+
+private func runArtifactStage(
+    destination: URL,
+    mapping: String,
+    environment: [String: String]
+) throws -> Int32 {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = [
+        ".github/scripts/stage-benchmark-artifacts.sh",
+        destination.path,
+        mapping,
+    ]
+    process.currentDirectoryURL = URL(
+        fileURLWithPath: FileManager.default.currentDirectoryPath
+    )
+    process.environment = ProcessInfo.processInfo.environment.merging(
+        ["MLXFAST_GITHUB_ANNOTATIONS": "0"].merging(environment) { _, new in new }
+    ) { _, new in new }
+    process.standardOutput = Pipe()
+    process.standardError = Pipe()
+    try process.run()
+    process.waitUntilExit()
+    return process.terminationStatus
+}
+
+@Test
+func privateArtifactGuardRejectsRawMTPReports() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    for name in [
+        "mtp-gates-report.json",
+        "mtp-gates-stdout.raw",
+        "mtp-gates-private.log",
+        "mtp-paired-results.json",
+        "mtp-measure-verdict.txt",
+    ] {
+        let path = root.appendingPathComponent(name)
+        try "{}".write(to: path, atomically: true, encoding: .utf8)
+        #expect(try runPrivateArtifactGuard([path]) != 0)
+    }
+    let measure = root.appendingPathComponent("mlxfast-mtp-measure-123-1")
+    try FileManager.default.createDirectory(
+        at: measure,
+        withIntermediateDirectories: true
+    )
+    for name in ["results.json", "verdict.txt"] {
+        let path = measure.appendingPathComponent(name)
+        try "{}".write(to: path, atomically: true, encoding: .utf8)
+        #expect(try runPrivateArtifactGuard([path]) != 0)
+    }
+}
+
+@Test
+func privateArtifactGuardEnforcesFixedMTPVerdict() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let verdict = root.appendingPathComponent("mtp-correctness-verdict.json")
+    let environment = [
+        "MLXFAST_ARTIFACT_PROFILE": "mtp-correctness",
+        "MLXFAST_EXPECTED_TRACK_ID": "gemma4-31b-it-mtp-v1",
+        "MLXFAST_EXPECTED_TOKEN_COUNT": "512",
+    ]
+    try """
+    {"schema_version":1,"track_id":"gemma4-31b-it-mtp-v1","gate_passed":true,"token_count":512}
+    """.write(to: verdict, atomically: true, encoding: .utf8)
+    #expect(try runPrivateArtifactGuard([verdict], environment: environment) == 0)
+
+    try """
+    {"schema_version":1,"track_id":"gemma4-31b-it-mtp-v1","gate_passed":true,"token_count":512,"diagnostic":"candidate controlled"}
+    """.write(to: verdict, atomically: true, encoding: .utf8)
+    #expect(try runPrivateArtifactGuard([verdict], environment: environment) != 0)
+
+    try """
+    {"schema_version":1,"track_id":"hidden","track_id":"gemma4-31b-it-mtp-v1","gate_passed":true,"token_count":512}
+    """.write(to: verdict, atomically: true, encoding: .utf8)
+    #expect(try runPrivateArtifactGuard([verdict], environment: environment) != 0)
+
+    try """
+    {"schema_version":1,"track_id":"gemma4-31b-it-mtp-v1","gate_passed":true,"token_count":512}
+    {"schema_version":1,"track_id":"gemma4-31b-it-mtp-v1","gate_passed":true,"token_count":512}
+    """.write(to: verdict, atomically: true, encoding: .utf8)
+    #expect(try runPrivateArtifactGuard([verdict], environment: environment) != 0)
+}
+
+@Test
+func privateArtifactGuardEnforcesMinimizedMTPScore() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let score = root.appendingPathComponent("score.json")
+    let environment = [
+        "MLXFAST_ARTIFACT_PROFILE": "mtp-score",
+        "MLXFAST_EXPECTED_TRACK_ID": "gemma4-31b-it-mtp-v1",
+        "MLXFAST_EXPECTED_TOKEN_COUNT": "512",
+        "MLXFAST_EXPECTED_SCORE_FLOOR": "1.0",
+        "MLXFAST_EXPECTED_MIN_PAIRS": "3",
+        "MLXFAST_EXPECTED_TARGET_PAIRS": "4",
+    ]
+    try """
+    {"score":1.25,"passed":true,"track_id":"gemma4-31b-it-mtp-v1","metrics":{"mode":"mtp-paired-decode-only","aggregation":"ratio_of_means","decode_tokens":512,"decode_speedup_floor":1.0,"accepted_pair_count":4,"target_pair_count":4,"parity_all_ok":true,"mtp_decode_speedup_ratio_of_means":1.25}}
+    """.write(to: score, atomically: true, encoding: .utf8)
+    #expect(try runPrivateArtifactGuard([score], environment: environment) == 0)
+
+    try """
+    {"score":1.25,"passed":true,"track_id":"gemma4-31b-it-mtp-v1","metrics":{"mode":"mtp-paired-decode-only","aggregation":"ratio_of_means","decode_tokens":512,"decode_speedup_floor":1.0,"accepted_pair_count":4,"target_pair_count":4,"parity_all_ok":true,"mtp_decode_speedup_ratio_of_means":1.25,"candidate_memory":123}}
+    """.write(to: score, atomically: true, encoding: .utf8)
+    #expect(try runPrivateArtifactGuard([score], environment: environment) != 0)
+
+    for raw in [
+        """
+        {"score":1e999,"passed":true,"track_id":"gemma4-31b-it-mtp-v1","metrics":{"mode":"mtp-paired-decode-only","aggregation":"ratio_of_means","decode_tokens":512,"decode_speedup_floor":1.0,"accepted_pair_count":4,"target_pair_count":4,"parity_all_ok":true,"mtp_decode_speedup_ratio_of_means":1e999}}
+        """,
+        """
+        {"score":NaN,"passed":true,"track_id":"gemma4-31b-it-mtp-v1","metrics":{"mode":"mtp-paired-decode-only","aggregation":"ratio_of_means","decode_tokens":512,"decode_speedup_floor":1.0,"accepted_pair_count":4,"target_pair_count":4,"parity_all_ok":true,"mtp_decode_speedup_ratio_of_means":NaN}}
+        """,
+        """
+        {"score":1.25,"passed":true,"track_id":"hidden","track_id":"gemma4-31b-it-mtp-v1","metrics":{"mode":"mtp-paired-decode-only","aggregation":"ratio_of_means","decode_tokens":512,"decode_speedup_floor":1.0,"accepted_pair_count":4,"target_pair_count":4,"parity_all_ok":true,"mtp_decode_speedup_ratio_of_means":1.25}}
+        """,
+        """
+        {"score":1.25,"passed":true,"track_id":"gemma4-31b-it-mtp-v1","error":"hidden","metrics":{"mode":"mtp-paired-decode-only","aggregation":"ratio_of_means","decode_tokens":512,"decode_speedup_floor":1.0,"accepted_pair_count":4,"target_pair_count":4,"parity_all_ok":true,"mtp_decode_speedup_ratio_of_means":1.25}}
+        """,
+        """
+        {"score":1.25,"passed":true,"track_id":"gemma4-31b-it-mtp-v1","metrics":{"mode":"mtp-paired-decode-only","aggregation":"ratio_of_means","decode_tokens":512,"decode_speedup_floor":1.0,"accepted_pair_count":4,"target_pair_count":4,"parity_all_ok":true,"mtp_decode_speedup_ratio_of_means":1.25}}
+        {"score":1.25,"passed":true,"track_id":"gemma4-31b-it-mtp-v1","metrics":{"mode":"mtp-paired-decode-only","aggregation":"ratio_of_means","decode_tokens":512,"decode_speedup_floor":1.0,"accepted_pair_count":4,"target_pair_count":4,"parity_all_ok":true,"mtp_decode_speedup_ratio_of_means":1.25}}
+        """,
+    ] {
+        try raw.write(to: score, atomically: true, encoding: .utf8)
+        #expect(try runPrivateArtifactGuard([score], environment: environment) != 0)
+    }
+
+    let realScore = root.appendingPathComponent("real-score.json")
+    try """
+    {"score":1.25,"passed":true,"track_id":"gemma4-31b-it-mtp-v1","metrics":{"mode":"mtp-paired-decode-only","aggregation":"ratio_of_means","decode_tokens":512,"decode_speedup_floor":1.0,"accepted_pair_count":4,"target_pair_count":4,"parity_all_ok":true,"mtp_decode_speedup_ratio_of_means":1.25}}
+    """.write(to: realScore, atomically: true, encoding: .utf8)
+    try FileManager.default.removeItem(at: score)
+    try FileManager.default.createSymbolicLink(
+        atPath: score.path,
+        withDestinationPath: realScore.path
+    )
+    #expect(try runPrivateArtifactGuard([score], environment: environment) != 0)
+}
+
+@Test
+func mtpArtifactProfilesStageCanonicalJSONOnly() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let runRoot = URL(
+        fileURLWithPath:
+            "/tmp/mlxfast-artifacts-mtp-canonical-\(UUID().uuidString)"
+    )
+    defer { try? FileManager.default.removeItem(at: runRoot) }
+
+    let verdict = root.appendingPathComponent("mtp-correctness-verdict.json")
+    try """
+    {
+      "token_count": 512,
+      "gate_passed": true,
+      "track_id": "gemma4-31b-it-mtp-v1",
+      "schema_version": 1
+    }
+    """.write(to: verdict, atomically: true, encoding: .utf8)
+    let correctnessEnvironment = [
+        "MLXFAST_ARTIFACT_PROFILE": "mtp-correctness",
+        "MLXFAST_EXPECTED_TRACK_ID": "gemma4-31b-it-mtp-v1",
+        "MLXFAST_EXPECTED_TOKEN_COUNT": "512",
+    ]
+    let correctnessDestination = runRoot.appendingPathComponent("correctness")
+    #expect(
+        try runArtifactStage(
+            destination: correctnessDestination,
+            mapping: "mtp-correctness-verdict.json=\(verdict.path)",
+            environment: correctnessEnvironment
+        ) == 0
+    )
+    #expect(
+        try String(
+            contentsOf: correctnessDestination.appendingPathComponent(
+                "mtp-correctness-verdict.json"
+            ),
+            encoding: .utf8
+        )
+            == """
+            {"gate_passed":true,"schema_version":1,"token_count":512,"track_id":"gemma4-31b-it-mtp-v1"}
+
+            """
+    )
+
+    let score = root.appendingPathComponent("score.json")
+    try """
+    {
+      "track_id": "gemma4-31b-it-mtp-v1",
+      "metrics": {
+        "target_pair_count": 4,
+        "parity_all_ok": true,
+        "mode": "mtp-paired-decode-only",
+        "accepted_pair_count": 4,
+        "mtp_decode_speedup_ratio_of_means": 1.25,
+        "decode_tokens": 512,
+        "decode_speedup_floor": 1.0,
+        "aggregation": "ratio_of_means"
+      },
+      "passed": true,
+      "score": 1.25
+    }
+    """.write(to: score, atomically: true, encoding: .utf8)
+    let scoreEnvironment = [
+        "MLXFAST_ARTIFACT_PROFILE": "mtp-score",
+        "MLXFAST_EXPECTED_TRACK_ID": "gemma4-31b-it-mtp-v1",
+        "MLXFAST_EXPECTED_TOKEN_COUNT": "512",
+        "MLXFAST_EXPECTED_SCORE_FLOOR": "1.0",
+        "MLXFAST_EXPECTED_MIN_PAIRS": "3",
+        "MLXFAST_EXPECTED_TARGET_PAIRS": "4",
+    ]
+    let scoreDestination = runRoot.appendingPathComponent("score")
+    #expect(
+        try runArtifactStage(
+            destination: scoreDestination,
+            mapping: "score.json=\(score.path)",
+            environment: scoreEnvironment
+        ) == 0
+    )
+    #expect(
+        try String(
+            contentsOf: scoreDestination.appendingPathComponent("score.json"),
+            encoding: .utf8
+        )
+            == """
+            {"metrics":{"accepted_pair_count":4,"aggregation":"ratio_of_means","decode_speedup_floor":1.0,"decode_tokens":512,"mode":"mtp-paired-decode-only","mtp_decode_speedup_ratio_of_means":1.25,"parity_all_ok":true,"target_pair_count":4},"passed":true,"score":1.25,"track_id":"gemma4-31b-it-mtp-v1"}
+
+            """
+    )
+
+    let realScore = root.appendingPathComponent("real-score-for-stage.json")
+    try Data(contentsOf: score).write(to: realScore)
+    try FileManager.default.removeItem(at: score)
+    try FileManager.default.createSymbolicLink(
+        atPath: score.path,
+        withDestinationPath: realScore.path
+    )
+    #expect(
+        try runArtifactStage(
+            destination: runRoot.appendingPathComponent("symlink-rejected"),
+            mapping: "score.json=\(score.path)",
+            environment: scoreEnvironment
+        ) != 0
+    )
+}
+
 // A real hidden-gate mismatch populates first_failing_case/expected_token/
 // actual_token with actual golden-adjacent values -- deny-private-artifacts.sh
 // only checks filenames, not content, so the jq validation gates are the only

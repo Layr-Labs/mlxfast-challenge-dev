@@ -19,6 +19,27 @@ The trusted parent drives:
 3. Target verification of every proposed token before commitment.
 4. Exact comparison of every returned token with the hidden serial oracle.
 
+A path named `exact` is exact at that returned-token and protocol boundary,
+not at every floating-point intermediate. Pair/four-row kernels may
+reassociate reductions, fuse operations, or use alternate reduction
+strategies when logits, pre-norm hidden state, and KV values remain finite and
+inside their numeric regression envelopes. Shapes, dtypes where applicable,
+cache offsets and lengths, commit/rollback, physical row accounting, argmax
+decisions, and returned token IDs remain exact implementation contracts.
+
+Numeric-envelope tests are trusted/local/upstream development regressions and
+must use public or operator-controlled non-hidden inputs. They are not invoked
+from candidate-linked ranked code with hidden oracle paths. Ranked enforcement
+combines the trusted parent's exact returned-token comparison and logical
+protocol/report-consistency validation with track-aware static review and
+hidden behavioral checks. Cache offsets, physical rollback/geometry, and
+numerical state are checked inside the candidate worker/model plus trusted
+implementation tests and manual/operator validation, not independently
+observed by the parent. The provisional tolerances are heuristics
+informed by existing tests and FP16/BF16 quantization behavior, not a proof of
+error detection; calibrate them on M5 before a kernel optimization relies on
+or loosens them.
+
 A one-token divergence fails the run. The parent owns the timer and the
 logical token count; seed prefill is charged to decode. Ranked timing uses at
 least three accepted alternating serial/MTP pairs behind the 40C thermal gate:
@@ -172,9 +193,12 @@ There is no Python harness path.
 
 The default track replays a hidden 512-token MTP correctness golden, requires
 the trained assistant and exact-pair target verification, and checks every
-returned token against the parent-owned serial K=1 oracle. It also validates
-block size, accepted-prefix accounting, cache offsets, and rollback. Any
-failure makes the submission ineligible before timing.
+returned token against the parent-owned serial K=1 oracle. The parent also
+validates block size, accepted-prefix accounting, and logical report
+consistency. Cache offsets and physical rollback/state are checked by the
+candidate worker/model plus trusted implementation tests, track-aware static
+review, hidden behavioral outputs, and manual validation. A failure in any
+applicable control makes the submission ineligible before timing.
 
 ### Archived serial gate
 
@@ -290,8 +314,11 @@ score >= 1.0
 ```
 
 A run below the floor or with any token mismatch is ineligible.
-`score.json` also carries pair counts, parity, MTP acceptance diagnostics,
-seconds/token means, and transformed-weight identity.
+`score.json` is artifact-minimized: score/pass/track plus fixed scoring mode,
+aggregation, decode count/floor, accepted/target pair counts, parity, and the
+ratio-of-means score. It excludes acceptance patterns, worker diagnostics,
+per-side timings, memory, transformed-weight identity, and free-form strings.
+The published score still carries unavoidable low-bandwidth timing feedback.
 
 ## Useful Commands
 

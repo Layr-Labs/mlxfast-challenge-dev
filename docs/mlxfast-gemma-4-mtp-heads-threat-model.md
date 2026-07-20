@@ -6,9 +6,9 @@ The highest risks are integrity attacks that make a candidate appear faster
 without performing single-pass target-equivalent inference: prompt lookup,
 denominator/timing forgery, unverified draft emission, stale or incorrectly
 rolled-back KV state, assistant substitution, and prompt-dependent work moved
-before the timer. Phase 1 gives the trusted parent authority over tokens,
-elapsed time, and an oracle-bounded configured denominator (default 128,
-maximum 512); pins and revalidates the
+before the timer. The live track gives the trusted parent authority over
+tokens, elapsed time, and an oracle-bounded configured denominator (512 ranked;
+128 compatibility default, maximum 512); pins and revalidates the
 assistant; and isolates the worker. It cannot prove the internal provenance of
 each computation when malicious editable model code still returns correct
 oracle tokens, so hidden-independent prompts, static review, M5 telemetry, and
@@ -17,12 +17,20 @@ manual audit remain necessary.
 The serial-K=1-verifier matrix achieved exact parity across 12
 variable-length pairs but was slower than serial in every category (overall
 ratio-of-means 0.815x). The current default replaces it with MTP-only
-exact-pair kernels that share packed weight reads while preserving each row's
-K=1 accumulation order; runtime gates compare logits, pre-norm hidden, and
-physical KV bytes against serial forwards, including forced
-zero/partial/full/second-segment acceptance and deep growth/wrap seams. The
-serial K=1 verifier remains the explicit fail-closed control mode. Any future
-kernel change must rerun those parity gates before promotion.
+exact-pair kernels and a distinct direct four-row path that share packed
+weight reads. Exactness applies to target token decisions, returned token IDs,
+and logical protocol/report consistency—not serial reduction order or
+intermediate bits. Trusted/local/upstream regressions use public or
+operator-controlled non-hidden inputs to compare finite float32 logits,
+pre-norm hidden state, and physical KV values against provisional heuristic
+envelopes while keeping shapes, metadata, offsets, state counts,
+commit/rollback, and physical row accounting exact. Candidate-linked ranked
+tests never receive hidden oracle paths. The parent directly observes exact
+token IDs and logical accounting; track-aware static review, hidden behavioral
+checks, implementation tests, and manual/operator validation cover physical
+cache geometry and numerical state that the parent cannot observe. Any kernel
+may reassociate or fuse reductions, but requires trusted M5 calibration before
+it relies on or loosens an envelope.
 
 ## Scope and assumptions
 
@@ -35,7 +43,7 @@ In scope:
 - `setup-mtp.sh` and MTP fixtures
 - `.github/scripts/run-submission-static-review.sh`
 
-Runtime, provisioning, and future ranked-CI boundaries are modeled separately.
+Runtime, provisioning, and live ranked-CI boundaries are modeled separately.
 The existing serial track is in scope only where isolation from MTP can regress.
 
 Assumptions:
@@ -49,14 +57,12 @@ Assumptions:
   from the organizer.
 - The parent serial oracle is generated from the exact pinned 31B-IT target.
 - Network denial, uid separation, thermal telemetry, and worker reaping remain
-  enabled in any future MTP workflow.
+  enabled in the ranked MTP workflow.
 
-Open questions that affect rollout risk:
+Residual operational question:
 
-- What MTP-specific hidden prompt mix and acceptance distribution will be used?
-- Will the official track score decode only or retain the serial
-  decode/prefill weighting?
-- What active-memory and background-GPU telemetry thresholds will be enforced?
+- What additional active-memory and background-GPU telemetry thresholds should
+  be enforced beyond the live thermal/telemetry contract?
 
 Observed public M5 runs peaked near 47.6 GiB process RSS, 31.2 GiB MLX active
 memory, and 34.1 GiB MLX allocator peak. These measurements are below the
@@ -79,8 +85,9 @@ multi-tenant or lower-memory deployment.
   (`Gemma4MTPRuntime.swift`, `Gemma4ExactTwo*.swift`).
 - Static review: chooses distinct serial or MTP policy from trusted track
   identity (`run-submission-static-review.sh`).
-- Future workflow/publisher: not implemented; must pair a trusted MTP
-  reference and candidate before score publication.
+- Ranked workflow/publisher: pairs the trusted serial MTP baseline and
+  candidate, enforces the 1.0 aggregate floor, and publishes only accepted
+  ratio-of-means scores.
 
 ### Data flows and trust boundaries
 
@@ -94,11 +101,27 @@ multi-tenant or lower-memory deployment.
   and within-request state; editable code is untrusted.
 - Worker → trusted parent: nonce-bound response ID plus token block; strict
   response schema and bounded line size.
+- Worker → trusted parent after timing: untrusted phase diagnostics (verification
+  mode, pair-equivalent segments, rollback rows, serial rows, and memory
+  counters). The parent proves only that reported verification counters are
+  reachable from its observed offset/request/response history and satisfy the
+  exact physical-row identity; it does not thereby observe internal cache
+  state.
 - Trusted oracle → parent only: expected seed and the configured target tokens;
   never sent
   in block requests.
-- Parent → future publisher: diagnostic data today; no score until a separate
-  baseline and workflow are enabled.
+- Trusted workflow → correctness-only artifact: fixed schema/version, track ID,
+  gate-passed boolean, and fixed token count only.
+- Parent/measure wrapper → ranked publisher: minimized score payload containing
+  the Yukon score contract and parent-owned aggregate gate values. Raw gate
+  reports/logs are removed at gate exit/pre-timing scrub; sealed pair results
+  and free-form verdicts are deleted immediately after score validation and
+  before staging. Public JSON is canonically reconstructed from strict field
+  allowlists rather than copied from original bytes; final cleanup is defense
+  in depth.
+- Ranked score → participant/public: the score and parent-measured timing basis
+  retain a residual low-bandwidth side channel. Strict field allowlists remove
+  avoidable candidate-controlled bandwidth but cannot erase timing feedback.
 
 #### Diagram
 
@@ -114,7 +137,7 @@ flowchart LR
   W --> M["Editable MTP model"]
   M --> W
   W --> T
-  T --> R["Future paired publisher"]
+  T --> R["Ranked paired publisher"]
   S["Track-aware static review"] --> R
 ```
 
@@ -163,8 +186,8 @@ flowchart LR
 | Worker request decoder | Private pipe JSON | Parent → worker | Unknown fields and bounds rejected | `GemmaRuntimeWorker.swift` |
 | Worker response decoder | Private pipe JSON | Worker → parent | Unknown timing/count fields rejected | `GemmaRuntimeWorker.swift` |
 | Draft/verify round | Editable Swift calls pinned MLX APIs | Worker → untrusted model | Verification mode is explicit; internal computation is not directly attestable | `Gemma4MTPRuntime.swift` |
-| Exact-pair kernels | Packed target weights and two hidden rows | Editable model → GPU | Weight reads are shared; each row must retain K=1 accumulation order | `Gemma4ExactTwoVector*.swift` |
-| KV rollback | Acceptance-dependent pair-row trim | Editable model state | Host offsets and exact physical bytes are runtime-tested | `Gemma4MTPRuntime.swift`, `Gemma4CombinedKVCache.swift` |
+| Exact-pair/four kernels | Packed target weights and multiple hidden rows | Editable model → GPU | Reassociation/fusion is allowed; parent observes tokens/logical accounting while trusted tests and review cover physical geometry/numerics | `Gemma4ExactTwo*.swift`, `Gemma4ExactFour*.swift` |
+| KV rollback | Acceptance-dependent pair-row trim | Editable model state | Host offsets/geometry are exact; physical values are runtime-tested within the KV envelope | `Gemma4MTPRuntime.swift`, `Gemma4CombinedKVCache.swift` |
 | Static-review track ID | Trusted environment | Workflow → review service | Defaults to serial; unsupported IDs fail | `run-submission-static-review.sh` |
 | Provisioning download | HTTPS and local cache writes | Repository → operator cache | Resume plus exact SHA256; TOCTOU depends on ownership | `setup-mtp.sh` |
 
@@ -177,12 +200,12 @@ flowchart LR
    strict request schema rejects unknown fields → worker sees only committed
    history.
 3. Unverified draft emission: editable code returns assistant tokens directly
-   → any mismatch fails parent oracle; lookup that predicts exact hidden output
+   → any mismatch fails parent oracle; lookup that predicts the private oracle output
    remains a static/hidden-prompt concern.
 4. Rollback corruption: candidate computes a pair, rejects row zero, but keeps
-   row one's physical KV state → exact cache-byte/offset tests catch the known
-   seam and later oracle tokens normally diverge; hidden stale buffers still
-   require instrumentation/manual review.
+   row one's physical KV state → exact cache geometry/offset tests and bounded
+   KV-value comparisons catch the known seam, and later oracle tokens normally
+   diverge; hidden stale buffers still require instrumentation/manual review.
 5. Prompt specialization: candidate hashes the 512-token prompt and returns a
    known continuation → public prompt can be gamed → hidden,
    prompt-independent cases and static review are mandatory.
@@ -208,14 +231,14 @@ flowchart LR
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | TM-001 | Participant | Known or fingerprintable prompt | Lookup/hardcode exact continuation | Fake speed with correct output | Score, leaderboard | No future oracle; static policy; parent oracle | Public prompt remains known | Multiple hidden-independent prompts; diff review; reject large lookup data | Acceptance/block patterns and source-size anomalies | High | High | Critical |
 | TM-002 | Participant | Editable MTP round | Return drafts without target verification or use stale logits | Incorrect inference accepted if tokens happen to match | Score, model integrity | Parent checks every token; MTP static policy | Parent cannot observe internal target calls | Hidden near-tie/diverse prompts; manual target-call audit; optional trusted kernel counters outside editable code | Compare target execution telemetry to reference | Medium | High | High |
-| TM-003 | Participant | Partial/zero acceptance | Leave cache physically or logically over-advanced | Future logits corrupt or hidden work is reused | KV state, score | Exact K=2 row arithmetic; row-zero rejection trims row one in every layer; no later pair after rejection; host offset checks; poison on error | Parent still cannot attest unused stale allocation bytes | Runtime-gated exact logits/hidden/KV bytes at multiple offsets; zero/partial/full and variable-tail parity tests | Cache-offset, physical-state, exact-byte, and oracle assertions | Medium | High | High |
+| TM-003 | Participant | Partial/zero acceptance | Leave cache physically or logically over-advanced | Future logits corrupt or hidden work is reused | KV state, score | Parent-owned exact tokens and logical report-consistency validation; candidate worker/model offset ledger and poison-on-error; track-aware static review and hidden behavior gates | Parent cannot independently observe cache offsets, physical geometry, numerical state, or unused stale allocation bytes | Trusted/local regression on public inputs: exact metadata/geometry plus provisional heuristic logits/hidden/KV envelopes at multiple offsets; zero/partial/full and variable-tail tests; manual validation | Ranked token/report assertions; candidate-worker offset checks; separate trusted physical/numeric regression | Medium | High | High |
 | TM-004 | Participant/local attacker | Writable artifact paths | Replace/add assistant or race path validation | Easier workload or malicious model | Model provenance, score | Exact ID/hash/size/config/inventory; no links; pre/post-load digest | Path loader is not descriptor-bound | Root-owned read-only cache; immutable volume; compare inode metadata around load | Provisioning audit and digest log | Low officially, medium locally | High | High |
 | TM-005 | Participant | Worker controls response behavior | Forge counts, seconds, nonce/ID, empty/oversized/partial blocks | Denominator or timing manipulation, hangs | Protocol, score, availability | Strict schema; nonce/ID; watchdog; bounds; fixed denominator | Deliberate slow responses still consume queue | Per-request and job timeout; response fuzz suite | Protocol-rejection counters | Medium | Medium | Medium |
 | TM-006 | Participant | Prompt supplied at begin | Precompute future tokens before timer or across requests | Uncharged work | Score | Timer before begin; fresh worker; no prompt before timer; allocator clear | Active background GPU allocations are not fully cleared/provable | Process isolation before prompt; active-memory baseline; GPU quiescence check | Metal/GPU activity before begin | Medium | High | High |
 | TM-007 | Participant | Known token/block shape | Special-case call count, offset, prompt length, or final tail | Benchmark-only speedup | Score | Trusted totals up to 512; variable 255/256/257 tail tests; static MTP policy | Shape itself is necessarily observable | Rotate hidden lengths and prompts; manual branch audit | Timing discontinuities by shape | High | Medium | High |
-| TM-008 | Participant | Resource access in worker | Memory bomb, allocator-state subsidy, background threads | OOM, unfair cache state, runner DoS | M5 availability, score | Sandbox, orphan reaper, allocator clear, watchdog | No hard active-memory cap in Phase 1 | Peak/active memory cap; terminate unexpected threads/process activity; fresh runner | Memory/threads sampled at phase boundaries | Medium | High | High |
+| TM-008 | Participant | Resource access in worker | Memory bomb, allocator-state subsidy, background threads | OOM, unfair cache state, runner DoS | M5 availability, score | Sandbox, orphan reaper, allocator clear, watchdog | No hard active-memory cap | Peak/active memory cap; terminate unexpected threads/process activity; fresh runner | Memory/threads sampled at phase boundaries | Medium | High | High |
 | TM-009 | Integration error | Shared CLI/workflow | Mix MTP and archived serial manifests, baselines, or scores | Corrupt either leaderboard | Track identity | Separate commands/types/kinds, workflows, manifests, baselines, and track-tagged score | Operator registration can still be misconfigured | Contract tests; release approval; verify namespace during import | Assert source/path hashes and track ID | Low | High | Medium |
-| TM-010 | Submitted code | Error/log path sees hidden prompt | Exfiltrate prompt through stderr, DNS, files, or protocol framing | Private benchmark disclosure | Oracle/prompts/secrets | FD isolation, stderr redaction, DNS/network/write/process denial, line bounds | OS sandbox defects remain platform risk | Retain uid/PF/operator sandbox probes; no secret-bearing env | Sandbox probe and egress telemetry | Low | High | Medium |
+| TM-010 | Submitted code | Error/log/diagnostic path sees hidden prompt | Exfiltrate through stderr, protocol framing, raw reports, artifacts, DNS, or files | Private benchmark disclosure | Oracle/prompts/secrets | FD isolation, submission-log suppression, network/write/process denial, strict artifact allowlists, fixed correctness verdict, minimized score, runner-private raw-report deletion | OS sandbox defects and residual timing/score bandwidth remain | Retain uid/PF/operator probes; no secret-bearing env; audit public schema changes | Sandbox/egress telemetry and artifact-content tests | Low | High | Medium |
 
 ## Criticality calibration
 
@@ -234,8 +257,8 @@ flowchart LR
 | Path | Why it matters | Related threats |
 | --- | --- | --- |
 | `Sources/MLXFastModel/Gemma4MTPRuntime.swift` | Editable draft/verify/rollback and persistent state | TM-001, TM-002, TM-003, TM-006, TM-007 |
-| `Sources/MLXFastModel/Gemma4ExactTwo*.swift` | Per-row arithmetic order and shared packed-weight traversal | TM-002, TM-003, TM-007 |
-| `Sources/MLXFastModel/Gemma4FastEngine.swift` | Exact-pair eligibility, causal pair composition, and MTP-only dispatch | TM-002, TM-003, TM-009 |
+| `Sources/MLXFastModel/Gemma4ExactTwo*.swift`, `Gemma4ExactFour*.swift` | Behavior-preserving shared/fused packed-weight traversal | TM-002, TM-003, TM-007 |
+| `Sources/MLXFastModel/Gemma4FastEngine.swift` | Pair/four eligibility, causal multi-row execution, and MTP-only dispatch | TM-002, TM-003, TM-009 |
 | `Sources/MLXFastHarness/GemmaRuntimeMTP.swift` | Trusted timer, oracle, bounds, denominator | TM-001, TM-005, TM-006 |
 | `Sources/MLXFastHarness/GemmaRuntimeMTPWorker.swift` | MTP-only request state and poisoning | TM-003, TM-005, TM-008 |
 | `Sources/MLXFastHarness/GemmaRuntimeMTPProvenance.swift` | Artifact identity and TOCTOU checks | TM-004 |
@@ -248,12 +271,11 @@ flowchart LR
 
 ## Quality check
 
-- Covered CLI, file, protocol, model-state, static-review, and future CI entry
+- Covered CLI, file, protocol, model-state, static-review, and ranked CI entry
   points.
 - Represented every cache/repository/parent/worker/model/publisher boundary in
   at least one threat.
-- Separated runtime, provisioning, and future CI/publication controls.
-- Kept supplied deployment assumptions explicit; unanswered rollout choices
-  remain open questions.
+- Separated runtime, provisioning, and ranked CI/publication controls.
+- Kept supplied deployment assumptions and residual operational risks explicit.
 - Distinguished parent-provable properties from editable internal behavior
   that still requires audit and hidden testing.
