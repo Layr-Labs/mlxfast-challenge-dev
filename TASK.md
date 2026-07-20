@@ -199,6 +199,35 @@ consistency. Cache offsets and physical rollback/state are checked by the
 candidate worker/model plus trusted implementation tests, track-aware static
 review, hidden behavioral outputs, and manual validation. A failure in any
 applicable control makes the submission ineligible before timing.
+Every official `mtp-benchmark` worker denies all filesystem writes except
+`/dev/null`, including after stripping injected-profile write allows. This
+prevents both exact and timed workers from persisting cross-phase state. The
+exact gate also supplies the explicit flag as defense in depth; local runs
+remain unchanged unless a caller opts in with that flag.
+
+After the exact MTP replay passes, the default ranked workflow runs a separate
+untimed semantic GPQA backstop on hidden cases that are not the exact-token
+golden. The trusted parent tokenizes each prompt with the pinned 31B-IT
+tokenizer, launches a fresh trained-assistant/exact-pair MTP worker per case,
+drives `mtp_decode_begin` followed by bounded `mtp_decode_block` requests, and
+collects only returned token IDs. These semantic-only cases carry no future
+token oracle. Every worker is shut down before the parent decodes or writes the
+answer document; the fixed private judge then enforces the fixed 1-of-5 policy
+floor in verdict-only mode.
+
+This is an independent secondary gate, not a replacement for token or numeric
+regressions. Exact-token failure stops before semantic capture and cannot be
+rescued; semantic failure stops before timing. Reference cases, generated
+answers, judge requests/responses, detailed verdicts, and aggregate semantic
+summaries are scrubbed before timing and never enter `score.json` or uploads.
+
+The existing model-independent private reference object is repository-pinned
+at SHA-256
+`fc8bcdaff94aa89b2fc2a1a2adc28943ed026899ae805b3c52b3f81a235c20ff`
+and 9919 bytes. The 1-of-5 minimum reuses the existing serial policy floor as a
+conservative semantic-catastrophe backstop. It is explicitly not an IT/Opus M5
+calibration or a claim that the serial and trained-MTP paths have equivalent
+answer quality.
 
 ### Archived serial gate
 

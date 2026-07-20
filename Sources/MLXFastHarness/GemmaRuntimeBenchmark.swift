@@ -567,27 +567,44 @@ extension GemmaRuntime {
                     options: workerOptions,
                     weightsPath: options.weightsPath
                 )
-                defer {
-                    correctnessWorker.close()
+                if semanticCapture != nil {
+                    correctnessResult = try withConfirmedRuntimeWorkerTermination(
+                        worker: correctnessWorker
+                    ) {
+                        runLayeredCorrectnessWithWorker(
+                            golden: golden,
+                            worker: correctnessWorker,
+                            steps: options.correctnessSteps,
+                            checkGates: options.checkGates,
+                            semanticCapture: semanticCapture,
+                            progress: progress
+                        )
+                    }
+                } else {
+                    defer {
+                        correctnessWorker.close()
+                    }
+                    correctnessResult = runLayeredCorrectnessWithWorker(
+                        golden: golden,
+                        worker: correctnessWorker,
+                        steps: options.correctnessSteps,
+                        checkGates: options.checkGates,
+                        semanticCapture: nil,
+                        progress: progress
+                    )
                 }
-                correctnessResult = runLayeredCorrectnessWithWorker(
-                    golden: golden,
-                    worker: correctnessWorker,
-                    steps: options.correctnessSteps,
-                    checkGates: options.checkGates,
-                    semanticCapture: semanticCapture,
-                    progress: progress
-                )
             }
-            // The correctness worker -- the only process that runs editable
-            // model code in this phase -- is now closed and reaped by the defer
-            // above. Only now is it safe to write the hidden-GPQA capture, which
-            // embeds hidden prompt text, answer keys, and reference answers: no
-            // submitted code may be alive while that file exists on disk.
-            // runLayeredCorrectnessWithWorker only collects and validates the
-            // answers (returned in its result); it no longer writes them from
-            // inside the live-worker window.
-            if let semanticCapture, let semanticAnswers = correctnessResult.semanticGPQAAnswers {
+            // Semantic capture reaches here only after confirmed worker
+            // termination. Tokenizer loading/decoding and the private write
+            // therefore happen with no submitted model process alive.
+            if let semanticCapture,
+               let pendingAnswers =
+                   correctnessResult.pendingSemanticGPQAAnswers
+            {
+                let semanticAnswers = try materializeSemanticGPQAAnswers(
+                    pendingAnswers,
+                    tokenizerPath: semanticCapture.tokenizerPath
+                )
                 try writeSemanticGPQAAnswers(semanticAnswers, to: semanticCapture.outputPath)
                 progress("correctness semantic GPQA answers written cases=\(semanticAnswers.count)")
             }

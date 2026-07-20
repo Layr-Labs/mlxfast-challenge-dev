@@ -40,9 +40,13 @@ name: benchmark
 #      parent (GemmaRuntimeMTP) owns the timer, the serial oracle, and the
 #      denominator; a single divergent token fails the run. Report stdout is
 #      sealed in the trusted shell exactly like the serial gates score.
-#   4. Scrubs hidden material back to the post-transform snapshot, reaps
+#   4. Runs a separate untimed semantic GPQA backstop through fresh
+#      Gemma4TrainedMTPBlockSession workers. These semantic-only prompts have
+#      no exact-token oracle and are distinct from the correctness golden;
+#      failure is secondary and cannot rescue the exact-token gate above.
+#   5. Scrubs hidden material back to the post-transform snapshot, reaps
 #      bench processes, and waits for quiescence.
-#   5. Runs the timed paired measurement LAST via the box-owned
+#   6. Runs the timed paired measurement LAST via the box-owned
 #      MLXFAST_MTP_MEASURE_JOB (fixed 40C thermal contract, 2 Hz macmon
 #      telemetry, throttle/telemetry rejection). Pairing discipline mirrors
 #      the serial track: the decode-only denominator is the trusted serial
@@ -53,7 +57,7 @@ name: benchmark
 #      MLXFAST_MTP_MIN_ACCEPTED_PAIRS accepted pairs. Worker-reported timing
 #      has no authority anywhere; the parent divides its own wall time by
 #      its own configured token total.
-#   6. Applies the decode-only score contract in the trusted shell:
+#   7. Applies the decode-only score contract in the trusted shell:
 #        score = mtp_decode_speedup
 #              = mean(serial s/tok over accepted pairs)
 #                / mean(mtp s/tok over accepted pairs)   [ratio-of-means]
@@ -122,9 +126,10 @@ jobs:
     name: "single-machine MTP ranked benchmark (m5-bench)"
     runs-on: [self-hosted, m5-bench]
     # Job budget: build (~15m) + IT transform (~10m) + artifact hashing of
-    # the 18.4 GB source (~3m) + full-length parity pass (~15m) + cooldowns
+    # the 18.4 GB source (~3m) + full-length parity pass (~15m) + five
+    # isolated semantic-case model loads/decodes + private judge + cooldowns
     # (up to 900s per timed phase) + >=3 alternating timed pairs. Generous
-    # until the track has its own timing history.
+    # until the track has complete semantic-path timing history.
     timeout-minutes: 360
     environment: benchmark-private-prompts
     env:
@@ -144,7 +149,8 @@ jobs:
       # same absolute-path build-cache reasoning as serial-benchmark.yml).
       MLXFAST_JOB_WS: /Users/Shared/bench-jobs/mtp-ranked-current
       # --- Runner-only private material (0700 runner).
-      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-mtp-private-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_PRIVATE_DIR: /private/tmp/mlxfast-mtp-private-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_MTP_SEMANTIC_GPQA_RESULTS_PATH: /private/tmp/mlxfast-mtp-private-${{ github.run_id }}-${{ github.run_attempt }}/mtp_semantic_gpqa_results.json
       # Distinct from the serial track's artifact run root while satisfying
       # stage-benchmark-artifacts.sh's /tmp/mlxfast-artifacts- prefix contract
       # (run component "mtp-<run>-<attempt>").
@@ -178,9 +184,23 @@ jobs:
       MLXFAST_MTP_CORRECTNESS_GOLDEN_BYTES: "14683"
       MLXFAST_MTP_BENCH_GOLDEN_SHA256: a472d6e40c3bada936fa39535753fec609d836e709db03274222a4a303ae6f58
       MLXFAST_MTP_BENCH_GOLDEN_BYTES: "14982"
+      # The semantic reference is the existing model-independent private GPQA
+      # question/answer object used by the serial workflow. Its model-specific
+      # accepted token sequences are parsed but ignored by MTP semantic capture.
+      # These repository pins identify that frozen object. The 1-of-5 minimum is
+      # the existing serial policy floor reused as a conservative catastrophe
+      # backstop; it is NOT an IT/Opus M5 calibration or a quality-equivalence
+      # claim between serial and trained-MTP generation.
+      MLXFAST_MTP_SEMANTIC_GPQA_REFERENCE_SHA256: fc8bcdaff94aa89b2fc2a1a2adc28943ed026899ae805b3c52b3f81a235c20ff
+      MLXFAST_MTP_SEMANTIC_GPQA_REFERENCE_BYTES: "9919"
+      MLXFAST_MTP_SEMANTIC_GPQA_CASE_COUNT: "5"
+      MLXFAST_MTP_SEMANTIC_GPQA_MAX_NEW_TOKENS: "64"
+      MLXFAST_MTP_SEMANTIC_GPQA_MIN_PASS: "1"
+      MLXFAST_MTP_SEMANTIC_GPQA_MODEL: claude-opus-4-8
       # --- Benchmark plumbing (shared with serial-benchmark.yml).
       MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
+      MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}
       MLXFAST_RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
       MLXFAST_CANDIDATE_SHA: ${{ github.sha }}
       MLXFAST_IS_SUBMISSION_BRANCH: ${{ startsWith(github.ref, 'refs/heads/submissions/') && '1' || '0' }}
@@ -237,12 +257,25 @@ jobs:
             MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256 \
             MLXFAST_MTP_CORRECTNESS_GOLDEN_BYTES \
             MLXFAST_MTP_BENCH_GOLDEN_SHA256 \
-            MLXFAST_MTP_BENCH_GOLDEN_BYTES; do
+            MLXFAST_MTP_BENCH_GOLDEN_BYTES \
+            MLXFAST_MTP_SEMANTIC_GPQA_REFERENCE_SHA256 \
+            MLXFAST_MTP_SEMANTIC_GPQA_REFERENCE_BYTES \
+            MLXFAST_MTP_SEMANTIC_GPQA_MIN_PASS; do
             if [[ -z "${!pin_name}" ]]; then
-              echo "::error::hidden MTP golden pin ${pin_name} is empty; restore the validated operator pin before serving submissions" >&2
+              echo "::error::hidden MTP correctness/semantic configuration ${pin_name} is empty; restore the validated operator pin/value before serving submissions" >&2
               exit 1
             fi
           done
+          if [[ ! "${MLXFAST_MTP_SEMANTIC_GPQA_REFERENCE_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+              || [[ ! "${MLXFAST_MTP_SEMANTIC_GPQA_REFERENCE_BYTES}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::MTP semantic GPQA reference digest/size configuration is malformed" >&2
+            exit 1
+          fi
+          if [[ ! "${MLXFAST_MTP_SEMANTIC_GPQA_MIN_PASS}" =~ ^[1-9][0-9]*$ ]] \
+              || (( MLXFAST_MTP_SEMANTIC_GPQA_MIN_PASS > MLXFAST_MTP_SEMANTIC_GPQA_CASE_COUNT )); then
+            echo "::error::MTP semantic GPQA non-inferiority threshold is missing or outside the configured case count" >&2
+            exit 1
+          fi
           if [[ "${CONFIRM_TRACK_ENABLED}" != "1" ]]; then
             echo "::error::MTP default-track interlock is disabled; dispatch requires confirm_track_enabled=true" >&2
             exit 1
@@ -364,7 +397,11 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
-            echo "::error::hidden MTP goldens require private R2 secrets" >&2
+            echo "::error::hidden MTP correctness and semantic fixtures require private R2 secrets" >&2
+            exit 1
+          fi
+          if [[ "${MLXFAST_ANTHROPIC_PRESENT}" != "1" ]]; then
+            echo "::error::MTP semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
             exit 1
           fi
 
@@ -805,12 +842,16 @@ jobs:
           sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
             /bin/bash "${MLXFAST_JOB_WS}/.github/scripts/reap-bench-processes.sh"
 
-      # Trusted download + pin of the hidden IT-target goldens. Raw bytes
-      # live runner-private; only the correctness golden is installed into
+      # Trusted download + pin of the hidden IT-target goldens and the
+      # model-independent semantic GPQA reference. Raw bytes live
+      # runner-private; only the correctness golden is installed into
       # the workspace (into the bench-NON-writable .mtp-ranked-src staging
-      # dir, symlink-guarded), because the bench harness PARENT must read it
-      # to drive the oracle. The worker Seatbelt profile denies it by
-      # literal path (BENCH_GOLDEN_PATH). The benchmark golden never enters
+      # dir, symlink-guarded) before the exact gate. The semantic reference
+      # stays in the runner-private directory until exact correctness passes,
+      # so that worker cannot read the future secondary-gate answers. Each
+      # worker Seatbelt profile denies its current private input by literal
+      # path (BENCH_GOLDEN_PATH plus the CLI's blocked-path profile).
+      # The benchmark golden never enters
       # the workspace here; measure-mtp-job installs and scrubs it per timed
       # side.
       - name: Prepare hidden MTP goldens
@@ -821,6 +862,7 @@ jobs:
           # Private object keys scoped to this trusted download step only.
           MLXFAST_MTP_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/mtp_correctness_golden_gemma4_31b_it-v1.json
           MLXFAST_MTP_BENCH_GOLDEN_R2_PATH: correctness_prompts/mtp_benchmark_golden_gemma4_31b_it-v1.json
+          MLXFAST_MTP_SEMANTIC_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json
         run: |
           set -euo pipefail
           .github/scripts/download-r2-object.sh \
@@ -841,13 +883,24 @@ jobs:
             echo "::error::hidden MTP benchmark golden pin mismatch" >&2
             exit 1
           fi
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_MTP_SEMANTIC_GPQA_R2_PATH}" \
+            "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference.json"
+          chmod 0600 "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference.json"
+          semantic_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference.json" | awk '{print $1}')"
+          semantic_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference.json" | tr -d ' ')"
+          if [[ "${semantic_hash}" != "${MLXFAST_MTP_SEMANTIC_GPQA_REFERENCE_SHA256}" \
+              || "${semantic_bytes}" != "${MLXFAST_MTP_SEMANTIC_GPQA_REFERENCE_BYTES}" ]]; then
+            echo "::error::hidden MTP semantic GPQA reference pin mismatch" >&2
+            exit 1
+          fi
           golden_dst="${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json"
           if [[ -e "${golden_dst}" || -L "${golden_dst}" ]]; then
             echo "::error::refusing to place hidden input over pre-existing path ${golden_dst}" >&2
             exit 1
           fi
           install -m 0444 "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden.json" "${golden_dst}"
-          echo "mtp-benchmark: hidden goldens verified (correctness ${correctness_hash}, benchmark ${bench_hash})"
+          echo "mtp-benchmark: hidden correctness, timing, and semantic fixtures verified"
 
       # TOCTOU guard: the submitted transform ran with workspace write access
       # since the post-build pins.
@@ -862,8 +915,10 @@ jobs:
       # fails), enforces the block protocol, and re-validates target and
       # assistant artifacts before and after load. Stdout (the diagnostic
       # report JSON) is sealed in this trusted shell; on-disk files are never
-      # trusted. Ordered BEFORE the timed phase so a broken submission never
-      # burns gated thermal time.
+      # trusted. The explicit no-write flag strips injected-profile write
+      # exceptions and permits only /dev/null, so exact-gate code cannot leave
+      # prompt-derived markers for semantic or timed workers. Ordered BEFORE
+      # the timed phase so a broken submission never burns gated thermal time.
       - name: MTP correctness and parity gate (untimed)
         env:
           BENCH_JOB_ID: mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-gates
@@ -901,6 +956,7 @@ jobs:
                   --block-size "${MLXFAST_MTP_BLOCK_SIZE}" \
                   --tokens "${MLXFAST_MTP_CORRECTNESS_TOKENS}" \
                   --target-verification exact-pair \
+                  --deny-worker-file-writes \
                   --require-trained-assistant
               ' > "${raw_stdout}" 2> "${gates_log}" || status=$?
           if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" != "1" ]]; then
@@ -942,10 +998,228 @@ jobs:
           echo "mtp-benchmark: correctness/parity gate passed in $((SECONDS - started))s (exit=${status})"
           exit "${status}"
 
+      # Defense in depth after the trusted CLI has already required confirmed
+      # RuntimeWorkerClient termination. Reap the bench uid and independently
+      # prove no non-zombie bench process remains before any semantic fixture
+      # is installed in the bench-readable staging tree. This step has no judge
+      # credential or semantic path.
+      - name: Reap exact MTP worker before semantic material
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /bin/bash "${MLXFAST_JOB_WS}/.github/scripts/reap-bench-processes.sh"
+          bench_uid="$(id -u bench)"
+          live_bench_pids="$(
+            ps -axo pid=,state=,uid= \
+              | awk -v uid="${bench_uid}" '$3 == uid && $2 !~ /^Z/ { print $1 }'
+          )"
+          if [[ -n "${live_bench_pids}" ]]; then
+            echo "::error::refusing semantic material while exact-gate bench processes remain alive" >&2
+            exit 1
+          fi
+          echo "mtp-benchmark: exact-gate bench processes reaped before semantic material"
+
+      # The exact oracle is no longer needed once the parent-owned parity gate
+      # succeeds. Remove its bench-readable staging copy before changing
+      # BENCH_GOLDEN_PATH or installing the semantic reference, so no semantic
+      # worker can read both private fixture classes. The runner-private pinned
+      # source remains 0700 and is never visible to the bench uid.
+      - name: Scrub exact MTP oracle before semantic capture
+        run: |
+          set -euo pipefail
+          exact_oracle="${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json"
+          rm -f -- "${exact_oracle}"
+          if [[ -e "${exact_oracle}" || -L "${exact_oracle}" ]]; then
+            echo "::error::exact MTP oracle remained readable before semantic capture" >&2
+            exit 1
+          fi
+          echo "mtp-benchmark: exact correctness oracle scrubbed before semantic capture"
+
+      # Independent secondary gate. Exact-token failure above stops the job
+      # before this step, so semantic judging can never rescue parity. The
+      # semantic-only GPQA cases carry no target-token oracle: the trusted
+      # parent tokenizes each prompt with the pinned IT tokenizer, launches one
+      # fresh exact-pair trained-MTP worker/session per case, and captures only
+      # parent-observed returned IDs. Fresh processes are intentionally costly
+      # but preserve the existing one-begin-per-worker protocol and isolate KV
+      # and assistant state across cases.
+      - name: Capture MTP semantic GPQA answers (untimed)
+        env:
+          BENCH_JOB_ID: mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-semantic-capture
+          BENCH_GOLDEN_PATH: ${{ env.MLXFAST_JOB_WS }}/.mtp-ranked-src/mtp_semantic_gpqa_reference.json
+        run: |
+          set -euo pipefail
+          umask 077
+          raw_stdout="${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.stdout"
+          capture_log="${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.log"
+          answers="${MLXFAST_JOB_WS}/private/mtp_semantic_gpqa_answers.json"
+          semantic_src="${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference.json"
+          semantic_dst="${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_semantic_gpqa_reference.json"
+          exact_oracle="${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json"
+          rm -f -- "${raw_stdout}" "${capture_log}"
+          if [[ -e "${exact_oracle}" || -L "${exact_oracle}" ]]; then
+            echo "::error::refusing semantic launch while exact MTP oracle remains staged" >&2
+            exit 1
+          fi
+          if [[ -e "${semantic_dst}" || -L "${semantic_dst}" ]]; then
+            echo "::error::refusing to place MTP semantic input over a pre-existing path" >&2
+            exit 1
+          fi
+          install -m 0600 "${semantic_src}" "${semantic_dst}"
+          /bin/chmod +a "user:bench allow read" "${semantic_dst}"
+          rm -rf "${MLXFAST_JOB_WS}/private"
+          mkdir -m 0700 "${MLXFAST_JOB_WS}/private"
+          /bin/chmod +a \
+            "user:bench allow list,search,readattr,readextattr,read,execute,add_file,add_subdirectory,delete_child,write,append,writeattr,writeextattr,file_inherit,directory_inherit" \
+            "${MLXFAST_JOB_WS}/private"
+          status=0
+          # shellcheck disable=SC2024  # trusted shell owns private capture files
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env \
+              MJOB_WS="${MLXFAST_JOB_WS}" \
+              MLXFAST_OFFICIAL_BENCHMARK_RUN=1 \
+              MLXFAST_PRIVATE_DIR="${MLXFAST_JOB_WS}/private" \
+              BENCH_GOLDEN_PATH="${BENCH_GOLDEN_PATH}" \
+              MLXFAST_MTP_TARGET_DIR="${MLXFAST_MTP_TARGET_DIR}" \
+              MLXFAST_MTP_ASSISTANT_DIR="${MLXFAST_MTP_ASSISTANT_DIR}" \
+              MLXFAST_MTP_CONTRACT_PATH="${MLXFAST_MTP_CONTRACT_PATH}" \
+              MLXFAST_MTP_BLOCK_SIZE="${MLXFAST_MTP_BLOCK_SIZE}" \
+              MLXFAST_MTP_SEMANTIC_GPQA_CASE_COUNT="${MLXFAST_MTP_SEMANTIC_GPQA_CASE_COUNT}" \
+              MLXFAST_MTP_SEMANTIC_GPQA_MAX_NEW_TOKENS="${MLXFAST_MTP_SEMANTIC_GPQA_MAX_NEW_TOKENS}" \
+              /bin/bash -c '
+                set -euo pipefail
+                cd "${MJOB_WS}"
+                exec .build/release/mlxfast-swift mtp-generate-gpqa-answers \
+                  --target-source "${MLXFAST_MTP_TARGET_DIR}" \
+                  --weights mtp-weights \
+                  --assistant "${MLXFAST_MTP_ASSISTANT_DIR}" \
+                  --contract "${MLXFAST_MTP_CONTRACT_PATH}" \
+                  --tokenizer "${MLXFAST_MTP_TARGET_DIR}" \
+                  --gpqa .mtp-ranked-src/mtp_semantic_gpqa_reference.json \
+                  --output private/mtp_semantic_gpqa_answers.json \
+                  --block-size "${MLXFAST_MTP_BLOCK_SIZE}" \
+                  --case-count "${MLXFAST_MTP_SEMANTIC_GPQA_CASE_COUNT}" \
+                  --max-new-tokens "${MLXFAST_MTP_SEMANTIC_GPQA_MAX_NEW_TOKENS}" \
+                  --require-trained-assistant
+              ' > "${raw_stdout}" 2> "${capture_log}" || status=$?
+          if [[ "${status}" -ne 0 ]]; then
+            echo "::error::MTP semantic GPQA capture failed" >&2
+            exit 1
+          fi
+          if [[ "$(tr -d '\r\n' < "${raw_stdout}")" != "mtp-generate-gpqa-answers: completed" ]]; then
+            echo "::error::MTP semantic GPQA capture emitted an unexpected public summary" >&2
+            exit 1
+          fi
+          if [[ ! -f "${answers}" || -L "${answers}" ]]; then
+            echo "::error::MTP semantic GPQA capture did not create a regular private answer file" >&2
+            exit 1
+          fi
+          answer_bytes="$(stat -f '%z' "${answers}")"
+          answer_mode="$(stat -f '%Lp' "${answers}")"
+          if ! [[ "${answer_bytes}" =~ ^[1-9][0-9]*$ ]] \
+              || (( answer_bytes > 1048576 )) \
+              || [[ "${answer_mode}" != "600" ]]; then
+            echo "::error::MTP semantic GPQA answer file violates its fixed size/permission contract" >&2
+            exit 1
+          fi
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /bin/bash "${MLXFAST_JOB_WS}/.github/scripts/reap-bench-processes.sh"
+          bench_uid="$(id -u bench)"
+          live_bench_pids="$(
+            ps -axo pid=,state=,uid= \
+              | awk -v uid="${bench_uid}" '$3 == uid && $2 !~ /^Z/ { print $1 }'
+          )"
+          if [[ -n "${live_bench_pids}" ]]; then
+            echo "::error::refusing MTP semantic answer handoff while bench processes remain alive" >&2
+            exit 1
+          fi
+          trusted_reader="$(id -un)"
+          if [[ ! "${trusted_reader}" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]]; then
+            echo "::error::trusted runner account name is unsafe for the semantic answer ACL" >&2
+            exit 1
+          fi
+          # The file is bench-owned mode 0600. Grant only the trusted runner
+          # read access after every candidate worker has exited; never relax
+          # group/other mode bits and never pass the judge key across the
+          # bench-exec bridge.
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /bin/chmod +a "user:${trusted_reader} allow read" "${answers}"
+          test -r "${answers}"
+          test "$(stat -f '%Lp' "${answers}")" = "600"
+          echo "mtp-benchmark: semantic GPQA capture completed"
+
+      # Trusted networked verdict-only judge. No score exists yet and this
+      # mode never creates or patches one; the detailed private result is
+      # consumed only as a pass/fail gate and scrubbed in the next step.
+      - name: MTP semantic GPQA gate (untimed)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
+          MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: ${{ env.MLXFAST_JOB_WS }}/private/mtp_semantic_gpqa_answers.json
+          MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: ${{ env.MLXFAST_MTP_SEMANTIC_GPQA_RESULTS_PATH }}
+          MLXFAST_SEMANTIC_GPQA_MODEL: ${{ env.MLXFAST_MTP_SEMANTIC_GPQA_MODEL }}
+          MLXFAST_SEMANTIC_GPQA_MIN_PASS: ${{ env.MLXFAST_MTP_SEMANTIC_GPQA_MIN_PASS }}
+          MLXFAST_SEMANTIC_GPQA_EXPECTED_CASE_COUNT: ${{ env.MLXFAST_MTP_SEMANTIC_GPQA_CASE_COUNT }}
+          MLXFAST_SEMANTIC_GPQA_EXPECTED_MAX_NEW_TOKENS: ${{ env.MLXFAST_MTP_SEMANTIC_GPQA_MAX_NEW_TOKENS }}
+          MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
+          MLXFAST_SEMANTIC_GPQA_VERDICT_ONLY: "1"
+        run: |
+          set -euo pipefail
+          if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+            echo "::error::MTP semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
+            exit 1
+          fi
+          .github/scripts/run-semantic-gpqa-gate.sh
+          if [[ ! -f "${MLXFAST_MTP_SEMANTIC_GPQA_RESULTS_PATH}" \
+              || -L "${MLXFAST_MTP_SEMANTIC_GPQA_RESULTS_PATH}" \
+              || "$(stat -f '%Lp' "${MLXFAST_MTP_SEMANTIC_GPQA_RESULTS_PATH}")" != "600" ]]; then
+            echo "::error::MTP semantic GPQA judge did not leave a restrictive private verdict" >&2
+            exit 1
+          fi
+          echo "mtp-benchmark: semantic GPQA gate passed"
+
+      # Runs even after capture/judge failure. Remove the reference, generated
+      # answers, judge result, requests/responses/temp details, and private
+      # capture logs before any correctness artifact or timed worker can run.
+      - name: Scrub MTP semantic GPQA material
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [[ -d "${MLXFAST_JOB_WS}" ]]; then
+            rm -f -- \
+              "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json" \
+              "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_semantic_gpqa_reference.json"
+            rm -rf "${MLXFAST_JOB_WS}/private"
+            mkdir -p "${MLXFAST_JOB_WS}/private"
+          fi
+          if [[ -d "${MLXFAST_PRIVATE_DIR}" ]]; then
+            rm -f -- \
+              "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference.json" \
+              "${MLXFAST_MTP_SEMANTIC_GPQA_RESULTS_PATH}" \
+              "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.stdout" \
+              "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.log"
+            find "${MLXFAST_PRIVATE_DIR}" -maxdepth 1 \
+              \( -name 'semantic-gpqa.*' -o -name 'mtp_semantic_gpqa*' -o -name 'mtp-semantic-*' \) \
+              -exec rm -rf -- {} +
+          fi
+          for sensitive_path in \
+            "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json" \
+            "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_semantic_gpqa_reference.json" \
+            "${MLXFAST_JOB_WS}/private/mtp_semantic_gpqa_answers.json" \
+            "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference.json" \
+            "${MLXFAST_MTP_SEMANTIC_GPQA_RESULTS_PATH}" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.stdout" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.log"; do
+            if [[ -e "${sensitive_path}" || -L "${sensitive_path}" ]]; then
+              echo "::error::MTP semantic GPQA scrub left private material" >&2
+              exit 1
+            fi
+          done
+          echo "mtp-benchmark: semantic GPQA private material scrubbed"
+
       # ---- correctness-only (run_benchmark=false) artifact path ------------
       - name: Stage MTP correctness artifacts
         id: stage_mtp_correctness_artifacts
-        if: ${{ !inputs.run_benchmark }}
+        if: ${{ success() && !inputs.run_benchmark }}
         run: |
           set -euo pipefail
           export MLXFAST_ARTIFACT_PROFILE=mtp-correctness
@@ -972,13 +1246,19 @@ jobs:
       # through the bridge, allowlist-delete every gates-phase file, and
       # re-verify mtp-weights against its pinned hash.
       - name: Scrub hidden material from bench workspace
-        if: ${{ inputs.run_benchmark }}
+        if: ${{ success() && inputs.run_benchmark }}
         run: |
           set -euo pipefail
-          rm -f "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json"
+          rm -f \
+            "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json" \
+            "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_semantic_gpqa_reference.json"
           rm -f \
             "${MLXFAST_PRIVATE_DIR}/mtp-gates-stdout.raw" \
             "${MLXFAST_PRIVATE_DIR}/mtp-gates-private.log" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.stdout" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.log" \
+            "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference.json" \
+            "${MLXFAST_MTP_SEMANTIC_GPQA_RESULTS_PATH}" \
             mtp-correctness-verdict.json \
             mtp-gates-report.json
           rm -rf "${MLXFAST_JOB_WS}/private"
@@ -1019,7 +1299,9 @@ jobs:
             echo "::error::transformed MTP weights changed before timing (hash ${scrub_weights_hash} != ${trusted_weights_hash})" >&2
             exit 1
           fi
-          leftovers="$(find "${MLXFAST_JOB_WS}" -maxdepth 2 -name '*golden*' ! -path "*/correctness_prompts/*" | grep -v '^$' || true)"
+          leftovers="$(find "${MLXFAST_JOB_WS}" -maxdepth 2 \
+            \( -name '*golden*' -o -name '*semantic*gpqa*' -o -name '*gpqa*reference*' \) \
+            ! -path "*/correctness_prompts/*" | grep -v '^$' || true)"
           if [[ -n "${leftovers}" ]]; then
             echo "::error::hidden-material scrub left candidates behind: ${leftovers}" >&2
             exit 1
@@ -1027,6 +1309,10 @@ jobs:
           for raw_report in \
             "${MLXFAST_PRIVATE_DIR}/mtp-gates-stdout.raw" \
             "${MLXFAST_PRIVATE_DIR}/mtp-gates-private.log" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.stdout" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.log" \
+            "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference.json" \
+            "${MLXFAST_MTP_SEMANTIC_GPQA_RESULTS_PATH}" \
             mtp-gates-report.json; do
             if [[ -e "${raw_report}" || -L "${raw_report}" ]]; then
               echo "::error::hidden-material scrub left raw MTP report: ${raw_report}" >&2
@@ -1079,6 +1365,9 @@ jobs:
       # measure-mtp-job enforces per-phase quiescence + the 40C gate + 2 Hz
       # telemetry acceptance, requires all_tokens_matched=true from every
       # run, checks the baseline calibration band, and seals results.json.
+      # No new wrapper argument is needed for filesystem isolation:
+      # MLXFAST_OFFICIAL_BENCHMARK_RUN makes every mtp-benchmark worker
+      # strip injected write allows and default to /dev/null-only writes.
       - name: Timed paired MTP benchmark (measure-mtp-job)
         if: ${{ inputs.run_benchmark }}
         run: |

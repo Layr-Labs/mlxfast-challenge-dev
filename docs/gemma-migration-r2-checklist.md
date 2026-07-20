@@ -58,8 +58,9 @@ verify them) were regenerated.
   `MLXFAST_SEMANTIC_GPQA_CASE_COUNT`, and `MLXFAST_GPQA_TTFT_CASE_COUNT`
   are all `5` in `serial-benchmark.yml`, so per-run "N/5" gate results are
   consistent with the 9-case object.
-- **No hash pin:** the augmented golden's hash/bytes are computed at run
-  time, so no workflow constant needs updating for this object itself.
+- **Pins:** both ranked workflows now verify SHA-256
+  `fc8bcdaff94aa89b2fc2a1a2adc28943ed026899ae805b3c52b3f81a235c20ff`
+  and byte count `9919` before the reference is used.
 - **Semantic threshold — recalibrated (2026-07-09):** the semantic-GPQA
   pass-count threshold is calibrated against the unmodified baseline's
   judged answer quality, and a regeneration of the hidden
@@ -69,7 +70,9 @@ verify them) were regenerated.
   29053091705) all scored 2/5 with identical per-case verdicts, so
   `MLXFAST_SEMANTIC_GPQA_MIN_PASS` moved from 0 (aggregate-recording) to
   min(observed) - 1 = 1. See `MLXFastConstants.semanticGPQAMinPassCount`
-  for the full calibration provenance.
+  for the full serial calibration provenance. The MTP semantic backstop reuses
+  this value only as a conservative policy floor, not as an IT/Opus M5
+  calibration or a serial/MTP quality-equivalence claim.
 
 ## 3. Private prompt manifest (organizer-side, not workflow-consumed)
 

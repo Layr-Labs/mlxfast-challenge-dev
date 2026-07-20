@@ -316,16 +316,29 @@ struct MTPWorkflowIsolationTests {
         #expect(minimizedValidation.lowerBound < privateResultsDelete.lowerBound)
         #expect(score.contains("\"${MLXFAST_MEASURE_OUT}/verdict.txt\""))
 
-        // Ordering: correctness gate -> scrub -> reap -> quiescence ->
-        // harness re-verify -> timed measurement -> score.
+        // Ordering: exact correctness -> exact-oracle scrub -> semantic
+        // capture/judge -> scrub -> reap -> quiescence -> harness re-verify ->
+        // timed measurement -> score.
         let gates = try #require(workflow.range(of: "- name: MTP correctness and parity gate (untimed)"))
+        let exactOracleScrub = try #require(
+            workflow.range(of: "- name: Scrub exact MTP oracle before semantic capture")
+        )
+        let semanticCapture = try #require(
+            workflow.range(of: "- name: Capture MTP semantic GPQA answers (untimed)")
+        )
+        let semanticGate = try #require(
+            workflow.range(of: "- name: MTP semantic GPQA gate (untimed)")
+        )
         let scrub = try #require(workflow.range(of: "- name: Scrub hidden material from bench workspace"))
         let reap = try #require(workflow.range(of: "- name: Reap lingering bench processes before timing"))
         let quiesce = try #require(workflow.range(of: "- name: Wait for quiescence before timing"))
         let verify = try #require(workflow.range(of: "- name: Verify trusted harness before timing"))
         let timed = try #require(workflow.range(of: "- name: Timed paired MTP benchmark (measure-mtp-job)"))
         let scoreStep = try #require(workflow.range(of: "- name: Compute MTP score and enforce floor"))
-        #expect(gates.lowerBound < scrub.lowerBound)
+        #expect(gates.lowerBound < exactOracleScrub.lowerBound)
+        #expect(exactOracleScrub.lowerBound < semanticCapture.lowerBound)
+        #expect(semanticCapture.lowerBound < semanticGate.lowerBound)
+        #expect(semanticGate.lowerBound < scrub.lowerBound)
         #expect(scrub.lowerBound < reap.lowerBound)
         #expect(reap.lowerBound < quiesce.lowerBound)
         #expect(quiesce.lowerBound < verify.lowerBound)
@@ -344,6 +357,7 @@ struct MTPWorkflowIsolationTests {
         #expect(gateBody.contains(".official_score_produced == false"))
         #expect(gateBody.contains("BENCH_GOLDEN_PATH"))
         #expect(gateBody.contains("--require-trained-assistant"))
+        #expect(gateBody.contains("--deny-worker-file-writes"))
         #expect(gateBody.contains("trap 'rm -f -- \"${raw_stdout}\" \"${gates_log}\"' EXIT"))
         #expect(gateBody.contains("schema_version: 1"))
         #expect(gateBody.contains("gate_passed: true"))
@@ -382,7 +396,9 @@ struct MTPWorkflowIsolationTests {
             from: "- name: Scrub hidden material from bench workspace",
             to: "- name: Reap lingering bench processes before timing"
         )
-        #expect(scrubBody.contains("rm -f \"${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json\""))
+        #expect(scrubBody.contains(
+            "\"${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json\""
+        ))
         #expect(scrubBody.contains("\"${MLXFAST_PRIVATE_DIR}/mtp-gates-stdout.raw\""))
         #expect(scrubBody.contains("\"${MLXFAST_PRIVATE_DIR}/mtp-gates-private.log\""))
         #expect(scrubBody.contains("mtp-gates-report.json"))

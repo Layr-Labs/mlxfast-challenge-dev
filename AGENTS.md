@@ -190,10 +190,63 @@ fidelity to the pinned 31B-IT target. The ranked M5 runner is the authority.
 The official correctness stack includes:
 
 - Hidden 512-token MTP correctness replay.
+- A distinct untimed semantic GPQA backstop through the actual trained-MTP
+  block worker/session path. These semantic-only cases have no exact-token
+  oracle; a fixed private judge enforces the repository-pinned 1-of-5 policy
+  floor.
 - A distinct hidden 512-token timed golden.
 - Trained-assistant requirement and exact-pair target verification.
 - Parent-owned serial oracle comparison for every returned token.
 - Cache offset, rollback, block-size, and acceptance-accounting invariants.
+
+The ordering is fail-closed: exact-token failure stops before semantic capture
+and cannot be rescued; semantic failure stops before timing. The semantic
+reference, returned token IDs, decoded answers, judge details, and pass-count
+summary remain private and are scrubbed before timing. They are never included
+in `score.json` or uploaded artifacts.
+`mtp-generate-gpqa-answers` requires `MLXFAST_PRIVATE_DIR`, a canonical strict
+descendant output, and a worker sandbox that denies the reference/private
+subtree plus all filesystem writes except `/dev/null`; one fresh worker is used
+per case.
+Every official `mtp-benchmark` worker, including the timed candidate, strips
+injected profile write exceptions and allows only `/dev/null`. The ranked exact
+gate also supplies `--deny-worker-file-writes` visibly as defense in depth;
+local MTP behavior is unchanged unless the caller supplies that flag.
+Exact trained-MTP orchestration retries `close()` and must confirm worker
+termination before returning a successful report. The ranked workflow then
+reaps the bench uid and verifies no live process remains before installing any
+semantic fixture.
+The archived serial semantic capture follows the same rule: while the worker
+is alive it retains only pending metadata/token IDs; tokenizer loading,
+decoding, and private output happen only after confirmed termination. Repeated
+close failure prevents the write. Non-semantic serial behavior is unchanged.
+
+The model-independent private reference object is pinned in-repo at SHA-256
+`fc8bcdaff94aa89b2fc2a1a2adc28943ed026899ae805b3c52b3f81a235c20ff`
+and 9919 bytes. The 1-of-5 minimum is the existing serial policy floor reused
+as a conservative semantic-catastrophe backstop, not an IT/Opus M5 calibration
+or a claim of serial/MTP quality equivalence. Participant code must not use
+POSIX named shared memory/semaphores, System V IPC, or equivalent named IPC to
+retain or communicate state across fresh semantic cases or ranked phases.
+Using `NSPasteboard`, `pbcopy`/`pbpaste`, `com.apple.pasteboard.*` Mach
+services, or another pasteboard channel for cross-worker persistence is
+equally prohibited.
+So are prompt/token-derived `UserDefaults` or CFPreferences writes, unified
+logging (`os_log`, `Logger`, `NSLog`, signposts), and dynamic Metal source or
+shader/cache keys derived from request inputs. Prompt-dependent dynamic shader
+compilation is benchmark-state persistence, not a valid optimization. Normal
+input-independent static Metal kernels and driver/library shader caches keyed
+only by fixed source, compile options, device, shapes, or offsets remain
+allowed.
+
+The repository does not attempt a minimal file-read allowlist, VM/page-cache
+flushing, or disabling normal input-independent Metal caches. Those controls
+would risk MLX correctness/performance, affect the existing exact hidden gate
+too, and belong to platform/operator isolation. Residual page, CPU/GPU,
+driver, and system-service cache channels are mitigated by fresh/reaped
+workers, file-write/IPC/preference/log denies, static review, no raw private
+artifacts, ephemeral runner registration, janitor cleanup, and operator
+integrity audit.
 
 ## Timing And Score Measurement
 
@@ -201,11 +254,11 @@ The official benchmark measures serial K=1 and candidate MTP decode
 seconds/token over alternating accepted pairs, then publishes the ratio of
 their means. The floor is `1.0`.
 
-The timed measurement runs last in the ranked job, after all correctness and
-gate work, behind a fixed 40C GPU thermal gate with telemetry-validated
-acceptance; the pinned reference is measured the same way on the same box in
-the same session. At least three pairs must pass parity, stall, thermal, and
-telemetry validation.
+The timed measurement runs last in the ranked job, after exact correctness,
+semantic GPQA, and all other gate work, behind a fixed 40C GPU thermal gate
+with telemetry-validated acceptance; the pinned reference is measured the
+same way on the same box in the same session. At least three pairs must pass
+parity, stall, thermal, and telemetry validation.
 
 Detailed memory, timing, acceptance, and worker diagnostics remain
 runner-private for trusted validation and are not uploaded. The public payload
@@ -351,7 +404,8 @@ behaviors are expected, not bugs:
  rarely. Know its scope: the lock lives in `benchmark.sh`, so
  `benchmark-mtp.sh` and direct
  `mlxfast-swift` model commands (`correctness`, `correctness-trace`,
- `generate-golden`, `generate-gpqa-answers`, `mtp-*`) take no lock and
+ `generate-golden`, `generate-gpqa-answers`,
+ `mtp-generate-gpqa-answers`, other `mtp-*`) take no lock and
  do not check for other runs -- run one model-holding command at a
  time, never concurrently with a local benchmark or with each other.
  (`swift test` never loads the real model and is safe alongside.)

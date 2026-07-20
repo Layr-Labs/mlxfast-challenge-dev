@@ -42,6 +42,9 @@ private enum MLXFastCLI {
             case "mtp-benchmark":
                 try runExperimentalTrainedMTPBenchmark(options)
                 return 0
+            case "mtp-generate-gpqa-answers":
+                try runExperimentalTrainedMTPSemanticGPQA(options)
+                return 0
             case "attach-gpqa-gates":
                 try runAttachGPQAGates(options)
                 return 0
@@ -449,7 +452,10 @@ private enum MLXFastCLI {
                 "--tokens",
                 "--target-verification",
             ],
-            flagOptions: ["--require-trained-assistant"]
+            flagOptions: [
+                "--require-trained-assistant",
+                "--deny-worker-file-writes",
+            ]
         )
         let sourceTargetPath = options.value(
             for: "--target-source",
@@ -510,7 +516,11 @@ private enum MLXFastCLI {
             )
         }
         guard let worker = try runtimeWorkerOptions(
-            blockedGoldenPath: goldenPath
+            blockedGoldenPath: goldenPath,
+            deniesWorkerFileWrites: options.hasFlag(
+                "--deny-worker-file-writes"
+            ),
+            deniesWorkerFileWritesInOfficialRuns: true
         ) else {
             throw MLXFastError.invalidInput(
                 "mtp-benchmark requires the sandboxed runtime worker"
@@ -543,6 +553,136 @@ private enum MLXFastCLI {
         if data.last != 0x0a {
             print("")
         }
+    }
+
+    private static func runExperimentalTrainedMTPSemanticGPQA(
+        _ options: ParsedOptions
+    ) throws {
+        try options.validate(
+            valueOptions: [
+                "--target-source",
+                "--weights",
+                "--assistant",
+                "--contract",
+                "--tokenizer",
+                "--gpqa",
+                "--output",
+                "--block-size",
+                "--case-count",
+                "--max-new-tokens",
+            ],
+            flagOptions: ["--require-trained-assistant"]
+        )
+        let sourceTargetPath = options.value(
+            for: "--target-source",
+            default: ""
+        )
+        let weightsPath = options.value(for: "--weights", default: "")
+        let assistantPath = options.value(for: "--assistant", default: "")
+        let contractPath = options.value(for: "--contract", default: "")
+        let tokenizerPath = options.value(for: "--tokenizer", default: "")
+        let gpqaPath = options.value(for: "--gpqa", default: "")
+        let outputPath = options.value(for: "--output", default: "")
+        let privateDirectoryPath = environmentValue(
+            "MLXFAST_PRIVATE_DIR",
+            fallback: ""
+        )
+        guard !sourceTargetPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "mtp-generate-gpqa-answers requires --target-source PATH"
+            )
+        }
+        guard !weightsPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "mtp-generate-gpqa-answers requires --weights PATH"
+            )
+        }
+        guard !assistantPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "mtp-generate-gpqa-answers requires --assistant PATH"
+            )
+        }
+        guard !contractPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "mtp-generate-gpqa-answers requires --contract PATH"
+            )
+        }
+        guard !tokenizerPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "mtp-generate-gpqa-answers requires --tokenizer PATH"
+            )
+        }
+        guard !gpqaPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "mtp-generate-gpqa-answers requires --gpqa PATH"
+            )
+        }
+        guard !outputPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "mtp-generate-gpqa-answers requires --output PATH"
+            )
+        }
+        guard !privateDirectoryPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "mtp-generate-gpqa-answers requires MLXFAST_PRIVATE_DIR"
+            )
+        }
+        try GemmaRuntime.validateMTPSemanticPrivateOutputPath(
+            outputPath,
+            privateDirectoryPath: privateDirectoryPath
+        )
+        let maxBlockSize = try parsePositiveInt(
+            options.value(
+                for: "--block-size",
+                default: "\(MLXFastConstants.experimentalMTPMaxBlockSize)"
+            ),
+            optionName: "--block-size"
+        )
+        let caseCount = try parsePositiveInt(
+            options.value(
+                for: "--case-count",
+                default: "\(MLXFastConstants.semanticGPQACaseCount)"
+            ),
+            optionName: "--case-count"
+        )
+        let maxNewTokens = try parsePositiveInt(
+            options.value(
+                for: "--max-new-tokens",
+                default: "\(MLXFastConstants.semanticGPQAMaxNewTokens)"
+            ),
+            optionName: "--max-new-tokens"
+        )
+        guard let worker = try runtimeWorkerOptions(
+            blockedGoldenPath: gpqaPath,
+            deniesWorkerFileWrites: true,
+            requiresWorkerSandbox: true
+        ) else {
+            throw MLXFastError.invalidInput(
+                "mtp-generate-gpqa-answers requires the sandboxed runtime worker"
+            )
+        }
+        _ = try GemmaRuntime.captureExperimentalTrainedMTPSemanticGPQAAnswers(
+            ExperimentalTrainedMTPSemanticGPQAOptions(
+                sourceTargetPath: sourceTargetPath,
+                targetWeightsPath: weightsPath,
+                assistantPath: assistantPath,
+                contractPath: contractPath,
+                tokenizerPath: tokenizerPath,
+                referenceCasesPath: gpqaPath,
+                privateDirectoryPath: privateDirectoryPath,
+                outputPath: outputPath,
+                maxBlockSize: maxBlockSize,
+                caseCount: caseCount,
+                maxNewTokens: maxNewTokens,
+                requireTrainedAssistant: options.hasFlag(
+                    "--require-trained-assistant"
+                )
+            ),
+            worker: worker
+        )
+        // Fixed and non-sensitive: never print paths, case identifiers, prompt
+        // lengths, generated token counts, answers, or token IDs.
+        print("mtp-generate-gpqa-answers: completed")
     }
 
     // Emits the in-memory payload, not a re-read of scorePath: the benchmark
@@ -1164,7 +1304,7 @@ private enum MLXFastCLI {
                     subdomain: testCase.subdomain,
                     prompt: testCase.prompt,
                     answerKey: testCase.answerKey,
-                    referenceAnswer: referenceAnswer(for: testCase),
+                    referenceAnswer: testCase.semanticReferenceAnswer,
                     candidateAnswer: decoded,
                     candidateTokens: generated,
                     maxNewTokens: maxNewTokens
@@ -1189,12 +1329,11 @@ private enum MLXFastCLI {
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        let outputURL = URL(fileURLWithPath: outputPath)
-        try FileManager.default.createDirectory(
-            at: outputURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+        try PrivateFileWriter.writeAtomically(
+            encoder.encode(document),
+            to: outputPath,
+            maximumByteCount: 1 * 1024 * 1024
         )
-        try encoder.encode(document).write(to: outputURL, options: [.atomic])
         print("generated semantic GPQA answer cases=\(answers.count) output=\(outputPath)")
     }
 
@@ -1215,42 +1354,6 @@ private enum MLXFastCLI {
         guard outputPath.hasPrefix(privatePath + "/") else {
             throw MLXFastError.invalidInput("\(description) must be under MLXFAST_PRIVATE_DIR")
         }
-    }
-
-    private static func referenceAnswer(for testCase: GPQAReferenceCase) -> String {
-        if let expected = trimmedNonEmpty(testCase.expectedResponse) {
-            return expected
-        }
-        if let accepted = testCase.acceptedResponses?.compactMap({ trimmedNonEmpty($0) }), !accepted.isEmpty {
-            return accepted.joined(separator: "\n")
-        }
-        if let answerKey = trimmedNonEmpty(testCase.answerKey) {
-            if let answerText = multipleChoiceAnswerText(in: testCase.prompt, answerKey: answerKey) {
-                return "\(answerKey). \(answerText)"
-            }
-            return "Correct option: \(answerKey)"
-        }
-        return ""
-    }
-
-    private static func multipleChoiceAnswerText(in prompt: String, answerKey: String) -> String? {
-        let normalizedKey = answerKey.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        guard normalizedKey.count == 1 else {
-            return nil
-        }
-        for rawLine in prompt.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            for marker in ["\(normalizedKey).", "\(normalizedKey):", "\(normalizedKey))"]
-                where line.hasPrefix(marker)
-            {
-                let start = line.index(line.startIndex, offsetBy: marker.count)
-                let value = line[start...].trimmingCharacters(in: .whitespacesAndNewlines)
-                if !value.isEmpty {
-                    return value
-                }
-            }
-        }
-        return nil
     }
 
     private static func buildGPQABehaviorCaseIfWithinPromptBudget(
@@ -1278,7 +1381,7 @@ private enum MLXFastCLI {
             maxNewTokens: maxNewTokens,
             semanticPrompt: testCase.prompt,
             semanticAnswerKey: trimmedNonEmpty(testCase.answerKey),
-            semanticReferenceAnswer: referenceAnswer(for: testCase),
+            semanticReferenceAnswer: testCase.semanticReferenceAnswer,
             semanticDomain: trimmedNonEmpty(testCase.domain),
             semanticSubdomain: trimmedNonEmpty(testCase.subdomain)
         )
@@ -1399,21 +1502,34 @@ private enum MLXFastCLI {
 
     private static func runtimeWorkerOptions(
         blockedGoldenPath: String? = nil,
-        forwardsWorkerStderr: Bool = false
+        forwardsWorkerStderr: Bool = false,
+        deniesWorkerFileWrites: Bool = false,
+        deniesWorkerFileWritesInOfficialRuns: Bool = false,
+        requiresWorkerSandbox: Bool = false
     ) throws -> RuntimeWorkerOptions? {
         // The trusted binary has no in-process model target. Disabling the worker
         // therefore fails closed in every mode rather than selecting an editable
         // model path inside the timer/gate/score process.
         let officialRun = environmentValue("MLXFAST_OFFICIAL_BENCHMARK_RUN", fallback: "0") == "1"
+        let effectiveDeniesWorkerFileWrites =
+            deniesWorkerFileWrites
+            || (officialRun && deniesWorkerFileWritesInOfficialRuns)
         let enabled = environmentValue("MLXFAST_USE_RUNTIME_WORKER", fallback: "1")
         guard enabled != "0" && enabled.lowercased() != "false" else {
             throw MLXFastError.invalidInput(
                 "mlxfast-swift requires the participant runtime worker; unset MLXFAST_USE_RUNTIME_WORKER"
             )
         }
-        if officialRun, environmentValue("MLXFAST_NO_SANDBOX", fallback: "0") == "1" {
+        if environmentValue("MLXFAST_NO_SANDBOX", fallback: "0") == "1",
+           officialRun || requiresWorkerSandbox
+        {
+            if officialRun {
+                throw MLXFastError.invalidInput(
+                    "official benchmark runs require the runtime worker sandbox; unset MLXFAST_NO_SANDBOX"
+                )
+            }
             throw MLXFastError.invalidInput(
-                "official benchmark runs require the runtime worker sandbox; unset MLXFAST_NO_SANDBOX"
+                "mtp-generate-gpqa-answers requires the runtime worker sandbox; unset MLXFAST_NO_SANDBOX"
             )
         }
         let configuredExecutable = environmentValue(
@@ -1453,19 +1569,35 @@ private enum MLXFastCLI {
         // ran the review step. Official runs fail closed; local runs warn.
         try enforceEditableSurfaceByteBudget(officialRun: officialRun)
         var sandboxProfile = environmentValue("MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE", fallback: "")
-        if sandboxProfile.isEmpty,
-           environmentValue("MLXFAST_NO_SANDBOX", fallback: "0") != "1",
+        if environmentValue("MLXFAST_NO_SANDBOX", fallback: "0") != "1",
            let blockedGoldenPath,
            !blockedGoldenPath.isEmpty
         {
-            sandboxProfile = try writeRuntimeWorkerSandboxProfile(
-                blockedGoldenPath: blockedGoldenPath,
-                allowedExecutablePath: executablePath
-            )
+            if sandboxProfile.isEmpty {
+                sandboxProfile = try writeRuntimeWorkerSandboxProfile(
+                    blockedGoldenPath: blockedGoldenPath,
+                    allowedExecutablePath: executablePath
+                )
+            } else {
+                // Operator profiles are trusted, but bind the current private
+                // fixture and semantic-output directory here as well. That
+                // keeps newly added parent-only paths denied even if an older
+                // box-owned profile template has not learned their names yet.
+                sandboxProfile = try augmentRuntimeWorkerSandboxProfile(
+                    sandboxProfile,
+                    blockedGoldenPath: blockedGoldenPath,
+                    deniesFileWrites: effectiveDeniesWorkerFileWrites
+                )
+            }
         }
-        if officialRun, sandboxProfile.isEmpty {
+        if (officialRun || requiresWorkerSandbox), sandboxProfile.isEmpty {
+            if officialRun {
+                throw MLXFastError.invalidInput(
+                    "official benchmark runs require a runtime worker sandbox profile; none was configured or derivable"
+                )
+            }
             throw MLXFastError.invalidInput(
-                "official benchmark runs require a runtime worker sandbox profile; none was configured or derivable"
+                "mtp-generate-gpqa-answers requires a runtime worker sandbox profile; none was configured or derivable"
             )
         }
         return RuntimeWorkerOptions(
@@ -1808,6 +1940,18 @@ private enum MLXFastCLI {
         (deny process-fork)
         (deny process-exec*)
         (allow process-exec (literal "\(seatbeltEscaped(absoluteExecutablePath))"))
+        (deny ipc-posix-shm*)
+        (deny ipc-posix-sem*)
+        (deny ipc-sysv*)
+        (allow ipc-posix-shm-read*
+            (ipc-posix-name "apple.shm.notification_center")
+            (ipc-posix-name "apple.shm.cfprefsd.daemon")
+            (ipc-posix-name-prefix "apple.cfprefs.")
+            (ipc-posix-name-prefix "apple.shm.cfprefsd."))
+        (deny user-preference-write)
+        (deny mach-lookup (global-name-prefix "com.apple.pasteboard."))
+        (deny mach-lookup (global-name-prefix "com.apple.logd"))
+        (deny mach-lookup (global-name "com.apple.system.logger"))
         (deny mach-lookup (global-name "com.apple.mDNSResponder"))
         (deny mach-lookup (global-name "com.apple.system.mDNSResponder"))
         (deny mach-lookup (global-name-prefix "com.apple.mDNSResponder"))
@@ -1817,6 +1961,99 @@ private enum MLXFastCLI {
         """
         try profile.write(to: profileURL, atomically: true, encoding: .utf8)
         return profileURL.path
+    }
+
+    private static func augmentRuntimeWorkerSandboxProfile(
+        _ profilePath: String,
+        blockedGoldenPath: String,
+        deniesFileWrites: Bool
+    ) throws -> String {
+        let source = try String(
+            contentsOfFile: profilePath,
+            encoding: .utf8
+        )
+        var retainedProfileLines: [Substring] = []
+        for line in source.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        ) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if deniesFileWrites,
+               trimmed.hasPrefix("(allow file-write")
+            {
+                guard trimmed.hasSuffix(")") else {
+                    throw MLXFastError.invalidInput(
+                        "runtime worker sandbox profile has an unsupported "
+                            + "multiline file-write allow"
+                    )
+                }
+                continue
+            }
+            retainedProfileLines.append(line)
+        }
+        let sourceWithoutSemanticWriteAllows =
+            retainedProfileLines.joined(separator: "\n")
+        var deniedReadRules = [
+            "(deny file-read* (literal \"\(seatbeltEscaped(absolutePath(blockedGoldenPath)))\"))",
+        ]
+        let privateDir = environmentValue("MLXFAST_PRIVATE_DIR", fallback: "")
+        if !privateDir.isEmpty {
+            deniedReadRules.append(
+                "(deny file-read* (subpath \"\(seatbeltEscaped(absolutePath(privateDir)))\"))"
+            )
+        }
+        // These operation names are present in Apple's shipped Seatbelt
+        // profiles and are exercised by probe-runtime-worker-sandbox.sh on the
+        // ranked host. They block named POSIX shared memory/semaphores and
+        // legacy System V IPC without denying Metal/MLX Mach services.
+        var workerIsolationRules = [
+            "(deny ipc-posix-shm*)",
+            "(deny ipc-posix-sem*)",
+            "(deny ipc-sysv*)",
+            """
+            (allow ipc-posix-shm-read*
+                (ipc-posix-name "apple.shm.notification_center")
+                (ipc-posix-name "apple.shm.cfprefsd.daemon")
+                (ipc-posix-name-prefix "apple.cfprefs.")
+                (ipc-posix-name-prefix "apple.shm.cfprefsd."))
+            """,
+            "(deny user-preference-write)",
+            "(deny mach-lookup (global-name-prefix \"com.apple.pasteboard.\"))",
+            "(deny mach-lookup (global-name-prefix \"com.apple.logd\"))",
+            "(deny mach-lookup (global-name \"com.apple.system.logger\"))",
+        ]
+        if deniesFileWrites {
+            // The generated fallback profile already has these rules. Append
+            // them to operator-injected profiles for the semantic-only path so
+            // one case cannot leave candidate-controlled filesystem state for
+            // the next fresh worker. MLX runtime safety is established by the
+            // same deny-all/allow-/dev/null policy used by the fallback.
+            workerIsolationRules += [
+                "(deny file-write*)",
+                "(allow file-write* (literal \"/dev/null\"))",
+            ]
+        }
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "mlxfast-runtime-worker-private-\(UUID().uuidString).sb"
+            )
+        let separator = sourceWithoutSemanticWriteAllows.hasSuffix("\n")
+            ? "" : "\n"
+        let augmented = sourceWithoutSemanticWriteAllows + separator + """
+        ;; Trusted-parent private input/output binding.
+        \(deniedReadRules.joined(separator: "\n"))
+        \(workerIsolationRules.joined(separator: "\n"))
+        """
+        try augmented.write(
+            to: outputURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o400],
+            ofItemAtPath: outputURL.path
+        )
+        return outputURL.path
     }
 
     private static func absolutePath(_ path: String) -> String {
@@ -1860,7 +2097,8 @@ private enum MLXFastCLI {
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--local-submit|--local-iterate] [--weights PATH] [--golden PATH] [--score-path PATH]
               mlxfast-swift mtp-probe --weights PATH --golden PATH [--block-size N] [--tokens N]
-              mlxfast-swift mtp-benchmark --target-source IT_SOURCE --weights IT_PATH --assistant PATH --contract PATH --golden IT_GOLDEN --require-trained-assistant [--block-size N] [--tokens N] [--target-verification exact-pair|serial]
+              mlxfast-swift mtp-benchmark --target-source IT_SOURCE --weights IT_PATH --assistant PATH --contract PATH --golden IT_GOLDEN --require-trained-assistant [--deny-worker-file-writes] [--block-size N] [--tokens N] [--target-verification exact-pair|serial]
+              mlxfast-swift mtp-generate-gpqa-answers --target-source IT_SOURCE --weights IT_PATH --assistant PATH --contract PATH --tokenizer PATH --gpqa PATH --output PATH --require-trained-assistant [--block-size N] [--case-count N] [--max-new-tokens N]
               mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
               mlxfast-swift attach-free-run-gate [--golden PATH] [--weights PATH] [--output PATH] [--name NAME] [--steps N] [--allow-partial] [--case NAME | --prompt-file PATH [--tokenizer PATH]] [--exact-prefix N]
               mlxfast-swift generate-golden --prompt-file PATH [--weights PATH] [--tokenizer PATH] --output PATH --name NAME --steps N
@@ -1913,38 +2151,6 @@ private struct NGramSimilarityAnalysisOutput: Codable {
         case passed
         case report
     }
-}
-
-private struct GPQAReferenceDocument: Decodable {
-    let cases: [GPQAReferenceCase]
-}
-
-private struct GPQAReferenceCase: Decodable {
-    let id: String?
-    let prompt: String
-    let expectedResponse: String?
-    let answerKey: String?
-    let acceptedTokenSequences: [[Int]]?
-    let acceptedResponses: [String]?
-    let domain: String?
-    let subdomain: String?
-
-    enum CodingKeys: String, CodingKey {
-        case id
-        case prompt
-        case expectedResponse = "expected_response"
-        case answerKey = "answer_key"
-        case acceptedTokenSequences = "accepted_token_sequences"
-        case acceptedResponses = "accepted_responses"
-        case domain
-        case subdomain
-    }
-
-    var identifier: String {
-        let trimmed = id?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return trimmed.isEmpty ? "gpqa-private" : trimmed
-    }
-
 }
 
 private struct SemanticGPQAAnswerDocument: Encodable {

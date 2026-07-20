@@ -549,17 +549,17 @@ extension GemmaRuntime {
                 verificationMode: options.verificationMode
             )
         )
-        defer {
-            worker.close()
-        }
-        let measurement = try measureExperimentalTrainedMTPWorkerDecode(
-            plan: plan,
-            maxBlockSize: options.maxBlockSize,
-            totalTokenCount: options.totalTokenCount,
-            verificationMode: options.verificationMode,
+        return try withConfirmedRuntimeWorkerTermination(
             worker: worker
-        )
-        return ExperimentalTrainedMTPReport(
+        ) {
+            let measurement = try measureExperimentalTrainedMTPWorkerDecode(
+                plan: plan,
+                maxBlockSize: options.maxBlockSize,
+                totalTokenCount: options.totalTokenCount,
+                verificationMode: options.verificationMode,
+                worker: worker
+            )
+            return ExperimentalTrainedMTPReport(
             experimental: true,
             trackID: artifacts.trackID,
             protocolName: "trusted_mtp_block_v1",
@@ -609,8 +609,9 @@ extension GemmaRuntime {
             // This CLI invocation never emits the official score even on the
             // enabled track: the trusted workflow computes the paired score
             // from measure-mtp-job's sealed results, never from this report.
-            officialScoreProduced: false
-        )
+                officialScoreProduced: false
+            )
+        }
     }
 
     static func validateExperimentalTrainedMTPOptions(
@@ -1081,19 +1082,19 @@ extension GemmaRuntime {
             options: workerOptions,
             weightsPath: options.weightsPath
         )
-        defer {
-            worker.close()
-        }
-        let measurement = try measureExperimentalMTPWorkerDecode(
-            plan: plan,
-            maxBlockSize: options.maxBlockSize,
-            totalTokenCount: options.totalTokenCount,
+        return try withConfirmedRuntimeWorkerTermination(
             worker: worker
-        )
-        let assistantUnavailableReason =
-            "assistant weights unavailable/incompatible: the shipped Gemma 4 31B base checkpoint "
-            + "contains no drafter weights, and the known public Gemma 4 assistant targets are IT models"
-        return ExperimentalMTPProbeReport(
+        ) {
+            let measurement = try measureExperimentalMTPWorkerDecode(
+                plan: plan,
+                maxBlockSize: options.maxBlockSize,
+                totalTokenCount: options.totalTokenCount,
+                worker: worker
+            )
+            let assistantUnavailableReason =
+                "assistant weights unavailable/incompatible: the shipped Gemma 4 31B base checkpoint "
+                + "contains no drafter weights, and the known public Gemma 4 assistant targets are IT models"
+            return ExperimentalMTPProbeReport(
             experimental: true,
             protocolName: "decode_block_v1",
             generator: "serial_target_fallback",
@@ -1116,8 +1117,9 @@ extension GemmaRuntime {
             mlxCacheMemoryBytes: measurement.mlxCacheMemoryBytes,
             mlxPeakMemoryBytes: measurement.mlxPeakMemoryBytes,
             allTokensMatched: true,
-            officialScoreProduced: false
-        )
+                officialScoreProduced: false
+            )
+        }
     }
 
     static func validateExperimentalMTPProbeOptions(

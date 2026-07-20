@@ -32,6 +32,23 @@ cache geometry and numerical state that the parent cannot observe. Any kernel
 may reassociate or fuse reductions, but requires trusted M5 calibration before
 it relies on or loosens an envelope.
 
+A separate untimed semantic GPQA backstop now broadens prompt coverage through
+the actual trained-MTP worker/session path. It has no exact-token oracle and
+cannot rescue the primary exact-token gate: exact failure stops before capture,
+while semantic failure stops before timing. Its private questions, references,
+returned IDs, decoded answers, judge details, and aggregate verdict remain
+runner-private and are scrubbed before scoring.
+The bench-readable exact oracle is removed before the semantic reference is
+installed. Semantic workers also require a sandbox outside ranked workflow
+assumptions and cannot write any filesystem path except `/dev/null`, including
+when an operator profile is injected, so fresh per-case processes cannot
+communicate through disk.
+All official `mtp-benchmark` workers now receive the same deny-all-write
+policy by default; injected write allows are removed before the deny is
+appended. This includes the operator-owned timed candidate without a wrapper
+interface change. The exact gate retains an explicit flag as defense in depth,
+while local MTP defaults remain unchanged.
+
 ## Scope and assumptions
 
 In scope:
@@ -80,6 +97,13 @@ multi-tenant or lower-memory deployment.
 - Sandboxed worker: loads target and assistant, executes the strict line-JSON
   protocol, and cannot write or use the network
   (`GemmaRuntimeMTPWorker.swift`, `main.swift` sandbox profile).
+- Semantic capture/judge: the trusted parent launches one fresh exact-pair MTP
+  worker per private GPQA case, tears it down before decoding/writing, then a
+  trusted networked step applies the fixed judge in verdict-only mode
+  (`GemmaRuntimeMTPSemanticGPQA.swift`, `run-semantic-gpqa-gate.sh`).
+- Shared GPQA fixture contract: serial and MTP parent paths both decode
+  `MLXFastCore/GPQAReference.swift`; accepted token sequences are validated but
+  never become an MTP semantic oracle.
 - Editable MTP model: drafts, selects an explicit exact-pair or serial
   verifier, commits, and rolls back target/shared KV state
   (`Gemma4MTPRuntime.swift`, `Gemma4ExactTwo*.swift`).
@@ -110,6 +134,15 @@ multi-tenant or lower-memory deployment.
 - Trusted oracle → parent only: expected seed and the configured target tokens;
   never sent
   in block requests.
+- Semantic GPQA reference → trusted parent only: model-independent question and
+  reference-answer text; the worker receives only tokenized prompt IDs at
+  begin, then the last committed token and block bound. It receives no fixture
+  path, answer, accepted sequence, or future oracle.
+- Semantic worker → parent → private judge: parent-observed token IDs are kept
+  in memory until each worker exits, decoded only in the trusted parent, and
+  written mode 0600 under a fixed cap only after every worker has exited.
+  Judge requests/responses and detailed verdicts stay in a 0700 runner-private
+  directory and are scrubbed before timing.
 - Trusted workflow → correctness-only artifact: fixed schema/version, track ID,
   gate-passed boolean, and fixed token count only.
 - Parent/measure wrapper → ranked publisher: minimized score payload containing
@@ -153,6 +186,7 @@ flowchart LR
 | Worker protocol | Carries the only scored model outputs | Integrity, availability |
 | M5 compute and memory | Resource abuse can forge speed or deny later jobs | Integrity, availability |
 | Runner secrets/private prompts | Submitted code must not read or exfiltrate them | Confidentiality |
+| Semantic GPQA references/answers/verdicts | Independent behavior gate must remain private and unforgeable | Confidentiality, integrity |
 
 ## Attacker model
 
@@ -176,12 +210,16 @@ flowchart LR
   required Seatbelt profile.
 - Supply an arbitrary assistant through the official organizer cache contract.
 - Make an incorrect returned token pass the parent's exact serial oracle.
+- Read a semantic reference answer or future semantic token oracle from the
+  worker; neither is present in its argv, environment, filesystem view, or
+  request schema.
 
 ## Entry points and attack surfaces
 
 | Surface | How reached | Trust boundary | Notes | Evidence |
 | --- | --- | --- | --- | --- |
 | MTP CLI | Explicit command arguments | Operator → parent | No environment toggle changes serial benchmark | `Sources/MLXFastCLI/main.swift` |
+| MTP semantic CLI | Explicit target/assistant/contract/tokenizer/reference/output arguments | Operator → trusted parent | Fixed exact-pair launch; no serial generation fallback; output only after worker teardown | `Sources/MLXFastCLI/main.swift`, `GemmaRuntimeMTPSemanticGPQA.swift` |
 | Artifact directories | Target/assistant paths | Cache → parent/worker | Hash, size, links, inventory, config | `GemmaRuntimeMTPProvenance.swift` |
 | Worker request decoder | Private pipe JSON | Parent → worker | Unknown fields and bounds rejected | `GemmaRuntimeWorker.swift` |
 | Worker response decoder | Private pipe JSON | Worker → parent | Unknown timing/count fields rejected | `GemmaRuntimeWorker.swift` |
@@ -224,6 +262,18 @@ flowchart LR
 10. Cross-track contamination: code blends archived serial scoring or state
     into the MTP default → distinct option types, subcommands, protocol kinds,
     manifests, workflows, and regression tests keep the tracks isolated.
+11. Semantic-oracle leakage or rescue: candidate reads reference answers, emits
+    free-form output into logs/artifacts, or uses semantic pass to bypass exact
+    failure → literal/subpath worker read denials, fresh per-case processes,
+    write-after-clean-shutdown, fixed summaries, verdict-only judging, strict
+    artifact allowlists, and exact-before-semantic workflow ordering prevent
+    the path; all private semantic files are capped and scrubbed before timing.
+12. Exact-phase marker: exact correctness code writes a prompt-derived marker
+    under an allowlisted build/weights path, then semantic or timed code reads
+    it → every official `mtp-benchmark` invocation defaults to repository-
+    enforced no-write isolation, strips injected-profile write exceptions, and
+    allows only `/dev/null`; the exact flag remains explicit and local defaults
+    remain unchanged.
 
 ## Threat model table
 
@@ -238,7 +288,8 @@ flowchart LR
 | TM-007 | Participant | Known token/block shape | Special-case call count, offset, prompt length, or final tail | Benchmark-only speedup | Score | Trusted totals up to 512; variable 255/256/257 tail tests; static MTP policy | Shape itself is necessarily observable | Rotate hidden lengths and prompts; manual branch audit | Timing discontinuities by shape | High | Medium | High |
 | TM-008 | Participant | Resource access in worker | Memory bomb, allocator-state subsidy, background threads | OOM, unfair cache state, runner DoS | M5 availability, score | Sandbox, orphan reaper, allocator clear, watchdog | No hard active-memory cap | Peak/active memory cap; terminate unexpected threads/process activity; fresh runner | Memory/threads sampled at phase boundaries | Medium | High | High |
 | TM-009 | Integration error | Shared CLI/workflow | Mix MTP and archived serial manifests, baselines, or scores | Corrupt either leaderboard | Track identity | Separate commands/types/kinds, workflows, manifests, baselines, and track-tagged score | Operator registration can still be misconfigured | Contract tests; release approval; verify namespace during import | Assert source/path hashes and track ID | Low | High | Medium |
-| TM-010 | Submitted code | Error/log/diagnostic path sees hidden prompt | Exfiltrate through stderr, protocol framing, raw reports, artifacts, DNS, or files | Private benchmark disclosure | Oracle/prompts/secrets | FD isolation, submission-log suppression, network/write/process denial, strict artifact allowlists, fixed correctness verdict, minimized score, runner-private raw-report deletion | OS sandbox defects and residual timing/score bandwidth remain | Retain uid/PF/operator probes; no secret-bearing env; audit public schema changes | Sandbox/egress telemetry and artifact-content tests | Low | High | Medium |
+| TM-010 | Submitted code | Error/log/diagnostic path sees hidden prompt | Exfiltrate or persist through stderr, protocol framing, workspace markers, raw reports, artifacts, DNS, preferences, pasteboard, named IPC, unified logging, or prompt-derived dynamic shader/cache keys | Private benchmark disclosure or phase-dependent behavior | Oracle/prompts/secrets, score integrity | FD isolation, submission-log suppression, network/process/file-write denial, preference-write/pasteboard/named-IPC/logd denial, read-only cfprefs carveout, all official MTP and semantic workers isolated, strict artifact allowlists, fixed correctness verdict, minimized score, runner-private raw-report deletion, static-review persistence policy | Page/CPU/GPU/Metal-driver caches, unenumerated system services, OS sandbox defects, and residual timing/score bandwidth remain | Retain uid/PF/operator probes; no secret-bearing env; audit public schema changes; keep prompt-dependent dynamic shader compilation prohibited | Sandbox/egress/preference/log probes, official/local policy-isolation tests, and artifact-content tests | Low | High | Medium |
+| TM-011 | Submitted code/integration error | Semantic capture runs after prompt delivery | Read either private fixture, retain cross-case filesystem/named-IPC/pasteboard state, write private output while worker lives, inject echoed/truncated/contradictory judge verdicts, or let semantic verdict rescue exact failure | Private-answer disclosure or weakened correctness | Exact oracle, semantic references/answers, leaderboard integrity | Exact report requires confirmed worker termination with retry; trusted reap plus zero-live-bench assertion precedes semantic install and answer ACL; exact staging copy scrubbed before semantic install; reference and strict private-output descendant denied to worker; sandbox mandatory; deny-all writes except `/dev/null`; deny named POSIX shm/semaphores, cross-process System V IPC, and `com.apple.pasteboard.*` Mach lookup; one process per case; nonce/ID/block/full-token-budget caps; clean shutdown before decode/write; exact gate precedes capture; strict end-turn/single-object judge response; immutable judge hard caps/deadline; verdict-only judge never patches score; semantic scrub precedes timing/staging | Seatbelt does not deny creation of a brand-new private System V shared-memory ID on tested macOS, but it denies lookup of an existing keyed object, which blocks cross-worker reuse; OS sandbox defects and same-uid host compromise remain | Keep repository object pins/floor synchronized; test teardown/order/cleanup; suppress free-form logs | IPC/pasteboard/file sandbox probe, missing-file/permission checks, structural workflow tests, final janitor audit | Low | High | High |
 
 ## Criticality calibration
 
@@ -260,6 +311,8 @@ flowchart LR
 | `Sources/MLXFastModel/Gemma4ExactTwo*.swift`, `Gemma4ExactFour*.swift` | Behavior-preserving shared/fused packed-weight traversal | TM-002, TM-003, TM-007 |
 | `Sources/MLXFastModel/Gemma4FastEngine.swift` | Pair/four eligibility, causal multi-row execution, and MTP-only dispatch | TM-002, TM-003, TM-009 |
 | `Sources/MLXFastHarness/GemmaRuntimeMTP.swift` | Trusted timer, oracle, bounds, denominator | TM-001, TM-005, TM-006 |
+| `Sources/MLXFastTrustedHarness/GemmaRuntimeMTPSemanticGPQA.swift` | Semantic-only trained-MTP orchestration, per-case lifecycle, bounds, write-after-teardown | TM-010, TM-011 |
+| `Sources/MLXFastCore/GPQAReference.swift` | Single serial/MTP private-reference schema and answer derivation contract | TM-009, TM-011 |
 | `Sources/MLXFastHarness/GemmaRuntimeMTPWorker.swift` | MTP-only request state and poisoning | TM-003, TM-005, TM-008 |
 | `Sources/MLXFastHarness/GemmaRuntimeMTPProvenance.swift` | Artifact identity and TOCTOU checks | TM-004 |
 | `Sources/MLXFastHarness/GemmaRuntimeWorker.swift` | Shared strict protocol, nonce, environment, process lifecycle | TM-005, TM-010 |
@@ -267,6 +320,7 @@ flowchart LR
 | `setup-mtp.sh` | Download integrity and cache path safety | TM-004 |
 | `.github/scripts/run-submission-static-review.sh` | Distinct serial/MTP allow-deny policy | TM-001, TM-002, TM-003, TM-007, TM-009 |
 | `.github/workflows/benchmark.yml` | Default-track identity, isolation, pairing, publication | TM-006, TM-008, TM-009, TM-010 |
+| `.github/scripts/run-semantic-gpqa-gate.sh` | Fixed private judge, verdict-only threshold, response/result caps | TM-010, TM-011 |
 | `Tests/MLXFastTests/ExperimentalMTPTests.swift` | Adversarial protocol and isolation regression suite | TM-003, TM-004, TM-005, TM-009 |
 
 ## Quality check
@@ -279,3 +333,6 @@ flowchart LR
 - Kept supplied deployment assumptions and residual operational risks explicit.
 - Distinguished parent-provable properties from editable internal behavior
   that still requires audit and hidden testing.
+- Phase 2 carries fixed repository pins for the existing private reference and
+  a 1-of-5 serial policy floor. That floor is a catastrophe backstop, not an
+  IT/Opus M5 calibration or a quality-equivalence claim.

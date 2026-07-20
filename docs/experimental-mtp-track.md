@@ -9,11 +9,14 @@ is decode-only paired speedup against the pinned serial K=1 target baseline.
 The former base-model serial challenge is archived as
 `benchmark.serial.json` and `.github/workflows/serial-benchmark.yml`.
 
-The two experimental commands are:
+The three MTP-specific commands are:
 
 - `mtp-probe`: PR #424's serial target-only block control.
 - `mtp-benchmark`: a real trained-assistant MTP path that refuses to run
   without `--require-trained-assistant`.
+- `mtp-generate-gpqa-answers`: an untimed semantic-only capture path that
+  drives private prompts through fresh trained-assistant/exact-pair workers,
+  without a serial answer-token oracle.
 
 The `mtp-*` commands remain protocol-explicit; no environment variable can
 turn the archived serial `benchmark` command into MTP.
@@ -270,7 +273,10 @@ MTP; only the final reachability DP runs after elapsed time is captured.
 Raw gate reports, worker diagnostics, sealed paired results, private logs, and
 free-form measure verdicts can carry hidden-prompt-influenced data. Gate
 stdout/logs are removed by the gate-step trap and verified absent by the
-pre-timing scrub. Ranked sealed results/verdicts are deleted immediately after
+pre-timing scrub. Semantic references, generated answers, judge
+requests/responses, detailed verdicts, and pass-count summaries are likewise
+deleted before timing and never copied to a public score. Ranked sealed
+results/verdicts are deleted immediately after
 the minimized score is constructed and schema-validated, before staging; the
 always-run cleanup remains defense in depth. A correctness-only run publishes
 only a canonically reconstructed fixed-schema trusted verdict containing
@@ -296,6 +302,101 @@ The trusted parent:
 All seed prefill, drafting, target verification, rejection, rollback, IPC, and
 final-tail work is charged. Worker-reported timing and acceptance have no
 authority.
+
+Every official `mtp-benchmark` invocation defaults to the runtime sandbox's
+no-write policy: injected-profile file-write allows are stripped, then
+deny-all writes plus the sole `/dev/null` exception are appended. This includes
+the operator-owned timed candidate without requiring a new measurement-wrapper
+argument. Exact-gate code therefore cannot leave prompt-derived markers under
+`.build/`, `mtp-weights/`, or another workspace path, and timed code cannot
+persist state either. The ranked exact invocation additionally supplies
+`--deny-worker-file-writes` as a visible defense-in-depth contract. Local MTP
+runs remain unchanged unless the caller explicitly supplies that flag.
+
+### Untimed semantic GPQA backstop
+
+After the 512-token exact MTP correctness replay passes, the ranked workflow
+runs a distinct set of model-independent private GPQA questions through
+`mtp-generate-gpqa-answers`. The parent tokenizes each prompt with the pinned
+31B-IT tokenizer, then launches
+`RuntimeWorkerLaunch.trainedMTP(..., verificationMode: .exactPair)`. The
+worker therefore executes the actual `Gemma4TrainedMTPBlockSession`; this path
+never calls the serial `generate-gpqa-answers` command.
+The trusted workflow removes the bench-readable exact correctness golden
+immediately after that gate passes and before installing the semantic
+reference, so a semantic worker can never read both fixture classes.
+The exact trained-MTP orchestration retries worker shutdown and refuses to
+return an otherwise successful report unless termination is confirmed. As a
+separate workflow backstop, the runner then executes the trusted bench-uid
+reaper and rejects any remaining non-zombie bench process before exposing the
+semantic fixture.
+
+The semantic cases deliberately do not carry an expected seed token or future
+continuation. The parent calls `mtp_decode_begin`, includes that observed seed
+token as the first generated answer token, and then loops
+`mtp_decode_block(lastCommittedToken, min(4, remainingBudget))` until the fixed
+answer budget is reached. It rejects non-monotonic response IDs/nonces,
+missing, empty, oversized, over-budget, or out-of-vocabulary blocks. No
+reference answer, accepted token sequence, fixture path, or future oracle token
+is sent to the worker.
+
+The protocol supports one begin per process, so the capture intentionally uses
+one worker/session per case. Repeated target/assistant loads are an accepted
+untimed cost in exchange for prompt, KV, and assistant-state isolation without
+adding a reset command to submitted code. A worker must terminate cleanly
+before the parent decodes its IDs; all workers must be gone before the hidden
+answer document is written. To eliminate same-uid filesystem state between
+cases, the semantic-only CLI requires a sandbox even outside official mode and
+denies all worker file writes except `/dev/null` in both generated and
+operator-injected profiles. This is runtime-safe because it is the same policy
+the generated runtime-worker profile already uses. The profile also denies
+named POSIX shared memory/semaphores and System V IPC operations validated by
+the macOS sandbox probe, preventing fresh cases from exchanging state through
+named IPC without denying required Metal/MLX Mach services. A separate
+targeted Mach rule denies `com.apple.pasteboard.*`; the host probe verifies the
+service is reachable before sandboxing and denied afterward, closing clipboard
+persistence without a broad Mach-service deny.
+`user-preference-write` is denied while narrowly allowing cfprefsd's read-only
+shared-memory names, and logd/system.logger Mach lookup is denied. The host
+probe uses two fresh sandboxed preference processes to prove a marker cannot
+cross workers and separately exercises unified logging with logd unavailable.
+
+Page cache, CPU/GPU caches, Metal driver caches, and unenumerated system-service
+state remain platform residuals. This repository does not attempt a minimal
+worker file-read allowlist, VM page-cache flushing, or disabling normal
+input-independent Metal shader caches; those measures risk MLX
+correctness/performance and apply equally to the exact hidden gate. Fresh and
+reaped workers, write/IPC/preference/pasteboard/log denies, static review, raw
+artifact suppression, ephemeral runners, janitor cleanup, and operator
+integrity audit are the proportionate controls. Prompt-dependent dynamic Metal
+source compilation or input-derived shader/cache keys remain prohibited;
+input-independent static kernels and caches remain allowed.
+
+Both serial and MTP paths decode the one shared private-fixture contract in
+`MLXFastCore/GPQAReference.swift`; the MTP boundary does not maintain a second
+schema. It decodes (and therefore validates) model-specific accepted token
+sequences but intentionally does not use them as a semantic oracle.
+
+The existing private judge runs in verdict-only mode and does not read or patch
+`score.json`. It accepts only `stop_reason=end_turn`, the expected
+thinking/redacted-thinking-plus-one-text content shape, and a canonical
+`{"passed":true|false}` object with no prose, fences, extra keys, or trailing
+documents. Retry, transfer, response, case-count, and overall gate limits have
+immutable hard maxima; environment overrides can only lower them. Exact-token
+failure stops before capture and cannot be rescued; semantic failure stops
+before the thermal/timed phase. The CLI requires
+`MLXFAST_PRIVATE_DIR`, requires the output to be a canonical strict descendant,
+and binds both reference and private-output paths into generated or injected
+worker profiles. The reference object is digest/size pinned, answer and judge
+files are size-capped and mode 0600, and all semantic material is scrubbed
+before timing and artifact staging.
+
+The shared model-independent reference object is pinned in-repo at SHA-256
+`fc8bcdaff94aa89b2fc2a1a2adc28943ed026899ae805b3c52b3f81a235c20ff`
+and 9919 bytes. The required 1-of-5 minimum reuses the existing serial policy
+floor as a conservative semantic-catastrophe backstop. It is not an IT/Opus M5
+calibration and does not claim quality equivalence between serial and
+trained-MTP generation.
 
 The MTP worker receives target, assistant, and contract paths as explicit
 arguments. Its environment uses the existing allowlist sanitizer. Its Seatbelt
@@ -611,13 +712,13 @@ not thermal/frequency, and present with or without inter-run cooldown); the
 multi-pair alternating-order protocol below averages it out, so single-pair
 totals still must not be quoted from one pair.
 
-The publication checklist is complete. The live default workflow is
-`.github/workflows/benchmark.yml`; the contract has
-`official_scoring_enabled=true`, the paired serial baseline and 1.0 floor are
-established, and hidden pins are populated. Ranked runs publish the adopted
-ratio-of-means score only after parent-owned token/protocol gates and the
-multi-pair thermal/telemetry checks pass. Historical enablement procedure is
-retained in `docs/mtp-track-golive-runbook.md`.
+The MTP publication checklist now includes the fixed semantic reference pins
+and 1-of-5 policy floor alongside `official_scoring_enabled=true`, the paired
+serial baseline, 1.0 speed floor, and exact-token hidden pins. Ranked runs may
+publish the adopted ratio-of-means score only after parent-owned
+token/protocol gates, the independent semantic GPQA backstop, and the
+multi-pair thermal/telemetry checks pass. Historical enablement procedure is retained in
+`docs/mtp-track-golive-runbook.md`.
 
 The archived serial configuration remains separate from MTP results.
 
@@ -672,6 +773,31 @@ Then run the trained-assistant prototype:
   --target-verification exact-pair \
   --require-trained-assistant
 ```
+
+For an operator-controlled, non-public semantic reference file, exercise the
+same capture path the ranked workflow uses:
+
+```bash
+mkdir -m 0700 /tmp/mtp-semantic-private
+MLXFAST_PRIVATE_DIR=/tmp/mtp-semantic-private \
+.build/release/mlxfast-swift mtp-generate-gpqa-answers \
+  --target-source "${MLXFAST_MTP_TARGET_DIR}" \
+  --weights mtp-weights \
+  --assistant "${MLXFAST_MTP_ASSISTANT_DIR}" \
+  --contract fixtures/gemma_4_31b_it_mtp_track.json \
+  --tokenizer "${MLXFAST_MTP_TARGET_DIR}" \
+  --gpqa /path/to/operator-private-gpqa-reference.json \
+  --output /tmp/mtp-semantic-private/answers.json \
+  --block-size 4 \
+  --case-count 5 \
+  --max-new-tokens 64 \
+  --require-trained-assistant
+```
+
+This direct command is untimed and writes no score. Run only one model-holding
+command at a time. The ranked workflow additionally pins the private reference,
+uses the worker Seatbelt deny for its path, invokes the fixed judge in
+verdict-only mode, and scrubs all outputs.
 
 `--tokens` defaults to 128 and accepts `1...512`; the selected golden must
 contain one seed token plus the requested number of decode tokens. The parent

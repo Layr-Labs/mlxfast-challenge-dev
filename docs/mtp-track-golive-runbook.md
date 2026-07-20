@@ -99,12 +99,22 @@ scoring.
 | Public IT fixture (optional, participant UX) | public prompt + 129-token golden for local `mtp-probe`/`mtp-benchmark` iteration | `correctness_prompts/` | Yes (optional, non-blocking) |
 | Serial oracle | not a separate artifact: the goldens ARE the serial oracle (greedy K=1 continuations of the pinned IT target); the trusted parent validates every returned token against them | — | — |
 
-Prompt selection: two distinct private prompts, not derived from the public
-fixtures, not GPQA (no GPQA gate in MTP v1), each tokenizing to >= 512
+Exact-golden prompt selection: two distinct private prompts, not derived from
+the public fixtures and not the semantic GPQA cases, each tokenizing to >= 512
 tokens with the IT tokenizer, mixed genre (one prose-like, one
 code/structured) so acceptance-rate behavior is exercised differently in the
 correctness pass vs the timed pass. Store the prompt texts in the operator
 private store alongside the R2 upload, like the serial hidden prompts.
+
+The later semantic GPQA backstop uses the existing model-independent private
+question/reference object as a third, distinct fixture. The repository pins it
+at SHA-256
+`fc8bcdaff94aa89b2fc2a1a2adc28943ed026899ae805b3c52b3f81a235c20ff`
+and 9919 bytes in both ranked workflows. The MTP semantic gate requires 1 of
+the configured 5 cases. This is the existing serial policy floor reused as a
+conservative semantic-catastrophe backstop—not an IT/Opus M5 calibration and
+not a claim that the serial and trained-MTP paths have equivalent quality.
+Rotating the object still requires updating both repository pins together.
 
 ### B.2 Capture (box 1, or box 2 inside the C window)
 
@@ -456,8 +466,11 @@ Validation ladder after merge (each step must pass before the next):
 
 1. Dispatch `benchmark.yml` on `main`, `confirm_track_enabled=true`,
    `run_benchmark=false` — parent-owned exact token and logical
-   protocol/report-consistency gate; candidate worker/model offset checks,
-   track-aware static review, and hidden behavior controls remain in force.
+   protocol/report-consistency gate followed by the separate trained-MTP
+   semantic GPQA verdict; candidate worker/model offset checks, track-aware
+   static review, and hidden behavior controls remain in force. Confirm that
+   exact failure stops before semantic capture, semantic failure blocks the
+   job, and correctness artifacts contain no semantic fields or summaries.
    The ranked workflow does not invoke candidate-linked tensor parity tests.
 2. Same on `main` with `run_benchmark=true` — full timed run; expect
    reference-vs-reference score ~1.2-1.3x, floor cleared, artifacts sealed,

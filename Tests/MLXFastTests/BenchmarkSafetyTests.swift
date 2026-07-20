@@ -1,8 +1,25 @@
 import Darwin
 import CryptoKit
 import Foundation
+@testable import MLXFastCore
 @testable import MLXFastHarness
 import Testing
+
+private final class ScriptedSerialSemanticWorkerLifecycle:
+    RuntimeWorkerLifecycle
+{
+    private var closeResults: [Bool]
+    private(set) var closeCallCount = 0
+
+    init(_ closeResults: [Bool]) {
+        self.closeResults = closeResults
+    }
+
+    func close() -> Bool {
+        closeCallCount += 1
+        return closeResults.isEmpty ? false : closeResults.removeFirst()
+    }
+}
 
 @Suite(.serialized)
 struct BenchmarkSafetyTests {
@@ -1205,12 +1222,50 @@ struct BenchmarkSafetyTests {
     // reference answers. It must never exist on disk while the correctness
     // worker -- the only process that runs editable model code in this phase --
     // is alive. runLayeredCorrectnessWithWorker therefore only COLLECTS and
-    // validates the answers and returns them in its result; the trusted
-    // benchmark caller writes them only AFTER closing/reaping the worker. This
+    // validates metadata/token IDs; the trusted benchmark caller confirms
+    // termination before tokenizer loading, decoding, and writing. This
     // is a source-ordering guard because the exposure requires a live worker
     // plus real weights to reproduce behaviorally (see the sibling comment on
     // benchmarkSplitsGatesAndTimingOntoSeparateMachinesWithoutSpuriousSemantic-
     // CaptureFailure).
+    @Test
+    func serialSemanticCaptureRetriesCloseBeforeDecodeAndWrite() throws {
+        let worker = ScriptedSerialSemanticWorkerLifecycle([false, true])
+        var decoded = false
+        var written = false
+        let pending = try withConfirmedRuntimeWorkerTermination(
+            worker: worker
+        ) {
+            [1, 2, 3]
+        }
+        decoded = !pending.isEmpty
+        written = decoded
+
+        #expect(worker.closeCallCount == 2)
+        #expect(decoded)
+        #expect(written)
+    }
+
+    @Test
+    func serialSemanticCaptureRepeatedCloseFailurePreventsWrite() {
+        let worker = ScriptedSerialSemanticWorkerLifecycle([false, false])
+        var decoded = false
+        var written = false
+
+        #expect(throws: MLXFastError.self) {
+            let pending = try withConfirmedRuntimeWorkerTermination(
+                worker: worker
+            ) {
+                [1, 2, 3]
+            }
+            decoded = !pending.isEmpty
+            written = decoded
+        }
+        #expect(worker.closeCallCount == 2)
+        #expect(!decoded)
+        #expect(!written)
+    }
+
     @Test
     func semanticGPQACaptureIsWrittenOnlyAfterCorrectnessWorkerCloses() throws {
         let correctness = try String(
@@ -1222,8 +1277,10 @@ struct BenchmarkSafetyTests {
             encoding: .utf8
         )
 
-        // The result struct carries the collected answers back to the caller.
-        #expect(correctness.contains("let semanticGPQAAnswers: [SemanticGPQAAnswerCase]?"))
+        // The result carries undecoded metadata/token IDs back to the caller.
+        #expect(correctness.contains(
+            "let pendingSemanticGPQAAnswers: [PendingSemanticGPQAAnswer]?"
+        ))
 
         // runLayeredCorrectnessWithWorker collects + returns the answers and
         // never writes them from inside the live-worker window.
@@ -1233,31 +1290,42 @@ struct BenchmarkSafetyTests {
             to: "static func failedCorrectnessReport("
         )
         #expect(!layered.contains("writeSemanticGPQAAnswers"))
+        #expect(!layered.contains("loadLocalTokenizer"))
+        #expect(!layered.contains("semanticAnswerCase("))
+        #expect(layered.contains("pendingSemanticAnswerCase("))
         #expect(layered.contains("capturedSemanticAnswers = semanticAnswers"))
-        #expect(layered.contains("semanticGPQAAnswers: capturedSemanticAnswers"))
+        #expect(layered.contains(
+            "pendingSemanticGPQAAnswers: capturedSemanticAnswers"
+        ))
         // The count guard that fails a bad capture still runs inside the worker
         // window; only the disk write is deferred.
         #expect(layered.contains("guard semanticAnswers.count == semanticCapture.caseCount else {"))
 
-        // In benchmarkWithWorker the single capture write happens only AFTER the
-        // worker-closing defer, guarded on the returned answers.
+        // The semantic branch uses confirmed termination; the non-semantic
+        // branch retains its compatibility defer. Decode and write are later.
         let benchmarkTail = try sourceSlice(
             benchmark,
             from: "let correctnessResult: WorkerLayeredCorrectnessResult",
             to: "correctnessSeconds = secondsSince(correctnessStart)"
         )
-        let close = try #require(benchmarkTail.range(of: "correctnessWorker.close()"))
+        let confirmedClose = try #require(
+            benchmarkTail.range(
+                of: "correctnessResult = try withConfirmedRuntimeWorkerTermination("
+            )
+        )
+        let materialize = try #require(
+            benchmarkTail.range(of: "materializeSemanticGPQAAnswers(")
+        )
         let write = try #require(benchmarkTail.range(of: "writeSemanticGPQAAnswers("))
-        #expect(close.lowerBound < write.lowerBound)
+        #expect(confirmedClose.lowerBound < materialize.lowerBound)
+        #expect(materialize.lowerBound < write.lowerBound)
         #expect(benchmarkTail.contains(
-            "if let semanticCapture, let semanticAnswers = correctnessResult.semanticGPQAAnswers"
+            "correctnessResult.pendingSemanticGPQAAnswers"
         ))
-        // Exactly one worker is created in this window, and its close() is a
-        // defer, so the write provably runs after the worker is reaped.
         #expect(benchmarkTail.components(separatedBy: "RuntimeWorkerClient(").count - 1 == 1)
         #expect(benchmarkTail.components(separatedBy: "writeSemanticGPQAAnswers(").count - 1 == 1)
-        let deferClose = try #require(benchmarkTail.range(of: "defer {"))
-        #expect(deferClose.lowerBound < write.lowerBound)
+        #expect(benchmarkTail.contains("if semanticCapture != nil"))
+        #expect(benchmarkTail.contains("semanticCapture: nil"))
     }
 }
 

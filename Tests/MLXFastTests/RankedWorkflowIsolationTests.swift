@@ -176,23 +176,33 @@ struct RankedWorkflowIsolationTests {
         )
         let prepareGoldenRange = try #require(workflow.range(of: "- name: Prepare hidden correctness golden"))
         let scrubRange = try #require(workflow.range(of: "- name: Scrub hidden material from bench workspace"))
+        let semanticHandoffRange = try #require(
+            workflow.range(
+                of: "- name: Handoff semantic GPQA answers to trusted judge"
+            )
+        )
+        let semanticJudgeRange = try #require(
+            workflow.range(of: "- name: Semantic GPQA gate")
+        )
         let reapBeforeTimingRange = try #require(
             workflow.range(of: "- name: Reap lingering bench processes before timing")
         )
         let quiescenceRange = try #require(workflow.range(of: "- name: Wait for quiescence before timing"))
 
-        // Reap #1 before hidden material is placed; reap #2 between the gates
-        // scrub and the timed measurement.
+        // Reap #1 before hidden material is placed; reap #2 before granting the
+        // trusted judge read access to the bench-owned answer; reap #3 between
+        // the gates scrub and the timed measurement.
         #expect(reapBeforeHiddenRange.lowerBound < prepareGoldenRange.lowerBound)
+        #expect(semanticHandoffRange.lowerBound < semanticJudgeRange.lowerBound)
         #expect(scrubRange.lowerBound < reapBeforeTimingRange.lowerBound)
         #expect(reapBeforeTimingRange.lowerBound < quiescenceRange.lowerBound)
 
-        // Both invocations cross the bench-exec bridge and run the trusted
+        // All invocations cross the bench-exec bridge and run the trusted
         // reaper from the workspace copy.
         let reapCount = workflow.components(
             separatedBy: "/bin/bash \"${MLXFAST_JOB_WS}/.github/scripts/reap-bench-processes.sh\""
         ).count - 1
-        #expect(reapCount == 2)
+        #expect(reapCount == 3)
 
         // The reaper refuses to signal a privileged uid, protects its own tree,
         // and escalates TERM -> KILL.

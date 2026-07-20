@@ -155,10 +155,10 @@ jobs:
       # so neither the bench parent nor the worker (both the bench uid) can
       # read it; the janitor's bench-uid purge never touches runner-owned
       # files.
-      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_PRIVATE_DIR: /private/tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
       MLXFAST_TIMED_DECODE_PROMPT_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/timed_decode_prompt.txt
-      MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json
+      MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /private/tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json
       MLXFAST_SUBMISSION_STATIC_REVIEW_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/submission_static_review.json
       MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_MEASURE_OUT: /tmp/mlxfast-measure-${{ github.run_id }}-${{ github.run_attempt }}
@@ -199,6 +199,8 @@ jobs:
       MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "5"
       MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: "64"
       MLXFAST_SEMANTIC_GPQA_MIN_PASS: "1"
+      MLXFAST_GPQA_REFERENCE_SHA256: fc8bcdaff94aa89b2fc2a1a2adc28943ed026899ae805b3c52b3f81a235c20ff
+      MLXFAST_GPQA_REFERENCE_BYTES: "9919"
       MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
       # Opus 4.8 at max effort (adaptive thinking): the Sonnet 4.5 judge
       # produced prose-wrapped/truncated verdicts (3 unparseable first
@@ -1224,6 +1226,14 @@ jobs:
           .github/scripts/download-r2-object.sh \
             "${MLXFAST_GPQA_R2_PATH}" \
             "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json"
+          gpqa_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" | awk '{print $1}')"
+          gpqa_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" | tr -d ' ')"
+          if [[ "${gpqa_hash}" != "${MLXFAST_GPQA_REFERENCE_SHA256}" \
+              || "${gpqa_bytes}" != "${MLXFAST_GPQA_REFERENCE_BYTES}" ]]; then
+            echo "::error::hidden GPQA reference pin mismatch" >&2
+            exit 1
+          fi
+          chmod 0600 "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json"
           echo "benchmark: raw hidden golden verified ${raw_hash} bytes=${raw_bytes}"
 
       # PARITY CONTRACT: attach-gpqa-gates augments the raw golden with GPQA
@@ -1262,7 +1272,8 @@ jobs:
             fi
           done
           install -m 0444 "${MLXFAST_PRIVATE_DIR}/raw_golden.json" "${golden_src}"
-          install -m 0444 "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" "${gpqa_src}"
+          install -m 0600 "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" "${gpqa_src}"
+          /bin/chmod +a "user:bench allow read" "${gpqa_src}"
           status=0
           # MLXFAST_SANDBOX_PARENT_TOOLS=1 arms the CLI's parent-tool Seatbelt
           # sandbox: attach-gpqa-gates runs the submission-built binary directly
@@ -1358,15 +1369,6 @@ jobs:
           MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ env.MLXFAST_CANDIDATE_SHA }} mode=single-machine-gates"
         run: |
           set -euo pipefail
-          # Known, documented residual: the semantic-answer capture (which
-          # embeds hidden reference answers) is written by the harness parent
-          # into ${MLXFAST_JOB_WS}/private/ at the very END of this pass, after
-          # every behavior verdict is already recorded; the bench-exec worker
-          # template cannot subpath-deny it like the VM harness profile did.
-          # The exposure window is the few seconds between that write and
-          # worker teardown, gains nothing (all gate verdicts are final by
-          # then), and the file is scrubbed by a trusted step before any later
-          # phase spawns another worker.
           raw_stdout="${MLXFAST_PRIVATE_DIR}/gates-stdout.raw"
           gates_log="${MLXFAST_PRIVATE_DIR}/gates-private.log"
           started="${SECONDS}"
@@ -1473,6 +1475,49 @@ jobs:
             and (.metrics.actual_token == null)
             and (.metrics.passed_correctness == true)
           ' score.json >/dev/null
+
+      # The answer capture is bench-owned mode 0600, so the runner cannot read
+      # it until the candidate gates process and every worker are gone. Reap
+      # any stray bench-uid process first, then use a second narrowly scoped
+      # bench-exec invocation to grant only the trusted runner read access.
+      # This step has no Anthropic credential; the networked judge runs later.
+      - name: Handoff semantic GPQA answers to trusted judge
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          answers="${MLXFAST_JOB_WS}/private/semantic_gpqa_answers.json"
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /bin/bash "${MLXFAST_JOB_WS}/.github/scripts/reap-bench-processes.sh"
+          bench_uid="$(id -u bench)"
+          live_bench_pids="$(
+            ps -axo pid=,state=,uid= \
+              | awk -v uid="${bench_uid}" '$3 == uid && $2 !~ /^Z/ { print $1 }'
+          )"
+          if [[ -n "${live_bench_pids}" ]]; then
+            echo "::error::refusing semantic answer handoff while bench processes remain alive" >&2
+            exit 1
+          fi
+          if [[ ! -f "${answers}" || -L "${answers}" ]]; then
+            echo "::error::semantic GPQA answer handoff requires a regular non-symlink file" >&2
+            exit 1
+          fi
+          answer_mode="$(stat -f '%Lp' "${answers}")"
+          answer_bytes="$(stat -f '%z' "${answers}")"
+          if [[ "${answer_mode}" != "600" ]] \
+              || ! [[ "${answer_bytes}" =~ ^[1-9][0-9]*$ ]] \
+              || (( answer_bytes > 1048576 )); then
+            echo "::error::semantic GPQA answer handoff violates its fixed mode/size contract" >&2
+            exit 1
+          fi
+          trusted_reader="$(id -un)"
+          if [[ ! "${trusted_reader}" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]]; then
+            echo "::error::trusted runner account name is unsafe for semantic answer ACL" >&2
+            exit 1
+          fi
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /bin/chmod +a "user:${trusted_reader} allow read" "${answers}"
+          test -r "${answers}"
+          test "$(stat -f '%Lp' "${answers}")" = "600"
 
       # Semantic GPQA judge (Anthropic), trusted step: consumes the bench-
       # written answer capture, patches the sealed score's semantic fields and

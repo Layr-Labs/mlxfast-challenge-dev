@@ -151,11 +151,97 @@ validate_mtp_score() {
     || fail "${path}" "MTP score must match the minimized trusted schema"
 }
 
+approved_serial_golden_sidecar_kind() {
+  local path="$1"
+  local golden_path="${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}"
+  [[ "${ARTIFACT_PROFILE}" == "default" ]] || return 1
+  [[ -n "${golden_path}" && -f "${path}" && ! -L "${path}" ]] || return 1
+  if [[ "${path}" == "${golden_path}.sha256" ]] \
+      && [[ "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'sha256'
+    return 0
+  fi
+  if [[ "${path}" == "${golden_path}.bytes" ]] \
+      && [[ "${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES:-}" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'bytes'
+    return 0
+  fi
+  return 1
+}
+
+validate_approved_serial_golden_sidecar() {
+  local path="$1"
+  local kind="$2"
+  local expected_value
+  local expected_line
+  local actual_line
+  local actual_bytes
+  local actual_lines
+  case "${kind}" in
+    sha256)
+      expected_value="${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256}"
+      ;;
+    bytes)
+      expected_value="${MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES}"
+      ;;
+    *)
+      fail "${path}" "unknown approved serial golden sidecar kind"
+      ;;
+  esac
+  expected_line="${expected_value}  correctness_golden.json"
+  IFS= read -r actual_line < "${path}" \
+    || fail "${path}" "approved serial golden sidecar is empty"
+  actual_bytes="$(wc -c < "${path}" | tr -d ' ')"
+  actual_lines="$(wc -l < "${path}" | tr -d ' ')"
+  [[ "${actual_line}" == "${expected_line}" \
+      && "${actual_lines}" == "1" \
+      && "${actual_bytes}" == "$((${#expected_line} + 1))" ]] \
+    || fail "${path}" "approved serial golden sidecar content is malformed"
+}
+
+reject_sensitive_path_components() {
+  local path="$1"
+  local component
+  local normalized
+  local old_ifs="${IFS}"
+  local -a components=()
+  local approved_sidecar=0
+  if approved_serial_golden_sidecar_kind "${path}" >/dev/null; then
+    approved_sidecar=1
+  fi
+  IFS='/'
+  read -r -a components <<< "${path}"
+  IFS="${old_ifs}"
+  for component in "${components[@]}"; do
+    [[ -n "${component}" && "${component}" != "." ]] || continue
+    if [[ "${component}" == ".." ]]; then
+      fail "${path}" "artifact candidate path must not contain a parent-directory component"
+    fi
+    normalized="$(printf '%s' "${component}" | tr '[:upper:]' '[:lower:]')"
+    case "${normalized}" in
+      *correctness_golden*|*golden_prompt*|*private_prompts*|*gpqa_reference*|*semantic_gpqa*|semantic-gpqa*|*gpqa_ttft_results*|mlxfast-mtp-measure-*|mtp-gates-report.json|mtp-gates-stdout.raw|mtp-gates-private.log|mtp-semantic-*|mtp-paired-results.json|mtp-measure-verdict.txt)
+        if [[ "${approved_sidecar}" -eq 1 \
+            && "${normalized}" == correctness_golden.json.sha256 \
+            || "${approved_sidecar}" -eq 1 \
+            && "${normalized}" == correctness_golden.json.bytes ]]; then
+          continue
+        fi
+        fail "${path}" "artifact path contains a private or sensitive component: ${component}"
+        ;;
+    esac
+  done
+}
+
 check_file() {
   local path="$1"
   local base
   local size
+  local approved_sidecar_kind=""
 
+  # Check the requested path itself before descending. Otherwise an empty
+  # directory named after a private fixture (or a directory containing only
+  # benignly named files) bypasses the leaf-file basename checks below.
+  reject_sensitive_path_components "${path}"
   [[ -e "${path}" ]] || return 0
 
   if [[ -L "${path}" ]]; then
@@ -179,13 +265,20 @@ check_file() {
 
   base="$(basename "${path}")"
   case "${base}" in
-    *correctness_golden*.json|*golden_prompt*.json|*golden_prompt*.txt|*private_prompts*.json|*gpqa_reference_cases*.json|*gpqa_ttft_results*.json|*.safetensors|*.bin|*.gguf)
+    *correctness_golden*.json|*golden_prompt*.json|*golden_prompt*.txt|*private_prompts*.json|*gpqa_reference*.json|*semantic_gpqa*.json|*semantic-gpqa*|*gpqa_ttft_results*.json|*.safetensors|*.bin|*.gguf)
       fail "${path}" "private prompt, golden, or model files must not be uploaded or cached"
       ;;
-    mtp-gates-report.json|mtp-gates-stdout.raw|mtp-gates-private.log|mtp-paired-results.json|mtp-measure-verdict.txt)
+    mtp-gates-report.json|mtp-gates-stdout.raw|mtp-gates-private.log|mtp-semantic-*|mtp-paired-results.json|mtp-measure-verdict.txt)
       fail "${path}" "raw MTP reports, diagnostics, and measure verdicts must remain runner-private"
       ;;
   esac
+
+  if approved_sidecar_kind="$(
+    approved_serial_golden_sidecar_kind "${path}"
+  )"; then
+    validate_approved_serial_golden_sidecar \
+      "${path}" "${approved_sidecar_kind}"
+  fi
 
   case "${ARTIFACT_PROFILE}" in
     default)

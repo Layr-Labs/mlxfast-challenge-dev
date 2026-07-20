@@ -204,15 +204,117 @@ written its private answer capture. The Anthropic key never crosses the
 bridge, and only aggregate semantic pass counts and the judge model name
 are patched into `score.json`; prompts, references, candidate answers, and
 judge transcripts stay in private runner paths covered by the artifact
-deny-list. One documented residual: the answer capture (which embeds hidden
-reference answers) is written into the bench workspace by the harness
-parent at the very end of the gates pass, and — unlike on the VM pipeline,
-whose harness profile could subpath-deny it — it is briefly readable by the
-worker in the few seconds between that write and worker teardown. The
-window gains a submission nothing (every behavior verdict is already final
-by then), and a trusted step scrubs the capture — together with the
-augmented golden and all other hidden material — before any later phase
-spawns another worker.
+deny-list. The harness writes the answer capture only after its candidate
+worker closes, with exact mode 0600 and bench ownership. The runner waits for
+the entire gates process, reaps any stray bench-uid process, validates the
+absence of any remaining non-zombie bench process, validates the file's
+type/mode/size, and then invokes only trusted `/bin/chmod` through the
+bench bridge to grant the runner account read ACL access. The Anthropic secret
+is introduced only in the following judge step, after that handoff; it is never
+present while candidate or residual bench code is alive. The capture is
+scrubbed with the augmented golden before any timed worker starts.
+
+The serial correctness harness returns only pending semantic metadata/token IDs
+from the live-worker window. When semantic capture is enabled it uses the same
+confirmed-termination guard as MTP: one failed close is retried, operation
+errors retain retrying cleanup, and repeated close failure prevents tokenizer
+loading, answer decoding, and the private mode-0600 write. Non-semantic serial
+execution retains its prior lifecycle behavior.
+
+### Default MTP semantic handling
+
+The default `.github/workflows/benchmark.yml` uses the same model-independent
+private GPQA question/reference object as a separate backstop, but does not
+reuse its base-model accepted token sequences and does not merge it into the
+MTP exact-token golden. Both paths decode the shared
+`MLXFastCore/GPQAReference.swift` fixture contract. Its digest and byte count
+are repository-pinned to
+`fc8bcdaff94aa89b2fc2a1a2adc28943ed026899ae805b3c52b3f81a235c20ff`
+and 9919 bytes. Only after the 512-token MTP oracle gate passes, the
+workflow removes that installed oracle before placing the semantic reference;
+the trusted parent then tokenizes each question with the pinned IT tokenizer
+and launches one fresh trained-assistant/exact-pair worker per case. The worker
+receives the prompt IDs and committed-token block protocol only; its sandbox
+denies both the reference path and the required `MLXFAST_PRIVATE_DIR` output
+subtree.
+
+The exact trained-MTP command does not publish a successful report until
+`RuntimeWorkerClient.close()` confirms termination (one immediate retry is
+allowed; operation-error cleanup also retries). Before the workflow installs
+any semantic material, it independently runs the trusted bench-process reaper
+and fails if any non-zombie bench-uid process remains. No judge credential is
+present in that step.
+
+Every semantic worker must exit before its IDs are decoded, and all workers
+must exit before the mode-0600 answer document is written. Before a narrow ACL
+grants only the trusted runner read access, the workflow runs the trusted
+bench-uid reaper and independently rejects any remaining non-zombie bench
+process. The Anthropic key appears only in the later judge step and never
+crosses the bench-exec bridge. Fresh per-case processes plus semantic-only deny-all
+filesystem writes (except `/dev/null`) in generated and operator-injected
+profiles prevent one case from leaving candidate-controlled disk state for the
+next. The same profiles deny named POSIX shared memory/semaphores and System V
+IPC lookup, plus the targeted `com.apple.pasteboard.*` Mach-service family; the
+host probe first proves the pasteboard service is available and then proves
+the sandboxed lookup is denied without blocking the worker/MLX startup path.
+Other Metal/MLX Mach services remain available. The judge runs in verdict-only
+mode with an explicit
+case count, exact token budget, and fixed 1-of-5 policy floor; it cannot patch
+or create `score.json`, accepts only full-length captures, and accepts only an
+`end_turn` response containing the exact expected content shape and canonical
+`{"passed":true|false}` text. Prose, fences, echoes, truncation, extra keys,
+multiple text blocks, and trailing documents fail closed. Environment
+overrides can only lower immutable response/case/retry/timeout caps, and a
+90-minute overall deadline covers every case and retry.
+
+Every official `mtp-benchmark` invocation—including the operator-owned timed
+candidate—defaults to deny-all worker writes except `/dev/null`. Generated
+profiles already use that policy; operator-injected profiles have every
+file-write allow stripped before the deny is appended. No new wrapper argument
+is required. The exact gate still carries `--deny-worker-file-writes` visibly
+as defense in depth. Local scripts omit it and, without the official marker,
+retain their existing behavior.
+
+An always-run step removes the reference, answer document, capped judge
+requests/responses/results, and capture logs before artifact staging or timing.
+Neither public MTP artifact schema has semantic fields or summaries.
+
+The 1-of-5 minimum reuses the serial policy floor as a conservative
+semantic-catastrophe backstop. It is not an IT/Opus M5 calibration and does not
+claim serial/MTP answer-quality equivalence.
+
+### Residual system and microarchitectural caches
+
+The worker sandbox additionally denies `user-preference-write`, while retaining
+read-only cfprefsd shared-memory access required by Foundation, and denies the
+targeted `com.apple.logd*` / `com.apple.system.logger` Mach services used by
+unified logging. The host probe seeds a read-only preference, proves a
+sandboxed worker cannot persist a marker, and proves a second fresh worker
+cannot recover it; it also proves logd is available before sandboxing and
+unreachable afterward. Participant use of preferences, pasteboard, named IPC,
+unified logging, or another platform service for prompt/token-derived
+cross-request state is independently rejected by static review.
+
+This repository deliberately does **not** attempt:
+
+- a minimal file-read allowlist for the MLX worker;
+- VM or filesystem page-cache flushing between prompts;
+- disabling normal input-independent Metal compiler/driver shader caches.
+
+Those changes would risk dyld, tokenizer, weight mapping, Metal/MLX correctness,
+and measured performance; they affect the pre-existing exact hidden gate as
+well as the semantic backstop and belong to the operator/platform isolation
+layer. Prompt-dependent dynamic Metal source compilation or shader/cache keys
+derived from tokens, prompts, answers, request history, or benchmark phase are
+still prohibited. Static kernels and normal caches keyed only by fixed source,
+compile options, device, shapes, or offsets remain legitimate.
+
+Residual page-cache, CPU/GPU cache, Metal-driver cache, and other unenumerated
+system-service timing/state channels cannot be fully erased in-process. The
+ranked design mitigates them with fresh and explicitly reaped workers,
+file-write/named-IPC/preference/pasteboard/logging denies, prompt-independent
+static-review policy, suppression of raw private artifacts, ephemeral runner
+registration, end-of-job janitor cleanup, and operator integrity auditing.
 
 ## Timed measurement and score sealing
 

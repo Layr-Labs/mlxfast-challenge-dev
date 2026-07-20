@@ -1601,6 +1601,37 @@ extension GemmaRuntime {
     }
 }
 
+protocol RuntimeWorkerLifecycle: AnyObject {
+    @discardableResult
+    func close() -> Bool
+}
+
+func withConfirmedRuntimeWorkerTermination<Result>(
+    worker: any RuntimeWorkerLifecycle,
+    operation: () throws -> Result
+) throws -> Result {
+    func closeWithRetry() -> Bool {
+        if worker.close() {
+            return true
+        }
+        return worker.close()
+    }
+
+    let result: Result
+    do {
+        result = try operation()
+    } catch {
+        _ = closeWithRetry()
+        throw error
+    }
+    guard closeWithRetry() else {
+        throw MLXFastError.invalidInput(
+            "runtime worker termination could not be confirmed"
+        )
+    }
+    return result
+}
+
 final class RuntimeWorkerClient {
     private let process: Process
     private let input: FileHandle
@@ -1609,16 +1640,26 @@ final class RuntimeWorkerClient {
     private let requestTimeoutSeconds: Double
     private let shutdownTimeoutSeconds: Double
     private let terminationGraceSeconds: Double
+    private let stopProcess: (Process, Double) -> Bool
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var sessionNonce = ""
     private var nextID = 1
-    private var closed = false
+    private var didCloseInput = false
+    private var didDrainStderr = false
 
     init(
         options: RuntimeWorkerOptions,
         weightsPath: String,
-        launch: RuntimeWorkerLaunch = .serial
+        launch: RuntimeWorkerLaunch = .serial,
+        stopProcess: @escaping (Process, Double) -> Bool = {
+            process,
+            timeoutSeconds in
+            stopRuntimeWorkerProcess(
+                process,
+                timeoutSeconds: timeoutSeconds
+            )
+        }
     ) throws {
         guard options.helloTimeoutSeconds.isFinite,
               options.helloTimeoutSeconds > 0,
@@ -1659,6 +1700,7 @@ final class RuntimeWorkerClient {
         self.requestTimeoutSeconds = options.requestTimeoutSeconds
         self.shutdownTimeoutSeconds = options.shutdownTimeoutSeconds
         self.terminationGraceSeconds = options.terminationGraceSeconds
+        self.stopProcess = stopProcess
         // Always consume the pipe. Official runs use a no-op emitter so worker
         // output cannot reach logs, while local modes retain live forwarding.
         self.stderrDrain = WorkerStderrDrain(
@@ -1694,19 +1736,28 @@ final class RuntimeWorkerClient {
     }
 
     deinit {
-        close()
+        if !close() {
+            _ = close()
+        }
     }
 
-    func close() {
-        guard !closed else {
-            return
+    @discardableResult
+    func close() -> Bool {
+        if !didCloseInput {
+            didCloseInput = true
+            try? input.close()
         }
-        closed = true
-        try? input.close()
         if process.isRunning {
-            _ = stopRuntimeWorkerProcess(process, timeoutSeconds: shutdownTimeoutSeconds)
+            _ = stopProcess(process, shutdownTimeoutSeconds)
         }
-        _ = stderrDrain.drainedOutput(timeoutSeconds: shutdownTimeoutSeconds + terminationGraceSeconds + 1)
+        if !process.isRunning, !didDrainStderr {
+            didDrainStderr = true
+            _ = stderrDrain.drainedOutput(
+                timeoutSeconds:
+                    shutdownTimeoutSeconds + terminationGraceSeconds + 1
+            )
+        }
+        return !process.isRunning
     }
 
     func generateCorrectness(promptTokens: [Int], steps: Int) throws -> RuntimeWorkerResponse {
@@ -1915,6 +1966,8 @@ final class RuntimeWorkerClient {
         return singleLine
     }
 }
+
+extension RuntimeWorkerClient: RuntimeWorkerLifecycle {}
 
 /// Runtime-worker child environment policy: STRICT ALLOWLIST, not a denylist.
 ///

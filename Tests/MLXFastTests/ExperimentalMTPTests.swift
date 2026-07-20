@@ -4,6 +4,96 @@ import Foundation
 @testable import MLXFastRuntimeWorkerSupport
 import Testing
 
+private final class ScriptedExperimentalMTPWorkerLifecycle:
+    RuntimeWorkerLifecycle
+{
+    private var closeResults: [Bool]
+    private(set) var closeCallCount = 0
+
+    init(closeResults: [Bool]) {
+        self.closeResults = closeResults
+    }
+
+    func close() -> Bool {
+        closeCallCount += 1
+        return closeResults.isEmpty ? false : closeResults.removeFirst()
+    }
+}
+
+private enum ExperimentalMTPLifecycleTestError: Error {
+    case expected
+}
+
+@Test
+func experimentalMTPLifecycleRetriesFirstFailedStopBeforeSuccess() throws {
+    let worker = ScriptedExperimentalMTPWorkerLifecycle(
+        closeResults: [false, true]
+    )
+    let result = try withConfirmedRuntimeWorkerTermination(worker: worker) {
+        "successful-report"
+    }
+    #expect(result == "successful-report")
+    #expect(worker.closeCallCount == 2)
+}
+
+@Test
+func experimentalMTPLifecycleRejectsSuccessfulResultWithoutTermination() {
+    let worker = ScriptedExperimentalMTPWorkerLifecycle(
+        closeResults: [false, false]
+    )
+    #expect(throws: MLXFastError.self) {
+        _ = try withConfirmedRuntimeWorkerTermination(worker: worker) {
+            "must-not-return"
+        }
+    }
+    #expect(worker.closeCallCount == 2)
+}
+
+@Test
+func experimentalMTPLifecycleRetriesCleanupAndPreservesOperationError() {
+    let worker = ScriptedExperimentalMTPWorkerLifecycle(
+        closeResults: [false, true]
+    )
+    var preservedOriginalError = false
+    do {
+        _ = try withConfirmedRuntimeWorkerTermination(worker: worker) {
+            () -> Int in
+            throw ExperimentalMTPLifecycleTestError.expected
+        }
+    } catch ExperimentalMTPLifecycleTestError.expected {
+        preservedOriginalError = true
+    } catch {
+        Issue.record("unexpected lifecycle error: \(error)")
+    }
+    #expect(preservedOriginalError)
+    #expect(worker.closeCallCount == 2)
+}
+
+@Test
+func exactTrainedMTPReportIsInsideConfirmedTerminationGuard() throws {
+    let source = try String(
+        contentsOfFile:
+            "Sources/MLXFastTrustedHarness/GemmaRuntimeMTP.swift",
+        encoding: .utf8
+    )
+    let start = try #require(
+        source.range(of: "public static func experimentalTrainedMTPBenchmark(")
+    )
+    let end = try #require(
+        source.range(
+            of: "static func validateExperimentalTrainedMTPOptions(",
+            range: start.upperBound..<source.endIndex
+        )
+    )
+    let body = source[start.lowerBound..<end.lowerBound]
+    #expect(body.contains(
+        "return try withConfirmedRuntimeWorkerTermination("
+    ))
+    #expect(body.contains("return ExperimentalTrainedMTPReport("))
+    #expect(!body.contains("defer {"))
+    #expect(!body.contains("worker.close()"))
+}
+
 @Test
 func experimentalMTPSerialFallbackChainsTokensAndOffsetsExactly() throws {
     var inputTokens: [Int] = []

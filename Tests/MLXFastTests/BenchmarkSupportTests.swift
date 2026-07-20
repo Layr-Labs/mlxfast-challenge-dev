@@ -1470,6 +1470,93 @@ func runtimeWorkerClientCloseEscalatesPastIgnoredTerminate() throws {
 }
 
 @Test
+func runtimeWorkerClientRetriesTerminationAcrossRepeatedCloseCalls() throws {
+    let executable = try makeRuntimeWorkerScript("""
+    #!/bin/sh
+    trap '' TERM
+    printf '%s\\n' '{"id":0,"nonce":"test-nonce","ok":true}'
+    \(boundedFixtureIdleLoop)
+    """)
+    defer {
+        try? FileManager.default.removeItem(
+            at: executable.deletingLastPathComponent()
+        )
+    }
+    var stopAttempts = 0
+    let client = try RuntimeWorkerClient(
+        options: RuntimeWorkerOptions(
+            executablePath: executable.path,
+            helloTimeoutSeconds: 2,
+            requestTimeoutSeconds: 0.1,
+            shutdownTimeoutSeconds: 0.1,
+            terminationGraceSeconds: 0.05
+        ),
+        weightsPath: executable.deletingLastPathComponent().path,
+        stopProcess: { process, timeoutSeconds in
+            stopAttempts += 1
+            if stopAttempts == 1 {
+                return false
+            }
+            return stopRuntimeWorkerProcess(
+                process,
+                timeoutSeconds: timeoutSeconds
+            )
+        }
+    )
+
+    #expect(!client.close())
+    #expect(client.close())
+    #expect(stopAttempts == 2)
+    // Stream handles are closed/drained once, while a third close remains a
+    // harmless status check and does not call the stop seam again.
+    #expect(client.close())
+    #expect(stopAttempts == 2)
+}
+
+@Test
+func runtimeWorkerClientDeinitRetriesAfterFailedClose() throws {
+    let executable = try makeRuntimeWorkerScript("""
+    #!/bin/sh
+    trap '' TERM
+    printf '%s\\n' '{"id":0,"nonce":"test-nonce","ok":true}'
+    \(boundedFixtureIdleLoop)
+    """)
+    defer {
+        try? FileManager.default.removeItem(
+            at: executable.deletingLastPathComponent()
+        )
+    }
+    var stopAttempts = 0
+    var stoppedByDeinit = false
+    var client: RuntimeWorkerClient? = try RuntimeWorkerClient(
+        options: RuntimeWorkerOptions(
+            executablePath: executable.path,
+            helloTimeoutSeconds: 2,
+            requestTimeoutSeconds: 0.1,
+            shutdownTimeoutSeconds: 0.1,
+            terminationGraceSeconds: 0.05
+        ),
+        weightsPath: executable.deletingLastPathComponent().path,
+        stopProcess: { process, timeoutSeconds in
+            stopAttempts += 1
+            if stopAttempts == 1 {
+                return false
+            }
+            stoppedByDeinit = stopRuntimeWorkerProcess(
+                process,
+                timeoutSeconds: timeoutSeconds
+            )
+            return stoppedByDeinit
+        }
+    )
+
+    #expect(!(client?.close() ?? true))
+    client = nil
+    #expect(stopAttempts == 2)
+    #expect(stoppedByDeinit)
+}
+
+@Test
 func runtimeWorkerClientDrainsLargeStderrBeforeHelloWhenForwardingIsOff() throws {
     let executable = try makeRuntimeWorkerScript("""
     #!/bin/sh

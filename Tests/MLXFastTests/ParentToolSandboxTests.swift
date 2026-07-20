@@ -106,6 +106,23 @@ struct ParentToolSandboxTests {
         #expect(profileBody.contains("(deny process-fork)"))
         #expect(profileBody.contains("(deny process-exec*)"))
         #expect(profileBody.contains("(deny file-write*)"))
+        #expect(profileBody.contains("(deny ipc-posix-shm*)"))
+        #expect(profileBody.contains("(deny ipc-posix-sem*)"))
+        #expect(profileBody.contains("(deny ipc-sysv*)"))
+        #expect(profileBody.contains("(allow ipc-posix-shm-read*"))
+        #expect(profileBody.contains(
+            "(ipc-posix-name-prefix \"apple.cfprefs.\")"
+        ))
+        #expect(profileBody.contains("(deny user-preference-write)"))
+        #expect(profileBody.contains(
+            "(deny mach-lookup (global-name-prefix \"com.apple.pasteboard.\"))"
+        ))
+        #expect(profileBody.contains(
+            "(deny mach-lookup (global-name-prefix \"com.apple.logd\"))"
+        ))
+        #expect(profileBody.contains(
+            "(deny mach-lookup (global-name \"com.apple.system.logger\"))"
+        ))
         // All three mDNSResponder mach-lookup deny variants, matching the
         // parent-tool profile (#494) and the operator-layer worker profile:
         // getaddrinfo(3) egresses through mDNSResponder from ITS own uid, so a

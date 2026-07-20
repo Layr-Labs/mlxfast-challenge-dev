@@ -82,7 +82,28 @@ It validates the pinned 31B-IT target and organizer-owned QAT assistant,
 builds and transforms submitted code in the sandbox, and replays a hidden
 512-token correctness golden through trained-assistant block decode. The
 trusted parent accepts only a target-confirmed prefix and compares every
-returned token with its serial K=1 oracle.
+returned token with its serial K=1 oracle. Every official `mtp-benchmark`
+worker—including the later timed candidate—denies all filesystem writes except
+`/dev/null`, preventing hidden-prompt markers from crossing phases. The exact
+gate keeps an explicit flag as defense in depth; local MTP defaults remain
+unchanged unless the caller supplies that flag.
+
+Only after that exact-token gate passes, the workflow runs a separate,
+untimed semantic GPQA backstop on different hidden prompts. Those prompts are
+tokenized with the pinned IT tokenizer and decoded through fresh
+`Gemma4TrainedMTPBlockSession` workers using the trained assistant and
+exact-pair verification. They intentionally have no exact-token oracle: the
+trusted parent collects the returned IDs, tears down every worker, decodes the
+answers, and asks the fixed private judge for a verdict. Semantic failure is
+an independent hard gate; it cannot rescue an exact-token failure and never
+changes the decode score.
+
+The shared private reference object is pinned in-repo at SHA-256
+`fc8bcdaff94aa89b2fc2a1a2adc28943ed026899ae805b3c52b3f81a235c20ff`
+and 9919 bytes. The gate requires 1 of the configured 5 cases. That value is
+the existing serial policy floor reused as a conservative semantic-catastrophe
+backstop; it is not an IT/Opus M5 calibration and does not claim serial/MTP
+quality equivalence.
 
 Here, `exact-pair` means exact returned-token verification and exact logical
 protocol, offset, and counter accounting. It does not require bit-identical
@@ -115,7 +136,9 @@ score = mean(serial_K1_seconds_per_token) / mean(MTP_seconds_per_token)
 
 The hard floor is `1.0`; token/logical-accounting failure, physical rollback
 corruption detected by the trusted review/regression controls, throttling, or
-invalid telemetry fails the run. `score.json` carries
+invalid telemetry fails the run. The semantic references, generated answers,
+judge details, and private verdict are scrubbed before timing and are never
+copied into `score.json` or an upload. `score.json` carries
 `track_id=gemma4-31b-it-mtp-v1`. See
 [`docs/experimental-mtp-track.md`](docs/experimental-mtp-track.md) for the
 protocol and [`docs/private-benchmark-security.md`](docs/private-benchmark-security.md)
@@ -292,14 +315,16 @@ it is committed. The whole target is RAM-resident with no weight streaming.
 `bandwidth_gb_per_token=0`. Detailed RAM, phase timing, acceptance, and worker
 diagnostics remain runner-private for trusted validation and are not uploaded.
 Correctness is a hard gate. See TASK.md for the full correctness specification.
-The ranked correctness replay runs before timing in a fresh worker. The
-benchmark golden is distinct from the correctness golden and is installed
-only by the trusted measurement wrapper. The public score payload is strictly
+The ranked correctness replay runs before the independent semantic GPQA gate;
+both complete before timing. The benchmark golden is distinct from the
+correctness and semantic fixtures and is installed only by the trusted
+measurement wrapper. The public score payload is strictly
 allowlisted to score/pass/track and the fixed scoring contract fields, pair
 count/parity gate outcomes, and ratio-of-means score. It excludes per-side
 timings, acceptance patterns, memory, hashes, raw reports, diagnostics, and
-free-form strings. The score itself still provides residual low-bandwidth
-timing feedback; prompts, token IDs, and per-case hidden outputs remain private.
+free-form strings, including semantic summaries. The score itself still
+provides residual low-bandwidth timing feedback; prompts, token IDs, answers,
+judge details, and per-case hidden outputs remain private.
 
 ## Architecture
 

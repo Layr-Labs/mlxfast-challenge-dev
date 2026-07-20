@@ -475,12 +475,47 @@ func benchmarkWorkflowProbesAndEnforcesRuntimeWorkerSandbox() throws {
     #expect(probe.contains("(deny process-fork)"))
     #expect(probe.contains("(deny process-exec*)"))
     #expect(probe.contains("(allow process-exec (literal"))
+    #expect(probe.contains("(deny ipc-posix-shm*)"))
+    #expect(probe.contains("(deny ipc-posix-sem*)"))
+    #expect(probe.contains("(deny ipc-sysv*)"))
+    #expect(probe.contains("(allow ipc-posix-shm-read*"))
+    #expect(probe.contains(
+        "(ipc-posix-name-prefix \"apple.cfprefs.\")"
+    ))
+    #expect(probe.contains("(deny user-preference-write)"))
+    #expect(probe.contains(
+        "(deny mach-lookup (global-name-prefix \"com.apple.pasteboard.\"))"
+    ))
+    #expect(probe.contains(
+        "(deny mach-lookup (global-name-prefix \"com.apple.logd\"))"
+    ))
+    #expect(probe.contains(
+        "(deny mach-lookup (global-name \"com.apple.system.logger\"))"
+    ))
     #expect(probe.contains("(deny file-write*)"))
     #expect(probe.contains("(allow file-write* (literal \"/dev/null\"))"))
     #expect(probe.contains("(deny file-read* (literal"))
     #expect(probe.contains("(deny file-read* (subpath"))
     #expect(probe.contains("expect_inet_network_denied()"))
     #expect(probe.contains("expect_unix_network_denied(argv[5])"))
+    #expect(probe.contains("expect_posix_shm_denied()"))
+    #expect(probe.contains("expect_posix_semaphore_denied()"))
+    #expect(probe.contains("expect_sysv_ipc_denied(argv[6])"))
+    #expect(probe.contains("expect_pasteboard_lookup_denied()"))
+    #expect(probe.contains("--pasteboard-available"))
+    #expect(probe.contains("expect_logging_lookup_denied()"))
+    #expect(probe.contains("--logging-available"))
+    #expect(probe.contains("os_log(OS_LOG_DEFAULT"))
+    #expect(probe.contains(
+        "sandbox-exec -f \"${profile_path}\""
+    ))
+    #expect(probe.contains(
+        #""${preference_probe_bin}" attempt "${preference_suite}""#
+    ))
+    #expect(probe.contains(
+        #""${preference_probe_bin}" verify "${preference_suite}""#
+    ))
+    #expect(probe.contains("fresh worker recovered persisted preference marker"))
     #expect(probe.contains("expect_fork_denied()"))
     #expect(probe.contains("expect_spawn_denied()"))
 }
@@ -709,7 +744,10 @@ func benchmarkPlacesHiddenGoldenInputsSymlinkSafely() throws {
     #expect(attach.contains("if [[ -e \"${hidden_target}\" || -L \"${hidden_target}\" ]]; then"))
     #expect(attach.contains("refusing to place hidden input over pre-existing path"))
     #expect(attach.contains("install -m 0444 \"${MLXFAST_PRIVATE_DIR}/raw_golden.json\" \"${golden_src}\""))
-    #expect(attach.contains("install -m 0444 \"${MLXFAST_PRIVATE_DIR}/gpqa_reference.json\" \"${gpqa_src}\""))
+    #expect(attach.contains("install -m 0600 \"${MLXFAST_PRIVATE_DIR}/gpqa_reference.json\" \"${gpqa_src}\""))
+    #expect(attach.contains(
+        #"/bin/chmod +a "user:bench allow read" "${gpqa_src}""#
+    ))
     #expect(attach.contains("--golden .ranked-src/golden.json"))
     #expect(attach.contains("--gpqa .ranked-src/gpqa.json"))
     // Cleanup unlinks the runner-owned staging dir (never an attacker symlink).
@@ -717,6 +755,74 @@ func benchmarkPlacesHiddenGoldenInputsSymlinkSafely() throws {
     // The old predictable workspace-root names are gone entirely.
     #expect(!workflow.contains(".ranked-golden-src.json"))
     #expect(!workflow.contains(".ranked-gpqa-src.json"))
+}
+
+@Test
+func serialSemanticAnswerHandoffOccursAfterWorkersDieAndBeforeJudgeSecrets()
+    throws
+{
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/serial-benchmark.yml",
+        encoding: .utf8
+    )
+    let gates = try #require(
+        workflow.range(
+            of: "- name: Correctness and gates "
+        )
+    )
+    let handoff = try #require(
+        workflow.range(
+            of: "- name: Handoff semantic GPQA answers to trusted judge"
+        )
+    )
+    let judge = try #require(
+        workflow.range(of: "- name: Semantic GPQA gate")
+    )
+    #expect(gates.lowerBound < handoff.lowerBound)
+    #expect(handoff.lowerBound < judge.lowerBound)
+
+    let handoffBody = String(
+        workflow[handoff.lowerBound..<judge.lowerBound]
+    )
+    let reaper = try #require(
+        handoffBody.range(of: "reap-bench-processes.sh")
+    )
+    let acl = try #require(
+        handoffBody.range(
+            of: #"/bin/chmod +a "user:${trusted_reader} allow read""#
+        )
+    )
+    #expect(reaper.lowerBound < acl.lowerBound)
+    let noLiveBench = try #require(
+        handoffBody.range(
+            of: "refusing semantic answer handoff while bench processes remain alive"
+        )
+    )
+    #expect(reaper.lowerBound < noLiveBench.lowerBound)
+    #expect(noLiveBench.lowerBound < acl.lowerBound)
+    #expect(handoffBody.contains("id -u bench"))
+    #expect(handoffBody.contains("$2 !~ /^Z/"))
+    #expect(handoffBody.contains(
+        "private/semantic_gpqa_answers.json"
+    ))
+    #expect(handoffBody.contains(
+        #"answer_mode="$(stat -f '%Lp' "${answers}")""#
+    ))
+    #expect(handoffBody.contains(
+        #"[[ "${answer_mode}" != "600" ]]"#
+    ))
+    #expect(handoffBody.contains(
+        #"test "$(stat -f '%Lp' "${answers}")" = "600""#
+    ))
+    #expect(handoffBody.contains("test -r \"${answers}\""))
+    #expect(!handoffBody.contains("ANTHROPIC_API_KEY"))
+    #expect(!handoffBody.contains("run-semantic-gpqa-gate.sh"))
+
+    let judgeBody = String(workflow[judge.lowerBound...])
+    #expect(judgeBody.contains(
+        "ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}"
+    ))
+    #expect(judgeBody.contains("run-semantic-gpqa-gate.sh"))
 }
 
 @Test
@@ -1221,7 +1327,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     )
 
     #expect(!workflow.contains("${{ runner.temp }}"))
-    #expect(workflow.contains("MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}"))
+    #expect(workflow.contains("MLXFAST_PRIVATE_DIR: /private/tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}"))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json"))
     // The raw GPQA reference is downloaded straight into the runner-private
     // dir; its accepted answers reach the bench workspace only inside the
@@ -1229,7 +1335,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("\"${MLXFAST_PRIVATE_DIR}/gpqa_reference.json\""))
     #expect(!workflow.contains("MLXFAST_GPQA_TTFT_RESULTS_PATH"))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: ${{ env.MLXFAST_JOB_WS }}/private/semantic_gpqa_answers.json"))
-    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json"))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /private/tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json"))
     #expect(workflow.contains("MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}"))
     #expect(workflow.contains("MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt"))
@@ -1242,6 +1348,17 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1.txt"))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"))
     #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json"))
+    #expect(workflow.contains(
+        "MLXFAST_GPQA_REFERENCE_SHA256: "
+            + "fc8bcdaff94aa89b2fc2a1a2adc28943ed026899ae805b3c52b3f81a235c20ff"
+    ))
+    #expect(workflow.contains("MLXFAST_GPQA_REFERENCE_BYTES: \"9919\""))
+    #expect(workflow.contains(
+        "chmod 0600 \"${MLXFAST_PRIVATE_DIR}/gpqa_reference.json\""
+    ))
+    #expect(workflow.contains(
+        "install -m 0600 \"${MLXFAST_PRIVATE_DIR}/gpqa_reference.json\" \"${gpqa_src}\""
+    ))
     #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
     // 64-token budget and min-pass 1 threshold are calibrated to the
     // unmodified Gemma 4 31B 4-bit rebase baseline, which stably judged 2/5
@@ -1319,19 +1436,20 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // path validates/stages even on failure (always()) so the artifact
     // reflects what ran, gated on validation for submission branches.
     #expect(workflow.contains("if: ${{ always() && !inputs.run_benchmark }}"))
-    // Seventeen ranked steps use the bare run_benchmark guard (no always(), so
+    // Nineteen ranked steps use the bare run_benchmark guard (no always(), so
     // any failure stops the serial chain before the timed measurement):
     // Check private material, hash transformed weights,
     // Reap lingering bench processes before hidden material,
     // Snapshot post-transform workspace, Prepare hidden golden,
     // Attach GPQA gates, Verify trusted harness before gates,
-    // Correctness and gates, Validate sealed gates score, Semantic GPQA gate,
+    // Correctness and gates, Validate sealed gates score, secure semantic
+    // answer handoff, Semantic GPQA gate,
     // Scrub hidden material, Reap lingering bench processes before timing,
     // Prepare hidden timed decode prompt, Wait for quiescence, Verify trusted harness before timing,
     // Timed paired benchmark, Overlay paired timing, Validate benchmark
     // artifacts.
     let bareRunBenchmarkGuardCount = workflow.components(separatedBy: "if: ${{ inputs.run_benchmark }}").count - 1
-    #expect(bareRunBenchmarkGuardCount == 18)
+    #expect(bareRunBenchmarkGuardCount == 19)
     #expect(workflow.contains("if: ${{ always() && inputs.run_benchmark }}"))
     #expect(workflow.contains("golden.sha256=\"${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256\""))
     #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results"))
@@ -1370,14 +1488,22 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(semanticGate.contains("env -u ANTHROPIC_API_KEY curl"))
     #expect(semanticGate.contains("header = \"x-api-key: %s\""))
     #expect(semanticGate.contains("anthropic-version: 2023-06-01"))
-    #expect(semanticGate.contains("extract_judge_json()"))
-    #expect(semanticGate.contains("```(?:json)?"))
-    #expect(semanticGate.contains("judge response was not parseable JSON (stop_reason=${stop_reason}); retrying"))
-    // Parse hardening after runs 28813130022 and 29124417146 lost cases to
-    // prose-wrapped/truncated judge responses: fenced/prose/balanced-object
-    // extraction preferring the LAST verdict, plus a lenient trailing
-    // "passed": true/false scan for truncation.
-    #expect(semanticGate.contains("\\\"passed\\\"[[:space:]]*:[[:space:]]*(true|false)"))
+    #expect(semanticGate.contains("strict_judge_json()"))
+    #expect(semanticGate.contains("jq -s -cer"))
+    #expect(semanticGate.contains("select(length == 1)"))
+    #expect(!semanticGate.contains(
+        "strict_judge_json \"${response_path}\" 2>/dev/null || true"
+    ))
+    #expect(semanticGate.contains(".stop_reason == \"end_turn\""))
+    #expect(semanticGate.contains(
+        "(($verdict | keys | sort) == [\"passed\"])"
+    ))
+    #expect(semanticGate.contains(
+        "$text == ($verdict | tojson)"
+    ))
+    #expect(semanticGate.contains(
+        "judge response failed strict validation; retrying"
+    ))
     // Opus 4.8 judge: adaptive thinking at max effort, and a max_tokens
     // budget (thinking + reply text) big enough that the verdict can never
     // be truncated the way the Sonnet-era 256 cap truncated it. Opus 4.8
@@ -1391,9 +1517,16 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(!semanticGate.contains("prefill_text"))
     #expect(!semanticGate.contains("role: \"assistant\""))
     #expect(!semanticGate.contains("budget_tokens"))
-    // A hung connection must fail the attempt (and trip the retry loop), not
-    // stall the serial ranked job.
-    #expect(semanticGate.contains("--max-time 900"))
+    // Environment values can only lower immutable hard bounds. Curl retries
+    // and every outer attempt share a deadline well below the six-hour job.
+    #expect(semanticGate.contains(
+        "readonly HARD_MAX_CURL_TIMEOUT_SECONDS=600"
+    ))
+    #expect(semanticGate.contains(
+        "readonly HARD_GATE_DEADLINE_SECONDS=5400"
+    ))
+    #expect(semanticGate.contains("--retry-max-time"))
+    #expect(semanticGate.contains("remaining_gate_seconds()"))
     #expect(semanticGate.contains("MIN_PASS=\"${MLXFAST_SEMANTIC_GPQA_MIN_PASS:-1}\""))
     #expect(semanticGate.contains("REQUIRED=\"${MLXFAST_SEMANTIC_GPQA_REQUIRED:-1}\""))
     #expect(semanticGate.contains("MLXFAST_SEMANTIC_GPQA_REQUIRED"))
@@ -1430,6 +1563,29 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(staticReview.contains("score.json or benchmark-integrity.json tampering"))
     #expect(staticReview.contains("request-shape, call-count, phase, process-lifetime, prompt-length, or cache-state special-casing"))
     #expect(staticReview.contains("only for timed benchmark workers"))
+    #expect(staticReview.contains(
+        "POSIX named shared memory or semaphores"
+    ))
+    #expect(staticReview.contains("System V IPC"))
+    #expect(staticReview.contains("shm_open/sem_open"))
+    #expect(staticReview.contains("shmget/semget/msgget"))
+    #expect(staticReview.contains("NSPasteboard"))
+    #expect(staticReview.contains("pbcopy/pbpaste"))
+    #expect(staticReview.contains("com.apple.pasteboard.*"))
+    #expect(staticReview.contains("UserDefaults"))
+    #expect(staticReview.contains("CFPreferences/cfprefsd"))
+    #expect(staticReview.contains("os_log"))
+    #expect(staticReview.contains("com.apple.logd/system.logger"))
+    #expect(staticReview.contains(
+        "prompt-dependent dynamic shader compilation is prohibited"
+    ))
+    #expect(staticReview.contains(
+        "dynamic Metal source/library compilation or shader/cache keys derived"
+    ))
+    #expect(staticReview.contains(
+        "input-independent static Metal kernels and normal driver/library shader caches"
+    ))
+    #expect(staticReview.contains("persistence_channel_rule"))
     #expect(staticReview.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES"))
     #expect(staticReview.contains("oversized source that could hide lookup tables"))
     #expect(staticReview.contains("find \"${editable_path}\" -type f -print0"))
@@ -2119,22 +2275,27 @@ func editableSurfaceByteBudgetEnforcesCapsAtWorkerLaunch() throws {
     #expect(malformedReason.contains("no usable editablePaths"))
 }
 
-// Behavioral pin for run-semantic-gpqa-gate.sh's Opus 4.8 judge request and
-// its parse hardening, via a curl shim serving canned Opus-shaped responses
-// (thinking block first, verdict in the trailing text block). Covers the
-// verdict shapes run 29124417146 tripped over: bare JSON, a ```json fence,
-// JSON preceded/followed by prose, a verdict split across text blocks, and
-// truncated garbage that must burn all retries and fail just that one case
-// without changing gate semantics.
+// Behavioral pin for run-semantic-gpqa-gate.sh's strict Opus response
+// contract. Only one canonical verdict object in one final text block after
+// well-shaped thinking is accepted; fences, prose/echoes, multiple text
+// blocks, and truncated responses burn their bounded retries and fail closed.
 @Test
-func semanticGPQAGateParsesOpusVerdictShapesAndFailsUnparseableCaseClosed() throws {
+func semanticGPQAGateAcceptsOnlyStrictOpusVerdictShape() throws {
     let fm = FileManager.default
     let scriptPath = URL(fileURLWithPath: fm.currentDirectoryPath)
         .appendingPathComponent(".github/scripts/run-semantic-gpqa-gate.sh").path
 
-    let root = fm.temporaryDirectory
+    let temporaryRoot = fm.temporaryDirectory
         .appendingPathComponent("semantic-gate-\(UUID().uuidString)")
-    try fm.createDirectory(at: root, withIntermediateDirectories: true)
+    try fm.createDirectory(
+        at: temporaryRoot,
+        withIntermediateDirectories: true
+    )
+    let root = URL(
+        fileURLWithPath: temporaryRoot.path.hasPrefix("/var/")
+            ? "/private" + temporaryRoot.path
+            : temporaryRoot.path
+    )
     defer { try? fm.removeItem(at: root) }
 
     func run(_ argv: [String], env extra: [String: String]) throws -> (status: Int32, output: String) {
@@ -2164,7 +2325,7 @@ func semanticGPQAGateParsesOpusVerdictShapesAndFailsUnparseableCaseClosed() thro
 
     let answersPath = root.appendingPathComponent("answers.json").path
     func answerCase(_ id: String) -> String {
-        #"{"id":"\#(id)","prompt":"marker-\#(id) question","answer_key":"C","reference_answer":"option C","candidate_answer":"C"}"#
+        #"{"id":"\#(id)","prompt":"marker-\#(id) question","answer_key":"C","reference_answer":"option C","candidate_answer":"C","candidate_tokens":[1],"max_new_tokens":64}"#
     }
     let answers = #"{"version":1,"cases":["# +
         [
@@ -2172,18 +2333,22 @@ func semanticGPQAGateParsesOpusVerdictShapesAndFailsUnparseableCaseClosed() thro
             answerCase("case-garbage"), answerCase("case-split"),
         ].joined(separator: ",") + "]}"
     try answers.write(toFile: answersPath, atomically: true, encoding: .utf8)
+    try fm.setAttributes(
+        [.posixPermissions: 0o600],
+        ofItemAtPath: answersPath
+    )
     let scorePath = root.appendingPathComponent("score.json").path
     try #"{"passed":true,"score":1.0,"metrics":{"error":""}}"#
         .write(toFile: scorePath, atomically: true, encoding: .utf8)
 
-    // Canned Opus-shaped responses: thinking first, verdict in text block(s).
+    // Canned Opus-shaped responses: only `bare` matches the strict contract.
     let shimDir = root.appendingPathComponent("bin").path
     try fm.createDirectory(atPath: shimDir, withIntermediateDirectories: true)
     let responses: [String: String] = [
-        "bare": #"{"content":[{"type":"thinking","thinking":"weighing the options"},{"type":"text","text":"{\"passed\":true}"}],"stop_reason":"end_turn"}"#,
+        "bare": #"{"content":[{"type":"thinking","thinking":"weighing the options","signature":"test-signature"},{"type":"text","text":"{\"passed\":true}"}],"stop_reason":"end_turn"}"#,
         "fenced": #"{"content":[{"type":"thinking","thinking":"comparing answers"},{"type":"text","text":"Here is the verdict:\n```json\n{\"passed\": true}\n```"}],"stop_reason":"end_turn"}"#,
         "prose": #"{"content":[{"type":"text","text":"The candidate names the wrong mechanism, so the verdict is {\"passed\": false}. Final."}],"stop_reason":"end_turn"}"#,
-        "garbage": #"{"content":[{"type":"thinking","thinking":"long think"},{"type":"text","text":"The candidate answer begins by discussing the reaction order and"}],"stop_reason":"max_tokens"}"#,
+        "garbage": #"{"content":[{"type":"thinking","thinking":"long think","signature":"test-signature"},{"type":"text","text":"The candidate answer begins by discussing the reaction order and"}],"stop_reason":"max_tokens"}"#,
         "split": #"{"content":[{"type":"thinking","thinking":"t"},{"type":"text","text":"Considering the equivalence carefully."},{"type":"text","text":"{\"passed\":true}"}],"stop_reason":"end_turn"}"#,
     ]
     for (name, body) in responses {
@@ -2220,7 +2385,13 @@ func semanticGPQAGateParsesOpusVerdictShapesAndFailsUnparseableCaseClosed() thro
     try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shimDir + "/curl")
 
     let inheritedPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
-    let resultsPath = root.appendingPathComponent("results.json").path
+    let privateDirectory = root.appendingPathComponent("private")
+    try fm.createDirectory(
+        at: privateDirectory,
+        withIntermediateDirectories: true
+    )
+    let resultsPath = privateDirectory
+        .appendingPathComponent("results.json").path
     let gate = try run(
         ["bash", scriptPath],
         env: [
@@ -2231,23 +2402,22 @@ func semanticGPQAGateParsesOpusVerdictShapesAndFailsUnparseableCaseClosed() thro
             "MLXFAST_SCORE_PATH": scorePath,
             "MLXFAST_INTEGRITY_PATH": root.appendingPathComponent("absent-integrity.json").path,
             "MLXFAST_SEMANTIC_GPQA_RESULTS_PATH": resultsPath,
-            "MLXFAST_PRIVATE_DIR": root.appendingPathComponent("private").path,
+            "MLXFAST_PRIVATE_DIR": privateDirectory.path,
             "MLXFAST_SEMANTIC_GPQA_MIN_PASS": "1",
             "MLXFAST_SEMANTIC_GPQA_REQUIRED": "1",
         ])
     #expect(gate.status == 0, gate.output.isEmpty ? "no output" : "\(gate.output)")
 
-    // Every parseable verdict shape lands, prose-wrapped false stays false,
-    // and only the garbage case fails -- after burning all three attempts.
+    // Only the exact canonical verdict lands. Every wrapped, echoed, split,
+    // or truncated shape fails after all three attempts.
     #expect(gate.output.contains("judging 5 hidden cases with claude-opus-4-8"))
     #expect(gate.output.contains("case 1/5 passed=true"))
-    #expect(gate.output.contains("case 2/5 passed=true"))
-    #expect(gate.output.contains("case 3/5 passed=false"))
-    #expect(!gate.output.contains("case 3/5 passed=false reason=invalid_judge_response"))
-    #expect(gate.output.contains("case 4/5 judge response was not parseable JSON (stop_reason=max_tokens); retrying"))
+    #expect(gate.output.contains("case 2/5 passed=false reason=invalid_judge_response"))
+    #expect(gate.output.contains("case 3/5 passed=false reason=invalid_judge_response"))
+    #expect(gate.output.contains("case 4/5 judge response failed strict validation; retrying"))
     #expect(gate.output.contains("case 4/5 passed=false reason=invalid_judge_response"))
-    #expect(gate.output.contains("case 5/5 passed=true"))
-    #expect(gate.output.contains("semantic-gpqa: passed 3/5"))
+    #expect(gate.output.contains("case 5/5 passed=false reason=invalid_judge_response"))
+    #expect(gate.output.contains("semantic-gpqa: passed 1/5"))
     let garbageAttempts = try String(contentsOfFile: shimDir + "/garbage-attempts", encoding: .utf8)
     #expect(garbageAttempts.components(separatedBy: "\n").filter { !$0.isEmpty }.count == 3)
 
@@ -2270,11 +2440,11 @@ func semanticGPQAGateParsesOpusVerdictShapesAndFailsUnparseableCaseClosed() thro
     let system = try #require(request["system"] as? String)
     #expect(system.contains("exactly one JSON object"))
 
-    // score.json is patched with the aggregate verdict and the new model pin;
-    // the gate stays green because pass_count 3 >= min_pass 1.
+    // score.json is patched with the aggregate verdict and model pin; the
+    // catastrophe floor stays green because pass_count 1 >= min_pass 1.
     let score = try String(contentsOfFile: scorePath, encoding: .utf8)
     #expect(score.contains("\"semantic_gpqa_passed\": true"))
-    #expect(score.contains("\"semantic_gpqa_pass_count\": 3"))
+    #expect(score.contains("\"semantic_gpqa_pass_count\": 1"))
     #expect(score.contains("\"semantic_gpqa_case_count\": 5"))
     #expect(score.contains("\"semantic_gpqa_model\": \"claude-opus-4-8\""))
     let results = try String(contentsOfFile: resultsPath, encoding: .utf8)
@@ -2418,6 +2588,10 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
         encoding: .utf8
     )
     let runtime = try harnessRuntimeSource()
+    let gpqaReference = try String(
+        contentsOfFile: "Sources/MLXFastCore/GPQAReference.swift",
+        encoding: .utf8
+    )
 
     #expect(package.contains(".product(name: \"Tokenizers\", package: \"swift-transformers\")"))
     #expect(cli.contains("case \"attach-gpqa-gates\""))
@@ -2430,13 +2604,21 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(cli.contains("runtimeWorkerOptions(blockedGoldenPath: gpqaPath)"))
     #expect(!cli.contains("calibrated_reference_outputs"))
     #expect(cli.contains("SemanticGPQAAnswerDocument"))
-    #expect(cli.contains("referenceAnswer(for: testCase)"))
+    #expect(cli.contains("testCase.semanticReferenceAnswer"))
+    #expect(cli.contains("PrivateFileWriter.writeAtomically("))
     #expect(cli.contains("generate-gpqa-answers requires --output or MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH"))
     #expect(cli.contains("semantic GPQA answer output"))
     #expect(!cli.contains("measure-gpqa-ttft"))
     #expect(!cli.contains("FirstTokenTimingOptions(weightsPath: weightsPath, promptTokenSets: selectedPrompts)"))
-    #expect(cli.contains("[\"\\(normalizedKey).\", \"\\(normalizedKey):\", \"\\(normalizedKey))\"]"))
-    #expect(!cli.contains("[\"\\(normalizedKey).\", \"\\(normalizedKey):\", \"\\(normalizedKey))\", \"\\(normalizedKey)\"]"))
+    #expect(gpqaReference.contains(
+        "\"\\(normalizedKey).\","
+    ))
+    #expect(gpqaReference.contains(
+        "\"\\(normalizedKey):\","
+    ))
+    #expect(gpqaReference.contains(
+        "\"\\(normalizedKey))\","
+    ))
     #expect(!cli.contains("existingSequences + [generated]"))
     #expect(!cli.contains("accepted_sequences="))
     #expect(cli.contains("accepted_token_sequences or accepted_responses generated from the reference model"))
@@ -4805,11 +4987,17 @@ func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
     let golden = root.appendingPathComponent("correctness_golden_512_2048.json")
     let prompts = root.appendingPathComponent("my_private_prompts.json")
     let gpqa = root.appendingPathComponent("gpqa_reference_cases.json")
+    let mtpGPQA = root.appendingPathComponent("mtp_semantic_gpqa_reference.json")
+    let mtpAnswers = root.appendingPathComponent("mtp_semantic_gpqa_answers.json")
+    let mtpResults = root.appendingPathComponent("mtp_semantic_gpqa_results.json")
     let goldenPromptText = root.appendingPathComponent("golden_prompt_benchmark_transcription_gate_english_512.txt")
     let goldenPromptJSON = root.appendingPathComponent("golden_prompt_benchmark_transcription_gate_english_512_256.json")
     try "{}".write(to: golden, atomically: true, encoding: .utf8)
     try "{}".write(to: prompts, atomically: true, encoding: .utf8)
     try "{}".write(to: gpqa, atomically: true, encoding: .utf8)
+    try "{}".write(to: mtpGPQA, atomically: true, encoding: .utf8)
+    try "{}".write(to: mtpAnswers, atomically: true, encoding: .utf8)
+    try "{}".write(to: mtpResults, atomically: true, encoding: .utf8)
     try "hidden prompt".write(to: goldenPromptText, atomically: true, encoding: .utf8)
     try "{}".write(to: goldenPromptJSON, atomically: true, encoding: .utf8)
 
@@ -4820,6 +5008,9 @@ func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
         golden.path,
         prompts.path,
         gpqa.path,
+        mtpGPQA.path,
+        mtpAnswers.path,
+        mtpResults.path,
         goldenPromptText.path,
         goldenPromptJSON.path,
     ]
@@ -4832,6 +5023,184 @@ func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
     process.waitUntilExit()
 
     #expect(process.terminationStatus != 0)
+}
+
+@Test
+func privateArtifactGuardRejectsSensitiveDirectoryComponentsBeforeRecursion()
+    throws
+{
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let safeDirectory = root.appendingPathComponent("safe")
+    try FileManager.default.createDirectory(
+        at: safeDirectory,
+        withIntermediateDirectories: true
+    )
+    let safeFile = safeDirectory.appendingPathComponent("score.json")
+    try "{}".write(to: safeFile, atomically: true, encoding: .utf8)
+    #expect(try runPrivateArtifactGuard([safeFile]) == 0)
+
+    let sensitiveDirectory = root.appendingPathComponent(
+        "semantic_gpqa_bundle"
+    )
+    try FileManager.default.createDirectory(
+        at: sensitiveDirectory,
+        withIntermediateDirectories: true
+    )
+    #expect(try runPrivateArtifactGuard([sensitiveDirectory]) != 0)
+
+    let nestedSensitiveDirectory = root
+        .appendingPathComponent("safe")
+        .appendingPathComponent("gpqa_reference_material")
+    try FileManager.default.createDirectory(
+        at: nestedSensitiveDirectory,
+        withIntermediateDirectories: true
+    )
+    let innocentlyNamedLeaf = nestedSensitiveDirectory
+        .appendingPathComponent("result.json")
+    try "{}".write(
+        to: innocentlyNamedLeaf,
+        atomically: true,
+        encoding: .utf8
+    )
+    #expect(try runPrivateArtifactGuard([innocentlyNamedLeaf]) != 0)
+
+    let traversalProcess = Process()
+    traversalProcess.executableURL = URL(fileURLWithPath: "/bin/bash")
+    traversalProcess.arguments = [
+        ".github/scripts/deny-private-artifacts.sh",
+        safeDirectory.path + "/../safe/score.json",
+    ]
+    traversalProcess.currentDirectoryURL = URL(
+        fileURLWithPath: FileManager.default.currentDirectoryPath
+    )
+    traversalProcess.environment = ProcessInfo.processInfo.environment.merging(
+        ["MLXFAST_GITHUB_ANNOTATIONS": "0"]
+    ) { _, new in new }
+    traversalProcess.standardOutput = Pipe()
+    traversalProcess.standardError = Pipe()
+    try traversalProcess.run()
+    traversalProcess.waitUntilExit()
+    #expect(traversalProcess.terminationStatus != 0)
+}
+
+@Test
+func privateArtifactGuardAllowsOnlyExactValidatedSerialGoldenSidecars()
+    throws
+{
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let golden = root.appendingPathComponent("correctness_golden.json")
+    let sha = URL(fileURLWithPath: golden.path + ".sha256")
+    let bytes = URL(fileURLWithPath: golden.path + ".bytes")
+    let expectedSHA = String(repeating: "a", count: 64)
+    let expectedBytes = "9919"
+    try "{}".write(to: golden, atomically: true, encoding: .utf8)
+    try "\(expectedSHA)  correctness_golden.json\n".write(
+        to: sha,
+        atomically: true,
+        encoding: .utf8
+    )
+    try "\(expectedBytes)  correctness_golden.json\n".write(
+        to: bytes,
+        atomically: true,
+        encoding: .utf8
+    )
+    let environment = [
+        "MLXFAST_ARTIFACT_PROFILE": "default",
+        "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
+        "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256": expectedSHA,
+        "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES": expectedBytes,
+    ]
+
+    // Matches the two sensitive arguments in the serial workflow's existing
+    // final deny-private-artifacts invocation.
+    #expect(
+        try runPrivateArtifactGuard(
+            [sha, bytes],
+            environment: environment
+        ) == 0
+    )
+
+    #expect(
+        try runPrivateArtifactGuard(
+            [golden],
+            environment: environment
+        ) != 0
+    )
+    let lookalike = root.appendingPathComponent(
+        "other_correctness_golden.json.sha256"
+    )
+    try "\(expectedSHA)  correctness_golden.json\n".write(
+        to: lookalike,
+        atomically: true,
+        encoding: .utf8
+    )
+    #expect(
+        try runPrivateArtifactGuard(
+            [lookalike],
+            environment: environment
+        ) != 0
+    )
+    let suffixBypass = root.appendingPathComponent(
+        "correctness_golden.json.sha256.backup"
+    )
+    try "\(expectedSHA)  correctness_golden.json\n".write(
+        to: suffixBypass,
+        atomically: true,
+        encoding: .utf8
+    )
+    #expect(
+        try runPrivateArtifactGuard(
+            [suffixBypass],
+            environment: environment
+        ) != 0
+    )
+
+    try "\(expectedSHA)  correctness_golden.json\nextra\n".write(
+        to: sha,
+        atomically: true,
+        encoding: .utf8
+    )
+    #expect(
+        try runPrivateArtifactGuard(
+            [sha],
+            environment: environment
+        ) != 0
+    )
+    try "\(expectedSHA)  correctness_golden.json\n".write(
+        to: sha,
+        atomically: true,
+        encoding: .utf8
+    )
+    #expect(
+        try runPrivateArtifactGuard(
+            [sha],
+            environment: environment.merging([
+                "MLXFAST_ARTIFACT_PROFILE": "mtp-score",
+            ]) { _, new in new }
+        ) != 0
+    )
+
+    let directoryRoot = root.appendingPathComponent("directory-variant")
+    try FileManager.default.createDirectory(
+        at: directoryRoot,
+        withIntermediateDirectories: true
+    )
+    let sensitiveDirectory = directoryRoot.appendingPathComponent(
+        "correctness_golden.json.bytes"
+    )
+    try FileManager.default.createDirectory(
+        at: sensitiveDirectory,
+        withIntermediateDirectories: true
+    )
+    #expect(
+        try runPrivateArtifactGuard(
+            [sensitiveDirectory],
+            environment: environment
+        ) != 0
+    )
 }
 
 private func runPrivateArtifactGuard(
@@ -4889,6 +5258,8 @@ func privateArtifactGuardRejectsRawMTPReports() throws {
         "mtp-gates-report.json",
         "mtp-gates-stdout.raw",
         "mtp-gates-private.log",
+        "mtp-semantic-capture.stdout",
+        "mtp-semantic-capture.log",
         "mtp-paired-results.json",
         "mtp-measure-verdict.txt",
     ] {
