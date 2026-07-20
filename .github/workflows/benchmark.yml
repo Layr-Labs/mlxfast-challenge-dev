@@ -197,6 +197,44 @@ jobs:
       MLXFAST_MTP_SEMANTIC_GPQA_MAX_NEW_TOKENS: "64"
       MLXFAST_MTP_SEMANTIC_GPQA_MIN_PASS: "1"
       MLXFAST_MTP_SEMANTIC_GPQA_MODEL: claude-opus-4-8
+      # Paired semantic floor (WARN-ONLY first release; flip
+      # MLXFAST_MTP_SEMANTIC_GPQA_PAIRED_ENFORCE to "1" only after the
+      # operator has judged reference captures across enough sessions to
+      # calibrate the delta). The judge gates on
+      # candidate_pass >= max(reference_pass - delta, MIN_PASS) with a
+      # reference-min session-validity guard; reference capture is
+      # best-effort until the pinned baseline tree is rotated to a ref that
+      # ships mtp-generate-gpqa-answers.
+      MLXFAST_MTP_SEMANTIC_GPQA_PAIRED_DELTA: "1"
+      MLXFAST_MTP_SEMANTIC_GPQA_REFERENCE_MIN_PASS: "1"
+      MLXFAST_MTP_SEMANTIC_GPQA_PAIRED_ENFORCE: "0"
+      # Untimed extended correctness legs. The block-size sweep re-runs the
+      # exact-token gate at additional protocol block sizes (fail-closed,
+      # exact-token, no new artifacts needed); empty the list to disable in
+      # an emergency. The sweep uses a shorter decode total to bound job
+      # time; the base 512-token leg above remains authoritative.
+      MLXFAST_MTP_GATE_BLOCK_SIZE_SWEEP: "2 3"
+      MLXFAST_MTP_GATE_SWEEP_TOKENS: "128"
+      # Hidden sliding-window-wrap correctness golden (final offset past the
+      # 1,024-position ring-buffer wrap; see
+      # MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens). The leg is
+      # SKIPPED with a notice while these pins are empty; once the operator
+      # provisions and pins the R2 object the leg becomes a fail-closed
+      # exact-token gate. A non-empty pin that mismatches the download fails
+      # the run.
+      MLXFAST_MTP_WRAP_GOLDEN_SHA256: ""
+      MLXFAST_MTP_WRAP_GOLDEN_BYTES: ""
+      MLXFAST_MTP_WRAP_GOLDEN_TOKENS: "1536"
+      # Per-run rotation of the untimed correctness gate: a pinned pool
+      # manifest plus deterministic selection keyed on run id/attempt. Only
+      # the UNTIMED gate rotates; the timed benchmark golden stays fixed
+      # (rotating it would force baseline recalibration). Members without
+      # operator-provisioned pins are skipped by the selector.
+      MLXFAST_MTP_GATE_ROTATION_POOL: fixtures/mtp_correctness_gate_rotation_pool.json
+      # Untimed in-session reference oracle replay: the pinned baseline tree
+      # replays a prefix of the frozen correctness golden; divergence is
+      # classified as INFRASTRUCTURE drift, never a candidate failure.
+      MLXFAST_MTP_REFERENCE_REPLAY_TOKENS: "128"
       # --- Benchmark plumbing (shared with serial-benchmark.yml).
       MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
@@ -276,6 +314,21 @@ jobs:
             echo "::error::MTP semantic GPQA non-inferiority threshold is missing or outside the configured case count" >&2
             exit 1
           fi
+          # Optional wrap-golden pins: both empty (leg skipped) or both
+          # well-formed (leg enabled). One-sided or malformed pins fail
+          # closed rather than silently skipping a provisioned leg.
+          if [[ -n "${MLXFAST_MTP_WRAP_GOLDEN_SHA256}" || -n "${MLXFAST_MTP_WRAP_GOLDEN_BYTES}" ]]; then
+            if [[ ! "${MLXFAST_MTP_WRAP_GOLDEN_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+                || [[ ! "${MLXFAST_MTP_WRAP_GOLDEN_BYTES}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::MTP wrap-golden pins are partially set or malformed; set both MLXFAST_MTP_WRAP_GOLDEN_SHA256 and MLXFAST_MTP_WRAP_GOLDEN_BYTES or clear both" >&2
+              exit 1
+            fi
+          fi
+          if [[ ! "${MLXFAST_MTP_WRAP_GOLDEN_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::MLXFAST_MTP_WRAP_GOLDEN_TOKENS must be a positive integer" >&2
+            exit 1
+          fi
+          test -s "${MLXFAST_MTP_GATE_ROTATION_POOL}"
           if [[ "${CONFIRM_TRACK_ENABLED}" != "1" ]]; then
             echo "::error::MTP default-track interlock is disabled; dispatch requires confirm_track_enabled=true" >&2
             exit 1
@@ -863,6 +916,7 @@ jobs:
           MLXFAST_MTP_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/mtp_correctness_golden_gemma4_31b_it-v1.json
           MLXFAST_MTP_BENCH_GOLDEN_R2_PATH: correctness_prompts/mtp_benchmark_golden_gemma4_31b_it-v1.json
           MLXFAST_MTP_SEMANTIC_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json
+          MLXFAST_MTP_WRAP_GOLDEN_R2_PATH: correctness_prompts/mtp_correctness_golden_gemma4_31b_it_wrap-v1.json
         run: |
           set -euo pipefail
           .github/scripts/download-r2-object.sh \
@@ -900,6 +954,70 @@ jobs:
             exit 1
           fi
           install -m 0444 "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden.json" "${golden_dst}"
+          # --- Extended untimed correctness legs (wrap + rotation). These are
+          # gate-only artifacts: they are staged into the bench-NON-writable
+          # .mtp-ranked-src dir like the base golden, consumed only by the
+          # extended-legs step, and scrubbed everywhere the base golden is.
+          stage_extended_golden() {
+            local src="$1" dst_name="$2"
+            local dst="${MLXFAST_JOB_WS}/.mtp-ranked-src/${dst_name}"
+            if [[ -e "${dst}" || -L "${dst}" ]]; then
+              echo "::error::refusing to place hidden input over pre-existing path ${dst}" >&2
+              exit 1
+            fi
+            install -m 0444 "${src}" "${dst}"
+          }
+          if [[ -n "${MLXFAST_MTP_WRAP_GOLDEN_SHA256}" ]]; then
+            .github/scripts/download-r2-object.sh \
+              "${MLXFAST_MTP_WRAP_GOLDEN_R2_PATH}" \
+              "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden_wrap.json"
+            wrap_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden_wrap.json" | awk '{print $1}')"
+            wrap_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden_wrap.json" | tr -d ' ')"
+            if [[ "${wrap_hash}" != "${MLXFAST_MTP_WRAP_GOLDEN_SHA256}" || "${wrap_bytes}" != "${MLXFAST_MTP_WRAP_GOLDEN_BYTES}" ]]; then
+              echo "::error::hidden MTP wrap-golden pin mismatch" >&2
+              exit 1
+            fi
+            stage_extended_golden \
+              "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden_wrap.json" \
+              mtp_correctness_golden_wrap.json
+            echo "mtp-benchmark: sliding-window-wrap correctness golden staged (${MLXFAST_MTP_WRAP_GOLDEN_TOKENS} decode tokens)"
+          else
+            echo "::notice::MTP wrap-golden pins are empty; the >1024-final-offset correctness leg is SKIPPED until the operator provisions and pins ${MLXFAST_MTP_WRAP_GOLDEN_R2_PATH}"
+          fi
+          # Deterministic per-run rotation draw (auditable: seed and member id
+          # are logged; the pool manifest is a public trusted fixture).
+          rotation_seed=$((GITHUB_RUN_ID + GITHUB_RUN_ATTEMPT))
+          rotation_member="$(.github/scripts/select-mtp-gate-rotation.sh \
+            "${MLXFAST_MTP_GATE_ROTATION_POOL}" "${rotation_seed}")"
+          if [[ -n "${rotation_member}" && "${rotation_member}" != "{}" ]]; then
+            rotation_id="$(jq -r '.id' <<< "${rotation_member}")"
+            rotation_r2_key="$(jq -r '.r2_key' <<< "${rotation_member}")"
+            rotation_sha="$(jq -r '.sha256' <<< "${rotation_member}")"
+            rotation_bytes="$(jq -r '.bytes' <<< "${rotation_member}")"
+            rotation_tokens="$(jq -r '.decode_tokens' <<< "${rotation_member}")"
+            rotation_block_size="$(jq -r '.block_size' <<< "${rotation_member}")"
+            .github/scripts/download-r2-object.sh \
+              "${rotation_r2_key}" \
+              "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden_rotation.json"
+            rot_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden_rotation.json" | awk '{print $1}')"
+            rot_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden_rotation.json" | tr -d ' ')"
+            if [[ "${rot_hash}" != "${rotation_sha}" || "${rot_bytes}" != "${rotation_bytes}" ]]; then
+              echo "::error::hidden MTP rotation-golden pin mismatch for member ${rotation_id}" >&2
+              exit 1
+            fi
+            stage_extended_golden \
+              "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden_rotation.json" \
+              mtp_correctness_golden_rotation.json
+            jq -n \
+              --arg id "${rotation_id}" \
+              --argjson tokens "${rotation_tokens}" \
+              --argjson block_size "${rotation_block_size}" \
+              '{id: $id, decode_tokens: $tokens, block_size: $block_size}' \
+              > "${MLXFAST_PRIVATE_DIR}/mtp-rotation-leg.json"
+            echo "mtp-benchmark: rotation leg drew member ${rotation_id} (seed=${rotation_seed}, tokens=${rotation_tokens}, block_size=${rotation_block_size})"
+          else
+            echo "::notice::MTP gate rotation pool has no provisioned members; the rotation leg is SKIPPED until the operator provisions and pins pool objects (seed=${rotation_seed})"
+          fi
           echo "mtp-benchmark: hidden correctness, timing, and semantic fixtures verified"
 
       # TOCTOU guard: the submitted transform ran with workspace write access
@@ -908,6 +1026,55 @@ jobs:
         run: |
           .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
           .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
+
+      # UNTIMED in-session reference oracle replay: before judging the
+      # candidate, the PINNED baseline tree (trusted operator artifact, the
+      # same tree the timed denominator runs from) serially replays a prefix
+      # of the frozen correctness golden via its own mtp-probe. The oracle is
+      # a frozen file, so silent host drift (macOS/Metal/silicon updates
+      # flipping a near-tie argmax) would otherwise surface as a candidate
+      # token mismatch. Classification contract:
+      #   - replay reproduces the golden  -> proceed;
+      #   - replay DIVERGES from golden   -> INFRASTRUCTURE failure (the
+      #     frozen oracle no longer matches the pinned reference on this
+      #     box); the run fails as infra/non-candidate and the operator must
+      #     re-freeze goldens before serving submissions;
+      #   - replay cannot launch (missing baseline tree/binaries, sandbox or
+      #     provisioning gap) -> loud warning + skip; this new step must not
+      #     brick ranked runs on provisioning differences.
+      # This step runs trusted (never through bench-exec): the baseline tree
+      # is operator-owned reference code, exactly like the timed denominator.
+      - name: MTP reference oracle replay (untimed)
+        run: |
+          set -euo pipefail
+          replay_log="${MLXFAST_PRIVATE_DIR}/mtp-reference-replay.log"
+          replay_stdout="${MLXFAST_PRIVATE_DIR}/mtp-reference-replay.stdout"
+          baseline_cli="${MLXFAST_MTP_BASELINE_WS}/.build/release/mlxfast-swift"
+          if [[ ! -x "${baseline_cli}" \
+              || ! -d "${MLXFAST_MTP_BASELINE_WS}/mtp-weights" ]]; then
+            echo "::warning::pinned MTP baseline tree is not runnable here (missing CLI or mtp-weights); SKIPPING the reference oracle replay"
+            exit 0
+          fi
+          status=0
+          # shellcheck disable=SC2024  # trusted shell owns the capture files
+          ( cd "${MLXFAST_MTP_BASELINE_WS}" \
+            && exec .build/release/mlxfast-swift mtp-probe \
+              --weights mtp-weights \
+              --golden "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden.json" \
+              --block-size 1 \
+              --tokens "${MLXFAST_MTP_REFERENCE_REPLAY_TOKENS}" \
+          ) > "${replay_stdout}" 2> "${replay_log}" || status=$?
+          if [[ "${status}" -eq 0 ]] \
+              && jq -e '.all_tokens_matched == true' "${replay_stdout}" >/dev/null 2>&1; then
+            echo "mtp-benchmark: reference oracle replay reproduced the frozen golden (${MLXFAST_MTP_REFERENCE_REPLAY_TOKENS} tokens)"
+            exit 0
+          fi
+          if grep -q "mismatch at step" "${replay_log}" 2>/dev/null; then
+            echo "::error::INFRASTRUCTURE: the pinned reference tree no longer reproduces the frozen MTP correctness golden in this session; this is host/reference drift, NOT a candidate failure. Quarantine ranked runs and re-freeze the hidden goldens before serving submissions." >&2
+            exit 1
+          fi
+          echo "::warning::reference oracle replay could not complete (exit=${status}); SKIPPING (provisioning/launch issue, not classified as drift). Investigate the baseline tree before trusting this session's drift classification."
+          exit 0
 
       # The untimed MTP correctness/parity gate: one full-length trained-MTP
       # pass over the hidden correctness golden. The trusted parent checks
@@ -935,6 +1102,16 @@ jobs:
           trap 'rm -f -- "${raw_stdout}" "${gates_log}"' EXIT
           started="${SECONDS}"
           status=0
+          # UNTIMED committed-KV audit (WARN-ONLY; see Constants.swift for the
+          # calibration procedure). The flag is passed ONLY here, never to the
+          # timed measure-mtp-job invocation. The reference workspace enables
+          # the pinned-reference serial-replay comparison when the baseline
+          # tree is runnable from the bench sandbox; every audit failure mode
+          # degrades to a report status, never a gate failure.
+          audit_reference_ws=""
+          if [[ -x "${MLXFAST_MTP_BASELINE_WS}/.build-worker/release/mlxfast-runtime-worker" ]]; then
+            audit_reference_ws="${MLXFAST_MTP_BASELINE_WS}"
+          fi
           # shellcheck disable=SC2024  # trusted shell owns the capture files
           sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
             /usr/bin/env \
@@ -944,6 +1121,7 @@ jobs:
               MLXFAST_MTP_CONTRACT_PATH="${MLXFAST_MTP_CONTRACT_PATH}" \
               MLXFAST_MTP_BLOCK_SIZE="${MLXFAST_MTP_BLOCK_SIZE}" \
               MLXFAST_MTP_CORRECTNESS_TOKENS="${MLXFAST_MTP_CORRECTNESS_TOKENS}" \
+              MLXFAST_MTP_AUDIT_REFERENCE_WS="${audit_reference_ws}" \
               /bin/bash -c '
                 set -u
                 cd "${MJOB_WS}" || exit 97
@@ -957,6 +1135,8 @@ jobs:
                   --tokens "${MLXFAST_MTP_CORRECTNESS_TOKENS}" \
                   --target-verification exact-pair \
                   --deny-worker-file-writes \
+                  --audit-committed-state \
+                  --audit-reference-workspace "${MLXFAST_MTP_AUDIT_REFERENCE_WS}" \
                   --require-trained-assistant
               ' > "${raw_stdout}" 2> "${gates_log}" || status=$?
           if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" != "1" ]]; then
@@ -986,6 +1166,30 @@ jobs:
               echo "::error::MTP correctness gate report failed validation (exit=${status})" >&2
               exit 1
             }
+          # Committed-KV audit surface (WARN-ONLY): the block must be present
+          # because this step requested the audit (its absence
+          # means the trusted wiring broke), but a would-fail verdict is only
+          # LOGGED -- categorical reasons, no token/logit content -- until
+          # the operator calibrates the envelopes and flips enforcement.
+          jq -e '
+            .committed_state_audit
+            and (.committed_state_audit.would_fail | type == "boolean")
+            and (.committed_state_audit.status | type == "string")
+            and (.committed_state_audit.reference_status | type == "string")
+            and (.committed_state_audit.would_fail_reasons | type == "array")
+            ' "${raw_stdout}" >/dev/null || {
+              echo "::error::MTP correctness gate report is missing the committed-state audit block" >&2
+              exit 1
+            }
+          audit_status="$(jq -r '.committed_state_audit.status' "${raw_stdout}")"
+          audit_reference_status="$(jq -r '.committed_state_audit.reference_status' "${raw_stdout}")"
+          audit_would_fail="$(jq -r '.committed_state_audit.would_fail' "${raw_stdout}")"
+          if [[ "${audit_would_fail}" == "true" ]]; then
+            audit_reasons="$(jq -r '.committed_state_audit.would_fail_reasons | join("; ")' "${raw_stdout}")"
+            echo "::warning::committed-KV audit WOULD FAIL (WARN-ONLY until the operator calibrates the envelopes in MLXFastConstants and flips enforcement): ${audit_reasons} (status=${audit_status}, reference=${audit_reference_status})"
+          else
+            echo "mtp-benchmark: committed-KV audit clean (status=${audit_status}, reference=${audit_reference_status})"
+          fi
           jq -n \
             --arg track "${MLXFAST_MTP_TRACK_ID}" \
             --argjson token_count "${MLXFAST_MTP_CORRECTNESS_TOKENS}" \
@@ -997,6 +1201,118 @@ jobs:
             }' > "${verdict}"
           echo "mtp-benchmark: correctness/parity gate passed in $((SECONDS - started))s (exit=${status})"
           exit "${status}"
+
+      # UNTIMED extended exact-token correctness legs. Same trusted seal and
+      # validation discipline as the base gate above, still strictly before
+      # any semantic material or timed phase:
+      #   1. block-size sweep: re-runs the exact-token gate at the additional
+      #      protocol block sizes over the base hidden golden (fail-closed;
+      #      a kernel that only decodes correctly at K=4 must not rank);
+      #   2. sliding-window-wrap leg: a longer hidden golden whose final
+      #      offset crosses the 1,024-position ring-buffer wrap (fail-closed
+      #      once staged; skipped with a notice until provisioned);
+      #   3. rotation leg: the per-run pool member drawn deterministically in
+      #      "Prepare hidden MTP goldens" (fail-closed once staged; skipped
+      #      with a notice until the pool is provisioned).
+      # Every leg is exact-token (a single divergent token fails the run);
+      # none of these legs runs in, or changes, the timed measure-mtp-job.
+      - name: MTP extended correctness legs (untimed)
+        env:
+          BENCH_JOB_ID: mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-gates-extended
+        run: |
+          set -euo pipefail
+          leg_stdout="${MLXFAST_PRIVATE_DIR}/mtp-gates-extended-stdout.raw"
+          leg_log="${MLXFAST_PRIVATE_DIR}/mtp-gates-extended-private.log"
+          trap 'rm -f -- "${leg_stdout}" "${leg_log}"' EXIT
+          run_leg() {
+            local leg_name="$1" leg_golden_rel="$2" leg_tokens="$3" leg_block_size="$4"
+            local leg_golden_abs="${MLXFAST_JOB_WS}/${leg_golden_rel}"
+            local started="${SECONDS}"
+            local status=0
+            rm -f -- "${leg_stdout}" "${leg_log}"
+            # shellcheck disable=SC2024  # trusted shell owns the capture files
+            BENCH_GOLDEN_PATH="${leg_golden_abs}" \
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /usr/bin/env \
+                MJOB_WS="${MLXFAST_JOB_WS}" \
+                MLXFAST_MTP_TARGET_DIR="${MLXFAST_MTP_TARGET_DIR}" \
+                MLXFAST_MTP_ASSISTANT_DIR="${MLXFAST_MTP_ASSISTANT_DIR}" \
+                MLXFAST_MTP_CONTRACT_PATH="${MLXFAST_MTP_CONTRACT_PATH}" \
+                LEG_GOLDEN_REL="${leg_golden_rel}" \
+                LEG_TOKENS="${leg_tokens}" \
+                LEG_BLOCK_SIZE="${leg_block_size}" \
+                /bin/bash -c '
+                  set -u
+                  cd "${MJOB_WS}" || exit 97
+                  exec .build/release/mlxfast-swift mtp-benchmark \
+                    --target-source "${MLXFAST_MTP_TARGET_DIR}" \
+                    --weights mtp-weights \
+                    --assistant "${MLXFAST_MTP_ASSISTANT_DIR}" \
+                    --contract "${MLXFAST_MTP_CONTRACT_PATH}" \
+                    --golden "${LEG_GOLDEN_REL}" \
+                    --block-size "${LEG_BLOCK_SIZE}" \
+                    --tokens "${LEG_TOKENS}" \
+                    --target-verification exact-pair \
+                    --deny-worker-file-writes \
+                    --require-trained-assistant
+                ' > "${leg_stdout}" 2> "${leg_log}" || status=$?
+            if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" != "1" ]]; then
+              cat "${leg_log}" || true
+            fi
+            if [[ "$(jq -s 'length' "${leg_stdout}" 2>/dev/null)" != "1" ]]; then
+              echo "::error::MTP extended correctness leg ${leg_name} did not emit a single valid report payload (exit=${status})" >&2
+              exit 1
+            fi
+            jq -e \
+              --arg track "${MLXFAST_MTP_TRACK_ID}" \
+              --argjson tokens "${leg_tokens}" \
+              --argjson block_size "${leg_block_size}" \
+              '
+              .experimental == true
+              and .track_id == $track
+              and .uses_trained_drafter == true
+              and .target_verification_mode == "exact-pair"
+              and .max_block_size == $block_size
+              and .decode_token_count == $tokens
+              and .all_tokens_matched == true
+              and .official_score_produced == false
+              and (has("score") | not)
+              and (has("speedup") | not)
+              ' "${leg_stdout}" >/dev/null || {
+                echo "::error::MTP extended correctness leg ${leg_name} failed validation (exit=${status})" >&2
+                exit 1
+              }
+            if [[ "${status}" -ne 0 ]]; then
+              echo "::error::MTP extended correctness leg ${leg_name} exited ${status}" >&2
+              exit "${status}"
+            fi
+            echo "mtp-benchmark: extended correctness leg ${leg_name} passed in $((SECONDS - started))s (tokens=${leg_tokens}, block_size=${leg_block_size})"
+          }
+          for sweep_block_size in ${MLXFAST_MTP_GATE_BLOCK_SIZE_SWEEP}; do
+            run_leg "block-size-${sweep_block_size}" \
+              ".mtp-ranked-src/mtp_correctness_golden.json" \
+              "${MLXFAST_MTP_GATE_SWEEP_TOKENS}" \
+              "${sweep_block_size}"
+          done
+          if [[ -f "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden_wrap.json" ]]; then
+            run_leg "window-wrap" \
+              ".mtp-ranked-src/mtp_correctness_golden_wrap.json" \
+              "${MLXFAST_MTP_WRAP_GOLDEN_TOKENS}" \
+              "${MLXFAST_MTP_BLOCK_SIZE}"
+          else
+            echo "::notice::window-wrap correctness leg skipped (wrap golden not provisioned)"
+          fi
+          if [[ -s "${MLXFAST_PRIVATE_DIR}/mtp-rotation-leg.json" ]]; then
+            rotation_id="$(jq -r '.id' "${MLXFAST_PRIVATE_DIR}/mtp-rotation-leg.json")"
+            rotation_tokens="$(jq -r '.decode_tokens' "${MLXFAST_PRIVATE_DIR}/mtp-rotation-leg.json")"
+            rotation_block_size="$(jq -r '.block_size' "${MLXFAST_PRIVATE_DIR}/mtp-rotation-leg.json")"
+            run_leg "rotation-${rotation_id}" \
+              ".mtp-ranked-src/mtp_correctness_golden_rotation.json" \
+              "${rotation_tokens}" \
+              "${rotation_block_size}"
+          else
+            echo "::notice::rotation correctness leg skipped (no provisioned pool member)"
+          fi
 
       # Defense in depth after the trusted CLI has already required confirmed
       # RuntimeWorkerClient termination. Reap the bench uid and independently
@@ -1027,13 +1343,17 @@ jobs:
       - name: Scrub exact MTP oracle before semantic capture
         run: |
           set -euo pipefail
-          exact_oracle="${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json"
-          rm -f -- "${exact_oracle}"
-          if [[ -e "${exact_oracle}" || -L "${exact_oracle}" ]]; then
-            echo "::error::exact MTP oracle remained readable before semantic capture" >&2
-            exit 1
-          fi
-          echo "mtp-benchmark: exact correctness oracle scrubbed before semantic capture"
+          for exact_oracle in \
+            "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json" \
+            "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden_wrap.json" \
+            "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden_rotation.json"; do
+            rm -f -- "${exact_oracle}"
+            if [[ -e "${exact_oracle}" || -L "${exact_oracle}" ]]; then
+              echo "::error::exact MTP oracle remained readable before semantic capture" >&2
+              exit 1
+            fi
+          done
+          echo "mtp-benchmark: exact correctness oracles scrubbed before semantic capture"
 
       # Independent secondary gate. Exact-token failure above stops the job
       # before this step, so semantic judging can never rescue parity. The
@@ -1055,12 +1375,16 @@ jobs:
           answers="${MLXFAST_JOB_WS}/private/mtp_semantic_gpqa_answers.json"
           semantic_src="${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference.json"
           semantic_dst="${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_semantic_gpqa_reference.json"
-          exact_oracle="${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json"
           rm -f -- "${raw_stdout}" "${capture_log}"
-          if [[ -e "${exact_oracle}" || -L "${exact_oracle}" ]]; then
-            echo "::error::refusing semantic launch while exact MTP oracle remains staged" >&2
-            exit 1
-          fi
+          for exact_oracle in \
+            "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json" \
+            "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden_wrap.json" \
+            "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden_rotation.json"; do
+            if [[ -e "${exact_oracle}" || -L "${exact_oracle}" ]]; then
+              echo "::error::refusing semantic launch while exact MTP oracle remains staged" >&2
+              exit 1
+            fi
+          done
           if [[ -e "${semantic_dst}" || -L "${semantic_dst}" ]]; then
             echo "::error::refusing to place MTP semantic input over a pre-existing path" >&2
             exit 1
@@ -1148,16 +1472,77 @@ jobs:
           test "$(stat -f '%Lp' "${answers}")" = "600"
           echo "mtp-benchmark: semantic GPQA capture completed"
 
+      # BEST-EFFORT reference semantic capture for the paired floor. The
+      # PINNED baseline tree replays the same semantic-only prompts through
+      # its own capture CLI so the judge can score candidate and reference
+      # interleaved in one session. The pinned baseline tree may predate
+      # mtp-generate-gpqa-answers; until the operator rotates it, this step
+      # detects that and skips with a notice, and the judge falls back to
+      # the absolute floor. Runs trusted (the baseline tree is operator
+      # reference code); never touches the judge credential; the reference
+      # answers live runner-private and are scrubbed with the other semantic
+      # material. Note this adds up to five reference model loads/decodes of
+      # untimed wall time when active.
+      - name: Capture reference semantic GPQA answers (best-effort, untimed)
+        run: |
+          set -euo pipefail
+          umask 077
+          baseline_cli="${MLXFAST_MTP_BASELINE_WS}/.build/release/mlxfast-swift"
+          reference_answers="${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference_answers.json"
+          capture_log="${MLXFAST_PRIVATE_DIR}/mtp-semantic-reference-capture.log"
+          rm -f -- "${reference_answers}" "${capture_log}"
+          if [[ ! -x "${baseline_cli}" \
+              || ! -d "${MLXFAST_MTP_BASELINE_WS}/mtp-weights" ]]; then
+            echo "::warning::pinned MTP baseline tree is not runnable here; SKIPPING reference semantic capture (paired floor falls back to the absolute floor)"
+            exit 0
+          fi
+          if ! "${baseline_cli}" help 2>/dev/null | grep -q "mtp-generate-gpqa-answers"; then
+            echo "::warning::pinned MTP baseline tree predates mtp-generate-gpqa-answers; SKIPPING reference semantic capture until the operator rotates the baseline tree (paired floor falls back to the absolute floor)"
+            exit 0
+          fi
+          status=0
+          # shellcheck disable=SC2024  # trusted shell owns the capture files
+          ( cd "${MLXFAST_MTP_BASELINE_WS}" \
+            && exec /usr/bin/env \
+              MLXFAST_PRIVATE_DIR="${MLXFAST_PRIVATE_DIR}" \
+              .build/release/mlxfast-swift mtp-generate-gpqa-answers \
+                --target-source "${MLXFAST_MTP_TARGET_DIR}" \
+                --weights mtp-weights \
+                --assistant "${MLXFAST_MTP_ASSISTANT_DIR}" \
+                --contract "${MLXFAST_MTP_CONTRACT_PATH}" \
+                --tokenizer "${MLXFAST_MTP_TARGET_DIR}" \
+                --gpqa "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference.json" \
+                --output "${reference_answers}" \
+                --block-size "${MLXFAST_MTP_BLOCK_SIZE}" \
+                --case-count "${MLXFAST_MTP_SEMANTIC_GPQA_CASE_COUNT}" \
+                --max-new-tokens "${MLXFAST_MTP_SEMANTIC_GPQA_MAX_NEW_TOKENS}" \
+                --require-trained-assistant \
+          ) > /dev/null 2> "${capture_log}" || status=$?
+          if [[ "${status}" -ne 0 || ! -f "${reference_answers}" ]]; then
+            echo "::warning::reference semantic capture failed (exit=${status}); SKIPPING (paired floor falls back to the absolute floor)"
+            rm -f -- "${reference_answers}"
+            exit 0
+          fi
+          chmod 600 "${reference_answers}"
+          echo "mtp-benchmark: reference semantic GPQA answers captured"
+
       # Trusted networked verdict-only judge. No score exists yet and this
       # mode never creates or patches one; the detailed private result is
       # consumed only as a pass/fail gate and scrubbed in the next step.
+      # The paired floor is WARN-ONLY (MLXFAST_MTP_SEMANTIC_GPQA_PAIRED_ENFORCE)
+      # until operator calibration; the absolute 1-of-5 floor stays the
+      # fail-closed backstop either way.
       - name: MTP semantic GPQA gate (untimed)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
           MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: ${{ env.MLXFAST_JOB_WS }}/private/mtp_semantic_gpqa_answers.json
+          MLXFAST_SEMANTIC_GPQA_REFERENCE_OUTPUT_PATH: ${{ env.MLXFAST_PRIVATE_DIR }}/mtp_semantic_gpqa_reference_answers.json
           MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: ${{ env.MLXFAST_MTP_SEMANTIC_GPQA_RESULTS_PATH }}
           MLXFAST_SEMANTIC_GPQA_MODEL: ${{ env.MLXFAST_MTP_SEMANTIC_GPQA_MODEL }}
           MLXFAST_SEMANTIC_GPQA_MIN_PASS: ${{ env.MLXFAST_MTP_SEMANTIC_GPQA_MIN_PASS }}
+          MLXFAST_SEMANTIC_GPQA_PAIRED_DELTA: ${{ env.MLXFAST_MTP_SEMANTIC_GPQA_PAIRED_DELTA }}
+          MLXFAST_SEMANTIC_GPQA_REFERENCE_MIN_PASS: ${{ env.MLXFAST_MTP_SEMANTIC_GPQA_REFERENCE_MIN_PASS }}
+          MLXFAST_SEMANTIC_GPQA_PAIRED_ENFORCE: ${{ env.MLXFAST_MTP_SEMANTIC_GPQA_PAIRED_ENFORCE }}
           MLXFAST_SEMANTIC_GPQA_EXPECTED_CASE_COUNT: ${{ env.MLXFAST_MTP_SEMANTIC_GPQA_CASE_COUNT }}
           MLXFAST_SEMANTIC_GPQA_EXPECTED_MAX_NEW_TOKENS: ${{ env.MLXFAST_MTP_SEMANTIC_GPQA_MAX_NEW_TOKENS }}
           MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
@@ -1187,6 +1572,8 @@ jobs:
           if [[ -d "${MLXFAST_JOB_WS}" ]]; then
             rm -f -- \
               "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json" \
+              "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden_wrap.json" \
+              "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden_rotation.json" \
               "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_semantic_gpqa_reference.json"
             rm -rf "${MLXFAST_JOB_WS}/private"
             mkdir -p "${MLXFAST_JOB_WS}/private"
@@ -1194,21 +1581,27 @@ jobs:
           if [[ -d "${MLXFAST_PRIVATE_DIR}" ]]; then
             rm -f -- \
               "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference.json" \
+              "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference_answers.json" \
               "${MLXFAST_MTP_SEMANTIC_GPQA_RESULTS_PATH}" \
               "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.stdout" \
-              "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.log"
+              "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.log" \
+              "${MLXFAST_PRIVATE_DIR}/mtp-semantic-reference-capture.log"
             find "${MLXFAST_PRIVATE_DIR}" -maxdepth 1 \
               \( -name 'semantic-gpqa.*' -o -name 'mtp_semantic_gpqa*' -o -name 'mtp-semantic-*' \) \
               -exec rm -rf -- {} +
           fi
           for sensitive_path in \
             "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json" \
+            "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden_wrap.json" \
+            "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden_rotation.json" \
             "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_semantic_gpqa_reference.json" \
             "${MLXFAST_JOB_WS}/private/mtp_semantic_gpqa_answers.json" \
             "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference.json" \
+            "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference_answers.json" \
             "${MLXFAST_MTP_SEMANTIC_GPQA_RESULTS_PATH}" \
             "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.stdout" \
-            "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.log"; do
+            "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.log" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-semantic-reference-capture.log"; do
             if [[ -e "${sensitive_path}" || -L "${sensitive_path}" ]]; then
               echo "::error::MTP semantic GPQA scrub left private material" >&2
               exit 1
@@ -1251,13 +1644,22 @@ jobs:
           set -euo pipefail
           rm -f \
             "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json" \
+            "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden_wrap.json" \
+            "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden_rotation.json" \
             "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_semantic_gpqa_reference.json"
           rm -f \
             "${MLXFAST_PRIVATE_DIR}/mtp-gates-stdout.raw" \
             "${MLXFAST_PRIVATE_DIR}/mtp-gates-private.log" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-gates-extended-stdout.raw" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-gates-extended-private.log" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-reference-replay.stdout" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-reference-replay.log" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-rotation-leg.json" \
             "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.stdout" \
             "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.log" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-semantic-reference-capture.log" \
             "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference.json" \
+            "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference_answers.json" \
             "${MLXFAST_MTP_SEMANTIC_GPQA_RESULTS_PATH}" \
             mtp-correctness-verdict.json \
             mtp-gates-report.json
@@ -1309,9 +1711,16 @@ jobs:
           for raw_report in \
             "${MLXFAST_PRIVATE_DIR}/mtp-gates-stdout.raw" \
             "${MLXFAST_PRIVATE_DIR}/mtp-gates-private.log" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-gates-extended-stdout.raw" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-gates-extended-private.log" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-reference-replay.stdout" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-reference-replay.log" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-rotation-leg.json" \
             "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.stdout" \
             "${MLXFAST_PRIVATE_DIR}/mtp-semantic-capture.log" \
+            "${MLXFAST_PRIVATE_DIR}/mtp-semantic-reference-capture.log" \
             "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference.json" \
+            "${MLXFAST_PRIVATE_DIR}/mtp_semantic_gpqa_reference_answers.json" \
             "${MLXFAST_MTP_SEMANTIC_GPQA_RESULTS_PATH}" \
             mtp-gates-report.json; do
             if [[ -e "${raw_report}" || -L "${raw_report}" ]]; then

@@ -224,10 +224,13 @@ func officialMTPBenchmarkDefaultsNoWriteWhileLocalRemainsOptIn() throws {
         to: "- name: Scrub exact MTP oracle before semantic capture"
     )
     #expect(exactBody.contains("--deny-worker-file-writes"))
+    // Exactly two untimed gate invocations carry the no-write flag: the base
+    // correctness gate and the extended-legs runner. The timed
+    // measure-mtp-job invocation never does.
     #expect(
         workflow.components(
             separatedBy: "--deny-worker-file-writes"
-        ).count - 1 == 1
+        ).count - 1 == 2
     )
 
     let timedBody = try mtpSemanticStepBody(

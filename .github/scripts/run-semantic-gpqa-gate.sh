@@ -104,6 +104,49 @@ if [[ "${verdict_only}" -eq 1 && ! "${MIN_PASS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "::error::verdict-only semantic GPQA requires a positive non-inferiority threshold" >&2
   exit 1
 fi
+# --- Paired semantic floor (WARN-ONLY until MLXFAST_SEMANTIC_GPQA_PAIRED_ENFORCE=1).
+# When a reference answers file is supplied (captured from the pinned
+# baseline tree through the same capture CLI), both sides are judged
+# interleaved in one session and the candidate is additionally held to
+#   pass_count >= max(reference_pass_count - PAIRED_DELTA, MIN_PASS)
+# with a reference-min session-validity guard: a reference scoring below
+# REFERENCE_MIN_PASS marks the judging session itself invalid
+# (infrastructure, never a candidate failure). Reference capture is
+# best-effort: a missing or invalid reference file falls back to the
+# absolute MIN_PASS floor with a notice. This path never touches
+# score.json; paired mode requires verdict-only mode.
+REFERENCE_ANSWERS_PATH="${MLXFAST_SEMANTIC_GPQA_REFERENCE_OUTPUT_PATH:-}"
+PAIRED_DELTA="${MLXFAST_SEMANTIC_GPQA_PAIRED_DELTA:-1}"
+REFERENCE_MIN_PASS="${MLXFAST_SEMANTIC_GPQA_REFERENCE_MIN_PASS:-1}"
+PAIRED_ENFORCE_RAW="${MLXFAST_SEMANTIC_GPQA_PAIRED_ENFORCE:-0}"
+case "${PAIRED_ENFORCE_RAW}" in
+  1|true|TRUE|yes|YES)
+    paired_enforce=1
+    ;;
+  0|false|FALSE|no|NO|"")
+    paired_enforce=0
+    ;;
+  *)
+    echo "::error::MLXFAST_SEMANTIC_GPQA_PAIRED_ENFORCE must be boolean-like" >&2
+    exit 1
+    ;;
+esac
+if ! [[ "${PAIRED_DELTA}" =~ ^[0-9]+$ ]]; then
+  echo "::error::MLXFAST_SEMANTIC_GPQA_PAIRED_DELTA must be a non-negative integer" >&2
+  exit 1
+fi
+if ! [[ "${REFERENCE_MIN_PASS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "::error::MLXFAST_SEMANTIC_GPQA_REFERENCE_MIN_PASS must be a positive integer" >&2
+  exit 1
+fi
+paired_mode=0
+if [[ -n "${REFERENCE_ANSWERS_PATH}" ]]; then
+  if [[ "${verdict_only}" -ne 1 ]]; then
+    echo "::error::paired semantic GPQA requires verdict-only mode (it must never patch score.json)" >&2
+    exit 1
+  fi
+  paired_mode=1
+fi
 for cap_name in \
   MAX_ANSWER_BYTES \
   MAX_JUDGE_REQUEST_BYTES \
@@ -189,59 +232,82 @@ if [[ -n "${EXPECTED_MAX_NEW_TOKENS}" ]] \
   echo "::error::MLXFAST_SEMANTIC_GPQA_EXPECTED_MAX_NEW_TOKENS must be an integer in 1...64" >&2
   exit 1
 fi
-jq -e \
-  --argjson expected_max_new_tokens "${EXPECTED_MAX_NEW_TOKENS:-0}" \
-  --argjson verdict_only "${verdict_only}" \
-  '
-  type == "object"
-  and ((keys | sort) == ["cases", "version"])
-  and .version == 1
-  and (.cases | type == "array" and length > 0)
-  and ([.cases[].id] | length == (unique | length))
-  and all(.cases[];
+validate_answers_document() {
+  local document_path="$1"
+  jq -e \
+    --argjson expected_max_new_tokens "${EXPECTED_MAX_NEW_TOKENS:-0}" \
+    --argjson verdict_only "${verdict_only}" \
+    '
     type == "object"
-    and ((keys - [
-      "answer_key",
-      "candidate_answer",
-      "candidate_tokens",
-      "domain",
-      "id",
-      "max_new_tokens",
-      "prompt",
-      "reference_answer",
-      "subdomain"
-    ]) | length == 0)
-    and (.id | type == "string" and length > 0)
-    and (.prompt | type == "string" and length > 0)
-    and (.reference_answer | type == "string" and length > 0)
-    and (.candidate_answer | type == "string")
-    and (.answer_key == null or (.answer_key | type == "string"))
-    and (.domain == null or (.domain | type == "string"))
-    and (.subdomain == null or (.subdomain | type == "string"))
-    and (.max_new_tokens | type == "number" and floor == . and . > 0 and . <= 64)
-    and ($expected_max_new_tokens == 0 or .max_new_tokens == $expected_max_new_tokens)
-    and (
-      .max_new_tokens as $max_new_tokens
-      | (.candidate_tokens
-        | type == "array"
-          and length > 0
-          and (
-            if $verdict_only == 1 then
-              length == $max_new_tokens
-            else
-              length <= $max_new_tokens
-            end
-          ))
+    and ((keys | sort) == ["cases", "version"])
+    and .version == 1
+    and (.cases | type == "array" and length > 0)
+    and ([.cases[].id] | length == (unique | length))
+    and all(.cases[];
+      type == "object"
+      and ((keys - [
+        "answer_key",
+        "candidate_answer",
+        "candidate_tokens",
+        "domain",
+        "id",
+        "max_new_tokens",
+        "prompt",
+        "reference_answer",
+        "subdomain"
+      ]) | length == 0)
+      and (.id | type == "string" and length > 0)
+      and (.prompt | type == "string" and length > 0)
+      and (.reference_answer | type == "string" and length > 0)
+      and (.candidate_answer | type == "string")
+      and (.answer_key == null or (.answer_key | type == "string"))
+      and (.domain == null or (.domain | type == "string"))
+      and (.subdomain == null or (.subdomain | type == "string"))
+      and (.max_new_tokens | type == "number" and floor == . and . > 0 and . <= 64)
+      and ($expected_max_new_tokens == 0 or .max_new_tokens == $expected_max_new_tokens)
+      and (
+        .max_new_tokens as $max_new_tokens
+        | (.candidate_tokens
+          | type == "array"
+            and length > 0
+            and (
+              if $verdict_only == 1 then
+                length == $max_new_tokens
+              else
+                length <= $max_new_tokens
+              end
+            ))
+      )
+      and all(.candidate_tokens[];
+        type == "number" and floor == . and . >= 0 and . < 262144
+      )
     )
-    and all(.candidate_tokens[];
-      type == "number" and floor == . and . >= 0 and . < 262144
-    )
-  )
-  ' "${ANSWERS_PATH}" >/dev/null \
+    ' "${document_path}" >/dev/null
+}
+
+validate_answers_document "${ANSWERS_PATH}" \
   || {
     echo "::error file=${ANSWERS_PATH}::semantic GPQA answer document failed strict schema validation" >&2
     exit 1
   }
+
+# Reference answers are BEST-EFFORT: any validation failure degrades to the
+# absolute floor with a notice instead of failing the gate (the pinned
+# baseline tree may predate the capture CLI until the operator rotates it).
+if [[ "${paired_mode}" -eq 1 ]]; then
+  if [[ ! -f "${REFERENCE_ANSWERS_PATH}" || -L "${REFERENCE_ANSWERS_PATH}" ]]; then
+    echo "semantic-gpqa: reference answers unavailable; falling back to the absolute floor (paired mode disabled this session)"
+    paired_mode=0
+  elif ! validate_answers_document "${REFERENCE_ANSWERS_PATH}" 2>/dev/null; then
+    echo "::warning::reference semantic answers failed strict schema validation; falling back to the absolute floor (paired mode disabled this session)"
+    paired_mode=0
+  elif ! jq -e --slurpfile candidate "${ANSWERS_PATH}" \
+      '([.cases[].id] | sort) == ($candidate[0].cases | [.[].id] | sort)' \
+      "${REFERENCE_ANSWERS_PATH}" >/dev/null 2>&1; then
+    echo "::warning::reference semantic answers cover different case ids than the candidate capture; falling back to the absolute floor (paired mode disabled this session)"
+    paired_mode=0
+  fi
+fi
 case "${REQUIRED}" in
   1|true|TRUE|yes|YES)
     semantic_required=1
@@ -418,10 +484,14 @@ remaining_gate_seconds() {
 if [[ "${verdict_only}" -eq 0 ]]; then
   echo "semantic-gpqa: judging ${case_count} hidden cases with ${MODEL}; min_pass=${MIN_PASS}; required=${semantic_required}"
 fi
-for index in $(seq 0 $((case_count - 1))); do
-  request_path="${work_dir}/request-${index}.json"
-  response_path="${work_dir}/response-${index}.json"
-  case_id="$(jq -r --argjson index "${index}" '.cases[$index].id // ("case-" + (($index + 1) | tostring))' "${ANSWERS_PATH}")"
+judge_one_case() {
+  local document_path="$1"
+  local index="$2"
+  local side="$3"
+  local request_path="${work_dir}/request-${side}-${index}.json"
+  local response_path
+  local case_id
+  case_id="$(jq -r --argjson index "${index}" '.cases[$index].id // ("case-" + (($index + 1) | tostring))' "${document_path}")"
 
   jq \
     --arg model "${MODEL}" \
@@ -457,7 +527,7 @@ for index in $(seq 0 $((case_count - 1))); do
           ]
         }
       ]
-    }' "${ANSWERS_PATH}" > "${request_path}"
+    }' "${document_path}" > "${request_path}"
   require_bounded_regular_file \
     "${request_path}" \
     "${MAX_JUDGE_REQUEST_BYTES}" \
@@ -468,10 +538,11 @@ for index in $(seq 0 $((case_count - 1))); do
   # curl's retry-max-time limits one transport attempt, and the script-wide
   # deadline limits every case/attempt combined. Only an end_turn response
   # with the exact expected content/verdict shape is accepted.
-  judge_json="${work_dir}/judge-${index}.json"
-  judge_json_text=""
+  local judge_json="${work_dir}/judge-${side}-${index}.json"
+  local judge_json_text=""
+  local attempt remaining request_timeout retry_timeout passed
   for ((attempt = 1; attempt <= JUDGE_ATTEMPTS; attempt++)); do
-    response_path="${work_dir}/response-${index}-${attempt}.json"
+    response_path="${work_dir}/response-${side}-${index}-${attempt}.json"
     remaining="$(remaining_gate_seconds)"
     request_timeout="${CURL_TIMEOUT_SECONDS}"
     retry_timeout="${CURL_RETRY_TIME_SECONDS}"
@@ -527,23 +598,34 @@ for index in $(seq 0 $((case_count - 1))); do
   if [[ -z "${judge_json_text}" ]]; then
     jq -n \
       --arg id "${case_id}" \
+      --arg side "${side}" \
       --argjson index "$((index + 1))" \
-      '{id: $id, index: $index, passed: false, error: "invalid_judge_response"}' >> "${results_ndjson}"
+      '{id: $id, index: $index, side: $side, passed: false, error: "invalid_judge_response"}' >> "${results_ndjson}"
     if [[ "${verdict_only}" -eq 0 ]]; then
       echo "semantic-gpqa: case $((index + 1))/${case_count} passed=false reason=invalid_judge_response"
     fi
-    continue
+    return 0
   fi
   printf '%s' "${judge_json_text}" > "${judge_json}"
   chmod 600 "${judge_json}"
   passed="$(jq -r '.passed' "${judge_json}")"
   jq -n \
     --arg id "${case_id}" \
+    --arg side "${side}" \
     --argjson index "$((index + 1))" \
     --argjson passed "${passed}" \
-    '{id: $id, index: $index, passed: $passed}' >> "${results_ndjson}"
+    '{id: $id, index: $index, side: $side, passed: $passed}' >> "${results_ndjson}"
   if [[ "${verdict_only}" -eq 0 ]]; then
     echo "semantic-gpqa: case $((index + 1))/${case_count} passed=${passed}"
+  fi
+}
+
+# Candidate and reference are judged INTERLEAVED within one judge session so
+# per-session judge drift affects both sides symmetrically.
+for index in $(seq 0 $((case_count - 1))); do
+  judge_one_case "${ANSWERS_PATH}" "${index}" "candidate"
+  if [[ "${paired_mode}" -eq 1 ]]; then
+    judge_one_case "${REFERENCE_ANSWERS_PATH}" "${index}" "reference"
   fi
 done
 
@@ -551,16 +633,35 @@ results_tmp="${work_dir}/semantic-gpqa-results.json"
 jq -s \
   --arg model "${MODEL}" \
   --argjson min_pass "${MIN_PASS}" \
+  --argjson paired_mode "${paired_mode}" \
+  --argjson paired_delta "${PAIRED_DELTA}" \
+  --argjson reference_min "${REFERENCE_MIN_PASS}" \
+  --argjson paired_enforce "${paired_enforce}" \
   '
-  (map(select(.passed == true)) | length) as $pass_count |
+  (map(select(.side == "candidate" and .passed == true)) | length) as $pass_count |
+  (map(select(.side == "candidate")) | length) as $candidate_case_count |
+  (map(select(.side == "reference" and .passed == true)) | length) as $reference_pass_count |
+  ([$reference_pass_count - $paired_delta, $min_pass] | max) as $paired_required |
   {
     model: $model,
     min_pass_count: $min_pass,
-    case_count: length,
+    case_count: $candidate_case_count,
     pass_count: $pass_count,
     passed: ($pass_count >= $min_pass),
-    cases: .
-  }' "${results_ndjson}" > "${results_tmp}"
+    paired_mode: ($paired_mode == 1),
+    paired_enforced: ($paired_enforce == 1)
+  }
+  + (if $paired_mode == 1 then
+      {
+        reference_pass_count: $reference_pass_count,
+        paired_delta: $paired_delta,
+        reference_min_pass_count: $reference_min,
+        paired_required_pass_count: $paired_required,
+        paired_passed: ($pass_count >= $paired_required),
+        reference_session_valid: ($reference_pass_count >= $reference_min)
+      }
+    else {} end)
+  + { cases: . }' "${results_ndjson}" > "${results_tmp}"
 chmod 600 "${results_tmp}"
 require_bounded_regular_file \
   "${results_tmp}" \
@@ -619,6 +720,32 @@ fi
 if [[ "${semantic_passed}" != "true" ]]; then
   echo "semantic-gpqa: diagnostic did not meet threshold pass_count=${semantic_pass_count}/${semantic_case_count}"
   exit 0
+fi
+
+# Paired floor evaluation. WARN-ONLY until the operator flips
+# MLXFAST_SEMANTIC_GPQA_PAIRED_ENFORCE=1 after calibrating the delta and the
+# reference-min floor against judged reference captures on the ranked box.
+# Log lines in verdict-only mode deliberately carry no pass counts (the same
+# covert-channel discipline as the absolute verdict); the detailed counts
+# live only in the runner-private results file.
+if [[ "${paired_mode}" -eq 1 ]]; then
+  paired_session_valid="$(jq -r '.reference_session_valid' "${RESULTS_PATH}")"
+  paired_passed="$(jq -r '.paired_passed' "${RESULTS_PATH}")"
+  if [[ "${paired_session_valid}" != "true" ]]; then
+    if [[ "${paired_enforce}" -eq 1 ]]; then
+      echo "::error::INFRASTRUCTURE: paired semantic judging session is invalid (the pinned reference scored below the session-validity floor); this is a reference/judge problem, never a candidate failure" >&2
+      exit 1
+    fi
+    echo "::warning::paired semantic judging session WOULD BE INVALID (reference below its session-validity floor); WARN-ONLY until MLXFAST_SEMANTIC_GPQA_PAIRED_ENFORCE=1 (details runner-private)"
+  elif [[ "${paired_passed}" != "true" ]]; then
+    if [[ "${paired_enforce}" -eq 1 ]]; then
+      echo "::error::semantic GPQA paired floor failed" >&2
+      exit 1
+    fi
+    echo "::warning::candidate WOULD FAIL the paired semantic floor; WARN-ONLY until MLXFAST_SEMANTIC_GPQA_PAIRED_ENFORCE=1 (details runner-private)"
+  else
+    echo "semantic-gpqa: paired floor satisfied"
+  fi
 fi
 
 if [[ "${verdict_only}" -eq 1 ]]; then

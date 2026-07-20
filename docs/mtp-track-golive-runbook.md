@@ -486,7 +486,8 @@ change):
 
 1. **Ranked decode denominator: 512 tokens** (`MLXFAST_MTP_DECODE_TOKENS`;
    the goldens carry 512 decode tokens, the contract's `decode_tokens: 128`
-   remains the CLI compatibility default with `maximum_decode_tokens: 512`).
+   remains the CLI compatibility default with `maximum_decode_tokens: 1536`;
+   the ranked timed window stays the workflow-owned 512).
 2. **Aggregation: ratio-of-means** — the published score is
    `mean(serial s/tok) / mean(mtp s/tok)` over the accepted pairs, computed
    in the trusted shell from the sealed per-side means; per-pair
@@ -509,3 +510,64 @@ Still open (non-blocking for the enablement draft):
    calibrations across boxes — same rule as the serial track).
 8. **Public IT fixture:** whether to check in a public IT-target golden for
    participant local iteration at go-live or later.
+
+## D. Correctness-gate hardening — operator provisioning checklist
+
+The gate-hardening change (extended untimed correctness legs, per-run gate
+rotation, in-session reference replay, paired semantic floor, committed-KV
+audit) ships with every artifact-dependent leg SKIPPING gracefully and every
+new numeric/semantic verdict WARN-ONLY. Nothing below blocks serving; each
+item upgrades one warn/skip into an enforced control. Work through them in
+order:
+
+1. **Provision the >1,024-final-offset (sliding-window wrap) correctness
+   golden.** Generate a hidden IT-target golden whose single case carries at
+   least `MLXFAST_MTP_WRAP_GOLDEN_TOKENS + 1` (default 1,537) expected
+   tokens using the same B.2 capture procedure on M5 silicon. Upload to R2
+   at `correctness_prompts/mtp_correctness_golden_gemma4_31b_it_wrap-v1.json`
+   and fill BOTH workflow pins `MLXFAST_MTP_WRAP_GOLDEN_SHA256` /
+   `MLXFAST_MTP_WRAP_GOLDEN_BYTES`. The wrap leg then becomes a fail-closed
+   exact-token gate (final offset 512 + 1,536 = 2,048 crosses the
+   1,024-position ring-buffer wrap, the regime the base 512-token gate
+   structurally never reaches).
+2. **Provision the rotation pool.** For each member of
+   `fixtures/mtp_correctness_gate_rotation_pool.json`, freeze a hidden
+   golden (same B.2 procedure; vary prompt category), upload to the
+   member's `r2_key`, and fill its `sha256`/`bytes` pins. Selection is
+   deterministic per run (`seed = run_id + attempt`,
+   `index = seed % eligible`), logged with the member id; only the UNTIMED
+   gate rotates — never the timed benchmark golden (that would force
+   baseline recalibration).
+3. **Rotate the pinned MTP baseline tree** (`MLXFAST_MTP_BASELINE_WS`) to a
+   ref that contains this hardening change. That single rotation activates
+   two best-effort paths at once: reference semantic capture
+   (`mtp-generate-gpqa-answers` exists in the tree) for the paired semantic
+   floor, and the reference serial-replay side of the committed-KV audit
+   (the tree's plain worker understands `mtp_audit_serial_replay`).
+   Rebuild `mtp-weights` in the rotated tree and re-run the C.6 calibration
+   after rotating. Also confirm the bench uid can traverse/read the
+   baseline tree; if it cannot, the audit logs
+   `reference_status=unsupported_or_failed` and the operator must grant
+   read access or accept candidate-only auditing.
+4. **Calibrate the committed-KV audit envelopes, then flip enforcement.**
+   Follow the calibration procedure documented at the
+   `mtpCommittedStateAudit*` constants in
+   `Sources/MLXFastCore/Constants.swift` (legit-variant spread × safety
+   factor, BF16 epsilon floor, plus the two negative controls: the M5
+   step-48 incident kernel and a deliberately-approximate kernel must
+   FAIL). Then, in one reviewed change: update the constants and make the
+   workflow's committed-KV `would_fail` verdict fail the run (today it only
+   logs a `::warning::`).
+5. **Calibrate and flip the paired semantic floor.** Collect judged
+   reference captures across enough sessions to fix
+   `MLXFAST_MTP_SEMANTIC_GPQA_PAIRED_DELTA` and
+   `MLXFAST_MTP_SEMANTIC_GPQA_REFERENCE_MIN_PASS`, then set
+   `MLXFAST_MTP_SEMANTIC_GPQA_PAIRED_ENFORCE: "1"`. The absolute 1-of-5
+   floor stays fail-closed throughout; a reference below the reference-min
+   floor is an INFRASTRUCTURE (session-invalid) outcome, never a candidate
+   failure.
+6. **Reference oracle replay stays advisory for launch failures.** The
+   untimed replay step hard-fails a run ONLY on a token mismatch
+   (infrastructure drift: re-freeze goldens before serving). If it logs
+   `SKIPPING` on ranked runs, fix baseline-tree runnability from the
+   trusted shell — do not leave the drift classifier dormant.

@@ -170,14 +170,25 @@ provisional regression heuristics informed by those tests and quantization
 behavior, not representation-derived bounds. An optimization must calibrate
 on M5 before relying on or loosening them.
 
-These tensor checks are not ranked submission gates. Candidate-linked test
-code never receives hidden correctness or benchmark oracle paths. Ranked
+These tensor checks are not ranked submission gates. They run only when a
+developer opts in locally with `MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1` (plus
+local weights); no ranked step evaluates them. Candidate-linked test
+code never receives hidden correctness or benchmark oracle paths. The ranked,
+fail-closed guarantee is exactly: exact returned token IDs against the
+parent-owned serial oracle plus exact cache geometry/accounting. Ranked
 enforcement combines parent-owned exact returned token IDs and logical
 protocol/report-consistency validation (`all_tokens_matched` and
 `parity_all_ok`) with track-aware static review and hidden behavioral checks.
 Cache offsets, physical rollback/geometry, and numerical state are checked
 inside the candidate worker/model plus trusted implementation regressions and
-manual/operator validation, not independently observed by the parent.
+manual/operator validation, not independently observed by the parent. One
+ranked-path numeric check is staged: the untimed committed-KV +
+next-decision-probe audit (`committed_state_audit`), which compares the
+candidate's actual committed cache digests and final-position probe against a
+pinned-reference serial replay within operator-calibrated envelopes. It ships
+WARN-ONLY (reported in the gate report and logged, never failing a run) until
+its envelopes are calibrated on the M5 box, and is then intended to become
+the single ranked-enforced numeric gate.
 
 For configured block size `K` in `2...4`, one round:
 
@@ -869,7 +880,12 @@ that is not linked into submission code.
   envelopes; the serial K=1 mode remains the fail-closed development control.
 - Decodes whose sliding offset crosses the 1,024-position window wrap lose
   pair eligibility and serialize the remaining rows; within the current
-  512-seed/512-decode contract this affects only the final pair position.
+  512-seed/512-decode TIMED contract this affects only the final pair
+  position. The untimed correctness gate can now exercise the wrap regime
+  directly: the trusted-parent configured maximum is 1,536 decode tokens and
+  the workflow's window-wrap leg (operator-provisioned wrap golden, final
+  offset 2,048) runs the ring-buffer wrap as a fail-closed exact-token gate
+  once its pins are filled.
 - The path-based upstream loader cannot atomically bind open descriptors;
   before/after hash validation plus read-only operator ownership mitigates
   TOCTOU, so official provisioning must continue enforcing ownership and

@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "track_id": "gemma4-31b-it-mtp-v1",
+  "purpose": "Pinned pool for per-run rotation of the UNTIMED MTP correctness gate. One member is drawn deterministically per ranked run (seed = GITHUB_RUN_ID + GITHUB_RUN_ATTEMPT, index = seed % eligible member count) by .github/scripts/select-mtp-gate-rotation.sh, downloaded from R2, pin-verified, and run as an additional fail-closed exact-token leg. The TIMED benchmark golden never rotates: rotating it would force baseline recalibration. Members whose sha256/bytes pins are empty are not yet operator-provisioned and are skipped by the selector; fill r2_key, sha256, and bytes after freezing each golden on the ranked M5 box (see docs/mtp-track-golive-runbook.md).",
+  "members": [
+    {
+      "id": "rotation-prose-256-k4",
+      "r2_key": "correctness_prompts/mtp_correctness_golden_gemma4_31b_it_rot_prose-v1.json",
+      "sha256": "",
+      "bytes": "",
+      "decode_tokens": 256,
+      "block_size": 4
+    },
+    {
+      "id": "rotation-code-256-k3",
+      "r2_key": "correctness_prompts/mtp_correctness_golden_gemma4_31b_it_rot_code-v1.json",
+      "sha256": "",
+      "bytes": "",
+      "decode_tokens": 256,
+      "block_size": 3
+    },
+    {
+      "id": "rotation-reasoning-384-k4",
+      "r2_key": "correctness_prompts/mtp_correctness_golden_gemma4_31b_it_rot_reasoning-v1.json",
+      "sha256": "",
+      "bytes": "",
+      "decode_tokens": 384,
+      "block_size": 4
+    },
+    {
+      "id": "rotation-copy-256-k2",
+      "r2_key": "correctness_prompts/mtp_correctness_golden_gemma4_31b_it_rot_copy-v1.json",
+      "sha256": "",
+      "bytes": "",
+      "decode_tokens": 256,
+      "block_size": 2
+    }
+  ]
+}
