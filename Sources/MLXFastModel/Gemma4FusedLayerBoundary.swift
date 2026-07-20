@@ -161,8 +161,10 @@ private let gemma4FusedAttentionToMLPBoundaryKernel = MLXFast.metalKernel(
 
 /// MTP-only two-row variant. Each grid-y threadgroup currently normalizes one
 /// token row while sharing a dispatch. The serial kernel itself is untouched.
-/// Alternate fusion or reduction trees are valid when exact token decisions,
-/// finite numeric envelopes, and cache geometry continue to pass.
+/// Alternate fusion or reduction trees are valid when exact token decisions
+/// and cache geometry continue to pass; the finite numeric envelopes are
+/// local opt-in regressions (MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1), not a
+/// ranked gate.
 private let gemma4FusedAttentionToMLPBoundaryPairKernel = MLXFast.metalKernel(
     name: "gemma4_fused_attention_to_mlp_boundary_pair_5376_mtp_v1",
     inputNames: [

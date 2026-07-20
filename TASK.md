@@ -22,12 +22,20 @@ The trusted parent drives:
 A path named `exact` is exact at that returned-token and protocol boundary,
 not at every floating-point intermediate. Pair/four-row kernels may
 reassociate reductions, fuse operations, or use alternate reduction
-strategies when logits, pre-norm hidden state, and KV values remain finite and
-inside their numeric regression envelopes. Shapes, dtypes where applicable,
+strategies. Shapes, dtypes where applicable,
 cache offsets and lengths, commit/rollback, physical row accounting, argmax
 decisions, and returned token IDs remain exact implementation contracts.
 
-Numeric-envelope tests are trusted/local/upstream development regressions and
+Be precise about what is ranked-enforced. The ranked, fail-closed guarantee
+is exactly: exact returned token IDs against the parent-owned serial oracle,
+plus exact protocol geometry and accounting (cache offsets, commit/rollback,
+physical row equations, report consistency). Interior-tensor numeric
+envelopes (logits, pre-norm hidden state, KV values) are LOCAL/trusted
+development heuristics that run only when a developer opts in with
+`MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1` and local weights; nothing on the ranked
+path evaluates them, so do not treat "inside the envelopes" as a ranked
+requirement or a ranked safety net. Numeric-envelope tests are
+trusted/local/upstream development regressions and
 must use public or operator-controlled non-hidden inputs. They are not invoked
 from candidate-linked ranked code with hidden oracle paths. Ranked enforcement
 combines the trusted parent's exact returned-token comparison and logical
@@ -38,7 +46,13 @@ implementation tests and manual/operator validation, not independently
 observed by the parent. The provisional tolerances are heuristics
 informed by existing tests and FP16/BF16 quantization behavior, not a proof of
 error detection; calibrate them on M5 before a kernel optimization relies on
-or loosens them.
+or loosens them. One ranked-path numeric check is being introduced: an
+untimed, post-timing committed-KV + next-decision-probe audit that compares
+the candidate's actual committed cache digests against a pinned-reference
+serial replay within calibrated envelopes. It ships WARN-ONLY (reported and
+logged, never failing a run) until the operator calibrates its envelopes on
+the M5 box; after calibration it is intended to become the one ranked-enforced
+numeric gate.
 
 A one-token divergence fails the run. The parent owns the timer and the
 logical token count; seed prefill is charged to decode. Ranked timing uses at

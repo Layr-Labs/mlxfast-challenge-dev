@@ -492,13 +492,17 @@ public local fixtures, and official scoring happens on the single self-hosted
 M5 runner. Kernel edits are bound by the same correctness gates as model
 edits: keep them prompt-independent and model-general for Gemma 4, and be
 free to reassociate reductions, fuse operations, or use alternate reduction
-strategies. Such changes must keep finite intermediates inside the documented
-numeric envelopes and preserve the exact-token gates; near-tie argmaxes can
+strategies. The ranked-enforced requirement is the exact-token gates plus
+exact cache geometry/accounting; near-tie argmaxes can
 still make a numerically small change fail behavior parity.
-The envelopes are provisional trusted/local/upstream regression heuristics
+The documented numeric envelopes are provisional trusted/local/upstream
+regression heuristics (opt-in via MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1 with
+local weights, never evaluated on the ranked path)
 informed by existing tests and FP16/BF16 quantization behavior; they do not
 guarantee every stale value is detected. Calibrate them on M5 before relying on
-or loosening them for a kernel change. Ranked candidate-linked code never
+or loosening them for a kernel change. A committed-KV + next-decision-probe
+audit against a pinned-reference serial replay is the planned ranked numeric
+check; it ships warn-only until its envelopes are M5-calibrated. Ranked candidate-linked code never
 receives hidden oracle paths for tensor parity. The trusted parent directly
 enforces exact returned token IDs and validates logical protocol/report
 consistency. Cache offsets, physical rollback/geometry, and numerical state
@@ -601,8 +605,9 @@ organizer-provisioned sidecar); a trusted parent drives a block protocol
 `mtp_decode_block` carrying only the last committed token and a max block
 size of 4), owns the timer and an independent serial-oracle check of every
 returned token, and divides its own wall time by its configured decode total
-(`--tokens` has a 128 compatibility default and 512 maximum; ranked workflow
-fixes 512). The participant surface is the drafting
+(`--tokens` has a 128 compatibility default and a 1,536 trusted-parent
+maximum used only by untimed correctness legs, including the
+sliding-window-wrap leg; ranked timed decode stays fixed at 512). The participant surface is the drafting
 and verification strategy inside `Sources/MLXFastModel/` — the
 `Gemma4TrainedMTPBlockSession` block decoder, behavior-exact pair kernels
 (`Gemma4ExactTwo*.swift`), and the distinct direct four-row kernels
@@ -610,11 +615,13 @@ and verification strategy inside `Sources/MLXFastModel/` — the
 production dispatch additionally requires adaptive margin-selector approval
 and four-row engine/cache geometry, otherwise K=4 composes pairs (with serial
 tails only at deterministic rotating-cache geometry).
-They may reassociate, fuse, or replace floating-point reduction strategies
-when intermediate tensors remain finite and inside the numeric regression
-envelopes. Those envelopes are provisional local/trusted checks, not ranked
+They may reassociate, fuse, or replace floating-point reduction strategies.
+The numeric regression envelopes are provisional local/trusted checks
+(opt-in via MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1), not ranked
 candidate gates, and require M5 calibration before an optimization relies on
-or loosens them. The implementation contract keeps target argmax and returned
+or loosens them; the ranked-enforced guarantee is exact returned tokens plus
+exact geometry/accounting, with a warn-only committed-KV/probe audit staged to
+become the calibrated ranked numeric check. The implementation contract keeps target argmax and returned
 token IDs, cache geometry, commit/rollback, and physical row accounting exact,
 but does not require bit-identical intermediate logits, hidden state, KV
 tensors, or serial K=1 reduction order. The legacy `bitExactTokenGate`

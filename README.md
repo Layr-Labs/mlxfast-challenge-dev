@@ -108,9 +108,11 @@ quality equivalence.
 Here, `exact-pair` means exact returned-token verification and exact logical
 protocol, offset, and counter accounting. It does not require bit-identical
 logits, hidden states, KV values, or serial K=1 reduction order.
-Reassociation, fusion, and alternate reduction strategies are allowed when
-finite intermediate tensors stay inside the documented numeric regression
-envelopes and implementation-level cache/rollback tests pass.
+Reassociation, fusion, and alternate reduction strategies are allowed. The
+documented numeric regression envelopes and implementation-level
+cache/rollback tests are local development checks (opt-in via
+`MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1` with local weights); the ranked path
+does not evaluate them.
 The mode also includes a distinct direct four-row forward with dedicated
 four-row kernels; it is not implemented solely as two pair calls. Production
 uses it only when the adaptive draft-margin selector and current engine/cache
@@ -120,12 +122,18 @@ Those provisional tensor envelopes are trusted/local/upstream heuristic
 regressions informed by existing tests and FP16/BF16 quantization behavior,
 not ranked checks. They do not prove every stale value will fail. Calibrate
 them on M5 before an optimization relies on or loosens them. Candidate-linked
-test code never receives hidden oracle paths. The ranked parent directly
+test code never receives hidden oracle paths. The ranked, fail-closed
+guarantee is exactly: exact returned token IDs plus exact cache
+geometry/accounting. The ranked parent directly
 enforces exact returned token IDs and validates logical protocol/report
 consistency. Cache offsets, physical rollback/geometry, and numerical state are
 checked within the candidate worker/model plus trusted implementation tests,
 track-aware static review, hidden behavioral outputs, and manual/operator
-validation rather than independent parent observation.
+validation rather than independent parent observation. A calibrated
+committed-KV + next-decision-probe audit (candidate committed cache digests
+compared against a pinned-reference serial replay, untimed, after the timer
+stops) is the planned ranked-enforced numeric check; it currently ships
+warn-only pending M5 envelope calibration.
 
 Timing runs last. At least three alternating candidate/reference pairs run
 behind the fixed 40C thermal gate. The published decode-only score is:
@@ -221,8 +229,10 @@ factory/tokenizer plumbing, kernels Gemma 4 does not dispatch such as
 `steel/attn`) stay non-editable. Kernel changes are bound by the same
 hidden correctness gates as model changes: keep them prompt-independent and
 model-general. Numeric reassociation, fusion, and alternate reduction
-strategies are explicitly permitted; they still must remain inside the
-intermediate numeric envelopes and preserve exact returned-token decisions.
+strategies are explicitly permitted; the ranked requirement is exact
+returned-token decisions and exact cache geometry/accounting. The
+intermediate numeric envelopes are local opt-in development checks
+(`MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1`), not ranked gates.
 Near-tie argmaxes make that token gate stricter than approximate tensor parity.
 The numeric checks use public/local fixtures or trusted upstream validation;
 ranked candidate code is checked by parent-owned exact token and logical

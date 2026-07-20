@@ -936,8 +936,12 @@ final class Gemma4FastLayer {
 
     /// Two causally ordered MTP target rows. Dense projections may share,
     /// fuse, or reassociate packed-weight work; "exact" requires exact target
-    /// token decisions plus the regression suite's finite numeric envelopes
-    /// and exact cache geometry, not serial K=1 intermediate bits.
+    /// token decisions and exact cache geometry, not serial K=1 intermediate
+    /// bits. The regression suite's finite numeric envelopes are local opt-in
+    /// development checks (MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1), not a ranked
+    /// gate; ranked runs enforce exact returned tokens plus
+    /// geometry/accounting, with a warn-only committed-KV/probe audit staged
+    /// to become the calibrated ranked numeric check.
     func exactMTPPair(
         _ x: MLXArray,
         normalizedInput: MLXArray?,
