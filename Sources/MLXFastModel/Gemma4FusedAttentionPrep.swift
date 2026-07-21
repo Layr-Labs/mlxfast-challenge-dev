@@ -1,6 +1,8 @@
 import Foundation
 import MLX
 
+nonisolated(unsafe) private let cachedInt32ScalarArrays: [MLXArray] = (0...32).map { MLXArray(Int32($0)) }
+
 private func gemma4PrefillAttentionEnvironmentFlag(
     _ name: String,
     default defaultValue: Bool
@@ -1062,7 +1064,7 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
         let rowsPerToken = isSliding ? 2 * kvHeads : kvHeads
         let inputs = [
             rawKeys, valueInput, kNormWeight, positionViews[offset],
-            MLXArray(Int32(length)), MLXArray(Int32(capacity)),
+            cachedInt32ScalarArrays[length], cachedInt32ScalarArrays[capacity],
             ropeCosines, ropeSines,
         ]
         let grid = (threads, capacity * rowsPerToken, 1)
@@ -1145,8 +1147,8 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
         let kvRowsPerToken = isSliding ? 2 * kvHeads : kvHeads
         let inputs = [
             rawQueries, rawKeys, valueInput, qNormWeight, kNormWeight,
-            positionViews[offset], MLXArray(Int32(length)),
-            MLXArray(Int32(capacity)), ropeCosines, ropeSines,
+            positionViews[offset], cachedInt32ScalarArrays[length],
+            cachedInt32ScalarArrays[capacity], ropeCosines, ropeSines,
         ]
         let grid = (
             threads,

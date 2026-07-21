@@ -1329,6 +1329,7 @@ final class Gemma4FastEngine {
     let finalNormWeight: MLXArray
     let eps: Float
     let softcap: Float
+    let softcapArray: MLXArray
     let layers: [Gemma4FastLayer]
     let slidingWindow: Int
     let asyncLayerGroup: Int
@@ -1350,6 +1351,7 @@ final class Gemma4FastEngine {
         self.embedScale = Float(config.hiddenSize).squareRoot()
         self.eps = config.rmsNormEps
         self.softcap = config.finalLogitSoftcapping
+        self.softcapArray = MLXArray(config.finalLogitSoftcapping)
         self.slidingWindow = config.slidingWindow
         let asyncLayerGroup = max(
             0,
@@ -1375,7 +1377,7 @@ final class Gemma4FastEngine {
             0,
             Int(ProcessInfo.processInfo.environment[
                 "DARKBLOOM_MTP_EXACT_PAIR_ASYNC_LAYER_GROUP"
-            ] ?? "12") ?? 12
+            ] ?? "6") ?? 6
         )
         self.exactPairAsyncLayerGroup = exactPairAsyncLayerGroup
         self.exactPairAsyncLayerLead = exactPairAsyncLayerGroup > 0
@@ -1627,7 +1629,7 @@ final class Gemma4FastEngine {
             hidden = gemma4LastTokenHidden(hidden)
             hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
         }
-        let cap = MLXArray(softcap)
+        let cap = softcapArray
         if let tiedVocabularyHead, usePacked13TiedVocabularyHead {
             let candidate = tiedVocabularyHead.packed13Softcapped(
                 hidden,
@@ -1713,7 +1715,7 @@ final class Gemma4FastEngine {
         }
         let logits = tiedVocabularyHead.exactTwoVectorPacked13Softcapped(
             result.normalizedInput,
-            cap: MLXArray(softcap)
+            cap: softcapArray
         )
         return Gemma4MTPForward(
             logits: logits.reshaped(1, 2, logits.dim(-1)),
@@ -1732,7 +1734,7 @@ final class Gemma4FastEngine {
         }
         let tokenIDs = tiedVocabularyHead.exactTwoVectorPacked13Argmax(
             result.normalizedInput,
-            cap: MLXArray(softcap)
+            cap: softcapArray
         )
         return Gemma4MTPTokenForward(
             tokenIDs: tokenIDs,
@@ -1812,7 +1814,7 @@ final class Gemma4FastEngine {
         }
         let logits = tiedVocabularyHead.exactFourVectorPacked13Softcapped(
             result.normalizedInput,
-            cap: MLXArray(softcap)
+            cap: softcapArray
         )
         return Gemma4MTPForward(
             logits: logits.reshaped(1, 4, logits.dim(-1)),
@@ -1831,7 +1833,7 @@ final class Gemma4FastEngine {
         }
         let tokenIDs = tiedVocabularyHead.exactFourVectorPacked13Argmax(
             result.normalizedInput,
-            cap: MLXArray(softcap)
+            cap: softcapArray
         )
         return Gemma4MTPTokenForward(
             tokenIDs: tokenIDs,
