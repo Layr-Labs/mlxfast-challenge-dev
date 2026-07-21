@@ -1,0 +1,24 @@
+# REGENERATE ON m5-bench WITH REAL WEIGHTS
+# Placeholder manifest for the Laguna XS 2.1 DFlash draft/assistant sidecar.
+# This manifest intentionally contains NO entries yet: the runtime sidecar is
+# the organizer's MLX affine 4-bit (group size 64) conversion of the upstream
+# BF16 speculator, and that converted artifact does not exist yet. setup-mtp.sh
+# fails closed on an entry-less manifest until the conversion is published,
+# hashed on m5-bench, and pinned here.
+#
+# Upstream draft: poolside/Laguna-XS-2.1-DFlash
+# Upstream revision: 5c36361aab23c8ed3afbd079c10c426b677bc607
+# Upstream BF16 model.safetensors: 924135848 bytes,
+#   sha256 0b51e20d76200a80e636414f45fb51a5c0e13b0852d977ba2db788214c68f6b8
+#   (Hugging Face LFS oid; the MLX 4-bit conversion is expected to land
+#   near 260 MB).
+# Upstream config.json: 963 bytes,
+#   sha256 22bdc5fd9fd41dc6945523fd504f1b70809af0f5ab26c09716e33616033ecf9a
+#   (5-layer DFlash Eagle speculator: block_size 16, mask_token_id 12,
+#   num_target_layers 40, target_layer_ids [1,13,25,33,39],
+#   draft_vocab_size 100352).
+#
+# Expected converted layout (fill with real values after conversion):
+# Format: <sha256> <byte_count> <relative_path>
+# <sha256-of-converted-config.json> <bytes> config.json
+# <sha256-of-converted-model.safetensors> <bytes> model.safetensors

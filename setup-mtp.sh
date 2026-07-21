@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# Provision the separate organizer-pinned Gemma 4 31B-IT MTP experiment.
+# Provision the separate organizer-pinned Laguna XS 2.1 MTP experiment.
 #
 # This script is intentionally independent from setup.sh: invoking the normal
-# setup path must never switch the base challenge to the IT target or download
+# setup path must never switch the base challenge to the MTP target or download
 # an assistant sidecar.
 set -euo pipefail
 umask 022
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-TARGET_MODEL_ID="mlx-community/gemma-4-31b-it-4bit"
-TARGET_REVISION="696d436c404745a59f30e4939a658162b0a9e57f"
-ASSISTANT_MODEL_ID="mlx-community/gemma-4-31B-it-qat-assistant-4bit"
-ASSISTANT_REVISION="5234fd588403c9b68f3bd20a140b7e61700cb7e2"
-TARGET_MANIFEST="${ROOT_DIR}/fixtures/mtp_gemma_4_31b_it_4bit.sha256"
-ASSISTANT_MANIFEST="${ROOT_DIR}/fixtures/mtp_gemma_4_31b_it_assistant_qat4bit.sha256"
+TARGET_MODEL_ID="mlx-community/Laguna-XS-2.1-4bit"
+TARGET_REVISION="c42e0a8f8d504ceacde015a535dcb286d65c8799"
+ASSISTANT_MODEL_ID="poolside/Laguna-XS-2.1-DFlash"
+ASSISTANT_REVISION="5c36361aab23c8ed3afbd079c10c426b677bc607"
+TARGET_MANIFEST="${ROOT_DIR}/fixtures/mtp_laguna_xs_2_1_4bit.sha256"
+ASSISTANT_MANIFEST="${ROOT_DIR}/fixtures/mtp_laguna_xs_2_1_dflash.sha256"
 
-DEFAULT_CACHE_ROOT="${HOME}/.cache/mlxfast/gemma4-31b-it-mtp-v1"
+DEFAULT_CACHE_ROOT="${HOME}/.cache/mlxfast/laguna-xs-2.1-mtp-v1"
 CACHE_ROOT="${MLXFAST_MTP_CACHE_ROOT:-${DEFAULT_CACHE_ROOT}}"
 TARGET_DIR="${MLXFAST_MTP_TARGET_DIR:-${CACHE_ROOT}/target}"
 ASSISTANT_DIR="${MLXFAST_MTP_ASSISTANT_DIR:-${CACHE_ROOT}/assistant}"
@@ -34,11 +34,16 @@ else
   TARGET_FALLBACK_BASE_URL=""
 fi
 
-# The assistant is mirrored as flat, manifest-pinned files in Darkbloom R2.
-# Stalled or failed mirror downloads fall back to the pinned Hugging Face
-# revision. An explicitly overridden primary has no implicit fallback.
-DEFAULT_ASSISTANT_BASE_URL="https://ds4.darkbloom.ai/gemma-4-31B-it-qat-assistant-4bit"
-DEFAULT_ASSISTANT_FALLBACK_BASE_URL="https://huggingface.co/${ASSISTANT_MODEL_ID}/resolve/${ASSISTANT_REVISION}"
+# The assistant sidecar is the organizer's MLX 4-bit conversion of the
+# upstream BF16 DFlash speculator. Until that conversion is published, keep
+# the pinned Hugging Face upstream as primary (the manifest fails closed on
+# the placeholder until real converted files are pinned) and the fallback
+# slot empty. An explicitly overridden primary has no implicit fallback.
+# TODO(operator): point this at the organizer mirror (e.g. Darkbloom R2)
+# hosting the MLX 4-bit DFlash conversion once it exists, and optionally
+# retain this Hugging Face URL as the fallback.
+DEFAULT_ASSISTANT_BASE_URL="https://huggingface.co/${ASSISTANT_MODEL_ID}/resolve/${ASSISTANT_REVISION}"
+DEFAULT_ASSISTANT_FALLBACK_BASE_URL=""
 ASSISTANT_BASE_URL="${MLXFAST_MTP_ASSISTANT_BASE_URL:-${DEFAULT_ASSISTANT_BASE_URL}}"
 if [[ -n "${MLXFAST_MTP_ASSISTANT_FALLBACK_BASE_URL+x}" ]]; then
   ASSISTANT_FALLBACK_BASE_URL="${MLXFAST_MTP_ASSISTANT_FALLBACK_BASE_URL}"
@@ -61,9 +66,9 @@ usage() {
   cat <<EOF
 Usage: ./setup-mtp.sh [--verify-only] [--target-only|--assistant-only] [--print-paths]
 
-Provision the explicit experimental Gemma 4 31B-IT target and its matched,
-organizer-pinned MTP assistant. Downloads are resumable and every byte is
-checked against the checked-in SHA256/size manifests.
+Provision the explicit experimental Laguna XS 2.1 target and its matched,
+organizer-pinned DFlash MTP assistant. Downloads are resumable and every byte
+is checked against the checked-in SHA256/size manifests.
 
 Cache paths:
   target:    ${TARGET_DIR}
@@ -415,19 +420,19 @@ if [[ "${PROVISION_TARGET}" == "1" ]]; then
   provision_manifest \
     "${TARGET_MANIFEST}" "${TARGET_DIR}" \
     "${TARGET_BASE_URL}" "${TARGET_FALLBACK_BASE_URL}" \
-    "Gemma 4 31B-IT target"
+    "Laguna XS 2.1 target"
 fi
 if [[ "${PROVISION_ASSISTANT}" == "1" ]]; then
   provision_manifest \
     "${ASSISTANT_MANIFEST}" "${ASSISTANT_DIR}" \
     "${ASSISTANT_BASE_URL}" "${ASSISTANT_FALLBACK_BASE_URL}" \
-    "Gemma 4 31B-IT assistant"
+    "Laguna XS 2.1 DFlash assistant"
 fi
 
 cat <<EOF
 setup-mtp.sh: MTP artifacts ready
   target:    ${TARGET_DIR}
   assistant: ${ASSISTANT_DIR}
-  source bytes: target=18444420181 assistant=264144321
+  source bytes: target=18829720326 assistant=pending MLX 4-bit DFlash conversion (upstream BF16 is 924135848)
   official score: disabled until a paired M5 rebaseline is established
 EOF
