@@ -160,6 +160,168 @@ func gemma4MTPTopTwoMargin(_ logits: MLXArray) -> MLXArray {
     )[0]
 }
 
+private let gemma4MTPFusedDraftArgmaxEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_FUSED_DRAFT_ARGMAX"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+// Fused variant of the top-two-margin reduction that also emits the argmax
+// index, replacing the separate MLX argMax pass over the 262,144 logits.
+// Value comparisons match gemma4_mtp_insert_top_two exactly, so the margin
+// output is bit-identical; the index uses first-max (lowest index on equal
+// values) semantics, tracked associatively so the reduction order cannot
+// change the winner.
+private let gemma4MTPTopTwoMarginArgmaxKernel = MLXFast.metalKernel(
+    name: "gemma4_mtp_top_two_margin_argmax_262144_v1",
+    inputNames: ["logits"],
+    outputNames: ["margin", "argmax_index"],
+    source: """
+        threadgroup float group_best[8];
+        threadgroup uint group_best_index[8];
+        threadgroup float group_second[8];
+
+        float best = -INFINITY;
+        uint best_index = 0xffffffffu;
+        float second = -INFINITY;
+        for (uint index = thread_position_in_threadgroup.x;
+             index < 262144;
+             index += threads_per_threadgroup.x) {
+            gemma4_mtp_insert_top_two_indexed(
+                static_cast<float>(logits[index]),
+                index,
+                best,
+                best_index,
+                second
+            );
+        }
+
+        for (ushort delta = 16; delta > 0; delta >>= 1) {
+            const float other_best = simd_shuffle_down(best, delta);
+            const uint other_best_index = simd_shuffle_down(best_index, delta);
+            const float other_second = simd_shuffle_down(second, delta);
+            if (thread_index_in_simdgroup + delta < 32) {
+                gemma4_mtp_merge_top_two_indexed(
+                    other_best, other_best_index, best, best_index, second);
+                gemma4_mtp_insert_second_only(other_second, best, second);
+            }
+        }
+        if (thread_index_in_simdgroup == 0) {
+            group_best[simdgroup_index_in_threadgroup] = best;
+            group_best_index[simdgroup_index_in_threadgroup] = best_index;
+            group_second[simdgroup_index_in_threadgroup] = second;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simdgroup_index_in_threadgroup == 0) {
+            if (thread_index_in_simdgroup < 8) {
+                best = group_best[thread_index_in_simdgroup];
+                best_index = group_best_index[thread_index_in_simdgroup];
+                second = group_second[thread_index_in_simdgroup];
+            } else {
+                best = -INFINITY;
+                best_index = 0xffffffffu;
+                second = -INFINITY;
+            }
+            for (ushort delta = 16; delta > 0; delta >>= 1) {
+                const float other_best = simd_shuffle_down(best, delta);
+                const uint other_best_index =
+                    simd_shuffle_down(best_index, delta);
+                const float other_second = simd_shuffle_down(second, delta);
+                if (thread_index_in_simdgroup + delta < 32) {
+                    gemma4_mtp_merge_top_two_indexed(
+                        other_best, other_best_index,
+                        best, best_index, second);
+                    gemma4_mtp_insert_second_only(other_second, best, second);
+                }
+            }
+            if (thread_index_in_simdgroup == 0) {
+                margin[0] = best - second;
+                argmax_index[0] = static_cast<int>(best_index);
+            }
+        }
+        """,
+    header: """
+        using namespace metal;
+
+        inline void gemma4_mtp_insert_top_two_indexed(
+            float value,
+            uint index,
+            thread float& best,
+            thread uint& best_index,
+            thread float& second
+        ) {
+            if (value > best) {
+                second = best;
+                best = value;
+                best_index = index;
+            } else if (value == best) {
+                if (index < best_index) {
+                    best_index = index;
+                }
+                if (value > second) {
+                    second = value;
+                }
+            } else if (value > second) {
+                second = value;
+            }
+        }
+
+        inline void gemma4_mtp_merge_top_two_indexed(
+            float other_best,
+            uint other_best_index,
+            thread float& best,
+            thread uint& best_index,
+            thread float& second
+        ) {
+            if (other_best > best) {
+                second = best;
+                best = other_best;
+                best_index = other_best_index;
+            } else if (other_best == best) {
+                if (other_best_index < best_index) {
+                    best_index = other_best_index;
+                }
+                if (other_best > second) {
+                    second = other_best;
+                }
+            } else if (other_best > second) {
+                second = other_best;
+            }
+        }
+
+        inline void gemma4_mtp_insert_second_only(
+            float value,
+            thread float& best,
+            thread float& second
+        ) {
+            if (value > best) {
+                second = best;
+                best = value;
+            } else if (value > second) {
+                second = value;
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func gemma4MTPTopTwoMarginArgmax(
+    _ logits: MLXArray
+) -> (margin: MLXArray, argmax: MLXArray) {
+    let outputs = gemma4MTPTopTwoMarginArgmaxKernel(
+        [logits],
+        grid: (256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1], [1]],
+        outputDTypes: [.float32, .int32]
+    )
+    return (outputs[0], outputs[1])
+}
+
 func gemma4MTPShouldUseExactFour(
     draftMargins: [Float],
     threshold: Float,
@@ -555,10 +717,20 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
                 positionOffset: Gemma4.PositionOffset.scalar(1)
             )
             let logits = output.logits[0..., -1, 0...]
-            let draft = logits.argMax(axis: -1).reshaped([1, 1])
+            let draft: MLXArray
             if gemma4MTPExactFourEnabled && gemma4MTPAdaptiveExactFourEnabled {
-                eval(draft, output.lastHidden, gemma4MTPTopTwoMargin(logits))
+                if gemma4MTPFusedDraftArgmaxEnabled {
+                    // Warm the fused margin+argmax pipeline the timed rounds
+                    // will use, so its JIT compile never lands in a block.
+                    let fused = gemma4MTPTopTwoMarginArgmax(logits)
+                    draft = fused.argmax.reshaped([1, 1])
+                    eval(draft, output.lastHidden, fused.margin)
+                } else {
+                    draft = logits.argMax(axis: -1).reshaped([1, 1])
+                    eval(draft, output.lastHidden, gemma4MTPTopTwoMargin(logits))
+                }
             } else {
+                draft = logits.argMax(axis: -1).reshaped([1, 1])
                 eval(draft, output.lastHidden)
             }
             draftInput = draft
@@ -743,11 +915,20 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
                 )
             }
             let draftLogits = assistantOutput.logits[0..., -1, 0...]
-            let draft = draftLogits.argMax(axis: -1)
-            if collectExactFourMargins {
-                draftMarginArrays.append(gemma4MTPTopTwoMargin(draftLogits))
+            let draft2D: MLXArray
+            if gemma4MTPFusedDraftArgmaxEnabled && collectExactFourMargins {
+                // One reduction pass yields both the margin and the drafted
+                // token, replacing the separate argMax pass over the logits.
+                let fused = gemma4MTPTopTwoMarginArgmax(draftLogits)
+                draftMarginArrays.append(fused.margin)
+                draft2D = fused.argmax.reshaped([1, 1])
+            } else {
+                let draft = draftLogits.argMax(axis: -1)
+                if collectExactFourMargins {
+                    draftMarginArrays.append(gemma4MTPTopTwoMargin(draftLogits))
+                }
+                draft2D = draft.reshaped([1, 1])
             }
-            let draft2D = draft.reshaped([1, 1])
             draftTokens.append(draft2D)
             draftInput = draft2D
             draftHidden = assistantOutput.lastHidden
