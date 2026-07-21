@@ -11,7 +11,12 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
         encoding: .utf8
     )
 
-    #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://ds4.darkbloom.ai/gemma-4-31b-4bit\""))
+    // TODO(operator): once a Darkbloom R2 mirror is provisioned for the Laguna
+    // checkpoint, re-pin this to the mirror URL (the Gemma track used
+    // https://ds4.darkbloom.ai/<model>). Until then the pinned Hugging Face
+    // revision is the primary source.
+    #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/c42e0a8f8d504ceacde015a535dcb286d65c8799\""))
+    #expect(setup.contains("DEFAULT_REFERENCE_FALLBACK_BASE_URL=\"https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/main\""))
     #expect(setup.contains("REFERENCE_BASE_URL=\"${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}\""))
     // 3 parallel shard downloads by default; env-overridable.
     #expect(setup.contains("REFERENCE_DOWNLOAD_JOBS=\"${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-3}\""))
@@ -239,6 +244,11 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     // The reference comes from the runner-owned cache, never a download. The
     // dependency-only SwiftPM cache is restored before the checkout is copied
     // into the bench workspace; ranked jobs never save submission build output.
+    // TODO(operator): the archived serial workflow still pins the retired Gemma
+    // reference cache/manifest; re-pin these to the Laguna checkpoint
+    // (models--mlx-community--Laguna-XS-2.1-4bit,
+    // fixtures/reference_laguna_xs_2_1_4bit.sha256) when the runner cache and
+    // workflow environment rotate.
     #expect(workflow.contains("MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main"))
     #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256"))
     #expect(workflow.contains("shasum -a 256 \"${path}\""))
@@ -1537,7 +1547,7 @@ func submissionStaticReviewPromptCoversMeasurementStructureExploitation() throws
         #expect(normalizedRule.contains("deferred cache rows"))
         #expect(normalizedRule.contains("one position and leaves no pending future token"))
         #expect(normalizedRule.contains("default"))
-        #expect(normalizedRule.contains("gemma 4 31b-it"))
+        #expect(normalizedRule.contains("laguna xs 2.1"))
         #expect(normalizedRule.contains("mtp_decode_block"))
         #expect(normalizedRule.contains("last committed token"))
     }
@@ -4712,12 +4722,12 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
     let refWeights = root.appendingPathComponent("reference_weights")
     try FileManager.default.createDirectory(at: refWeights, withIntermediateDirectories: true)
     try FileManager.default.createSymbolicLink(
-        atPath: refWeights.appendingPathComponent("gemma-4-31b-4bit").path,
+        atPath: refWeights.appendingPathComponent("laguna-xs-2.1-4bit").path,
         withDestinationPath: root.appendingPathComponent("does-not-exist").path
     )
 
     // A real cache directory holding the checkpoint.
-    let cache = root.appendingPathComponent("hfcache/models--mlx-community--gemma-4-31b-4bit/snapshots/main")
+    let cache = root.appendingPathComponent("hfcache/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main")
     try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
     try "{}".write(to: cache.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
 
@@ -4794,7 +4804,7 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
     let recorded = (try? String(contentsOf: reflog, encoding: .utf8)) ?? ""
     // The transform was handed the real cache dir, not the broken symlink.
     #expect(recorded.contains(cache.path))
-    #expect(!recorded.contains("reference_weights/gemma-4-31b-4bit"))
+    #expect(!recorded.contains("reference_weights/laguna-xs-2.1-4bit"))
 }
 
 @Test
