@@ -138,8 +138,8 @@ jobs:
       # (world-readable; verified against the pinned manifest below every
       # run). No download happens on this box, so the old
       # reference_download_jobs/reference_min_free_gib inputs are gone.
-      MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
-      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_4bit.sha256
       # Bench workspace: the ONLY place submitted code executes and writes.
       # Must live under /Users/Shared/bench-jobs (bench-exec refuses anything
       # else). The path is STABLE across runs (not per-run) because llbuild's

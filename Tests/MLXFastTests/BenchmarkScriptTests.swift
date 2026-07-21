@@ -244,13 +244,8 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     // The reference comes from the runner-owned cache, never a download. The
     // dependency-only SwiftPM cache is restored before the checkout is copied
     // into the bench workspace; ranked jobs never save submission build output.
-    // TODO(operator): the archived serial workflow still pins the retired Gemma
-    // reference cache/manifest; re-pin these to the Laguna checkpoint
-    // (models--mlx-community--Laguna-XS-2.1-4bit,
-    // fixtures/reference_laguna_xs_2_1_4bit.sha256) when the runner cache and
-    // workflow environment rotate.
-    #expect(workflow.contains("MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main"))
-    #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_4bit.sha256"))
     #expect(workflow.contains("shasum -a 256 \"${path}\""))
     #expect(workflow.contains("reference checkpoint failed manifest verification"))
     #expect(!workflow.contains("./setup.sh"))
