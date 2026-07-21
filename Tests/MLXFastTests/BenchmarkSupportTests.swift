@@ -1597,7 +1597,7 @@ func runtimeWorkerStartsTheOrphanReaperBeforeLoadingTheModel() throws {
     )
     let reaperCall = try #require(worker.range(of: "startRuntimeWorkerOrphanReaper()"))
     let protocolIO = try #require(worker.range(of: "RuntimeWorkerProtocolIO.isolatingStandardIO()"))
-    let weightCache = try #require(worker.range(of: "Gemma4RuntimeWeightCache(loader:"))
+    let weightCache = try #require(worker.range(of: "LagunaRuntimeWeightCache(loader:"))
     #expect(reaperCall.lowerBound < protocolIO.lowerBound)
     #expect(reaperCall.lowerBound < weightCache.lowerBound)
     #expect(worker.contains("getppid() == 1"))

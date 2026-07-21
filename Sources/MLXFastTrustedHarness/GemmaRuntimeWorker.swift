@@ -6,6 +6,7 @@ import MLX
 import MLXFastCore
 #if !MLXFAST_TRUSTED_HARNESS
 import MLXFastModel
+import MLXLMCommon
 #endif
 
 // GemmaRuntime is split across GemmaRuntime*.swift for auditability.
@@ -27,11 +28,11 @@ extension GemmaRuntime {
         // use standard I/O; none of that may be confused with protocol traffic.
         let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
         try validateRuntimeWorkerPinnedConfiguration(weightsPath: weightsPath)
-        let config = try Gemma4Config.load(from: weightsPath)
-        let loader = try Gemma4WeightLoader(weightsPath: weightsPath)
+        let config = try LagunaConfig.load(from: weightsPath)
+        let loader = try LagunaWeightLoader(weightsPath: weightsPath)
         // Validate transformed-weight structure HERE, inside the sandboxed worker,
         // rather than in the trusted parent. These checks execute editable
-        // MLXFastModel code (DenseTensorStore / Gemma4WeightLoader); the parent
+        // MLXFastModel code (DenseTensorStore / LagunaWeightLoader); the parent
         // used to run the equivalent via BenchmarkPreflight.check, which meant
         // submitted code ran in the unsandboxed process that authors score.json.
         // Failing here throws before the protocol hello below, so the parent's
@@ -40,7 +41,10 @@ extension GemmaRuntime {
         // parent.
         try loader.denseStore.validateReadableByteRanges()
         try loader.validateRequiredMetadata(config: config)
-        let weightCache = Gemma4RuntimeWeightCache(loader: loader, config: config)
+        // Constructing the weight cache loads the whole 4-bit Laguna text
+        // tower and runs its constructor-time kernel warmup, all before the
+        // protocol hello -- outside every scored window.
+        let weightCache = LagunaRuntimeWeightCache(loader: loader, config: config)
         _ = try weightCache.requireLibraryModel()
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
@@ -93,8 +97,8 @@ extension GemmaRuntime {
         let response: RuntimeWorkerPreflightResponse
         do {
             try validateRuntimeWorkerPinnedConfiguration(weightsPath: weightsPath)
-            let config = try Gemma4Config.load(from: weightsPath)
-            let loader = try Gemma4WeightLoader(weightsPath: weightsPath)
+            let config = try LagunaConfig.load(from: weightsPath)
+            let loader = try LagunaWeightLoader(weightsPath: weightsPath)
             try loader.denseStore.validateReadableByteRanges()
             try loader.validateRequiredMetadata(config: config)
             response = RuntimeWorkerPreflightResponse(ok: true)
@@ -188,10 +192,62 @@ extension GemmaRuntime {
         }
     }
 
+    /// One forward through the RAM-resident Laguna runtime model. This is
+    /// the harness-side replacement for the former static
+    /// `Gemma4Model.logits(inputIDs:weightCache:cache:positionOffset:)`
+    /// adapter: Laguna is an INSTANCE model whose per-layer `[KVCache]`
+    /// stack both stores K/V and supplies RoPE positions, so the model
+    /// takes no explicit offset. `positionOffset` is kept as the caller's
+    /// statement of where the sequence should be and is validated against
+    /// the cache offsets, preserving the old adapter's fail-loudly contract
+    /// for a stale or reused cache. Returns `[1, 1, vocab]` LAST-token
+    /// logits (Laguna applies no final softcap and no embedding scaling).
+    static func lagunaLogits(
+        inputIDs: MLXArray,
+        model: LagunaRuntimeModel,
+        cache: [KVCache],
+        positionOffset: Int
+    ) throws -> MLXArray {
+        try verifyLagunaCachePosition(positionOffset: positionOffset, cache: cache)
+        return model(inputIDs, cache: cache)
+    }
+
+    /// Mirrors the former `verifyCachePosition` check inside the Gemma 4
+    /// adapter: every layer cache must agree on one logical offset
+    /// (`StandardKVCache` and `RotatingKVCache` both count total positions
+    /// seen), and it must equal the caller's expected position.
+    static func verifyLagunaCachePosition(
+        positionOffset: Int,
+        cache: [KVCache]
+    ) throws {
+        guard positionOffset >= 0 else {
+            throw MLXFastError.invalidInput("Laguna position offset must be non-negative")
+        }
+        guard let cacheOffset = cache.first?.offset else {
+            throw MLXFastError.invalidInput("Laguna model returned no KV caches")
+        }
+        guard cache.allSatisfy({ $0.offset == cacheOffset }) else {
+            throw MLXFastError.invalidInput("Laguna KV cache layer offsets are inconsistent")
+        }
+        guard positionOffset == cacheOffset else {
+            throw MLXFastError.invalidInput(
+                "Laguna position offset \(positionOffset) does not match KV cache offset \(cacheOffset)"
+            )
+        }
+    }
+
+    /// Force-evaluate the per-layer KV state (the Laguna analog of the
+    /// former `Gemma4ModelCache.materializeCachedState()`), so the seed
+    /// prefill's cache writes are complete before decode steps are timed
+    /// against it.
+    static func materializeLagunaCacheState(_ cache: [KVCache]) {
+        eval(cache)
+    }
+
     static func handleWorkerRequest(
         _ request: RuntimeWorkerRequest,
         sessionNonce: String,
-        weightCache: Gemma4RuntimeWeightCache,
+        weightCache: LagunaRuntimeWeightCache,
         state: inout RuntimeWorkerState
     ) throws -> RuntimeWorkerResponse {
         if request.kind != "decode_block", request.maxBlockSize != nil {
@@ -244,10 +300,11 @@ extension GemmaRuntime {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing prompt_tokens")
             }
             try resetRuntimeWorkerAllocatorForPhaseStart()
-            let cache = Gemma4ModelCache(config: weightCache.config)
-            let logits = try Gemma4Model.logits(
+            let model = try weightCache.requireLibraryModel()
+            let cache = model.newCache(parameters: nil)
+            let logits = try lagunaLogits(
                 inputIDs: inputIDsArray(promptTokens),
-                weightCache: weightCache,
+                model: model,
                 cache: cache,
                 positionOffset: 0
             )
@@ -281,9 +338,9 @@ extension GemmaRuntime {
             guard let cache = state.correctnessCache else {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness step before begin")
             }
-            let logits = try Gemma4Model.logits(
+            let logits = try lagunaLogits(
                 inputIDs: inputIDsArray([previousToken]),
-                weightCache: weightCache,
+                model: try weightCache.requireLibraryModel(),
                 cache: cache,
                 positionOffset: state.correctnessPromptTokenCount + state.correctnessStep
             )
@@ -313,10 +370,11 @@ extension GemmaRuntime {
                 throw MLXFastError.invalidInput("runtime worker prefill request missing prompt_tokens")
             }
             try resetRuntimeWorkerAllocatorForPhaseStart()
-            let cache = Gemma4ModelCache(config: weightCache.config)
-            let logits = try Gemma4Model.logits(
+            let model = try weightCache.requireLibraryModel()
+            let cache = model.newCache(parameters: nil)
+            let logits = try lagunaLogits(
                 inputIDs: inputIDsArray(promptTokens),
-                weightCache: weightCache,
+                model: model,
                 cache: cache,
                 positionOffset: 0
             )
@@ -349,16 +407,17 @@ extension GemmaRuntime {
             // precomputed. Prefill/decode/correctness each run in their own worker
             // process, so no model-owned memo persists across phases; the trusted
             // reset above separately removes allocator free-buffer state.
-            let cache = Gemma4ModelCache(config: weightCache.config)
-            let logits = try Gemma4Model.logits(
+            let model = try weightCache.requireLibraryModel()
+            let cache = model.newCache(parameters: nil)
+            let logits = try lagunaLogits(
                 inputIDs: inputIDsArray(seedTokens),
-                weightCache: weightCache,
+                model: model,
                 cache: cache,
                 positionOffset: 0
             )
             let token = try GemmaCorrectness.greedyToken(from: logits)
             let seedToken = token
-            cache.materializeCachedState()
+            materializeLagunaCacheState(cache)
             state.decodeCache = cache
             state.decodeSeedTokenCount = seedTokens.count
             state.decodeStep = 0
@@ -377,17 +436,18 @@ extension GemmaRuntime {
                 throw MLXFastError.invalidInput("runtime worker decode_step before decode_begin")
             }
             // decode_step invokes only the same editable entry points the
-            // correctness path invokes (Gemma4Model.logits / greedyToken); it
-            // must never call an editable hook that is unique to the scored
-            // decode path. The former editable decode-delay knob (removed) was
-            // exactly such a phase oracle: because submitted model code is
-            // editable, the mere fact that it was invoked ONLY on the timed
-            // decode path told the submission "I am being scored now", which
-            // lets it serve a slow/correct path while checked and a cheap path
-            // while timed. Keep trusted->editable calls phase-agnostic.
-            let logits = try Gemma4Model.logits(
+            // correctness path invokes (the Laguna model forward /
+            // greedyToken); it must never call an editable hook that is
+            // unique to the scored decode path. The former editable
+            // decode-delay knob (removed) was exactly such a phase oracle:
+            // because submitted model code is editable, the mere fact that it
+            // was invoked ONLY on the timed decode path told the submission
+            // "I am being scored now", which lets it serve a slow/correct
+            // path while checked and a cheap path while timed. Keep
+            // trusted->editable calls phase-agnostic.
+            let logits = try lagunaLogits(
                 inputIDs: inputIDsArray([inputToken]),
-                weightCache: weightCache,
+                model: try weightCache.requireLibraryModel(),
                 cache: cache,
                 positionOffset: state.decodeSeedTokenCount + state.decodeStep
             )
@@ -420,13 +480,24 @@ extension GemmaRuntime {
 
             let tokens: [Int]
             do {
-                tokens = try Gemma4SerialTargetBlockGenerator().generateBlock(
+                // Serial target-only block fallback (one Laguna forward per
+                // returned token) through the shared pure block-generation
+                // helper, replacing the Gemma4SerialTargetBlockGenerator
+                // whose signature is bound to the Gemma 4 cache types.
+                let model = try weightCache.requireLibraryModel()
+                tokens = try Gemma4TargetBlockGeneration.generateSerialBlock(
                     previousToken: blockRequest.previousToken,
                     maxBlockSize: blockRequest.maxBlockSize,
-                    cache: cache,
-                    positionOffset: positionOffset,
-                    weightCache: weightCache
-                )
+                    positionOffset: positionOffset
+                ) { inputToken, stepOffset in
+                    let logits = try lagunaLogits(
+                        inputIDs: MLXArray([Int32(inputToken)], [1, 1]),
+                        model: model,
+                        cache: cache,
+                        positionOffset: stepOffset
+                    )
+                    return try GemmaCorrectness.greedyToken(from: logits)
+                }
             } catch {
                 // A failed multi-forward request may have partially advanced
                 // device KV state. Poison this decode sequence so no later
@@ -911,10 +982,10 @@ func validateExperimentalDecodeBlockRequest(
 
 #if !MLXFAST_TRUSTED_HARNESS
     struct RuntimeWorkerState {
-        var correctnessCache: Gemma4ModelCache?
+        var correctnessCache: [KVCache]?
         var correctnessPromptTokenCount = 0
         var correctnessStep = 0
-        var decodeCache: Gemma4ModelCache?
+        var decodeCache: [KVCache]?
         var decodeSeedTokenCount = 0
         var decodeStep = 0
     }
