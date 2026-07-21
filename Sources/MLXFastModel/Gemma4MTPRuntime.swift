@@ -147,6 +147,128 @@ private let gemma4MTPTopTwoMarginKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+private let gemma4MTPArgmaxAndTopTwoMarginKernel = MLXFast.metalKernel(
+    name: "gemma4_mtp_argmax_and_top_two_margin_262144_v1",
+    inputNames: ["logits"],
+    outputNames: ["token", "margin"],
+    source: """
+        threadgroup float group_best[8];
+        threadgroup float group_second[8];
+        threadgroup uint group_token[8];
+
+        float best = -INFINITY;
+        float second = -INFINITY;
+        uint token_idx = 0xffffffffu;
+        for (uint index = thread_position_in_threadgroup.x;
+             index < 262144;
+             index += threads_per_threadgroup.x) {
+            gemma4_mtp_insert_top_two_with_token(
+                static_cast<float>(logits[index]),
+                index,
+                best,
+                second,
+                token_idx
+            );
+        }
+
+        for (ushort delta = 16; delta > 0; delta >>= 1) {
+            const float other_best = simd_shuffle_down(best, delta);
+            const float other_second = simd_shuffle_down(second, delta);
+            const uint other_token = simd_shuffle_down(token_idx, delta);
+            if (thread_index_in_simdgroup + delta < 32) {
+                gemma4_mtp_insert_top_two_with_token(
+                    other_best,
+                    other_token,
+                    best,
+                    second,
+                    token_idx
+                );
+                gemma4_mtp_insert_top_two_with_token(
+                    other_second,
+                    0xffffffffu,
+                    best,
+                    second,
+                    token_idx
+                );
+            }
+        }
+        if (thread_index_in_simdgroup == 0) {
+            group_best[simdgroup_index_in_threadgroup] = best;
+            group_second[simdgroup_index_in_threadgroup] = second;
+            group_token[simdgroup_index_in_threadgroup] = token_idx;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simdgroup_index_in_threadgroup == 0) {
+            if (thread_index_in_simdgroup < 8) {
+                best = group_best[thread_index_in_simdgroup];
+                second = group_second[thread_index_in_simdgroup];
+                token_idx = group_token[thread_index_in_simdgroup];
+            } else {
+                best = -INFINITY;
+                second = -INFINITY;
+                token_idx = 0xffffffffu;
+            }
+            for (ushort delta = 16; delta > 0; delta >>= 1) {
+                const float other_best = simd_shuffle_down(best, delta);
+                const float other_second = simd_shuffle_down(second, delta);
+                const uint other_token = simd_shuffle_down(token_idx, delta);
+                if (thread_index_in_simdgroup + delta < 32) {
+                    gemma4_mtp_insert_top_two_with_token(
+                        other_best,
+                        other_token,
+                        best,
+                        second,
+                        token_idx
+                    );
+                    gemma4_mtp_insert_top_two_with_token(
+                        other_second,
+                        0xffffffffu,
+                        best,
+                        second,
+                        token_idx
+                    );
+                }
+            }
+            if (thread_index_in_simdgroup == 0) {
+                token[0] = token_idx;
+                margin[0] = best - second;
+            }
+        }
+        """,
+    header: """
+        using namespace metal;
+
+        inline void gemma4_mtp_insert_top_two_with_token(
+            float value,
+            uint index,
+            thread float& best,
+            thread float& second,
+            thread uint& token
+        ) {
+            if (value > best || (value == best && index < token)) {
+                second = best;
+                best = value;
+                token = index;
+            } else if (value > second) {
+                second = value;
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func gemma4MTPArgmaxAndTopTwoMargin(_ logits: MLXArray) -> (token: MLXArray, margin: MLXArray) {
+    let result = gemma4MTPArgmaxAndTopTwoMarginKernel(
+        [logits],
+        grid: (256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1], [1]],
+        outputDTypes: [.uint32, .float32]
+    )
+    return (token: result[0], margin: result[1])
+}
+
 func gemma4MTPTopTwoMargin(_ logits: MLXArray) -> MLXArray {
     gemma4MTPTopTwoMarginKernel(
         [logits],
@@ -554,10 +676,13 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
                 )
             )
             let logits = output.logits[0..., -1, 0...]
-            let draft = logits.argMax(axis: -1).reshaped([1, 1])
+            let draft: MLXArray
             if gemma4MTPExactFourEnabled && gemma4MTPAdaptiveExactFourEnabled {
-                eval(draft, output.lastHidden, gemma4MTPTopTwoMargin(logits))
+                let selection = gemma4MTPArgmaxAndTopTwoMargin(logits)
+                draft = selection.token.reshaped([1, 1])
+                eval(draft, output.lastHidden, selection.margin)
             } else {
+                draft = logits.argMax(axis: -1).reshaped([1, 1])
                 eval(draft, output.lastHidden)
             }
             draftInput = draft
@@ -724,9 +849,13 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
                 positionOffset: positionOffset
             )
             let draftLogits = assistantOutput.logits[0..., -1, 0...]
-            let draft = draftLogits.argMax(axis: -1)
+            let draft: MLXArray
             if collectExactFourMargins {
-                draftMarginArrays.append(gemma4MTPTopTwoMargin(draftLogits))
+                let selection = gemma4MTPArgmaxAndTopTwoMargin(draftLogits)
+                draft = selection.token
+                draftMarginArrays.append(selection.margin)
+            } else {
+                draft = draftLogits.argMax(axis: -1)
             }
             let draft2D = draft.reshaped([1, 1])
             draftTokens.append(draft2D)
