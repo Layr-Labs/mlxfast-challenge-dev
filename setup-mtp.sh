@@ -34,14 +34,15 @@ else
   TARGET_FALLBACK_BASE_URL=""
 fi
 
-# The assistant sidecar is the organizer's MLX 4-bit conversion of the
-# upstream BF16 DFlash speculator. Until that conversion is published, keep
-# the pinned Hugging Face upstream as primary (the manifest fails closed on
-# the placeholder until real converted files are pinned) and the fallback
-# slot empty. An explicitly overridden primary has no implicit fallback.
-# TODO(operator): point this at the organizer mirror (e.g. Darkbloom R2)
-# hosting the MLX 4-bit DFlash conversion once it exists, and optionally
-# retain this Hugging Face URL as the fallback.
+# The assistant slot is the BF16 DFlash draft, downloaded from the pinned
+# Hugging Face upstream and converted to MLX affine 4-bit (group size 64) at
+# setup by the Swift tooling. The manifest pins the BF16 download and fails
+# closed while it is an entry-less placeholder (regenerate it on m5-bench).
+# The fallback slot stays empty; an explicitly overridden primary has no
+# implicit fallback.
+# TODO(operator): add an organizer mirror (e.g. Darkbloom R2) for the DFlash
+# draft and make it the primary once provisioned, optionally retaining this
+# Hugging Face URL as the fallback.
 DEFAULT_ASSISTANT_BASE_URL="https://huggingface.co/${ASSISTANT_MODEL_ID}/resolve/${ASSISTANT_REVISION}"
 DEFAULT_ASSISTANT_FALLBACK_BASE_URL=""
 ASSISTANT_BASE_URL="${MLXFAST_MTP_ASSISTANT_BASE_URL:-${DEFAULT_ASSISTANT_BASE_URL}}"
@@ -433,6 +434,6 @@ cat <<EOF
 setup-mtp.sh: MTP artifacts ready
   target:    ${TARGET_DIR}
   assistant: ${ASSISTANT_DIR}
-  source bytes: target=18829720326 assistant=pending MLX 4-bit DFlash conversion (upstream BF16 is 924135848)
+  source bytes: target=18829720326 assistant=924135848 (BF16 draft; converted to MLX 4-bit at setup)
   official score: disabled until a paired M5 rebaseline is established
 EOF
