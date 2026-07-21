@@ -1375,7 +1375,7 @@ final class Gemma4FastEngine {
             0,
             Int(ProcessInfo.processInfo.environment[
                 "DARKBLOOM_MTP_EXACT_PAIR_ASYNC_LAYER_GROUP"
-            ] ?? "12") ?? 12
+            ] ?? "6") ?? 6
         )
         self.exactPairAsyncLayerGroup = exactPairAsyncLayerGroup
         self.exactPairAsyncLayerLead = exactPairAsyncLayerGroup > 0
