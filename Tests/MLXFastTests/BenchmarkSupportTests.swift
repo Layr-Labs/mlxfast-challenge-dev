@@ -944,7 +944,7 @@ func nonWorkerBenchmarkRejectsBehaviorGatesBecauseTTFTRequiresWorker() throws {
 
 @Test
 func benchmarkPreflightRejectsMissingSemanticTensor() throws {
-    let fixture = try makePreflightFixture(omitDenseTensorName: Gemma4WeightNames.finalNorm)
+    let fixture = try makePreflightFixture(omitDenseTensorName: LagunaWeightNames.finalNorm)
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
@@ -994,13 +994,13 @@ private func makePreflightFixture(
     let weights = directory.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
 
-    try minimalGemma4ConfigJSON().write(
+    try lagunaPreflightConfigJSON().write(
         to: weights.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
     )
 
-    var denseTensors = requiredGemma4DenseTensorFixtures()
+    var denseTensors = requiredLagunaDenseTensorFixtures()
     if let omitDenseTensorName {
         denseTensors.removeAll { $0.name == omitDenseTensorName }
     }
@@ -1018,24 +1018,23 @@ private func makePreflightFixture(
     return PreflightFixture(root: directory, weights: weights, golden: golden)
 }
 
-private func minimalGemma4ConfigJSON() -> String {
-    """
-    {
-      "model_type": "gemma4_text",
-      "vocab_size": \(MLXFastConstants.vocabSize),
-      "hidden_size": \(MLXFastConstants.hiddenSize),
-      "intermediate_size": \(MLXFastConstants.intermediateSize),
-      "num_hidden_layers": \(MLXFastConstants.numHiddenLayers),
-      "num_attention_heads": \(MLXFastConstants.attentionHeads),
-      "num_key_value_heads": 16,
-      "num_global_key_value_heads": 4,
-      "head_dim": 256,
-      "global_head_dim": 512,
-      "attention_k_eq_v": true,
-      "sliding_window": 1024,
-      "tie_word_embeddings": true
+/// The pinned Laguna runtime config as the transform writes it, with the
+/// 8-bit router-gate quantization override present for every sparse layer
+/// (the shared `pinnedRuntimeWorkerConfigurationObject()` carries a single
+/// representative override; the preflight weight validation resolves the
+/// expected router bit width per layer from these entries).
+private func lagunaPreflightConfigJSON() throws -> String {
+    var root = pinnedRuntimeWorkerConfigurationObject()
+    var quantization = root["quantization"] as? [String: Any] ?? [:]
+    for layerIndex in 1..<MLXFastConstants.numHiddenLayers {
+        quantization["language_model.model.layers.\(layerIndex).mlp.gate.proj"] = [
+            "group_size": 64,
+            "bits": 8,
+        ]
     }
-    """
+    root["quantization"] = quantization
+    let data = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+    return String(decoding: data, as: UTF8.self)
 }
 
 private func validGoldenJSON(
@@ -1086,116 +1085,147 @@ private func correctnessOnlyGoldenJSON() -> String {
     """
 }
 
-/// Every tensor `Gemma4WeightLoader.validateRequiredMetadata` requires for a
-/// synthetic Gemma4-shaped checkpoint built from the current
-/// `MLXFastConstants` geometry (now the Laguna pin: 40 layers, alternating
-/// five sliding + one full-attention layer per Gemma4 block). Real byte
-/// contents do not matter for these preflight tests -- only declared
-/// dtype/shape -- so linear weights use the same packed `U32` (affine 4-bit,
-/// 8 values/word) layout a real checkpoint ships, which keeps the sparse
-/// fixture files under the default transformed-weights byte cap the way the
-/// small norm/scalar tensors alone could not.
-private func requiredGemma4DenseTensorFixtures() -> [TensorFixture] {
+/// Every tensor `LagunaWeightLoader.validateRequiredMetadata` requires for a
+/// synthetic Laguna-shaped checkpoint built from the pinned geometry (40
+/// layers, one full-attention layer per block of four, dense MLP at layer 0,
+/// 256-expert MoE with a shared expert elsewhere, per-head attention
+/// gating, untied lm_head). Real byte contents do not matter for these
+/// preflight tests -- only declared dtype/shape -- so the shard is written
+/// sparse: quantized projections use the packed `U32` affine layout the
+/// real checkpoint ships (4-bit group-64 everywhere, 8-bit router gates)
+/// with BF16 `.scales`/`.biases` companions.
+private func requiredLagunaDenseTensorFixtures() -> [TensorFixture] {
     let hidden = MLXFastConstants.hiddenSize
-    let intermediate = MLXFastConstants.intermediateSize
+    let denseIntermediate = MLXFastConstants.intermediateSize
     let vocab = MLXFastConstants.vocabSize
     let layers = MLXFastConstants.numHiddenLayers
-    let heads = MLXFastConstants.attentionHeads
-    let headDim = 256
-    let globalHeadDim = 512
-    let kvHeads = 16
-    let globalKVHeads = 4
+    let kvHeads = 8
+    let headDim = 128
+    let experts = 256
+    let expertIntermediate = 512
+    let sharedExpertIntermediate = 512
+    let groupSize = 64
 
-    func packedCols(_ inFeatures: Int) -> Int {
-        inFeatures / 8
+    var tensors: [TensorFixture] = []
+
+    func appendQuantized(
+        _ name: String,
+        leadingShape: [Int],
+        inputFeatures: Int,
+        bits: Int = 4
+    ) {
+        tensors.append(TensorFixture(
+            name: name,
+            dtype: "U32",
+            shape: leadingShape + [inputFeatures * bits / 32]
+        ))
+        let stem = name.hasSuffix(".weight") ? String(name.dropLast(".weight".count)) : name
+        let companionShape = leadingShape + [inputFeatures / groupSize]
+        for suffix in ["scales", "biases"] {
+            tensors.append(TensorFixture(
+                name: "\(stem).\(suffix)",
+                dtype: "BF16",
+                shape: companionShape
+            ))
+        }
     }
 
-    var tensors: [TensorFixture] = [
-        TensorFixture(name: Gemma4WeightNames.embedTokens, dtype: "U32", shape: [vocab, packedCols(hidden)]),
-        TensorFixture(name: Gemma4WeightNames.finalNorm, dtype: "F32", shape: [hidden]),
-    ]
+    appendQuantized(LagunaWeightNames.embedTokens, leadingShape: [vocab], inputFeatures: hidden)
+    tensors.append(TensorFixture(name: LagunaWeightNames.finalNorm, dtype: "BF16", shape: [hidden]))
+    appendQuantized(LagunaWeightNames.lmHead, leadingShape: [vocab], inputFeatures: hidden)
 
     for layerIndex in 0..<layers {
-        let isFull = layerIndex % 6 == 5
-        let effectiveHeadDim = isFull ? globalHeadDim : headDim
-        let effectiveKVHeads = isFull ? globalKVHeads : kvHeads
+        let layerHeads = layerIndex % 4 == 0 ? 48 : 64
 
-        for suffix in [
-            "input_layernorm.weight", "post_attention_layernorm.weight",
-            "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
-        ] {
-            tensors.append(
-                TensorFixture(name: Gemma4WeightNames.layer(layerIndex, suffix), dtype: "F32", shape: [hidden])
+        for suffix in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+            tensors.append(TensorFixture(
+                name: LagunaWeightNames.layer(layerIndex, suffix),
+                dtype: "BF16",
+                shape: [hidden]
+            ))
+        }
+
+        appendQuantized(
+            LagunaWeightNames.attention(layerIndex, "q_proj.weight"),
+            leadingShape: [layerHeads * headDim],
+            inputFeatures: hidden
+        )
+        for suffix in ["k_proj.weight", "v_proj.weight"] {
+            appendQuantized(
+                LagunaWeightNames.attention(layerIndex, suffix),
+                leadingShape: [kvHeads * headDim],
+                inputFeatures: hidden
             )
         }
-        tensors.append(
-            TensorFixture(name: Gemma4WeightNames.layer(layerIndex, "layer_scalar"), dtype: "F32", shape: [1])
+        appendQuantized(
+            LagunaWeightNames.attention(layerIndex, "o_proj.weight"),
+            leadingShape: [hidden],
+            inputFeatures: layerHeads * headDim
         )
-
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.attention(layerIndex, "q_proj.weight"),
-            dtype: "U32",
-            shape: [heads * effectiveHeadDim, packedCols(hidden)]
-        ))
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.attention(layerIndex, "k_proj.weight"),
-            dtype: "U32",
-            shape: [effectiveKVHeads * effectiveHeadDim, packedCols(hidden)]
-        ))
-        if !isFull {
+        // Per-head attention gating: one gate per query head.
+        appendQuantized(
+            LagunaWeightNames.attention(layerIndex, "g_proj.weight"),
+            leadingShape: [layerHeads],
+            inputFeatures: hidden
+        )
+        for suffix in ["q_norm.weight", "k_norm.weight"] {
             tensors.append(TensorFixture(
-                name: Gemma4WeightNames.attention(layerIndex, "v_proj.weight"),
-                dtype: "U32",
-                shape: [effectiveKVHeads * effectiveHeadDim, packedCols(hidden)]
+                name: LagunaWeightNames.attention(layerIndex, suffix),
+                dtype: "BF16",
+                shape: [headDim]
             ))
         }
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.attention(layerIndex, "o_proj.weight"),
-            dtype: "U32",
-            shape: [hidden, packedCols(heads * effectiveHeadDim)]
-        ))
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.attention(layerIndex, "q_norm.weight"),
-            dtype: "F32",
-            shape: [effectiveHeadDim]
-        ))
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.attention(layerIndex, "k_norm.weight"),
-            dtype: "F32",
-            shape: [effectiveHeadDim]
-        ))
 
-        for suffix in ["gate_proj", "up_proj"] {
+        if layerIndex == 0 {
+            for suffix in ["gate_proj.weight", "up_proj.weight"] {
+                appendQuantized(
+                    LagunaWeightNames.mlp(layerIndex, suffix),
+                    leadingShape: [denseIntermediate],
+                    inputFeatures: hidden
+                )
+            }
+            appendQuantized(
+                LagunaWeightNames.mlp(layerIndex, "down_proj.weight"),
+                leadingShape: [hidden],
+                inputFeatures: denseIntermediate
+            )
+        } else {
+            appendQuantized(
+                LagunaWeightNames.mlp(layerIndex, "gate.proj.weight"),
+                leadingShape: [experts],
+                inputFeatures: hidden,
+                bits: 8
+            )
             tensors.append(TensorFixture(
-                name: Gemma4WeightNames.mlp(layerIndex, "\(suffix).weight"),
-                dtype: "U32",
-                shape: [intermediate, packedCols(hidden)]
+                name: LagunaWeightNames.mlp(layerIndex, "gate.e_score_correction_bias"),
+                dtype: "F32",
+                shape: [experts]
             ))
+            for suffix in ["switch_mlp.gate_proj.weight", "switch_mlp.up_proj.weight"] {
+                appendQuantized(
+                    LagunaWeightNames.mlp(layerIndex, suffix),
+                    leadingShape: [experts, expertIntermediate],
+                    inputFeatures: hidden
+                )
+            }
+            appendQuantized(
+                LagunaWeightNames.mlp(layerIndex, "switch_mlp.down_proj.weight"),
+                leadingShape: [experts, hidden],
+                inputFeatures: expertIntermediate
+            )
+            for suffix in ["shared_expert.gate_proj.weight", "shared_expert.up_proj.weight"] {
+                appendQuantized(
+                    LagunaWeightNames.mlp(layerIndex, suffix),
+                    leadingShape: [sharedExpertIntermediate],
+                    inputFeatures: hidden
+                )
+            }
+            appendQuantized(
+                LagunaWeightNames.mlp(layerIndex, "shared_expert.down_proj.weight"),
+                leadingShape: [hidden],
+                inputFeatures: sharedExpertIntermediate
+            )
         }
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.mlp(layerIndex, "down_proj.weight"),
-            dtype: "U32",
-            shape: [hidden, packedCols(intermediate)]
-        ))
-    }
-
-    let quantizedTensors = tensors.filter { $0.dtype == "U32" }
-    for tensor in quantizedTensors {
-        let baseName = tensor.name.hasSuffix(".weight")
-            ? String(tensor.name.dropLast(".weight".count))
-            : tensor.name
-        let groupCount = tensor.shape[1] / 8
-        let companionShape = [tensor.shape[0], groupCount]
-        tensors.append(TensorFixture(
-            name: "\(baseName).scales",
-            dtype: "BF16",
-            shape: companionShape
-        ))
-        tensors.append(TensorFixture(
-            name: "\(baseName).biases",
-            dtype: "BF16",
-            shape: companionShape
-        ))
     }
 
     return tensors
