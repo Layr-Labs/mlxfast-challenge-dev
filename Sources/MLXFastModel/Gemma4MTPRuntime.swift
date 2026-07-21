@@ -73,6 +73,15 @@ private let gemma4MTPAssistantPositionDelta: Int = {
     ] == "0" ? 0 : -1
 }()
 
+private let gemma4MTPCompiledDrafterEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_COMPILED_DRAFTER"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private let gemma4MTPTopTwoMarginKernel = MLXFast.metalKernel(
     name: "gemma4_mtp_top_two_margin_262144_v1",
     inputNames: ["logits"],
@@ -449,6 +458,128 @@ struct Gemma4MTPVerifiedBlock {
     let sharedKV: Gemma4SharedKV
 }
 
+/// Cache of compiled drafter closures keyed by (fullBucket, slidingBucket).
+/// Single-bucket policy: every in-phase KV length (<= 1024) pads to the 1024
+/// bucket, so exactly one closure is traced (in untimed warmup) and no bucket
+/// crossing can recompile inside a timed block. Longer lengths bucket to the
+/// next multiple of 128; those keys are never warmed, so `call` misses and
+/// the caller falls back to the eager drafter.
+private final class Gemma4CompiledDrafterCache: @unchecked Sendable {
+    private let drafter: Gemma4AssistantDraftModel
+    private var cache: [String: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+    private let lock = NSLock()
+
+    init(drafter: Gemma4AssistantDraftModel) {
+        self.drafter = drafter
+    }
+
+    static func bucket(_ kvLen: Int) -> Int {
+        kvLen <= 1024 ? 1024 : ((kvLen + 127) / 128) * 128
+    }
+
+    private static func key(fullBucket: Int, slidingBucket: Int) -> String {
+        "\(fullBucket),\(slidingBucket)"
+    }
+
+    func ensureCompiled(
+        fullBucket: Int, slidingBucket: Int,
+        fullKHeadDim: Int, slidingKHeadDim: Int,
+        fullKVHeads: Int, slidingKVHeads: Int
+    ) {
+        let k = Self.key(fullBucket: fullBucket, slidingBucket: slidingBucket)
+        lock.lock()
+        if cache[k] != nil {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        let compiledFn = Self.makeCompiled(drafter: drafter)
+        // The drafter input is [target embedding | backbone hidden], i.e.
+        // 2 x backboneHiddenSize wide (the preProjection input), not the
+        // drafter's own hidden size.
+        let embedsWidth = 2 * drafter.config.backboneHiddenSize
+        let inputs: [MLXArray] = [
+            MLXArray.zeros([1, 1, embedsWidth], dtype: .bfloat16),
+            MLXArray.zeros([1, fullKVHeads, fullBucket, fullKHeadDim], dtype: .bfloat16),
+            MLXArray.zeros([1, fullKVHeads, fullBucket, fullKHeadDim], dtype: .bfloat16),
+            MLXArray.zeros([1, slidingKVHeads, slidingBucket, slidingKHeadDim], dtype: .bfloat16),
+            MLXArray.zeros([1, slidingKVHeads, slidingBucket, slidingKHeadDim], dtype: .bfloat16),
+            MLXArray([Int32(0)]),
+            MLXArray.zeros([1, 1, 1, fullBucket], dtype: .bfloat16),
+            MLXArray.zeros([1, 1, 1, slidingBucket], dtype: .bfloat16),
+        ]
+        let out = compiledFn(inputs)
+        eval(out[0], out[1])
+
+        lock.lock()
+        cache[k] = compiledFn
+        lock.unlock()
+    }
+
+    func call(
+        fullKVLen: Int, slidingKVLen: Int,
+        inputsEmbeds: MLXArray,
+        paddedFullK: MLXArray, paddedFullV: MLXArray,
+        paddedSlidingK: MLXArray, paddedSlidingV: MLXArray,
+        positionOffset: MLXArray,
+        fullMask: MLXArray, slidingMask: MLXArray
+    ) -> (lastHidden: MLXArray, logits: MLXArray)? {
+        let fullBucket = Self.bucket(fullKVLen)
+        let slidingBucket = Self.bucket(slidingKVLen)
+        let k = Self.key(fullBucket: fullBucket, slidingBucket: slidingBucket)
+
+        lock.lock()
+        guard let fn = cache[k] else {
+            lock.unlock()
+            return nil
+        }
+        lock.unlock()
+
+        let out = fn([
+            inputsEmbeds, paddedFullK, paddedFullV,
+            paddedSlidingK, paddedSlidingV,
+            positionOffset, fullMask, slidingMask
+        ])
+        return (out[0], out[1])
+    }
+
+    private static func makeCompiled(
+        drafter: Gemma4AssistantDraftModel
+    ) -> @Sendable ([MLXArray]) -> [MLXArray] {
+        MLX.compile(
+            inputs: [], outputs: [], shapeless: false
+        ) { (inputs: [MLXArray]) -> [MLXArray] in
+            let result = drafter.forwardForCompile(
+                inputsEmbeds: inputs[0],
+                fullK: inputs[1],
+                fullV: inputs[2],
+                slidingK: inputs[3],
+                slidingV: inputs[4],
+                positionOffset: inputs[5],
+                fullMask: inputs[6],
+                slidingMask: inputs[7]
+            )
+            return [result.lastHidden, result.logits]
+        }
+    }
+}
+
+/// Round-constant inputs for the compiled drafter: the shared KV padded to
+/// the single bucket, allow-real/-inf-pad additive masks, and the block's
+/// position offset. Built once per round, reused by all drafts.
+private struct Gemma4CompiledRoundInputs {
+    let fullKVLen: Int
+    let slidingKVLen: Int
+    let fullK: MLXArray
+    let fullV: MLXArray
+    let slidingK: MLXArray
+    let slidingV: MLXArray
+    let fullMask: MLXArray
+    let slidingMask: MLXArray
+    let positionOffset: MLXArray
+}
+
 /// Stateful, greedy Gemma 4 MTP block decoder.
 ///
 /// One instance owns one request. Target cache, target hidden state, shared
@@ -465,6 +596,7 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
 
     private let target: Gemma4RuntimeModel
     private let drafter: Gemma4AssistantDraftModel
+    private let compiledDrafterCache: Gemma4CompiledDrafterCache?
     public let verificationMode: Gemma4MTPVerificationMode
     // Internal (not public) so runtime seam tests can compare this cache's
     // physical bytes against an independent serial cache.
@@ -497,6 +629,9 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
         self.target = target
         self.drafter = drafter
         self.verificationMode = verificationMode
+        self.compiledDrafterCache = gemma4MTPCompiledDrafterEnabled
+            ? Gemma4CompiledDrafterCache(drafter: drafter)
+            : nil
         try drafter.bind(target: target)
     }
 
@@ -562,6 +697,22 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
             }
             draftInput = draft
             draftHidden = output.lastHidden
+        }
+
+        // Pre-compile the single-bucket drafter closure so the compile trace
+        // and its Metal compilation never land inside a timed block. One
+        // bucket pair covers the whole ranked phase (full and sliding KV
+        // lengths never exceed 1024 before decode completes).
+        if let compiledDrafterCache {
+            let textCfg = drafter.config.textConfig
+            compiledDrafterCache.ensureCompiled(
+                fullBucket: 1024, slidingBucket: 1024,
+                fullKHeadDim: textCfg.globalHeadDim,
+                slidingKHeadDim: textCfg.headDim,
+                fullKVHeads: textCfg.numGlobalKeyValueHeads
+                    ?? textCfg.numKeyValueHeads,
+                slidingKVHeads: textCfg.numKeyValueHeads
+            )
         }
     }
 
@@ -712,17 +863,80 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
             && gemma4MTPAdaptiveExactFourEnabled
             && draftCount == 3
 
+        // Compiled drafter: pad the round-constant shared KV to the single
+        // 1024 bucket once per round. Pad K/V rows are zeros and the additive
+        // masks carry -inf on pad columns, so the pad's softmax weight is
+        // exactly zero and proposals match the eager path (which resolves to
+        // allow-all `.none` masks at these lengths).
+        let compiledRound: Gemma4CompiledRoundInputs?
+        if compiledDrafterCache != nil {
+            let fullK = currentSharedKV.fullAttention.0
+            let fullV = currentSharedKV.fullAttention.1
+            let slidingK = currentSharedKV.slidingAttention.0
+            let slidingV = currentSharedKV.slidingAttention.1
+            let fullKVLen = fullK.dim(2)
+            let slidingKVLen = slidingK.dim(2)
+            let fBucket = Gemma4CompiledDrafterCache.bucket(fullKVLen)
+            let sBucket = Gemma4CompiledDrafterCache.bucket(slidingKVLen)
+            func padded(_ kv: MLXArray, to bucket: Int, len: Int) -> MLXArray {
+                guard bucket > len else { return kv }
+                let pad = MLXArray.zeros(
+                    [1, kv.dim(1), bucket - len, kv.dim(3)], dtype: kv.dtype)
+                return concatenated([kv, pad], axis: 2)
+            }
+            func bucketMask(realLen: Int, bucket: Int) -> MLXArray {
+                let allow = MLXArray.zeros([1, 1, 1, realLen], dtype: .bfloat16)
+                guard bucket > realLen else { return allow }
+                let negInf = MLXArray(-Float.infinity).asType(.bfloat16)
+                let pad = broadcast(negInf, to: [1, 1, 1, bucket - realLen])
+                return concatenated([allow, pad], axis: -1)
+            }
+            compiledRound = Gemma4CompiledRoundInputs(
+                fullKVLen: fullKVLen,
+                slidingKVLen: slidingKVLen,
+                fullK: padded(fullK, to: fBucket, len: fullKVLen),
+                fullV: padded(fullV, to: fBucket, len: fullKVLen),
+                slidingK: padded(slidingK, to: sBucket, len: slidingKVLen),
+                slidingV: padded(slidingV, to: sBucket, len: slidingKVLen),
+                fullMask: bucketMask(realLen: fullKVLen, bucket: fBucket),
+                slidingMask: bucketMask(realLen: slidingKVLen, bucket: sBucket),
+                positionOffset: MLXArray(
+                    [Int32(hostCacheOffset + gemma4MTPAssistantPositionDelta)]
+                )
+            )
+        } else {
+            compiledRound = nil
+        }
+
         for _ in 0..<draftCount {
             let targetEmbedding = target.embedTokensForDrafter(draftInput)
             let assistantInput = concatenated(
                 [targetEmbedding, draftHidden],
                 axis: -1
             )
-            let assistantOutput = drafter(
-                inputsEmbeds: assistantInput,
-                sharedKV: currentSharedKV,
-                positionOffset: positionOffset
-            )
+            let assistantOutput: (lastHidden: MLXArray, logits: MLXArray)
+            if let compiledDrafterCache, let round = compiledRound,
+               let out = compiledDrafterCache.call(
+                    fullKVLen: round.fullKVLen,
+                    slidingKVLen: round.slidingKVLen,
+                    inputsEmbeds: assistantInput,
+                    paddedFullK: round.fullK,
+                    paddedFullV: round.fullV,
+                    paddedSlidingK: round.slidingK,
+                    paddedSlidingV: round.slidingV,
+                    positionOffset: round.positionOffset,
+                    fullMask: round.fullMask,
+                    slidingMask: round.slidingMask
+               )
+            {
+                assistantOutput = out
+            } else {
+                assistantOutput = drafter(
+                    inputsEmbeds: assistantInput,
+                    sharedKV: currentSharedKV,
+                    positionOffset: positionOffset
+                )
+            }
             let draftLogits = assistantOutput.logits[0..., -1, 0...]
             let draft = draftLogits.argMax(axis: -1)
             if collectExactFourMargins {

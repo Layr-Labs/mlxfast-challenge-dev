@@ -1133,6 +1133,36 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         return (lastHidden, logits)
     }
 
+    /// Compile-friendly forward: unpacks sharedKV into 4 plain arrays,
+    /// uses graphArray positionOffset, and takes masks as plain MLXArrays
+    /// wrapped into the mask-mode the layers expect.
+    public func forwardForCompile(
+        inputsEmbeds: MLXArray,
+        fullK: MLXArray,
+        fullV: MLXArray,
+        slidingK: MLXArray,
+        slidingV: MLXArray,
+        positionOffset: MLXArray,
+        fullMask: MLXArray,
+        slidingMask: MLXArray
+    ) -> (lastHidden: MLXArray, logits: MLXArray) {
+        let sharedKV = Gemma4SharedKV(
+            fullAttention: (fullK, fullV),
+            slidingAttention: (slidingK, slidingV)
+        )
+        let masks = Gemma4DrafterMasks(
+            full: .array(fullMask),
+            sliding: .array(slidingMask)
+        )
+        let po = Gemma4.PositionOffset.graphArray(positionOffset)
+        return forwardProjected(
+            preProjection(inputsEmbeds),
+            sharedKV: sharedKV,
+            positionOffset: po,
+            masks: masks
+        )
+    }
+
     /// Dispatch the LM head: masked-centroid if `useOrderedEmbeddings`,
     /// tied otherwise (unless an explicit `lm_head` is present).
     /// No softcap.
