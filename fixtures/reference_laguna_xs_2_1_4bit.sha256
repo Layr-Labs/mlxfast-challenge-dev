@@ -1,0 +1,10 @@
+# TODO(operator): regenerate on m5-bench for mlx-community/Laguna-XS-2.1-4bit
+# Placeholder manifest for the serial-track reference checkpoint (the archived
+# serial track and the MTP target share this checkpoint). It contains no
+# entries on purpose: hashes are only ever pinned from an on-box download on
+# m5-bench, never pre-filled off-box. setup.sh fails closed on an entry-less
+# manifest until this file is regenerated (use MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1
+# in the meantime).
+# Repository: mlx-community/Laguna-XS-2.1-4bit
+# Revision: c42e0a8f8d504ceacde015a535dcb286d65c8799
+# Format: <sha256> <byte_count> <relative_path>
