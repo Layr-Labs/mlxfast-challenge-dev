@@ -45,61 +45,52 @@ private let gemma4ExactFourVectorSlidingQKVSource = """
     float result2[kRowsPerSIMD] = {0};
     float result3[kRowsPerSIMD] = {0};
     for (int block = 0; block < 21; ++block) {
-        {
-            float values0[8];
-            float values1[8];
-            const float input_sum0 =
-                gemma4_exact_four_vector_sliding_qkv_load_values(
-                    input0, values0);
-            const float input_sum1 =
-                gemma4_exact_four_vector_sliding_qkv_load_values(
-                    input1, values1);
-            #pragma clang loop unroll(full)
-            for (int row = 0; row < kRowsPerSIMD; ++row) {
-                const device uint* row_weight_words =
-                    weight_words + row * kWeightWordsPerRow;
-                const ushort metadata_index =
-                    row_indices[row * kGroupsPerRow];
-                const uint pair = lut[metadata_index];
-                gemma4_exact_four_vector_sliding_qkv_qdot_pair_4bit(
-                    row_weight_words[0],
-                    values0,
-                    values1,
-                    gemma4_exact_four_vector_sliding_qkv_pair_scale(pair),
-                    gemma4_exact_four_vector_sliding_qkv_pair_bias(pair),
-                    input_sum0,
-                    input_sum1,
-                    result0[row],
-                    result1[row]);
-            }
-        }
-        {
-            float values2[8];
-            float values3[8];
-            const float input_sum2 =
-                gemma4_exact_four_vector_sliding_qkv_load_values(
-                    input2, values2);
-            const float input_sum3 =
-                gemma4_exact_four_vector_sliding_qkv_load_values(
-                    input3, values3);
-            #pragma clang loop unroll(full)
-            for (int row = 0; row < kRowsPerSIMD; ++row) {
-                const device uint* row_weight_words =
-                    weight_words + row * kWeightWordsPerRow;
-                const ushort metadata_index =
-                    row_indices[row * kGroupsPerRow];
-                const uint pair = lut[metadata_index];
-                gemma4_exact_four_vector_sliding_qkv_qdot_pair_4bit(
-                    row_weight_words[0],
-                    values2,
-                    values3,
-                    gemma4_exact_four_vector_sliding_qkv_pair_scale(pair),
-                    gemma4_exact_four_vector_sliding_qkv_pair_bias(pair),
-                    input_sum2,
-                    input_sum3,
-                    result2[row],
-                    result3[row]);
-            }
+        float values0[8];
+        float values1[8];
+        float values2[8];
+        float values3[8];
+        const float input_sum0 =
+            gemma4_exact_four_vector_sliding_qkv_load_values(
+                input0, values0);
+        const float input_sum1 =
+            gemma4_exact_four_vector_sliding_qkv_load_values(
+                input1, values1);
+        const float input_sum2 =
+            gemma4_exact_four_vector_sliding_qkv_load_values(
+                input2, values2);
+        const float input_sum3 =
+            gemma4_exact_four_vector_sliding_qkv_load_values(
+                input3, values3);
+        #pragma clang loop unroll(full)
+        for (int row = 0; row < kRowsPerSIMD; ++row) {
+            const device uint* row_weight_words =
+                weight_words + row * kWeightWordsPerRow;
+            const ushort metadata_index =
+                row_indices[row * kGroupsPerRow];
+            const uint pair = lut[metadata_index];
+            const float scale = gemma4_exact_four_vector_sliding_qkv_pair_scale(pair);
+            const float bias = gemma4_exact_four_vector_sliding_qkv_pair_bias(pair);
+            const uint packed_word = row_weight_words[0];
+            gemma4_exact_four_vector_sliding_qkv_qdot_pair_4bit(
+                packed_word,
+                values0,
+                values1,
+                scale,
+                bias,
+                input_sum0,
+                input_sum1,
+                result0[row],
+                result1[row]);
+            gemma4_exact_four_vector_sliding_qkv_qdot_pair_4bit(
+                packed_word,
+                values2,
+                values3,
+                scale,
+                bias,
+                input_sum2,
+                input_sum3,
+                result2[row],
+                result3[row]);
         }
 
         weight_words += kSIMDSize;
@@ -263,61 +254,52 @@ private let gemma4ExactFourVectorFullQKSource = """
     float result2[kRowsPerSIMD] = {0};
     float result3[kRowsPerSIMD] = {0};
     for (int block = 0; block < 21; ++block) {
-        {
-            float values0[8];
-            float values1[8];
-            const float input_sum0 =
-                gemma4_exact_four_vector_sliding_qkv_load_values(
-                    input0, values0);
-            const float input_sum1 =
-                gemma4_exact_four_vector_sliding_qkv_load_values(
-                    input1, values1);
-            #pragma clang loop unroll(full)
-            for (int row = 0; row < kRowsPerSIMD; ++row) {
-                const device uint* row_weight_words =
-                    weight_words + row * kWeightWordsPerRow;
-                const ushort metadata_index =
-                    row_indices[row * kGroupsPerRow];
-                const uint pair = lut[metadata_index];
-                gemma4_exact_four_vector_sliding_qkv_qdot_pair_4bit(
-                    row_weight_words[0],
-                    values0,
-                    values1,
-                    gemma4_exact_four_vector_sliding_qkv_pair_scale(pair),
-                    gemma4_exact_four_vector_sliding_qkv_pair_bias(pair),
-                    input_sum0,
-                    input_sum1,
-                    result0[row],
-                    result1[row]);
-            }
-        }
-        {
-            float values2[8];
-            float values3[8];
-            const float input_sum2 =
-                gemma4_exact_four_vector_sliding_qkv_load_values(
-                    input2, values2);
-            const float input_sum3 =
-                gemma4_exact_four_vector_sliding_qkv_load_values(
-                    input3, values3);
-            #pragma clang loop unroll(full)
-            for (int row = 0; row < kRowsPerSIMD; ++row) {
-                const device uint* row_weight_words =
-                    weight_words + row * kWeightWordsPerRow;
-                const ushort metadata_index =
-                    row_indices[row * kGroupsPerRow];
-                const uint pair = lut[metadata_index];
-                gemma4_exact_four_vector_sliding_qkv_qdot_pair_4bit(
-                    row_weight_words[0],
-                    values2,
-                    values3,
-                    gemma4_exact_four_vector_sliding_qkv_pair_scale(pair),
-                    gemma4_exact_four_vector_sliding_qkv_pair_bias(pair),
-                    input_sum2,
-                    input_sum3,
-                    result2[row],
-                    result3[row]);
-            }
+        float values0[8];
+        float values1[8];
+        float values2[8];
+        float values3[8];
+        const float input_sum0 =
+            gemma4_exact_four_vector_sliding_qkv_load_values(
+                input0, values0);
+        const float input_sum1 =
+            gemma4_exact_four_vector_sliding_qkv_load_values(
+                input1, values1);
+        const float input_sum2 =
+            gemma4_exact_four_vector_sliding_qkv_load_values(
+                input2, values2);
+        const float input_sum3 =
+            gemma4_exact_four_vector_sliding_qkv_load_values(
+                input3, values3);
+        #pragma clang loop unroll(full)
+        for (int row = 0; row < kRowsPerSIMD; ++row) {
+            const device uint* row_weight_words =
+                weight_words + row * kWeightWordsPerRow;
+            const ushort metadata_index =
+                row_indices[row * kGroupsPerRow];
+            const uint pair = lut[metadata_index];
+            const float scale = gemma4_exact_four_vector_sliding_qkv_pair_scale(pair);
+            const float bias = gemma4_exact_four_vector_sliding_qkv_pair_bias(pair);
+            const uint packed_word = row_weight_words[0];
+            gemma4_exact_four_vector_sliding_qkv_qdot_pair_4bit(
+                packed_word,
+                values0,
+                values1,
+                scale,
+                bias,
+                input_sum0,
+                input_sum1,
+                result0[row],
+                result1[row]);
+            gemma4_exact_four_vector_sliding_qkv_qdot_pair_4bit(
+                packed_word,
+                values2,
+                values3,
+                scale,
+                bias,
+                input_sum2,
+                input_sum3,
+                result2[row],
+                result3[row]);
         }
 
         weight_words += kSIMDSize;
