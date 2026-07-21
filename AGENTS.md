@@ -157,15 +157,15 @@ The target is Poolside Laguna XS 2.1, MoE, 4-bit (untied embeddings, vocab
 100352), text tower only (the empty `vision_config` is out of scope and never
 loaded). The frozen target checkpoint is about
 18.8 GB across 4 safetensors shards; `setup-mtp.sh` also provisions the
-matched DFlash speculator (organizer MLX 4-bit conversion of the 924,135,848-
-byte BF16 upstream, expected ~260 MB) as the assistant and verifies both
+matched DFlash speculator (the 924,135,848-byte BF16 upstream, converted to
+MLX affine 4-bit group-64 at setup) as the assistant and verifies both
 against pinned manifests. The
 transformed `mtp-weights/` tree holds only the text-tower tensors
 (everything under the source checkpoint's `language_model.` prefix) plus a
 runtime-authored `config.json`; it is an overlay/runtime artifact, not a
 second full copy of the model. Aim to keep generated transformed weights under
 20 GB (the default cap is 25 GiB; the MTP contract caps transformed output at
-24 GiB).
+20 GiB).
 
 ## What Not To Change
 
@@ -543,8 +543,9 @@ contract. An organizer-pinned Laguna XS 2.1 target
 (`mlx-community/Laguna-XS-2.1-4bit`, MLX affine 4-bit group-64) is
 paired with Poolside's matched trained DFlash speculator
 (`poolside/Laguna-XS-2.1-DFlash`, a 5-layer Eagle-style draft over target
-layers [1,13,25,33,39] with block_size 16 and mask token 12, provisioned as
-an organizer MLX 4-bit sidecar); a trusted parent drives a block protocol
+layers [1,13,25,33,39] with block_size 16 and mask token 12, downloaded as
+the BF16 upstream and converted to MLX 4-bit at setup); a trusted parent
+drives a block protocol
 (`mtp_decode_begin`, then
 `mtp_decode_block` carrying only the last committed token and a max block
 size of 4), owns the timer and an independent serial-oracle check of every

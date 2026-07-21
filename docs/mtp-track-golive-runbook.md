@@ -3,8 +3,9 @@
 > **Laguna XS 2.1 re-pin (2026-07): this runbook must be re-executed.**
 > The track has been re-pinned from Gemma 4 31B-IT to Poolside Laguna XS 2.1
 > (target `mlx-community/Laguna-XS-2.1-4bit`, upstream
-> `poolside/Laguna-XS-2.1`, assistant `poolside/Laguna-XS-2.1-DFlash` as an
-> organizer MLX 4-bit sidecar) under the new track ID `laguna-xs-2.1-mtp-v1`
+> `poolside/Laguna-XS-2.1`, assistant `poolside/Laguna-XS-2.1-DFlash`
+> downloaded as the BF16 upstream and converted to MLX 4-bit at setup) under
+> the new track ID `laguna-xs-2.1-mtp-v1`
 > (serial: `laguna-xs-2.1-serial-v1`). Everything M5-derived below is stale
 > for the new model and must be regenerated on `m5-bench` with the real
 > Laguna weights before the track can go live again:
@@ -15,11 +16,11 @@
 > - the public local fixtures under `correctness_prompts/` (same reason);
 > - the weight manifests `fixtures/mtp_laguna_xs_2_1_4bit.sha256`,
 >   `fixtures/mtp_laguna_xs_2_1_dflash.sha256`, and
->   `fixtures/reference_laguna_xs_2_1_4bit.sha256` (placeholders pre-filled
->   from Hugging Face metadata; the DFlash manifest is empty until the
->   organizer MLX 4-bit conversion exists), plus the `manifest_sha256`,
->   assistant byte pins, and `expected_source_bytes` confirmation in
->   `fixtures/laguna_xs_2_1_mtp_track.json`;
+>   `fixtures/reference_laguna_xs_2_1_4bit.sha256` (checked in as entry-less
+>   placeholder headers; hashes are only ever pinned from on-box downloads,
+>   and setup fails closed until they are regenerated), plus the
+>   `manifest_sha256`, assistant file pins, and `expected_source_bytes`
+>   confirmation in `fixtures/laguna_xs_2_1_mtp_track.json`;
 > - the paired serial K=1 baseline tree, floor calibration, and box-2 MTP
 >   caches (`/opt/bench-runner/cache/mtp/laguna-xs-2.1-mtp-v1/...`);
 > - the enablement commit that flips the contract fixture back to

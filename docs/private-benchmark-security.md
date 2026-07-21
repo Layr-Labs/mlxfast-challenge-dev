@@ -166,7 +166,10 @@ Correctness-only dispatches (`run_benchmark=false`) fetch no private
 material at all. The correctness objects were regenerated from the Gemma 4 31B 4-bit
 reference on the ranked hardware through the organizer-controlled offline
 process; `docs/gemma-migration-r2-checklist.md` records the provenance and
-the current pins.
+the current pins. (The Laguna XS 2.1 re-pin makes these `-gemma` objects
+stale: the same offline process must regenerate them from the Laguna
+reference — new tokenizer, vocab 100352 — and the object names will rotate
+accordingly; see `docs/mtp-track-golive-runbook.md`.)
 
 Raw private bytes land only in a runner-only `0700` per-run directory; the
 raw golden and timed prompt are each verified against a SHA-256 and byte

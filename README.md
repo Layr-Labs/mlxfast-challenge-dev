@@ -45,7 +45,10 @@ Hugging Face-style cache under
 `~/.cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main/`
 (in `$HOME` by default so parallel clones reuse one checkpoint).
 It verifies cached files against `fixtures/reference_laguna_xs_2_1_4bit.sha256`
-and redownloads only files that are missing, truncated, or hash-mismatched. A
+and redownloads only files that are missing, truncated, or hash-mismatched.
+(The checked-in Laguna weight manifests are entry-less placeholders until the
+operator regenerates them on m5-bench; setup fails closed on an entry-less
+manifest, so use `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1` until then.) A
 compatibility symlink is created at `reference_weights/laguna-xs-2.1-4bit`
 for older commands, but current setup and CI pass the canonical cache directory
 to transform explicitly. The downloader uses resumable `curl` requests, prints

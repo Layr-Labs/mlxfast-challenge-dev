@@ -61,7 +61,9 @@ By default `setup.sh` downloads `mlx-community/Laguna-XS-2.1-4bit` from the
 pinned Hugging Face revision with resumable `curl` requests (no organizer
 mirror exists yet; one may be added later). It checks cached files
 against the pinned SHA256 manifest and redownloads only missing, truncated, or
-hash-mismatched files. The safetensors payload is about 18.8 GB across 4
+hash-mismatched files. (The checked-in Laguna weight manifests are entry-less
+placeholders until the operator regenerates them on m5-bench; setup fails
+closed on an entry-less manifest.) The safetensors payload is about 18.8 GB across 4
 shards; `setup.sh` requires 40 GiB free by default before starting. After a
 full verification, setup writes `.mlxfast-reference-cache.lock`; later setup
 runs use cheap size/mtime checks from that lock and skip the full checkpoint

@@ -50,8 +50,8 @@ and the target's `generation_config` speculative block with this target:
   `model.safetensors` = 924,135,848 bytes; dflash_config: block_size 16,
   mask_token_id 12, num_target_layers 40, target_layer_ids [1,13,25,33,39],
   causal; draft_vocab_size 100352; aux hidden-state layer ids
-  [2,14,26,34,40]. The runtime sidecar is the organizer's MLX affine 4-bit
-  group-64 conversion, expected to land near 260 MB.)
+  [2,14,26,34,40]. The draft is downloaded as the BF16 upstream and
+  converted to MLX affine 4-bit, group size 64, at setup.)
 
 The DFlash speculator is trained against this exact target, so the track
 binds the pinned pair directly; there is no separate base-vs-IT pairing
@@ -88,26 +88,27 @@ Byte manifests:
 - `fixtures/mtp_laguna_xs_2_1_4bit.sha256`
 - `fixtures/mtp_laguna_xs_2_1_dflash.sha256`
 
-Both manifests, the manifest self-hashes, and the assistant byte pins are
-placeholders until they are regenerated on m5-bench with the real weights
-(the target manifest is pre-filled from Hugging Face LFS metadata; the
-assistant manifest is empty because the organizer MLX 4-bit DFlash
-conversion does not exist yet).
+Both manifests are entry-less placeholder headers, and the manifest
+self-hashes and assistant byte pins in the contract fixture are TODO markers,
+until they are regenerated on m5-bench with the real weights (hashes are
+never pre-filled off-box; setup fails closed on an entry-less manifest).
 
-The assistant runtime inventory is exactly two regular, single-link files:
+The assistant source inventory is exactly two regular, single-link files:
 
-- `config.json`: bytes pinned after conversion
-- `model.safetensors`: bytes pinned after conversion (expected ~260 MB;
-  the BF16 upstream is 924,135,848 bytes)
+- `config.json`: bytes pinned on m5-bench (the upstream file is 963 bytes)
+- `model.safetensors`: bytes pinned on m5-bench (the BF16 upstream payload
+  is 924,135,848 bytes per Hugging Face LFS metadata; setup converts it to
+  MLX affine 4-bit, group size 64, on-box)
 
 Extra files,
 symlinks, hardlinks, size mismatches, hash mismatches, incompatible config
-fields (including the pinned affine 4-bit group-64 quantization block), or a
-total above the pinned maximum fail before model load.
+fields (including the runtime affine 4-bit group-64 quantization contract),
+or a total above the pinned maximum fail before model load.
 
-The target source manifest totals 18,829,720,326 bytes (pre-filled from the
-pinned revision; confirm on m5-bench). The transformed
-text-only target is capped at 24 GiB. The assistant remains an
+The target source totals 18,829,720,326 bytes per Hugging Face API metadata
+at the pinned revision (confirm on m5-bench when the manifest is
+regenerated). The transformed
+text-only target is capped at 20 GiB. The assistant remains an
 organizer-provisioned read-only sidecar and is not copied into participant
 submission artifacts.
 
@@ -282,16 +283,17 @@ and fixed timing/count contract remain the substantive runtime controls.
 
 Known on-disk bytes:
 
-- target source: 18,829,720,326 bytes (pre-filled from the pinned revision;
-  confirm on m5-bench);
-- assistant sidecar: to be pinned after the organizer MLX 4-bit DFlash
-  conversion (expected ~260 MB; BF16 upstream is 924,135,848 bytes);
-- combined: about 17.8 GiB plus the converted sidecar.
+- target source: 18,829,720,326 bytes per Hugging Face API metadata at the
+  pinned revision (confirm on m5-bench);
+- assistant draft download: 924,135,848 bytes BF16 per Hugging Face LFS
+  metadata (converted to MLX affine 4-bit at setup; the converted runtime
+  form is smaller);
+- combined source: about 18.4 GiB.
 
-The assistant is the 5-layer DFlash Eagle-style speculator, to be stored as
-affine 4-bit
-(group size 64) packed U32 weights with scales/biases after the organizer
-conversion. The old-target M5 matrix measured up to 47.6 GiB peak process RSS,
+The assistant is the 5-layer DFlash Eagle-style speculator, stored at
+runtime as affine 4-bit
+(group size 64) packed U32 weights with scales/biases after the on-box
+setup conversion. The old-target M5 matrix measured up to 47.6 GiB peak process RSS,
 31.2 GiB MLX active memory, 3.4 GiB MLX cache memory, and 34.1 GiB MLX allocator
 peak; expect the Laguna numbers to be re-measured during the M5 rebaseline.
 Runtime peak is higher than file size because target and assistant
