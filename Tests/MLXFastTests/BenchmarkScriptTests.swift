@@ -1271,8 +1271,8 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // The augmented golden is pinned to a self-anchored hash exported into
     // GITHUB_ENV right after attach-gpqa-gates, exactly as the old gates
     // machine did.
-    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 56c282dcaac433543ef0eecb625cd99bc20f1ae1f7b9415efe32a71e6eb4eae9"))
-    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: \"38162\""))
+    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 96689a9ceaf7cc813174d0a6cb2ab650454d7d031f88514cbd222bcb17bb4d7e"))
+    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: \"35749\""))
     #expect(workflow.contains("raw hidden correctness golden pin mismatch"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"))
