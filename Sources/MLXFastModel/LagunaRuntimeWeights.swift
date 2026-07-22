@@ -8,8 +8,8 @@ import MLXNN
 /// source checkpoint's tensor names (including the `language_model.model.`
 /// prefix) unchanged when it copies text-tower tensors into the transformed
 /// weights tree, so the loader can address them directly without a rename
-/// pass. See `LAGUNA_WEIGHT_CONTRACT.md` (same directory) for the full key
-/// scheme, shapes, and quantization layout the transform must produce.
+/// pass. See `docs/laguna-weight-contract.md` for the full key scheme,
+/// shapes, and quantization layout the transform must produce.
 public enum LagunaWeightNames {
     private static let prefix = "language_model.model"
 
