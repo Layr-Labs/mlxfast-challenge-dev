@@ -11,12 +11,10 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
         encoding: .utf8
     )
 
-    // TODO(operator): once a Darkbloom R2 mirror is provisioned for the Laguna
-    // checkpoint, re-pin this to the mirror URL (the Gemma track used
-    // https://ds4.darkbloom.ai/<model>). Until then the pinned Hugging Face
-    // revision is the primary source.
-    #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/c42e0a8f8d504ceacde015a535dcb286d65c8799\""))
-    #expect(setup.contains("DEFAULT_REFERENCE_FALLBACK_BASE_URL=\"https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/main\""))
+    #expect(setup.contains("REFERENCE_MODEL_REPO=\"${MLXFAST_REFERENCE_MODEL_REPO:-poolside/Laguna-XS-2.1-NVFP4-mlx}\""))
+    #expect(setup.contains("REFERENCE_REVISION=\"${MLXFAST_REFERENCE_REVISION:-841778bda563a36104dd521e37d99218e46f4f25}\""))
+    #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx\""))
+    #expect(setup.contains("DEFAULT_REFERENCE_FALLBACK_BASE_URL=\"https://huggingface.co/poolside/Laguna-XS-2.1-NVFP4-mlx/resolve/841778bda563a36104dd521e37d99218e46f4f25\""))
     #expect(setup.contains("REFERENCE_BASE_URL=\"${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}\""))
     // 3 parallel shard downloads by default; env-overridable.
     #expect(setup.contains("REFERENCE_DOWNLOAD_JOBS=\"${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-3}\""))
@@ -248,8 +246,8 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     // The reference comes from the runner-owned cache, never a download. The
     // dependency-only SwiftPM cache is restored before the checkout is copied
     // into the bench workspace; ranked jobs never save submission build output.
-    #expect(workflow.contains("MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main"))
-    #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_4bit.sha256"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256"))
     #expect(workflow.contains("shasum -a 256 \"${path}\""))
     #expect(workflow.contains("reference checkpoint failed manifest verification"))
     #expect(!workflow.contains("./setup.sh"))
@@ -521,11 +519,11 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
     #expect(!workflow.contains("secrets."))
     #expect(!workflow.contains("secrets: inherit"))
     #expect(!workflow.contains("MLXFAST_REFERENCE_AUTH_HEADER"))
-    #expect(workflow.contains("MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || 'https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/main' }}"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || 'https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx' }}"))
     // The probe must target the LAGUNA reference checkpoint: the Gemma-era
     // manifest and cache directory were deleted with the migration, so stale
     // defaults would fail every dispatch at the manifest hash step.
-    #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_4bit.sha256"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256"))
     #expect(!workflow.contains("gemma-4-31b-4bit"))
 }
 
@@ -1290,14 +1288,13 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_TARGET_ID: \(MLXFastConstants.benchmarkEvaluationTargetID)"))
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_SHA256: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}"))
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_BYTES: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_BYTES }}"))
-    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt"))
-    #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json"))
-    #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json"))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna-nvfp4-v2.txt"))
+    #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna-nvfp4-v2.json"))
+    #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna-nvfp4-v2.json"))
     #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
-    // 64-token budget and min-pass 1 threshold, re-validated against the
-    // unmodified Laguna XS 2.1 4-bit baseline (judged 1/5-2/5 across four
-    // ranked official-runner runs on the regenerated hidden Laguna prompts);
-    // see MLXFastConstants.semanticGPQAMinPassCount.
+    // Temporary affine-checkpoint values; Poolside NVFP4 M5 validation must
+    // replace or explicitly re-confirm them before merge. See
+    // MLXFastConstants.semanticGPQAMinPassCount.
     #expect(workflow.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"64\""))
     #expect(workflow.contains("MLXFAST_GPQA_TTFT_CASE_COUNT: \"5\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_CASE_COUNT: \"5\""))
@@ -3863,10 +3860,10 @@ func benchmarkRestoresFansWhenAbortedAfterBoost() throws {
     #expect(helperInvocations.contains("normal"))
 }
 
-// The ~17 GB RAM-resident model means TWO simultaneous residencies (an
+// The ~21.6 GB RAM-resident model means TWO simultaneous residencies (an
 // overlapping second local run, or a new run started while an orphaned
 // model-holding worker from an aborted run lingers) can out-of-memory a
-// 36 GB machine. Local modes must therefore (1) serialize runs behind a
+// 40 GiB machine. Local modes must therefore (1) serialize runs behind a
 // per-user lock, (2) refuse to start while a model-holding process is
 // already alive -- warn-and-abort, never auto-kill -- and (3) reap the
 // spawned benchmark process tree on INT/TERM/EXIT so aborted runs cannot
@@ -4095,7 +4092,7 @@ func terminatedLocalRunReapsTheModelHoldingProcessTree() throws {
     )
 
     // The fake benchmark stands in for `mlxfast-swift benchmark`: it spawns a
-    // long-lived child (the stand-in for the ~17 GB runtime worker), records
+    // long-lived child (the stand-in for the ~21.6 GB runtime worker), records
     // both pids, then idles like a real run mid-measurement.
     let workerPidFile = root.appendingPathComponent("worker.pid")
     let marker = root.appendingPathComponent("benchmark-running.marker")
@@ -4764,12 +4761,12 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
     let refWeights = root.appendingPathComponent("reference_weights")
     try FileManager.default.createDirectory(at: refWeights, withIntermediateDirectories: true)
     try FileManager.default.createSymbolicLink(
-        atPath: refWeights.appendingPathComponent("laguna-xs-2.1-4bit").path,
+        atPath: refWeights.appendingPathComponent("laguna-xs-2.1-nvfp4-mlx").path,
         withDestinationPath: root.appendingPathComponent("does-not-exist").path
     )
 
     // A real cache directory holding the checkpoint.
-    let cache = root.appendingPathComponent("hfcache/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main")
+    let cache = root.appendingPathComponent("hfcache/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25")
     try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
     try "{}".write(to: cache.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
 
@@ -4846,7 +4843,7 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
     let recorded = (try? String(contentsOf: reflog, encoding: .utf8)) ?? ""
     // The transform was handed the real cache dir, not the broken symlink.
     #expect(recorded.contains(cache.path))
-    #expect(!recorded.contains("reference_weights/laguna-xs-2.1-4bit"))
+    #expect(!recorded.contains("reference_weights/laguna-xs-2.1-nvfp4-mlx"))
 }
 
 @Test

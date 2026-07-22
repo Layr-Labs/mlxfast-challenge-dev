@@ -3,7 +3,7 @@ name: benchmark
 # DEFAULT SERIAL RANKED PIPELINE (self-hosted Apple M5 Max, label m5-bench).
 #
 # This is the Yukon-default ranked entrypoint declared by benchmark.json
-# (track id laguna-xs-2.1-serial-v1). It runs the one-token serial contract:
+# (track id laguna-xs-2.1-serial-v2). It runs the one-token serial contract:
 # the MTP track is retired, and this serial pipeline is the only ranked
 # track.
 #
@@ -46,8 +46,8 @@ name: benchmark
 # harness spawns its per-phase runtime workers fresh inside that run, so no
 # model/cache state survives from the correctness pass into the timed pass.
 # The paired ratio (candidate vs the PINNED baseline tree at
-# /opt/bench-runner/baseline/current, sanity-banded against
-# /opt/bench-runner/state/baseline-calibration.json) cancels the remaining
+# /opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current, sanity-banded
+# against the matching versioned calibration) cancels the remaining
 # common-mode host drift exactly like the old separate-VM pairing did --
 # validated on this box at paired score 1.0507 with decode CV 0.13%.
 #
@@ -132,15 +132,15 @@ jobs:
       MLXFAST_MEASURE_JOB: /opt/bench-runner/measure-job.sh
       MLXFAST_QUARANTINE_FLAG: /opt/bench/quarantine.flag
       MLXFAST_MACMON: /opt/bench-runner/bin/macmon
-      MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/current
-      MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/baseline-calibration.json
-      MLXFAST_MEASURE_STATE_DIR: /opt/bench-runner/state
+      MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current
+      MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/laguna-xs-2.1-serial-v2/baseline-calibration.json
+      MLXFAST_MEASURE_STATE_DIR: /opt/bench-runner/state/laguna-xs-2.1-serial-v2
       # Reference checkpoint pre-provisioned in the runner-owned cache
       # (world-readable; verified against the pinned manifest below every
       # run). No download happens on this box, so the old
       # reference_download_jobs/reference_min_free_gib inputs are gone.
-      MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main
-      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_4bit.sha256
+      MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256
       # Bench workspace: the ONLY place submitted code executes and writes.
       # Must live under /Users/Shared/bench-jobs (bench-exec refuses anything
       # else). The path is STABLE across runs (not per-run) because llbuild's
@@ -194,11 +194,10 @@ jobs:
       MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "35749"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
       MLXFAST_GPQA_CASE_COUNT: "5"
-      # 64-token GPQA behavior/semantic budget and min-pass 1 threshold:
-      # re-validated 2026-07-22 against the unmodified Laguna XS 2.1 4-bit
-      # baseline, which judges 1/5-2/5 on the regenerated hidden Laguna
-      # prompts (four ranked runs, see
-      # MLXFastConstants.semanticGPQAMinPassCount). Keep in sync with
+      # TEMPORARY legacy GPQA budget/min-pass calibration from the superseded
+      # mlx-community affine checkpoint. Re-evaluate both values from repeated
+      # Poolside NVFP4 M5 runs before this migration merges; do not weaken the
+      # semantic gate merely to make the new baseline pass. Keep in sync with
       # MLXFastConstants.{correctnessGPQAMaxNewTokens,semanticGPQAMaxNewTokens,
       # semanticGPQAMinPassCount}.
       MLXFAST_GPQA_MAX_NEW_TOKENS: "64"
@@ -407,8 +406,22 @@ jobs:
           test -s "${MLXFAST_REFERENCE_MANIFEST_PATH}"
           failures=0
           checked=0
-          while read -r want_hash want_bytes rel_path; do
-            [[ -z "${want_hash}" || "${want_hash}" == \#* ]] && continue
+          checked_bytes=0
+          while IFS= read -r line || [[ -n "${line}" ]]; do
+            [[ -z "${line}" || "${line}" == \#* ]] && continue
+            read -r want_hash want_bytes rel_path extra <<< "${line}"
+            if [[ -n "${extra:-}" \
+                || ! "${want_hash:-}" =~ ^[0-9a-f]{64}$ \
+                || ! "${want_bytes:-}" =~ ^[0-9]+$ \
+                || -z "${rel_path:-}" \
+                || "${rel_path}" == /* \
+                || "${rel_path}" == *\\* \
+                || "/${rel_path}/" == *"/../"* \
+                || "/${rel_path}/" == *"/./"* ]]; then
+              echo "::error::malformed reference manifest entry" >&2
+              failures=$((failures + 1))
+              continue
+            fi
             path="${MLXFAST_REFERENCE_DIR}/${rel_path}"
             if [[ ! -f "${path}" ]]; then
               echo "::error::reference file missing: ${rel_path}" >&2
@@ -422,12 +435,15 @@ jobs:
               failures=$((failures + 1))
             fi
             checked=$((checked + 1))
+            checked_bytes=$((checked_bytes + want_bytes))
           done < "${MLXFAST_REFERENCE_MANIFEST_PATH}"
-          if [[ "${failures}" -ne 0 || "${checked}" -eq 0 ]]; then
-            echo "::error::reference checkpoint failed manifest verification (checked=${checked} failures=${failures})" >&2
+          if [[ "${failures}" -ne 0 \
+              || "${checked}" -ne 13 \
+              || "${checked_bytes}" -ne 21568905520 ]]; then
+            echo "::error::reference checkpoint failed manifest verification (checked=${checked} bytes=${checked_bytes} failures=${failures})" >&2
             exit 1
           fi
-          echo "benchmark: reference checkpoint verified against pinned manifest (${checked} files)"
+          echo "benchmark: reference checkpoint verified against pinned manifest (${checked} files, ${checked_bytes} bytes)"
 
       # Dependency checkouts for BOTH SwiftPM roots: the trusted CLI resolves
       # into .build and the participant worker into its own .build-worker
@@ -1213,8 +1229,8 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           # Private object keys scoped to this trusted download step only (not
           # job-level), so untrusted bench phases never receive the object names.
-          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json
-          MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json
+          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna-nvfp4-v2.json
+          MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna-nvfp4-v2.json
         run: |
           set -euo pipefail
           .github/scripts/download-r2-object.sh \
@@ -1596,7 +1612,7 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt
+          MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna-nvfp4-v2.txt
         run: |
           set -euo pipefail
           .github/scripts/download-r2-object.sh \

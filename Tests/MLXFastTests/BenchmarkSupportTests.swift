@@ -240,7 +240,7 @@ func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
     }
     addCase("quantization-group") {
         var quantization = $0["quantization"] as! [String: Any]
-        quantization["group_size"] = 32
+        quantization["group_size"] = 64
         $0["quantization"] = quantization
     }
     addCase("quantization-mode") {
@@ -249,6 +249,20 @@ func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
         $0["quantization"] = quantization
     }
     addCase("missing-quantization") { $0.removeValue(forKey: "quantization") }
+    addCase("missing-quantization-config") { $0.removeValue(forKey: "quantization_config") }
+    addCase("quantization-missing-mode") {
+        var quantization = $0["quantization"] as! [String: Any]
+        quantization.removeValue(forKey: "mode")
+        $0["quantization"] = quantization
+    }
+    addCase("quantization-override") {
+        var quantization = $0["quantization"] as! [String: Any]
+        quantization["model.layers.1.mlp.switch_mlp.gate_proj"] = [
+            "group_size": 16,
+            "bits": 4,
+        ]
+        $0["quantization"] = quantization
+    }
 
     for (name, object) in cases {
         let data = try JSONSerialization.data(withJSONObject: object)
@@ -260,11 +274,10 @@ func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
 
 @Test
 func runtimeWorkerPinnedConfigurationAcceptsSafeOptionalRepresentations() throws {
-    // The alternate spelling: quantization under quantization_config, the
-    // boolean gating form, and every optional field absent (the validator
-    // treats absence as the pinned default).
+    // The boolean gating form and every architecture field that the source
+    // legitimately omits remain accepted. Both explicit quantization blocks
+    // stay mandatory because they are part of the pinned Poolside identity.
     var object = pinnedRuntimeWorkerConfigurationObject()
-    object["quantization_config"] = object.removeValue(forKey: "quantization")
     object["gating"] = true
     for optionalKey in [
         "attention_bias",
@@ -952,6 +965,24 @@ func benchmarkPreflightRejectsMissingSemanticTensor() throws {
     }
 }
 
+@Test
+func lagunaWeightLoaderRejectsUnexpectedTensorInventory() throws {
+    let fixture = try makePreflightFixture(
+        extraDenseTensor: TensorFixture(
+            name: "model.unexpected.weight",
+            dtype: "BF16",
+            shape: [1]
+        )
+    )
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    let config = try LagunaConfig.load(from: fixture.weights.path)
+    let loader = try LagunaWeightLoader(weightsPath: fixture.weights.path)
+    #expect(throws: MLXFastError.self) {
+        try loader.validateRequiredMetadata(config: config)
+    }
+}
+
 private struct PreflightFixture {
     let root: URL
     let weights: URL
@@ -988,7 +1019,8 @@ private func checkCorrectnessPreflight(
 
 private func makePreflightFixture(
     goldenContents: String? = nil,
-    omitDenseTensorName: String? = nil
+    omitDenseTensorName: String? = nil,
+    extraDenseTensor: TensorFixture? = nil
 ) throws -> PreflightFixture {
     let directory = try temporaryDirectory()
     let weights = directory.appendingPathComponent("weights", isDirectory: true)
@@ -1004,6 +1036,9 @@ private func makePreflightFixture(
     if let omitDenseTensorName {
         denseTensors.removeAll { $0.name == omitDenseTensorName }
     }
+    if let extraDenseTensor {
+        denseTensors.append(extraDenseTensor)
+    }
     let denseShard = "model-00001.safetensors"
     try writeSafetensors(weights.appendingPathComponent(denseShard), tensors: denseTensors)
     try writeIndex(
@@ -1018,21 +1053,9 @@ private func makePreflightFixture(
     return PreflightFixture(root: directory, weights: weights, golden: golden)
 }
 
-/// The pinned Laguna runtime config as the transform writes it, with the
-/// 8-bit router-gate quantization override present for every sparse layer
-/// (the shared `pinnedRuntimeWorkerConfigurationObject()` carries a single
-/// representative override; the preflight weight validation resolves the
-/// expected router bit width per layer from these entries).
+/// The pinned Poolside Laguna NVFP4 runtime config as the transform writes it.
 private func lagunaPreflightConfigJSON() throws -> String {
-    var root = pinnedRuntimeWorkerConfigurationObject()
-    var quantization = root["quantization"] as? [String: Any] ?? [:]
-    for layerIndex in 1..<MLXFastConstants.numHiddenLayers {
-        quantization["language_model.model.layers.\(layerIndex).mlp.gate.proj"] = [
-            "group_size": 64,
-            "bits": 8,
-        ]
-    }
-    root["quantization"] = quantization
+    let root = pinnedRuntimeWorkerConfigurationObject()
     let data = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
     return String(decoding: data, as: UTF8.self)
 }
@@ -1091,9 +1114,8 @@ private func correctnessOnlyGoldenJSON() -> String {
 /// 256-expert MoE with a shared expert elsewhere, per-head attention
 /// gating, untied lm_head). Real byte contents do not matter for these
 /// preflight tests -- only declared dtype/shape -- so the shard is written
-/// sparse: quantized projections use the packed `U32` affine layout the
-/// real checkpoint ships (4-bit group-64 everywhere, 8-bit router gates)
-/// with BF16 `.scales`/`.biases` companions.
+/// sparse: only routed/shared expert projections use Poolside's packed U32
+/// NVFP4 layout with U8 group-16 scales; all other matrices are BF16.
 private func requiredLagunaDenseTensorFixtures() -> [TensorFixture] {
     let hidden = MLXFastConstants.hiddenSize
     let denseIntermediate = MLXFastConstants.intermediateSize
@@ -1104,35 +1126,36 @@ private func requiredLagunaDenseTensorFixtures() -> [TensorFixture] {
     let experts = 256
     let expertIntermediate = 512
     let sharedExpertIntermediate = 512
-    let groupSize = 64
+    let groupSize = 16
 
     var tensors: [TensorFixture] = []
 
-    func appendQuantized(
+    func appendBFloat16(_ name: String, shape: [Int]) {
+        tensors.append(TensorFixture(name: name, dtype: "BF16", shape: shape))
+    }
+
+    func appendNVFP4(
         _ name: String,
         leadingShape: [Int],
-        inputFeatures: Int,
-        bits: Int = 4
+        inputFeatures: Int
     ) {
         tensors.append(TensorFixture(
             name: name,
             dtype: "U32",
-            shape: leadingShape + [inputFeatures * bits / 32]
+            shape: leadingShape + [inputFeatures * 4 / 32]
         ))
         let stem = name.hasSuffix(".weight") ? String(name.dropLast(".weight".count)) : name
         let companionShape = leadingShape + [inputFeatures / groupSize]
-        for suffix in ["scales", "biases"] {
-            tensors.append(TensorFixture(
-                name: "\(stem).\(suffix)",
-                dtype: "BF16",
-                shape: companionShape
-            ))
-        }
+        tensors.append(TensorFixture(
+            name: "\(stem).scales",
+            dtype: "U8",
+            shape: companionShape
+        ))
     }
 
-    appendQuantized(LagunaWeightNames.embedTokens, leadingShape: [vocab], inputFeatures: hidden)
-    tensors.append(TensorFixture(name: LagunaWeightNames.finalNorm, dtype: "BF16", shape: [hidden]))
-    appendQuantized(LagunaWeightNames.lmHead, leadingShape: [vocab], inputFeatures: hidden)
+    appendBFloat16(LagunaWeightNames.embedTokens, shape: [vocab, hidden])
+    appendBFloat16(LagunaWeightNames.finalNorm, shape: [hidden])
+    appendBFloat16(LagunaWeightNames.lmHead, shape: [vocab, hidden])
 
     for layerIndex in 0..<layers {
         let layerHeads = layerIndex % 4 == 0 ? 48 : 64
@@ -1145,28 +1168,24 @@ private func requiredLagunaDenseTensorFixtures() -> [TensorFixture] {
             ))
         }
 
-        appendQuantized(
+        appendBFloat16(
             LagunaWeightNames.attention(layerIndex, "q_proj.weight"),
-            leadingShape: [layerHeads * headDim],
-            inputFeatures: hidden
+            shape: [layerHeads * headDim, hidden]
         )
         for suffix in ["k_proj.weight", "v_proj.weight"] {
-            appendQuantized(
+            appendBFloat16(
                 LagunaWeightNames.attention(layerIndex, suffix),
-                leadingShape: [kvHeads * headDim],
-                inputFeatures: hidden
+                shape: [kvHeads * headDim, hidden]
             )
         }
-        appendQuantized(
+        appendBFloat16(
             LagunaWeightNames.attention(layerIndex, "o_proj.weight"),
-            leadingShape: [hidden],
-            inputFeatures: layerHeads * headDim
+            shape: [hidden, layerHeads * headDim]
         )
         // Per-head attention gating: one gate per query head.
-        appendQuantized(
+        appendBFloat16(
             LagunaWeightNames.attention(layerIndex, "g_proj.weight"),
-            leadingShape: [layerHeads],
-            inputFeatures: hidden
+            shape: [layerHeads, hidden]
         )
         for suffix in ["q_norm.weight", "k_norm.weight"] {
             tensors.append(TensorFixture(
@@ -1178,23 +1197,19 @@ private func requiredLagunaDenseTensorFixtures() -> [TensorFixture] {
 
         if layerIndex == 0 {
             for suffix in ["gate_proj.weight", "up_proj.weight"] {
-                appendQuantized(
+                appendBFloat16(
                     LagunaWeightNames.mlp(layerIndex, suffix),
-                    leadingShape: [denseIntermediate],
-                    inputFeatures: hidden
+                    shape: [denseIntermediate, hidden]
                 )
             }
-            appendQuantized(
+            appendBFloat16(
                 LagunaWeightNames.mlp(layerIndex, "down_proj.weight"),
-                leadingShape: [hidden],
-                inputFeatures: denseIntermediate
+                shape: [hidden, denseIntermediate]
             )
         } else {
-            appendQuantized(
-                LagunaWeightNames.mlp(layerIndex, "gate.proj.weight"),
-                leadingShape: [experts],
-                inputFeatures: hidden,
-                bits: 8
+            appendBFloat16(
+                LagunaWeightNames.mlp(layerIndex, "gate.weight"),
+                shape: [experts, hidden]
             )
             tensors.append(TensorFixture(
                 name: LagunaWeightNames.mlp(layerIndex, "gate.e_score_correction_bias"),
@@ -1202,25 +1217,25 @@ private func requiredLagunaDenseTensorFixtures() -> [TensorFixture] {
                 shape: [experts]
             ))
             for suffix in ["switch_mlp.gate_proj.weight", "switch_mlp.up_proj.weight"] {
-                appendQuantized(
+                appendNVFP4(
                     LagunaWeightNames.mlp(layerIndex, suffix),
                     leadingShape: [experts, expertIntermediate],
                     inputFeatures: hidden
                 )
             }
-            appendQuantized(
+            appendNVFP4(
                 LagunaWeightNames.mlp(layerIndex, "switch_mlp.down_proj.weight"),
                 leadingShape: [experts, hidden],
                 inputFeatures: expertIntermediate
             )
             for suffix in ["shared_expert.gate_proj.weight", "shared_expert.up_proj.weight"] {
-                appendQuantized(
+                appendNVFP4(
                     LagunaWeightNames.mlp(layerIndex, suffix),
                     leadingShape: [sharedExpertIntermediate],
                     inputFeatures: hidden
                 )
             }
-            appendQuantized(
+            appendNVFP4(
                 LagunaWeightNames.mlp(layerIndex, "shared_expert.down_proj.weight"),
                 leadingShape: [hidden],
                 inputFeatures: sharedExpertIntermediate
@@ -2149,14 +2164,19 @@ private func makeRuntimeWorkerScript(_ contents: String) throws -> URL {
 }
 
 /// The pinned Laguna XS 2.1 MoE architecture as the transformed runtime
-/// config declares it (mirroring mlx-community/Laguna-XS-2.1-4bit's
+/// config declares it (mirroring poolside/Laguna-XS-2.1-NVFP4-mlx's
 /// config.json): a full-attention layer with 48 query heads and YaRN
 /// partial RoPE at layers 0, 4, ..., 36, sliding-window layers with 64
 /// query heads and default RoPE elsewhere, a dense MLP only at layer 0,
 /// and 256-expert top-8 MoE blocks with a 512-wide shared expert on the
 /// other 39 layers.
 private func pinnedRuntimeWorkerConfigurationObject() -> [String: Any] {
-    [
+    let quantization: [String: Any] = [
+        "group_size": 16,
+        "bits": 4,
+        "mode": "nvfp4",
+    ]
+    return [
         "model_type": "laguna",
         "hidden_size": MLXFastConstants.hiddenSize,
         "num_hidden_layers": MLXFastConstants.numHiddenLayers,
@@ -2206,19 +2226,8 @@ private func pinnedRuntimeWorkerConfigurationObject() -> [String: Any] {
                 "partial_rotary_factor": 0.5,
             ],
         ],
-        "quantization": [
-            "group_size": 64,
-            "bits": 4,
-            "mode": "affine",
-            // The shipped checkpoint declares per-tensor 8-bit overrides for
-            // the MoE router gates; the global pinned-config gate tolerates
-            // them (the runtime weight loader validates them against the
-            // stored tensor geometry).
-            "language_model.model.layers.1.mlp.gate.proj": [
-                "group_size": 64,
-                "bits": 8,
-            ],
-        ],
+        "quantization": quantization,
+        "quantization_config": quantization,
     ]
 }
 

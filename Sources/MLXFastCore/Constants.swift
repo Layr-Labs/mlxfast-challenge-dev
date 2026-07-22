@@ -1,7 +1,7 @@
 public enum MLXFastConstants {
-    public static let referenceModelName = "laguna-xs-2.1-4bit"
-    public static let defaultReferencePath = "reference_weights/laguna-xs-2.1-4bit"
-    public static let defaultReferenceCachePath = ".cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main"
+    public static let referenceModelName = "laguna-xs-2.1-nvfp4-mlx"
+    public static let defaultReferencePath = "reference_weights/laguna-xs-2.1-nvfp4-mlx"
+    public static let defaultReferenceCachePath = ".cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25"
     public static let defaultWeightsPath = "weights"
     public static let defaultGoldenPath = "correctness_golden.json"
     public static let defaultPublicCorrectnessPromptPath = "correctness_prompts/public_longcopy_gate_english_512.txt"
@@ -10,8 +10,8 @@ public enum MLXFastConstants {
     public static let defaultScorePath = "score.json"
     public static let defaultLocalIterateScorePath = "score.local-iterate.json"
 
-    // Frozen text-tower geometry of the pinned Poolside Laguna XS 2.1 4-bit
-    // target (mlx-community/Laguna-XS-2.1-4bit), mirrored from
+    // Frozen text-tower geometry of the pinned Poolside Laguna XS 2.1 NVFP4
+    // target (poolside/Laguna-XS-2.1-NVFP4-mlx), mirrored from
     // Sources/MLXFastModel/LagunaConfig.swift's LagunaConstants (MLXFastCore
     // is trusted and cannot import the editable model target).
     // `intermediateSize` is the dense MLP width used only by layer 0 -- the
@@ -42,11 +42,9 @@ public enum MLXFastConstants {
     // 64 (was 10, DeepSeek-era): originally a Gemma-era calibration (a
     // 2026-07-06 budget capture at 10/32/64 showed shorter budgets cut most
     // candidates off mid-sentence; 64, the correctnessMaxBehaviorSteps
-    // ceiling, gave the judge the most usable text). Retained unchanged for
-    // the Laguna XS 2.1 re-pin: the four ranked Laguna runs on m5-bench
-    // (29891158354, 29898041981, 29931435233, 29934545157) all passed the
-    // judge gate at this budget against the regenerated hidden Laguna GPQA
-    // reference, so 64 remains the working budget.
+    // ceiling, gave the judge the most usable text). TEMPORARY: the four
+    // cited Laguna runs used the superseded mlx-community affine checkpoint.
+    // Re-evaluate this budget from Poolside NVFP4 M5 runs before merge.
     public static let correctnessGPQAMaxNewTokens = 64
     // Semantic judging uses short hidden GPQA answers as a baseline-calibrated
     // gate for optimizations that preserve the exact prefix but damage answer
@@ -56,18 +54,17 @@ public enum MLXFastConstants {
     // correctnessGPQAMaxNewTokens (and must stay <= correctnessMaxBehaviorSteps).
     public static let semanticGPQACaseCount = 5
     public static let semanticGPQAMaxNewTokens = 64
-    // Baseline-calibrated threshold, re-validated 2026-07-22 for the Laguna
-    // XS 2.1 re-pin against the regenerated hidden Laguna GPQA reference:
-    // the four ranked official-runner Laguna baseline observations judged
+    // TEMPORARY threshold from the superseded mlx-community affine
+    // checkpoint. Its four ranked official-runner observations judged
     // 2/5, 2/5, 1/5, and 2/5 (runs 29891158354, 29898041981, 29931435233,
     // and 29934545157; Opus 4.8 judge). min(observed) is 1, so 1 stays the
     // conservative floor: an observed 1/5 sits exactly AT the threshold
     // (raising it would flake honest runs on single-case judge
     // nondeterminism), while a submission that wrecks answer quality (0/5
     // judged) still fails the gate instead of merely being recorded. Keep in
-    // sync with the workflow env MLXFAST_SEMANTIC_GPQA_MIN_PASS. If the
-    // hidden prompts, the judge model, or the reference model change, a
-    // fresh judged official-runner baseline must recalibrate this threshold.
+    // sync with the workflow env MLXFAST_SEMANTIC_GPQA_MIN_PASS. The reference
+    // model is changing here, so repeated Poolside NVFP4 judged M5 runs must
+    // recalibrate this threshold before merge.
     // (Historical: the 2026-07-09 Gemma 4 31B-IT calibration observed a
     // stable 2/5 across five runs and set min(observed) - 1 = 1.)
     public static let semanticGPQAMinPassCount = 1
@@ -138,8 +135,10 @@ public enum MLXFastConstants {
     public static let prefillBandDownTolerance = 0.05
     public static let decodeBandUpTolerance = 0.02
     public static let decodeBandDownTolerance = 0.05
-    // CACHED serial baseline: the Poolside Laguna XS 2.1 4-bit calibration.
-    // Calibration provenance: the live M5 paired baseline as of 2026-07-22 --
+    // TEMPORARY legacy calibration from the superseded mlx-community affine
+    // checkpoint. Replace both literals from Poolside NVFP4 M5 measurements
+    // before this migration merges.
+    // Legacy calibration provenance: the live M5 paired baseline as of 2026-07-22 --
     // the mean of the `baseline_decode_seconds_per_token` /
     // `baseline_prefill_seconds_per_token` fields published by the 4
     // consecutive successful ranked Laguna runs on the self-hosted M5 Max
@@ -170,7 +169,7 @@ public enum MLXFastConstants {
     public static let scoreDecodeWeight = 0.75
     public static let scorePrefillSpeedupFloor = 0.95
     public static let scoreDecodeSpeedupFloor = 0.95
-    // The Laguna XS 2.1 4-bit text tower is ~19 GB; 25 GiB keeps ample
+    // The Poolside Laguna XS 2.1 NVFP4 text tower is ~21.6 GB; 25 GiB keeps ample
     // headroom for shard alignment/padding without approving a second full
     // copy of the model. (The MTP track contract enforces its own tighter
     // 20 GiB `maximum_transformed_bytes` cap separately.)

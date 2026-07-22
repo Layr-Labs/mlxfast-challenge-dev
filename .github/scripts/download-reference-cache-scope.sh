@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Download a small, manifest-verified subset of the Laguna XS 2.1 4-bit
+# Download a small, manifest-verified subset of the Poolside Laguna XS 2.1 NVFP4
 # reference checkpoint for cache experiments. The full checkpoint path
 # intentionally stays in setup.sh so full downloads keep the same
 # lock/verification behavior.
 set -euo pipefail
 
 SCOPE="${1:-}"
-REFERENCE_DIR="${MLXFAST_REFERENCE_DIR:-.cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main}"
-REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/main}"
+REFERENCE_DIR="${MLXFAST_REFERENCE_DIR:-.cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25}"
+REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx}"
 REFERENCE_AUTH_HEADER="${MLXFAST_REFERENCE_AUTH_HEADER:-}"
 REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}"
-REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_laguna_xs_2_1_4bit.sha256}"
+REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256}"
 
 usage() {
   cat >&2 <<EOF

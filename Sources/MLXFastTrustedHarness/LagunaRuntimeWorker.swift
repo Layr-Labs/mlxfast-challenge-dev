@@ -15,7 +15,7 @@ import MLXLMCommon
 #if !MLXFAST_TRUSTED_HARNESS
 extension LagunaRuntime {
     public static func runWorker(weightsPath: String) throws {
-        // The worker holds the ~19 GB model for its whole lifetime, so it must
+        // The worker holds the ~21.6 GB model for its whole lifetime, so it must
         // never outlive the harness parent that spawned it. Reading protocol
         // stdin already ends the worker on parent death (pipe EOF), but only
         // while the worker is blocked reading -- NOT during the minutes-long
@@ -134,7 +134,7 @@ extension LagunaRuntime {
     /// on macOS its parent dying re-parents it to launchd and `getppid()`
     /// becomes 1 -- an unambiguous "the harness that owns me is dead" signal
     /// that cannot fire in any healthy run (local or ranked). Exiting frees
-    /// the ~19 GB model residency so the next run cannot double-load into an
+    /// the ~21.6 GB model residency so the next run cannot double-load into an
     /// out-of-memory. The seams exist for tests only; production callers use
     /// the defaults.
     @discardableResult
@@ -674,15 +674,43 @@ private struct RuntimeWorkerPinnedRopeSpec: Decodable {
     }
 }
 
-private struct RuntimeWorkerPinnedQuantization: Decodable {
+private struct RuntimeWorkerPinnedQuantization: Decodable, Equatable {
     let bits: Int
     let groupSize: Int
-    let mode: String?
+    let mode: String
 
-    enum CodingKeys: String, CodingKey {
-        case bits
-        case groupSize = "group_size"
-        case mode
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: RuntimeWorkerQuantizationKey.self)
+        let allowed = Set(["bits", "group_size", "mode"])
+        guard container.allKeys.allSatisfy({ allowed.contains($0.stringValue) }) else {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription:
+                        "Poolside Laguna NVFP4 does not permit per-tensor quantization overrides"
+                )
+            )
+        }
+        bits = try container.decode(Int.self, forKey: .init("bits"))
+        groupSize = try container.decode(Int.self, forKey: .init("group_size"))
+        mode = try container.decode(String.self, forKey: .init("mode"))
+    }
+}
+
+private struct RuntimeWorkerQuantizationKey: CodingKey {
+    let stringValue: String
+    let intValue: Int? = nil
+
+    init(_ stringValue: String) {
+        self.stringValue = stringValue
+    }
+
+    init?(stringValue: String) {
+        self.init(stringValue)
+    }
+
+    init?(intValue: Int) {
+        return nil
     }
 }
 
@@ -728,12 +756,17 @@ func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
     let expectedMLPLayerTypes = (0..<MLXFastConstants.numHiddenLayers).map {
         $0 == 0 ? "dense" : "sparse"
     }
-    let quantizations = [decoded.quantization, decoded.quantizationConfig].compactMap { $0 }
+    guard let quantization = decoded.quantization,
+          let quantizationConfig = decoded.quantizationConfig,
+          quantization == quantizationConfig
+    else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json requires matching quantization and quantization_config blocks"
+        )
+    }
     // Optional fields follow the runtime loader's tolerance: absent means
-    // the pinned default, present must equal the pinned value. The global
-    // quantization spec is affine 4-bit group-64; the checkpoint's 8-bit
-    // router-gate overrides live in per-tensor sub-objects that the runtime
-    // weight loader validates against the stored tensor geometry.
+    // the pinned default, present must equal the pinned value. Poolside's
+    // exact quantization contract is NVFP4 4-bit group-16 with no overrides.
     guard decoded.modelType == "laguna",
           decoded.hiddenSize == MLXFastConstants.hiddenSize,
           decoded.numHiddenLayers == MLXFastConstants.numHiddenLayers,
@@ -782,12 +815,9 @@ func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
               || decoded.ropeParameters.fullAttention.betaFast == 64,
           decoded.ropeParameters.fullAttention.betaSlow == nil
               || decoded.ropeParameters.fullAttention.betaSlow == 1,
-          !quantizations.isEmpty,
-          quantizations.allSatisfy({
-              $0.bits == 4
-                  && $0.groupSize == 64
-                  && ($0.mode == nil || $0.mode == "affine")
-          })
+          quantization.bits == 4,
+          quantization.groupSize == 16,
+          quantization.mode == "nvfp4"
     else {
         throw MLXFastError.invalidInput(
             "runtime worker config.json does not match the pinned Laguna XS 2.1 MoE architecture"

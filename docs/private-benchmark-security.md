@@ -157,12 +157,12 @@ sees them.
 
 Full benchmark dispatches (`run_benchmark=true`) download three objects from
 the private R2 bucket in trusted steps:
-`correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json`
+`correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna-nvfp4-v2.json`
 (the hidden teacher-forced base case) and
-`correctness_prompts/gpqa_reference_cases-laguna.json` (the hidden GPQA
+`correctness_prompts/gpqa_reference_cases-laguna-nvfp4-v2.json` (the hidden GPQA
 reference cases, merged into the golden as 5 behavior gates), followed after
 the correctness scrub by
-`correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt` (the
+`correctness_prompts/timed_decode_lowsim_prose_v1-laguna-nvfp4-v2.txt` (the
 independent timed prefill/decode target).
 Correctness-only dispatches (`run_benchmark=false`) fetch no private
 material at all. The 2026-07 Poolside Laguna XS 2.1 re-pin rotated these

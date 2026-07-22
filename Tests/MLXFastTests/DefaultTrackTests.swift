@@ -66,8 +66,8 @@ struct DefaultTrackTests {
         let track = try #require(
             try JSONSerialization.jsonObject(with: registration) as? [String: Any]
         )
-        #expect(track["trackId"] as? String == "laguna-xs-2.1-serial-v1")
-        #expect(track["name"] as? String == "mlxfast-challenge-dev-serial")
+        #expect(track["trackId"] as? String == "laguna-xs-2.1-serial-v2")
+        #expect(track["name"] as? String == "mlxfast-challenge-dev-serial-v2")
         let runner = try #require(track["runner"] as? [String: Any])
         #expect(runner["provider"] as? String == "github-actions")
         #expect(runner["workflow"] as? String == "benchmark.yml")
@@ -89,7 +89,7 @@ struct DefaultTrackTests {
         #expect(scoring["decodeSpeedupFloor"] as? Double == 0.95)
         #expect(scoring["prefillSpeedupFloor"] as? Double == 0.95)
         let leaderboard = try #require(track["leaderboard"] as? [String: Any])
-        #expect(leaderboard["namespace"] as? String == "laguna-xs-2.1-serial-v1")
+        #expect(leaderboard["namespace"] as? String == "laguna-xs-2.1-serial-v2")
         // The serial track has no separate contract fixture; the manifest is
         // the single source of truth.
         #expect(track["contractPath"] == nil)
@@ -118,7 +118,7 @@ struct DefaultTrackTests {
         )
         let editablePaths = try #require(track["editablePaths"] as? [String])
         #expect(!editablePaths.isEmpty)
-        #expect(editablePaths.count == 91)
+        #expect(editablePaths.count == 92)
         #expect(Set(editablePaths).count == editablePaths.count, "editablePaths must be unique")
 
         let requiredFullStackPaths = [

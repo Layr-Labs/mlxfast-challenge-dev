@@ -1,4 +1,6 @@
 import Foundation
+import MLXLMCommon
+import MLXNN
 import Testing
 @testable import MLXFastCore
 @testable import MLXFastModel
@@ -7,23 +9,15 @@ import Testing
 // transformed-weights contract in docs/laguna-weight-contract.md). The
 // runtime worker's pinned-configuration gate is covered separately in
 // BenchmarkSupportTests; these tests pin the LagunaConfig parse/validation
-// behavior itself, including the quantization-override rules the weight
-// loader depends on.
+// behavior itself, including the exact Poolside NVFP4 contract.
 
-/// The pinned Laguna XS 2.1 runtime config as the transform emits it,
-/// including the checkpoint's per-router-gate 8-bit quantization overrides.
+/// The pinned Poolside Laguna XS 2.1 NVFP4 runtime config.
 private func pinnedLagunaConfigObject() -> [String: Any] {
-    var quantization: [String: Any] = [
-        "group_size": 64,
+    let pinnedQuantization: [String: Any] = [
+        "group_size": LagunaConstants.quantizationGroupSize,
         "bits": 4,
-        "mode": "affine",
+        "mode": "nvfp4",
     ]
-    for layerIndex in 1..<LagunaConstants.numHiddenLayers {
-        quantization["language_model.model.layers.\(layerIndex).mlp.gate.proj"] = [
-            "group_size": 64,
-            "bits": 8,
-        ]
-    }
     return [
         "model_type": "laguna",
         "vocab_size": LagunaConstants.vocabSize,
@@ -77,7 +71,8 @@ private func pinnedLagunaConfigObject() -> [String: Any] {
                 "partial_rotary_factor": 0.5,
             ],
         ],
-        "quantization": quantization,
+        "quantization": pinnedQuantization,
+        "quantization_config": pinnedQuantization,
     ]
 }
 
@@ -99,7 +94,7 @@ private func loadLagunaConfig(_ object: [String: Any]) throws -> LagunaConfig {
 }
 
 @Test
-func lagunaConfigLoadsPinnedGeometryAndRouterOverrides() throws {
+func lagunaConfigLoadsPinnedPoolsideNVFP4Geometry() throws {
     let config = try loadLagunaConfig(pinnedLagunaConfigObject())
 
     #expect(config.modelType == LagunaConstants.modelType)
@@ -132,21 +127,48 @@ func lagunaConfigLoadsPinnedGeometryAndRouterOverrides() throws {
     #expect(config.slidingRope.type == "default")
     #expect(config.slidingRope.partialRotaryFactor == 1.0)
 
-    // Quantization: global affine 4-bit group-64 with the router gates
-    // resolved to 8-bit through the per-tensor overrides.
+    // Quantization: exact Poolside NVFP4 4-bit group-16 with no overrides.
     #expect(config.quantization.groupSize == LagunaConstants.quantizationGroupSize)
     #expect(config.quantization.bits == LagunaConstants.quantizationBits)
-    #expect(config.quantization.overrides.count == LagunaConstants.numHiddenLayers - 1)
-    let router = config.quantization.expected(
-        forTensorStem: "language_model.model.layers.1.mlp.gate.proj"
+    #expect(config.quantization.mode == LagunaConstants.quantizationMode)
+    #expect(config.quantization.overrides.isEmpty)
+}
+
+@Test
+func lagunaRuntimeWiresOnlyExpertsToNVFP4WhenRuntimeTestsAreEnabled() throws {
+    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+        return
+    }
+
+    let model = LagunaRuntimeModel(try loadLagunaConfig(pinnedLagunaConfigObject()))
+    let leaves = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
+
+    let denseGate = try #require(
+        leaves["model.layers.0.mlp.gate_proj"] as? Linear
     )
-    #expect(router.groupSize == LagunaConstants.quantizationGroupSize)
-    #expect(router.bits == LagunaConstants.routerGateQuantizationBits)
-    let ordinary = config.quantization.expected(
-        forTensorStem: "language_model.model.layers.1.self_attn.q_proj"
+    #expect(!(denseGate is QuantizedLinear))
+
+    let router = try #require(leaves["model.layers.1.mlp.gate"])
+    #expect(!(router is Quantized))
+
+    let routedGate = try #require(
+        leaves["model.layers.1.mlp.switch_mlp.gate_proj"] as? QuantizedSwitchLinear
     )
-    #expect(ordinary.groupSize == LagunaConstants.quantizationGroupSize)
-    #expect(ordinary.bits == LagunaConstants.quantizationBits)
+    #expect(routedGate.groupSize == LagunaConstants.quantizationGroupSize)
+    #expect(routedGate.bits == LagunaConstants.quantizationBits)
+    #expect(routedGate.mode == .nvfp4)
+
+    let sharedGate = try #require(
+        leaves["model.layers.1.mlp.shared_expert.gate_proj"] as? QuantizedLinear
+    )
+    #expect(sharedGate.groupSize == LagunaConstants.quantizationGroupSize)
+    #expect(sharedGate.bits == LagunaConstants.quantizationBits)
+    #expect(sharedGate.mode == .nvfp4)
+
+    let attention = try #require(
+        leaves["model.layers.1.self_attn.q_proj"] as? Linear
+    )
+    #expect(!(attention is QuantizedLinear))
 }
 
 @Test
@@ -170,20 +192,41 @@ func lagunaConfigRejectsChangedArchitecture() throws {
     }
 }
 
-// The runtime weight loader promotes every quantized module using the
-// global group size (bits are derived per tensor from the packed width, so
-// bit-width overrides like the 8-bit router gates are representable; group
-// size overrides are not). A config declaring a different per-tensor group
-// size must fail config validation up front instead of surfacing as a
-// module shape mismatch after the multi-GB weight load.
 @Test
-func lagunaConfigRejectsQuantizationOverrideGroupSizeMismatch() throws {
+func lagunaConfigRejectsAnyQuantizationOverride() throws {
     var object = pinnedLagunaConfigObject()
     var quantization = try #require(object["quantization"] as? [String: Any])
-    quantization["language_model.model.layers.1.mlp.gate.proj"] = [
-        "group_size": 32,
-        "bits": 8,
+    quantization["model.layers.1.mlp.switch_mlp.gate_proj"] = [
+        "group_size": 16,
+        "bits": 4,
     ]
+    object["quantization"] = quantization
+    #expect(throws: MLXFastError.self) {
+        _ = try loadLagunaConfig(object)
+    }
+}
+
+@Test
+func lagunaConfigRequiresMatchingExplicitQuantizationBlocks() throws {
+    var object = pinnedLagunaConfigObject()
+    object.removeValue(forKey: "quantization_config")
+    #expect(throws: MLXFastError.self) {
+        _ = try loadLagunaConfig(object)
+    }
+
+    object = pinnedLagunaConfigObject()
+    var quantizationConfig = try #require(
+        object["quantization_config"] as? [String: Any]
+    )
+    quantizationConfig["group_size"] = 32
+    object["quantization_config"] = quantizationConfig
+    #expect(throws: MLXFastError.self) {
+        _ = try loadLagunaConfig(object)
+    }
+
+    object = pinnedLagunaConfigObject()
+    var quantization = try #require(object["quantization"] as? [String: Any])
+    quantization.removeValue(forKey: "mode")
     object["quantization"] = quantization
     #expect(throws: MLXFastError.self) {
         _ = try loadLagunaConfig(object)

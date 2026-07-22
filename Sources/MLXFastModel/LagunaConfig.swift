@@ -2,8 +2,8 @@ import CoreFoundation
 import Foundation
 import MLXFastCore
 
-/// Frozen invariants of the pinned Poolside Laguna XS 2.1 4-bit target
-/// (`mlx-community/Laguna-XS-2.1-4bit`). They live here because
+/// Frozen invariants of the pinned Poolside Laguna XS 2.1 NVFP4 target
+/// (`poolside/Laguna-XS-2.1-NVFP4-mlx`). They live here because
 /// `MLXFastCore` is trusted harness code outside the editable surface.
 ///
 /// Laguna is a 256-expert MoE decoder: 40 layers, hidden 2048, GQA with 8 KV
@@ -34,15 +34,12 @@ public enum LagunaConstants {
     /// prompt-independent warmup forwards (never for scored decoding).
     public static let bosTokenID = 2
     public static let eosTokenIDs = [2, 24]
-    /// Global affine quantization of the mlx-community export. Every
-    /// projection (embed, attention, MLP, experts, shared expert, untied
-    /// lm_head) is affine 4-bit group-64 except the MoE router gate.
-    public static let quantizationGroupSize = 64
+    /// The Poolside checkpoint keeps embeddings, attention, the dense layer,
+    /// routers, and lm_head in BF16. Only routed/shared expert projections are
+    /// NVFP4-packed, with one E4M3 scale per group of 16 values.
+    public static let quantizationGroupSize = 16
     public static let quantizationBits = 4
-    /// The sparse layers' router (`mlp.gate.proj`) is stored at 8 bits
-    /// (group 64) via per-tensor overrides in the checkpoint's
-    /// `quantization` config block.
-    public static let routerGateQuantizationBits = 8
+    public static let quantizationMode = "nvfp4"
 }
 
 /// Attention layer type for a single Laguna decoder layer. Laguna alternates
@@ -110,11 +107,9 @@ public struct LagunaRopeSpec: Equatable {
     }
 }
 
-/// Per-tensor quantization override. The checkpoint's `quantization` block
-/// interleaves the global `{group_size, bits, mode}` scalars with
-/// tensor-stem-keyed dictionaries (e.g.
-/// `"language_model.model.layers.1.mlp.gate.proj": {"group_size": 64,
-/// "bits": 8}` for the 8-bit router gates).
+/// Per-tensor quantization override. The intended Poolside checkpoint does
+/// not use these; retaining the parsed representation lets validation reject
+/// a checkpoint that tries to smuggle in a different per-layer contract.
 public struct LagunaQuantizationOverride: Equatable {
     public let groupSize: Int
     public let bits: Int
@@ -130,7 +125,7 @@ public struct LagunaQuantizationSpec: Equatable {
     public let bits: Int
     public let mode: String
     /// Keyed by the source tensor stem without the trailing `.weight`
-    /// (e.g. `language_model.model.layers.1.mlp.gate.proj`).
+    /// (e.g. `model.layers.1.mlp.switch_mlp.gate_proj`).
     public let overrides: [String: LagunaQuantizationOverride]
 
     public init(
@@ -305,10 +300,6 @@ public struct LagunaConfig: Equatable {
         let ropeParameters = root["rope_parameters"] as? [String: Any]
         let slidingRopeObject = ropeParameters?["sliding_attention"] as? [String: Any] ?? [:]
         let fullRopeObject = ropeParameters?["full_attention"] as? [String: Any] ?? [:]
-        let quantizationObject =
-            (root["quantization"] as? [String: Any])
-            ?? (root["quantization_config"] as? [String: Any]) ?? [:]
-
         let layerTypes = try lagunaLayerTypesField(
             "layer_types", root: root, layerCount: numHiddenLayers)
         let config = LagunaConfig(
@@ -382,7 +373,7 @@ public struct LagunaConfig: Equatable {
                 betaFast: try doubleField("beta_fast", root: fullRopeObject, defaultValue: 64.0),
                 betaSlow: try doubleField("beta_slow", root: fullRopeObject, defaultValue: 1.0)
             ),
-            quantization: try lagunaQuantizationField(quantizationObject)
+            quantization: try pinnedLagunaQuantizationField(root)
         )
         try config.validateFrozenInvariants()
         try config.validateStructuralValues()
@@ -542,19 +533,20 @@ public struct LagunaConfig: Equatable {
     }
 
     private func validateQuantization() throws {
-        guard quantization.mode == "affine" else {
+        guard quantization.mode == LagunaConstants.quantizationMode else {
             throw MLXFastError.invalidInput(
-                "Laguna quantization mode must be affine, found \(quantization.mode)"
+                "Laguna quantization mode must be \(LagunaConstants.quantizationMode), found \(quantization.mode)"
             )
         }
-        guard quantization.groupSize > 0,
+        guard quantization.groupSize == LagunaConstants.quantizationGroupSize,
+              quantization.bits == LagunaConstants.quantizationBits,
               hiddenSize.isMultiple(of: quantization.groupSize),
               intermediateSize.isMultiple(of: quantization.groupSize),
               moeIntermediateSize.isMultiple(of: quantization.groupSize),
               sharedExpertIntermediateSize.isMultiple(of: quantization.groupSize)
         else {
             throw MLXFastError.invalidInput(
-                "Laguna quantization group_size must divide the hidden and intermediate dimensions"
+                "Laguna NVFP4 quantization must use 4-bit group_size 16 and divide the hidden and intermediate dimensions"
             )
         }
         for layerHeads in numAttentionHeadsPerLayer {
@@ -564,28 +556,10 @@ public struct LagunaConfig: Equatable {
                 )
             }
         }
-        guard [2, 4, 8].contains(quantization.bits) else {
-            throw MLXFastError.invalidInput("Laguna quantization bits must be 2, 4, or 8")
-        }
-        for (stem, override) in quantization.overrides {
-            guard override.groupSize > 0, [2, 4, 8].contains(override.bits) else {
-                throw MLXFastError.invalidInput(
-                    "Laguna quantization override for \(stem) must use a positive group size and bits in {2, 4, 8}"
-                )
-            }
-            // The runtime weight loader promotes quantized modules using the
-            // GLOBAL group size for every tensor (it derives each module's
-            // logical input width, and from it the bit width, as
-            // `scales.dim(-1) * groupSize`). An override that changes only
-            // the bit width (the pinned checkpoint's 8-bit router gates) is
-            // representable; an override with a different group size is not,
-            // and would otherwise surface as a shape-mismatch crash after
-            // the multi-GB weight load instead of a clear config error here.
-            guard override.groupSize == quantization.groupSize else {
-                throw MLXFastError.invalidInput(
-                    "Laguna quantization override for \(stem) must keep the global group size \(quantization.groupSize), found \(override.groupSize)"
-                )
-            }
+        guard quantization.overrides.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "Poolside Laguna NVFP4 does not permit per-tensor quantization overrides"
+            )
         }
     }
 }
@@ -719,23 +693,52 @@ private func lagunaGatingField(
     }
 }
 
-private func lagunaQuantizationField(_ root: [String: Any]) throws -> LagunaQuantizationSpec {
-    let groupSize = try intField(
-        "group_size", root: root, defaultValue: LagunaConstants.quantizationGroupSize)
-    let bits = try intField("bits", root: root, defaultValue: LagunaConstants.quantizationBits)
-    let mode = try stringField("mode", root: root, defaultValue: "affine")
-    var overrides: [String: LagunaQuantizationOverride] = [:]
-    for (key, value) in root {
-        guard let overrideObject = value as? [String: Any] else {
-            continue
-        }
-        overrides[key] = LagunaQuantizationOverride(
-            groupSize: try intField("group_size", root: overrideObject, defaultValue: groupSize),
-            bits: try intField("bits", root: overrideObject, defaultValue: bits)
+private func requiredLagunaQuantizationField(
+    _ root: [String: Any],
+    key: String
+) throws -> LagunaQuantizationSpec {
+    guard let value = root[key] else {
+        throw MLXFastError.invalidInput("Laguna config is missing required \(key)")
+    }
+    guard let object = value as? [String: Any] else {
+        throw MLXFastError.invalidInput("Laguna config \(key) must be an object")
+    }
+
+    let allowedKeys: Set<String> = ["group_size", "bits", "mode"]
+    let unexpectedKeys = Set(object.keys).subtracting(allowedKeys)
+    guard unexpectedKeys.isEmpty else {
+        throw MLXFastError.invalidInput(
+            "Laguna config \(key) contains unsupported fields: \(unexpectedKeys.sorted().joined(separator: ", "))"
         )
     }
+    guard object["group_size"] != nil, object["bits"] != nil, object["mode"] != nil else {
+        throw MLXFastError.invalidInput(
+            "Laguna config \(key) must explicitly define group_size, bits, and mode"
+        )
+    }
+
     return LagunaQuantizationSpec(
-        groupSize: groupSize, bits: bits, mode: mode, overrides: overrides)
+        groupSize: try intField("group_size", root: object, defaultValue: 0),
+        bits: try intField("bits", root: object, defaultValue: 0),
+        mode: try stringField("mode", root: object, defaultValue: ""),
+        overrides: [:]
+    )
+}
+
+private func pinnedLagunaQuantizationField(
+    _ root: [String: Any]
+) throws -> LagunaQuantizationSpec {
+    let quantization = try requiredLagunaQuantizationField(root, key: "quantization")
+    let quantizationConfig = try requiredLagunaQuantizationField(
+        root,
+        key: "quantization_config"
+    )
+    guard quantization == quantizationConfig else {
+        throw MLXFastError.invalidInput(
+            "Laguna config quantization and quantization_config must match exactly"
+        )
+    }
+    return quantization
 }
 
 private func parseInt(_ value: Any, field: String) throws -> Int {
