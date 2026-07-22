@@ -30,6 +30,39 @@ public enum LagunaWeightNames {
     }
 }
 
+/// Add a decode-only combined Q/K/V/per-head-gate affine-quantized layout.
+/// The original projections remain model parameters for multi-token prefill,
+/// avoiding strided slices or copies across the sequence dimension.
+func lagunaAddDecodeQKVGWeights(
+    _ source: [String: MLXArray],
+    layerIndices: [Int]
+) throws -> [String: MLXArray] {
+    var weights = source
+    for layerIndex in layerIndices {
+        let prefix = "model.layers.\(layerIndex).self_attn"
+        for suffix in ["weight", "scales", "biases"] {
+            let names = ["q_proj", "k_proj", "v_proj", "g_proj"].map {
+                "\(prefix).\($0).\(suffix)"
+            }
+            let arrays = try names.map { name -> MLXArray in
+                guard let array = weights[name], array.ndim == 2 else {
+                    throw MLXFastError.invalidInput(
+                        "Laguna fused decode QKVG is missing a rank-2 \(name)"
+                    )
+                }
+                return array
+            }
+            guard arrays.dropFirst().allSatisfy({ $0.dim(-1) == arrays[0].dim(-1) }) else {
+                throw MLXFastError.invalidInput(
+                    "Laguna fused decode QKVG input widths disagree at layer \(layerIndex) \(suffix)"
+                )
+            }
+            weights["\(prefix).qkvg_proj.\(suffix)"] = concatenated(arrays, axis: -2)
+        }
+    }
+    return weights
+}
+
 /// Metadata-level access and validation for the transformed Laguna weights
 /// tree. `validateRequiredMetadata` checks that every tensor the runtime model
 /// needs is present with the
@@ -375,7 +408,13 @@ public final class LagunaRuntimeWeightCache {
         let model = LagunaRuntimeModel(config)
 
         let loadedWeights = try loadRuntimeWeightArrays(denseStore: loader.denseStore)
-        let sanitized = model.sanitize(weights: loadedWeights)
+        var sanitized = model.sanitize(weights: loadedWeights)
+        if lagunaFusedDecodeQKVGEnabled() {
+            sanitized = try lagunaAddDecodeQKVGWeights(
+                sanitized,
+                layerIndices: Array(0..<config.numHiddenLayers)
+            )
+        }
         let groupSize = config.quantization.groupSize
         quantize(model: model) {
             (path: String, _: Module) -> (groupSize: Int, bits: Int, mode: QuantizationMode)? in
