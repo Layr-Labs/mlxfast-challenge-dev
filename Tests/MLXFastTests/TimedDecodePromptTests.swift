@@ -61,7 +61,7 @@ func hiddenTimedPromptIsPinnedAndScopedToTrustedSteps() throws {
     #expect(!jobHeader.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH:"))
     #expect(
         workflow.components(
-            separatedBy: "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_gc_runtimes_essay-laguna.txt"
+            separatedBy: "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt"
         ).count - 1 == 1
     )
     #expect(prepare.contains(".github/scripts/download-r2-object.sh"))

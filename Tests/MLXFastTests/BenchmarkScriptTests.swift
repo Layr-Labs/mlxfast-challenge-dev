@@ -1247,7 +1247,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_TARGET_ID: \(MLXFastConstants.benchmarkEvaluationTargetID)"))
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_SHA256: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}"))
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_BYTES: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_BYTES }}"))
-    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_gc_runtimes_essay-laguna.txt"))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt"))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json"))
     #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json"))
     #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
