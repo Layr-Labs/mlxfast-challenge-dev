@@ -1,4 +1,6 @@
 public enum MLXFastConstants {
+    public static let referenceModelRepository = "poolside/Laguna-XS-2.1-NVFP4-mlx"
+    public static let referenceModelRevision = "841778bda563a36104dd521e37d99218e46f4f25"
     public static let referenceModelName = "laguna-xs-2.1-nvfp4-mlx"
     public static let defaultReferencePath = "reference_weights/laguna-xs-2.1-nvfp4-mlx"
     public static let defaultReferenceCachePath = ".cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25"

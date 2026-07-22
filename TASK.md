@@ -62,8 +62,9 @@ By default `setup.sh` downloads
 from the public organizer R2 mirror, with the exact Hugging Face revision as
 fallback. It checks cached files
 against the pinned SHA256 manifest and redownloads only missing, truncated, or
-hash-mismatched files. The 13-file checkpoint is 21,568,905,520 bytes across 5
-shards; `setup.sh` requires 40 GiB free by default before starting. After a
+hash-mismatched files. The complete manifest covers 13 files totaling
+21,568,905,520 bytes, including 5 safetensors shards; `setup.sh` requires
+40 GiB free by default before starting. After a
 full verification, setup writes `.mlxfast-reference-cache.lock`; later setup
 runs use cheap size/mtime checks from that lock and skip the full checkpoint
 hash pass when the cache is unchanged. Set

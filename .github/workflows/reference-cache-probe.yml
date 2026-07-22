@@ -70,8 +70,8 @@ jobs:
       # since-retired parallel-correctness probe workflows. Removed: the probe
       # exists to test the cache backend, not the private mirror, and both setup.sh and
       # download-reference-cache-scope.sh verify every byte against the pinned
-      # manifest, so the public organizer R2 mirror (no auth header) is fully
-      # sufficient.
+      # manifest, so the public organizer R2 mirror and immutable public
+      # Hugging Face fallback (neither needs an auth header) are sufficient.
       MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || 'https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx' }}
       MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
       MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}

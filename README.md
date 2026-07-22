@@ -75,8 +75,8 @@ for the full local setup knobs.
 
 Yukon dispatches `.github/workflows/benchmark.yml`, the serial ranked
 pipeline. Unlike local `setup.sh`, ranked M5 jobs never download a checkpoint:
-they verify the pre-provisioned Poolside cache against the
-pinned manifest, build and transform submitted code in the sandbox, run
+they verify the pre-provisioned Poolside cache against the pinned manifest,
+build and transform submitted code in the sandbox, run
 the public drift tripwire, then the hidden teacher-forced base case plus the
 anchor/free-run/behavior/GPQA gates and the semantic GPQA judge.
 
@@ -101,10 +101,11 @@ frozen timed window.
 
 Poolside Laguna XS 2.1 is a fine-grained MoE text model (256 routed experts
 plus one shared expert per sparse layer, 8 experts per token, per-head
-gating). The Poolside export is already text-only (`model.*` / `lm_head.*`
+gating). The pinned Poolside export is already text-only (`model.*` / `lm_head.*`
 tensors). Its sparse routed/shared expert projections are NVFP4 4-bit
 group-16; attention, embeddings, the untied lm_head, layer-0 dense MLP, and
-routers remain BF16. The checkpoint is about 21.6 GB, small enough to load
+routers remain BF16. The 13-file checkpoint is exactly 21,568,905,520 bytes,
+small enough to load
 entirely into unified memory once at process startup on the official runner
 (a self-hosted Apple M5 Max with 128 GB of unified memory, runner label
 `m5-bench`). There is no weight streaming: the model is RAM-resident before

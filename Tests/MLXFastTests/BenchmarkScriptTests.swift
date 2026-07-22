@@ -16,6 +16,20 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx\""))
     #expect(setup.contains("DEFAULT_REFERENCE_FALLBACK_BASE_URL=\"https://huggingface.co/poolside/Laguna-XS-2.1-NVFP4-mlx/resolve/841778bda563a36104dd521e37d99218e46f4f25\""))
     #expect(setup.contains("REFERENCE_BASE_URL=\"${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}\""))
+    #expect(setup.contains("REFERENCE_MANIFEST_PATH=\"${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256}\""))
+    for metadata in [
+        ".gitattributes",
+        "LICENSE.md",
+        "README.md",
+        "chat_template.jinja",
+        "config.json",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ] {
+        #expect(setup.contains("  \"\(metadata)\""))
+    }
+    #expect(!setup.contains("REFERENCE_OPTIONAL_METADATA_FILES"))
     // 3 parallel shard downloads by default; env-overridable.
     #expect(setup.contains("REFERENCE_DOWNLOAD_JOBS=\"${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-3}\""))
     #expect(setup.contains("DEFAULT_HF_HOME=\"${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}\""))
@@ -70,7 +84,7 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"))
     #expect(setup.contains("sudo xcodebuild -license accept"))
 
-    // The cold ~17 GiB parallel shard download prints an aggregate progress
+    // The cold ~20 GiB parallel shard download prints an aggregate progress
     // heartbeat instead of going silent for the whole transfer.
     #expect(setup.contains("start_reference_download_heartbeat \"${output_dir}\" \"${expected_total_bytes}\" \"$@\""))
     #expect(setup.contains("stop_reference_download_heartbeat"))
@@ -82,6 +96,103 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(main.contains("wait_for_mlx_metallib_build\ncheck_mlxfast_cli\nprint_setup_summary \"ready\""))
     #expect(setup.contains("is not on PATH, so"))
     #expect(setup.contains("external Yukon installer"))
+}
+
+@Test
+func poolsideNVFP4DistributionIdentityIsPinned() throws {
+    let repository = "poolside/Laguna-XS-2.1-NVFP4-mlx"
+    let revision = "841778bda563a36104dd521e37d99218e46f4f25"
+    #expect(MLXFastConstants.referenceModelRepository == repository)
+    #expect(MLXFastConstants.referenceModelRevision == revision)
+    #expect(MLXFastConstants.referenceModelName == "laguna-xs-2.1-nvfp4-mlx")
+    #expect(
+        MLXFastConstants.defaultReferencePath
+            == "reference_weights/laguna-xs-2.1-nvfp4-mlx"
+    )
+    #expect(
+        MLXFastConstants.defaultReferenceCachePath
+            == ".cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/\(revision)"
+    )
+    #expect(LagunaRuntime.experimentalMTPTargetModelID == repository)
+    #expect(LagunaRuntime.experimentalMTPTargetRevision == revision)
+
+    let trustedProvenance = try String(
+        contentsOfFile:
+            "Sources/MLXFastTrustedHarness/LagunaRuntimeMTPProvenance.swift",
+        encoding: .utf8
+    )
+    #expect(
+        trustedProvenance.contains(
+            "experimentalMTPTargetModelID =\n        \"\(repository)\""
+        )
+    )
+    #expect(
+        trustedProvenance.contains(
+            "experimentalMTPTargetRevision =\n        \"\(revision)\""
+        )
+    )
+
+    let manifest = try String(
+        contentsOfFile: "fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256",
+        encoding: .utf8
+    )
+    #expect(manifest.contains("# SHA256 manifest for \(repository)."))
+    #expect(manifest.contains("# Revision: \(revision)"))
+
+    let expectedPaths: Set<String> = [
+        ".gitattributes",
+        "LICENSE.md",
+        "README.md",
+        "chat_template.jinja",
+        "config.json",
+        "model.safetensors.index.json",
+        "model-00001-of-00005.safetensors",
+        "model-00002-of-00005.safetensors",
+        "model-00003-of-00005.safetensors",
+        "model-00004-of-00005.safetensors",
+        "model-00005-of-00005.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ]
+    let records = manifest.split(separator: "\n").filter { !$0.hasPrefix("#") }
+    var paths = Set<String>()
+    var byteCount = 0
+    var shardHashes: [String: String] = [:]
+    for record in records {
+        let fields = record.split(separator: " ")
+        guard fields.count == 3, let size = Int(fields[1]) else {
+            Issue.record("malformed Poolside manifest record: \(record)")
+            continue
+        }
+        let hash = String(fields[0])
+        let path = String(fields[2])
+        #expect(hash.count == 64)
+        #expect(hash.allSatisfy { $0.isHexDigit })
+        #expect(size > 0)
+        #expect(paths.insert(path).inserted)
+        byteCount += size
+        if path.hasSuffix(".safetensors") {
+            shardHashes[path] = hash
+        }
+    }
+
+    #expect(records.count == 13)
+    #expect(paths == expectedPaths)
+    #expect(byteCount == 21_568_905_520)
+    #expect(
+        shardHashes == [
+            "model-00001-of-00005.safetensors":
+                "5072099885cf248ee097c3b2cf508846cf6245c713cb722d8e7a24f83407ee64",
+            "model-00002-of-00005.safetensors":
+                "52ddbf2d53c3587ec1d56a8c61a5ec7961df7dbef7d5db1347f9a60b4532a3d3",
+            "model-00003-of-00005.safetensors":
+                "4c1239b3a246f2f5fb7312d8cb3afac0a63a1d17c7eaec06738df0a3fc118cdb",
+            "model-00004-of-00005.safetensors":
+                "fdf825800be5ce39c414778d785ea8c3282d58b54550b5f8f99fc5a0177b928f",
+            "model-00005-of-00005.safetensors":
+                "b9a2482014602e31bbd167389340f1932caf1e0d979f87bf35d93bfc748e2ffe",
+        ]
+    )
 }
 
 @Test
@@ -498,6 +609,10 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
         contentsOfFile: ".github/workflows/reference-cache-probe.yml",
         encoding: .utf8
     )
+    let downloader = try String(
+        contentsOfFile: ".github/scripts/download-reference-cache-scope.sh",
+        encoding: .utf8
+    )
     #expect(workflow.contains("name: reference-cache-probe"))
     #expect(workflow.contains("workflow_dispatch:"))
     #expect(!workflow.contains("pull_request:"))
@@ -513,8 +628,8 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
     // `environment:` approval gate, so a repo credential injected here (as a
     // prior version did with secrets.MLXFAST_REFERENCE_BASE_URL/
     // MLXFAST_REFERENCE_AUTH_HEADER) would be exfiltratable by any ref with a
-    // modified setup.sh. The public Hugging Face mirror needs no credential
-    // and every downloaded byte is verified against the pinned manifest.
+    // modified setup.sh. The public R2 mirror and immutable Hugging Face
+    // fallback need no credential, and every downloaded byte is manifest-pinned.
     #expect(!workflow.contains("environment:"))
     #expect(!workflow.contains("secrets."))
     #expect(!workflow.contains("secrets: inherit"))
@@ -524,6 +639,10 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
     // manifest and cache directory were deleted with the migration, so stale
     // defaults would fail every dispatch at the manifest hash step.
     #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256"))
+    #expect(workflow.contains("cache_key=\"laguna-xs-2.1-nvfp4-mlx-${CACHE_SCOPE}-"))
+    #expect(downloader.contains("DEFAULT_REFERENCE_BASE_URL=\"https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx\""))
+    #expect(downloader.contains("DEFAULT_REFERENCE_FALLBACK_BASE_URL=\"https://huggingface.co/poolside/Laguna-XS-2.1-NVFP4-mlx/resolve/841778bda563a36104dd521e37d99218e46f4f25\""))
+    #expect(downloader.contains("trying fallback source for ${relative_path}"))
     #expect(!workflow.contains("gemma-4-31b-4bit"))
 }
 

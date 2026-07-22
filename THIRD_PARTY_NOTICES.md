@@ -20,7 +20,7 @@ Artifacts referenced (and hash-pinned) by this repository:
 | Artifact | Upstream | License |
 |---|---|---|
 | `poolside/Laguna-XS-2.1` @ `c405648833500615a2efde76886b8aed4fb9324e` (upstream model, BF16) | Poolside | OpenMDW-1.1 |
-| `poolside/Laguna-XS-2.1-NVFP4-mlx` @ `841778bda563a36104dd521e37d99218e46f4f25` (current serial-track reference checkpoint; Poolside NVFP4, group size 16) | Poolside | OpenMDW-1.1 |
+| `poolside/Laguna-XS-2.1-NVFP4-mlx` @ `841778bda563a36104dd521e37d99218e46f4f25` (current v2 serial-track reference checkpoint; Poolside NVFP4, group size 16) | Poolside | OpenMDW-1.1 |
 | `mlx-community/Laguna-XS-2.1-4bit` @ `c42e0a8f8d504ceacde015a535dcb286d65c8799` (historical `laguna-xs-2.1-serial-v1` reference; MLX affine 4-bit, group size 64) | mlx-community conversion of the above | OpenMDW-1.1 |
 | `poolside/Laguna-XS-2.1-DFlash` @ `5c36361aab23c8ed3afbd079c10c426b677bc607` (the retired MTP track's draft/assistant; no longer downloaded or pinned by setup, credited here for the historical records under `docs/`) | Poolside | OpenMDW-1.1 |
 
