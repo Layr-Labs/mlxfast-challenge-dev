@@ -120,12 +120,15 @@ struct DefaultTrackTests {
         )
         let editablePaths = try #require(track["editablePaths"] as? [String])
         #expect(!editablePaths.isEmpty)
-        #expect(editablePaths.count == 92)
+        #expect(editablePaths.count == 95)
         #expect(Set(editablePaths).count == editablePaths.count, "editablePaths must be unique")
 
         let requiredFullStackPaths = [
             "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift",
             "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/AttentionUtils.swift",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/matmul.cpp",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/jit_kernels.cpp",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels.h",
             "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/sort.metal",
             "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/sort.h",
             "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/reduce.metal",
@@ -147,6 +150,12 @@ struct DefaultTrackTests {
                 "Laguna MoE/attention full-stack path \(path) must remain editable"
             )
         }
+        #expect(
+            !editablePaths.contains(
+                "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal"
+            ),
+            "host-side MLX edits must stay limited to exact reviewed files"
+        )
 
         let fm = FileManager.default
         for path in editablePaths {

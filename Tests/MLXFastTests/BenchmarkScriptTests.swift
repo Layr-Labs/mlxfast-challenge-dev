@@ -1607,6 +1607,9 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(staticReview.contains("score.json or benchmark-integrity.json tampering"))
     #expect(staticReview.contains("request-shape, call-count, phase, process-lifetime, prompt-length, or cache-state special-casing"))
     #expect(staticReview.contains("only for timed benchmark workers"))
+    #expect(staticReview.contains("exact host-side C++ GEMM dispatch and JIT source-factory files"))
+    #expect(staticReview.contains("compiled template dtype/source selection"))
+    #expect(staticReview.contains("binds template dtypes to the actual input buffers"))
     #expect(staticReview.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES"))
     #expect(staticReview.contains("oversized source that could hide lookup tables"))
     #expect(staticReview.contains("find \"${editable_path}\" -type f -print0"))
@@ -2207,6 +2210,12 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
     #expect(staticReview.contains("Metal kernel tuning"))
     #expect(staticReview.contains("M5 (_nax) kernel variants"))
     #expect(staticReview.contains("matched edits applied consistently to a kernel AOT .metal/.h source and its JIT mlx-generated twin"))
+    #expect(staticReview.contains(
+        "host-side C++ GEMM dispatch or JIT source-factory edits"
+    ))
+    #expect(staticReview.contains(
+        "bind compiled template dtypes to the actual input buffers"
+    ))
 
     // Launch-time backstop in the trusted CLI: same knobs, same defaults,
     // official fail-closed, and the TODO marker resolved.
@@ -2236,6 +2245,15 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
     }
     #expect(totalBytes > 0)
     #expect(fileCount > 0)
+    for path in [
+        "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/matmul.cpp",
+        "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/jit_kernels.cpp",
+        "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels.h",
+    ] {
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        let bytes = try #require((attributes[.size] as? NSNumber)?.intValue)
+        #expect(bytes <= EditableSurfaceByteBudget.defaultMaxFileBytes)
+    }
 }
 
 @Test
