@@ -282,6 +282,32 @@ public final class LagunaRuntimeWeightCache {
     public init(loader: LagunaWeightLoader, config: LagunaConfig) {
         self.loader = loader
         self.config = config
+        // Select the startup memory profile BEFORE the model load, mirroring
+        // `Gemma4RuntimeWeightCache`. Laguna retains no alternate weight
+        // layouts, so the full profile is deliberately a no-op here (the
+        // ranked 128 GiB box keeps stock allocator behavior); the documented
+        // low-memory profile for <64 GiB machines caps the MLX allocator
+        // cache at 6 GiB, shortens command buffers, installs the
+        // feature-disable env defaults (no-overwrite), and clears free
+        // warmup buffers before the worker protocol hello. The layer-count
+        // guard keeps tiny unit-test configurations on stock behavior.
+        let startupMemoryPolicy: Gemma4StartupMemoryPolicy?
+        if config.numHiddenLayers >= 16 {
+            let policy = Gemma4StartupMemoryPolicy.resolve(
+                physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+                requestedProfile: ProcessInfo.processInfo.environment[
+                    Gemma4StartupMemoryPolicy.profileOverrideEnvironmentName
+                ]
+            )
+            if policy.isLowMemory {
+                policy.apply()
+                startupMemoryPolicy = policy
+            } else {
+                startupMemoryPolicy = nil
+            }
+        } else {
+            startupMemoryPolicy = nil
+        }
         do {
             libraryModel = try LagunaRuntimeWeightCache.loadLibraryModel(
                 loader: loader,
@@ -301,6 +327,12 @@ public final class LagunaRuntimeWeightCache {
         // warmup.
         if let model = libraryModel, config.numHiddenLayers >= 16 {
             Self.warmLibraryModel(model)
+            if startupMemoryPolicy?.clearAllocatorCacheAfterWarmup == true {
+                // Pipeline state is process-lifetime state, while free
+                // warmup allocations are exactly the pressure a low-memory
+                // machine cannot afford to retain before the protocol hello.
+                Memory.clearCache()
+            }
         }
     }
 
