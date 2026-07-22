@@ -24,6 +24,8 @@ public enum LagunaConstants {
     public static let fullAttentionHeads = 48
     /// Query head count on sliding-window layers (the other 30 layers).
     public static let slidingAttentionHeads = 64
+    public static let rmsNormEpsilon = 1e-6
+    public static let maxPositionEmbeddings = 262_144
     public static let slidingWindow = 512
     public static let numExperts = 256
     public static let numExpertsPerTok = 8
@@ -40,6 +42,11 @@ public enum LagunaConstants {
     public static let quantizationGroupSize = 16
     public static let quantizationBits = 4
     public static let quantizationMode = "nvfp4"
+    public static let tensorCount = 912
+    public static let bfloat16TensorCount = 405
+    public static let float32TensorCount = 39
+    public static let packedUInt32TensorCount = 234
+    public static let e4m3ScaleUInt8TensorCount = 234
 }
 
 /// Attention layer type for a single Laguna decoder layer. Laguna alternates
@@ -87,6 +94,11 @@ public struct LagunaRopeSpec: Equatable {
     public let originalMaxPositionEmbeddings: Int
     public let betaFast: Double
     public let betaSlow: Double
+    /// Serialized by the XS checkpoint as 1.0. The vendored MLX Laguna
+    /// implementation intentionally does not pass this Hugging Face field to
+    /// `initializeRope`; MLX derives YaRN mscale as
+    /// `1 + 0.1 * ln(factor)` from its own defaults instead.
+    public let attentionFactor: Double?
 
     public init(
         theta: Double,
@@ -95,7 +107,8 @@ public struct LagunaRopeSpec: Equatable {
         factor: Double = 1.0,
         originalMaxPositionEmbeddings: Int = 8_192,
         betaFast: Double = 64.0,
-        betaSlow: Double = 1.0
+        betaSlow: Double = 1.0,
+        attentionFactor: Double? = nil
     ) {
         self.theta = theta
         self.type = type
@@ -104,6 +117,7 @@ public struct LagunaRopeSpec: Equatable {
         self.originalMaxPositionEmbeddings = originalMaxPositionEmbeddings
         self.betaFast = betaFast
         self.betaSlow = betaSlow
+        self.attentionFactor = attentionFactor
     }
 }
 
@@ -177,7 +191,10 @@ public struct LagunaConfig: Equatable {
     public let slidingWindow: Int
     public let layerTypes: [LagunaLayerType]
     public let mlpLayerTypes: [LagunaMLPType]
+    public let mlpOnlyLayers: [Int]
+    public let decoderSparseStep: Int
     public let gating: LagunaGatingMode
+    public let gatingTypes: [LagunaGatingMode]
     public let tieWordEmbeddings: Bool
     public let numExperts: Int
     public let numExpertsPerTok: Int
@@ -185,6 +202,7 @@ public struct LagunaConfig: Equatable {
     public let sharedExpertIntermediateSize: Int
     public let moeRoutedScalingFactor: Double
     public let normTopkProb: Bool
+    public let moeApplyRouterWeightOnInput: Bool
     public let moeRouterLogitSoftcapping: Double
     public let slidingRope: LagunaRopeSpec
     public let fullRope: LagunaRopeSpec
@@ -208,7 +226,10 @@ public struct LagunaConfig: Equatable {
         slidingWindow: Int,
         layerTypes: [LagunaLayerType],
         mlpLayerTypes: [LagunaMLPType],
+        mlpOnlyLayers: [Int],
+        decoderSparseStep: Int,
         gating: LagunaGatingMode,
+        gatingTypes: [LagunaGatingMode],
         tieWordEmbeddings: Bool,
         numExperts: Int,
         numExpertsPerTok: Int,
@@ -216,6 +237,7 @@ public struct LagunaConfig: Equatable {
         sharedExpertIntermediateSize: Int,
         moeRoutedScalingFactor: Double,
         normTopkProb: Bool,
+        moeApplyRouterWeightOnInput: Bool,
         moeRouterLogitSoftcapping: Double,
         slidingRope: LagunaRopeSpec,
         fullRope: LagunaRopeSpec,
@@ -238,7 +260,10 @@ public struct LagunaConfig: Equatable {
         self.slidingWindow = slidingWindow
         self.layerTypes = layerTypes
         self.mlpLayerTypes = mlpLayerTypes
+        self.mlpOnlyLayers = mlpOnlyLayers
+        self.decoderSparseStep = decoderSparseStep
         self.gating = gating
+        self.gatingTypes = gatingTypes
         self.tieWordEmbeddings = tieWordEmbeddings
         self.numExperts = numExperts
         self.numExpertsPerTok = numExpertsPerTok
@@ -246,6 +271,7 @@ public struct LagunaConfig: Equatable {
         self.sharedExpertIntermediateSize = sharedExpertIntermediateSize
         self.moeRoutedScalingFactor = moeRoutedScalingFactor
         self.normTopkProb = normTopkProb
+        self.moeApplyRouterWeightOnInput = moeApplyRouterWeightOnInput
         self.moeRouterLogitSoftcapping = moeRouterLogitSoftcapping
         self.slidingRope = slidingRope
         self.fullRope = fullRope
@@ -268,14 +294,19 @@ public struct LagunaConfig: Equatable {
         layerType == .full ? fullRope : slidingRope
     }
 
+    public func gatingMode(forLayer layerIndex: Int) -> LagunaGatingMode {
+        gatingTypes[layerIndex]
+    }
+
     /// Output feature count of a layer's attention gate projection
     /// (`g_proj`): one gate per query head for per-head gating, one gate per
     /// output element for per-element gating. Returns nil when gating is
     /// disabled (no `g_proj` tensors exist).
     public func gateProjectionOutputDim(forLayer layerIndex: Int) -> Int? {
-        guard gating.enabled else { return nil }
+        let layerGating = gatingMode(forLayer: layerIndex)
+        guard layerGating.enabled else { return nil }
         let layerHeads = heads(forLayer: layerIndex)
-        return gating.isPerHead ? layerHeads : layerHeads * headDim
+        return layerGating.isPerHead ? layerHeads : layerHeads * headDim
     }
 
     public static func load(from weightsPath: String) throws -> LagunaConfig {
@@ -287,6 +318,7 @@ public struct LagunaConfig: Equatable {
         guard let root = object as? [String: Any] else {
             throw MLXFastError.invalidInput("config.json must be a JSON object")
         }
+        try requirePinnedLagunaFields(root)
 
         let numHiddenLayers = try intField(
             "num_hidden_layers", root: root, defaultValue: LagunaConstants.numHiddenLayers)
@@ -297,11 +329,46 @@ public struct LagunaConfig: Equatable {
         }
         let numAttentionHeads = try intField(
             "num_attention_heads", root: root, defaultValue: LagunaConstants.fullAttentionHeads)
-        let ropeParameters = root["rope_parameters"] as? [String: Any]
-        let slidingRopeObject = ropeParameters?["sliding_attention"] as? [String: Any] ?? [:]
-        let fullRopeObject = ropeParameters?["full_attention"] as? [String: Any] ?? [:]
+        let ropeParameters = try requiredObjectField("rope_parameters", root: root)
+        let slidingRopeObject = try requiredObjectField(
+            "sliding_attention",
+            root: ropeParameters
+        )
+        let fullRopeObject = try requiredObjectField(
+            "full_attention",
+            root: ropeParameters
+        )
+        try validatePinnedRopeObjectKeys(
+            slidingRopeObject,
+            label: "sliding_attention",
+            expectedKeys: ["rope_theta", "rope_type", "partial_rotary_factor"]
+        )
+        try validatePinnedRopeObjectKeys(
+            fullRopeObject,
+            label: "full_attention",
+            expectedKeys: [
+                "rope_theta",
+                "rope_type",
+                "factor",
+                "original_max_position_embeddings",
+                "beta_fast",
+                "beta_slow",
+                "attention_factor",
+                "partial_rotary_factor",
+            ]
+        )
         let layerTypes = try lagunaLayerTypesField(
             "layer_types", root: root, layerCount: numHiddenLayers)
+        let mlpOnlyLayers = try intArrayField(
+            "mlp_only_layers",
+            root: root,
+            defaultValue: []
+        )
+        let decoderSparseStep = try intField(
+            "decoder_sparse_step",
+            root: root,
+            defaultValue: 0
+        )
         let config = LagunaConfig(
             modelType: try stringField(
                 "model_type", root: root, defaultValue: LagunaConstants.modelType),
@@ -321,9 +388,16 @@ public struct LagunaConfig: Equatable {
                 "num_key_value_heads", root: root,
                 defaultValue: LagunaConstants.numKeyValueHeads),
             headDim: try intField("head_dim", root: root, defaultValue: LagunaConstants.headDim),
-            rmsNormEps: try doubleField("rms_norm_eps", root: root, defaultValue: 1e-6),
+            rmsNormEps: try doubleField(
+                "rms_norm_eps",
+                root: root,
+                defaultValue: LagunaConstants.rmsNormEpsilon
+            ),
             maxPositionEmbeddings: try intField(
-                "max_position_embeddings", root: root, defaultValue: 262_144),
+                "max_position_embeddings",
+                root: root,
+                defaultValue: LagunaConstants.maxPositionEmbeddings
+            ),
             attentionBias: try boolField("attention_bias", root: root, defaultValue: false),
             qkvBias: try boolField("qkv_bias", root: root, defaultValue: false),
             attentionDropout: try doubleField(
@@ -332,7 +406,13 @@ public struct LagunaConfig: Equatable {
                 "sliding_window", root: root, defaultValue: LagunaConstants.slidingWindow),
             layerTypes: layerTypes,
             mlpLayerTypes: try lagunaMLPLayerTypesField(root: root, layerCount: numHiddenLayers),
+            mlpOnlyLayers: mlpOnlyLayers,
+            decoderSparseStep: decoderSparseStep,
             gating: try lagunaGatingField("gating", root: root, defaultValue: .perHead),
+            gatingTypes: try lagunaGatingTypesField(
+                root: root,
+                layerCount: numHiddenLayers
+            ),
             tieWordEmbeddings: try boolField(
                 "tie_word_embeddings", root: root, defaultValue: false),
             numExperts: try intField(
@@ -350,6 +430,11 @@ public struct LagunaConfig: Equatable {
                 "moe_routed_scaling_factor", root: root,
                 defaultValue: LagunaConstants.moeRoutedScalingFactor),
             normTopkProb: try boolField("norm_topk_prob", root: root, defaultValue: true),
+            moeApplyRouterWeightOnInput: try boolField(
+                "moe_apply_router_weight_on_input",
+                root: root,
+                defaultValue: false
+            ),
             moeRouterLogitSoftcapping: try doubleField(
                 "moe_router_logit_softcapping", root: root, defaultValue: 0.0),
             slidingRope: LagunaRopeSpec(
@@ -371,7 +456,12 @@ public struct LagunaConfig: Equatable {
                     "original_max_position_embeddings", root: fullRopeObject,
                     defaultValue: 8_192),
                 betaFast: try doubleField("beta_fast", root: fullRopeObject, defaultValue: 64.0),
-                betaSlow: try doubleField("beta_slow", root: fullRopeObject, defaultValue: 1.0)
+                betaSlow: try doubleField("beta_slow", root: fullRopeObject, defaultValue: 1.0),
+                attentionFactor: try doubleField(
+                    "attention_factor",
+                    root: fullRopeObject,
+                    defaultValue: .nan
+                )
             ),
             quantization: try pinnedLagunaQuantizationField(root)
         )
@@ -381,6 +471,21 @@ public struct LagunaConfig: Equatable {
     }
 
     public func validateFrozenInvariants() throws {
+        let expectedLayerTypes = (0..<LagunaConstants.numHiddenLayers).map {
+            $0 % 4 == 0 ? LagunaLayerType.full : LagunaLayerType.sliding
+        }
+        let expectedMLPTypes = (0..<LagunaConstants.numHiddenLayers).map {
+            $0 == 0 ? LagunaMLPType.dense : LagunaMLPType.sparse
+        }
+        let expectedHeadSchedule = (0..<LagunaConstants.numHiddenLayers).map {
+            $0 % 4 == 0
+                ? LagunaConstants.fullAttentionHeads
+                : LagunaConstants.slidingAttentionHeads
+        }
+        let expectedGatingTypes = [LagunaGatingMode](
+            repeating: .perHead,
+            count: LagunaConstants.numHiddenLayers
+        )
         let expected: [(String, Int, Int)] = [
             ("vocab_size", vocabSize, LagunaConstants.vocabSize),
             ("hidden_size", hiddenSize, LagunaConstants.hiddenSize),
@@ -400,23 +505,95 @@ public struct LagunaConfig: Equatable {
         var errors = expected.compactMap { name, actual, expected in
             actual == expected ? nil : "\(name)=\(actual) expected \(expected)"
         }
-        if layerTypes.count != numHiddenLayers {
-            errors.append("layer_types count=\(layerTypes.count) expected \(numHiddenLayers)")
+        if modelType != LagunaConstants.modelType {
+            errors.append("model_type=\(modelType) expected \(LagunaConstants.modelType)")
         }
-        if mlpLayerTypes.count != numHiddenLayers {
+        if numAttentionHeads != LagunaConstants.fullAttentionHeads {
             errors.append(
-                "mlp_layer_types count=\(mlpLayerTypes.count) expected \(numHiddenLayers)")
-        }
-        if numAttentionHeadsPerLayer.count != numHiddenLayers {
-            errors.append(
-                "num_attention_heads_per_layer count=\(numAttentionHeadsPerLayer.count) expected \(numHiddenLayers)"
+                "num_attention_heads=\(numAttentionHeads) expected \(LagunaConstants.fullAttentionHeads)"
             )
+        }
+        if numAttentionHeadsPerLayer != expectedHeadSchedule {
+            errors.append(
+                "num_attention_heads_per_layer does not match the pinned 48/64 XS schedule"
+            )
+        }
+        if layerTypes != expectedLayerTypes {
+            errors.append("layer_types does not match the pinned 1-full:3-sliding XS schedule")
+        }
+        if mlpLayerTypes != expectedMLPTypes {
+            errors.append("mlp_layer_types must be dense at layer 0 and sparse at layers 1-39")
+        }
+        if mlpOnlyLayers != [0] {
+            errors.append("mlp_only_layers=\(mlpOnlyLayers) expected [0]")
+        }
+        if decoderSparseStep != 1 {
+            errors.append("decoder_sparse_step=\(decoderSparseStep) expected 1")
+        }
+        if maxPositionEmbeddings != LagunaConstants.maxPositionEmbeddings {
+            errors.append(
+                "max_position_embeddings=\(maxPositionEmbeddings) expected \(LagunaConstants.maxPositionEmbeddings)"
+            )
+        }
+        if rmsNormEps != LagunaConstants.rmsNormEpsilon {
+            errors.append(
+                "rms_norm_eps=\(rmsNormEps) expected \(LagunaConstants.rmsNormEpsilon)"
+            )
+        }
+        if attentionBias {
+            errors.append("attention_bias=true expected false")
+        }
+        if qkvBias {
+            errors.append("qkv_bias=true expected false/null")
+        }
+        if attentionDropout != 0 {
+            errors.append("attention_dropout=\(attentionDropout) expected 0")
         }
         if tieWordEmbeddings {
             errors.append("tie_word_embeddings=true expected false (Laguna's lm_head is untied)")
         }
         if gating != .perHead {
             errors.append("gating expected per-head for the pinned Laguna checkpoint")
+        }
+        if gatingTypes != expectedGatingTypes {
+            errors.append("gating_types must contain per_head for all 40 XS layers")
+        }
+        if moeRoutedScalingFactor != LagunaConstants.moeRoutedScalingFactor {
+            errors.append(
+                "moe_routed_scaling_factor=\(moeRoutedScalingFactor) expected \(LagunaConstants.moeRoutedScalingFactor)"
+            )
+        }
+        if !normTopkProb {
+            errors.append("norm_topk_prob=false expected true")
+        }
+        if moeApplyRouterWeightOnInput {
+            errors.append("moe_apply_router_weight_on_input=true expected false")
+        }
+        if moeRouterLogitSoftcapping != 0 {
+            errors.append(
+                "moe_router_logit_softcapping=\(moeRouterLogitSoftcapping) expected 0/null"
+            )
+        }
+        let expectedSlidingRope = LagunaRopeSpec(
+            theta: 10_000,
+            type: "default",
+            partialRotaryFactor: 1
+        )
+        if slidingRope != expectedSlidingRope {
+            errors.append("sliding_attention RoPE parameters do not match the pinned XS contract")
+        }
+        let expectedFullRope = LagunaRopeSpec(
+            theta: 500_000,
+            type: "yarn",
+            partialRotaryFactor: 0.5,
+            factor: 32,
+            originalMaxPositionEmbeddings: 8_192,
+            betaFast: 64,
+            betaSlow: 1,
+            attentionFactor: 1
+        )
+        if fullRope != expectedFullRope {
+            errors.append("full_attention YaRN parameters do not match the pinned XS contract")
         }
         if !errors.isEmpty {
             throw MLXFastError.invalidInput(
@@ -673,23 +850,108 @@ private func lagunaGatingField(
     guard let value = fieldValue(key, root: root) else {
         return defaultValue
     }
-    if let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() {
-        return number.boolValue ? .perHead : .disabled
-    }
     guard let string = value as? String else {
-        throw MLXFastError.invalidInput("config field \(key) must be a boolean or string")
+        throw MLXFastError.invalidInput("config field \(key) must be the string per-head")
     }
     switch string {
-    case "per-element", "per_element":
-        return .perElement
-    case "false", "none", "":
-        return .disabled
     case "per-head", "per_head":
         return .perHead
     default:
-        // Mirror the vendored `LagunaGating` decoder: any other non-empty
-        // string enables the default per-head gating.
+        throw MLXFastError.invalidInput(
+            "config field \(key) must be the pinned value per-head"
+        )
+    }
+}
+
+private func lagunaGatingTypesField(
+    root: [String: Any],
+    layerCount: Int
+) throws -> [LagunaGatingMode] {
+    guard let rawValues = root["gating_types"] as? [String] else {
+        throw MLXFastError.invalidInput("config field gating_types must be a string array")
+    }
+    guard rawValues.count == layerCount else {
+        throw MLXFastError.invalidInput(
+            "config field gating_types contains \(rawValues.count) entries; expected \(layerCount)"
+        )
+    }
+    return try rawValues.map { raw in
+        guard raw == "per_head" else {
+            throw MLXFastError.invalidInput(
+                "config field gating_types contains unsupported value \(raw); expected per_head"
+            )
+        }
         return .perHead
+    }
+}
+
+private func requirePinnedLagunaFields(_ root: [String: Any]) throws {
+    let required = [
+        "model_type",
+        "vocab_size",
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_attention_heads_per_layer",
+        "num_key_value_heads",
+        "head_dim",
+        "rms_norm_eps",
+        "max_position_embeddings",
+        "attention_bias",
+        "qkv_bias",
+        "attention_dropout",
+        "sliding_window",
+        "layer_types",
+        "mlp_layer_types",
+        "mlp_only_layers",
+        "decoder_sparse_step",
+        "gating",
+        "gating_types",
+        "tie_word_embeddings",
+        "num_experts",
+        "num_experts_per_tok",
+        "moe_intermediate_size",
+        "shared_expert_intermediate_size",
+        "moe_routed_scaling_factor",
+        "norm_topk_prob",
+        "moe_apply_router_weight_on_input",
+        "moe_router_logit_softcapping",
+        "rope_parameters",
+        "quantization",
+        "quantization_config",
+    ]
+    let missing = required.filter { root[$0] == nil }
+    guard missing.isEmpty else {
+        throw MLXFastError.invalidInput(
+            "Laguna config is missing pinned XS fields: \(missing.joined(separator: ", "))"
+        )
+    }
+}
+
+private func requiredObjectField(
+    _ key: String,
+    root: [String: Any]
+) throws -> [String: Any] {
+    guard let object = root[key] as? [String: Any] else {
+        throw MLXFastError.invalidInput("config field \(key) must be an object")
+    }
+    return object
+}
+
+private func validatePinnedRopeObjectKeys(
+    _ object: [String: Any],
+    label: String,
+    expectedKeys: Set<String>
+) throws {
+    let actualKeys = Set(object.keys)
+    guard actualKeys == expectedKeys else {
+        let missing = expectedKeys.subtracting(actualKeys).sorted()
+        let unexpected = actualKeys.subtracting(expectedKeys).sorted()
+        throw MLXFastError.invalidInput(
+            "Laguna \(label) RoPE fields do not match the pinned XS contract; "
+                + "missing=\(missing) unexpected=\(unexpected)"
+        )
     }
 }
 

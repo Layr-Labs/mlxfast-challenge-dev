@@ -340,9 +340,9 @@ extension LagunaRuntime {
     static let experimentalMTPDependencyRevision =
         "bc1c0ee67d15798343be17c9f8f61f7c0d977149"
     static let experimentalMTPTargetModelID =
-        "poolside/Laguna-XS-2.1-NVFP4-mlx"
+        "mlx-community/Laguna-XS-2.1-4bit"
     static let experimentalMTPTargetRevision =
-        "841778bda563a36104dd521e37d99218e46f4f25"
+        "c42e0a8f8d504ceacde015a535dcb286d65c8799"
     static let experimentalMTPUpstreamTargetModelID =
         "poolside/Laguna-XS-2.1"
     static let experimentalMTPUpstreamTargetRevision =

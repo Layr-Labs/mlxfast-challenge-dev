@@ -40,9 +40,11 @@ func lagunaLastTokenHidden(_ hidden: MLXArray) -> MLXArray {
 
 /// Builds the `initializeRope` scaling dictionary for a per-type Laguna RoPE
 /// spec. For `default` RoPE only the type is consulted; for YaRN the factory
-/// reads factor / original context / betas (Laguna leaves mscale and
-/// mscale_all_dim at the shared defaults 1.0 / 0.0, which yields the vendored
-/// attention scaling of `0.1 * ln(32) + 1`).
+/// reads factor / original context / betas. The XS config also serializes
+/// `attention_factor: 1.0`, but both vendored MLX Laguna implementations
+/// intentionally ignore that Hugging Face field. Do not forward it here:
+/// leaving MLX's mscale/mscale_all_dim defaults at 1.0/0.0 yields the upstream
+/// attention scaling of `0.1 * ln(32) + 1` (~1.34657).
 func lagunaRopeScalingConfig(_ spec: LagunaRopeSpec) -> [String: StringOrNumber] {
     var scalingConfig: [String: StringOrNumber] = ["rope_type": .string(spec.type)]
     if spec.type == "yarn" {
@@ -87,8 +89,9 @@ final class LagunaRuntimeAttention: Module {
         self.nKVHeads = config.numKeyValueHeads
         self.headDim = config.headDim
         self.scale = pow(Float(headDim), -0.5)
-        self.gatingEnabled = config.gating.enabled
-        self.gatePerHead = config.gating.isPerHead
+        let layerGating = config.gatingMode(forLayer: layerIdx)
+        self.gatingEnabled = layerGating.enabled
+        self.gatePerHead = layerGating.isPerHead
 
         let layerType = config.layerType(forLayer: layerIdx)
         self.isSliding = layerType == .sliding

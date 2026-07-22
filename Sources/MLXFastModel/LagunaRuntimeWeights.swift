@@ -45,6 +45,49 @@ public struct LagunaWeightLoader {
     }
 
     public func validateRequiredMetadata(config: LagunaConfig) throws {
+        let tensorNames = denseStore.tensorNames
+        let forbiddenSuffixes = [
+            ".weight_packed",
+            ".input_global_scale",
+            ".weight_global_scale",
+            ".k_scale",
+            ".v_scale",
+            ".biases",
+        ]
+        if let forbiddenName = tensorNames.first(where: { name in
+            forbiddenSuffixes.contains(where: name.hasSuffix)
+        }) {
+            throw MLXFastError.invalidInput(
+                "Poolside Laguna MLX checkpoint must not contain compressed-tensors/global-scale, "
+                    + "FP8 KV-scale, or affine-bias tensor \(forbiddenName)"
+            )
+        }
+        guard tensorNames.count == LagunaConstants.tensorCount else {
+            throw MLXFastError.invalidInput(
+                "Poolside Laguna tensor inventory contains \(tensorNames.count) tensors; "
+                    + "expected exactly \(LagunaConstants.tensorCount)"
+            )
+        }
+        var dtypeCounts: [String: Int] = [:]
+        for name in tensorNames {
+            guard let record = denseStore.record(named: name) else {
+                throw MLXFastError.invalidInput("dense tensor not found: \(name)")
+            }
+            dtypeCounts[record.dtype, default: 0] += 1
+        }
+        let expectedDTypeCounts = [
+            "BF16": LagunaConstants.bfloat16TensorCount,
+            "F32": LagunaConstants.float32TensorCount,
+            "U32": LagunaConstants.packedUInt32TensorCount,
+            "U8": LagunaConstants.e4m3ScaleUInt8TensorCount,
+        ]
+        guard dtypeCounts == expectedDTypeCounts else {
+            throw MLXFastError.invalidInput(
+                "Poolside Laguna tensor dtype inventory \(dtypeCounts) does not match "
+                    + "expected \(expectedDTypeCounts)"
+            )
+        }
+
         try validateBFloat16ProjectionMetadata(
             named: LagunaWeightNames.embedTokens,
             expectedShape: [config.vocabSize, config.hiddenSize]
@@ -172,9 +215,10 @@ public struct LagunaWeightLoader {
             // the sole dense three-projection MLP.
             expectedTensorCount += config.isSparse(layer: layerIndex) ? 14 : 3
         }
-        guard denseStore.tensorNames.count == expectedTensorCount else {
+        guard expectedTensorCount == LagunaConstants.tensorCount else {
             throw MLXFastError.invalidInput(
-                "Poolside Laguna tensor inventory contains \(denseStore.tensorNames.count) tensors; expected exactly \(expectedTensorCount)"
+                "internal Poolside Laguna tensor contract computed \(expectedTensorCount) tensors; "
+                    + "expected \(LagunaConstants.tensorCount)"
             )
         }
     }

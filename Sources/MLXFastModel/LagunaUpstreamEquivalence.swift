@@ -137,10 +137,23 @@ public enum LagunaUpstreamEquivalence {
             )
         }
 
+        let runtimeFinite = all(isFinite(runtimeLast))
+        let upstreamFinite = all(isFinite(upstreamLast))
+        eval(runtimeLast, upstreamLast, runtimeFinite, upstreamFinite)
+        let runtimeLogitsAreFinite = runtimeFinite.item(Bool.self)
+        let upstreamLogitsAreFinite = upstreamFinite.item(Bool.self)
+        guard runtimeLogitsAreFinite, upstreamLogitsAreFinite else {
+            throw MLXFastError.invalidInput(
+                "Laguna upstream equivalence \(label) produced non-finite logits: "
+                    + "runtime_finite=\(runtimeLogitsAreFinite) "
+                    + "upstream_finite=\(upstreamLogitsAreFinite)"
+            )
+        }
+
         let difference = abs(
             runtimeLast.asType(.float32) - upstreamLast.asType(.float32)
         )
-        eval(runtimeLast, upstreamLast, difference)
+        eval(difference)
         return LagunaUpstreamEquivalenceStep(
             label: label,
             maximumAbsoluteLogitError: difference.max().item(Float.self),

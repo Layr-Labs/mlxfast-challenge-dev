@@ -156,6 +156,23 @@ enum LagunaCheckpointValidation {
         headers: [String: SafetensorsHeader],
         quantization: LagunaTransformQuantizationSpec
     ) throws {
+        let forbiddenSuffixes = [
+            ".weight_packed",
+            ".input_global_scale",
+            ".weight_global_scale",
+            ".k_scale",
+            ".v_scale",
+            ".biases",
+        ]
+        if let forbiddenName = selectedKeys.sorted().first(where: { name in
+            forbiddenSuffixes.contains { suffix in name.hasSuffix(suffix) }
+        }) {
+            throw MLXFastError.invalidInput(
+                "Poolside Laguna MLX transform rejects compressed-tensors/global-scale, "
+                    + "FP8 KV-scale, and affine-bias tensor \(forbiddenName)"
+            )
+        }
+
         var routerExpertsByLayer: [Int: Int] = [:]
         var stackedExpertsByLayer: [Int: Int] = [:]
 

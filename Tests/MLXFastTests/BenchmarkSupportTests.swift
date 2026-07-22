@@ -983,6 +983,94 @@ func lagunaWeightLoaderRejectsUnexpectedTensorInventory() throws {
     }
 }
 
+@Test
+func lagunaWeightContractPinsExactXSHeaderInventory() {
+    let tensors = requiredLagunaDenseTensorFixtures()
+    let dtypeCounts = Dictionary(grouping: tensors, by: \.dtype).mapValues(\.count)
+
+    #expect(tensors.count == LagunaConstants.tensorCount)
+    #expect(dtypeCounts == [
+        "BF16": LagunaConstants.bfloat16TensorCount,
+        "F32": LagunaConstants.float32TensorCount,
+        "U32": LagunaConstants.packedUInt32TensorCount,
+        "U8": LagunaConstants.e4m3ScaleUInt8TensorCount,
+    ])
+    #expect(
+        tensors.first {
+            $0.name == "model.layers.1.mlp.switch_mlp.gate_proj.weight"
+        }?.shape == [256, 512, 256]
+    )
+    #expect(
+        tensors.first {
+            $0.name == "model.layers.1.mlp.switch_mlp.gate_proj.scales"
+        }?.shape == [256, 512, 128]
+    )
+    #expect(
+        tensors.first {
+            $0.name == "model.layers.1.mlp.switch_mlp.down_proj.weight"
+        }?.shape == [256, 2_048, 64]
+    )
+    #expect(
+        tensors.first {
+            $0.name == "model.layers.1.mlp.switch_mlp.down_proj.scales"
+        }?.shape == [256, 2_048, 32]
+    )
+    #expect(
+        tensors.first {
+            $0.name == "model.layers.1.mlp.shared_expert.gate_proj.weight"
+        }?.shape == [512, 256]
+    )
+    #expect(
+        tensors.first {
+            $0.name == "model.layers.1.mlp.shared_expert.gate_proj.scales"
+        }?.shape == [512, 128]
+    )
+    #expect(
+        tensors.first {
+            $0.name == "model.layers.1.mlp.shared_expert.down_proj.weight"
+        }?.shape == [2_048, 64]
+    )
+    #expect(
+        tensors.first {
+            $0.name == "model.layers.1.mlp.shared_expert.down_proj.scales"
+        }?.shape == [2_048, 32]
+    )
+}
+
+@Test
+func lagunaWeightLoaderExplicitlyRejectsNonMLXQuantizationSchemas() throws {
+    for forbiddenName in [
+        "model.layers.1.mlp.switch_mlp.gate_proj.weight_packed",
+        "model.layers.1.mlp.switch_mlp.gate_proj.input_global_scale",
+        "model.layers.1.mlp.switch_mlp.gate_proj.weight_global_scale",
+        "model.layers.1.self_attn.k_scale",
+        "model.layers.1.self_attn.v_scale",
+        "model.layers.1.mlp.switch_mlp.gate_proj.biases",
+    ] {
+        let fixture = try makePreflightFixture(
+            extraDenseTensor: TensorFixture(
+                name: forbiddenName,
+                dtype: "U8",
+                shape: [1]
+            )
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let config = try LagunaConfig.load(from: fixture.weights.path)
+        let loader = try LagunaWeightLoader(weightsPath: fixture.weights.path)
+        var rejection: MLXFastError?
+        do {
+            try loader.validateRequiredMetadata(config: config)
+        } catch let error as MLXFastError {
+            rejection = error
+        }
+        #expect(
+            rejection?.description.contains("must not contain") == true,
+            Comment(rawValue: forbiddenName)
+        )
+    }
+}
+
 private struct PreflightFixture {
     let root: URL
     let weights: URL
@@ -2192,8 +2280,13 @@ private func pinnedRuntimeWorkerConfigurationObject() -> [String: Any] {
         "sliding_window": 512,
         "max_position_embeddings": 262_144,
         "attention_bias": false,
+        "qkv_bias": NSNull(),
         "attention_dropout": 0.0,
         "gating": "per-head",
+        "gating_types": [String](
+            repeating: "per_head",
+            count: MLXFastConstants.numHiddenLayers
+        ),
         "tie_word_embeddings": false,
         "num_experts": 256,
         "num_experts_per_tok": 8,
@@ -2201,6 +2294,8 @@ private func pinnedRuntimeWorkerConfigurationObject() -> [String: Any] {
         "shared_expert_intermediate_size": 512,
         "moe_routed_scaling_factor": 2.5,
         "norm_topk_prob": true,
+        "moe_apply_router_weight_on_input": false,
+        "moe_router_logit_softcapping": NSNull(),
         "mlp_layer_types": (0..<MLXFastConstants.numHiddenLayers).map {
             $0 == 0 ? "dense" : "sparse"
         },

@@ -416,6 +416,47 @@ func transformRejectsPoolsideQuantizationOverrides() throws {
 }
 
 @Test
+func transformRejectsNonMLXCompressedAndGlobalScaleSchemas() throws {
+    for forbiddenName in [
+        "model.layers.1.mlp.switch_mlp.gate_proj.weight_packed",
+        "model.layers.1.mlp.switch_mlp.gate_proj.input_global_scale",
+        "model.layers.1.mlp.switch_mlp.gate_proj.weight_global_scale",
+        "model.layers.1.self_attn.k_scale",
+        "model.layers.1.self_attn.v_scale",
+        "model.layers.1.mlp.switch_mlp.gate_proj.biases",
+    ] {
+        let fixture = try writeLagunaCheckpointFixture(
+            tensors: [
+                TensorFixture(
+                    name: forbiddenName,
+                    dtype: "U8",
+                    shape: [1],
+                    data: Data([0])
+                )
+            ]
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        var rejection: MLXFastError?
+        do {
+            _ = try SwiftTransform.run(
+                TransformOptions(
+                    referencePath: fixture.reference.path,
+                    outputPath: fixture.output.path
+                )
+            )
+        } catch let error as MLXFastError {
+            rejection = error
+        }
+        #expect(
+            rejection?.description.contains("rejects compressed-tensors") == true,
+            Comment(rawValue: forbiddenName)
+        )
+        #expect(!FileManager.default.fileExists(atPath: fixture.output.path))
+    }
+}
+
+@Test
 func transformRequiresMatchingExplicitPoolsideQuantizationBlocks() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -1185,13 +1226,17 @@ private func lagunaReferenceConfigJSON() throws -> String {
     root["rms_norm_eps"] = 1e-6
     root["max_position_embeddings"] = 262_144
     root["attention_bias"] = false
+    root["qkv_bias"] = NSNull()
     root["attention_dropout"] = 0.0
     root["sliding_window"] = LagunaConstants.slidingWindow
     root["layer_types"] = (0..<layerCount).map {
         $0 % 4 == 0 ? "full_attention" : "sliding_attention"
     }
     root["mlp_layer_types"] = (0..<layerCount).map { $0 == 0 ? "dense" : "sparse" }
+    root["mlp_only_layers"] = [0]
+    root["decoder_sparse_step"] = 1
     root["gating"] = "per-head"
+    root["gating_types"] = [String](repeating: "per_head", count: layerCount)
     root["tie_word_embeddings"] = false
     root["num_experts"] = LagunaConstants.numExperts
     root["num_experts_per_tok"] = LagunaConstants.numExpertsPerTok
@@ -1199,7 +1244,8 @@ private func lagunaReferenceConfigJSON() throws -> String {
     root["shared_expert_intermediate_size"] = LagunaConstants.sharedExpertIntermediateSize
     root["moe_routed_scaling_factor"] = LagunaConstants.moeRoutedScalingFactor
     root["norm_topk_prob"] = true
-    root["moe_router_logit_softcapping"] = 0.0
+    root["moe_apply_router_weight_on_input"] = false
+    root["moe_router_logit_softcapping"] = NSNull()
     root["rope_parameters"] = [
         "sliding_attention": [
             "rope_type": "default",
