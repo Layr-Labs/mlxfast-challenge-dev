@@ -113,8 +113,14 @@ func poolsideNVFP4DistributionIdentityIsPinned() throws {
         MLXFastConstants.defaultReferenceCachePath
             == ".cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/\(revision)"
     )
-    #expect(LagunaRuntime.experimentalMTPTargetModelID == repository)
-    #expect(LagunaRuntime.experimentalMTPTargetRevision == revision)
+    // The retired MTP prototype is a frozen historical affine-v1 contract.
+    // Repointing only its model ID while leaving its group-64 manifest,
+    // byte-count, and quantization fields intact would create incoherent
+    // provenance, so the serial-v2 distribution migration must not mutate it.
+    let retiredMTPRepository = "mlx-community/Laguna-XS-2.1-4bit"
+    let retiredMTPRevision = "c42e0a8f8d504ceacde015a535dcb286d65c8799"
+    #expect(LagunaRuntime.experimentalMTPTargetModelID == retiredMTPRepository)
+    #expect(LagunaRuntime.experimentalMTPTargetRevision == retiredMTPRevision)
 
     let trustedProvenance = try String(
         contentsOfFile:
@@ -123,12 +129,12 @@ func poolsideNVFP4DistributionIdentityIsPinned() throws {
     )
     #expect(
         trustedProvenance.contains(
-            "experimentalMTPTargetModelID =\n        \"\(repository)\""
+            "experimentalMTPTargetModelID =\n        \"\(retiredMTPRepository)\""
         )
     )
     #expect(
         trustedProvenance.contains(
-            "experimentalMTPTargetRevision =\n        \"\(revision)\""
+            "experimentalMTPTargetRevision =\n        \"\(retiredMTPRevision)\""
         )
     )
 
