@@ -262,7 +262,7 @@ public struct LagunaWeightLoader {
 
 /// Eagerly-prepared, RAM-resident weight cache for the Laguna text tower,
 /// mirroring `Gemma4RuntimeWeightCache`'s construction contract: the whole
-/// 4-bit checkpoint (~17.5 GB) is loaded once at construction time (outside
+/// 4-bit checkpoint (~18.8 GB) is loaded once at construction time (outside
 /// every scored window -- the runtime worker builds this before the
 /// benchmark protocol handshake), so every scored forward pays no dense
 /// loads or quantized-module construction. All expert tensors are
