@@ -42,6 +42,18 @@ func lagunaLastTokenHidden(_ hidden: MLXArray) -> MLXArray {
     return hidden[0..., range, 0...]
 }
 
+/// Enable the decode-only combined Q/K/V/per-head-gate projection on the
+/// full-memory profile. The startup policy writes `0` on low-memory hosts;
+/// an explicit caller value always wins over that policy's defaults.
+func lagunaFusedDecodeQKVGEnabled(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> Bool {
+    guard let raw = environment["MLXFAST_FUSED_QKV"] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}
+
 /// Builds the `initializeRope` scaling dictionary for a per-type Laguna RoPE
 /// spec. For `default` RoPE only the type is consulted; for YaRN the factory
 /// reads factor / original context / betas (Laguna leaves mscale and
@@ -79,6 +91,7 @@ final class LagunaRuntimeAttention: Module {
     @ModuleInfo(key: "v_proj") var wv: Linear
     @ModuleInfo(key: "o_proj") var wo: Linear
     @ModuleInfo(key: "g_proj") var gProj: Linear?
+    @ModuleInfo(key: "qkvg_proj") var qkvgProj: Linear?
 
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
@@ -105,6 +118,13 @@ final class LagunaRuntimeAttention: Module {
         if gatingEnabled {
             let gateDim = gatePerHead ? nHeads : nHeads * headDim
             self._gProj.wrappedValue = Linear(dim, gateDim, bias: false)
+            if lagunaFusedDecodeQKVGEnabled() {
+                self._qkvgProj.wrappedValue = Linear(
+                    dim,
+                    (nHeads + 2 * nKVHeads) * headDim + gateDim,
+                    bias: false
+                )
+            }
         }
 
         self._qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: Float(config.rmsNormEps))
@@ -128,9 +148,29 @@ final class LagunaRuntimeAttention: Module {
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
 
-        var queries = wq(x)
-        var keys = wk(x)
-        var values = wv(x)
+        let queriesFlat: MLXArray
+        let keysFlat: MLXArray
+        let valuesFlat: MLXArray
+        let fusedGate: MLXArray?
+        if B == 1, L == 1, let qkvgProj {
+            let qWidth = nHeads * headDim
+            let kWidth = nKVHeads * headDim
+            let vEnd = qWidth + 2 * kWidth
+            let qkvg = qkvgProj(x)
+            queriesFlat = qkvg[.ellipsis, ..<qWidth]
+            keysFlat = qkvg[.ellipsis, qWidth..<(qWidth + kWidth)]
+            valuesFlat = qkvg[.ellipsis, (qWidth + kWidth)..<vEnd]
+            fusedGate = qkvg[.ellipsis, vEnd...]
+        } else {
+            queriesFlat = wq(x)
+            keysFlat = wk(x)
+            valuesFlat = wv(x)
+            fusedGate = nil
+        }
+
+        var queries = queriesFlat
+        var keys = keysFlat
+        var values = valuesFlat
 
         queries = qNorm(queries.reshaped(B, L, nHeads, headDim)).transposed(0, 2, 1, 3)
         keys = kNorm(keys.reshaped(B, L, nKVHeads, headDim)).transposed(0, 2, 1, 3)
@@ -150,11 +190,11 @@ final class LagunaRuntimeAttention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        if gatingEnabled, let gProj {
+        if gatingEnabled, let gateProjection = fusedGate ?? gProj?(x) {
             // Per-head softplus gate computed in float32, then broadcast
             // across the head dimension (or applied elementwise for a
             // per-element gate).
-            let gate = softplus(gProj(x).asType(.float32)).asType(output.dtype)
+            let gate = softplus(gateProjection.asType(.float32)).asType(output.dtype)
             if gatePerHead {
                 output =
                     (output.reshaped(B, L, nHeads, headDim) * gate[.ellipsis, .newAxis])
@@ -301,8 +341,8 @@ final class LagunaRuntimeDecoderLayer: Module {
 
 // MARK: - Model
 
-/// The Laguna text tower: unscaled embedding, 40 decoder layers, final
-/// RMSNorm.
+/// The Laguna text tower: embedding (NOT scaled -- unlike Gemma there is no
+/// `sqrt(hidden)` embedding multiplier), 40 decoder layers, final RMSNorm.
 /// Returns post-norm hidden states for every input position.
 final class LagunaRuntimeModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
@@ -355,7 +395,8 @@ final class LagunaRuntimeModelInner: Module {
 /// Scored Laguna runtime model: last-token vocabulary head over the
 /// reimplemented Laguna text tower.
 ///
-/// `callAsFunction(_:cache:)` serves both prompt prefill
+/// Interface shape mirrors `Gemma4RuntimeModel` so the worker can swap the
+/// model type: `callAsFunction(_:cache:)` serves both prompt prefill
 /// (`[1, L]`) and single-token decode steps (`[1, 1]`) and returns
 /// `[1, 1, vocab]` last-token logits; `newCache(parameters:)` creates the
 /// per-layer cache stack (unbounded `StandardKVCache` for full-attention

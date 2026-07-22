@@ -30,9 +30,42 @@ public enum LagunaWeightNames {
     }
 }
 
+/// Add a decode-only combined Q/K/V/per-head-gate affine-quantized layout.
+/// The original projections remain model parameters for multi-token prefill,
+/// avoiding strided slices or copies across the sequence dimension.
+func lagunaAddDecodeQKVGWeights(
+    _ source: [String: MLXArray],
+    layerIndices: [Int]
+) throws -> [String: MLXArray] {
+    var weights = source
+    for layerIndex in layerIndices {
+        let prefix = "model.layers.\(layerIndex).self_attn"
+        for suffix in ["weight", "scales", "biases"] {
+            let names = ["q_proj", "k_proj", "v_proj", "g_proj"].map {
+                "\(prefix).\($0).\(suffix)"
+            }
+            let arrays = try names.map { name -> MLXArray in
+                guard let array = weights[name], array.ndim == 2 else {
+                    throw MLXFastError.invalidInput(
+                        "Laguna fused decode QKVG is missing a rank-2 \(name)"
+                    )
+                }
+                return array
+            }
+            guard arrays.dropFirst().allSatisfy({ $0.dim(-1) == arrays[0].dim(-1) }) else {
+                throw MLXFastError.invalidInput(
+                    "Laguna fused decode QKVG input widths disagree at layer \(layerIndex) \(suffix)"
+                )
+            }
+            weights["\(prefix).qkvg_proj.\(suffix)"] = concatenated(arrays, axis: -2)
+        }
+    }
+    return weights
+}
+
 /// Metadata-level access and validation for the transformed Laguna weights
-/// tree. `validateRequiredMetadata` checks that every tensor the runtime model
-/// needs is present with the
+/// tree. Mirrors `Gemma4WeightLoader`'s role: `validateRequiredMetadata`
+/// checks that every tensor the runtime model needs is present with the
 /// expected dtype/shape/quantization WITHOUT materializing any `MLXArray`s,
 /// so a malformed weights directory fails fast before the (expensive) full
 /// weight load.
@@ -260,8 +293,9 @@ public struct LagunaWeightLoader {
     }
 }
 
-/// Eagerly-prepared, RAM-resident weight cache for the Laguna text tower. The
-/// whole 4-bit checkpoint (~18.8 GB) is loaded once at construction time (outside
+/// Eagerly-prepared, RAM-resident weight cache for the Laguna text tower,
+/// mirroring `Gemma4RuntimeWeightCache`'s construction contract: the whole
+/// 4-bit checkpoint (~18.8 GB) is loaded once at construction time (outside
 /// every scored window -- the runtime worker builds this before the
 /// benchmark protocol handshake), so every scored forward pays no dense
 /// loads or quantized-module construction. All expert tensors are
@@ -281,21 +315,21 @@ public final class LagunaRuntimeWeightCache {
     public init(loader: LagunaWeightLoader, config: LagunaConfig) {
         self.loader = loader
         self.config = config
-        // Select the startup memory profile BEFORE the model load. Laguna
-        // retains no alternate weight layouts, so the full profile is
-        // deliberately a no-op here (the
+        // Select the startup memory profile BEFORE the model load, mirroring
+        // `Gemma4RuntimeWeightCache`. Laguna retains no alternate weight
+        // layouts, so the full profile is deliberately a no-op here (the
         // ranked 128 GiB box keeps stock allocator behavior); the documented
         // low-memory profile for <64 GiB machines caps the MLX allocator
         // cache at 6 GiB, shortens command buffers, installs the
         // feature-disable env defaults (no-overwrite), and clears free
         // warmup buffers before the worker protocol hello. The layer-count
         // guard keeps tiny unit-test configurations on stock behavior.
-        let startupMemoryPolicy: RuntimeStartupMemoryPolicy?
+        let startupMemoryPolicy: Gemma4StartupMemoryPolicy?
         if config.numHiddenLayers >= 16 {
-            let policy = RuntimeStartupMemoryPolicy.resolve(
+            let policy = Gemma4StartupMemoryPolicy.resolve(
                 physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
                 requestedProfile: ProcessInfo.processInfo.environment[
-                    RuntimeStartupMemoryPolicy.profileOverrideEnvironmentName
+                    Gemma4StartupMemoryPolicy.profileOverrideEnvironmentName
                 ]
             )
             if policy.isLowMemory {
@@ -375,7 +409,13 @@ public final class LagunaRuntimeWeightCache {
         let model = LagunaRuntimeModel(config)
 
         let loadedWeights = try loadRuntimeWeightArrays(denseStore: loader.denseStore)
-        let sanitized = model.sanitize(weights: loadedWeights)
+        var sanitized = model.sanitize(weights: loadedWeights)
+        if lagunaFusedDecodeQKVGEnabled() {
+            sanitized = try lagunaAddDecodeQKVGWeights(
+                sanitized,
+                layerIndices: Array(0..<config.numHiddenLayers)
+            )
+        }
         let groupSize = config.quantization.groupSize
         quantize(model: model) {
             (path: String, _: Module) -> (groupSize: Int, bits: Int, mode: QuantizationMode)? in
@@ -391,7 +431,7 @@ public final class LagunaRuntimeWeightCache {
         // The mlx-community Laguna checkpoint already stores scales/biases
         // and norms in bf16 (only the packed codes are U32), so the
         // library's fp16->bf16 conversion pass is a no-op here and is
-        // intentionally omitted.
+        // intentionally omitted -- same reasoning as the Gemma 4 loader.
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
         eval(model)
         return model
