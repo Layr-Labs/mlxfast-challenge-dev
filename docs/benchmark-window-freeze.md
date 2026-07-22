@@ -177,8 +177,8 @@ freeze test fails on purpose -- the doc and the code must move together.
 ### Paired baseline on the single M5 box
 
 The ranked runner is one self-hosted Apple M5 Max (label `m5-bench`). The
-paired baseline is a **pinned reference tree provisioned on that box**
-(`/opt/bench-runner/baseline/current`), and the timed measurement is owned by
+v2 paired baseline is a **pinned reference tree provisioned on that box**
+(`/opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current`), and the timed measurement is owned by
 the on-box `measure-job` (trusted, runner-provisioned, fixed thermal
 contract). Per ranked run, after all correctness/gates work, a hidden-material
 scrub, and a quiescence wait, measure-job runs the pinned **baseline tree
@@ -192,7 +192,8 @@ common-mode host drift exactly like the old separate-VM pairing did
 (validated on this box at paired score 1.0507 with decode CV 0.13%).
 
 - The baseline sample is additionally sanity-checked against the box's
-  recorded calibration (`/opt/bench-runner/state/baseline-calibration.json`),
+  versioned calibration
+  (`/opt/bench-runner/state/laguna-xs-2.1-serial-v2/baseline-calibration.json`),
   so a broken baseline build or a sick host fails the run instead of
   repricing every speedup.
 - The baseline's own floor verdict is ignored; token mismatches or harness

@@ -148,8 +148,8 @@ public enum MLXFastConstants {
     // (each field is measure-job's on-box timing of the pinned Laguna
     // reference tree in that run's session): decode clustered
     // 0.0093606-0.0094083 (CV 0.20%), prefill 0.0003596-0.0003664 (CV
-    // 0.71%). The on-box /opt/bench-runner/state/baseline-calibration.json
-    // is runner-private, so the published per-run baseline fields are the
+    // 0.71%). The v2 calibration lives under the versioned on-box state
+    // directory and is runner-private, so the published per-run fields are the
     // audited public source. Supersedes the Gemma 4 31B 4-bit calibration of
     // 2026-07-12 (prefill 0.0016216554767252605 / decode
     // 0.04405625764973958, runs 29179374395-29197772284), which was ~4.5x /

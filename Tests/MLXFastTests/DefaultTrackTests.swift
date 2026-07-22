@@ -39,9 +39,11 @@ struct DefaultTrackTests {
         // prefill+decode floors.
         #expect(workflow.contains("MLXFAST_MEASURE_JOB: /opt/bench-runner/measure-job.sh"))
         #expect(workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-current"))
-        #expect(workflow.contains("MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/current"))
         #expect(workflow.contains(
-            "MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/baseline-calibration.json"
+            "MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current"
+        ))
+        #expect(workflow.contains(
+            "MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/laguna-xs-2.1-serial-v2/baseline-calibration.json"
         ))
         #expect(workflow.contains("MLXFAST_DECODE_SPEEDUP_FLOOR: \"0.95\""))
         #expect(workflow.contains("MLXFAST_PREFILL_SPEEDUP_FLOOR: \"0.95\""))

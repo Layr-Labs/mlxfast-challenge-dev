@@ -128,8 +128,10 @@ verify them) were regenerated.
 - The ranked score no longer prices against a repo-pinned baseline ref or
   the calibrated constants: the single-machine pipeline measures the
   **pinned reference baseline tree provisioned on the M5 box**
-  (`/opt/bench-runner/baseline/current`, sanity-banded against
-  `/opt/bench-runner/state/baseline-calibration.json`) in the same session
+  (`/opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current`,
+  sanity-banded against the versioned
+  `/opt/bench-runner/state/laguna-xs-2.1-serial-v2/baseline-calibration.json`)
+  in the same session
   as the candidate. Regenerating that tree or its calibration is an
   operator procedure (RUNBOOK) and a ranking-contract change.
 - The `officialBaselinePrefillSecondsPerToken` /

@@ -248,7 +248,7 @@ public enum SwiftTransform {
             )
         case .laguna:
             // docs/laguna-weight-contract.md forbids derived layouts and
-            // metadata sidecars in v1, and the Laguna runtime loads exactly the
+            // metadata sidecars in the Poolside v2 contract, and the runtime loads exactly the
             // indexed checkpoint tensors (its untied lm_head makes the
             // Gemma tied-head packed13 sidecar meaningless anyway). Emit
             // nothing beyond the pass-through tensor set.
