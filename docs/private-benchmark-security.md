@@ -160,7 +160,7 @@ the private R2 bucket in trusted steps:
 `correctness_prompts/gpqa_reference_cases-laguna.json` (the hidden GPQA
 reference cases, merged into the golden as 5 behavior gates), followed after
 the correctness scrub by
-`correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt` (the
+`correctness_prompts/timed_decode_gc_runtimes_essay-laguna.txt` (the
 independent timed prefill/decode target).
 Correctness-only dispatches (`run_benchmark=false`) fetch no private
 material at all. The 2026-07 Poolside Laguna XS 2.1 re-pin rotated these

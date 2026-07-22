@@ -40,7 +40,7 @@ struct RankedWorkflowIsolationTests {
             "MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json"
         ))
         #expect(!jobHeader.contains(
-            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt"
+            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_gc_runtimes_essay-laguna.txt"
         ))
 
         let prepareStep = try stepBody(
@@ -60,7 +60,7 @@ struct RankedWorkflowIsolationTests {
             to: "- name: Wait for quiescence before timing"
         )
         #expect(prepareTimedPromptStep.contains(
-            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt"
+            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_gc_runtimes_essay-laguna.txt"
         ))
     }
 
