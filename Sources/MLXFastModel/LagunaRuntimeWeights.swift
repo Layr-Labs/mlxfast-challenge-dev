@@ -30,9 +30,42 @@ public enum LagunaWeightNames {
     }
 }
 
+/// Replace sparse layers' separate quantized expert gate/up triplets with the
+/// `SwitchGLU(fuseGateUp:)` parameter layout. Internal so the byte-ordering
+/// transform can be checked with small synthetic tensors without loading the
+/// full checkpoint.
+func lagunaFuseRoutedGateUpWeights(
+    _ source: [String: MLXArray],
+    sparseLayerIndices: [Int]
+) throws -> [String: MLXArray] {
+    var weights = source
+    for layerIndex in sparseLayerIndices {
+        let prefix = "model.layers.\(layerIndex).mlp.switch_mlp"
+        for suffix in ["weight", "scales", "biases"] {
+            let gateName = "\(prefix).gate_proj.\(suffix)"
+            let upName = "\(prefix).up_proj.\(suffix)"
+            guard let gate = weights.removeValue(forKey: gateName),
+                  let up = weights.removeValue(forKey: upName)
+            else {
+                throw MLXFastError.invalidInput(
+                    "Laguna fused routed gate/up is missing \(gateName) or \(upName)"
+                )
+            }
+            guard gate.shape == up.shape, gate.ndim == 3 else {
+                throw MLXFastError.invalidInput(
+                    "Laguna routed gate/up tensors disagree for layer \(layerIndex) \(suffix)"
+                )
+            }
+            weights["\(prefix).gate_up_proj.\(suffix)"] = concatenated(
+                [gate, up], axis: -2)
+        }
+    }
+    return weights
+}
+
 /// Metadata-level access and validation for the transformed Laguna weights
-/// tree. `validateRequiredMetadata` checks that every tensor the runtime model
-/// needs is present with the
+/// tree. Mirrors `Gemma4WeightLoader`'s role: `validateRequiredMetadata`
+/// checks that every tensor the runtime model needs is present with the
 /// expected dtype/shape/quantization WITHOUT materializing any `MLXArray`s,
 /// so a malformed weights directory fails fast before the (expensive) full
 /// weight load.
@@ -260,8 +293,9 @@ public struct LagunaWeightLoader {
     }
 }
 
-/// Eagerly-prepared, RAM-resident weight cache for the Laguna text tower. The
-/// whole 4-bit checkpoint (~18.8 GB) is loaded once at construction time (outside
+/// Eagerly-prepared, RAM-resident weight cache for the Laguna text tower,
+/// mirroring `Gemma4RuntimeWeightCache`'s construction contract: the whole
+/// 4-bit checkpoint (~18.8 GB) is loaded once at construction time (outside
 /// every scored window -- the runtime worker builds this before the
 /// benchmark protocol handshake), so every scored forward pays no dense
 /// loads or quantized-module construction. All expert tensors are
@@ -281,21 +315,21 @@ public final class LagunaRuntimeWeightCache {
     public init(loader: LagunaWeightLoader, config: LagunaConfig) {
         self.loader = loader
         self.config = config
-        // Select the startup memory profile BEFORE the model load. Laguna
-        // retains no alternate weight layouts, so the full profile is
-        // deliberately a no-op here (the
+        // Select the startup memory profile BEFORE the model load, mirroring
+        // `Gemma4RuntimeWeightCache`. Laguna retains no alternate weight
+        // layouts, so the full profile is deliberately a no-op here (the
         // ranked 128 GiB box keeps stock allocator behavior); the documented
         // low-memory profile for <64 GiB machines caps the MLX allocator
         // cache at 6 GiB, shortens command buffers, installs the
         // feature-disable env defaults (no-overwrite), and clears free
         // warmup buffers before the worker protocol hello. The layer-count
         // guard keeps tiny unit-test configurations on stock behavior.
-        let startupMemoryPolicy: RuntimeStartupMemoryPolicy?
+        let startupMemoryPolicy: Gemma4StartupMemoryPolicy?
         if config.numHiddenLayers >= 16 {
-            let policy = RuntimeStartupMemoryPolicy.resolve(
+            let policy = Gemma4StartupMemoryPolicy.resolve(
                 physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
                 requestedProfile: ProcessInfo.processInfo.environment[
-                    RuntimeStartupMemoryPolicy.profileOverrideEnvironmentName
+                    Gemma4StartupMemoryPolicy.profileOverrideEnvironmentName
                 ]
             )
             if policy.isLowMemory {
@@ -375,7 +409,15 @@ public final class LagunaRuntimeWeightCache {
         let model = LagunaRuntimeModel(config)
 
         let loadedWeights = try loadRuntimeWeightArrays(denseStore: loader.denseStore)
-        let sanitized = model.sanitize(weights: loadedWeights)
+        var sanitized = model.sanitize(weights: loadedWeights)
+        if lagunaFusedRoutedGateUpEnabled() {
+            sanitized = try lagunaFuseRoutedGateUpWeights(
+                sanitized,
+                sparseLayerIndices: (0..<config.numHiddenLayers).filter {
+                    config.isSparse(layer: $0)
+                }
+            )
+        }
         let groupSize = config.quantization.groupSize
         quantize(model: model) {
             (path: String, _: Module) -> (groupSize: Int, bits: Int, mode: QuantizationMode)? in
@@ -391,7 +433,7 @@ public final class LagunaRuntimeWeightCache {
         // The mlx-community Laguna checkpoint already stores scales/biases
         // and norms in bf16 (only the packed codes are U32), so the
         // library's fp16->bf16 conversion pass is a no-op here and is
-        // intentionally omitted.
+        // intentionally omitted -- same reasoning as the Gemma 4 loader.
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
         eval(model)
         return model

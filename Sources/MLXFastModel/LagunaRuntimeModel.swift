@@ -42,6 +42,23 @@ func lagunaLastTokenHidden(_ hidden: MLXArray) -> MLXArray {
     return hidden[0..., range, 0...]
 }
 
+/// Whether sparse Laguna experts should use one gathered gate+up projection.
+///
+/// The full-profile default is enabled: concatenating the two output-row
+/// domains preserves each row's quantized K reduction while removing one
+/// gather-QMM launch per sparse layer. The shared startup-memory policy sets
+/// this flag to `0` on <64 GiB hosts because construction transiently retains
+/// the source arrays until the combined layout is materialized. Explicit user
+/// values retain the policy's existing no-overwrite semantics.
+func lagunaFusedRoutedGateUpEnabled(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> Bool {
+    guard let raw = environment["MLXFAST_FUSED_GATE_UP"] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}
+
 /// Builds the `initializeRope` scaling dictionary for a per-type Laguna RoPE
 /// spec. For `default` RoPE only the type is consulted; for YaRN the factory
 /// reads factor / original context / betas (Laguna leaves mscale and
@@ -242,7 +259,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
-            numExperts: config.numExperts
+            numExperts: config.numExperts,
+            fuseGateUp: lagunaFusedRoutedGateUpEnabled()
         )
         self._sharedExpert.wrappedValue = LagunaRuntimeMLP(
             dimensions: config.hiddenSize,
@@ -301,8 +319,8 @@ final class LagunaRuntimeDecoderLayer: Module {
 
 // MARK: - Model
 
-/// The Laguna text tower: unscaled embedding, 40 decoder layers, final
-/// RMSNorm.
+/// The Laguna text tower: embedding (NOT scaled -- unlike Gemma there is no
+/// `sqrt(hidden)` embedding multiplier), 40 decoder layers, final RMSNorm.
 /// Returns post-norm hidden states for every input position.
 final class LagunaRuntimeModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
@@ -355,7 +373,8 @@ final class LagunaRuntimeModelInner: Module {
 /// Scored Laguna runtime model: last-token vocabulary head over the
 /// reimplemented Laguna text tower.
 ///
-/// `callAsFunction(_:cache:)` serves both prompt prefill
+/// Interface shape mirrors `Gemma4RuntimeModel` so the worker can swap the
+/// model type: `callAsFunction(_:cache:)` serves both prompt prefill
 /// (`[1, L]`) and single-token decode steps (`[1, 1]`) and returns
 /// `[1, 1, vocab]` last-token logits; `newCache(parameters:)` creates the
 /// per-layer cache stack (unbounded `StandardKVCache` for full-attention
