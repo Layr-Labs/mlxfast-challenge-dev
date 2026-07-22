@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "status": "synthetic-template",
+  "needs_reference_output": true,
+  "cases": [
+    {
+      "id": "synthetic-gpqa-a",
+      "prompt": "Synthetic public question A?\nA. Alpha\nB. Beta",
+      "expected_response": "A. Alpha",
+      "answer_key": "A",
+      "accepted_token_sequences": [[21, 22]],
+      "accepted_responses": ["A", "Alpha"],
+      "domain": "synthetic-science",
+      "subdomain": "synthetic-a",
+      "needs_reference_output": true
+    },
+    {
+      "id": "synthetic-gpqa-b",
+      "prompt": "Synthetic public question B?\nA. Gamma\nB. Delta",
+      "expected_response": "B. Delta",
+      "answer_key": "B",
+      "accepted_responses": ["B", "Delta"],
+      "domain": "synthetic-science",
+      "subdomain": "synthetic-b"
+    }
+  ]
+}

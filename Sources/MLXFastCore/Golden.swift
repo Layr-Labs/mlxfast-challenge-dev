@@ -304,15 +304,37 @@ public func loadGoldenFixture(
     requiredSteps: Int = MLXFastConstants.correctnessSteps,
     requiredPromptTokens: Int = MLXFastConstants.correctnessPromptTokens
 ) throws -> GoldenFixture {
+    try requireFile(path, description: "correctness golden file")
+    let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    let decoded = try decodeGoldenDocument(
+        from: data,
+        requiredSteps: requiredSteps,
+        requiredPromptTokens: requiredPromptTokens
+    )
+    let digest = SHA256.hash(data: data)
+    let hash = digest.map { String(format: "%02x", $0) }.joined()
+    return GoldenFixture(
+        cases: decoded.cases,
+        correctnessGates: decoded.correctnessGates,
+        benchmark: decoded.benchmark,
+        sha256: hash
+    )
+}
+
+/// Strictly decodes and validates an in-memory golden document using the same
+/// contract as ``loadGoldenFixture``. Operator tooling uses this before any
+/// private artifact is written.
+public func decodeGoldenDocument(
+    from data: Data,
+    requiredSteps: Int = MLXFastConstants.correctnessSteps,
+    requiredPromptTokens: Int = MLXFastConstants.correctnessPromptTokens
+) throws -> GoldenDocument {
     guard requiredSteps > 0 else {
         throw MLXFastError.invalidInput("correctness required steps must be positive")
     }
     guard requiredPromptTokens > 0 else {
         throw MLXFastError.invalidInput("correctness required prompt tokens must be positive")
     }
-    try requireFile(path, description: "correctness golden file")
-
-    let data = try Data(contentsOf: URL(fileURLWithPath: path))
     try validateGoldenFixtureKeys(data)
     let decoded = try JSONDecoder().decode(GoldenDocument.self, from: data)
     guard decoded.version == 1 else {
@@ -333,14 +355,7 @@ public func loadGoldenFixture(
     if let benchmark = decoded.benchmark {
         try validateBenchmarkGolden(benchmark)
     }
-    let digest = SHA256.hash(data: data)
-    let hash = digest.map { String(format: "%02x", $0) }.joined()
-    return GoldenFixture(
-        cases: decoded.cases,
-        correctnessGates: decoded.correctnessGates,
-        benchmark: decoded.benchmark,
-        sha256: hash
-    )
+    return decoded
 }
 
 public enum GoldenSequenceMatcher {
