@@ -38,6 +38,21 @@ func lagunaLastTokenHidden(_ hidden: MLXArray) -> MLXArray {
     return hidden[0..., range, 0...]
 }
 
+/// Whether sparse Laguna experts should use one gathered gate+up projection.
+///
+/// Concatenating the output-row domains preserves each row's quantized K
+/// reduction while removing one gather-QMM launch per sparse layer. The
+/// startup-memory policy disables this by default on low-memory hosts because
+/// materializing the combined layout temporarily retains the source arrays.
+func lagunaFusedRoutedGateUpEnabled(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> Bool {
+    guard let raw = environment["MLXFAST_FUSED_GATE_UP"] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}
+
 /// Builds the `initializeRope` scaling dictionary for a per-type Laguna RoPE
 /// spec. For `default` RoPE only the type is consulted; for YaRN the factory
 /// reads factor / original context / betas. The XS config also serializes
@@ -238,7 +253,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
-            numExperts: config.numExperts
+            numExperts: config.numExperts,
+            fuseGateUp: lagunaFusedRoutedGateUpEnabled()
         )
         self._sharedExpert.wrappedValue = LagunaRuntimeMLP(
             dimensions: config.hiddenSize,
