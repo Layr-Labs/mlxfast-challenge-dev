@@ -75,31 +75,33 @@ func goldenModelProvenanceIsStrictAndPinned() throws {
         )
     }
 
-    let valid = try decodeGoldenDocument(
-        from: documentJSON(
+    func load(_ data: Data) throws -> GoldenFixture {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("golden.json")
+        try data.write(to: path)
+        return try loadGoldenFixture(from: path.path)
+    }
+
+    let valid = try load(
+        documentJSON(
             repository: MLXFastConstants.referenceModelRepository,
             revision: MLXFastConstants.referenceModelRevision
         )
     )
-    #expect(
-        valid.modelProvenance
-            == GoldenModelProvenance(
-                repository: MLXFastConstants.referenceModelRepository,
-                revision: MLXFastConstants.referenceModelRevision
-            )
-    )
+    #expect(valid.cases.count == 1)
 
     #expect(throws: MLXFastError.self) {
-        _ = try decodeGoldenDocument(
-            from: documentJSON(
+        _ = try load(
+            documentJSON(
                 repository: "mlx-community/Laguna-XS-2.1-4bit",
                 revision: "c42e0a8f8d504ceacde015a535dcb286d65c8799"
             )
         )
     }
     #expect(throws: MLXFastError.self) {
-        _ = try decodeGoldenDocument(
-            from: documentJSON(
+        _ = try load(
+            documentJSON(
                 repository: MLXFastConstants.referenceModelRepository,
                 revision: MLXFastConstants.referenceModelRevision,
                 extra: ", \"unexpected\": true"

@@ -2227,8 +2227,7 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
     // official fail-closed, and the TODO marker resolved.
     let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
     #expect(!cli.contains("TODO(security)"))
-    #expect(cli.contains("try enforceEditableSurfaceByteBudget("))
-    #expect(cli.contains("emitWarnings: !suppressWarnings"))
+    #expect(cli.contains("try enforceEditableSurfaceByteBudget(officialRun: officialRun)"))
     #expect(cli.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES"))
     #expect(cli.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_FILE_BYTES"))
     #expect(cli.contains(
@@ -2664,23 +2663,22 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(package.contains(".product(name: \"Tokenizers\", package: \"swift-transformers\")"))
     #expect(cli.contains("case \"attach-gpqa-gates\""))
     #expect(!cli.contains("case \"calibrate-gpqa-gates\""))
-    #expect(cli.contains("case \"calibrate-private-golden\""))
+    #expect(!cli.contains("case \"calibrate-private-golden\""))
+    #expect(!cli.contains("collectPrivateArtifactCalibration"))
+    #expect(!cli.contains("PrivateArtifactCalibrator"))
+    #expect(!cli.contains("PrivateArtifactWriter"))
+    #expect(!cli.contains("requirePrivateIsolation"))
+    #expect(!cli.contains("--gpqa-output"))
     #expect(cli.contains("case \"generate-gpqa-answers\""))
     #expect(!cli.contains("case \"measure-gpqa-ttft\""))
     #expect(cli.contains("AutoTokenizer.from(modelFolder: modelFolder, strict: false)"))
     #expect(cli.contains("acceptedReferenceTokenSequences"))
     #expect(cli.contains("LagunaRuntime.generateGreedyTokens"))
-    #expect(cli.contains("blockedGoldenPath: gpqaPath,"))
-    #expect(cli.contains("suppressWarnings: true"))
+    #expect(cli.contains("runtimeWorkerOptions(blockedGoldenPath: gpqaPath)"))
     #expect(!cli.contains("calibrated_reference_outputs"))
     #expect(cli.contains("SemanticGPQAAnswerDocument"))
     #expect(cli.contains("referenceAnswer(for: testCase)"))
-    #expect(cli.contains("generate-gpqa-answers requires --output PATH"))
-    #expect(cli.contains("generate-gpqa-answers requires --gpqa-output PATH"))
-    #expect(cli.contains("collectPrivateArtifactCalibration"))
-    #expect(cli.contains("PrivateArtifactCalibrator.calibrateGPQA"))
-    #expect(cli.contains("PrivateArtifactWriter.write"))
-    #expect(cli.contains("PrivateArtifactLogSummary.gpqaSuccess"))
+    #expect(cli.contains("generate-gpqa-answers requires --output or MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH"))
     #expect(cli.contains("semantic GPQA answer output"))
     #expect(!cli.contains("measure-gpqa-ttft"))
     #expect(!cli.contains("FirstTokenTimingOptions(weightsPath: weightsPath, promptTokenSets: selectedPrompts)"))
@@ -2734,6 +2732,22 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(workerBehavior.contains("let usesSemanticJudge = behaviorUsesSemanticJudge(testCase)"))
     #expect(workerBehavior.contains("if !usesSemanticJudge"))
     #expect(workerBehavior.contains("if usesSemanticJudge ||"))
+}
+
+@Test
+func unsafePrivateCalibrationToolingStaysExcluded() {
+    for path in [
+        "Sources/MLXFastCore/PrivateArtifactCalibration.swift",
+        "Sources/MLXFastTrustedHarness/LagunaRuntimePrivateCalibration.swift",
+        "Tests/Fixtures/PrivateArtifactCalibration/synthetic-private-golden-template.json",
+        "Tests/Fixtures/PrivateArtifactCalibration/synthetic-private-gpqa-template.json",
+        "Tests/MLXFastTests/PrivateArtifactCalibrationTests.swift",
+    ] {
+        #expect(
+            !FileManager.default.fileExists(atPath: path),
+            "unsafe participant-worker private calibration tooling must remain excluded: \(path)"
+        )
+    }
 }
 
 @Test

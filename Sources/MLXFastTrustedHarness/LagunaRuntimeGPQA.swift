@@ -72,9 +72,12 @@ extension LagunaRuntime {
         let document = SemanticGPQAAnswerDocument(version: 1, cases: answers)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        var data = try encoder.encode(document)
-        data.append(0x0a)
-        _ = try PrivateArtifactWriter.write(data, to: path)
+        let outputURL = URL(fileURLWithPath: path)
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try encoder.encode(document).write(to: outputURL, options: [.atomic])
     }
 
 }

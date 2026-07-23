@@ -45,9 +45,6 @@ private enum MLXFastCLI {
             case "attach-gpqa-gates":
                 try runAttachGPQAGates(options)
                 return 0
-            case "calibrate-private-golden":
-                try runCalibratePrivateGolden(options)
-                return 0
             case "attach-free-run-gate":
                 try runAttachFreeRunGate(options)
                 return 0
@@ -574,158 +571,6 @@ private enum MLXFastCLI {
         if data.last != 0x0a { print("") }
     }
 
-    private static func runCalibratePrivateGolden(
-        _ options: ParsedOptions
-    ) throws {
-        _ = Darwin.umask(mode_t(0o077))
-        do {
-            try runCalibratePrivateGoldenUnsafe(options)
-        } catch {
-            throw MLXFastError.invalidInput(
-                PrivateArtifactLogSummary.goldenFailure
-            )
-        }
-    }
-
-    private static func runCalibratePrivateGoldenUnsafe(
-        _ options: ParsedOptions
-    ) throws {
-        try options.validate(
-            valueOptions: [
-                "--golden",
-                "--weights",
-                "--output",
-                "--anchor-max-rank",
-                "--anchor-max-top-logit-delta",
-            ]
-        )
-        let goldenPath = options.value(for: "--golden", default: "")
-        guard !goldenPath.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "calibrate-private-golden requires --golden PATH"
-            )
-        }
-        let weightsPath = options.value(for: "--weights", default: "")
-        guard !weightsPath.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "calibrate-private-golden requires --weights PATH"
-            )
-        }
-        let outputPath = options.value(for: "--output", default: "")
-        guard !outputPath.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "calibrate-private-golden requires --output PATH"
-            )
-        }
-        try requireStrictPrivateArtifactPath(
-            goldenPath,
-            description: "private golden input"
-        )
-        try requireStrictPrivateArtifactPath(
-            outputPath,
-            description: "private golden output"
-        )
-        try requireFile(goldenPath, description: "private golden input")
-        try requireFile(
-            URL(fileURLWithPath: weightsPath)
-                .appendingPathComponent("config.json").path,
-            description: "weights config.json"
-        )
-
-        let templateData = try Data(
-            contentsOf: URL(fileURLWithPath: goldenPath)
-        )
-        let template = try decodeGoldenDocument(from: templateData)
-        let anchors = template.correctnessGates?.anchorCases ?? []
-        let behaviors = template.correctnessGates?.behaviorCases ?? []
-        guard !anchors.isEmpty || !behaviors.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "private golden has no calibratable cases"
-            )
-        }
-
-        let rankText = options.value(
-            for: "--anchor-max-rank",
-            default: ""
-        )
-        let deltaText = options.value(
-            for: "--anchor-max-top-logit-delta",
-            default: ""
-        )
-        let anchorPolicy: PrivateAnchorCalibrationPolicy?
-        if anchors.isEmpty {
-            guard rankText.isEmpty, deltaText.isEmpty else {
-                throw MLXFastError.invalidInput(
-                    "anchor policy options require anchor cases"
-                )
-            }
-            anchorPolicy = nil
-        } else {
-            guard !rankText.isEmpty, !deltaText.isEmpty else {
-                throw MLXFastError.invalidInput(
-                    "anchor cases require explicit rank and logit-delta policy"
-                )
-            }
-            anchorPolicy = PrivateAnchorCalibrationPolicy(
-                maximumExpectedRank: try parsePositiveInt(
-                    rankText,
-                    optionName: "--anchor-max-rank"
-                ),
-                maximumTopLogitDelta: try parseNonNegativeFiniteDouble(
-                    deltaText,
-                    optionName: "--anchor-max-top-logit-delta"
-                )
-            )
-        }
-
-        let anchorRequests = anchors.map {
-            PrivateAnchorCalibrationRequest(
-                id: $0.name,
-                contextTokens: $0.contextTokens,
-                expectedToken: $0.expectedToken
-            )
-        }
-        let behaviorRequests = behaviors.map {
-            PrivateSequenceCalibrationRequest(
-                id: $0.name,
-                promptTokens: $0.promptTokens,
-                steps: $0.maxNewTokens
-            )
-        }
-        guard let worker = try runtimeWorkerOptions(
-            blockedGoldenPath: goldenPath,
-            suppressWarnings: true,
-            requirePrivateIsolation: true
-        ) else {
-            throw MLXFastError.invalidInput(
-                "private golden calibration requires the runtime worker"
-            )
-        }
-        let observations = try LagunaRuntime
-            .collectPrivateArtifactCalibration(
-                weightsPath: weightsPath,
-                anchors: anchorRequests,
-                sequences: behaviorRequests,
-                worker: worker
-            )
-        let calibrated = try PrivateArtifactCalibrator.calibrateGolden(
-            templateData: templateData,
-            observations: observations,
-            anchorPolicy: anchorPolicy
-        )
-        let writeResult = try PrivateArtifactWriter.write(
-            calibrated.data,
-            to: outputPath
-        )
-        print(
-            PrivateArtifactLogSummary.goldenSuccess(
-                anchorCount: calibrated.anchorCount,
-                behaviorCount: calibrated.behaviorCount,
-                sha256: writeResult.sha256
-            )
-        )
-    }
-
     private static func runAttachGPQAGates(_ options: ParsedOptions) throws {
         try reexecUnderParentToolSandboxIfRequested(subcommand: "attach-gpqa-gates")
         try options.validate(
@@ -1232,78 +1077,34 @@ private enum MLXFastCLI {
     }
 
     private static func runGenerateGPQAAnswers(_ options: ParsedOptions) throws {
-        _ = Darwin.umask(mode_t(0o077))
-        do {
-            try runGenerateGPQAAnswersUnsafe(options)
-        } catch {
-            throw MLXFastError.invalidInput(
-                PrivateArtifactLogSummary.gpqaFailure
-            )
-        }
-    }
-
-    private static func runGenerateGPQAAnswersUnsafe(
-        _ options: ParsedOptions
-    ) throws {
         try options.validate(
-            valueOptions: [
-                "--gpqa",
-                "--weights",
-                "--tokenizer",
-                "--output",
-                "--gpqa-output",
-                "--case-count",
-                "--max-new-tokens",
-            ]
+            valueOptions: ["--gpqa", "--weights", "--tokenizer", "--output", "--case-count", "--max-new-tokens"]
         )
-        let gpqaPath = options.value(for: "--gpqa", default: "")
+        let gpqaPath = options.value(
+            for: "--gpqa",
+            default: environmentValue("MLXFAST_GPQA_REFERENCE_PATH", fallback: "")
+        )
         guard !gpqaPath.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "generate-gpqa-answers requires --gpqa PATH"
-            )
+            throw MLXFastError.invalidInput("generate-gpqa-answers requires --gpqa or MLXFAST_GPQA_REFERENCE_PATH")
         }
-        let weightsPath = options.value(for: "--weights", default: "")
-        guard !weightsPath.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "generate-gpqa-answers requires --weights PATH"
-            )
-        }
+        let weightsPath = options.value(
+            for: "--weights",
+            default: environmentValue("MLXFAST_WEIGHTS_PATH", fallback: MLXFastConstants.defaultWeightsPath)
+        )
         let tokenizerPath = options.value(
             for: "--tokenizer",
-            default: weightsPath
+            default: environmentValue("MLXFAST_TOKENIZER_PATH", fallback: weightsPath)
         )
-        let outputPath = options.value(for: "--output", default: "")
+        let outputPath = options.value(
+            for: "--output",
+            default: environmentValue("MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH", fallback: "")
+        )
         guard !outputPath.isEmpty else {
             throw MLXFastError.invalidInput(
-                "generate-gpqa-answers requires --output PATH"
+                "generate-gpqa-answers requires --output or MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH"
             )
         }
-        let calibratedGPQAPath = options.value(
-            for: "--gpqa-output",
-            default: ""
-        )
-        guard !calibratedGPQAPath.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "generate-gpqa-answers requires --gpqa-output PATH"
-            )
-        }
-        try requireStrictPrivateArtifactPath(
-            gpqaPath,
-            description: "GPQA calibration input"
-        )
-        try requireStrictPrivateArtifactPath(
-            outputPath,
-            description: "semantic GPQA answer output"
-        )
-        try requireStrictPrivateArtifactPath(
-            calibratedGPQAPath,
-            description: "calibrated GPQA output"
-        )
-        guard absolutePath(outputPath) != absolutePath(calibratedGPQAPath) else {
-            throw MLXFastError.invalidInput(
-                "semantic and calibrated GPQA outputs must be distinct"
-            )
-        }
+        try requirePrivateOutputPath(outputPath, description: "semantic GPQA answer output")
         let caseCount = try parsePositiveInt(
             options.value(for: "--case-count", default: "\(MLXFastConstants.semanticGPQACaseCount)"),
             optionName: "--case-count"
@@ -1335,67 +1136,31 @@ private enum MLXFastCLI {
         let tokenizer = try loadLocalTokenizer(at: tokenizerPath)
         let data = try Data(contentsOf: URL(fileURLWithPath: gpqaPath))
         let gpqa = try JSONDecoder().decode(GPQAReferenceDocument.self, from: data)
-        let calibrationCases = try PrivateArtifactCalibrator.gpqaCases(
-            from: data
-        )
-        guard gpqa.cases.count == calibrationCases.count,
-              caseCount == calibrationCases.count,
-              zip(gpqa.cases, calibrationCases).allSatisfy({ pair in
-                  pair.0.identifier == pair.1.id
-              })
-        else {
-            throw MLXFastError.invalidInput(
-                "GPQA case count, IDs, or ordering do not match"
-            )
-        }
+        let worker = try runtimeWorkerOptions(blockedGoldenPath: gpqaPath)
 
-        var requests: [PrivateSequenceCalibrationRequest] = []
-        requests.reserveCapacity(caseCount)
-        for (testCase, calibrationCase) in zip(
-            gpqa.cases,
-            calibrationCases
-        ) {
+        var answers: [SemanticGPQAAnswerCase] = []
+        var skippedOverBudget = 0
+        for testCase in gpqa.cases {
+            guard answers.count < caseCount else {
+                break
+            }
             let promptTokens = tokenizer.encode(text: testCase.prompt, addSpecialTokens: false)
             guard !promptTokens.isEmpty else {
                 throw MLXFastError.invalidInput("\(testCase.identifier).prompt tokenized to zero tokens")
             }
             guard promptTokens.count <= MLXFastConstants.correctnessMaxBehaviorPromptTokens else {
-                throw MLXFastError.invalidInput(
-                    "GPQA calibration prompt exceeds the behavior prompt budget"
-                )
+                skippedOverBudget += 1
+                continue
             }
-            requests.append(
-                PrivateSequenceCalibrationRequest(
-                    id: calibrationCase.id,
+
+            let generated = try LagunaRuntime.generateGreedyTokens(
+                GreedyGenerationOptions(
+                    weightsPath: weightsPath,
                     promptTokens: promptTokens,
                     steps: maxNewTokens
-                )
-            )
-        }
-        guard let worker = try runtimeWorkerOptions(
-            blockedGoldenPath: gpqaPath,
-            suppressWarnings: true,
-            requirePrivateIsolation: true
-        ) else {
-            throw MLXFastError.invalidInput(
-                "private GPQA generation requires the runtime worker"
-            )
-        }
-        let observations = try LagunaRuntime
-            .collectPrivateArtifactCalibration(
-                weightsPath: weightsPath,
-                anchors: [],
-                sequences: requests,
+                ),
                 worker: worker
             )
-
-        var answers: [SemanticGPQAAnswerCase] = []
-        answers.reserveCapacity(caseCount)
-        for (testCase, observation) in zip(
-            gpqa.cases,
-            observations.sequences
-        ) {
-            let generated = observation.generatedTokens
             let decoded = tokenizer.decode(tokens: generated, skipSpecialTokens: true)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             answers.append(
@@ -1411,6 +1176,17 @@ private enum MLXFastCLI {
                     maxNewTokens: maxNewTokens
                 )
             )
+            fputs(
+                "generate-gpqa-answers: generated \(answers.count)/\(caseCount) "
+                    + "tokens=\(generated.count)\n",
+                stderr
+            )
+        }
+        guard answers.count == caseCount else {
+            throw MLXFastError.invalidInput(
+                "GPQA reference produced \(answers.count) token-budget-valid semantic cases; "
+                    + "need \(caseCount); skipped_over_budget=\(skippedOverBudget)"
+            )
         }
 
         let document = SemanticGPQAAnswerDocument(
@@ -1419,27 +1195,13 @@ private enum MLXFastCLI {
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        var answerData = try encoder.encode(document)
-        answerData.append(0x0a)
-        let calibratedGPQA = try PrivateArtifactCalibrator.calibrateGPQA(
-            templateData: data,
-            observations: observations.sequences
+        let outputURL = URL(fileURLWithPath: outputPath)
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
         )
-        let calibratedWrite = try PrivateArtifactWriter.write(
-            calibratedGPQA.data,
-            to: calibratedGPQAPath
-        )
-        let answersWrite = try PrivateArtifactWriter.write(
-            answerData,
-            to: outputPath
-        )
-        print(
-            PrivateArtifactLogSummary.gpqaSuccess(
-                caseCount: calibratedGPQA.caseCount,
-                calibratedSHA256: calibratedWrite.sha256,
-                answersSHA256: answersWrite.sha256
-            )
-        )
+        try encoder.encode(document).write(to: outputURL, options: [.atomic])
+        print("generated semantic GPQA answer cases=\(answers.count) output=\(outputPath)")
     }
 
     private static func loadLocalTokenizer(at path: String) throws -> any Tokenizer {
@@ -1458,28 +1220,6 @@ private enum MLXFastCLI {
         let privatePath = absolutePath(privateDir)
         guard outputPath.hasPrefix(privatePath + "/") else {
             throw MLXFastError.invalidInput("\(description) must be under MLXFAST_PRIVATE_DIR")
-        }
-    }
-
-    private static func requireStrictPrivateArtifactPath(
-        _ path: String,
-        description: String
-    ) throws {
-        let privateDir = environmentValue(
-            "MLXFAST_PRIVATE_DIR",
-            fallback: ""
-        )
-        guard !privateDir.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "\(description) requires MLXFAST_PRIVATE_DIR"
-            )
-        }
-        let privatePath = absolutePath(privateDir)
-        let artifactPath = absolutePath(path)
-        guard artifactPath.hasPrefix(privatePath + "/") else {
-            throw MLXFastError.invalidInput(
-                "\(description) must be under MLXFAST_PRIVATE_DIR"
-            )
         }
     }
 
@@ -1656,21 +1396,6 @@ private enum MLXFastCLI {
         return value
     }
 
-    private static func parseNonNegativeFiniteDouble(
-        _ rawValue: String,
-        optionName: String
-    ) throws -> Double {
-        guard let value = Double(rawValue),
-              value.isFinite,
-              value >= 0
-        else {
-            throw MLXFastError.invalidInput(
-                "\(optionName) must be a finite non-negative number"
-            )
-        }
-        return value
-    }
-
     private static func parseNonNegativeInt(_ rawValue: String, optionName: String) throws -> Int {
         guard let value = Int(rawValue), value >= 0 else {
             throw MLXFastError.invalidInput("\(optionName) must be a non-negative integer")
@@ -1680,9 +1405,7 @@ private enum MLXFastCLI {
 
     private static func runtimeWorkerOptions(
         blockedGoldenPath: String? = nil,
-        forwardsWorkerStderr: Bool = false,
-        suppressWarnings: Bool = false,
-        requirePrivateIsolation: Bool = false
+        forwardsWorkerStderr: Bool = false
     ) throws -> RuntimeWorkerOptions? {
         // The trusted binary has no in-process model target. Disabling the worker
         // therefore fails closed in every mode rather than selecting an editable
@@ -1694,9 +1417,7 @@ private enum MLXFastCLI {
                 "mlxfast-swift requires the participant runtime worker; unset MLXFAST_USE_RUNTIME_WORKER"
             )
         }
-        if (officialRun || requirePrivateIsolation),
-           environmentValue("MLXFAST_NO_SANDBOX", fallback: "0") == "1"
-        {
+        if officialRun, environmentValue("MLXFAST_NO_SANDBOX", fallback: "0") == "1" {
             throw MLXFastError.invalidInput(
                 "official benchmark runs require the runtime worker sandbox; unset MLXFAST_NO_SANDBOX"
             )
@@ -1729,35 +1450,16 @@ private enum MLXFastCLI {
         // fingerprint sidecar keeps working until ./setup.sh is rerun.
         try enforceMetallibFingerprint(
             workerExecutablePath: executablePath,
-            officialRun: officialRun,
-            requireVerified: requirePrivateIsolation,
-            emitWarnings: !suppressWarnings
+            officialRun: officialRun
         )
         // The kernel-bypass POLICY half of the static review is the LLM
         // judge in .github/scripts/run-submission-static-review.sh; the
         // deterministic byte caps are re-enforced here so every ranked
         // worker launch is bound by them even on dispatch paths that never
         // ran the review step. Official runs fail closed; local runs warn.
-        try enforceEditableSurfaceByteBudget(
-            officialRun: officialRun,
-            requireVerified: requirePrivateIsolation,
-            emitWarnings: !suppressWarnings
-        )
+        try enforceEditableSurfaceByteBudget(officialRun: officialRun)
         var sandboxProfile = environmentValue("MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE", fallback: "")
-        if requirePrivateIsolation {
-            guard let blockedGoldenPath, !blockedGoldenPath.isEmpty else {
-                throw MLXFastError.invalidInput(
-                    "private calibration requires a blocked artifact path"
-                )
-            }
-            // Always derive the private-calibration profile locally. A generic
-            // configured profile may be safe for scored inference but need not
-            // deny the operator's private directory.
-            sandboxProfile = try writeRuntimeWorkerSandboxProfile(
-                blockedGoldenPath: blockedGoldenPath,
-                allowedExecutablePath: executablePath
-            )
-        } else if sandboxProfile.isEmpty,
+        if sandboxProfile.isEmpty,
            environmentValue("MLXFAST_NO_SANDBOX", fallback: "0") != "1",
            let blockedGoldenPath,
            !blockedGoldenPath.isEmpty
@@ -1767,7 +1469,7 @@ private enum MLXFastCLI {
                 allowedExecutablePath: executablePath
             )
         }
-        if (officialRun || requirePrivateIsolation), sandboxProfile.isEmpty {
+        if officialRun, sandboxProfile.isEmpty {
             throw MLXFastError.invalidInput(
                 "official benchmark runs require a runtime worker sandbox profile; none was configured or derivable"
             )
@@ -1790,9 +1492,7 @@ private enum MLXFastCLI {
     /// warn and continue (the sidecar may simply predate this check).
     private static func enforceMetallibFingerprint(
         workerExecutablePath: String,
-        officialRun: Bool,
-        requireVerified: Bool = false,
-        emitWarnings: Bool = true
+        officialRun: Bool
     ) throws {
         let configuredMetallib = environmentValue("MLXFAST_MLX_METALLIB", fallback: "")
         let metallibPath = configuredMetallib.isEmpty
@@ -1810,23 +1510,21 @@ private enum MLXFastCLI {
         case .verified:
             return
         case .skipped(let reason):
-            if officialRun || requireVerified {
+            if officialRun {
                 throw MLXFastError.invalidInput(
                     "official benchmark runs require the metallib fingerprint check; "
                         + reason
                 )
             }
         case .mismatch(let reason):
-            if officialRun || requireVerified {
+            if officialRun {
                 throw MLXFastError.invalidInput(
                     "refusing to spawn the participant worker: " + reason
                 )
             }
-            if emitWarnings {
-                FileHandle.standardError.write(Data(
-                    ("mlxfast-swift: warning: " + reason + "\n").utf8
-                ))
-            }
+            FileHandle.standardError.write(Data(
+                ("mlxfast-swift: warning: " + reason + "\n").utf8
+            ))
         }
     }
 
@@ -1834,11 +1532,7 @@ private enum MLXFastCLI {
     /// surface in this workspace must fit the same total and per-file
     /// budgets `.github/scripts/run-submission-static-review.sh` enforces
     /// (identical env knobs, identical defaults).
-    private static func enforceEditableSurfaceByteBudget(
-        officialRun: Bool,
-        requireVerified: Bool = false,
-        emitWarnings: Bool = true
-    ) throws {
+    private static func enforceEditableSurfaceByteBudget(officialRun: Bool) throws {
         let contractPath = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent(EditableSurfaceByteBudget.defaultContractRelativePath)
             .path
@@ -1858,23 +1552,21 @@ private enum MLXFastCLI {
         case .verified:
             return
         case .skipped(let reason):
-            if officialRun || requireVerified {
+            if officialRun {
                 throw MLXFastError.invalidInput(
                     "official benchmark runs require the editable-surface byte budget check; "
                         + reason
                 )
             }
         case .exceeded(let reason):
-            if officialRun || requireVerified {
+            if officialRun {
                 throw MLXFastError.invalidInput(
                     "refusing to spawn the participant worker: " + reason
                 )
             }
-            if emitWarnings {
-                FileHandle.standardError.write(Data(
-                    ("mlxfast-swift: warning: " + reason + "\n").utf8
-                ))
-            }
+            FileHandle.standardError.write(Data(
+                ("mlxfast-swift: warning: " + reason + "\n").utf8
+            ))
         }
     }
 
@@ -2176,16 +1868,13 @@ private enum MLXFastCLI {
               mlxfast-swift mtp-probe --weights PATH --golden PATH [--block-size N] [--tokens N]
               mlxfast-swift mtp-benchmark --target-source IT_SOURCE --weights IT_PATH --assistant PATH --contract PATH --golden IT_GOLDEN --require-trained-assistant [--block-size N] [--tokens N] [--target-verification exact-pair|serial]
               mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
-              mlxfast-swift calibrate-private-golden --golden PATH --weights PATH --output PATH [--anchor-max-rank N --anchor-max-top-logit-delta D]
               mlxfast-swift attach-free-run-gate [--golden PATH] [--weights PATH] [--output PATH] [--name NAME] [--steps N] [--allow-partial] [--case NAME | --prompt-file PATH [--tokenizer PATH]] [--exact-prefix N]
               mlxfast-swift generate-golden --prompt-file PATH [--weights PATH] [--tokenizer PATH] --output PATH --name NAME --steps N
               mlxfast-swift analyze-ngram-similarity --golden PATH [--case NAME] [--orders 1,2,3] [--max-hit-rate RATE]
-              mlxfast-swift generate-gpqa-answers --gpqa PATH --weights PATH [--tokenizer PATH] --output PATH --gpqa-output PATH [--case-count N] [--max-new-tokens N]
+              mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
 
             Swift-only Poolside Laguna XS 2.1 NVFP4 harness entrypoint.
-            Private calibration commands require MLXFAST_PRIVATE_DIR; every
-            private input/output path must remain beneath that directory.
             """
         )
     }
