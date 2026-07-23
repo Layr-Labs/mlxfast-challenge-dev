@@ -1372,6 +1372,93 @@ func benchmarkWorkflowPinsTrustedLayerCountForFinalValidation() throws {
 }
 
 @Test
+func manualUnpinnedBenchmarkModeIsUnrankedAndCannotPublishScore() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+    let dispatch = try #require(workflow.range(of: "  workflow_dispatch:"))
+    let permissions = try #require(
+        workflow.range(of: "\npermissions:", range: dispatch.upperBound..<workflow.endIndex)
+    )
+    let dispatchInputs = String(workflow[dispatch.lowerBound..<permissions.lowerBound])
+    #expect(dispatchInputs.contains(
+        """
+              allow_unpinned_test:
+                description: "UNRANKED DEBUG ONLY: use the staged Poolside v2 baseline before protected baseline activation."
+                required: false
+                default: false
+                type: boolean
+        """
+    ))
+
+    // The bypass requires an explicit manual opt-in on a dedicated unranked
+    // baseline branch. Submission/main/yukon baseline dispatches cannot enter
+    // it even though the benchmark workflow itself is dispatch-only.
+    #expect(workflow.contains(
+        "MLXFAST_UNRANKED_TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_unpinned_test && startsWith(github.ref, 'refs/heads/baseline/unranked-') && '1' || '0' }}"
+    ))
+    let preflightStart = try #require(workflow.range(of: "- name: Host preflight"))
+    let checkout = try #require(
+        workflow.range(
+            of: "- uses: actions/checkout@",
+            range: preflightStart.upperBound..<workflow.endIndex
+        )
+    )
+    let preflight = String(workflow[preflightStart.lowerBound..<checkout.lowerBound])
+    #expect(preflight.contains(
+        "allow_unpinned_test is restricted to workflow_dispatch refs/heads/baseline/unranked-*"
+    ))
+    #expect(preflight.contains(
+        "\"${MLXFAST_UNRANKED_TEST_MODE}\" != \"1\" \\\n              && \"${MLXFAST_POOLSIDE_V2_CALIBRATION_READY}\" != \"1\""
+    ))
+    #expect(preflight.contains(
+        "Poolside v2 baseline requires the exact final merged 40-character commit"
+    ))
+    #expect(preflight.contains(
+        "if [[ \"${MLXFAST_UNRANKED_TEST_MODE}\" != \"1\" ]]; then\n              baseline_commit="
+    ))
+
+    // Debug mode only substitutes the staged baseline/state. The calibration
+    // still pins the actual binary and prompt, and all private-artifact,
+    // correctness, timing, sandbox, quarantine, and janitor checks remain.
+    #expect(preflight.contains("staged_roots=(/Users/gaj/poolside-v2-m5*)"))
+    #expect(preflight.contains(".track_id == $track"))
+    #expect(preflight.contains(".targets[$target].prompt_sha256 == $prompt"))
+    #expect(preflight.contains(
+        "staged_binary_hash=\"$(\n                  shasum -a 256"
+    ))
+    #expect(preflight.contains(
+        "MLXFAST_MEASURE_STATE_DIR=\"${MLXFAST_PRIVATE_DIR}/unranked-measure-state\""
+    ))
+    #expect(preflight.contains(
+        "MLXFAST_REFERENCE_DIR=\"${staged_reference}\""
+    ))
+    #expect(preflight.contains("Poolside v2 private artifacts require three pinned SHA-256 values"))
+    #expect(preflight.contains("box is quarantined"))
+    #expect(workflow.contains("- name: Verify reference checkpoint against pinned manifest"))
+    #expect(workflow.contains("- name: Correctness and gates"))
+    #expect(workflow.contains("- name: Timed paired benchmark (measure-job)"))
+    #expect(workflow.contains("BASELINE_CALIBRATION=\"${MLXFAST_BASELINE_CALIBRATION}\""))
+    #expect(workflow.contains("- name: Janitor reset and integrity audit"))
+
+    // The canonical benchmark-results artifact is the ranking publisher's
+    // lookup contract. All of its check/stage/upload steps are unreachable
+    // whenever the opt-in is true; only an unmistakably unranked audit remains.
+    let publicationGuard =
+        "inputs.run_benchmark && !inputs.allow_unpinned_test && "
+    #expect(workflow.components(separatedBy: publicationGuard).count - 1 == 3)
+    #expect(workflow.contains("name: benchmark-results-${{ github.run_id }}"))
+    #expect(workflow.contains(
+        "name: ${{ inputs.allow_unpinned_test && 'UNRANKED-debug-audit' || 'benchmark-audit' }}"
+    ))
+    #expect(workflow.contains("This artifact is diagnostic and must not be published or ranked."))
+    #expect(workflow.contains(
+        "name: ${{ inputs.allow_unpinned_test && 'UNRANKED-debug-failure' || 'benchmark-failure' }}"
+    ))
+}
+
+@Test
 func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/benchmark.yml",

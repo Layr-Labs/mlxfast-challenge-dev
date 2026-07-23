@@ -101,6 +101,11 @@ on:
         required: false
         default: false
         type: boolean
+      allow_unpinned_test:
+        description: "UNRANKED DEBUG ONLY: use the staged Poolside v2 baseline before protected baseline activation."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -119,7 +124,7 @@ concurrency:
 
 jobs:
   ranked:
-    name: "single-machine ranked benchmark (m5-bench)"
+    name: ${{ inputs.allow_unpinned_test && 'UNRANKED DEBUG single-machine benchmark' || 'single-machine ranked benchmark (m5-bench)' }}
     runs-on: [self-hosted, m5-bench]
     # Serial budget: build (~15m) + transform (~10m) + public gate (~10m) +
     # base case + gates (~45m) + cooldowns (up to 900s per timed phase) +
@@ -242,6 +247,11 @@ jobs:
       MLXFAST_CANDIDATE_SHA: ${{ github.sha }}
       MLXFAST_IS_SUBMISSION_BRANCH: ${{ startsWith(github.ref, 'refs/heads/submissions/') && '1' || '0' }}
       MLXFAST_VERIFY_TRANSFORM: ${{ inputs.verify_transform && '1' || '0' }}
+      MLXFAST_UNPINNED_TEST_REQUESTED: ${{ inputs.allow_unpinned_test && '1' || '0' }}
+      # Two independent conditions keep the temporary bypass out of every
+      # submission/ranked path: explicit dispatch opt-in plus a dedicated
+      # unranked baseline branch namespace.
+      MLXFAST_UNRANKED_TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_unpinned_test && startsWith(github.ref, 'refs/heads/baseline/unranked-') && '1' || '0' }}
       # POLICY (TOOLCHAINS override, ranked side): the ranked build must use
       # exactly ONE operator-chosen Metal toolchain. This pin is the
       # operator-installed Metal Toolchain on the m5-bench box (Metal build
@@ -269,7 +279,17 @@ jobs:
           fi
           test -e "${MLXFAST_BENCH_EXEC}" || { echo "::error::bench-exec bridge missing" >&2; exit 1; }
           test -e "${MLXFAST_JANITOR}" || { echo "::error::janitor missing" >&2; exit 1; }
-          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" && "${MLXFAST_POOLSIDE_V2_CALIBRATION_READY}" != "1" ]]; then
+          if [[ "${MLXFAST_UNPINNED_TEST_REQUESTED}" == "1" && "${MLXFAST_UNRANKED_TEST_MODE}" != "1" ]]; then
+            echo "::error::allow_unpinned_test is restricted to workflow_dispatch refs/heads/baseline/unranked-*" >&2
+            exit 1
+          fi
+          if [[ "${MLXFAST_UNRANKED_TEST_MODE}" == "1" && "${MLXFAST_RUN_BENCHMARK}" != "1" ]]; then
+            echo "::error::allow_unpinned_test requires run_benchmark=true" >&2
+            exit 1
+          fi
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" \
+              && "${MLXFAST_UNRANKED_TEST_MODE}" != "1" \
+              && "${MLXFAST_POOLSIDE_V2_CALIBRATION_READY}" != "1" ]]; then
             echo "::error::Poolside v2 model-derived fixtures and final-SHA baseline are not calibrated" >&2
             exit 1
           fi
@@ -292,18 +312,97 @@ jobs:
                 exit 1
               fi
             done
-            if [[ ! "${MLXFAST_BASELINE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "::error::Poolside v2 baseline requires the exact final merged 40-character commit" >&2
-              exit 1
+            if [[ "${MLXFAST_UNRANKED_TEST_MODE}" == "1" ]]; then
+              # Temporary manual test path: consume the already measured,
+              # user-owned Poolside v2 staging tree without treating it as the
+              # protected ranked baseline. The calibration still pins the
+              # baseline binary and timed prompt, and measure-job still applies
+              # its calibration band, token, telemetry, and thermal checks.
+              shopt -s nullglob
+              staged_roots=(/Users/gaj/poolside-v2-m5*)
+              shopt -u nullglob
+              valid_staged_roots=()
+              for staged_root in "${staged_roots[@]}"; do
+                staged_baseline="${staged_root}/source"
+                staged_calibration="${staged_root}/calibration/baseline-calibration.json"
+                staged_state="${staged_root}/calibration/state"
+                if [[ ! -d "${staged_baseline}" \
+                    || ! -s "${staged_calibration}" \
+                    || ! -d "${staged_state}" \
+                    || ! -x "${staged_baseline}/.build/release/mlxfast-swift" ]]; then
+                  continue
+                fi
+                if ! jq -e \
+                    --arg track "laguna-xs-2.1-serial-v2" \
+                    --arg target "${MLXFAST_TIMED_DECODE_TARGET_ID}" \
+                    --arg prompt "${MLXFAST_TIMED_DECODE_PROMPT_SHA256}" \
+                    '
+                    .schema_version == 1
+                    and .track_id == $track
+                    and .stability.accepted == true
+                    and .targets[$target].prompt_sha256 == $prompt
+                    and (.targets[$target].binary_sha256
+                      | type == "string" and test("^[0-9a-f]{64}$"))
+                    ' "${staged_calibration}" >/dev/null; then
+                  continue
+                fi
+                staged_binary_hash="$(
+                  shasum -a 256 "${staged_baseline}/.build/release/mlxfast-swift" \
+                    | awk '{print $1}'
+                )"
+                calibrated_binary_hash="$(
+                  jq -r --arg target "${MLXFAST_TIMED_DECODE_TARGET_ID}" \
+                    '.targets[$target].binary_sha256' "${staged_calibration}"
+                )"
+                if [[ "${staged_binary_hash}" != "${calibrated_binary_hash}" ]]; then
+                  continue
+                fi
+                valid_staged_roots+=("${staged_root}")
+              done
+              if [[ "${#valid_staged_roots[@]}" -ne 1 ]]; then
+                echo "::error::UNRANKED DEBUG expected exactly one calibrated Poolside v2 staging root, found ${#valid_staged_roots[@]}" >&2
+                exit 1
+              fi
+              staged_root="${valid_staged_roots[0]}"
+              staged_reference="/Users/gaj/poolside-nvfp4-staging/841778bda563a36104dd521e37d99218e46f4f25"
+              test -f "${staged_reference}/config.json" || {
+                echo "::error::UNRANKED DEBUG staged Poolside v2 reference checkpoint is missing" >&2
+                exit 1
+              }
+              MLXFAST_BASELINE_WS="${staged_root}/source"
+              MLXFAST_BASELINE_CALIBRATION="${staged_root}/calibration/baseline-calibration.json"
+              MLXFAST_REFERENCE_DIR="${staged_reference}"
+              # Do not mutate the staged calibration state. Oracle/lock state is
+              # per-run and removed with the runner-private directory.
+              MLXFAST_MEASURE_STATE_DIR="${MLXFAST_PRIVATE_DIR}/unranked-measure-state"
+              {
+                printf 'MLXFAST_BASELINE_WS=%s\n' "${MLXFAST_BASELINE_WS}"
+                printf 'MLXFAST_BASELINE_CALIBRATION=%s\n' "${MLXFAST_BASELINE_CALIBRATION}"
+                printf 'MLXFAST_REFERENCE_DIR=%s\n' "${MLXFAST_REFERENCE_DIR}"
+                printf 'MLXFAST_MEASURE_STATE_DIR=%s\n' "${MLXFAST_MEASURE_STATE_DIR}"
+              } >> "${GITHUB_ENV}"
+              echo "::warning::UNRANKED DEBUG: bypassing protected baseline activation/source-version checks; no rankable score artifact will be published"
+              {
+                echo "## UNRANKED DEBUG benchmark"
+                echo
+                echo "Uses a user-owned staged Poolside v2 baseline. Protected baseline activation/source-version checks are bypassed; score publication is disabled."
+              } >> "${GITHUB_STEP_SUMMARY}"
+            else
+              if [[ ! "${MLXFAST_BASELINE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "::error::Poolside v2 baseline requires the exact final merged 40-character commit" >&2
+                exit 1
+              fi
             fi
             test -x "${MLXFAST_MEASURE_JOB}" || { echo "::error::measure-job missing" >&2; exit 1; }
             test -x "${MLXFAST_MACMON}" || { echo "::error::macmon missing" >&2; exit 1; }
             test -d "${MLXFAST_BASELINE_WS}" || { echo "::error::pinned baseline workspace missing" >&2; exit 1; }
             test -s "${MLXFAST_BASELINE_CALIBRATION}" || { echo "::error::baseline calibration missing" >&2; exit 1; }
-            baseline_commit="$(git -C "${MLXFAST_BASELINE_WS}" rev-parse HEAD)"
-            if [[ "${baseline_commit}" != "${MLXFAST_BASELINE_COMMIT}" ]]; then
-              echo "::error::Poolside v2 baseline is ${baseline_commit}, expected ${MLXFAST_BASELINE_COMMIT}" >&2
-              exit 1
+            if [[ "${MLXFAST_UNRANKED_TEST_MODE}" != "1" ]]; then
+              baseline_commit="$(git -C "${MLXFAST_BASELINE_WS}" rev-parse HEAD)"
+              if [[ "${baseline_commit}" != "${MLXFAST_BASELINE_COMMIT}" ]]; then
+                echo "::error::Poolside v2 baseline is ${baseline_commit}, expected ${MLXFAST_BASELINE_COMMIT}" >&2
+                exit 1
+              fi
             fi
           fi
           test -f "${MLXFAST_REFERENCE_DIR}/config.json" || { echo "::error::reference checkpoint cache missing" >&2; exit 1; }
@@ -1729,6 +1828,10 @@ jobs:
         if: ${{ inputs.run_benchmark }}
         run: |
           set -euo pipefail
+          measure_tag="ranked-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [[ "${MLXFAST_UNRANKED_TEST_MODE}" == "1" ]]; then
+            measure_tag="UNRANKED-debug-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          fi
           # GPU_LOADED_UTIL=0.95 (documented measure-job tunable): the M5 GPU's
           # first loaded telemetry sample is a spin-up transient (~1590 MHz at
           # 93-94% util, coolest sample of the run) that false-trips the fixed
@@ -1749,7 +1852,7 @@ jobs:
               --prompt "${MLXFAST_TIMED_DECODE_PROMPT_PATH}" \
               --prompt-sha256 "${MLXFAST_TIMED_DECODE_PROMPT_SHA256}" \
               --target-id "${MLXFAST_TIMED_DECODE_TARGET_ID}" \
-              --tag "ranked-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+              --tag "${measure_tag}" \
               --out "${MLXFAST_MEASURE_OUT}"
           test -s "${MLXFAST_MEASURE_OUT}/results.json"
           jq -c '{mode, paired}' "${MLXFAST_MEASURE_OUT}/results.json"
@@ -1777,7 +1880,7 @@ jobs:
         run: .github/scripts/validate-benchmark-artifacts.sh
 
       - name: Check benchmark artifact paths
-        if: ${{ inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success' }}
+        if: ${{ inputs.run_benchmark && !inputs.allow_unpinned_test && steps.validate_benchmark_artifacts.outcome == 'success' }}
         run: |
           set -euo pipefail
           test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"
@@ -1793,7 +1896,7 @@ jobs:
 
       - name: Stage benchmark artifacts
         id: stage_benchmark_artifacts
-        if: ${{ inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success' }}
+        if: ${{ inputs.run_benchmark && !inputs.allow_unpinned_test && steps.validate_benchmark_artifacts.outcome == 'success' }}
         run: |
           set -euo pipefail
           .github/scripts/stage-benchmark-artifacts.sh \
@@ -1806,7 +1909,7 @@ jobs:
             benchmark-integrity.json=benchmark-integrity.json
 
       - name: Upload benchmark artifacts
-        if: ${{ inputs.run_benchmark && steps.stage_benchmark_artifacts.outcome == 'success' }}
+        if: ${{ inputs.run_benchmark && !inputs.allow_unpinned_test && steps.stage_benchmark_artifacts.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           # run_id-only name is the orchestrator's lookup contract; overwrite
@@ -1842,6 +1945,14 @@ jobs:
           if [[ -s public-gate-report.json ]]; then
             staged+=(public-gate-report.json=public-gate-report.json)
           fi
+          if [[ "${MLXFAST_UNRANKED_TEST_MODE}" == "1" ]]; then
+            cat > UNRANKED-DEBUG.txt <<'EOF'
+          UNRANKED DEBUG ONLY
+          Protected baseline activation/source-version checks were bypassed.
+          This artifact is diagnostic and must not be published or ranked.
+          EOF
+            staged+=(UNRANKED-DEBUG.txt=UNRANKED-DEBUG.txt)
+          fi
           if [[ "${#staged[@]}" -eq 0 ]]; then
             echo "benchmark: no audit artifacts to stage"
             exit 0
@@ -1854,7 +1965,7 @@ jobs:
         if: ${{ always() && inputs.run_benchmark && steps.stage_audit_artifacts.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: benchmark-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ inputs.allow_unpinned_test && 'UNRANKED-debug-audit' || 'benchmark-audit' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-audit
           if-no-files-found: ignore
           retention-days: 90
@@ -1877,7 +1988,7 @@ jobs:
         if: ${{ failure() && steps.redact_benchmark_failure.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: benchmark-failure-${{ github.run_id }}-${{ github.run_attempt }}-single-machine
+          name: ${{ inputs.allow_unpinned_test && 'UNRANKED-debug-failure' || 'benchmark-failure' }}-${{ github.run_id }}-${{ github.run_attempt }}-single-machine
           path: benchmark-failure.json
           if-no-files-found: error
           retention-days: 90
