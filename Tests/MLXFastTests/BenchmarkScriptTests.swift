@@ -459,7 +459,7 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     // build output can never enter the trusted cache namespaces. The trusted
     // CLI root and the participant worker root are cached as two separate
     // entries.
-    #expect(workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-current"))
+    #expect(workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-laguna-xs-2.1-serial-v2"))
     #expect(!workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-${{"))
     let resetBuildProductsStep = String(workflow[resetBuildProductsRange.lowerBound..<restoreBuildProductsRange.lowerBound])
     #expect(resetBuildProductsStep.contains("run: /bin/rm -rf .mlxfast-cache/trusted-build .mlxfast-cache/worker-build"))
@@ -1395,16 +1395,22 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     )
 
     #expect(!workflow.contains("${{ runner.temp }}"))
-    #expect(workflow.contains("MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}"))
-    #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json"))
+    #expect(workflow.contains("environment: benchmark-private-prompts-v2"))
+    #expect(workflow.contains("MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}"))
+    #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json"))
+    #expect(workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-laguna-xs-2.1-serial-v2"))
+    #expect(workflow.contains("MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current"))
+    #expect(workflow.contains("MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/laguna-xs-2.1-serial-v2/baseline-calibration.json"))
+    #expect(workflow.contains("MLXFAST_MEASURE_STATE_DIR: /opt/bench-runner/state/laguna-xs-2.1-serial-v2"))
+    #expect(workflow.contains("MLXFAST_BASELINE_COMMIT: __FINAL_MERGED_POOLSIDE_V2_SHA_PENDING__"))
     // The raw GPQA reference is downloaded straight into the runner-private
     // dir; its accepted answers reach the bench workspace only inside the
     // augmented golden.
     #expect(workflow.contains("\"${MLXFAST_PRIVATE_DIR}/gpqa_reference.json\""))
     #expect(!workflow.contains("MLXFAST_GPQA_TTFT_RESULTS_PATH"))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: ${{ env.MLXFAST_JOB_WS }}/private/semantic_gpqa_answers.json"))
-    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json"))
-    #expect(workflow.contains("MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}"))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json"))
+    #expect(workflow.contains("MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}"))
     #expect(workflow.contains("MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}"))
     #expect(workflow.contains("MLXFAST_POOLSIDE_V2_CALIBRATION_READY: \"0\""))
     #expect(
@@ -1414,14 +1420,14 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     )
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
-    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 679ba44220d581316c752533472883f4905a1b6a30f5f657a25f1177ae6247c1"))
-    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"10519\""))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: b9509697c08a2cf3c2943a85f0b76e39c485c441794690fa76835b40a58d7a63"))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"10686\""))
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_TARGET_ID: \(MLXFastConstants.benchmarkEvaluationTargetID)"))
-    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_SHA256: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}"))
-    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_BYTES: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_BYTES }}"))
-    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna-nvfp4-v2.txt"))
-    #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna-nvfp4-v2.json"))
-    #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna-nvfp4-v2.json"))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_SHA256: __POOLSIDE_V2_TIMED_PROMPT_SHA256_PENDING__"))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_BYTES: \"0\""))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/timed-prompt-${{ env.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}.txt"))
+    #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/hidden-golden-${{ env.MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256 }}.json"))
+    #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-${{ env.MLXFAST_GPQA_REFERENCE_SHA256 }}.json"))
     #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
     // Temporary affine-checkpoint values; Poolside NVFP4 M5 validation must
     // replace or explicitly re-confirm them before merge. See
@@ -1440,12 +1446,16 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(!workflow.contains("mlxfast-gpqa-calibration-private.log"))
     #expect(!workflow.contains(".github/scripts/upload-r2-object.sh"))
     #expect(!workflow.contains("uploaded calibrated GPQA reference cases to private R2"))
-    // These remain affine-v1 placeholders while the explicit v2 calibration
-    // interlock is zero. Poolside M5 calibration must replace them before the
-    // private path can run.
-    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 96689a9ceaf7cc813174d0a6cb2ab650454d7d031f88514cbd222bcb17bb4d7e"))
-    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: \"35749\""))
+    // All three Poolside-private artifacts remain explicit fail-closed
+    // placeholders until trusted operator generation replaces all six pins.
+    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: __POOLSIDE_V2_HIDDEN_GOLDEN_SHA256_PENDING__"))
+    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: \"0\""))
+    #expect(workflow.contains("MLXFAST_GPQA_REFERENCE_SHA256: __POOLSIDE_V2_GPQA_REFERENCE_SHA256_PENDING__"))
+    #expect(workflow.contains("MLXFAST_GPQA_REFERENCE_BYTES: \"0\""))
     #expect(workflow.contains("raw hidden correctness golden pin mismatch"))
+    #expect(workflow.contains("private GPQA reference pin mismatch"))
+    #expect(workflow.contains("Poolside v2 private artifacts require three pinned SHA-256 values"))
+    #expect(workflow.contains("Poolside v2 private artifacts require three positive byte-count pins"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"))
     #expect(workflow.contains(".github/scripts/verify-correctness-golden.sh"))
@@ -2248,10 +2258,10 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
         Issue.record("editable surface exceeds the shipped launch budget: \(verdict)")
         return
     }
-    #expect(totalBytes == 2_802_365)
+    #expect(totalBytes == 2_802_363)
     #expect(fileCount == 177)
-    #expect(staticReview.contains("unmodified surface is 2,802,365 bytes"))
-    #expect(staticReview.contains("leaving 197,635 bytes"))
+    #expect(staticReview.contains("unmodified surface is 2,802,363 bytes"))
+    #expect(staticReview.contains("leaving 197,637 bytes"))
     for path in [
         "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/matmul.cpp",
         "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/jit_kernels.cpp",
@@ -5422,7 +5432,7 @@ func cheapPreflightChecksRunBeforeExpensiveWork() throws {
     let timingGuardRange = try #require(hostPreflightStep.range(of: "if [[ \"${MLXFAST_RUN_BENCHMARK}\" == \"1\" ]]; then"))
     let measureCheckRange = try #require(hostPreflightStep.range(of: "measure-job missing"))
     let timingGuardEndRange = try #require(
-        hostPreflightStep.range(of: "          fi", range: timingGuardRange.lowerBound..<hostPreflightStep.endIndex)
+        hostPreflightStep.range(of: "test -f \"${MLXFAST_REFERENCE_DIR}/config.json\"")
     )
     #expect(timingGuardRange.lowerBound < measureCheckRange.lowerBound)
     #expect(measureCheckRange.lowerBound < timingGuardEndRange.lowerBound)

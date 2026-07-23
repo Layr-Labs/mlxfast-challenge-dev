@@ -35,10 +35,12 @@ struct DefaultTrackTests {
         ))
 
         // Serial ranked identity: the serial measure wrapper, stable bench
-        // workspace, pinned baseline tree, calibration, and the frozen
+        // v2 workspace, pinned baseline tree, calibration, and the frozen
         // prefill+decode floors.
         #expect(workflow.contains("MLXFAST_MEASURE_JOB: /opt/bench-runner/measure-job.sh"))
-        #expect(workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-current"))
+        #expect(workflow.contains(
+            "MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-laguna-xs-2.1-serial-v2"
+        ))
         #expect(workflow.contains(
             "MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current"
         ))
