@@ -563,19 +563,21 @@ private struct RuntimeWorkerPinnedConfiguration: Decodable {
     let attentionBias: Bool?
     let qkvBias: Bool?
     let attentionDropout: Double?
-    let gating: RuntimeWorkerPinnedGating?
+    let gating: String
+    let gatingTypes: [String]
     let tieWordEmbeddings: Bool
     let numExperts: Int
     let numExpertsPerTok: Int
     let moeIntermediateSize: Int
     let sharedExpertIntermediateSize: Int
-    let moeRoutedScalingFactor: Double?
-    let normTopkProb: Bool?
+    let moeRoutedScalingFactor: Double
+    let normTopkProb: Bool
+    let moeApplyRouterWeightOnInput: Bool
     let moeRouterLogitSoftcapping: Double?
     let layerTypes: [String]
-    let mlpLayerTypes: [String]?
-    let mlpOnlyLayers: [Int]?
-    let decoderSparseStep: Int?
+    let mlpLayerTypes: [String]
+    let mlpOnlyLayers: [Int]
+    let decoderSparseStep: Int
     let ropeParameters: RuntimeWorkerPinnedRopeParameters
     let quantization: RuntimeWorkerPinnedQuantization?
     let quantizationConfig: RuntimeWorkerPinnedQuantization?
@@ -597,6 +599,7 @@ private struct RuntimeWorkerPinnedConfiguration: Decodable {
         case qkvBias = "qkv_bias"
         case attentionDropout = "attention_dropout"
         case gating
+        case gatingTypes = "gating_types"
         case tieWordEmbeddings = "tie_word_embeddings"
         case numExperts = "num_experts"
         case numExpertsPerTok = "num_experts_per_tok"
@@ -604,6 +607,7 @@ private struct RuntimeWorkerPinnedConfiguration: Decodable {
         case sharedExpertIntermediateSize = "shared_expert_intermediate_size"
         case moeRoutedScalingFactor = "moe_routed_scaling_factor"
         case normTopkProb = "norm_topk_prob"
+        case moeApplyRouterWeightOnInput = "moe_apply_router_weight_on_input"
         case moeRouterLogitSoftcapping = "moe_router_logit_softcapping"
         case layerTypes = "layer_types"
         case mlpLayerTypes = "mlp_layer_types"
@@ -612,29 +616,6 @@ private struct RuntimeWorkerPinnedConfiguration: Decodable {
         case ropeParameters = "rope_parameters"
         case quantization
         case quantizationConfig = "quantization_config"
-    }
-}
-
-/// Attention output gating flag. The source config encodes per-head gating
-/// as either a bool (`true`) or a string (`"per-head"` / `"per_head"`; any
-/// other non-empty, non-disabling string also selects the default per-head
-/// mode). Mirrors the vendored `LagunaGating` decoder so the gate and the
-/// runtime read the same value.
-private struct RuntimeWorkerPinnedGating: Decodable {
-    let isPerHead: Bool
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        if let flag = try? container.decode(Bool.self) {
-            isPerHead = flag
-            return
-        }
-        switch try container.decode(String.self) {
-        case "per-element", "per_element", "false", "none", "":
-            isPerHead = false
-        default:
-            isPerHead = true
-        }
     }
 }
 
@@ -656,6 +637,7 @@ private struct RuntimeWorkerPinnedRopeSpec: Decodable {
     let originalMaxPositionEmbeddings: Int?
     let betaFast: Double?
     let betaSlow: Double?
+    let attentionFactor: Double?
 
     enum CodingKeys: String, CodingKey {
         case ropeTheta = "rope_theta"
@@ -665,6 +647,7 @@ private struct RuntimeWorkerPinnedRopeSpec: Decodable {
         case originalMaxPositionEmbeddings = "original_max_position_embeddings"
         case betaFast = "beta_fast"
         case betaSlow = "beta_slow"
+        case attentionFactor = "attention_factor"
     }
 }
 
@@ -750,6 +733,10 @@ func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
     let expectedMLPLayerTypes = (0..<MLXFastConstants.numHiddenLayers).map {
         $0 == 0 ? "dense" : "sparse"
     }
+    let expectedGatingTypes = [String](
+        repeating: "per_head",
+        count: MLXFastConstants.numHiddenLayers
+    )
     guard let quantization = decoded.quantization,
           let quantizationConfig = decoded.quantizationConfig,
           quantization == quantizationConfig
@@ -758,9 +745,10 @@ func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
             "runtime worker config.json requires matching quantization and quantization_config blocks"
         )
     }
-    // Optional fields follow the runtime loader's tolerance: absent means
-    // the pinned default, present must equal the pinned value. Poolside's
-    // exact quantization contract is NVFP4 4-bit group-16 with no overrides.
+    // Match the immutable Poolside artifact's behavior-bearing fields exactly.
+    // qkv_bias and moe_router_logit_softcapping are absent in the source
+    // config (an explicit JSON null decodes equivalently); concrete false/zero
+    // substitutions are rejected rather than treated as a synthetic schema.
     guard decoded.modelType == "laguna",
           decoded.hiddenSize == MLXFastConstants.hiddenSize,
           decoded.numHiddenLayers == MLXFastConstants.numHiddenLayers,
@@ -773,42 +761,37 @@ func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
           decoded.vocabSize == MLXFastConstants.vocabSize,
           decoded.slidingWindow == 512,
           decoded.maxPositionEmbeddings == 262_144,
-          decoded.attentionBias == nil || decoded.attentionBias == false,
-          decoded.qkvBias == nil || decoded.qkvBias == false,
-          decoded.attentionDropout == nil || decoded.attentionDropout == 0,
-          decoded.gating?.isPerHead ?? true,
+          decoded.attentionBias == false,
+          decoded.qkvBias == nil,
+          decoded.attentionDropout == 0,
+          decoded.gating == "per-head",
+          decoded.gatingTypes == expectedGatingTypes,
           !decoded.tieWordEmbeddings,
           decoded.numExperts == 256,
           decoded.numExpertsPerTok == 8,
           decoded.moeIntermediateSize == 512,
           decoded.sharedExpertIntermediateSize == 512,
-          decoded.moeRoutedScalingFactor == nil
-              || decoded.moeRoutedScalingFactor == 2.5,
-          decoded.normTopkProb ?? true,
-          decoded.moeRouterLogitSoftcapping == nil
-              || decoded.moeRouterLogitSoftcapping == 0,
+          decoded.moeRoutedScalingFactor == 2.5,
+          decoded.normTopkProb,
+          !decoded.moeApplyRouterWeightOnInput,
+          decoded.moeRouterLogitSoftcapping == nil,
           decoded.layerTypes == expectedLayerTypes,
-          decoded.mlpLayerTypes == nil
-              || decoded.mlpLayerTypes == expectedMLPLayerTypes,
-          decoded.mlpOnlyLayers == nil || decoded.mlpOnlyLayers == [0],
-          decoded.decoderSparseStep == nil || decoded.decoderSparseStep == 1,
+          decoded.mlpLayerTypes == expectedMLPLayerTypes,
+          decoded.mlpOnlyLayers == [0],
+          decoded.decoderSparseStep == 1,
           decoded.ropeParameters.slidingAttention.ropeTheta == 10_000,
           decoded.ropeParameters.slidingAttention.ropeType == "default",
-          decoded.ropeParameters.slidingAttention.partialRotaryFactor == nil
-              || decoded.ropeParameters.slidingAttention.partialRotaryFactor == 1,
+          decoded.ropeParameters.slidingAttention.partialRotaryFactor == 1,
+          decoded.ropeParameters.slidingAttention.attentionFactor == nil,
           decoded.ropeParameters.fullAttention.ropeTheta == 500_000,
           decoded.ropeParameters.fullAttention.ropeType == "yarn",
-          decoded.ropeParameters.fullAttention.partialRotaryFactor == nil
-              || decoded.ropeParameters.fullAttention.partialRotaryFactor == 0.5,
-          decoded.ropeParameters.fullAttention.factor == nil
-              || decoded.ropeParameters.fullAttention.factor == 32,
-          decoded.ropeParameters.fullAttention.originalMaxPositionEmbeddings == nil
-              || decoded.ropeParameters.fullAttention.originalMaxPositionEmbeddings
-                  == 8_192,
-          decoded.ropeParameters.fullAttention.betaFast == nil
-              || decoded.ropeParameters.fullAttention.betaFast == 64,
-          decoded.ropeParameters.fullAttention.betaSlow == nil
-              || decoded.ropeParameters.fullAttention.betaSlow == 1,
+          decoded.ropeParameters.fullAttention.partialRotaryFactor == 0.5,
+          decoded.ropeParameters.fullAttention.factor == 32,
+          decoded.ropeParameters.fullAttention.originalMaxPositionEmbeddings
+              == 8_192,
+          decoded.ropeParameters.fullAttention.betaFast == 64,
+          decoded.ropeParameters.fullAttention.betaSlow == 1,
+          decoded.ropeParameters.fullAttention.attentionFactor == 1,
           quantization.bits == 4,
           quantization.groupSize == 16,
           quantization.mode == "nvfp4"

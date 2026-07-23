@@ -319,6 +319,11 @@ public struct LagunaConfig: Equatable {
             throw MLXFastError.invalidInput("config.json must be a JSON object")
         }
         try requirePinnedLagunaFields(root)
+        try requireAbsentOrNullLagunaField("qkv_bias", root: root)
+        try requireAbsentOrNullLagunaField(
+            "moe_router_logit_softcapping",
+            root: root
+        )
 
         let numHiddenLayers = try intField(
             "num_hidden_layers", root: root, defaultValue: LagunaConstants.numHiddenLayers)
@@ -899,7 +904,6 @@ private func requirePinnedLagunaFields(_ root: [String: Any]) throws {
         "rms_norm_eps",
         "max_position_embeddings",
         "attention_bias",
-        "qkv_bias",
         "attention_dropout",
         "sliding_window",
         "layer_types",
@@ -916,7 +920,6 @@ private func requirePinnedLagunaFields(_ root: [String: Any]) throws {
         "moe_routed_scaling_factor",
         "norm_topk_prob",
         "moe_apply_router_weight_on_input",
-        "moe_router_logit_softcapping",
         "rope_parameters",
         "quantization",
         "quantization_config",
@@ -925,6 +928,20 @@ private func requirePinnedLagunaFields(_ root: [String: Any]) throws {
     guard missing.isEmpty else {
         throw MLXFastError.invalidInput(
             "Laguna config is missing pinned XS fields: \(missing.joined(separator: ", "))"
+        )
+    }
+}
+
+private func requireAbsentOrNullLagunaField(
+    _ key: String,
+    root: [String: Any]
+) throws {
+    guard let value = root[key] else {
+        return
+    }
+    guard value is NSNull else {
+        throw MLXFastError.invalidInput(
+            "Laguna config field \(key) must be absent or null for the pinned XS artifact"
         )
     }
 }

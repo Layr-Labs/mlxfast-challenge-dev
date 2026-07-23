@@ -92,7 +92,9 @@ on:
       run_benchmark:
         description: "Run the private gates + timed benchmark after the public correctness gate. false = public-fixture correctness only."
         required: false
-        default: true
+        # Poolside v2 remains fail-closed until its M5-derived public/private
+        # fixtures, GPQA policy, and final-SHA baseline are calibrated.
+        default: false
         type: boolean
       verify_transform:
         description: "Run deterministic transform verification before timing."
@@ -103,9 +105,10 @@ on:
 permissions:
   contents: read
 
-# Ranked serving now spans two hardened, at-parity M5 boxes (both PF-locked-down,
-# same pinned baseline ref 4475b88, cross-box timing measured ~0.01% decode /
-# ~0.09% prefill apart). A per-run concurrency group lets dispatches run
+# Ranked serving spans two hardened M5 boxes. Poolside v2 parity and its pinned
+# baseline must be re-established from the FINAL migration SHA before ranked
+# dispatch is enabled; no Gemma/affine baseline claim applies to this track.
+# A per-run concurrency group lets dispatches run
 # concurrently -- one per box -- instead of serializing behind a single global
 # queue; actual concurrency is naturally bounded by the number of online
 # m5-bench runners (2). cancel-in-progress stays false so no ranked run is ever
@@ -135,6 +138,10 @@ jobs:
       MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current
       MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/laguna-xs-2.1-serial-v2/baseline-calibration.json
       MLXFAST_MEASURE_STATE_DIR: /opt/bench-runner/state/laguna-xs-2.1-serial-v2
+      # Deliberate migration interlock. Set to "1" only in the same final
+      # calibration change that replaces every legacy model-derived pin below
+      # and provisions the final-SHA v2 baseline on both M5 boxes.
+      MLXFAST_POOLSIDE_V2_CALIBRATION_READY: "0"
       # Reference checkpoint pre-provisioned in the runner-owned cache
       # (world-readable; verified against the pinned manifest below every
       # run). No download happens on this box, so the old
@@ -186,10 +193,10 @@ jobs:
       # needlessly reach the untrusted bench environment. They are scoped to
       # their trusted download steps. (The operator denylist blocks them at the
       # bridge as defense in depth.)
-      # The RAW (pre-GPQA-augmentation) hidden golden's pins -- the same object
-      # the old slices verified. The augmented golden is verified against a
-      # self-anchored hash computed right after attach-gpqa-gates, exactly as
-      # the old gates machine did.
+      # TEMPORARY affine-v1 raw hidden-golden pins. The calibration interlock
+      # above prevents private/ranked use until these are replaced by the
+      # versioned Poolside v2 object produced on M5. The augmented golden is
+      # then verified against a self-anchored hash after attach-gpqa-gates.
       MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 96689a9ceaf7cc813174d0a6cb2ab650454d7d031f88514cbd222bcb17bb4d7e
       MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "35749"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
@@ -207,11 +214,13 @@ jobs:
       MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
       # Opus 4.8 at max effort (adaptive thinking) replaced the Sonnet 4.5
       # judge after that model produced prose-wrapped/truncated verdicts
-      # (3 unparseable first attempts in run 29124417146). The Laguna
-      # threshold calibration above was judged by Opus 4.8 across four runs.
+      # (3 unparseable first attempts in run 29124417146). Poolside v2's
+      # pass threshold still requires its own repeated M5 calibration.
       MLXFAST_SEMANTIC_GPQA_MODEL: claude-opus-4-8
       MLXFAST_GPQA_TTFT_CASE_COUNT: "5"
-      # Public drift-tripwire fixture, pinned (enforced by BenchmarkScriptTests).
+      # TEMPORARY affine-v1 public drift-tripwire fixture. It intentionally
+      # lacks Poolside model_provenance and must be regenerated and re-pinned
+      # on M5 before the calibration interlock is enabled.
       MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 679ba44220d581316c752533472883f4905a1b6a30f5f657a25f1177ae6247c1
@@ -254,6 +263,10 @@ jobs:
           fi
           test -e "${MLXFAST_BENCH_EXEC}" || { echo "::error::bench-exec bridge missing" >&2; exit 1; }
           test -e "${MLXFAST_JANITOR}" || { echo "::error::janitor missing" >&2; exit 1; }
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" && "${MLXFAST_POOLSIDE_V2_CALIBRATION_READY}" != "1" ]]; then
+            echo "::error::Poolside v2 model-derived fixtures and final-SHA baseline are not calibrated" >&2
+            exit 1
+          fi
           if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
             test -x "${MLXFAST_MEASURE_JOB}" || { echo "::error::measure-job missing" >&2; exit 1; }
             test -x "${MLXFAST_MACMON}" || { echo "::error::macmon missing" >&2; exit 1; }

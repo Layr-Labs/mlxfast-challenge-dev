@@ -813,6 +813,7 @@ private enum MLXFastCLI {
         )
         let merged = GoldenDocument(
             version: golden.version ?? 1,
+            modelProvenance: golden.modelProvenance,
             cases: golden.cases,
             correctnessGates: mergedGates,
             benchmark: golden.benchmark
@@ -974,6 +975,7 @@ private enum MLXFastCLI {
         )
         let merged = GoldenDocument(
             version: golden.version ?? 1,
+            modelProvenance: golden.modelProvenance,
             cases: golden.cases,
             correctnessGates: mergedGates,
             benchmark: golden.benchmark
@@ -1075,6 +1077,10 @@ private enum MLXFastCLI {
 
         let document = GoldenDocument(
             version: 1,
+            modelProvenance: GoldenModelProvenance(
+                repository: MLXFastConstants.referenceModelRepository,
+                revision: MLXFastConstants.referenceModelRevision
+            ),
             cases: [
                 GoldenCase(
                     name: caseName,

@@ -798,7 +798,7 @@ void qmm_splitk(
   // whole quantization groups. The qmm_t_splitk kernels tile K by BK=32 and do
   // not bound the K dimension, so a partition smaller than BK (e.g. nvfp4's
   // group_size=16) would over-read into the next group's weights/scales.
-  int k_align = group_size > 32 ? group_size : 32;
+  int k_align = std::max(group_size, 32);
   split_k = std::min(split_k, K / k_align);
 
   // Ensure K divides evenly by split_k * k_align

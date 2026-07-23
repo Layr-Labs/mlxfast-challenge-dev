@@ -57,6 +57,13 @@ struct PrivateArtifactCalibrationTests {
             requiredSteps: 2,
             requiredPromptTokens: 3
         )
+        #expect(
+            document.modelProvenance
+                == GoldenModelProvenance(
+                    repository: MLXFastConstants.referenceModelRepository,
+                    revision: MLXFastConstants.referenceModelRevision
+                )
+        )
         let gates = try #require(document.correctnessGates)
         let anchor = try #require(gates.anchorCases.first)
         #expect(anchor.name == "synthetic-anchor")
@@ -99,6 +106,47 @@ struct PrivateArtifactCalibrationTests {
             actual: [31, 32]
         )
         #expect(behaviorMatch.passed)
+    }
+
+    @Test
+    func goldenCalibrationRequiresPinnedModelProvenance() throws {
+        var template = try jsonObject(
+            fixtureData("synthetic-private-golden-template.json")
+        )
+        template.removeValue(forKey: "model_provenance")
+        let templateData = try canonicalJSON(template)
+
+        #expect(throws: MLXFastError.self) {
+            _ = try PrivateArtifactCalibrator.calibrateGolden(
+                templateData: templateData,
+                observations: PrivateReferenceCalibrationObservations(
+                    anchors: [
+                        PrivateAnchorCalibrationObservation(
+                            id: "synthetic-anchor",
+                            generatedToken: 30,
+                            expectedTokenRank: 2,
+                            expectedTokenTopLogitDelta: 0.125
+                        )
+                    ],
+                    sequences: [
+                        PrivateSequenceCalibrationObservation(
+                            id: "synthetic-behavior-a",
+                            generatedTokens: [31, 32]
+                        ),
+                        PrivateSequenceCalibrationObservation(
+                            id: "synthetic-behavior-b",
+                            generatedTokens: [33]
+                        ),
+                    ]
+                ),
+                anchorPolicy: PrivateAnchorCalibrationPolicy(
+                    maximumExpectedRank: 3,
+                    maximumTopLogitDelta: 0.25
+                ),
+                requiredSteps: 2,
+                requiredPromptTokens: 3
+            )
+        }
     }
 
     @Test

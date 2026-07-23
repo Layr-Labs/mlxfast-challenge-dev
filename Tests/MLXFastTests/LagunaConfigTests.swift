@@ -11,75 +11,28 @@ import Testing
 // BenchmarkSupportTests; these tests pin the LagunaConfig parse/validation
 // behavior itself, including the exact Poolside NVFP4 contract.
 
-/// The pinned Poolside Laguna XS 2.1 NVFP4 runtime config.
+/// Exact behavior-bearing fields from the immutable Poolside R2 config. The
+/// checked-in fixture also records the source repository, revision, and
+/// manifest-pinned config digest so tests cannot silently drift into a
+/// synthetic schema.
 func pinnedLagunaConfigObject() -> [String: Any] {
-    let pinnedQuantization: [String: Any] = [
-        "group_size": LagunaConstants.quantizationGroupSize,
-        "bits": 4,
-        "mode": "nvfp4",
-    ]
-    return [
-        "model_type": "laguna",
-        "vocab_size": LagunaConstants.vocabSize,
-        "hidden_size": LagunaConstants.hiddenSize,
-        "intermediate_size": LagunaConstants.denseIntermediateSize,
-        "num_hidden_layers": LagunaConstants.numHiddenLayers,
-        "num_attention_heads": LagunaConstants.fullAttentionHeads,
-        "num_attention_heads_per_layer": (0..<LagunaConstants.numHiddenLayers).map {
-            $0 % 4 == 0
-                ? LagunaConstants.fullAttentionHeads
-                : LagunaConstants.slidingAttentionHeads
-        },
-        "num_key_value_heads": LagunaConstants.numKeyValueHeads,
-        "head_dim": LagunaConstants.headDim,
-        "rms_norm_eps": 1e-6,
-        "max_position_embeddings": 262_144,
-        "attention_bias": false,
-        "qkv_bias": NSNull(),
-        "attention_dropout": 0.0,
-        "sliding_window": LagunaConstants.slidingWindow,
-        "layer_types": (0..<LagunaConstants.numHiddenLayers).map {
-            $0 % 4 == 0 ? "full_attention" : "sliding_attention"
-        },
-        "mlp_layer_types": (0..<LagunaConstants.numHiddenLayers).map {
-            $0 == 0 ? "dense" : "sparse"
-        },
-        "mlp_only_layers": [0],
-        "decoder_sparse_step": 1,
-        "gating": "per-head",
-        "gating_types": [String](
-            repeating: "per_head",
-            count: LagunaConstants.numHiddenLayers
-        ),
-        "tie_word_embeddings": false,
-        "num_experts": LagunaConstants.numExperts,
-        "num_experts_per_tok": LagunaConstants.numExpertsPerTok,
-        "moe_intermediate_size": LagunaConstants.moeIntermediateSize,
-        "shared_expert_intermediate_size": LagunaConstants.sharedExpertIntermediateSize,
-        "moe_routed_scaling_factor": LagunaConstants.moeRoutedScalingFactor,
-        "norm_topk_prob": true,
-        "moe_apply_router_weight_on_input": false,
-        "moe_router_logit_softcapping": NSNull(),
-        "rope_parameters": [
-            "sliding_attention": [
-                "rope_theta": 10_000.0,
-                "rope_type": "default",
-                "partial_rotary_factor": 1.0,
-            ],
-            "full_attention": [
-                "rope_theta": 500_000.0,
-                "rope_type": "yarn",
-                "factor": 32.0,
-                "original_max_position_embeddings": 8_192,
-                "beta_fast": 64.0,
-                "beta_slow": 1.0,
-                "attention_factor": 1.0,
-                "partial_rotary_factor": 0.5,
-            ],
-        ],
-        "quantization": pinnedQuantization,
-        "quantization_config": pinnedQuantization,
-    ]
+    let path =
+        "Tests/Fixtures/PoolsideLagunaXS21NVFP4/config-contract.json"
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+          let root = try? JSONSerialization.jsonObject(with: data)
+            as? [String: Any],
+          let source = root["source"] as? [String: Any],
+          source["repository"] as? String
+            == MLXFastConstants.referenceModelRepository,
+          source["revision"] as? String
+            == MLXFastConstants.referenceModelRevision,
+          source["config_sha256"] as? String
+            == "ef1eaf6709b38ab58b47480fdf8b2732163b34427d4a0ec334f77af27e1ce3b9",
+          let config = root["config"] as? [String: Any]
+    else {
+        preconditionFailure("invalid pinned Poolside config contract fixture")
+    }
+    return config
 }
 
 private func temporaryDirectory() throws -> URL {
@@ -254,33 +207,120 @@ func lagunaConfigRejectsBehaviorChangingXSMutations() throws {
     }
     try expectRejected("mlp_only_layers") { $0["mlp_only_layers"] = [0, 2] }
     try expectRejected("decoder_sparse_step") { $0["decoder_sparse_step"] = 2 }
+    try expectRejected("top-level attention heads") {
+        $0["num_attention_heads"] = LagunaConstants.slidingAttentionHeads
+    }
+    try expectRejected("KV heads") { $0["num_key_value_heads"] = 4 }
+    try expectRejected("head dimension") { $0["head_dim"] = 64 }
+    try expectRejected("sliding window") { $0["sliding_window"] = 1_024 }
     try expectRejected("maximum position") { $0["max_position_embeddings"] = 131_072 }
     try expectRejected("RMS epsilon") { $0["rms_norm_eps"] = 1e-5 }
+    try expectRejected("attention bias") { $0["attention_bias"] = true }
+    try expectRejected("qkv_bias absent/null contract") { $0["qkv_bias"] = false }
+    try expectRejected("attention dropout") { $0["attention_dropout"] = 0.1 }
+    try expectRejected("global gating") { $0["gating"] = "per-element" }
+    try expectRejected("tied embeddings") { $0["tie_word_embeddings"] = true }
+    try expectRejected("expert count") { $0["num_experts"] = 128 }
+    try expectRejected("experts per token") { $0["num_experts_per_tok"] = 4 }
+    try expectRejected("routed expert width") { $0["moe_intermediate_size"] = 1_024 }
+    try expectRejected("shared expert width") {
+        $0["shared_expert_intermediate_size"] = 1_024
+    }
     try expectRejected("routed scaling") { $0["moe_routed_scaling_factor"] = 1.0 }
     try expectRejected("top-k normalization") { $0["norm_topk_prob"] = false }
     try expectRejected("router weight placement") {
         $0["moe_apply_router_weight_on_input"] = true
+    }
+    try expectRejected("router softcap absent/null contract") {
+        $0["moe_router_logit_softcapping"] = 0.0
     }
     try expectRejected("per-layer gating") {
         var schedule = $0["gating_types"] as! [String]
         schedule[7] = "per_element"
         $0["gating_types"] = schedule
     }
+    try expectRejected("sliding RoPE theta") {
+        mutateRope(&$0, kind: "sliding_attention", field: "rope_theta", value: 20_000.0)
+    }
+    try expectRejected("sliding partial rotary") {
+        mutateRope(
+            &$0,
+            kind: "sliding_attention",
+            field: "partial_rotary_factor",
+            value: 0.5
+        )
+    }
+    try expectRejected("full RoPE theta") {
+        mutateRope(&$0, kind: "full_attention", field: "rope_theta", value: 1_000_000.0)
+    }
+    try expectRejected("full RoPE type") {
+        mutateRope(&$0, kind: "full_attention", field: "rope_type", value: "default")
+    }
+    try expectRejected("YaRN factor") {
+        mutateRope(&$0, kind: "full_attention", field: "factor", value: 16.0)
+    }
+    try expectRejected("YaRN original context") {
+        mutateRope(
+            &$0,
+            kind: "full_attention",
+            field: "original_max_position_embeddings",
+            value: 4_096
+        )
+    }
+    try expectRejected("YaRN beta fast") {
+        mutateRope(&$0, kind: "full_attention", field: "beta_fast", value: 32.0)
+    }
+    try expectRejected("YaRN beta slow") {
+        mutateRope(&$0, kind: "full_attention", field: "beta_slow", value: 2.0)
+    }
+    try expectRejected("full partial rotary") {
+        mutateRope(
+            &$0,
+            kind: "full_attention",
+            field: "partial_rotary_factor",
+            value: 1.0
+        )
+    }
     try expectRejected("serialized YaRN attention factor") {
+        mutateRope(&$0, kind: "full_attention", field: "attention_factor", value: 1.25)
+    }
+    try expectRejected("missing serialized YaRN attention factor") {
         var ropes = $0["rope_parameters"] as! [String: Any]
         var full = ropes["full_attention"] as! [String: Any]
-        full["attention_factor"] = 1.25
+        full.removeValue(forKey: "attention_factor")
         ropes["full_attention"] = full
         $0["rope_parameters"] = ropes
     }
     try expectRejected("unexpected YaRN mscale override") {
-        var ropes = $0["rope_parameters"] as! [String: Any]
-        var full = ropes["full_attention"] as! [String: Any]
-        full["mscale"] = 1.0
-        ropes["full_attention"] = full
-        $0["rope_parameters"] = ropes
+        mutateRope(&$0, kind: "full_attention", field: "mscale", value: 1.0)
     }
     try expectRejected("missing gating schedule") { $0.removeValue(forKey: "gating_types") }
+}
+
+@Test
+func lagunaConfigAcceptsAbsentOrExplicitNullNullableArtifactFields() throws {
+    var object = pinnedLagunaConfigObject()
+    #expect(object["qkv_bias"] == nil)
+    #expect(object["moe_router_logit_softcapping"] == nil)
+    object["qkv_bias"] = NSNull()
+    object["moe_router_logit_softcapping"] = NSNull()
+
+    let config = try loadLagunaConfig(object)
+    #expect(!config.qkvBias)
+    #expect(config.moeRouterLogitSoftcapping == 0)
+}
+
+private func mutateRope(
+    _ object: inout [String: Any],
+    kind: String,
+    field: String,
+    value: Any
+) {
+    var ropes = object["rope_parameters"] as! [String: Any]
+    var rope = ropes[kind] as! [String: Any]
+    rope[field] = value
+    ropes[kind] = rope
+    object["rope_parameters"] = ropes
 }
 
 @Test

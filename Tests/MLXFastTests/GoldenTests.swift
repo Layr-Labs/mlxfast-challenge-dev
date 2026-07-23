@@ -55,6 +55,60 @@ func checkedInPublicCorrectnessGoldenIsValid() throws {
 }
 
 @Test
+func goldenModelProvenanceIsStrictAndPinned() throws {
+    func documentJSON(repository: String, revision: String, extra: String = "") -> Data {
+        Data(
+            """
+            {
+              "version": 1,
+              "model_provenance": {
+                "repository": "\(repository)",
+                "revision": "\(revision)"\(extra)
+              },
+              "cases": [{
+                "name": "provenance-contract",
+                "prompt_tokens": \(correctnessPromptJSON()),
+                "expected_tokens": \(Array(repeating: 7, count: MLXFastConstants.correctnessSteps))
+              }]
+            }
+            """.utf8
+        )
+    }
+
+    let valid = try decodeGoldenDocument(
+        from: documentJSON(
+            repository: MLXFastConstants.referenceModelRepository,
+            revision: MLXFastConstants.referenceModelRevision
+        )
+    )
+    #expect(
+        valid.modelProvenance
+            == GoldenModelProvenance(
+                repository: MLXFastConstants.referenceModelRepository,
+                revision: MLXFastConstants.referenceModelRevision
+            )
+    )
+
+    #expect(throws: MLXFastError.self) {
+        _ = try decodeGoldenDocument(
+            from: documentJSON(
+                repository: "mlx-community/Laguna-XS-2.1-4bit",
+                revision: "c42e0a8f8d504ceacde015a535dcb286d65c8799"
+            )
+        )
+    }
+    #expect(throws: MLXFastError.self) {
+        _ = try decodeGoldenDocument(
+            from: documentJSON(
+                repository: MLXFastConstants.referenceModelRepository,
+                revision: MLXFastConstants.referenceModelRevision,
+                extra: ", \"unexpected\": true"
+            )
+        )
+    }
+}
+
+@Test
 func loadGoldenFixtureAcceptsLayeredCorrectnessGates() throws {
     let directory = try temporaryDirectory()
     let path = directory.appendingPathComponent("golden.json")

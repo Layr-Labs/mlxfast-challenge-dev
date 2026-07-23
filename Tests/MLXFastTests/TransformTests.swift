@@ -1200,75 +1200,11 @@ private func gemmaReferenceConfigJSON() -> String {
 }
 
 /// Flat Poolside Laguna XS 2.1 NVFP4 source config: Laguna geometry and the
-/// exact global NVFP4 4-bit group-16 block, mirrored in
-/// `quantization_config`.
+/// exact global NVFP4 4-bit group-16 block, loaded from the immutable artifact
+/// contract fixture rather than reconstructed synthetically here.
 private func lagunaReferenceConfigJSON() throws -> String {
-    let quantization: [String: Any] = [
-        "group_size": LagunaConstants.quantizationGroupSize,
-        "bits": LagunaConstants.quantizationBits,
-        "mode": LagunaConstants.quantizationMode,
-    ]
-
-    let layerCount = LagunaConstants.numHiddenLayers
-    var root: [String: Any] = [:]
-    root["architectures"] = ["LagunaForCausalLM"]
-    root["model_type"] = LagunaConstants.modelType
-    root["vocab_size"] = LagunaConstants.vocabSize
-    root["hidden_size"] = LagunaConstants.hiddenSize
-    root["intermediate_size"] = LagunaConstants.denseIntermediateSize
-    root["num_hidden_layers"] = layerCount
-    root["num_attention_heads"] = LagunaConstants.fullAttentionHeads
-    root["num_attention_heads_per_layer"] = (0..<layerCount).map {
-        $0 % 4 == 0 ? LagunaConstants.fullAttentionHeads : LagunaConstants.slidingAttentionHeads
-    }
-    root["num_key_value_heads"] = LagunaConstants.numKeyValueHeads
-    root["head_dim"] = LagunaConstants.headDim
-    root["rms_norm_eps"] = 1e-6
-    root["max_position_embeddings"] = 262_144
-    root["attention_bias"] = false
-    root["qkv_bias"] = NSNull()
-    root["attention_dropout"] = 0.0
-    root["sliding_window"] = LagunaConstants.slidingWindow
-    root["layer_types"] = (0..<layerCount).map {
-        $0 % 4 == 0 ? "full_attention" : "sliding_attention"
-    }
-    root["mlp_layer_types"] = (0..<layerCount).map { $0 == 0 ? "dense" : "sparse" }
-    root["mlp_only_layers"] = [0]
-    root["decoder_sparse_step"] = 1
-    root["gating"] = "per-head"
-    root["gating_types"] = [String](repeating: "per_head", count: layerCount)
-    root["tie_word_embeddings"] = false
-    root["num_experts"] = LagunaConstants.numExperts
-    root["num_experts_per_tok"] = LagunaConstants.numExpertsPerTok
-    root["moe_intermediate_size"] = LagunaConstants.moeIntermediateSize
-    root["shared_expert_intermediate_size"] = LagunaConstants.sharedExpertIntermediateSize
-    root["moe_routed_scaling_factor"] = LagunaConstants.moeRoutedScalingFactor
-    root["norm_topk_prob"] = true
-    root["moe_apply_router_weight_on_input"] = false
-    root["moe_router_logit_softcapping"] = NSNull()
-    root["rope_parameters"] = [
-        "sliding_attention": [
-            "rope_type": "default",
-            "rope_theta": 10_000.0,
-            "partial_rotary_factor": 1.0,
-        ] as [String: Any],
-        "full_attention": [
-            "rope_type": "yarn",
-            "rope_theta": 500_000.0,
-            "factor": 32.0,
-            "original_max_position_embeddings": 8_192,
-            "beta_fast": 64.0,
-            "beta_slow": 1.0,
-            "partial_rotary_factor": 0.5,
-            "attention_factor": 1.0,
-        ] as [String: Any],
-    ]
-    root["vision_config"] = [String: Any]()
-    root["quantization"] = quantization
-    root["quantization_config"] = quantization
-
     let data = try JSONSerialization.data(
-        withJSONObject: root,
+        withJSONObject: pinnedLagunaConfigObject(),
         options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
     )
     return String(decoding: data, as: UTF8.self)

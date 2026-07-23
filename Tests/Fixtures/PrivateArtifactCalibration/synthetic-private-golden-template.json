@@ -1,5 +1,9 @@
 {
   "version": 1,
+  "model_provenance": {
+    "repository": "poolside/Laguna-XS-2.1-NVFP4-mlx",
+    "revision": "841778bda563a36104dd521e37d99218e46f4f25"
+  },
   "cases": [
     {
       "name": "synthetic-base",

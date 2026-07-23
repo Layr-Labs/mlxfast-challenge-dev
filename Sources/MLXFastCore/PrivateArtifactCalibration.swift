@@ -126,6 +126,11 @@ public enum PrivateArtifactCalibrator {
             requiredSteps: requiredSteps,
             requiredPromptTokens: requiredPromptTokens
         )
+        guard template.modelProvenance != nil else {
+            throw MLXFastError.invalidInput(
+                "private golden calibration requires pinned model_provenance"
+            )
+        }
         let anchors = template.correctnessGates?.anchorCases ?? []
         let behaviors = template.correctnessGates?.behaviorCases ?? []
         guard !anchors.isEmpty || !behaviors.isEmpty else {
@@ -213,6 +218,7 @@ public enum PrivateArtifactCalibrator {
         )
         let calibrated = GoldenDocument(
             version: template.version ?? 1,
+            modelProvenance: template.modelProvenance,
             cases: template.cases,
             correctnessGates: calibratedGates,
             benchmark: template.benchmark

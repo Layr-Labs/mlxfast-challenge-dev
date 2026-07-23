@@ -1,4 +1,5 @@
 import Darwin
+import CryptoKit
 import Foundation
 @testable import MLXFastCore
 @testable import MLXFastModel
@@ -136,6 +137,14 @@ func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
     addCase("attention-dropout") { $0["attention_dropout"] = 0.1 }
     addCase("per-element-gating") { $0["gating"] = "per-element" }
     addCase("disabled-gating") { $0["gating"] = false }
+    addCase("per-layer-gating") {
+        var schedule = $0["gating_types"] as! [String]
+        schedule[7] = "per_element"
+        $0["gating_types"] = schedule
+    }
+    addCase("missing-per-layer-gating") {
+        $0.removeValue(forKey: "gating_types")
+    }
     // Laguna's lm_head is untied; a tied-embedding config is a different
     // (dense-era) checkpoint layout.
     addCase("tie-embeddings") { $0["tie_word_embeddings"] = true }
@@ -148,6 +157,9 @@ func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
     }
     addCase("routed-scaling") { $0["moe_routed_scaling_factor"] = 1.0 }
     addCase("norm-topk") { $0["norm_topk_prob"] = false }
+    addCase("router-weight-on-input") {
+        $0["moe_apply_router_weight_on_input"] = true
+    }
     addCase("router-softcap") { $0["moe_router_logit_softcapping"] = 30.0 }
     addCase("missing-layer-types") { $0.removeValue(forKey: "layer_types") }
     addCase("layer-pattern") {
@@ -233,6 +245,20 @@ func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
         rope["full_attention"] = full
         $0["rope_parameters"] = rope
     }
+    addCase("yarn-attention-factor") {
+        var rope = $0["rope_parameters"] as! [String: Any]
+        var full = rope["full_attention"] as! [String: Any]
+        full["attention_factor"] = 1.25
+        rope["full_attention"] = full
+        $0["rope_parameters"] = rope
+    }
+    addCase("missing-yarn-attention-factor") {
+        var rope = $0["rope_parameters"] as! [String: Any]
+        var full = rope["full_attention"] as! [String: Any]
+        full.removeValue(forKey: "attention_factor")
+        rope["full_attention"] = full
+        $0["rope_parameters"] = rope
+    }
     addCase("quantization-bits") {
         var quantization = $0["quantization"] as! [String: Any]
         quantization["bits"] = 8
@@ -273,51 +299,18 @@ func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
 }
 
 @Test
-func runtimeWorkerPinnedConfigurationAcceptsSafeOptionalRepresentations() throws {
-    // The boolean gating form and every architecture field that the source
-    // legitimately omits remain accepted. Both explicit quantization blocks
-    // stay mandatory because they are part of the pinned Poolside identity.
+func runtimeWorkerPinnedConfigurationAcceptsNullableArtifactFields() throws {
+    // The immutable config omits these two fields. Explicit JSON null is the
+    // only equivalent representation; concrete false/zero values are rejected
+    // by the mutation table above.
     var object = pinnedRuntimeWorkerConfigurationObject()
-    object["gating"] = true
-    for optionalKey in [
-        "attention_bias",
-        "qkv_bias",
-        "attention_dropout",
-        "moe_routed_scaling_factor",
-        "norm_topk_prob",
-        "moe_router_logit_softcapping",
-        "mlp_layer_types",
-        "mlp_only_layers",
-        "decoder_sparse_step",
-    ] {
-        object.removeValue(forKey: optionalKey)
-    }
-    var rope = object["rope_parameters"] as! [String: Any]
-    var sliding = rope["sliding_attention"] as! [String: Any]
-    var full = rope["full_attention"] as! [String: Any]
-    sliding.removeValue(forKey: "partial_rotary_factor")
-    for yarnKey in [
-        "factor",
-        "original_max_position_embeddings",
-        "beta_fast",
-        "beta_slow",
-        "attention_factor",
-    ] {
-        full.removeValue(forKey: yarnKey)
-    }
-    rope["sliding_attention"] = sliding
-    rope["full_attention"] = full
-    object["rope_parameters"] = rope
+    #expect(object["qkv_bias"] == nil)
+    #expect(object["moe_router_logit_softcapping"] == nil)
+    object["qkv_bias"] = NSNull()
+    object["moe_router_logit_softcapping"] = NSNull()
 
     try validateRuntimeWorkerPinnedConfigurationData(
         JSONSerialization.data(withJSONObject: object)
-    )
-
-    // Missing gating is also the pinned per-head default.
-    var withoutGating = pinnedRuntimeWorkerConfigurationObject()
-    withoutGating.removeValue(forKey: "gating")
-    try validateRuntimeWorkerPinnedConfigurationData(
-        JSONSerialization.data(withJSONObject: withoutGating)
     )
 }
 
@@ -984,57 +977,54 @@ func lagunaWeightLoaderRejectsUnexpectedTensorInventory() throws {
 }
 
 @Test
-func lagunaWeightContractPinsExactXSHeaderInventory() {
+func lagunaWeightContractPinsExactXSHeaderInventory() throws {
+    let contractData = try Data(
+        contentsOf: URL(
+            fileURLWithPath:
+                "Tests/Fixtures/PoolsideLagunaXS21NVFP4/header-inventory-contract.json"
+        )
+    )
+    let contract = try JSONDecoder().decode(
+        LagunaHeaderInventoryContract.self,
+        from: contractData
+    )
     let tensors = requiredLagunaDenseTensorFixtures()
     let dtypeCounts = Dictionary(grouping: tensors, by: \.dtype).mapValues(\.count)
+    let canonicalInventory = tensors
+        .sorted { $0.name < $1.name }
+        .map {
+            "\($0.name)\t\($0.dtype)\t\($0.shape.map(String.init).joined(separator: ","))"
+        }
+        .joined(separator: "\n") + "\n"
+    let inventoryDigest = SHA256.hash(data: Data(canonicalInventory.utf8))
+        .map { String(format: "%02x", $0) }
+        .joined()
 
-    #expect(tensors.count == LagunaConstants.tensorCount)
-    #expect(dtypeCounts == [
+    #expect(contract.schemaVersion == 1)
+    #expect(contract.source.repository == MLXFastConstants.referenceModelRepository)
+    #expect(contract.source.revision == MLXFastConstants.referenceModelRevision)
+    #expect(contract.canonicalRecordFormat.contains("name<TAB>dtype<TAB>"))
+    #expect(tensors.count == contract.tensorCount)
+    #expect(contract.tensorCount == LagunaConstants.tensorCount)
+    #expect(dtypeCounts == contract.dtypeCounts)
+    #expect(contract.dtypeCounts == [
         "BF16": LagunaConstants.bfloat16TensorCount,
         "F32": LagunaConstants.float32TensorCount,
         "U32": LagunaConstants.packedUInt32TensorCount,
         "U8": LagunaConstants.e4m3ScaleUInt8TensorCount,
     ])
     #expect(
-        tensors.first {
-            $0.name == "model.layers.1.mlp.switch_mlp.gate_proj.weight"
-        }?.shape == [256, 512, 256]
+        inventoryDigest == contract.canonicalInventorySHA256,
+        Comment(rawValue: "actual inventory digest: \(inventoryDigest)")
     )
-    #expect(
-        tensors.first {
-            $0.name == "model.layers.1.mlp.switch_mlp.gate_proj.scales"
-        }?.shape == [256, 512, 128]
-    )
-    #expect(
-        tensors.first {
-            $0.name == "model.layers.1.mlp.switch_mlp.down_proj.weight"
-        }?.shape == [256, 2_048, 64]
-    )
-    #expect(
-        tensors.first {
-            $0.name == "model.layers.1.mlp.switch_mlp.down_proj.scales"
-        }?.shape == [256, 2_048, 32]
-    )
-    #expect(
-        tensors.first {
-            $0.name == "model.layers.1.mlp.shared_expert.gate_proj.weight"
-        }?.shape == [512, 256]
-    )
-    #expect(
-        tensors.first {
-            $0.name == "model.layers.1.mlp.shared_expert.gate_proj.scales"
-        }?.shape == [512, 128]
-    )
-    #expect(
-        tensors.first {
-            $0.name == "model.layers.1.mlp.shared_expert.down_proj.weight"
-        }?.shape == [2_048, 64]
-    )
-    #expect(
-        tensors.first {
-            $0.name == "model.layers.1.mlp.shared_expert.down_proj.scales"
-        }?.shape == [2_048, 32]
-    )
+    for representative in contract.representativeTensors {
+        let tensor = try #require(
+            tensors.first { $0.name == representative.name },
+            Comment(rawValue: representative.name)
+        )
+        #expect(tensor.dtype == representative.dtype)
+        #expect(tensor.shape == representative.shape)
+    }
 }
 
 @Test
@@ -1081,6 +1071,37 @@ private struct TensorFixture {
     let name: String
     let dtype: String
     let shape: [Int]
+}
+
+private struct LagunaHeaderInventoryContract: Decodable {
+    struct Source: Decodable {
+        let repository: String
+        let revision: String
+    }
+
+    struct RepresentativeTensor: Decodable {
+        let name: String
+        let dtype: String
+        let shape: [Int]
+    }
+
+    let schemaVersion: Int
+    let source: Source
+    let tensorCount: Int
+    let dtypeCounts: [String: Int]
+    let canonicalRecordFormat: String
+    let canonicalInventorySHA256: String
+    let representativeTensors: [RepresentativeTensor]
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case source
+        case tensorCount = "tensor_count"
+        case dtypeCounts = "dtype_counts"
+        case canonicalRecordFormat = "canonical_record_format"
+        case canonicalInventorySHA256 = "canonical_inventory_sha256"
+        case representativeTensors = "representative_tensors"
+    }
 }
 
 private func checkPreflight(
@@ -2259,71 +2280,7 @@ private func makeRuntimeWorkerScript(_ contents: String) throws -> URL {
 /// and 256-expert top-8 MoE blocks with a 512-wide shared expert on the
 /// other 39 layers.
 private func pinnedRuntimeWorkerConfigurationObject() -> [String: Any] {
-    let quantization: [String: Any] = [
-        "group_size": 16,
-        "bits": 4,
-        "mode": "nvfp4",
-    ]
-    return [
-        "model_type": "laguna",
-        "hidden_size": MLXFastConstants.hiddenSize,
-        "num_hidden_layers": MLXFastConstants.numHiddenLayers,
-        "intermediate_size": MLXFastConstants.intermediateSize,
-        "num_attention_heads": MLXFastConstants.attentionHeads,
-        "num_attention_heads_per_layer": (0..<MLXFastConstants.numHiddenLayers).map {
-            $0 % 4 == 0 ? 48 : 64
-        },
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-        "rms_norm_eps": 1e-6,
-        "vocab_size": MLXFastConstants.vocabSize,
-        "sliding_window": 512,
-        "max_position_embeddings": 262_144,
-        "attention_bias": false,
-        "qkv_bias": NSNull(),
-        "attention_dropout": 0.0,
-        "gating": "per-head",
-        "gating_types": [String](
-            repeating: "per_head",
-            count: MLXFastConstants.numHiddenLayers
-        ),
-        "tie_word_embeddings": false,
-        "num_experts": 256,
-        "num_experts_per_tok": 8,
-        "moe_intermediate_size": 512,
-        "shared_expert_intermediate_size": 512,
-        "moe_routed_scaling_factor": 2.5,
-        "norm_topk_prob": true,
-        "moe_apply_router_weight_on_input": false,
-        "moe_router_logit_softcapping": NSNull(),
-        "mlp_layer_types": (0..<MLXFastConstants.numHiddenLayers).map {
-            $0 == 0 ? "dense" : "sparse"
-        },
-        "mlp_only_layers": [0],
-        "decoder_sparse_step": 1,
-        "layer_types": (0..<MLXFastConstants.numHiddenLayers).map {
-            $0 % 4 == 0 ? "full_attention" : "sliding_attention"
-        },
-        "rope_parameters": [
-            "sliding_attention": [
-                "rope_theta": 10_000.0,
-                "rope_type": "default",
-                "partial_rotary_factor": 1.0,
-            ],
-            "full_attention": [
-                "rope_theta": 500_000.0,
-                "rope_type": "yarn",
-                "factor": 32.0,
-                "original_max_position_embeddings": 8_192,
-                "beta_fast": 64.0,
-                "beta_slow": 1.0,
-                "attention_factor": 1.0,
-                "partial_rotary_factor": 0.5,
-            ],
-        ],
-        "quantization": quantization,
-        "quantization_config": quantization,
-    ]
+    pinnedLagunaConfigObject()
 }
 
 private func shortRuntimeWorkerOptions(executable: URL) -> RuntimeWorkerOptions {

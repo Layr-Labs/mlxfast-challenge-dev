@@ -1406,6 +1406,12 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json"))
     #expect(workflow.contains("MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}"))
     #expect(workflow.contains("MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}"))
+    #expect(workflow.contains("MLXFAST_POOLSIDE_V2_CALIBRATION_READY: \"0\""))
+    #expect(
+        workflow.contains(
+            "Poolside v2 model-derived fixtures and final-SHA baseline are not calibrated"
+        )
+    )
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 679ba44220d581316c752533472883f4905a1b6a30f5f657a25f1177ae6247c1"))
@@ -1434,11 +1440,9 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(!workflow.contains("mlxfast-gpqa-calibration-private.log"))
     #expect(!workflow.contains(".github/scripts/upload-r2-object.sh"))
     #expect(!workflow.contains("uploaded calibrated GPQA reference cases to private R2"))
-    // The RAW (pre-GPQA-augmentation) hidden golden pins -- the same object the
-    // prior shard goldens verified as MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_*.
-    // The augmented golden is pinned to a self-anchored hash exported into
-    // GITHUB_ENV right after attach-gpqa-gates, exactly as the old gates
-    // machine did.
+    // These remain affine-v1 placeholders while the explicit v2 calibration
+    // interlock is zero. Poolside M5 calibration must replace them before the
+    // private path can run.
     #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 96689a9ceaf7cc813174d0a6cb2ab650454d7d031f88514cbd222bcb17bb4d7e"))
     #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: \"35749\""))
     #expect(workflow.contains("raw hidden correctness golden pin mismatch"))
@@ -2580,6 +2584,9 @@ func cliSupportsPublicBaseGoldenGeneration() throws {
     #expect(cli.contains("generate-golden requires --prompt-file PATH"))
     #expect(cli.contains("requiredSteps: steps,"))
     #expect(cli.contains("generate-golden --prompt-file PATH"))
+    #expect(cli.contains("modelProvenance: GoldenModelProvenance("))
+    #expect(cli.contains("repository: MLXFastConstants.referenceModelRepository"))
+    #expect(cli.contains("revision: MLXFastConstants.referenceModelRevision"))
 }
 
 @Test

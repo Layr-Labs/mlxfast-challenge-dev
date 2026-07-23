@@ -140,24 +140,24 @@ public enum MLXFastConstants {
     // TEMPORARY legacy calibration from the superseded mlx-community affine
     // checkpoint. Replace both literals from Poolside NVFP4 M5 measurements
     // before this migration merges.
-    // Legacy calibration provenance: the live M5 paired baseline as of 2026-07-22 --
+    // Legacy calibration provenance: the affine-v1 M5 paired baseline as of 2026-07-22 --
     // the mean of the `baseline_decode_seconds_per_token` /
     // `baseline_prefill_seconds_per_token` fields published by the 4
     // consecutive successful ranked Laguna runs on the self-hosted M5 Max
     // (m5-bench): 29891158354, 29898041981, 29931435233, and 29934545157
-    // (each field is measure-job's on-box timing of the pinned Laguna
-    // reference tree in that run's session): decode clustered
+    // (each field is measure-job's on-box timing of that superseded Laguna
+    // reference tree in the run's session): decode clustered
     // 0.0093606-0.0094083 (CV 0.20%), prefill 0.0003596-0.0003664 (CV
-    // 0.71%). The v2 calibration lives under the versioned on-box state
-    // directory and is runner-private, so the published per-run fields are the
-    // audited public source. Supersedes the Gemma 4 31B 4-bit calibration of
+    // 0.71%). No Poolside v2 baseline/calibration exists yet; it must be built
+    // from the final migration SHA under the versioned on-box state directory.
+    // The legacy affine values superseded the Gemma 4 31B 4-bit calibration of
     // 2026-07-12 (prefill 0.0016216554767252605 / decode
     // 0.04405625764973958, runs 29179374395-29197772284), which was ~4.5x /
     // ~4.7x slower than the Laguna baseline and inflated local score
     // estimates accordingly after the model re-pin.
     //
     // These constants are NOT the ranked scoring denominator. The ranked runner
-    // is the single self-hosted M5 Max (m5-bench), where measure-job times the
+    // uses self-hosted M5 Max boxes (m5-bench), where measure-job times the
     // candidate and the PINNED on-box reference tree back to back in the same
     // session behind the same 40C thermal gate; the paired ratio against that
     // live same-session baseline is what overlay-paired-timing.sh folds into
