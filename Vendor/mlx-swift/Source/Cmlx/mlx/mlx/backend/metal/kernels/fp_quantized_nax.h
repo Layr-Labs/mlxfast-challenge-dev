@@ -92,6 +92,21 @@ struct QuantizedBlockLoader {
 
   MLX_MTL_CONST short n_groups = BCOLS / group_size;
 
+  // NVFP4 (4-bit, group_size 16, bfloat destination) SWAR fast-decode
+  // preconditions. n_reads_per_scale == 8 gives one 8-byte code word per
+  // scale group; n_reads % 8 == 0 with BCOLS_PACKED % n_reads == 0 makes
+  // every thread's src byte offset a multiple of 8 (bj is a multiple of
+  // n_reads and row strides src_ld / pack_factor are multiples of 8 bytes
+  // because the packed dimension of a group_size-16 quantized matrix is a
+  // multiple of 16), so the uint2 loads below are 8-byte aligned; the same
+  // divisibilities make every thread's dst element offset a multiple of 4
+  // (dst_ld % 4 == 0 and bj * pack_factor % 4 == 0), so the vec<T, 4>
+  // threadgroup stores are 8-byte aligned.
+  MLX_MTL_CONST bool use_nvfp4_swar = (bits == 4) && (group_size == 16) &&
+      (n_reads_per_scale == 8) && ((n_reads % 8) == 0) &&
+      ((BCOLS_PACKED % n_reads) == 0) && ((dst_ld % 4) == 0) &&
+      metal::is_same_v<T, bfloat>;
+
   const int src_ld;
   const int tile_stride;
   const int group_stride;
@@ -129,6 +144,50 @@ struct QuantizedBlockLoader {
 
   void load_unsafe() const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    if constexpr (use_nvfp4_swar) {
+      // Bit-exact vs the scalar path below. Each 4-bit code n decodes
+      // through the identical half bit pattern the scalar Dequantize<4>
+      // uses (magnitude (n & 7) << 9, sign (n & 8) into the half sign
+      // bit, matching fp4_e2m1's negate), so bfloat(pattern) equals
+      // bfloat(fp4_value) * 2^-14 exactly (all 16 code points, including
+      // -0.0, are exact 2-bit-significand values; 2^-14 scaling stays in
+      // the normal bfloat range). Folding the 2^14 renormalization into
+      // the per-group scale is exact: scale * 16384 is a power-of-two
+      // scaling of an fp8-e4m3 value (max 448 * 2^14 ~ 7.3e6, well inside
+      // normal bfloat range), every pairwise product of these 8-bit
+      // significand operands is exact in float, and all intermediate
+      // magnitudes stay normal, so round(scale*2^14 * v*2^-14) ==
+      // round(scale * v) for every association — the stored bfloat bits
+      // match the scalar path's scale * Dequantize(w) exactly, into the
+      // same dst slots.
+      STEEL_PRAGMA_UNROLL
+      for (int i = 0; i < n_steps_per_read; i++) {
+        const T scale = dequantize_scale<T, group_size>(scales[i]);
+        const T scale_pre = scale * static_cast<T>(16384.0f);
+        const uint2 codes = ((const device uint2*)src)[i];
+        STEEL_PRAGMA_UNROLL
+        for (int j = 0; j < 2; j++) {
+          const uint32_t c = (j == 0) ? codes.x : codes.y;
+          const uint32_t p0 =
+              ((c & 0x00070007u) << 9) | ((c & 0x00080008u) << 12);
+          const uint32_t p1 =
+              ((c & 0x00700070u) << 5) | ((c & 0x00800080u) << 8);
+          const uint32_t p2 =
+              ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4);
+          const uint32_t p3 = ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
+          const vec<T, 2> b04 = vec<T, 2>(as_type<half2>(p0));
+          const vec<T, 2> b15 = vec<T, 2>(as_type<half2>(p1));
+          const vec<T, 2> b26 = vec<T, 2>(as_type<half2>(p2));
+          const vec<T, 2> b37 = vec<T, 2>(as_type<half2>(p3));
+          threadgroup vec<T, 4>* out =
+              (threadgroup vec<T, 4>*)(dst + i * 16 + j * 8);
+          out[0] = vec<T, 4>(b04.x, b15.x, b26.x, b37.x) * scale_pre;
+          out[1] = vec<T, 4>(b04.y, b15.y, b26.y, b37.y) * scale_pre;
+        }
+      }
       return;
     }
 
@@ -180,6 +239,14 @@ struct QuantizedBlockLoader {
     } else {
       scales += n_groups * group_stride;
     }
+  }
+
+  // Retarget the threadgroup destination by delta elements. Used by the
+  // software-pipelined (double-buffered) kernels to alternate the staging
+  // buffer between loads; the device-side source walk (src / scales) is
+  // unaffected.
+  void shift_dst(const int delta) {
+    dst += delta;
   }
 };
 
@@ -277,15 +344,43 @@ METAL_FUNC void fp_qmm_t_impl(
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Software-pipelined k-loop over a double-buffered Ws (the caller
+      // allocates 2 * BN * BK_padded elements): while the mma consumes the
+      // weight tile staged in one half, the loader streams the next k tile
+      // into the other half. The single barrier per iteration (a) makes
+      // the previously staged tile visible to every mma reader and (b)
+      // guarantees every reader of the half about to be overwritten has
+      // finished. The device load/dequant sequence and the per-element mma
+      // sequence are identical to the unpipelined loop; only the phases
+      // overlap.
+      constexpr int Ws_tile = BN * BK_padded;
+
+      // Prologue: stage tile 0 into the first half of Ws.
+      if (K > 0) {
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
           loader_w.load_safe(short2(BK, tgp_bn));
         }
+        loader_w.next();
+        loader_w.shift_dst(Ws_tile);
+      }
 
+      short cur = 0;
+      for (int k = 0; k < K; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (k + BK < K) {
+          if constexpr (kAlignedN.value) {
+            loader_w.load_unsafe();
+          } else {
+            loader_w.load_safe(short2(BK, tgp_bn));
+          }
+          loader_w.next();
+          loader_w.shift_dst(cur ? Ws_tile : -Ws_tile);
+        }
+
+        const threadgroup Wtype* Wk = Ws + cur * Ws_tile;
 
         STEEL_PRAGMA_NO_UNROLL
         for (int kk1 = 0; kk1 < BK; kk1 += SK) {
@@ -300,7 +395,7 @@ METAL_FUNC void fp_qmm_t_impl(
             Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
           }
 
-          Btile.template load<Wtype, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          Btile.template load<Wtype, BK_padded, 1>(Wk + tn * BK_padded + kk1);
 
           tile_matmad_nax(
               Dtile,
@@ -313,7 +408,7 @@ METAL_FUNC void fp_qmm_t_impl(
         }
 
         x += BK;
-        loader_w.next();
+        cur ^= 1;
       }
 
       // Store results to device memory
@@ -570,7 +665,8 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(Wtype));
 
-  threadgroup Wtype Ws[BN * BK_padded];
+  // Double-buffered: fp_qmm_t_impl software-pipelines its weight loads.
+  threadgroup Wtype Ws[2 * BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets(
@@ -691,7 +787,8 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(Wtype));
 
-  threadgroup Wtype Ws[BN * BK_padded];
+  // Double-buffered: fp_qmm_t_impl software-pipelines its weight loads.
+  threadgroup Wtype Ws[2 * BN * BK_padded];
 
   adjust_matrix_offsets(
       x,
@@ -822,7 +919,10 @@ template <
       group_size,
       bits>;
 
-  threadgroup Wtype Ws[transpose ? BN * BK_padded : BK * BN_padded];
+  // Two staging buffers for software-pipelined (double-buffered) weight
+  // tile loads.
+  constexpr int Ws_tile = transpose ? BN * BK_padded : BK * BN_padded;
+  threadgroup Wtype Ws[2 * Ws_tile];
 
   // Compute the block
   const int K_w = K * bytes_per_pack / pack_factor;
@@ -912,16 +1012,44 @@ template <
 
     dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
       dispatch_bool(align_N || !is_unaligned_bn, [&](auto kAlignedN) {
-        for (int k = 0; k < K_it; k++) {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Software-pipelined k-loop over the double-buffered Ws: while the
+        // mma consumes the weight tile staged in one half, the loader
+        // streams the next k tile into the other half. The prologue
+        // barrier orders every Ws reader of the previous expert segment
+        // before tile 0 overwrites buffer 0; the single barrier per
+        // iteration then (a) makes the previously staged tile visible to
+        // every mma reader and (b) guarantees every reader of the half
+        // about to be overwritten has finished. The device load/dequant
+        // sequence and the per-element mma sequence are identical to the
+        // unpipelined loop; only the phases overlap.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (K_it > 0) {
           if constexpr (kAlignedN.value) {
             loader_w.load_unsafe();
           } else {
             loader_w.load_safe(
                 transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
           }
+          loader_w.next();
+          loader_w.shift_dst(Ws_tile);
+        }
 
+        short cur = 0;
+        for (int k = 0; k < K_it; k++) {
           threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          if (k + 1 < K_it) {
+            if constexpr (kAlignedN.value) {
+              loader_w.load_unsafe();
+            } else {
+              loader_w.load_safe(
+                  transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
+            }
+            loader_w.next();
+            loader_w.shift_dst(cur ? Ws_tile : -Ws_tile);
+          }
+
+          const threadgroup Wtype* Wk = Ws + cur * Ws_tile;
 
           STEEL_PRAGMA_NO_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
@@ -938,10 +1066,10 @@ template <
 
             if constexpr (transpose) {
               Btile.template load<Wtype, BK_padded, 1>(
-                  Ws + tn * BK_padded + kk1);
+                  Wk + tn * BK_padded + kk1);
             } else {
               Btile.template load<Wtype, BN_padded, 1>(
-                  Ws + tn + kk1 * BN_padded);
+                  Wk + tn + kk1 * BN_padded);
             }
 
             tile_matmad_nax(
@@ -955,13 +1083,18 @@ template <
           }
 
           xn += BK;
-          loader_w.next();
+          cur ^= 1;
         }
 
         if (!align_K) {
+          // The K tail stages into Ws half `cur` (the half the last main
+          // iteration's mma did not read), so the first barrier only has
+          // to publish it before the tail mma below.
           threadgroup_barrier(mem_flags::mem_threadgroup);
           loader_w.load_safe(tile_w);
           threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          const threadgroup Wtype* Wk = Ws + cur * Ws_tile;
 
           STEEL_PRAGMA_NO_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
@@ -975,10 +1108,10 @@ template <
 
             if constexpr (transpose) {
               Btile.template load<Wtype, BK_padded, 1>(
-                  Ws + tn * BK_padded + kk1);
+                  Wk + tn * BK_padded + kk1);
             } else {
               Btile.template load<Wtype, BN_padded, 1>(
-                  Ws + tn + kk1 * BN_padded);
+                  Wk + tn + kk1 * BN_padded);
             }
 
             tile_matmad_nax(
