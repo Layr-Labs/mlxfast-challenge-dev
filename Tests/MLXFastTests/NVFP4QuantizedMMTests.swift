@@ -67,6 +67,37 @@ struct NVFP4QuantizedMMTests {
     }
 
     @Test
+    func nvfp4NAXGatherFactoryUsesDeclaredTemplateNames() throws {
+        let kernelRoot =
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels"
+        let generatedRoot =
+            "Vendor/mlx-swift/Source/Cmlx/mlx-generated"
+        let declaredFunctions = [
+            "fp_gather_qmm_t_nax",
+            "fp_gather_qmm_n_nax",
+        ]
+        for path in [
+            "\(kernelRoot)/fp_quantized_nax.h",
+            "\(generatedRoot)/fp_quantized_nax.cpp",
+        ] {
+            let source = try String(contentsOfFile: path, encoding: .utf8)
+            for function in declaredFunctions {
+                #expect(source.contains("void \(function)("))
+            }
+        }
+
+        let factory = try String(
+            contentsOfFile:
+                "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/quantized.cpp",
+            encoding: .utf8
+        )
+        #expect(factory.contains(#""gather_qmm_t_nax","#))
+        #expect(factory.contains(#""gather_qmm_n_nax","#))
+        #expect(!factory.contains(#""gather_qmm_t_nax_","#))
+        #expect(!factory.contains(#""gather_qmm_n_nax_","#))
+    }
+
+    @Test
     func nvfp4PackedNibblesDecodeLowNibbleFirstWhenRuntimeTestsAreEnabled() {
         guard nvfp4RuntimeTestsEnabled else { return }
 

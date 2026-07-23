@@ -630,7 +630,7 @@ void gather_qmm_nax(
     kernel = get_qmm_nax_kernel_wrapped(
         d,
         kname,
-        "gather_qmm_t_nax_",
+        "gather_qmm_t_nax",
         mode,
         type_string,
         group_size,
@@ -645,7 +645,7 @@ void gather_qmm_nax(
     kernel = get_qmm_nax_kernel_wrapped(
         d,
         kname,
-        "gather_qmm_n_nax_",
+        "gather_qmm_n_nax",
         mode,
         type_string,
         group_size,
