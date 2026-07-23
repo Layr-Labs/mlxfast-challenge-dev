@@ -355,6 +355,38 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
 
 // MARK: - MoE
 
+/// Compiled fused router tail for the softcap-free Laguna XS contract:
+/// `[logits_bf16, bias_f32] -> [scores, -(scores + bias)]`, folding the
+/// float32 cast, sigmoid, correction-bias add, and the argPartition-operand
+/// negate -- four elementwise launches per router call, 39 router calls per
+/// token -- into one compiled shapeless kernel. The body is the identical
+/// expression tree the eager code builds (same `sigmoid`/`asType`/`+`/`-`
+/// functors applied in the same order, no reassociation; compile fuses
+/// elementwise ops without changing per-element arithmetic), so both
+/// outputs are bit-exact against the uncompiled tail. Gated like the
+/// sibling compiled fusions: when compiled decode is unsupported the
+/// identical uncompiled body runs instead.
+private let lagunaCompiledRouterTail: @Sendable ([MLXArray]) -> [MLXArray] = {
+    let body: @Sendable ([MLXArray]) -> [MLXArray] = { inputs in
+        let scores = sigmoid(inputs[0].asType(.float32))
+        let scoresForChoice = scores + inputs[1].asType(scores.dtype)
+        return [scores, -scoresForChoice]
+    }
+    return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
+/// Compiled top-k mixture-weight renormalization
+/// (`weights / weights.sum(axis: -1, keepDims: true)`), the router's
+/// `normTopkProb` tail. Identical expression tree to the eager code: the
+/// sum still dispatches the stock reduce kernel (compile does not fuse
+/// reductions) and the divide is elementwise, so the result is bit-exact.
+private let lagunaCompiledTopKNormalize: @Sendable (MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray) -> MLXArray = { weights in
+        weights / weights.sum(axis: -1, keepDims: true)
+    }
+    return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
 /// Sigmoid top-k router. The routing math mirrors the vendored
 /// `LagunaMoEGate` exactly (sigmoid scores, correction bias added only for
 /// expert CHOICE, mixture weights taken from the pre-bias scores, optional
@@ -376,10 +408,26 @@ final class LagunaRuntimeMoEGate: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        var logits = x.matmul(weight.T).asType(.float32)
-        if routerLogitSoftcapping > 0 {
-            logits = tanh(logits / routerLogitSoftcapping) * routerLogitSoftcapping
+        if routerLogitSoftcapping <= 0 {
+            // Pinned Laguna XS contract (config load rejects a nonzero
+            // router softcap): the raw BF16 matmul feeds the compiled fused
+            // tail, which returns the pre-bias sigmoid scores and the exact
+            // `-(scores + bias)` operand the eager code hands argPartition.
+            // argPartition/takeAlong themselves are untouched.
+            let tail = lagunaCompiledRouterTail([x.matmul(weight.T), eScoreCorrectionBias])
+            let scores = tail[0]
+            let inds = argPartition(tail[1], kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+            var weights = takeAlong(scores, inds, axis: -1)
+            if normTopkProb {
+                weights = lagunaCompiledTopKNormalize(weights)
+            }
+            return (inds, weights)
         }
+
+        // Softcapped router variant (not the Laguna XS contract): the
+        // original eager tail, unchanged.
+        var logits = x.matmul(weight.T).asType(.float32)
+        logits = tanh(logits / routerLogitSoftcapping) * routerLogitSoftcapping
 
         let scores = sigmoid(logits)
         let scoresForChoice = scores + eScoreCorrectionBias.asType(scores.dtype)
