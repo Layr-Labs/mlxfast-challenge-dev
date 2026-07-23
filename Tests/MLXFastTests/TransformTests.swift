@@ -12,7 +12,7 @@ func transformSelectsTextTowerTensorsAndDropsVisionTensors() throws {
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
 
-    try lagunaReferenceConfigJSON().write(
+    try gemmaReferenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
@@ -23,7 +23,7 @@ func transformSelectsTextTowerTensorsAndDropsVisionTensors() throws {
         encoding: .utf8
     )
 
-    let textName = "model.layers.0.self_attn.q_proj.weight"
+    let textName = "language_model.model.layers.0.self_attn.q_proj.weight"
     let visionName = "vision_tower.encoder.layers.0.self_attn.q_proj.weight"
     let embedVisionName = "embed_vision.embedding_projection.weight"
     let shardName = "model-00001-of-00001.safetensors"
@@ -158,24 +158,10 @@ func transformKeySelectionDropsRotaryInvFreqOnlyForLaguna() {
 }
 
 @Test
-func transformWritesPoolsideLagunaNVFP4RuntimeConfig() throws {
-    let fixture = try writeLagunaCheckpointFixture(
-        tensors: [
-            TensorFixture(
-                name: "model.embed_tokens.weight",
-                dtype: "U8",
-                shape: [1],
-                data: Data([1])
-            )
-        ]
+func transformBuildsPoolsideLagunaNVFP4RuntimeConfig() throws {
+    let configData = try SwiftTransform.makeRuntimeConfigData(
+        sourceConfigPath: poolsideLagunaConfigFixtureURL
     )
-    defer { try? FileManager.default.removeItem(at: fixture.root) }
-
-    _ = try SwiftTransform.run(
-        TransformOptions(referencePath: fixture.reference.path, outputPath: fixture.output.path)
-    )
-
-    let configData = try Data(contentsOf: fixture.output.appendingPathComponent("config.json"))
     let config = try JSONSerialization.jsonObject(with: configData) as? [String: Any]
     #expect(config?["model_type"] as? String == LagunaConstants.modelType)
     #expect(config?["vocab_size"] as? Int == LagunaConstants.vocabSize)
@@ -208,138 +194,32 @@ func transformWritesPoolsideLagunaNVFP4RuntimeConfig() throws {
 }
 
 @Test
-func transformPassesThroughLagunaMoEInventoryWithoutSidecars() throws {
-    var tensors: [TensorFixture] = []
-    tensors.append(bf16Tensor(name: "model.embed_tokens.weight", shape: [8, 128]))
-    tensors.append(bf16Tensor(name: "lm_head.weight", shape: [8, 128]))
-    tensors.append(bf16Tensor(name: "model.norm.weight", shape: [4]))
-
-    for layer in [0, 1] {
-        let prefix = "model.layers.\(layer)"
-        tensors.append(bf16Tensor(name: "\(prefix).input_layernorm.weight", shape: [4]))
-        tensors.append(
-            bf16Tensor(name: "\(prefix).post_attention_layernorm.weight", shape: [4])
-        )
-        for projection in ["q_proj", "k_proj", "v_proj", "o_proj", "g_proj"] {
-            tensors.append(
-                bf16Tensor(
-                    name: "\(prefix).self_attn.\(projection).weight",
-                    shape: [8, 128]
-                )
+func transformRejectsPartialLagunaInventoryBeforePublishing() throws {
+    let fixture = try writeLagunaCheckpointFixture(
+        tensors: [
+            TensorFixture(
+                name: "model.embed_tokens.weight",
+                dtype: "U8",
+                shape: [1],
+                data: Data([1])
             )
-        }
-        tensors.append(bf16Tensor(name: "\(prefix).self_attn.q_norm.weight", shape: [2]))
-        tensors.append(bf16Tensor(name: "\(prefix).self_attn.k_norm.weight", shape: [2]))
-    }
-
-    // Layer 0: dense MLP.
-    for projection in ["gate_proj", "up_proj", "down_proj"] {
-        tensors.append(
-            bf16Tensor(
-                name: "model.layers.0.mlp.\(projection).weight",
-                shape: [8, 128]
-            )
-        )
-    }
-    // Layer 1: BF16 router + F32 correction bias, NVFP4 stacked experts,
-    // and NVFP4 shared expert.
-    tensors.append(
-        bf16Tensor(
-            name: "model.layers.1.mlp.gate.weight",
-            shape: [4, 128]
-        )
+        ]
     )
-    tensors.append(
-        f32Tensor(
-            name: "model.layers.1.mlp.gate.e_score_correction_bias",
-            shape: [4]
-        )
-    )
-    for projection in ["gate_proj", "up_proj"] {
-        tensors += nvfp4TensorPair(
-            stem: "model.layers.1.mlp.switch_mlp.\(projection)",
-            leadingShape: [4, 6],
-            inputFeatures: 128
-        )
-    }
-    tensors += nvfp4TensorPair(
-        stem: "model.layers.1.mlp.switch_mlp.down_proj",
-        leadingShape: [4, 8],
-        inputFeatures: 128
-    )
-    for projection in ["gate_proj", "up_proj"] {
-        tensors += nvfp4TensorPair(
-            stem: "model.layers.1.mlp.shared_expert.\(projection)",
-            leadingShape: [6],
-            inputFeatures: 128
-        )
-    }
-    tensors += nvfp4TensorPair(
-        stem: "model.layers.1.mlp.shared_expert.down_proj",
-        leadingShape: [8],
-        inputFeatures: 128
-    )
-    let expectedNames = Set(tensors.map(\.name))
-
-    // Both must be dropped: inv_freq per the Laguna weight contract, the
-    // vision tensor because it is outside the text tower.
-    tensors.append(
-        TensorFixture(
-            name: "model.rotary_emb.inv_freq",
-            dtype: "F32",
-            shape: [4],
-            data: Data(count: 16)
-        )
-    )
-    tensors.append(
-        TensorFixture(
-            name: "vision_tower.encoder.layers.0.self_attn.q_proj.weight",
-            dtype: "U8",
-            shape: [2],
-            data: Data([1, 2])
-        )
-    )
-
-    let fixture = try writeLagunaCheckpointFixture(tensors: tensors)
     defer { try? FileManager.default.removeItem(at: fixture.root) }
-    let report = try SwiftTransform.run(
-        TransformOptions(referencePath: fixture.reference.path, outputPath: fixture.output.path)
-    )
-
-    #expect(report.denseTensorCount == expectedNames.count)
-    #expect(report.denseShardCount == 1)
-
-    let outputShard = fixture.output.appendingPathComponent(fixture.shardName)
-    let header = try Safetensors.readHeader(outputShard)
-    #expect(Set(header.tensors.keys) == expectedNames)
-
-    let indexData = try Data(
-        contentsOf: fixture.output.appendingPathComponent("model.safetensors.index.json")
-    )
-    let index = try JSONSerialization.jsonObject(with: indexData) as? [String: Any]
-    let weightMap = try #require(index?["weight_map"] as? [String: String])
-    #expect(Set(weightMap.keys) == expectedNames)
-    #expect(Set(weightMap.values) == [fixture.shardName])
-    #expect(!weightMap.keys.contains(where: { $0.contains("metadata_indices") }))
-    #expect(!weightMap.keys.contains(where: { $0.contains("metadata_lut") }))
-    #expect(!weightMap.keys.contains(where: { $0.contains("tied_head_packed13") }))
-
-    // No derived metadata sidecars for Laguna (the Gemma projection and
-    // tied-head shards must not exist).
-    #expect(
-        !FileManager.default.fileExists(
-            atPath: fixture.output.appendingPathComponent(
-                "mlxfast-projection-metadata.safetensors"
-            ).path
+    var rejection: MLXFastError?
+    do {
+        _ = try SwiftTransform.run(
+            TransformOptions(
+                referencePath: fixture.reference.path,
+                outputPath: fixture.output.path
+            )
         )
-    )
-    #expect(
-        !FileManager.default.fileExists(
-            atPath: fixture.output.appendingPathComponent(
-                "mlxfast-tied-head-metadata.safetensors"
-            ).path
-        )
-    )
+    } catch let error as MLXFastError {
+        rejection = error
+    }
+
+    #expect(rejection?.description.contains("exact public 912-tensor contract") == true)
+    #expect(!FileManager.default.fileExists(atPath: fixture.output.path))
 }
 
 @Test
@@ -1101,13 +981,13 @@ func transformAcceptsSparseShardLargerThanInt32() throws {
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try lagunaReferenceConfigJSON().write(
+    try gemmaReferenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
     )
 
-    let textName = "model.layers.0.self_attn.q_proj.weight"
+    let textName = "language_model.model.layers.0.self_attn.q_proj.weight"
     let visionName = "vision_tower.encoder.layers.0.self_attn.q_proj.weight"
     let shardName = "model-00001-of-00001.safetensors"
     let shard = reference.appendingPathComponent(shardName)
@@ -1152,7 +1032,7 @@ private func writeTransformFixture() throws -> TransformFixturePaths {
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try lagunaReferenceConfigJSON().write(
+    try gemmaReferenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
@@ -1163,7 +1043,7 @@ private func writeTransformFixture() throws -> TransformFixturePaths {
         encoding: .utf8
     )
 
-    let textName = "model.layers.0.self_attn.q_proj.weight"
+    let textName = "language_model.model.layers.0.self_attn.q_proj.weight"
     let visionName = "vision_tower.encoder.layers.0.self_attn.q_proj.weight"
     let shardName = "model-00001-of-00001.safetensors"
     try writeSafetensors(

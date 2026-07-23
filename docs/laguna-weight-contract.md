@@ -18,6 +18,21 @@ The source is text-only. Its five shards contain 912 tensors and
 `model.*` / `lm_head.*` names and the source config (minus an empty
 `vision_config` if present).
 
+The public artifact contract is checked in without model data:
+
+```text
+fixtures/poolside_laguna_xs_2_1_nvfp4_config.json
+fixtures/poolside_laguna_xs_2_1_nvfp4_tensor_inventory.json
+```
+
+The config fixture is the complete public `config.json`, normalized only for
+JSON formatting. The inventory fixture was extracted with HTTP range requests
+for the five safetensors headers plus the public index; no tensor payload was
+downloaded. It records every name, dtype, shape, and index shard assignment,
+the public config/index SHA256 values, each raw header SHA256, representative
+records, per-shard hashes, and a full canonical inventory SHA256
+`6da902713b7348d11f3b9664b2ad64703c2544eae6d028133f3d2c45be926848`.
+
 ## Directory and inventory
 
 ```text
@@ -107,13 +122,16 @@ Sparse layers 1–39:
 
 Count check:
 
-- 639 `.weight` tensors
-- 234 `.scales` tensors
-- 39 correction-bias tensors
+- 405 BF16 tensors
+- 39 F32 tensors
+- 234 U32 tensors
+- 234 U8 tensors
 - total 912
 
 The `switch_mlp` tensors remain stacked by expert. They must not be split into
-per-expert tensors.
+per-expert tensors. Affine `.biases`, compressed-tensors `weight_packed`,
+`global_scale`, or KV-scale tensors, and any missing, extra, or renamed tensor
+are different schemas and fail the exact inventory check.
 
 ## Config invariants
 
@@ -121,17 +139,31 @@ The runtime validates the frozen architecture before materializing weights:
 model type `laguna`, vocab 100352, hidden 2048, dense intermediate 8192, 40
 layers, 8 KV heads, head dimension 128, sliding window 512, 256 experts,
 top-8 routing, expert/shared intermediate 512, untied head, per-head gating,
-and the every-fourth full-attention schedule.
+all 40 `gating_types` entries set to `per_head`, and the every-fourth
+full-attention schedule. It also pins max position 262144, RMS epsilon 1e-6,
+zero attention dropout, normalized top-k probabilities, routed factor 2.5,
+`moe_apply_router_weight_on_input=false`, `router_aux_loss_coef=0`, and
+`use_cache=true`. The public artifact explicitly stores the two zero-valued
+fields but omits `qkv_bias` and `moe_router_logit_softcapping`; the exact
+fixture preserves absent, JSON null, and numeric zero as distinct states.
 
 RoPE remains:
 
 - sliding: default, theta 10000, full head rotation
 - full: YaRN, theta 500000, factor 32, original context 8192, beta 64/1,
-  partial rotary factor 0.5
+  attention factor 1.0, partial rotary factor 0.5
+
+`attention_factor` is parsed and pinned as public artifact metadata, but it is
+not applied directly as the YaRN query/key multiplier. The vendored
+mlx-swift-lm `YarnRoPE` implementation is the runtime authority: with its
+default `mscale=1`, `mscale_all_dim=0`, and factor 32 it derives
+`1 + 0.1 * log(32) = 1.3465736...`. Replacing that derived multiplier with
+the literal public `attention_factor=1.0` changes runtime math and is forbidden.
 
 Any affine checkpoint, group size other than 16, quantization override,
 quantized router, affine bias companion, non-U8 NVFP4 scale, or non-BF16
-dense projection fails closed before the first forward.
+dense projection fails closed before the first forward. The 48-layer,
+top-10 Laguna S geometry is likewise a different artifact and fails closed.
 
 ## M5 upstream equivalence gate
 

@@ -94,10 +94,13 @@ public struct LagunaRopeSpec: Equatable {
     public let originalMaxPositionEmbeddings: Int
     public let betaFast: Double
     public let betaSlow: Double
-    /// Serialized by the XS checkpoint as 1.0. The vendored MLX Laguna
-    /// implementation intentionally does not pass this Hugging Face field to
-    /// `initializeRope`; MLX derives YaRN mscale as
-    /// `1 + 0.1 * ln(factor)` from its own defaults instead.
+    /// Pinned from Poolside's public config for artifact validation only.
+    ///
+    /// mlx-swift-lm's `YarnRoPE` is the runtime authority: it intentionally
+    /// ignores Hugging Face's `attention_factor` spelling and derives its
+    /// query/key multiplier from `factor` and the vendored mscale defaults.
+    /// For factor 32 that multiplier is `1 + 0.1 * log(32)`, about 1.34657,
+    /// not the literal public metadata value 1.0.
     public let attentionFactor: Double?
 
     public init(
@@ -204,6 +207,8 @@ public struct LagunaConfig: Equatable {
     public let normTopkProb: Bool
     public let moeApplyRouterWeightOnInput: Bool
     public let moeRouterLogitSoftcapping: Double
+    public let routerAuxLossCoef: Double
+    public let useCache: Bool
     public let slidingRope: LagunaRopeSpec
     public let fullRope: LagunaRopeSpec
     public let quantization: LagunaQuantizationSpec
@@ -239,6 +244,8 @@ public struct LagunaConfig: Equatable {
         normTopkProb: Bool,
         moeApplyRouterWeightOnInput: Bool,
         moeRouterLogitSoftcapping: Double,
+        routerAuxLossCoef: Double,
+        useCache: Bool,
         slidingRope: LagunaRopeSpec,
         fullRope: LagunaRopeSpec,
         quantization: LagunaQuantizationSpec
@@ -273,6 +280,8 @@ public struct LagunaConfig: Equatable {
         self.normTopkProb = normTopkProb
         self.moeApplyRouterWeightOnInput = moeApplyRouterWeightOnInput
         self.moeRouterLogitSoftcapping = moeRouterLogitSoftcapping
+        self.routerAuxLossCoef = routerAuxLossCoef
+        self.useCache = useCache
         self.slidingRope = slidingRope
         self.fullRope = fullRope
         self.quantization = quantization
@@ -442,6 +451,9 @@ public struct LagunaConfig: Equatable {
             ),
             moeRouterLogitSoftcapping: try doubleField(
                 "moe_router_logit_softcapping", root: root, defaultValue: 0.0),
+            routerAuxLossCoef: try doubleField(
+                "router_aux_loss_coef", root: root, defaultValue: 0.0),
+            useCache: try boolField("use_cache", root: root, defaultValue: true),
             slidingRope: LagunaRopeSpec(
                 theta: try doubleField(
                     "rope_theta", root: slidingRopeObject, defaultValue: 10_000.0),
@@ -578,6 +590,12 @@ public struct LagunaConfig: Equatable {
             errors.append(
                 "moe_router_logit_softcapping=\(moeRouterLogitSoftcapping) expected 0/null"
             )
+        }
+        if routerAuxLossCoef != 0 {
+            errors.append("router_aux_loss_coef=\(routerAuxLossCoef) expected 0")
+        }
+        if !useCache {
+            errors.append("use_cache=false expected true")
         }
         let expectedSlidingRope = LagunaRopeSpec(
             theta: 10_000,
@@ -920,6 +938,8 @@ private func requirePinnedLagunaFields(_ root: [String: Any]) throws {
         "moe_routed_scaling_factor",
         "norm_topk_prob",
         "moe_apply_router_weight_on_input",
+        "router_aux_loss_coef",
+        "use_cache",
         "rope_parameters",
         "quantization",
         "quantization_config",
@@ -928,6 +948,12 @@ private func requirePinnedLagunaFields(_ root: [String: Any]) throws {
     guard missing.isEmpty else {
         throw MLXFastError.invalidInput(
             "Laguna config is missing pinned XS fields: \(missing.joined(separator: ", "))"
+        )
+    }
+    let nullFields = required.filter { root[$0] is NSNull }
+    guard nullFields.isEmpty else {
+        throw MLXFastError.invalidInput(
+            "Laguna config has null pinned XS fields: \(nullFields.joined(separator: ", "))"
         )
     }
 }

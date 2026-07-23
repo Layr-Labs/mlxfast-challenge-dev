@@ -580,6 +580,8 @@ private struct RuntimeWorkerPinnedConfiguration: Decodable {
     let normTopkProb: Bool
     let moeApplyRouterWeightOnInput: Bool
     let moeRouterLogitSoftcapping: Double?
+    let routerAuxLossCoef: Double
+    let useCache: Bool
     let layerTypes: [String]
     let mlpLayerTypes: [String]
     let mlpOnlyLayers: [Int]
@@ -615,6 +617,8 @@ private struct RuntimeWorkerPinnedConfiguration: Decodable {
         case normTopkProb = "norm_topk_prob"
         case moeApplyRouterWeightOnInput = "moe_apply_router_weight_on_input"
         case moeRouterLogitSoftcapping = "moe_router_logit_softcapping"
+        case routerAuxLossCoef = "router_aux_loss_coef"
+        case useCache = "use_cache"
         case layerTypes = "layer_types"
         case mlpLayerTypes = "mlp_layer_types"
         case mlpOnlyLayers = "mlp_only_layers"
@@ -645,7 +649,7 @@ private struct RuntimeWorkerPinnedRopeSpec: Decodable {
     let betaSlow: Double?
     let attentionFactor: Double?
 
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case ropeTheta = "rope_theta"
         case ropeType = "rope_type"
         case partialRotaryFactor = "partial_rotary_factor"
@@ -654,6 +658,38 @@ private struct RuntimeWorkerPinnedRopeSpec: Decodable {
         case betaFast = "beta_fast"
         case betaSlow = "beta_slow"
         case attentionFactor = "attention_factor"
+    }
+
+    init(from decoder: Decoder) throws {
+        let wire = try decoder.container(keyedBy: RuntimeWorkerQuantizationKey.self)
+        let allowed = Set(CodingKeys.allCases.map(\.rawValue))
+        guard wire.allKeys.allSatisfy({ allowed.contains($0.stringValue) }) else {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription:
+                        "Poolside Laguna RoPE contains unsupported fields"
+                )
+            )
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        ropeTheta = try container.decode(Double.self, forKey: .ropeTheta)
+        ropeType = try container.decode(String.self, forKey: .ropeType)
+        partialRotaryFactor = try container.decodeIfPresent(
+            Double.self,
+            forKey: .partialRotaryFactor
+        )
+        factor = try container.decodeIfPresent(Double.self, forKey: .factor)
+        originalMaxPositionEmbeddings = try container.decodeIfPresent(
+            Int.self,
+            forKey: .originalMaxPositionEmbeddings
+        )
+        betaFast = try container.decodeIfPresent(Double.self, forKey: .betaFast)
+        betaSlow = try container.decodeIfPresent(Double.self, forKey: .betaSlow)
+        attentionFactor = try container.decodeIfPresent(
+            Double.self,
+            forKey: .attentionFactor
+        )
     }
 }
 
@@ -781,6 +817,8 @@ func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
           decoded.normTopkProb,
           !decoded.moeApplyRouterWeightOnInput,
           decoded.moeRouterLogitSoftcapping == nil,
+          decoded.routerAuxLossCoef == 0,
+          decoded.useCache == true,
           decoded.layerTypes == expectedLayerTypes,
           decoded.mlpLayerTypes == expectedMLPLayerTypes,
           decoded.mlpOnlyLayers == [0],
@@ -788,6 +826,10 @@ func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
           decoded.ropeParameters.slidingAttention.ropeTheta == 10_000,
           decoded.ropeParameters.slidingAttention.ropeType == "default",
           decoded.ropeParameters.slidingAttention.partialRotaryFactor == 1,
+          decoded.ropeParameters.slidingAttention.factor == nil,
+          decoded.ropeParameters.slidingAttention.originalMaxPositionEmbeddings == nil,
+          decoded.ropeParameters.slidingAttention.betaFast == nil,
+          decoded.ropeParameters.slidingAttention.betaSlow == nil,
           decoded.ropeParameters.slidingAttention.attentionFactor == nil,
           decoded.ropeParameters.fullAttention.ropeTheta == 500_000,
           decoded.ropeParameters.fullAttention.ropeType == "yarn",

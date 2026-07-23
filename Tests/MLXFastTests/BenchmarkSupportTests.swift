@@ -161,6 +161,8 @@ func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
         $0["moe_apply_router_weight_on_input"] = true
     }
     addCase("router-softcap") { $0["moe_router_logit_softcapping"] = 30.0 }
+    addCase("router-aux-loss") { $0["router_aux_loss_coef"] = 0.1 }
+    addCase("use-cache") { $0["use_cache"] = false }
     addCase("missing-layer-types") { $0.removeValue(forKey: "layer_types") }
     addCase("layer-pattern") {
         // The dense Gemma 4 schedule (full attention every 6th layer) is

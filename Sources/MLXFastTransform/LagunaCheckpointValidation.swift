@@ -50,6 +50,11 @@ struct LagunaTransformQuantizationSpec: Equatable {
 /// runtime validates their full BF16/F32 dtype and exact geometry against
 /// `LagunaConfig` before the first forward.
 enum LagunaCheckpointValidation {
+    struct ExpectedTensorMetadata: Equatable {
+        let dtype: String
+        let shape: [Int]
+    }
+
     struct RecognizedQuantizedStem: Equatable {
         enum Kind: Equatable {
             /// Ordinary 2D projection: `[rows, in]`.
@@ -286,6 +291,168 @@ enum LagunaCheckpointValidation {
                 throw MLXFastError.invalidInput(
                     "Laguna layer \(layerIndex) router rows (\(routerExperts)) do not match the "
                         + "stacked expert count (\(experts))"
+                )
+            }
+        }
+
+        try validateExactPublicInventory(
+            selectedKeys: selectedKeys,
+            index: index,
+            headers: headers
+        )
+    }
+
+    /// Exact metadata contract extracted from the public five-shard
+    /// `poolside/Laguna-XS-2.1-NVFP4-mlx` artifact at revision
+    /// `841778bda563a36104dd521e37d99218e46f4f25`.
+    ///
+    /// This is intentionally independent of shard placement: the public
+    /// fixture pins placement and header hashes, while transform validation
+    /// pins the complete tensor namespace, dtype, and shape before copying
+    /// 21.6 GB. It rejects compressed-tensors aliases, affine companions,
+    /// split per-expert namespaces, and geometrically similar Laguna variants.
+    static func expectedTensorInventory() -> [String: ExpectedTensorMetadata] {
+        let hiddenSize = 2_048
+        let denseIntermediateSize = 8_192
+        let layerCount = 40
+        let headDimension = 128
+        let keyValueHeads = 8
+        let expertCount = 256
+        let expertIntermediateSize = 512
+        let groupSize = 16
+        let bits = 4
+
+        var inventory: [String: ExpectedTensorMetadata] = [:]
+        func add(_ name: String, _ dtype: TensorDType, _ shape: [Int]) {
+            precondition(inventory[name] == nil, "duplicate expected Laguna tensor \(name)")
+            inventory[name] = ExpectedTensorMetadata(dtype: dtype.rawValue, shape: shape)
+        }
+        func addNVFP4(_ stem: String, leadingShape: [Int], inputFeatures: Int) {
+            add(
+                "\(stem).weight",
+                .u32,
+                leadingShape + [inputFeatures * bits / 32]
+            )
+            add(
+                "\(stem).scales",
+                .u8,
+                leadingShape + [inputFeatures / groupSize]
+            )
+        }
+
+        add("model.embed_tokens.weight", .bf16, [100_352, hiddenSize])
+        add("model.norm.weight", .bf16, [hiddenSize])
+        add("lm_head.weight", .bf16, [100_352, hiddenSize])
+
+        for layerIndex in 0..<layerCount {
+            let prefix = "model.layers.\(layerIndex)"
+            let queryHeads = layerIndex.isMultiple(of: 4) ? 48 : 64
+            let queryWidth = queryHeads * headDimension
+            let keyValueWidth = keyValueHeads * headDimension
+
+            add("\(prefix).input_layernorm.weight", .bf16, [hiddenSize])
+            add("\(prefix).post_attention_layernorm.weight", .bf16, [hiddenSize])
+            add("\(prefix).self_attn.q_proj.weight", .bf16, [queryWidth, hiddenSize])
+            add("\(prefix).self_attn.k_proj.weight", .bf16, [keyValueWidth, hiddenSize])
+            add("\(prefix).self_attn.v_proj.weight", .bf16, [keyValueWidth, hiddenSize])
+            add("\(prefix).self_attn.o_proj.weight", .bf16, [hiddenSize, queryWidth])
+            add("\(prefix).self_attn.g_proj.weight", .bf16, [queryHeads, hiddenSize])
+            add("\(prefix).self_attn.q_norm.weight", .bf16, [headDimension])
+            add("\(prefix).self_attn.k_norm.weight", .bf16, [headDimension])
+
+            if layerIndex == 0 {
+                add(
+                    "\(prefix).mlp.gate_proj.weight",
+                    .bf16,
+                    [denseIntermediateSize, hiddenSize]
+                )
+                add(
+                    "\(prefix).mlp.up_proj.weight",
+                    .bf16,
+                    [denseIntermediateSize, hiddenSize]
+                )
+                add(
+                    "\(prefix).mlp.down_proj.weight",
+                    .bf16,
+                    [hiddenSize, denseIntermediateSize]
+                )
+                continue
+            }
+
+            add("\(prefix).mlp.gate.weight", .bf16, [expertCount, hiddenSize])
+            add(
+                "\(prefix).mlp.gate.e_score_correction_bias",
+                .f32,
+                [expertCount]
+            )
+            for projection in ["gate_proj", "up_proj"] {
+                addNVFP4(
+                    "\(prefix).mlp.switch_mlp.\(projection)",
+                    leadingShape: [expertCount, expertIntermediateSize],
+                    inputFeatures: hiddenSize
+                )
+                addNVFP4(
+                    "\(prefix).mlp.shared_expert.\(projection)",
+                    leadingShape: [expertIntermediateSize],
+                    inputFeatures: hiddenSize
+                )
+            }
+            addNVFP4(
+                "\(prefix).mlp.switch_mlp.down_proj",
+                leadingShape: [expertCount, hiddenSize],
+                inputFeatures: expertIntermediateSize
+            )
+            addNVFP4(
+                "\(prefix).mlp.shared_expert.down_proj",
+                leadingShape: [hiddenSize],
+                inputFeatures: expertIntermediateSize
+            )
+        }
+
+        precondition(inventory.count == 912, "Poolside Laguna inventory must contain 912 tensors")
+        return inventory
+    }
+
+    static func validateExactPublicInventory(
+        selectedKeys: Set<String>,
+        index: CheckpointIndex,
+        headers: [String: SafetensorsHeader]
+    ) throws {
+        let expected = expectedTensorInventory()
+        let expectedNames = Set(expected.keys)
+        let indexedNames = Set(index.weightMap.keys)
+        let headerNameList = headers.values.flatMap { $0.tensors.keys }
+        let headerNames = Set(headerNameList)
+
+        guard selectedKeys == expectedNames,
+              indexedNames == expectedNames,
+              headerNames == expectedNames,
+              headerNameList.count == expectedNames.count
+        else {
+            let missing = expectedNames.subtracting(indexedNames).sorted()
+            let extra = indexedNames.subtracting(expectedNames).sorted()
+            let unindexed = headerNames.subtracting(indexedNames).sorted()
+            throw MLXFastError.invalidInput(
+                "Poolside Laguna checkpoint tensor inventory must match the exact public "
+                    + "912-tensor contract (missing: \(missing.prefix(8).joined(separator: ", ")); "
+                    + "extra: \(extra.prefix(8).joined(separator: ", ")); "
+                    + "unindexed/duplicate header tensors: "
+                    + "\(unindexed.prefix(8).joined(separator: ", ")))"
+            )
+        }
+
+        for name in expected.keys.sorted() {
+            guard let expectedMetadata = expected[name] else {
+                preconditionFailure("missing expected Laguna metadata for \(name)")
+            }
+            let actual = try tensorInfo(named: name, index: index, headers: headers)
+            guard actual.dtype == expectedMetadata.dtype,
+                  actual.shape == expectedMetadata.shape
+            else {
+                throw MLXFastError.invalidInput(
+                    "Poolside Laguna tensor \(name) dtype/shape \(actual.dtype) \(actual.shape) "
+                        + "does not match exact public metadata "
+                        + "\(expectedMetadata.dtype) \(expectedMetadata.shape)"
                 )
             }
         }
