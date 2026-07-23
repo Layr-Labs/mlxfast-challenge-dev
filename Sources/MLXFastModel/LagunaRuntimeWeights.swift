@@ -27,6 +27,40 @@ public enum LagunaWeightNames {
     }
 }
 
+/// Replace sparse layers' separate NVFP4 expert gate/up pairs with the
+/// `SwitchGLU(fuseGateUp:)` parameter layout.
+func lagunaFuseRoutedGateUpWeights(
+    _ source: [String: MLXArray],
+    sparseLayerIndices: [Int]
+) throws -> [String: MLXArray] {
+    var weights = source
+    for layerIndex in sparseLayerIndices {
+        let prefix = "model.layers.\(layerIndex).mlp.switch_mlp"
+        // Poolside NVFP4 stores packed U32 weights and U8 E4M3 scales with no
+        // affine-bias companion. Both arrays have [experts, rows, input] axes,
+        // so concatenating rows preserves every expert's packed K layout.
+        for suffix in ["weight", "scales"] {
+            let gateName = "\(prefix).gate_proj.\(suffix)"
+            let upName = "\(prefix).up_proj.\(suffix)"
+            guard let gate = weights.removeValue(forKey: gateName),
+                  let up = weights.removeValue(forKey: upName)
+            else {
+                throw MLXFastError.invalidInput(
+                    "Laguna fused routed gate/up is missing \(gateName) or \(upName)"
+                )
+            }
+            guard gate.shape == up.shape, gate.ndim == 3 else {
+                throw MLXFastError.invalidInput(
+                    "Laguna routed gate/up tensors disagree for layer \(layerIndex) \(suffix)"
+                )
+            }
+            weights["\(prefix).gate_up_proj.\(suffix)"] = concatenated(
+                [gate, up], axis: -2)
+        }
+    }
+    return weights
+}
+
 /// Metadata-level access and validation for the transformed Laguna weights
 /// tree. `validateRequiredMetadata` checks that every tensor the runtime model
 /// needs is present with the
@@ -434,16 +468,19 @@ public final class LagunaRuntimeWeightCache {
         let model = LagunaRuntimeModel(config)
 
         let loadedWeights = try loadRuntimeWeightArrays(denseStore: loader.denseStore)
-        let sanitized = model.sanitize(weights: loadedWeights)
+        var sanitized = model.sanitize(weights: loadedWeights)
+        if lagunaFusedRoutedGateUpEnabled() {
+            sanitized = try lagunaFuseRoutedGateUpWeights(
+                sanitized,
+                sparseLayerIndices: (0..<config.numHiddenLayers).filter {
+                    config.isSparse(layer: $0)
+                }
+            )
+        }
         // Poolside stores dense parameters in BF16 and NVFP4 scales in U8, so
         // the library's fp16->bf16 conversion pass is a no-op and is omitted.
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
         eval(model)
-        // Build the retained fused weight layouts (fused QKV, fused
-        // shared-expert gate/up; see the DARKBLOOM_FUSED_* flags) from the
-        // now-materialized checkpoint arrays, before the constructor-time
-        // warmup so the fused kernels warm with their production shapes.
-        model.prepareFusedRuntimeWeights()
         return model
     }
 
