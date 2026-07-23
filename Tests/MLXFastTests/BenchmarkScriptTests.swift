@@ -2216,6 +2216,12 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
     #expect(staticReview.contains(
         "bind compiled template dtypes to the actual input buffers"
     ))
+    #expect(staticReview.contains(
+        "canonical fp4.h and fp8.h datatype helpers"
+    ))
+    #expect(staticReview.contains(
+        "runtime JIT fp_quantized, fp_quantized_nax, and unary sources"
+    ))
 
     // Launch-time backstop in the trusted CLI: same knobs, same defaults,
     // official fail-closed, and the TODO marker resolved.
@@ -2243,17 +2249,53 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
         Issue.record("editable surface exceeds the shipped launch budget: \(verdict)")
         return
     }
-    #expect(totalBytes > 0)
-    #expect(fileCount > 0)
+    #expect(totalBytes == 2_802_365)
+    #expect(fileCount == 177)
+    #expect(staticReview.contains("unmodified surface is 2,802,365 bytes"))
+    #expect(staticReview.contains("leaving 197,635 bytes"))
     for path in [
         "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/matmul.cpp",
         "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/jit_kernels.cpp",
         "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels.h",
+        "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/fp4.h",
+        "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/fp8.h",
     ] {
         let attributes = try FileManager.default.attributesOfItem(atPath: path)
         let bytes = try #require((attributes[.size] as? NSNumber)?.intValue)
         #expect(bytes <= EditableSurfaceByteBudget.defaultMaxFileBytes)
     }
+    let matmulAttributes = try FileManager.default.attributesOfItem(
+        atPath: "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/matmul.cpp"
+    )
+    #expect((matmulAttributes[.size] as? NSNumber)?.intValue == 86_040)
+
+    // Ranked builds consume the overlaid host dispatch source through the
+    // pinned local mlx-swift package. On Apple platforms the Cmlx target walks
+    // Source/Cmlx and does not exclude metal/matmul.cpp.
+    let rootPackage = try String(contentsOfFile: "Package.swift", encoding: .utf8)
+    let mlxPackage = try String(
+        contentsOfFile: "Vendor/mlx-swift/Package.swift",
+        encoding: .utf8
+    )
+    #expect(rootPackage.contains(#".package(path: "Vendor/mlx-swift")"#))
+    #expect(mlxPackage.contains(#"name: "Cmlx","#))
+    #expect(mlxPackage.contains(#"path: "Source/Cmlx","#))
+    let appleStart = try #require(
+        mlxPackage.range(of: "// Apple's platforms with Metal")
+    )
+    let appleEnd = try #require(
+        mlxPackage.range(
+            of: "#endif",
+            range: appleStart.upperBound..<mlxPackage.endIndex
+        )
+    )
+    let applePlatformConfiguration =
+        mlxPackage[appleStart.lowerBound..<appleEnd.lowerBound]
+    #expect(
+        !applePlatformConfiguration.contains(
+            #""mlx/mlx/backend/metal/matmul.cpp""#
+        )
+    )
 }
 
 @Test
@@ -2888,6 +2930,8 @@ func overlayScriptRejectsDangerousArtifactsAfterCopy() throws {
     )
 
     #expect(overlay.contains("validate_overlay_tree \"${target_path}\""))
+    #expect(overlay.contains("submitted editable path is missing"))
+    #expect(overlay.contains("jq -r '.editablePaths[]'"))
     #expect(overlay.contains("overlaid editable paths must not contain symlinks"))
     #expect(overlay.contains("overlaid editable paths must contain only regular files and directories"))
     #expect(overlay.contains("-links +1"))

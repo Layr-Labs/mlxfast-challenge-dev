@@ -120,7 +120,7 @@ struct DefaultTrackTests {
         )
         let editablePaths = try #require(track["editablePaths"] as? [String])
         #expect(!editablePaths.isEmpty)
-        #expect(editablePaths.count == 95)
+        #expect(editablePaths.count == 97)
         #expect(Set(editablePaths).count == editablePaths.count, "editablePaths must be unique")
 
         let requiredFullStackPaths = [
@@ -129,6 +129,8 @@ struct DefaultTrackTests {
             "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/matmul.cpp",
             "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/jit_kernels.cpp",
             "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels.h",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/fp4.h",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/fp8.h",
             "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/sort.metal",
             "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/sort.h",
             "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/reduce.metal",
@@ -156,6 +158,22 @@ struct DefaultTrackTests {
             ),
             "host-side MLX edits must stay limited to exact reviewed files"
         )
+        for trustedRoot in [
+            ".github",
+            "correctness_prompts",
+            "fixtures",
+            "Sources/MLXFastCLI",
+            "Sources/MLXFastCore",
+            "Sources/MLXFastHarness",
+            "Sources/MLXFastTrustedHarness",
+        ] {
+            #expect(
+                !editablePaths.contains {
+                    $0 == trustedRoot || $0.hasPrefix(trustedRoot + "/")
+                },
+                "distribution, golden, and trusted harness tooling must stay excluded: \(trustedRoot)"
+            )
+        }
 
         let fm = FileManager.default
         for path in editablePaths {

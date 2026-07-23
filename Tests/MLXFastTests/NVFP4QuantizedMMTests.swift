@@ -6,6 +6,67 @@ import Testing
 @Suite(.serialized)
 struct NVFP4QuantizedMMTests {
     @Test
+    func nvfp4DatatypeHelpersStayInAOTAndJITSources() throws {
+        let kernelRoot =
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels"
+        let generatedRoot =
+            "Vendor/mlx-swift/Source/Cmlx/mlx-generated"
+        let fp4 = try String(contentsOfFile: "\(kernelRoot)/fp4.h", encoding: .utf8)
+        let fp8 = try String(contentsOfFile: "\(kernelRoot)/fp8.h", encoding: .utf8)
+        let fp4Body = fp4.components(separatedBy: "\n").dropFirst(2)
+            .joined(separator: "\n")
+        let fp8Body = fp8.components(separatedBy: "\n").dropFirst(2)
+            .joined(separator: "\n")
+
+        #expect(fp4Body.contains("struct fp4_e2m1"))
+        #expect(fp8Body.contains("struct fp8_e4m3"))
+        #expect(fp8Body.contains("struct fp8_e8m0"))
+
+        for path in [
+            "\(kernelRoot)/fp_quantized.h",
+            "\(kernelRoot)/fp_quantized_nax.h",
+        ] {
+            let aot = try String(contentsOfFile: path, encoding: .utf8)
+            #expect(aot.contains(#"#include "mlx/backend/metal/kernels/fp4.h""#))
+            #expect(aot.contains(#"#include "mlx/backend/metal/kernels/fp8.h""#))
+        }
+
+        for path in [
+            "\(generatedRoot)/fp_quantized.cpp",
+            "\(generatedRoot)/fp_quantized_nax.cpp",
+        ] {
+            let jit = try String(contentsOfFile: path, encoding: .utf8)
+            #expect(jit.contains(#"Contents from "mlx/backend/metal/kernels/fp4.h""#))
+            #expect(jit.contains(#"Contents from "mlx/backend/metal/kernels/fp8.h""#))
+            #expect(jit.contains(fp4Body))
+            #expect(jit.contains(fp8Body))
+        }
+
+        let unaryAOT = try String(
+            contentsOfFile: "\(kernelRoot)/unary_ops.h",
+            encoding: .utf8
+        )
+        let unaryJIT = try String(
+            contentsOfFile: "\(generatedRoot)/unary_ops.cpp",
+            encoding: .utf8
+        )
+        #expect(unaryAOT.contains(#"#include "mlx/backend/metal/kernels/fp8.h""#))
+        #expect(unaryJIT.contains(#"Contents from "mlx/backend/metal/kernels/fp8.h""#))
+        #expect(unaryJIT.contains(fp8Body))
+    }
+
+    @Test
+    func nvfp4Group16SplitKUsesKernelTileAlignment() throws {
+        let source = try String(
+            contentsOfFile:
+                "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/quantized.cpp",
+            encoding: .utf8
+        )
+        #expect(source.contains("int k_align = std::max(group_size, 32);"))
+        #expect(!source.contains("int k_align = group_size;"))
+    }
+
+    @Test
     func nvfp4PackedNibblesDecodeLowNibbleFirstWhenRuntimeTestsAreEnabled() {
         guard nvfp4RuntimeTestsEnabled else { return }
 
