@@ -407,7 +407,10 @@ final class LagunaRuntimeMoEGate: Module {
         self._eScoreCorrectionBias.wrappedValue = zeros([config.numExperts])
     }
 
-    func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
+    func callAsFunction(
+        _ x: MLXArray,
+        normalizeWeights: Bool = true
+    ) -> (MLXArray, MLXArray) {
         if routerLogitSoftcapping <= 0 {
             // Pinned Laguna XS contract (config load rejects a nonzero
             // router softcap): the raw BF16 matmul feeds the compiled fused
@@ -418,7 +421,7 @@ final class LagunaRuntimeMoEGate: Module {
             let scores = tail[0]
             let inds = argPartition(tail[1], kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
             var weights = takeAlong(scores, inds, axis: -1)
-            if normTopkProb {
+            if normTopkProb && normalizeWeights {
                 weights = lagunaCompiledTopKNormalize(weights)
             }
             return (inds, weights)
@@ -434,7 +437,7 @@ final class LagunaRuntimeMoEGate: Module {
 
         let inds = argPartition(-scoresForChoice, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
         var weights = takeAlong(scores, inds, axis: -1)
-        if normTopkProb {
+        if normTopkProb && normalizeWeights {
             weights = weights / weights.sum(axis: -1, keepDims: true)
         }
         return (inds, weights)
@@ -454,7 +457,23 @@ private let lagunaCompiledExpertCombine: @Sendable (
     return routed * Float(LagunaConstants.moeRoutedScalingFactor) + shared
 }
 
+/// Pinned Laguna XS tail with top-k normalization kept in the same compiled
+/// graph as the promoted expert combine. Arithmetic order remains:
+/// FP32 normalize -> output-dtype cast -> weighted reduction -> * 2.5 -> add.
+private let lagunaCompiledNormalizedExpertCombine: @Sendable (
+    MLXArray, MLXArray, MLXArray
+) -> MLXArray = compile(shapeless: true) { outputs, weights, shared in
+    let normalized = weights / weights.sum(axis: -1, keepDims: true)
+    let typedWeights = normalized.asType(outputs.dtype)
+    let routed =
+        (outputs * MLX.expandedDimensions(typedWeights, axis: -1))
+        .sum(axis: -2)
+    return routed * Float(LagunaConstants.moeRoutedScalingFactor) + shared
+}
+
 final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
+    let usesDeferredTopKNormalization: Bool
+
     @ModuleInfo(key: "gate") var gate: LagunaRuntimeMoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "shared_expert") var sharedExpert: LagunaRuntimeMLP
@@ -524,6 +543,10 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     }
 
     init(_ config: LagunaConfig) {
+        self.usesDeferredTopKNormalization =
+            config.normTopkProb
+            && config.moeRouterLogitSoftcapping <= 0
+            && config.moeRoutedScalingFactor == LagunaConstants.moeRoutedScalingFactor
         self._gate.wrappedValue = LagunaRuntimeMoEGate(config)
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
@@ -537,7 +560,10 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let (inds, weights) = gate(x)
+        let (inds, weights) = gate(
+            x,
+            normalizeWeights: !usesDeferredTopKNormalization
+        )
         var y: MLXArray
         if let fusedWeight = _fusedRoutedGateUpWeight,
             let fusedScales = _fusedRoutedGateUpScales,
@@ -576,6 +602,13 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
             y = MLX.squeezed(downProj(activated, inds, sortedIndices: false), axis: -2)
         } else {
             y = switchMLP(x, inds)
+        }
+        if usesDeferredTopKNormalization {
+            return lagunaCompiledNormalizedExpertCombine(
+                y,
+                weights,
+                sharedExpert(x)
+            )
         }
         return lagunaCompiledExpertCombine(
             y,
