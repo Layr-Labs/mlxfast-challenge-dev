@@ -94,9 +94,12 @@ let lagunaFusedRoutedGateUpEnabled =
 
 // MARK: - Attention
 
-private let lagunaCompiledSoftplusGate: @Sendable (MLXArray) -> MLXArray = {
-    let body: @Sendable (MLXArray) -> MLXArray = { gate in
-        softplus(gate.asType(.float32)).asType(gate.dtype)
+private let lagunaCompiledPerHeadGate: @Sendable (
+    MLXArray, MLXArray
+) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { output, projectedGate in
+        let gate = softplus(projectedGate.asType(.float32)).asType(output.dtype)
+        return output * gate[.ellipsis, .newAxis]
     }
     return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
@@ -251,15 +254,23 @@ final class LagunaRuntimeAttention: Module {
             // across the head dimension (or applied elementwise for a
             // per-element gate).
             let projectedGate = gProj(x)
-            let gate = gatePerHead && projectedGate.dtype == output.dtype
-                ? lagunaCompiledSoftplusGate(projectedGate)
-                : softplus(projectedGate.asType(.float32)).asType(output.dtype)
-            if gatePerHead {
+            if gatePerHead && projectedGate.dtype == output.dtype {
                 output =
-                    (output.reshaped(B, L, nHeads, headDim) * gate[.ellipsis, .newAxis])
+                    lagunaCompiledPerHeadGate(
+                        output.reshaped(B, L, nHeads, headDim),
+                        projectedGate
+                    )
                     .reshaped(B, L, -1)
             } else {
-                output = output * gate
+                let gate = softplus(projectedGate.asType(.float32)).asType(output.dtype)
+                if gatePerHead {
+                    output =
+                        (output.reshaped(B, L, nHeads, headDim)
+                            * gate[.ellipsis, .newAxis])
+                        .reshaped(B, L, -1)
+                } else {
+                    output = output * gate
+                }
             }
         }
 
