@@ -441,9 +441,20 @@ final class LagunaRuntimeMoEGate: Module {
     }
 }
 
-final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
-    let routedScalingFactor: Float
+/// Compile the routed expert weighting, Laguna's pinned routed scale, and the
+/// shared-expert residual as one graph. This preserves the eager expression
+/// order (weighted reduction -> scale -> add) while avoiding a separately
+/// materialized routed subtotal between the final sparse-MoE operations.
+private let lagunaCompiledExpertCombine: @Sendable (
+    MLXArray, MLXArray, MLXArray
+) -> MLXArray = compile(shapeless: true) { outputs, weights, shared in
+    let routed =
+        (outputs * MLX.expandedDimensions(weights, axis: -1))
+        .sum(axis: -2)
+    return routed * Float(LagunaConstants.moeRoutedScalingFactor) + shared
+}
 
+final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     @ModuleInfo(key: "gate") var gate: LagunaRuntimeMoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "shared_expert") var sharedExpert: LagunaRuntimeMLP
@@ -513,7 +524,6 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     }
 
     init(_ config: LagunaConfig) {
-        self.routedScalingFactor = Float(config.moeRoutedScalingFactor)
         self._gate.wrappedValue = LagunaRuntimeMoEGate(config)
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
@@ -567,11 +577,11 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         } else {
             y = switchMLP(x, inds)
         }
-        y = weightedExpertSum(y, weights.asType(y.dtype))
-        if routedScalingFactor != 1 {
-            y = y * routedScalingFactor
-        }
-        return y + sharedExpert(x)
+        return lagunaCompiledExpertCombine(
+            y,
+            weights.asType(y.dtype),
+            sharedExpert(x)
+        )
     }
 }
 
