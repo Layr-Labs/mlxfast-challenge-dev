@@ -457,6 +457,19 @@ private let lagunaCompiledExpertCombine: @Sendable (
     return routed * Float(LagunaConstants.moeRoutedScalingFactor) + shared
 }
 
+/// Generic sparse-layer variant that also retains the decoder residual add
+/// in the compiled combine. Grouping matches the eager layer exactly:
+/// residual + ((weighted expert reduction * 2.5) + shared expert).
+private let lagunaCompiledExpertCombineWithResidual: @Sendable (
+    MLXArray, MLXArray, MLXArray, MLXArray
+) -> MLXArray = compile(shapeless: true) { outputs, weights, shared, residual in
+    let routed =
+        (outputs * MLX.expandedDimensions(weights, axis: -1))
+        .sum(axis: -2)
+    let moe = routed * Float(LagunaConstants.moeRoutedScalingFactor) + shared
+    return residual + moe
+}
+
 /// Pinned Laguna XS tail with top-k normalization kept in the same compiled
 /// graph as the promoted expert combine. Arithmetic order remains:
 /// FP32 normalize -> output-dtype cast -> weighted reduction -> * 2.5 -> add.
@@ -469,6 +482,20 @@ private let lagunaCompiledNormalizedExpertCombine: @Sendable (
         (outputs * MLX.expandedDimensions(typedWeights, axis: -1))
         .sum(axis: -2)
     return routed * Float(LagunaConstants.moeRoutedScalingFactor) + shared
+}
+
+/// Pinned normalized tail plus the outer sparse decoder residual. Arithmetic
+/// stays residual + ((normalize -> cast -> reduction -> * 2.5) + shared).
+private let lagunaCompiledNormalizedExpertCombineWithResidual: @Sendable (
+    MLXArray, MLXArray, MLXArray, MLXArray
+) -> MLXArray = compile(shapeless: true) { outputs, weights, shared, residual in
+    let normalized = weights / weights.sum(axis: -1, keepDims: true)
+    let typedWeights = normalized.asType(outputs.dtype)
+    let routed =
+        (outputs * MLX.expandedDimensions(typedWeights, axis: -1))
+        .sum(axis: -2)
+    let moe = routed * Float(LagunaConstants.moeRoutedScalingFactor) + shared
+    return residual + moe
 }
 
 final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
@@ -560,6 +587,14 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        callAsFunction(x, residual: nil)
+    }
+
+    func callAsFunction(_ x: MLXArray, residual: MLXArray) -> MLXArray {
+        callAsFunction(x, residual: Optional(residual))
+    }
+
+    private func callAsFunction(_ x: MLXArray, residual: MLXArray?) -> MLXArray {
         let (inds, weights) = gate(
             x,
             normalizeWeights: !usesDeferredTopKNormalization
@@ -603,17 +638,35 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         } else {
             y = switchMLP(x, inds)
         }
+        let shared = sharedExpert(x)
         if usesDeferredTopKNormalization {
+            if let residual {
+                return lagunaCompiledNormalizedExpertCombineWithResidual(
+                    y,
+                    weights,
+                    shared,
+                    residual
+                )
+            }
             return lagunaCompiledNormalizedExpertCombine(
                 y,
                 weights,
-                sharedExpert(x)
+                shared
+            )
+        }
+        let typedWeights = weights.asType(y.dtype)
+        if let residual {
+            return lagunaCompiledExpertCombineWithResidual(
+                y,
+                typedWeights,
+                shared,
+                residual
             )
         }
         return lagunaCompiledExpertCombine(
             y,
-            weights.asType(y.dtype),
-            sharedExpert(x)
+            typedWeights,
+            shared
         )
     }
 }
@@ -651,8 +704,11 @@ final class LagunaRuntimeDecoderLayer: Module {
     ) -> MLXArray {
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
         let h = x + r
-        let r2 = mlp(postAttentionLayerNorm(h))
-        return h + r2
+        let mlpInput = postAttentionLayerNorm(h)
+        if let sparseMLP = mlp as? LagunaRuntimeSparseMoEBlock {
+            return sparseMLP(mlpInput, residual: h)
+        }
+        return h + mlp(mlpInput)
     }
 }
 
