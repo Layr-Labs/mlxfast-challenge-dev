@@ -1030,6 +1030,93 @@ template <
       w, scales, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
+// Dequantize the transposed-B (nt) NAX fragments of an fp4 weight tile
+// directly from device memory into registers, bypassing the threadgroup
+// staging buffer. Bit-exact with the staged path: for group_size 16 /
+// bfloat it applies the identical SWAR half bit-pattern decode and the
+// identical scale_pre = scale * 2^14 bfloat multiply documented in
+// QuantizedBlockLoader::load_unsafe (same patterns, same elementwise
+// bfloat multiply, so each fragment register holds exactly the bits the
+// staged Ws slot would hold); otherwise it evaluates the loader's scalar
+// expression scale * Dequantize<4>(code) per nibble. Fragment (nn, kk)
+// element [r * 4 + j] corresponds to weight row (nn * 16 + coord.y +
+// r * 8) relative to wb and column k0 + kk * 16 + coord.x + j, matching
+// NAXFrag::load's layout for a row-major staged tile, so tile_matmad_nax
+// consumes identical operand values in identical positions. Rows at or
+// beyond row_lim and 4-column chunks at or beyond col_lim are zero-filled
+// without touching device memory (each lane's chunk base coord.x is
+// 4-aligned inside a 16-aligned fragment and col_lim = K is a multiple of
+// group_size >= 16, so a chunk never straddles col_lim, and one scale
+// byte covers all 4 columns).
+template <
+    typename Wtype,
+    int group_size,
+    int BR,
+    int BC,
+    bool safe_rows,
+    bool safe_cols>
+METAL_FUNC void load_fp4_bfrags_nt(
+    thread NAXTile<Wtype, BR, BC>& Btile,
+    const device uint8_t* wb, // codes at (fragment row 0, column 0 of row)
+    const device uint8_t* sb, // scales at (fragment row 0, group 0 of row)
+    const int K_w, // code bytes per weight row
+    const int K_g, // scale bytes per weight row
+    const int k0, // column of this tile's first element (16-aligned)
+    const short row_lim, // valid rows relative to wb / sb
+    const int col_lim) { // valid columns (absolute, like k0)
+  const short2 sc = NAXTile<Wtype, BR, BC>::NAXFrag_t::get_coord();
+  const_for_loop<0, BR, 1>([&](auto idx_nn) {
+    const_for_loop<0, BC, 1>([&](auto idx_kk) {
+      thread auto& frag = Btile.template frag_at<idx_nn.value, idx_kk.value>();
+      const int k4 = k0 + idx_kk.value * 16 + sc.x;
+      const bool col_ok = !safe_cols || (k4 < col_lim);
+      STEEL_PRAGMA_UNROLL
+      for (short r = 0; r < 2; r++) {
+        const short row = idx_nn.value * 16 + sc.y + r * 8;
+        vec<Wtype, 4> vals;
+        if ((!safe_rows || row < row_lim) && col_ok) {
+          const uint32_t c =
+              uint32_t(*(const device ushort*)(wb + row * K_w + (k4 >> 1)));
+          const Wtype scale = dequantize_scale<Wtype, group_size>(
+              sb[row * K_g + (k4 / group_size)]);
+          if constexpr (group_size == 16 && metal::is_same_v<Wtype, bfloat>) {
+            // Same bit patterns and multiply as the loader's SWAR path;
+            // the zero high halfword of c only feeds the unused .y lanes.
+            const Wtype scale_pre = scale * static_cast<Wtype>(16384.0f);
+            const uint32_t p0 =
+                ((c & 0x00070007u) << 9) | ((c & 0x00080008u) << 12);
+            const uint32_t p1 =
+                ((c & 0x00700070u) << 5) | ((c & 0x00800080u) << 8);
+            const uint32_t p2 =
+                ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4);
+            const uint32_t p3 = ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
+            vals = vec<Wtype, 4>(
+                       vec<Wtype, 2>(as_type<half2>(p0)).x,
+                       vec<Wtype, 2>(as_type<half2>(p1)).x,
+                       vec<Wtype, 2>(as_type<half2>(p2)).x,
+                       vec<Wtype, 2>(as_type<half2>(p3)).x) *
+                scale_pre;
+          } else {
+            // Same expressions as the loader's scalar dequantize path.
+            const uint8_t b0 = uint8_t(c & 0xffu);
+            const uint8_t b1 = uint8_t((c >> 8) & 0xffu);
+            vals[0] = scale * Dequantize<4, Wtype>{}(b0);
+            vals[1] = scale * Dequantize<4, Wtype>{}(b0 >> 4);
+            vals[2] = scale * Dequantize<4, Wtype>{}(b1);
+            vals[3] = scale * Dequantize<4, Wtype>{}(b1 >> 4);
+          }
+        } else {
+          vals = vec<Wtype, 4>(Wtype(0));
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < 4; j++) {
+          frag[r * 4 + j] = vals[j];
+        }
+      }
+    });
+  });
+}
+
 template <
     typename T,
     int group_size,
@@ -1068,10 +1155,15 @@ template <
       group_size,
       bits>;
 
-  // Two staging buffers for software-pipelined (double-buffered) weight
-  // tile loads.
+  // The nt fp4 path dequantizes B fragments directly from device memory
+  // into registers (load_fp4_bfrags_nt above): no threadgroup weight
+  // staging and no k-loop barriers, so the staged pipeline below is
+  // compiled out and the threadgroup allocation shrinks to a token
+  // element. Other configurations keep the two staging buffers for
+  // software-pipelined (double-buffered) weight tile loads.
+  constexpr bool kRegisterB = transpose && (bits == 4);
   constexpr int Ws_tile = transpose ? BN * BK_padded : BK * BN_padded;
-  threadgroup Wtype Ws[2 * Ws_tile];
+  threadgroup Wtype Ws[kRegisterB ? 1 : 2 * Ws_tile];
 
   // Compute the block
   const int K_w = K * bytes_per_pack / pack_factor;
@@ -1150,44 +1242,114 @@ template <
 
     const device T* xn = x + tm * K;
 
-    // Prepare threadgroup loading operations
-    thread loader_w_t loader_w(
-        wl + index * stride_w,
-        scales + index * stride_s,
-        transpose ? K : N,
-        Ws,
-        simd_group_id,
-        simd_lane_id);
-
     dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
       dispatch_bool(align_N || !is_unaligned_bn, [&](auto kAlignedN) {
-        // Software-pipelined k-loop over the double-buffered Ws: while the
-        // mma consumes the weight tile staged in one half, the loader
-        // streams the next k tile into the other half. The prologue
-        // barrier orders every Ws reader of the previous expert segment
-        // before tile 0 overwrites buffer 0; the single barrier per
-        // iteration then (a) makes the previously staged tile visible to
-        // every mma reader and (b) guarantees every reader of the half
-        // about to be overwritten has finished. The device load/dequant
-        // sequence and the per-element mma sequence are identical to the
-        // unpipelined loop; only the phases overlap.
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (K_it > 0) {
-          if constexpr (kAlignedN.value) {
-            loader_w.load_unsafe();
-          } else {
-            loader_w.load_safe(
-                transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
+        if constexpr (kRegisterB) {
+          // Register B-dequant k-loop: each simdgroup dequantizes its own
+          // B fragments straight from device codes/scales into registers,
+          // so there is no Ws staging, no k-loop barrier, and nothing
+          // shared between simdgroups inside the loop. The (k, kk1, kk)
+          // mma sequence and every operand bit match the staged pipeline
+          // exactly (see load_fp4_bfrags_nt); only where the dequantized
+          // values live changes.
+          const device uint8_t* wb =
+              wl + index * stride_w + size_t(tn) * size_t(K_w);
+          const device uint8_t* sb =
+              scales + index * stride_s + size_t(tn) * size_t(K_g);
+          const short row_lim = short(tgp_bn - tn);
+
+          for (int k = 0; k < K_it; k++) {
+            STEEL_PRAGMA_NO_UNROLL
+            for (short kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<Wtype, BR, BC> Btile;
+
+              volatile int compiler_barrier;
+
+              if constexpr (kAlignedM.value) {
+                Atile.load(xn + kk1, K);
+              } else {
+                Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+              }
+
+              load_fp4_bfrags_nt<
+                  Wtype,
+                  group_size,
+                  BR,
+                  BC,
+                  !kAlignedN.value,
+                  false>(Btile, wb, sb, K_w, K_g, k * BK + kk1, row_lim, K);
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<transpose>{});
+
+              (void)compiler_barrier;
+            }
+
+            xn += BK;
           }
-          loader_w.next();
-          loader_w.shift_dst(Ws_tile);
-        }
 
-        short cur = 0;
-        for (int k = 0; k < K_it; k++) {
+          if (!align_K) {
+            // K tail: zero-fill both operands beyond the true remaining
+            // columns so the tail mma adds exact zeros there, mirroring
+            // the staged tail's zero-padded Ws semantics.
+            const int kb = K_it * BK;
+            const short k_len = short(K - kb);
+
+            STEEL_PRAGMA_NO_UNROLL
+            for (short kk1 = 0; kk1 < k_len; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<Wtype, BR, BC> Btile;
+
+              volatile int compiler_barrier;
+
+              const short psk = min(int(SK), max(0, (k_len - kk1)));
+              Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+
+              load_fp4_bfrags_nt<
+                  Wtype,
+                  group_size,
+                  BR,
+                  BC,
+                  !kAlignedN.value,
+                  true>(Btile, wb, sb, K_w, K_g, kb + kk1, row_lim, K);
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<transpose>{});
+
+              (void)compiler_barrier;
+            }
+          }
+        } else {
+          // Prepare threadgroup loading operations
+          thread loader_w_t loader_w(
+              wl + index * stride_w,
+              scales + index * stride_s,
+              transpose ? K : N,
+              Ws,
+              simd_group_id,
+              simd_lane_id);
+
+          // Software-pipelined k-loop over the double-buffered Ws: while
+          // the mma consumes the weight tile staged in one half, the
+          // loader streams the next k tile into the other half. The
+          // prologue barrier orders every Ws reader of the previous expert
+          // segment before tile 0 overwrites buffer 0; the single barrier
+          // per iteration then (a) makes the previously staged tile
+          // visible to every mma reader and (b) guarantees every reader of
+          // the half about to be overwritten has finished. The device
+          // load/dequant sequence and the per-element mma sequence are
+          // identical to the unpipelined loop; only the phases overlap.
           threadgroup_barrier(mem_flags::mem_threadgroup);
-
-          if (k + 1 < K_it) {
+          if (K_it > 0) {
             if constexpr (kAlignedN.value) {
               loader_w.load_unsafe();
             } else {
@@ -1195,86 +1357,102 @@ template <
                   transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
             }
             loader_w.next();
-            loader_w.shift_dst(cur ? Ws_tile : -Ws_tile);
+            loader_w.shift_dst(Ws_tile);
           }
 
-          const threadgroup Wtype* Wk = Ws + cur * Ws_tile;
+          short cur = 0;
+          for (int k = 0; k < K_it; k++) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<Wtype, BR, BC> Btile;
-
-            volatile int compiler_barrier;
-
-            if constexpr (kAlignedM.value) {
-              Atile.load(xn + kk1, K);
-            } else {
-              Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+            if (k + 1 < K_it) {
+              if constexpr (kAlignedN.value) {
+                loader_w.load_unsafe();
+              } else {
+                loader_w.load_safe(
+                    transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
+              }
+              loader_w.next();
+              loader_w.shift_dst(cur ? Ws_tile : -Ws_tile);
             }
 
-            if constexpr (transpose) {
-              Btile.template load<Wtype, BK_padded, 1>(
-                  Wk + tn * BK_padded + kk1);
-            } else {
-              Btile.template load<Wtype, BN_padded, 1>(
-                  Wk + tn + kk1 * BN_padded);
+            const threadgroup Wtype* Wk = Ws + cur * Ws_tile;
+
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<Wtype, BR, BC> Btile;
+
+              volatile int compiler_barrier;
+
+              if constexpr (kAlignedM.value) {
+                Atile.load(xn + kk1, K);
+              } else {
+                Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+              }
+
+              if constexpr (transpose) {
+                Btile.template load<Wtype, BK_padded, 1>(
+                    Wk + tn * BK_padded + kk1);
+              } else {
+                Btile.template load<Wtype, BN_padded, 1>(
+                    Wk + tn + kk1 * BN_padded);
+              }
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<transpose>{});
+
+              (void)compiler_barrier;
             }
 
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<transpose>{});
-
-            (void)compiler_barrier;
+            xn += BK;
+            cur ^= 1;
           }
 
-          xn += BK;
-          cur ^= 1;
-        }
+          if (!align_K) {
+            // The K tail stages into Ws half `cur` (the half the last main
+            // iteration's mma did not read), so the first barrier only has
+            // to publish it before the tail mma below.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            loader_w.load_safe(tile_w);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (!align_K) {
-          // The K tail stages into Ws half `cur` (the half the last main
-          // iteration's mma did not read), so the first barrier only has
-          // to publish it before the tail mma below.
+            const threadgroup Wtype* Wk = Ws + cur * Ws_tile;
+
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<Wtype, BR, BC> Btile;
+
+              volatile int compiler_barrier;
+
+              const short psk = min(int(SK), max(0, (BK - kk1)));
+              Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+
+              if constexpr (transpose) {
+                Btile.template load<Wtype, BK_padded, 1>(
+                    Wk + tn * BK_padded + kk1);
+              } else {
+                Btile.template load<Wtype, BN_padded, 1>(
+                    Wk + tn + kk1 * BN_padded);
+              }
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<transpose>{});
+
+              (void)compiler_barrier;
+            }
+          }
+
           threadgroup_barrier(mem_flags::mem_threadgroup);
-          loader_w.load_safe(tile_w);
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-
-          const threadgroup Wtype* Wk = Ws + cur * Ws_tile;
-
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<Wtype, BR, BC> Btile;
-
-            volatile int compiler_barrier;
-
-            const short psk = min(int(SK), max(0, (BK - kk1)));
-            Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
-
-            if constexpr (transpose) {
-              Btile.template load<Wtype, BK_padded, 1>(
-                  Wk + tn * BK_padded + kk1);
-            } else {
-              Btile.template load<Wtype, BN_padded, 1>(
-                  Wk + tn + kk1 * BN_padded);
-            }
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<transpose>{});
-
-            (void)compiler_barrier;
-          }
         }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         const short m_lo_lim = min(int(sgp_sm), max(0, offset - tm));
         const short m_hi_lim = min(int(sgp_sm), max(0, offset_next - tm));
