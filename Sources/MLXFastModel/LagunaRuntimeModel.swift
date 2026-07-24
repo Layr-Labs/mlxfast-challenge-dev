@@ -375,6 +375,24 @@ private let lagunaCompiledRouterTail: @Sendable ([MLXArray]) -> [MLXArray] = {
     return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+/// Pinned top-8 router selection expressed as one compiled graph while still
+/// dispatching MLX's stock argPartition and takeAlong implementations. This
+/// preserves partition ordering and selected pre-bias weights exactly.
+private let lagunaCompiledRouterTop8: @Sendable ([MLXArray]) -> [MLXArray] = {
+    let body: @Sendable ([MLXArray]) -> [MLXArray] = { inputs in
+        let scores = sigmoid(inputs[0].asType(.float32))
+        let scoresForChoice = scores + inputs[1].asType(scores.dtype)
+        let inds = argPartition(
+            -scoresForChoice,
+            kth: LagunaConstants.numExpertsPerTok - 1,
+            axis: -1
+        )[.ellipsis, ..<LagunaConstants.numExpertsPerTok]
+        let weights = takeAlong(scores, inds, axis: -1)
+        return [inds, weights]
+    }
+    return compile(shapeless: true, body)
+}()
+
 /// Compiled top-k mixture-weight renormalization
 /// (`weights / weights.sum(axis: -1, keepDims: true)`), the router's
 /// `normTopkProb` tail. Identical expression tree to the eager code: the
@@ -412,6 +430,17 @@ final class LagunaRuntimeMoEGate: Module {
         normalizeWeights: Bool = true
     ) -> (MLXArray, MLXArray) {
         if routerLogitSoftcapping <= 0 {
+            if topK == LagunaConstants.numExpertsPerTok {
+                let selected = lagunaCompiledRouterTop8([
+                    x.matmul(weight.T), eScoreCorrectionBias,
+                ])
+                var weights = selected[1]
+                if normTopkProb && normalizeWeights {
+                    weights = lagunaCompiledTopKNormalize(weights)
+                }
+                return (selected[0], weights)
+            }
+
             // Pinned Laguna XS contract (config load rejects a nonzero
             // router softcap): the raw BF16 matmul feeds the compiled fused
             // tail, which returns the pre-bias sigmoid scores and the exact
