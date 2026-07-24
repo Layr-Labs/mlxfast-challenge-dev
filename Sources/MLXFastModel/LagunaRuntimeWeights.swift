@@ -439,6 +439,12 @@ public final class LagunaRuntimeWeightCache {
         // the library's fp16->bf16 conversion pass is a no-op and is omitted.
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
         eval(model)
+        let compressedLMHead = model.prepareCompressedLMHead(
+            bytes: try loader.denseStore.tensorBytes(named: "lm_head.weight")
+        )
+        if !compressedLMHead.isEmpty {
+            eval(compressedLMHead)
+        }
         // Build the retained fused weight layouts (fused QKV, fused
         // shared-expert gate/up; see the DARKBLOOM_FUSED_* flags) from the
         // now-materialized checkpoint arrays, before the constructor-time

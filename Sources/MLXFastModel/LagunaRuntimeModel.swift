@@ -92,6 +92,107 @@ let lagunaFusedSharedGateUpEnabled =
 let lagunaFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_GATE_UP"] != "0"
 
+let lagunaCompressedLMHeadEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_COMPRESSED_LM_HEAD"] != "0"
+
+private let lagunaCompressedBF16Gemv = MLXFast.metalKernel(
+    name: "laguna_compressed_bf16_gemv",
+    inputNames: [
+        "x", "sign_mantissa", "exponent_delta", "base_exponent",
+        "escape_exponent_0", "escape_exponent_1", "fallback_values",
+    ],
+    outputNames: ["out"],
+    source: """
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+        const uint first_row = threadgroup_position_in_grid.x * 32 + simd_group * 4;
+
+        float result[4] = {0.0f};
+        for (uint k_base = lane * 4; k_base < K; k_base += 128) {
+            float input_values[4];
+            for (uint k_inner = 0; k_inner < 4; ++k_inner) {
+                input_values[k_inner] = static_cast<float>(x[k_base + k_inner]);
+            }
+
+            for (uint row_inner = 0; row_inner < 4; ++row_inner) {
+                const uint row = first_row + row_inner;
+                const uint weight_base = row * K + k_base;
+                const uint block = weight_base >> 6;
+                const uchar base = base_exponent[block];
+                bfloat16_t weights[4];
+                if (base == uchar(0xff)) {
+                    const ushort fallback = ushort(escape_exponent_0[block])
+                        | (ushort(escape_exponent_1[block]) << 8);
+                    const device ushort4* source =
+                        reinterpret_cast<const device ushort4*>(
+                            fallback_values + uint(fallback) * 64 + (weight_base & 63));
+                    const ushort4 raw = *source;
+                    weights[0] = as_type<bfloat16_t>(raw.x);
+                    weights[1] = as_type<bfloat16_t>(raw.y);
+                    weights[2] = as_type<bfloat16_t>(raw.z);
+                    weights[3] = as_type<bfloat16_t>(raw.w);
+                } else {
+                    const device uchar4* sm_source =
+                        reinterpret_cast<const device uchar4*>(
+                            sign_mantissa + weight_base);
+                    const uchar4 sm = *sm_source;
+                    const device ushort* code_source =
+                        reinterpret_cast<const device ushort*>(
+                            exponent_delta + (weight_base >> 1));
+                    const ushort packed_codes = *code_source;
+                    for (uint k_inner = 0; k_inner < 4; ++k_inner) {
+                        const uchar code = uchar((packed_codes >> (k_inner * 4)) & 15);
+                        const uchar exponent = code < 14
+                            ? base + code
+                            : (code == 14
+                                ? escape_exponent_0[block]
+                                : escape_exponent_1[block]);
+                        const uchar sm_value = sm[k_inner];
+                        const ushort weight_bits = ushort(sm_value & 0x7f)
+                            | (ushort(sm_value & 0x80) << 8)
+                            | (ushort(exponent) << 7);
+                        weights[k_inner] = as_type<bfloat16_t>(weight_bits);
+                    }
+                }
+                for (uint k_inner = 0; k_inner < 4; ++k_inner) {
+                    result[row_inner] +=
+                        static_cast<float>(weights[k_inner]) * input_values[k_inner];
+                }
+            }
+        }
+
+        for (uint row_inner = 0; row_inner < 4; ++row_inner) {
+            for (ushort offset = 16; offset >= 1; offset >>= 1) {
+                result[row_inner] += simd_shuffle_down(result[row_inner], offset);
+            }
+        }
+        if (lane == 0) {
+            for (uint row_inner = 0; row_inner < 4; ++row_inner) {
+                out[first_row + row_inner] = static_cast<bfloat16_t>(result[row_inner]);
+            }
+        }
+        """,
+    ensureRowContiguous: false
+)
+
+private struct LagunaCompressedBF16Matrix {
+    let signMantissa: MLXArray
+    let exponentDelta: MLXArray
+    let baseExponent: MLXArray
+    let escapeExponent0: MLXArray
+    let escapeExponent1: MLXArray
+    let fallbackValues: MLXArray
+    let rows: Int
+    let columns: Int
+
+    var arrays: [MLXArray] {
+        [
+            signMantissa, exponentDelta, baseExponent, escapeExponent0,
+            escapeExponent1, fallbackValues,
+        ]
+    }
+}
+
 // MARK: - Attention
 
 private let lagunaCompiledSoftplusGate: @Sendable (MLXArray) -> MLXArray = {
@@ -778,6 +879,8 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     @ModuleInfo(key: "model") var model: LagunaRuntimeModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
+    private var _compressedLMHead: LagunaCompressedBF16Matrix?
+
     public let configuration: LagunaConfig
 
     public init(_ config: LagunaConfig) {
@@ -812,6 +915,27 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         // position's row; slicing before the head removes a
         // [length-1, vocab]-sized slab of dead work from every prefill.
         let hidden = lagunaLastTokenHidden(fullHidden)
+        if let compressed = _compressedLMHead {
+            return lagunaCompressedBF16Gemv(
+                [
+                    hidden,
+                    compressed.signMantissa,
+                    compressed.exponentDelta,
+                    compressed.baseExponent,
+                    compressed.escapeExponent0,
+                    compressed.escapeExponent1,
+                    compressed.fallbackValues,
+                ],
+                template: [
+                    ("K", compressed.columns),
+                    ("N", compressed.rows),
+                ],
+                grid: (compressed.rows * 8, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[hidden.dim(0), hidden.dim(1), compressed.rows]],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
         if let lmHead {
             return lmHead(hidden)
         }
@@ -862,6 +986,131 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         if !fusedArrays.isEmpty {
             eval(fusedArrays)
         }
+    }
+
+    func prepareCompressedLMHead(bytes: Data) -> [MLXArray] {
+        guard lagunaCompressedLMHeadEnabled,
+            _compressedLMHead == nil,
+            let lmHead,
+            lmHead.bias == nil,
+            lmHead.weight.dtype == .bfloat16,
+            lmHead.weight.ndim == 2
+        else {
+            return []
+        }
+
+        let rows = lmHead.weight.dim(0)
+        let columns = lmHead.weight.dim(1)
+        let valueCount = rows * columns
+        guard columns.isMultiple(of: 64), rows.isMultiple(of: 32),
+            bytes.count == valueCount * MemoryLayout<UInt16>.stride
+        else {
+            return []
+        }
+
+        var signMantissa = [UInt8](repeating: 0, count: valueCount)
+        var exponentDelta = [UInt8](repeating: 0, count: valueCount / 2)
+        var baseExponent = [UInt8](repeating: 0, count: valueCount / 64)
+        var escapeExponent0 = [UInt8](repeating: 0, count: valueCount / 64)
+        var escapeExponent1 = [UInt8](repeating: 0, count: valueCount / 64)
+        var fallbackValues: [UInt16] = []
+        fallbackValues.reserveCapacity(valueCount / 1_000)
+        var exponentCounts = [UInt8](repeating: 0, count: 256)
+        var touchedExponents: [UInt8] = []
+        touchedExponents.reserveCapacity(64)
+        var blockExponents = [UInt8](repeating: 0, count: 64)
+
+        bytes.withUnsafeBytes { rawBytes in
+            let source = rawBytes.bindMemory(to: UInt16.self)
+            for block in 0..<(valueCount / 64) {
+                let start = block * 64
+                touchedExponents.removeAll(keepingCapacity: true)
+                for offset in 0..<64 {
+                    let bits = UInt16(littleEndian: source[start + offset])
+                    let exponent = UInt8((bits >> 7) & 0xff)
+                    blockExponents[offset] = exponent
+                    if exponentCounts[Int(exponent)] == 0 {
+                        touchedExponents.append(exponent)
+                    }
+                    exponentCounts[Int(exponent)] += 1
+                    signMantissa[start + offset] = UInt8(bits & 0x7f)
+                        | UInt8((bits >> 8) & 0x80)
+                }
+
+                touchedExponents.sort()
+                var first = 0
+                var windowCount = 0
+                var bestFirst = 0
+                var bestCount = 0
+                for last in touchedExponents.indices {
+                    windowCount += Int(exponentCounts[Int(touchedExponents[last])])
+                    while Int(touchedExponents[last]) - Int(touchedExponents[first]) > 13 {
+                        windowCount -= Int(exponentCounts[Int(touchedExponents[first])])
+                        first += 1
+                    }
+                    if windowCount > bestCount {
+                        bestCount = windowCount
+                        bestFirst = first
+                    }
+                }
+
+                let base = touchedExponents[bestFirst]
+                let baseInt = Int(base)
+                let escapes = touchedExponents.filter {
+                    Int($0) < baseInt || Int($0) > baseInt + 13
+                }
+                if base != .max, escapes.count <= 2 {
+                    baseExponent[block] = base
+                    escapeExponent0[block] = escapes.first ?? base
+                    escapeExponent1[block] = escapes.count == 2 ? escapes[1] : base
+                    for offset in 0..<64 {
+                        let exponent = blockExponents[offset]
+                        let code: UInt8
+                        if Int(exponent) >= baseInt, Int(exponent) <= baseInt + 13 {
+                            code = exponent - base
+                        } else if exponent == escapeExponent0[block] {
+                            code = 14
+                        } else {
+                            code = 15
+                        }
+                        let packedIndex = (start + offset) >> 1
+                        if offset.isMultiple(of: 2) {
+                            exponentDelta[packedIndex] = code
+                        } else {
+                            exponentDelta[packedIndex] |= code << 4
+                        }
+                    }
+                } else {
+                    let fallbackBlock = fallbackValues.count / 64
+                    precondition(fallbackBlock < Int(UInt16.max))
+                    baseExponent[block] = .max
+                    escapeExponent0[block] = UInt8(fallbackBlock & 0xff)
+                    escapeExponent1[block] = UInt8(fallbackBlock >> 8)
+                    for offset in 0..<64 {
+                        fallbackValues.append(UInt16(littleEndian: source[start + offset]))
+                    }
+                }
+                for exponent in touchedExponents {
+                    exponentCounts[Int(exponent)] = 0
+                }
+            }
+        }
+
+        if fallbackValues.isEmpty {
+            fallbackValues = [UInt16](repeating: 0, count: 64)
+        }
+        let compressed = LagunaCompressedBF16Matrix(
+            signMantissa: MLXArray(signMantissa, [rows, columns]),
+            exponentDelta: MLXArray(exponentDelta, [rows, columns / 2]),
+            baseExponent: MLXArray(baseExponent, [rows, columns / 64]),
+            escapeExponent0: MLXArray(escapeExponent0, [rows, columns / 64]),
+            escapeExponent1: MLXArray(escapeExponent1, [rows, columns / 64]),
+            fallbackValues: MLXArray(fallbackValues, [fallbackValues.count / 64, 64]),
+            rows: rows,
+            columns: columns
+        )
+        _compressedLMHead = compressed
+        return compressed.arrays
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
