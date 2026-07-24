@@ -448,8 +448,11 @@ final class LagunaRuntimeMoEGate: Module {
 private let lagunaCompiledExpertCombine: @Sendable (
     MLXArray, MLXArray, MLXArray
 ) -> MLXArray = compile(shapeless: true) { outputs, weights, shared in
+    // The router-weight F32->BF16 cast lives inside the compiled graph too
+    // (same cast, same point in the expression as the previous eager
+    // `weights.asType(y.dtype)`), removing one more per-layer dispatch.
     let routed =
-        (outputs * MLX.expandedDimensions(weights, axis: -1))
+        (outputs * MLX.expandedDimensions(weights.asType(outputs.dtype), axis: -1))
         .sum(axis: -2)
     return routed * Float(LagunaConstants.moeRoutedScalingFactor) + shared
 }
@@ -579,7 +582,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         }
         return lagunaCompiledExpertCombine(
             y,
-            weights.asType(y.dtype),
+            weights,
             sharedExpert(x)
         )
     }
@@ -672,7 +675,12 @@ final class LagunaRuntimeModelInner: Module {
             h = layer(h, mask: mask, cache: cache?[i])
         }
 
-        return norm(h)
+        // Only the LAST position's hidden state is ever consumed downstream
+        // (the head slices it anyway), and RMSNorm is row-independent, so
+        // slicing before the final norm removes a [length-1, hidden] slab of
+        // dead normalization work from every prefill without changing any
+        // consumed value.
+        return norm(lagunaLastTokenHidden(h))
     }
 }
 
