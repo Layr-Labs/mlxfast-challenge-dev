@@ -761,7 +761,10 @@ final class LagunaRuntimeModelInner: Module {
             h = layer(h, mask: mask, cache: cache?[i])
         }
 
-        return norm(h)
+        // The language-model head consumes only the final sequence row.
+        // RMSNorm is row-independent, so slice first and avoid normalizing
+        // the other prefill rows that are immediately discarded.
+        return norm(lagunaLastTokenHidden(h))
     }
 }
 
