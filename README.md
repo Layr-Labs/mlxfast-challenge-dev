@@ -285,9 +285,9 @@ prefill_speedup must land in [0.952, 1.053]
 The upper bound caps a single submission's gain at about 5% — a larger
 measured win is either a lucky reading or too big to trust in one shot, so
 chunk it across submissions (the cap is per submission, not cumulative).
-Local modes do not evaluate the band, so `--local-iterate` and
-`--local-submit` will report an estimate above it without complaint. A
-ranked run that trips it fails with failure category
+Local modes never fail on the band: `--local-iterate` and `--local-submit`
+print a warning when their estimate exceeds it but still publish the
+estimate. A ranked run that trips it fails with failure category
 `acceptance_band_failed`; see `docs/benchmark-window-freeze.md`.
 
 Correctness is a hard gate: the full 64-step teacher-forced base case, the
