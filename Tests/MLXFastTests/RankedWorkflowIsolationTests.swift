@@ -212,11 +212,37 @@ struct RankedWorkflowIsolationTests {
         #expect(scrubStep.contains(
             "find \"${MJOB_WS}/tmp\" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +"
         ))
-        // Allowlist diff against the pre-hidden snapshot, fail-closed.
+        // Allowlist diff against the pre-hidden snapshot, fail-closed. The
+        // membership test is a byte-exact set difference (perl -0), not a
+        // per-file grep: BSD `grep -zvxFf` does not honor NUL delimiters in a
+        // pattern file and would report present paths as absent, and bash 3.2
+        // has no associative arrays, so neither shortcut may be substituted.
         #expect(scrubStep.contains("post-transform-manifest.nul"))
-        #expect(scrubStep.contains("grep -zqxF -- \"${rel}\" \"${manifest}\""))
-        #expect(scrubStep.contains("./weights/*|./.build/*|./.build-worker/*|./correctness_prompts/*"))
-        #expect(scrubStep.contains("./bench_oracle*|./private/*"))
+        #expect(scrubStep.contains("/usr/bin/perl -0 -ne"))
+        // Negative checks run against EXECUTABLE lines only: the step's own
+        // comments name these rejected alternatives on purpose.
+        let scrubCode = scrubStep
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("#") }
+            .joined(separator: "\n")
+        #expect(!scrubCode.contains("grep -zqxF"))
+        #expect(!scrubCode.contains("declare -A"))
+        #expect(!scrubCode.contains("grep -zvxFf"))
+        // The whole manifest must be proven loaded before anything is deleted:
+        // a partial membership set would delete Sources/, Vendor/, .github/.
+        #expect(scrubStep.contains("post-transform-manifest.nul.count")
+            || scrubStep.contains("${manifest}.count"))
+        #expect(scrubStep.contains("scrub: manifest load incomplete"))
+        // ...and the delete set is bounded, so a wrong membership set fails
+        // closed instead of emptying the workspace.
+        #expect(scrubStep.contains("allowlist scrub delete set implausibly large"))
+        // Same allowlisted prefixes as the former `case` globs.
+        #expect(scrubStep.contains("^\\./weights/"))
+        #expect(scrubStep.contains("^\\./\\.build/"))
+        #expect(scrubStep.contains("^\\./\\.build-worker/"))
+        #expect(scrubStep.contains("^\\./correctness_prompts/"))
+        #expect(scrubStep.contains("^\\./bench_oracle"))
+        #expect(scrubStep.contains("^\\./private/"))
         #expect(scrubStep.contains("allowlist scrub could not remove gates-phase workspace file"))
         // weights/ re-verified against the pinned post-transform hash.
         #expect(scrubStep.contains(".github/scripts/hash-weights-directory.sh \"${MLXFAST_JOB_WS}/weights\""))

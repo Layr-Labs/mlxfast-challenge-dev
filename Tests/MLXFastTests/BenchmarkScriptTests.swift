@@ -439,7 +439,12 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     // into the bench workspace; ranked jobs never save submission build output.
     #expect(workflow.contains("MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25"))
     #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256"))
-    #expect(workflow.contains("shasum -a 256 \"${path}\""))
+    // Every manifest entry is still SHA-256'd and compared, but the shards are
+    // hashed concurrently (xargs -0 -P) and matched as a whole-line set against
+    // the pinned expectations rather than one blocking shasum per entry.
+    #expect(workflow.contains("xargs -0 -n 1 -P \"${MLXFAST_REFERENCE_HASH_JOBS:-4}\" shasum -a 256"))
+    #expect(workflow.contains("reference file mismatch"))
+    #expect(workflow.contains("reference checkpoint digest set did not match the pinned manifest"))
     #expect(workflow.contains("reference checkpoint failed manifest verification"))
     #expect(!workflow.contains("./setup.sh"))
     #expect(workflow.contains("- name: Restore trusted SwiftPM dependency cache"))

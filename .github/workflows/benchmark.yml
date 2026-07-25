@@ -472,6 +472,10 @@ jobs:
           failures=0
           checked=0
           checked_bytes=0
+          verify_dir="$(mktemp -d)"
+          trap 'rm -rf "${verify_dir}"' EXIT
+          : > "${verify_dir}/expected"
+          : > "${verify_dir}/paths.nul"
           while IFS= read -r line || [[ -n "${line}" ]]; do
             [[ -z "${line}" || "${line}" == \#* ]] && continue
             read -r want_hash want_bytes rel_path extra <<< "${line}"
@@ -494,14 +498,43 @@ jobs:
               continue
             fi
             actual_bytes="$(wc -c < "${path}" | tr -d ' ')"
-            actual_hash="$(shasum -a 256 "${path}" | awk '{print $1}')"
-            if [[ "${actual_bytes}" != "${want_bytes}" || "${actual_hash}" != "${want_hash}" ]]; then
+            if [[ "${actual_bytes}" != "${want_bytes}" ]]; then
               echo "::error::reference file mismatch: ${rel_path}" >&2
               failures=$((failures + 1))
             fi
+            # Defer the digest: hashing 21.6 GB one shard at a time was ~36s of
+            # single-threaded wall. Entries are collected here and hashed in
+            # parallel below. Safe to batch because these paths come from the
+            # PINNED, checked-in manifest and were just validated (no absolute
+            # path, no backslash, no ./ or ../ segment) -- and `read` into four
+            # fields already rejects any entry whose path contains whitespace.
+            printf '%s  %s\n' "${want_hash}" "${path}" >> "${verify_dir}/expected"
+            printf '%s\0' "${path}" >> "${verify_dir}/paths.nul"
             checked=$((checked + 1))
             checked_bytes=$((checked_bytes + want_bytes))
           done < "${MLXFAST_REFERENCE_MANIFEST_PATH}"
+          if [[ -s "${verify_dir}/paths.nul" ]]; then
+            # `shasum -a 256` prints "<hash>  <path>", the exact shape written
+            # to expected above, so a whole-line set comparison is the digest
+            # check. xargs -0 keeps arbitrary bytes in the reference dir prefix
+            # intact; -n 1 gives one shard per process so all jobs stay busy.
+            xargs -0 -n 1 -P "${MLXFAST_REFERENCE_HASH_JOBS:-4}" shasum -a 256 \
+              < "${verify_dir}/paths.nul" > "${verify_dir}/actual"
+            LC_ALL=C sort "${verify_dir}/expected" > "${verify_dir}/expected.sorted"
+            LC_ALL=C sort "${verify_dir}/actual" > "${verify_dir}/actual.sorted"
+            if ! cmp -s "${verify_dir}/expected.sorted" "${verify_dir}/actual.sorted"; then
+              while IFS= read -r bad; do
+                echo "::error::reference file mismatch: ${bad##*/}" >&2
+                failures=$((failures + 1))
+              done < <(LC_ALL=C comm -13 "${verify_dir}/actual.sorted" "${verify_dir}/expected.sorted" | awk '{print $2}')
+              # A digest set that differs only by count (duplicate/missing
+              # lines) must still fail even if the loop above emitted nothing.
+              if [[ "${failures}" -eq 0 ]]; then
+                echo "::error::reference checkpoint digest set did not match the pinned manifest" >&2
+                failures=$((failures + 1))
+              fi
+            fi
+          fi
           if [[ "${failures}" -ne 0 \
               || "${checked}" -ne 13 \
               || "${checked_bytes}" -ne 21568905520 ]]; then
@@ -1099,7 +1132,12 @@ jobs:
       # correctness dispatches skip the full-model read.
       - name: Hash transformed weights for ranked audit
         if: ${{ inputs.run_benchmark }}
-        run: .github/scripts/hash-weights-directory.sh "${MLXFAST_JOB_WS}/weights" weights.sha256
+        # MLXFAST_HASH_JOBS opts THIS call into concurrent per-file hashing.
+        # The scrub's re-hash of the same tree deliberately does NOT set it: it
+        # is the last work before the quiescence wait and the 40C gate, so it
+        # stays sequential rather than pushing a parallel CPU burn into the
+        # scored window.
+        run: MLXFAST_HASH_JOBS=4 .github/scripts/hash-weights-directory.sh "${MLXFAST_JOB_WS}/weights" weights.sha256
 
       # TOCTOU guard: the submitted transform just ran with workspace write
       # access. Re-verify that the trusted driver + binary and the participant
@@ -1291,6 +1329,12 @@ jobs:
           fi
           test -s "${manifest}"
           count="$(tr -cd '\0' < "${manifest}" | wc -c | tr -d ' ')"
+          # Persist the entry count so the scrub can prove it loaded the WHOLE
+          # manifest before it deletes anything. A partially loaded membership
+          # set would turn the allowlist scrub into "delete Sources, Vendor,
+          # .github, benchmark.sh" -- the count equality below is what makes
+          # that unrepresentable.
+          printf '%s' "${count}" > "${manifest}.count"
           echo "benchmark: snapshotted ${count} pre-hidden workspace files for the allowlist scrub"
 
       # Trusted steps fetch and pin the hidden artifacts. Raw bytes live only
@@ -1515,9 +1559,16 @@ jobs:
           # so the runner user cannot signal it (kill -0 would EPERM and end
           # the heartbeat immediately) but can still see it in the process
           # table.
+          # Poll at 5s, heartbeat every ~60s. The poll interval is pure wall
+          # clock: the gates child finishes in ~30s, so a 60s sleep idled this
+          # step to a flat 60s on every ranked run (measured: step 60s vs the
+          # child's own "wall_seconds=30.3"), i.e. ~30s of dead time per run.
+          # The heartbeat cadence is unchanged -- it is throttled by elapsed
+          # time rather than by the sleep length.
           while ps -p "${pid}" >/dev/null 2>&1; do
-            sleep 60
-            if ps -p "${pid}" >/dev/null 2>&1; then
+            sleep 5
+            if ps -p "${pid}" >/dev/null 2>&1 \
+                && (( (SECONDS - started) % 60 < 5 )); then
               echo "benchmark: correctness+gates still running elapsed=$((SECONDS - started))s"
             fi
           done
@@ -1637,22 +1688,65 @@ jobs:
             '
           manifest="${MLXFAST_PRIVATE_DIR}/post-transform-manifest.nul"
           test -s "${manifest}"
+          test -s "${manifest}.count"
+          manifest_count="$(tr -cd '0-9' < "${manifest}.count")"
+          [[ -n "${manifest_count}" && "${manifest_count}" -gt 0 ]]
+          # Membership is a SET DIFFERENCE, not a grep per file. The former
+          # `grep -zqxF` spawned one process per non-allowlisted file, each
+          # rescanning a multi-MB NUL manifest that (under LC_ALL=C) sorts
+          # ./.build* first while every repo path sorts after it -- so nearly
+          # every probe was a full scan: O(F x N), ~60s of the scrub on a real
+          # ranked tree.
+          #
+          # perl -0 (not bash associative arrays: /bin/bash here is 3.2.57, so
+          # `declare -A` does not exist, and without it the subscript would be
+          # an ARITHMETIC context evaluated over attacker-controlled filenames
+          # in this trusted shell). Also deliberately NOT one-process greps:
+          # BSD `grep -zvxFf` does not treat the -f pattern file as
+          # NUL-delimited (it reports nearly every present path as absent, i.e.
+          # it would delete the whole tree), `awk RS="\0"` degrades to
+          # paragraph mode, and `comm -z` is GNU-only.
+          #
+          # Membership is byte-exact here, where BSD grep -F -x was
+          # locale-dependent: the delete set is identical except for filenames
+          # containing invalid UTF-8, where this form is strictly more correct.
           scrub_failed=0
+          delete_list="${MLXFAST_PRIVATE_DIR}/scrub-delete.nul"
+          ( cd "${MLXFAST_JOB_WS}" && find . -mindepth 1 \( -type f -o -type l \) -print0 | LC_ALL=C sort -z ) \
+            | MANIFEST="${manifest}" MANIFEST_COUNT="${manifest_count}" /usr/bin/perl -0 -ne '
+                BEGIN {
+                  open(M, "<", $ENV{MANIFEST}) or die "scrub: cannot open manifest\n";
+                  local $/ = "\0";
+                  while (<M>) { chomp; $seen{$_} = 1 }
+                  close(M);
+                  my $loaded = scalar keys %seen;
+                  die "scrub: manifest load incomplete ($loaded != $ENV{MANIFEST_COUNT})\n"
+                    unless $loaded == $ENV{MANIFEST_COUNT};
+                }
+                chomp;
+                next if m{^\./weights/} || m{^\./\.build/} || m{^\./\.build-worker/}
+                     || m{^\./correctness_prompts/} || m{^\./bench_oracle} || m{^\./private/};
+                print "$_\0" unless $seen{$_};
+              ' > "${delete_list}"
+          delete_count="$(tr -cd '\0' < "${delete_list}" | wc -c | tr -d ' ')"
+          # Bound the delete set: a gates pass legitimately leaves few files, so
+          # a runaway count means the membership set is wrong. Counts only --
+          # the paths themselves are attacker-controlled and can encode
+          # golden-derived bytes.
+          if [[ "${delete_count}" -gt 512 ]]; then
+            echo "::error::allowlist scrub delete set implausibly large (${delete_count} files vs ${manifest_count} snapshotted); refusing to delete" >&2
+            exit 1
+          fi
           while IFS= read -r -d '' rel; do
-            case "${rel}" in
-              ./weights/*|./.build/*|./.build-worker/*|./correctness_prompts/*) continue ;;
-              ./bench_oracle*|./private/*) continue ;;
-            esac
-            if grep -zqxF -- "${rel}" "${manifest}"; then
-              continue
-            fi
             target="${MLXFAST_JOB_WS}/${rel#./}"
             rm -f -- "${target}" 2>/dev/null || true
             if [[ -e "${target}" || -L "${target}" ]]; then
               echo "::error::allowlist scrub could not remove gates-phase workspace file: ${rel}" >&2
               scrub_failed=1
             fi
-          done < <(cd "${MLXFAST_JOB_WS}" && find . -mindepth 1 \( -type f -o -type l \) -print0 | LC_ALL=C sort -z)
+          done < "${delete_list}"
+          rm -f "${delete_list}"
+          echo "benchmark: allowlist scrub removed ${delete_count} gates-phase files (manifest ${manifest_count} entries)"
           if [[ "${scrub_failed}" -ne 0 ]]; then
             echo "::error::allowlist scrub left gates-phase workspace files it could not delete" >&2
             exit 1

@@ -37,23 +37,82 @@ if [[ -n "${hardlinked_entry}" ]]; then
   exit 1
 fi
 
-hash="$(
-  find "${WEIGHTS_PATH}" -type f -print0 \
-    | LC_ALL=C sort -z \
-    | while IFS= read -r -d '' path; do
-        relative_path="${path#"${WEIGHTS_PATH}"/}"
-        if [[ "${relative_path}" == '.benchmark-source.sha256' \
-            || "${relative_path}" == '.gitkeep' ]]; then
-          continue
-        fi
-        file_hash="$(shasum -a 256 "${path}" | awk '{print $1}')"
-        printf '%s\0' "${relative_path}"
-        printf '%s' "${file_hash}" | "${XXD_BIN}" -r -p
-        printf '\0'
-      done \
-    | shasum -a 256 \
-    | awk '{print $1}'
-)"
+# MLXFAST_HASH_JOBS>1 hashes the (few, very large) weight files concurrently.
+# It DEFAULTS TO 1 -- byte-identical to the original sequential loop -- because
+# one caller must stay sequential: the pre-timing scrub re-hashes this tree as
+# the last action before the quiescence wait and the 40C thermal gate, and a
+# parallel CPU burn there would push heat into the scored window. Only the
+# ranked audit-hash step, which runs early, opts in.
+#
+# The digest is order-sensitive (it must match LagunaRuntime.directoryDigest),
+# and these filenames come from the UNTRUSTED transform, so the parallel path
+# never parses hasher stdout: each file's digest is written to a temp file
+# named by its sorted index, then consumed in index order. Paths move through
+# NUL-terminated files only, so any byte except NUL survives intact.
+HASH_JOBS="${MLXFAST_HASH_JOBS:-1}"
+if [[ ! "${HASH_JOBS}" =~ ^[0-9]+$ || "${HASH_JOBS}" -lt 1 ]]; then
+  echo "hash-weights-directory: MLXFAST_HASH_JOBS must be a positive integer" >&2
+  exit 1
+fi
+
+if [[ "${HASH_JOBS}" -eq 1 ]]; then
+  hash="$(
+    find "${WEIGHTS_PATH}" -type f -print0 \
+      | LC_ALL=C sort -z \
+      | while IFS= read -r -d '' path; do
+          relative_path="${path#"${WEIGHTS_PATH}"/}"
+          if [[ "${relative_path}" == '.benchmark-source.sha256' \
+              || "${relative_path}" == '.gitkeep' ]]; then
+            continue
+          fi
+          file_hash="$(shasum -a 256 "${path}" | awk '{print $1}')"
+          printf '%s\0' "${relative_path}"
+          printf '%s' "${file_hash}" | "${XXD_BIN}" -r -p
+          printf '\0'
+        done \
+      | shasum -a 256 \
+      | awk '{print $1}'
+  )"
+else
+  work_dir="$(mktemp -d)"
+  trap 'rm -rf "${work_dir}"' EXIT
+  entries=0
+  while IFS= read -r -d '' path; do
+    relative_path="${path#"${WEIGHTS_PATH}"/}"
+    if [[ "${relative_path}" == '.benchmark-source.sha256' \
+        || "${relative_path}" == '.gitkeep' ]]; then
+      continue
+    fi
+    printf '%s\0' "${path}" > "${work_dir}/${entries}.abs"
+    printf '%s\0' "${relative_path}" > "${work_dir}/${entries}.rel"
+    entries=$((entries + 1))
+  done < <(find "${WEIGHTS_PATH}" -type f -print0 | LC_ALL=C sort -z)
+  if [[ "${entries}" -eq 0 ]]; then
+    echo "hash-weights-directory: no hashable files under ${WEIGHTS_PATH}" >&2
+    exit 1
+  fi
+  seq 0 "$((entries - 1))" \
+    | xargs -P "${HASH_JOBS}" -I '{}' /bin/bash -c '
+        set -euo pipefail
+        IFS= read -r -d "" p < "$1/{}.abs"
+        shasum -a 256 "${p}" | awk "{print \$1}" > "$1/{}.hex"
+      ' _ "${work_dir}"
+  hash="$(
+    for ((i = 0; i < entries; i++)); do
+      IFS= read -r -d '' rel < "${work_dir}/${i}.rel"
+      file_hash="$(tr -d '[:space:]' < "${work_dir}/${i}.hex")"
+      if [[ ! "${file_hash}" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "hash-weights-directory: parallel digest missing or malformed for entry ${i}" >&2
+        exit 1
+      fi
+      printf '%s\0' "${rel}"
+      printf '%s' "${file_hash}" | "${XXD_BIN}" -r -p
+      printf '\0'
+    done \
+      | shasum -a 256 \
+      | awk '{print $1}'
+  )"
+fi
 
 if [[ -n "${OUTPUT_PATH}" ]]; then
   printf '%s\n' "${hash}" > "${OUTPUT_PATH}"
