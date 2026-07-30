@@ -267,6 +267,39 @@ struct DFlashTrackTests {
         }
     }
 
+    // The scored window and the block size are declared in three places that
+    // must not drift: the contract fixture's protocol block, the fixture's
+    // proposed_scoring block, and the manifest's scoring block. They disagreed
+    // on the revived scaffolding (protocol said 128 while both scoring blocks
+    // said 512), which would have scored a different window than the contract
+    // documented.
+    @Test
+    func scoredWindowAndBlockSizeAgreeEverywhereTheyAreDeclared() throws {
+        let fixture = try json(Self.fixturePath)
+        let manifest = try json(Self.manifestPath)
+        let workflow = try text(Self.workflowPath)
+
+        let protocolBlock = try #require(fixture["protocol"] as? [String: Any])
+        let proposedScoring = try #require(fixture["proposed_scoring"] as? [String: Any])
+        let scoring = try #require(manifest["scoring"] as? [String: Any])
+
+        let window = try #require(protocolBlock["decode_tokens"] as? Int)
+        #expect(proposedScoring["ranked_decode_window_tokens"] as? Int == window)
+        #expect(scoring["decodeTokens"] as? Int == window)
+        #expect(workflow.contains("MLXFAST_DFLASH_DECODE_TOKENS: \"\(window)\""))
+
+        // The protocol ceiling must not be below the scored window.
+        let ceiling = try #require(protocolBlock["maximum_decode_tokens"] as? Int)
+        #expect(ceiling >= window)
+
+        // Block size: the drafter is trained for 16 and the measured peak on M5
+        // is K=8, so the ranked default must be within the protocol maximum and
+        // must not silently revert to the retired MTP track's 4.
+        let maxBlock = try #require(protocolBlock["maximum_block_size"] as? Int)
+        #expect(maxBlock == 16)
+        #expect(workflow.contains("MLXFAST_DFLASH_BLOCK_SIZE: \"8\""))
+    }
+
     // CONTRACT LAYER L6 (anti-lottery). A frozen timed prompt makes a failed
     // ranked run free to retry, which turns every output-side gate into
     // submit-until-green and lets a drafter-confidence threshold be tuned across

@@ -110,9 +110,7 @@
     "vocab_size": 100352,
     "head_dim": 128,
     "sliding_window": 512,
-    "quantization_bits": 4,
-    "quantization_group_size": 64,
-    "quantization_note": "MLX affine 4-bit group-64 with per-layer exceptions: the MoE router gate projections (language_model.model.layers.{1..39}.mlp.gate.proj) are affine 8-bit group-64 per the runtime checkpoint config.json.",
+    "quantization_superseded_note": "The retired track's flat quantization_bits/quantization_group_size fields (affine 4-bit group-64, describing the mlx-community target) were removed when this track was repointed at the NVFP4 reference checkpoint. The authoritative description is the quantization object below.",
     "num_experts": 256,
     "num_experts_per_tok": 8,
     "moe_intermediate_size": 512,
@@ -200,10 +198,11 @@
     "name": "trusted_dflash_block_v1",
     "maximum_block_size": 16,
     "maximum_block_size_note": "Raised from 4 (Gemma-MTP assistant era) to 16: the DFlash draft model's config block_size is 16 and it drafts a whole masked block in one forward. Measured on M5 (dev-repo binary, 2026-07-30): peak decode speedup at K=8 (1.60x), K=16 slightly lower (1.53x); K remains a runtime choice bounded by this maximum.",
-    "decode_tokens": 128,
+    "decode_tokens": 512,
     "maximum_decode_tokens": 1536,
     "parent_oracle_required": true,
-    "worker_timing_is_authoritative": false
+    "worker_timing_is_authoritative": false,
+    "decode_tokens_note": "The RANKED decode window, in parent-counted tokens. Was 128 (inherited from the retired track's local-iterate default) while proposed_scoring.ranked_decode_window_tokens and benchmark.dflash.json scoring.decodeTokens both said 512 -- three places disagreeing about the scored window. All three must stay equal; DFlashTrackTests pins that. maximum_decode_tokens (1536) remains the protocol ceiling, and the local scripts use their own smaller values for directional runs."
   },
   "reference_baseline": {
     "status": "pending_m5_rebaseline",

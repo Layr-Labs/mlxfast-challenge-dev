@@ -160,10 +160,17 @@ jobs:
       MLXFAST_DFLASH_ASSISTANT_MANIFEST_PATH: fixtures/dflash_laguna_xs_2_1_drafter.sha256
       # Decode-only score contract (adopted 2026-07-14; see header). Keep in
       # sync with the contract fixture's proposed_scoring block; the floor is
-      # HARD (an MTP submission that is not actually faster than trusted
+      # HARD (a DFlash submission that is not actually faster than trusted
       # serial decode does not rank) and applies to the ratio-of-means
       # aggregate over the accepted pairs.
-      MLXFAST_DFLASH_BLOCK_SIZE: "4"
+      #
+      # Block size 8, not the retired MTP track's 4: the DFlash drafter is
+      # trained for block_size 16 and drafts a whole masked block in ONE
+      # forward, and the measured sweep on this silicon (M5-C, 2026-07-30,
+      # 6 prompts) peaks at K=8 -- 1.86x vs 1.56x at K=4 and 1.80x at K=16,
+      # with mean accepted drafts 3.55/7. Higher K keeps raising acceptance
+      # (4.10/15 at K=16) but pays more wasted verify rows per round.
+      MLXFAST_DFLASH_BLOCK_SIZE: "8"
       MLXFAST_DFLASH_DECODE_TOKENS: "512"
       MLXFAST_DFLASH_CORRECTNESS_TOKENS: "512"
       MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: "1.0"
