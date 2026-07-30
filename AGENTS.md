@@ -70,19 +70,19 @@ KV-cache handling, memory layout, and MLX
 scheduling — not disk I/O.
 
 Local work needs enough unified memory for the ~21.6 GB model plus KV state
-and buffers; roughly 40 GiB is the practical local minimum.
+and buffers; roughly 36 GiB is the practical local minimum.
 Machines below 64 GiB automatically use a low-memory startup profile: the
 MLX allocator cache is capped at 6 GiB, command buffers are shortened, and
 free warmup buffers are cleared before the worker protocol starts. The
 profile is pure memory management — compiled decode and every other ranked
 code path stay enabled, so local runs execute the same code paths as the
-ranked box all the way down to the documented 40 GiB local minimum. It
+ranked box all the way down to the documented 36 GiB local minimum. It
 prints a stderr notice when it engages; set
 `DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low|auto` to override the automatic
 selection. A machine too small for the model plus the decode working set
 fails loudly with an out-of-memory error rather than silently skipping
-ranked code paths — if that happens, use a 64 GiB+ machine or rely on the
-ranked run. The 128 GB ranked runner keeps the full profile.
+ranked code paths — if that happens, use a machine with more unified
+memory or rely on the ranked run. The 128 GB ranked runner keeps the full profile.
 The ranked box has more headroom than that, but memory-hungry strategies
 tuned against a different machine still have to survive the paired
 measurement on the M5, and a kernel or layout strategy that helps on one
@@ -583,6 +583,28 @@ buffers, deferred cache rows, and commit, rollback, recommit, or discard
 markers for those rows. Generic, bit-exact, or production-useful
 implementations are still excluded under this track. Pre-hello or
 initialization warmup of an excluded speculative pipeline is also excluded.
+
+The model quantization is frozen to an accepted envelope, and every
+submission may use all of it. The envelope is exactly two things: (1) the
+reference NVFP4 weights as shipped — group size 16, 4 bits, mode `nvfp4`; and
+(2) one established re-quantization, in which the attention Q/K/V, output, and
+per-head gate (`g_proj`) projection weights may be re-represented as group-32
+affine INT8 derived at
+init from the loaded NVFP4 weights. That attention re-quant is accepted and
+available to all submissions. Note the attention per-head gate `g_proj` is a
+distinct parameter from the MoE router gate: `g_proj` is an attention
+projection and is inside the envelope, whereas the MoE router gate is not and
+stays as shipped. Nothing beyond this envelope is permitted: do
+not re-quantize any other weight (the MoE routed or shared experts, MoE router
+gate, embeddings, `lm_head`, and every other parameter must remain NVFP4
+group-16 4-bit); do not use any bit width other than 4 or 8, any group size
+other than 16 or 32, or any mode other than `nvfp4` or affine; and do not make
+the attention re-quant (including `g_proj`) lossier than group-32 affine INT8
+(a larger group or fewer bits). This holds even when a further re-quantization passes the
+correctness gates, because going beyond the envelope substitutes a
+further-degraded numerical representation of the model rather than optimizing
+the accepted one. Pure memory relayout or co-tiling that preserves quantized
+values, and input-independent dequantized caches, remain allowed.
 
 Ordinary within-request KV reuse, current-token-only decode, and
 input-independent weight, dequantization, kernel, mask, or RoPE caches remain
