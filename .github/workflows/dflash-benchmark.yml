@@ -204,7 +204,15 @@ jobs:
       MLXFAST_DFLASH_BLOCK_SIZE: "3"
       MLXFAST_DFLASH_DECODE_TOKENS: "512"
       MLXFAST_DFLASH_CORRECTNESS_TOKENS: "512"
-      MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: "1.0"
+      # 0.80, matching scoring.decodeSpeedupFloor in benchmark.dflash.json, the
+      # contract fixture, and MIN_ACCEPTED_SPEEDUP in the box wrapper. This is a
+      # FIFTH place the floor lives: the score is recomputed here in the trusted
+      # shell from the sealed per-side means and gated against this value, so a
+      # 1.0 here would override the 0.80 everywhere else at go-live. On this track
+      # 1.0 is not the no-change line -- block decode costs ~16% on realistic
+      # prose, so an unmodified candidate measures 0.87 (measured end-to-end
+      # 2026-07-30: ACCEPT, 4/4 pairs, 0.8705).
+      MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: "0.80"
       MLXFAST_DFLASH_MIN_ACCEPTED_PAIRS: "3"
       MLXFAST_DFLASH_TARGET_PAIRS: "4"
       # Contract layer L6: attributable ranked failures allowed per submission
@@ -278,7 +286,7 @@ jobs:
           scoring_enabled="$(jq -r '.official_scoring_enabled' "${MLXFAST_DFLASH_CONTRACT_PATH}")"
           publication_allowed="$(jq -r '.reference_baseline.publication_allowed' "${MLXFAST_DFLASH_CONTRACT_PATH}")"
           if [[ "${scoring_enabled}" != "true" || "${publication_allowed}" != "true" ]]; then
-            echo "::error::MTP track ${MLXFAST_DFLASH_TRACK_ID} is NOT enabled (official_scoring_enabled=${scoring_enabled}, reference_baseline.publication_allowed=${publication_allowed}). This workflow is deliberately inert until the operator completes the DFlash go-live runbook and flips both trusted-contract fields on main." >&2
+            echo "::error::DFlash track ${MLXFAST_DFLASH_TRACK_ID} is NOT enabled (official_scoring_enabled=${scoring_enabled}, reference_baseline.publication_allowed=${publication_allowed}). This workflow is deliberately inert until the operator completes the DFlash go-live runbook and flips both trusted-contract fields on main." >&2
             exit 1
           fi
           for pin_name in \
@@ -1281,7 +1289,7 @@ jobs:
           speedup="$(jq -r '.aggregate.baseline_serial_seconds_per_token_mean / .aggregate.candidate_dflash_seconds_per_token_mean' "${results}")"
           floor_ok="$(echo "${speedup} >= ${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR}" | bc -l)"
           if [[ "${floor_ok}" != "1" ]]; then
-            echo "::error::dflash_decode_speedup (ratio-of-means) ${speedup} is below the ${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR} floor; a DFlash submission that is not faster than trusted serial decode does not rank" >&2
+            echo "::error::dflash_decode_speedup (ratio-of-means) ${speedup} is below the ${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR} floor; block decode itself costs ~16% on realistic prose, so this floor is the unmodified-candidate score (~0.87) with room for variation, NOT parity with serial decode" >&2
             exit 1
           fi
           jq -n \
