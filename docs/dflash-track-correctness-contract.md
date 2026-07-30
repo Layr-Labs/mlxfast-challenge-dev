@@ -1322,3 +1322,88 @@ and size it from the measured near-tie density rather than from a run that never
 entered the near-tie regime. Both defects must close before
 `official_scoring_enabled` can be considered, and Defect 1 should close first
 because it corrupts the material any recalibration would use.
+
+# Amendment 11 (2026-07-30): matched-length pairs, and what the score is actually measuring
+
+Amendment 10 established that the fixtures were degenerate. This entry establishes
+the performance consequence, and corrects two wrong readings made along the way —
+one of them mine.
+
+## The measurement trap: token counts must match
+
+`seconds_per_token` on this track is NOT comparable across runs of different
+length, because a large fixed cost sits inside the measured window. Measured on
+the SAME golden, same code, same box:
+
+| golden | K | 64 tokens | 128 tokens |
+|---|---|---|---|
+| repetitive | 1 | 0.029784 s/tok | 0.021420 s/tok |
+| repetitive | 4 | 0.028149 s/tok | 0.019600 s/tok |
+
+Decomposing total time as `fixed + n * marginal`:
+
+```
+K=1:  marginal 13.056 ms/token,  fixed 1.071 s
+K=4:  marginal 11.051 ms/token,  fixed 1.094 s
+```
+
+The fixed term is the 512-token seed prefill, which the driver deliberately
+charges into the decode measurement ("the clock starts immediately before the
+request so the seed cost cannot be hidden"). At the frozen window that is ~1.08 s
+of ~2.74 s — **about 39% of the scored quantity is prefill, not decode.** It is
+identical on both sides, so it does not bias direction, but it compresses every
+ratio toward 1.0: the true steady-state decode speedup on the degenerate fixture
+is 13.056/11.051 = **1.181x**, reported as 1.093x.
+
+Two consequences worth stating plainly. A 64-token run is ~39% slower per token
+than a 128-token run for reasons that have nothing to do with the code under test.
+And any comparison that pairs a 64-token control against a 128-token candidate
+manufactures a ~1.4x artifact.
+
+## Correction 1: the "varied serial decode is 39% slower" claim was that artifact
+
+It was inferred from a 64-token varied control against 128-token varied
+candidates, and attributed to MoE expert-routing locality on varied tokens. Direct
+test at matched length:
+
+```
+varied golden,     K=1, 64 tokens: 0.029889 s/token
+repetitive golden, K=1, 64 tokens: 0.029784 s/token     -> 0.35% apart
+```
+
+The control's cost is prompt-INDEPENDENT, as it should be: at width 1 every round
+declares exactly one row regardless of content, and the routed expert count per
+token is fixed at 8. There is no routing-locality penalty to find.
+
+## Correction 2: my "per-row cost is flat, so speculation buys nothing" was wrong
+
+Per DECLARED row (declared = accepted + rejected + rounds, the L3 identity):
+21.42 ms at K=1, 20.64 at K=3, 19.29 at K=4. There is a real ~10% economy of scale
+at K=4, and it is exactly what produces the measured speedup on the degenerate
+fixture. The correct model is not "batching is free" nor "batching is useless" but:
+
+```
+speedup ~= 21.42 / (declared_rows_per_emitted_token * ~19.6)
+```
+
+## What the track actually scores, on each kind of text
+
+| text | draft acceptance | declared/emitted | K=4 vs K=1, matched length |
+|---|---|---|---|
+| degenerate (122 distinct/512, no near-ties) | ~100% | 1.016 | **1.093x** (1.181x steady-state) |
+| varied prose/code (317 distinct/512) | 69% | 1.250 | **0.823x** (0.742x steady-state) |
+
+The varied figure pairs the varied 128-token candidate against the 128-token
+control, which the prompt-independence measurement above licenses. Break-even
+needs `declared/emitted < 1.092`, i.e. draft acceptance above roughly 92%.
+
+So the track produces a speedup on repetitive text and a ~1.2x SLOWDOWN on
+realistic text, against a hard 1.0 floor. This is not a tuning problem: the
+drafter is already accepting ~100% on easy text, so the ~10% per-row economy is
+the entire ceiling, and every rejected row spends it. The hidden ranked prompts
+are prose.
+
+Recorded as measurement, not as a recommendation. Whether the track ships with the
+floor removed, ships with a different scored quantity (e.g. excluding prefill from
+the decode metric, which would restore ~1.18x/0.74x separation), or does not ship
+on Laguna, is the organizer's decision.
