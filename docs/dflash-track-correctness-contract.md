@@ -599,18 +599,25 @@ NOT yet validated, and each blocks enablement:
 
 1. **Long-context viability** — see Amendment 5. This is the substantive
    blocker: the harness is correct but the track may not be rankable.
-2. **A multi-token, seam-crossing timed run.** The passing e2e above is a
-   1-token run, so its timings (0.33 vs 0.18 s/token) are fixed-cost dominated
-   and meaningless, and it does not cross the ring boundary.
-3. **`DFlashWorkBindingTolerance` calibration** (Amendment 1) from measured
-   honest candidate-vs-reference logit deltas.
+2. ~~A multi-token, seam-crossing timed run.~~ **DONE — see Amendment 6.** It
+   also found a second, unfixed ring-seam defect, this one on the DRAFTER side,
+   which fails every block round at a ranked-length seed.
+3. ~~`DFlashWorkBindingTolerance` calibration.~~ **MEASURED — see Amendment 6.**
+   The constant is now set from observation (5.0 / 0.25, was 0.75 / 0.02), but
+   two parts of the calibration remain open and are named there.
 4. **L4 ring-index consistency** (Amendment 4) and **L5 reference-drafter
    replay** are designed but unimplemented.
-5. The box wrapper `/opt/bench-runner/measure-dflash-job.sh` still passes the
-   nonexistent `--contract` and `--require-trained-drafter` flags, omits
-   `--drafter` on the probe side, and asserts
-   `reference_checked_row_total == declared_rows_total` where the reference can
-   only score EMITTED rows (it should be `>= emitted_token_total`).
+5. ~~The box wrapper passes nonexistent flags.~~ Reconciled; the wrapper now
+   matches the CLI surface, `bash -n` clean, `--preflight-only` OK, manifest
+   re-signed, janitor audit clean.
+6. **Pre-generated goldens desynchronize.** A golden built before the run is
+   teacher-forced on the REFERENCE's chain. The first token a candidate emits
+   that is admitted but different (declared-frame or residual) puts every later
+   row on a different context, and the run then fails `tokenNotAdmissible` for
+   reasons that are an artifact of golden pre-generation, not misbehaviour. See
+   Amendment 6; the ranked pipeline is unaffected because it generates the
+   golden AFTER the run from the observed emitted plan, but every local
+   pre-generated golden inherits this.
 
 # Amendment 5 (2026-07-30) — MEASURED AT LONG CONTEXT: DFlash is currently a NET SLOWDOWN
 
@@ -800,3 +807,147 @@ belong in any participant-facing description of the track:
   the vendored model/kernels — consistent with `benchmark.dflash.json`.
 - Both tracks nonetheless load the SAME NVFP4 group-16 reference checkpoint, so
   the model under test is identical; only the forward implementation differs.
+
+---
+
+# Amendment 6 (2026-07-30) — the seam-crossing run happened; it found a SECOND seam defect, and it calibrated L2
+
+Validation-record items 2 and 3 are closed by measurement, and the measurement
+produced three findings that change the contract. All numbers below are M5-C,
+one build for both candidate and reference, organizer-provisioned target and
+drafter, `official_scoring_enabled` still false.
+
+## 0. How a long seed was reached at all
+
+`dflash-reference` gained a chain-generation mode. The trusted binary links no
+tokenizer, so a long seed cannot be written as text; instead the reference
+GENERATES it — `--seed-generate M` extends the seed by M of the reference's own
+width-1 argmax tokens, then `--generate N` produces the N scored tokens, all in
+one process with the model resident once. That is what makes seed length a dial
+and the 512-slot ring reachable. Each step is its own stateless reference
+request, so every generated token comes from exactly the computation the
+golden's replay later uses; the cost is quadratic in the number of steps, paid
+once per golden, outside any timed window.
+
+Goldens also now record a GENUINE block frame for every width the parent could
+declare (`count ... blockSize`, plus width 1 for free, since a one-row frame is
+the sequential frame) rather than one width computed at the wrong width.
+Widening the replayed frame is sound for the scored rows: attention is causally
+masked, so rows `0 ..< count` cannot see the tail rows the widening filled in
+with later emitted tokens instead of the candidate's unknown rejected drafts.
+
+## 1. The target-side wrap-seam fix HOLDS
+
+| seed | regime | K | tokens | rounds | accepted | rejected | offset_final | verdict |
+|---|---|---|---|---|---|---|---|---|
+| 509 | ring seam (starts trimmable, ends wrapped) | 1 | 24 | 24 | 0 | 0 | 533 = 509+24 | **pass**, 24/24 exact |
+| 509 | ring seam | 3 | 24 | 10 | 15 | 0 | 533 = 509+24 | **pass**, 24/24 exact |
+| 600 | fully wrapped | 1 | 128 | 128 | 0 | 0 | 728 = 600+128 | **pass**, 128/128 exact |
+
+No `untrimmableCache` on any of these, `residual_divergence_count` 0
+throughout, `declared_rows_total >= emitted_token_total` with equality except
+the one K=3 round that declared 3 rows and emitted 2 at the window edge, and the
+parent-derived KV ledger matching `seed + committed` exactly in every case.
+Amendment 3's fix is therefore confirmed by a run that actually crosses the
+boundary, which is what that amendment asked for.
+
+## 2. NEW DEFECT: the same seam exists on the DRAFTER side and is NOT fixed
+
+Seed 600 with K=3 fails on its FIRST scored round:
+
+```
+runtime worker dflash_decode_block failed: untrimmableCache
+```
+
+Traced (`MLX_DFLASH_TRACE_CACHE_SEAM=1`; the `MLX_` prefix is load-bearing,
+`MLXFAST_*` is deliberately not in `sanitizedRuntimeWorkerEnvironment`'s
+allowlist so a harness-named variable never reaches worker code):
+
+```
+seed 509, round 1: draft_offset=509 committed=508 extra=1 draft_trimmable=true  draft_max=511  -> trim OK
+seed 509, round 2: draft_offset=511 committed=511 extra=0 draft_trimmable=false draft_max=511  -> no trim attempted
+seed 600, round 1: draft_offset=600 committed=599 extra=1 draft_trimmable=false draft_max=511  -> THROWS
+```
+
+The throw is `DFlashGreedyRound.swift:124`, the DRAFT cache alignment trim — not
+the target rollback that Amendment 3 fixed. The drafter is 5 sliding-window
+layers with `sliding_window: 512`, so its `RotatingKVCache` has
+`maxSize` 511 and `isTrimmable == offset < maxSize`; once the seed alone exceeds
+that, `trimPromptCache` returns 0, the requested 1 is not satisfied, and the
+round fails. Seed 509 survives only by luck: `extra` is 1 on the single round
+where the cache is still trimmable and 0 forever after, and the trim is guarded
+by `if extraDraftContext > 0`.
+
+**This fires on the ranked configuration.** The frozen window is a 512-token
+seed, so `draft_offset` is already past 511 at round 1 and EVERY block round
+fails. The serial control (K=1) is unaffected because it never drafts, so the
+paired measurement fails on exactly the side that produces the speedup.
+
+Not fixed here, deliberately. Every candidate fix is a design decision the
+parent should make rather than something to patch under a measurement task:
+snapshot/restore the draft cache the way the target does; align the drafter's
+cache at `begin()` so the extra row never exists; or relax `RotatingKVCache`'s
+trim refusal for the recoverable "forget the last n writes" case — the last
+would change semantics for every caller including the serial track's sliding
+layers, and should not be done casually. It also interacts with the unimplemented
+L5 drafter replay.
+
+## 3. L2 calibration: measured, constant changed, and two gaps stay open
+
+Gap = `|candidate - reference|` per top-2 slot. Logits are BF16; top-1 magnitudes
+ran 21.4..26.5, so one ULP is 0.125.
+
+| regime | context | n | max | p99 | p50 | mean | max relative |
+|---|---|---|---|---|---|---|---|
+| short, K=1 | 12..21 | 18 | 0.250 | 0.250 | 0.125 | 0.104 | 0.015 |
+| seed 509, K=1 | 509..533 | 48 | **3.375** | 3.375 | 0.250 | 0.401 | — |
+| seed 509, K=3 | 509..533 | 48 | 2.750 | 2.750 | 0.375 | 0.495 | — |
+| seed 600, K=1 | 600..728 | 256 | 2.500 | 1.750 | 0.250 | 0.316 | 0.120 |
+
+Two things in that table decide the constant:
+
+- The gap is 1-2 ULP at short context and up to **27 ULP** once context passes
+  the sliding window. This is a WINDOW-EDGE FRAME effect — incremental
+  ring-cache decode versus the reference's stateless prefill-and-replay — not
+  arithmetic noise. The ranked window lies entirely in the wrapped regime, so the
+  large-gap regime is the only one that matters.
+- It is not a seam transient. In the 256-sample run the 16 gaps above 1.0 are
+  spread across the whole run (rows 7, 23, 25, 32, 34, 39, 46, 61, 63, 76, 81,
+  89, ...), not clustered at the crossing.
+
+`DFlashWorkBindingTolerance` therefore moves from the placeholder 0.75 / 0.02 to
+**absolute 5.0, relative 0.25**: 1.5x the observed maximum over 352 long-context
+comparisons (headroom for the unobserved tail of a sample that small, without
+doubling), and ~2x the largest observed relative gap. The old relative 0.02 was
+dead code — below even the short-context gaps. All three passing runs in §1 were
+re-run with the compiled-in constant and no override.
+
+What this does NOT establish, stated because it bounds the claim:
+
+- **The cross-build term is unmeasured.** Candidate and reference were the SAME
+  build here, so these gaps are frame differences only. A real submission adds
+  its own kernels, and that term is additive on top.
+- **The false-negative side is unmeasured.** No deliberately degraded verifier
+  was run, so "a cheaper verifier cannot hide inside 5.0" is NOT a measured
+  claim. At 5.0 against top-1 logits near 21, the binder prices only gross
+  degradation. It still constrains a verifier that skips the per-row lm_head
+  entirely — it then has no values to report at all — but it does not price a
+  subtly reduced trunk. `LOGIT_VAL_TOL` in the calibration list stays open, and
+  the honest reading is that L2's discriminating power at long context is WEAK
+  and the fidelity authority remains the hidden gates.
+
+Both gaps must close before `official_scoring_enabled` is turned on.
+
+## 4. Calibration machinery, and why it cannot weaken a ranked run
+
+Measuring §3 required running with the check widened, which means a flag that
+widens a gate now exists (`--work-binding-tolerance-absolute/-relative`). It is
+refused outright when `MLXFAST_OFFICIAL_BENCHMARK_RUN=1`, prints a WARNING that
+the run is not contract-enforcing, and is pinned by
+`wideningTheWorkBindingToleranceIsRefusedOnTheOfficialPath` in
+`DFlashTrackTests`. The per-comparison gap array is published only on such a
+run: on a ranked run a per-row proximity trace against a hidden prompt is an
+oracle signal, which is what L6 keeps out of published artifacts. Aggregates
+(count, max, p99, p50, mean, and the tolerance actually used) are always
+reported, so an audit can see both the distribution and that the binding
+compared anything at all.

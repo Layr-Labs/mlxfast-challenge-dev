@@ -6,6 +6,17 @@ import MLX
 import MLXLLM
 import MLXLMCommon
 
+/// Operator diagnostic for the sliding-window ring seam. Off unless asked for:
+/// it writes cache offsets, which are structural, not token content, but there is
+/// no reason for a scored run to emit them.
+///
+/// The `MLX_` prefix is load-bearing: `sanitizedRuntimeWorkerEnvironment` copies
+/// only an allowlist into the sandboxed worker, and `MLXFAST_*` is deliberately
+/// NOT on it, so a harness-named variable never reaches this code. Same
+/// convention as `MLX_DFLASH_CPU_ACCEPT_WALK` below.
+private let dFlashTraceCacheSeam: Bool =
+    ProcessInfo.processInfo.environment["MLX_DFLASH_TRACE_CACHE_SEAM"] == "1"
+
 private let dFlashCPUAcceptWalk: Bool = {
     switch ProcessInfo.processInfo.environment["MLX_DFLASH_CPU_ACCEPT_WALK"]?.lowercased() {
     case "0", "false", "no", "off":
@@ -118,6 +129,22 @@ public func runDFlashGreedyRound(
     let committedDraftOffset = Swift.max(0, promptTokenCount + generatedTokenCount - 1)
     if let draftOffset = draftCache.first?.offset {
         let extraDraftContext = draftOffset - committedDraftOffset
+        if dFlashTraceCacheSeam {
+            FileHandle.standardError.write(
+                Data(
+                    ("dflash-trace: draft_offset=\(draftOffset) "
+                        + "committed=\(committedDraftOffset) "
+                        + "extra=\(extraDraftContext) "
+                        + "draft_trimmable=\(canTrimPromptCache(draftCache)) "
+                        + "draft_max=\(draftCache.first?.maxSize.map(String.init) ?? "nil") "
+                        + "target_offset=\(targetCache.first?.offset ?? -1) "
+                        + "target_trimmable=\(canTrimPromptCache(targetCache)) "
+                        + "prompt=\(promptTokenCount) "
+                        + "generated=\(generatedTokenCount) "
+                        + "block=\(blockSize)\n").utf8
+                )
+            )
+        }
         if extraDraftContext > 0 {
             let trimmed = trimPromptCache(draftCache, numTokens: extraDraftContext)
             if trimmed != extraDraftContext {

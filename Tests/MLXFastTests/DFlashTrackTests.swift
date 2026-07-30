@@ -372,6 +372,50 @@ struct DFlashTrackTests {
     // The retired GEMMA-era MTP surface stays retired under its own names.
     // DFlash carries its own filenames precisely so reviving a speculative
     // track cannot be confused with un-retiring the old one.
+    // The work-binding tolerance can be widened from the command line, because
+    // calibrating it means measuring the honest gap distribution with the check
+    // effectively off. A flag that widens a gate is a bypass surface, so the
+    // refusal on the official path is pinned here rather than left to review.
+    @Test
+    func wideningTheWorkBindingToleranceIsRefusedOnTheOfficialPath() throws {
+        let cli = try text("Sources/MLXFastCLI/main.swift")
+        let flag = "--work-binding-tolerance-absolute"
+        #expect(cli.contains(flag), "the calibration flag should exist")
+
+        // The guard must sit between the flag being read and the tolerance being
+        // constructed, so locate the override block and require the official-run
+        // refusal inside it.
+        let block = try #require(
+            cli.range(of: flag).flatMap { start in
+                cli.range(
+                    of: "tolerance = DFlashWorkBindingTolerance(",
+                    range: start.upperBound ..< cli.endIndex
+                ).map { end in String(cli[start.upperBound ..< end.lowerBound]) }
+            },
+            "could not find the tolerance override block"
+        )
+        #expect(
+            block.contains("MLXFAST_OFFICIAL_BENCHMARK_RUN"),
+            """
+            The DFlash work-binding tolerance override must be refused when \
+            MLXFAST_OFFICIAL_BENCHMARK_RUN=1; otherwise a ranked run could be \
+            scored against a widened contract check.
+            """
+        )
+
+        // The per-comparison gap trace is calibration output only: on a ranked
+        // run it is a per-row proximity signal against a hidden prompt, which
+        // contract layer L6 keeps out of every published artifact.
+        #expect(
+            cli.contains("payload[\"work_binding_logit_deltas\"]")
+                && cli.contains("tolerance.absolute != toleranceDefaults.absolute"),
+            """
+            work_binding_logit_deltas must only be published when a calibration \
+            tolerance is in use.
+            """
+        )
+    }
+
     @Test
     func retiredMTPNamesStayRetired() throws {
         let fm = FileManager.default

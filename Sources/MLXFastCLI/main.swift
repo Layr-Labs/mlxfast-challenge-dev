@@ -1269,6 +1269,9 @@ private enum MLXFastCLI {
             valueOptions: [
                 "--weights", "--drafter", "--golden", "--block-size",
                 "--tokens", "--schedule-seed", "--output",
+                // Calibration only -- see the guard below.
+                "--work-binding-tolerance-absolute",
+                "--work-binding-tolerance-relative",
             ]
         )
         let weightsPath = options.value(
@@ -1319,10 +1322,71 @@ private enum MLXFastCLI {
             options.value(for: "--schedule-seed", default: "0")
         ) ?? 0
         guard let workerOptions = try runtimeWorkerOptions(
-            blockedGoldenPath: goldenPath
+            blockedGoldenPath: goldenPath,
+            // Operator seam diagnostic: the worker's ring-cache trace is only
+            // useful if it reaches the parent's stderr. `runtimeWorkerOptions`
+            // ANDs this with `!officialRun`, so a ranked run stays silent.
+            forwardsWorkerStderr: environmentValue(
+                "MLX_DFLASH_TRACE_CACHE_SEAM",
+                fallback: "0"
+            ) == "1"
         ) else {
             throw MLXFastError.invalidInput(
                 "\(subcommand) requires the participant runtime worker"
+            )
+        }
+
+        // The work-binding tolerance is OPERATOR CALIBRATION MACHINERY, not a run
+        // parameter: the honest gap distribution has to be measured before the
+        // constant can be defended, and measuring it means running with the check
+        // widened. A flag that widens a gate is a bypass surface, so it is
+        // refused outright on the official path -- a ranked run always uses the
+        // compiled-in constant.
+        let toleranceAbsolute = options.value(
+            for: "--work-binding-tolerance-absolute",
+            default: ""
+        )
+        let toleranceRelative = options.value(
+            for: "--work-binding-tolerance-relative",
+            default: ""
+        )
+        let toleranceDefaults = DFlashWorkBindingTolerance()
+        var tolerance = toleranceDefaults
+        if !toleranceAbsolute.isEmpty || !toleranceRelative.isEmpty {
+            guard environmentValue(
+                "MLXFAST_OFFICIAL_BENCHMARK_RUN",
+                fallback: "0"
+            ) != "1" else {
+                throw MLXFastError.invalidInput(
+                    "official benchmark runs must use the compiled-in DFlash "
+                        + "work-binding tolerance; drop "
+                        + "--work-binding-tolerance-*"
+                )
+            }
+            guard let absolute = Double(
+                toleranceAbsolute.isEmpty
+                    ? String(toleranceDefaults.absolute)
+                    : toleranceAbsolute
+            ), absolute >= 0,
+                let relative = Double(
+                    toleranceRelative.isEmpty
+                        ? String(toleranceDefaults.relative)
+                        : toleranceRelative
+                ), relative >= 0
+            else {
+                throw MLXFastError.invalidInput(
+                    "--work-binding-tolerance-* require non-negative numbers"
+                )
+            }
+            tolerance = DFlashWorkBindingTolerance(
+                absolute: absolute,
+                relative: relative
+            )
+            fputs(
+                "\(subcommand): WARNING calibration tolerance in use "
+                    + "(absolute=\(absolute) relative=\(relative)); this run is "
+                    + "NOT a contract-enforcing run\n",
+                stderr
             )
         }
 
@@ -1335,7 +1399,8 @@ private enum MLXFastCLI {
                 totalTokenCount: tokens
             ),
             workerOptions: workerOptions,
-            scheduleSeed: scheduleSeed
+            scheduleSeed: scheduleSeed,
+            tolerance: tolerance
         )
 
         fputs(
@@ -1366,6 +1431,9 @@ private enum MLXFastCLI {
             "decode_seconds": report.decodeSeconds,
             "accepted_draft_rate": report.acceptedDraftRate,
             "residual_divergence_count": report.residualDivergenceCount,
+            "admissible_exact_count": report.admissibleExactCount,
+            "admissible_declared_frame_count":
+                report.admissibleDeclaredFrameCount,
             // L3 ledger.
             "emitted_token_total": report.totalTokenCount,
             "declared_rows_total": report.declaredRowTotal,
@@ -1376,9 +1444,32 @@ private enum MLXFastCLI {
             "round_count": report.roundCount,
             "seed_token_count": report.seedTokenCount,
             "target_cache_offset_final": report.targetCacheOffsetFinal,
+            // L2 work-binding gap distribution. Reported so the tolerance stays
+            // traceable to measurement (contract Amendment 1) and so an audit can
+            // see whether the binding compared anything at all.
+            "work_binding_comparison_count": report.workBindingComparisonCount,
+            "max_top2_logit_delta": report.maxTop2LogitDelta,
+            "mean_top2_logit_delta": report.meanTop2LogitDelta,
+            "p50_top2_logit_delta": report.p50Top2LogitDelta,
+            "p99_top2_logit_delta": report.p99Top2LogitDelta,
+            "max_top2_logit_relative_delta": report.maxTop2LogitRelativeDelta,
+            "p99_top2_logit_relative_delta": report.p99Top2LogitRelativeDelta,
+            "work_binding_tolerance_absolute":
+                report.workBindingToleranceAbsolute,
+            "work_binding_tolerance_relative":
+                report.workBindingToleranceRelative,
         ]
         if let stall = report.maxOverMedianRoundLatency {
             payload["max_over_median_round_latency"] = stall
+        }
+        // Per-comparison gaps are calibration output, not run output: on a ranked
+        // run they would be a per-row proximity trace against a hidden prompt,
+        // which contract layer L6 keeps out of any published artifact. The
+        // widened tolerance that enables them is refused on the official path.
+        if tolerance.absolute != toleranceDefaults.absolute
+            || tolerance.relative != toleranceDefaults.relative
+        {
+            payload["work_binding_logit_deltas"] = report.workBindingLogitDeltas
         }
         let data = try JSONSerialization.data(
             withJSONObject: payload,
@@ -1397,7 +1488,13 @@ private enum MLXFastCLI {
     /// baseline tree, over organizer-transformed weights.
     private static func runDFlashReference(_ options: ParsedOptions) throws {
         try options.validate(
-            valueOptions: ["--weights", "--drafter", "--emitted", "--output"]
+            valueOptions: [
+                "--weights", "--drafter", "--emitted", "--output",
+                // Chain generation: the reference produces the decode chain
+                // itself instead of replaying a hand-written `emitted` array.
+                "--generate", "--seed-generate", "--block-size",
+                "--schedule-seed", "--plan-output",
+            ]
         )
         let weightsPath = options.value(
             for: "--weights",
@@ -1417,10 +1514,14 @@ private enum MLXFastCLI {
             )
         }
         let emittedPath = options.value(for: "--emitted", default: "")
+        let generateCount = try optionalCount(
+            options.value(for: "--generate", default: ""),
+            name: "--generate"
+        )
         guard !emittedPath.isEmpty else {
             throw MLXFastError.invalidInput(
                 "dflash-reference requires --emitted PATH (the emitted plan to "
-                    + "replay)"
+                    + "replay, or a seed-only plan when --generate is used)"
             )
         }
         let outputPath = options.value(for: "--output", default: "")
@@ -1439,8 +1540,37 @@ private enum MLXFastCLI {
             DFlashEmittedPlan.self,
             from: try Data(contentsOf: URL(fileURLWithPath: emittedPath))
         )
+
+        // `--generate N` makes the reference produce the decode chain itself.
+        // `--seed-generate M` first extends the SEED by M reference-generated
+        // tokens, which is the only way to build a long seed here: the trusted
+        // binary links no tokenizer, so seed length is dialled in tokens, not
+        // text. That is what makes the 512-slot ring seam reachable.
+        var chain: DFlashReferenceChainOptions?
+        if let generateCount {
+            let planOutput = options.value(for: "--plan-output", default: "")
+            chain = DFlashReferenceChainOptions(
+                seedExtensionSteps: try optionalCount(
+                    options.value(for: "--seed-generate", default: ""),
+                    name: "--seed-generate"
+                ) ?? 0,
+                generateTokenCount: generateCount,
+                roundBlockSize: try positiveInteger(
+                    options.value(for: "--block-size", default: "1"),
+                    name: "--block-size"
+                ),
+                scheduleSeed: UInt64(
+                    options.value(for: "--schedule-seed", default: "0")
+                ) ?? 0,
+                planOutputPath: planOutput.isEmpty
+                    ? outputPath + ".plan.json"
+                    : planOutput
+            )
+        }
+
         let result = try LagunaRuntime.experimentalDFlashReferenceGolden(
             plan: plan,
+            chain: chain,
             targetWeightsPath: weightsPath,
             drafterPath: drafterPath,
             outputPath: outputPath,
@@ -1449,7 +1579,11 @@ private enum MLXFastCLI {
 
         print(
             "dflash-reference: rows=\(result.rowCount) "
+                + "seed_tokens=\(result.seedTokenCount) "
                 + "reference_seed_token=\(result.referenceSeedToken) "
+                + "recorded_frame_widths="
+                + "\(result.recordedFrameWidths.map(String.init).joined(separator: ","))"
+                + " plan_output=\(result.planOutputPath ?? "-") "
                 + "reference_self_consistent=\(result.selfConsistent) "
                 + "replayed_rows=\(result.selfConsistencyRowCount) "
                 + "detail=\(result.selfConsistencyDetail)"
@@ -1475,6 +1609,20 @@ private enum MLXFastCLI {
     ) throws -> Int {
         guard let value = Int(text), value > 0 else {
             throw MLXFastError.invalidInput("\(name) requires a positive integer")
+        }
+        return value
+    }
+
+    /// A non-negative count that is absent when the flag was not passed.
+    private static func optionalCount(
+        _ text: String,
+        name: String
+    ) throws -> Int? {
+        guard !text.isEmpty else { return nil }
+        guard let value = Int(text), value >= 0 else {
+            throw MLXFastError.invalidInput(
+                "\(name) requires a non-negative integer"
+            )
         }
         return value
     }

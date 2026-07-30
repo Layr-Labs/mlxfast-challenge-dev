@@ -34,12 +34,32 @@ public struct DFlashReferenceGolden: Codable {
     /// (contract layer L1 requirement R5). A run must refuse to score against a
     /// golden that never proved reference determinism.
     public let referenceSelfConsistent: Bool?
+    /// The emitted chain these rows were replayed against, when the reference
+    /// generated it itself. Carried so a plan can be reconstructed from the
+    /// golden alone; it leaks nothing the rows do not already contain, since
+    /// `rows[i].sequentialArgmax` is the same chain for a generated golden.
+    public let emittedTokens: [Int]?
 
     enum CodingKeys: String, CodingKey {
         case seedTokens = "seed_tokens"
         case referenceSeedToken = "reference_seed_token"
         case rows
         case referenceSelfConsistent = "reference_self_consistent"
+        case emittedTokens = "emitted_tokens"
+    }
+
+    public init(
+        seedTokens: [Int],
+        referenceSeedToken: Int,
+        rows: [Row],
+        referenceSelfConsistent: Bool?,
+        emittedTokens: [Int]? = nil
+    ) {
+        self.seedTokens = seedTokens
+        self.referenceSeedToken = referenceSeedToken
+        self.rows = rows
+        self.referenceSelfConsistent = referenceSelfConsistent
+        self.emittedTokens = emittedTokens
     }
 }
 
@@ -230,6 +250,8 @@ extension LagunaRuntime {
             rejectedDraftTotal: rejectedTotal,
             declaredRowTotal: validator.declaredRowTotal,
             residualDivergenceCount: validator.residualDivergenceCount,
+            admissibleExactCount: validator.admissibleExactCount,
+            admissibleDeclaredFrameCount: validator.admissibleDeclaredFrameCount,
             maxOverMedianRoundLatency: validator.maxOverMedianRoundLatency(),
             allTokensAdmissible: true,
             seedTokenCount: golden.seedTokens.count,
@@ -243,7 +265,17 @@ extension LagunaRuntime {
             maxBlockRequestSeconds: validator.maxBlockRequestSeconds,
             p50BlockRequestSeconds: validator.p50BlockRequestSeconds,
             blockSize: options.maxBlockSize,
-            usesTrainedDrafter: options.maxBlockSize > 1
+            usesTrainedDrafter: options.maxBlockSize > 1,
+            workBindingComparisonCount: validator.workBindingComparisonCount,
+            maxTop2LogitDelta: validator.maxWorkBindingLogitDelta,
+            meanTop2LogitDelta: validator.meanWorkBindingLogitDelta,
+            p50Top2LogitDelta: validator.p50WorkBindingLogitDelta,
+            p99Top2LogitDelta: validator.p99WorkBindingLogitDelta,
+            maxTop2LogitRelativeDelta: validator.maxWorkBindingLogitRelativeDelta,
+            p99Top2LogitRelativeDelta: validator.p99WorkBindingLogitRelativeDelta,
+            workBindingLogitDeltas: validator.workBindingLogitDeltas,
+            workBindingToleranceAbsolute: tolerance.absolute,
+            workBindingToleranceRelative: tolerance.relative
         )
     }
 }
@@ -278,6 +310,42 @@ public struct DFlashEmittedPlan: Codable {
     }
 }
 
+/// Reference-driven chain generation for `dflash-reference --generate`.
+///
+/// Without this, a golden can only ever be as long as an `emitted` array someone
+/// typed by hand, which makes the long-context and wrap-seam cases untestable.
+/// Here the REFERENCE produces the chain itself: sequential width-1 argmax over
+/// its own growing context, one token at a time, in a single process with the
+/// model resident once.
+///
+/// `seedExtensionSteps` is the seam lever. The trusted binary links no
+/// tokenizer, so a long seed cannot be typed as text; instead the seed becomes
+/// the supplied prompt plus that many reference-generated tokens. That is real
+/// model-shaped context, and it lets the seed length be dialled to any position
+/// relative to Laguna's 512-slot sliding-window ring -- including the ~505..511
+/// band where a block round STARTS trimmable and ENDS wrapped.
+public struct DFlashReferenceChainOptions {
+    public let seedExtensionSteps: Int
+    public let generateTokenCount: Int
+    public let roundBlockSize: Int
+    public let scheduleSeed: UInt64
+    public let planOutputPath: String?
+
+    public init(
+        seedExtensionSteps: Int = 0,
+        generateTokenCount: Int,
+        roundBlockSize: Int = 1,
+        scheduleSeed: UInt64 = 0,
+        planOutputPath: String? = nil
+    ) {
+        self.seedExtensionSteps = seedExtensionSteps
+        self.generateTokenCount = generateTokenCount
+        self.roundBlockSize = roundBlockSize
+        self.scheduleSeed = scheduleSeed
+        self.planOutputPath = planOutputPath
+    }
+}
+
 /// Outcome of a reference pass, including the self-consistency verdict.
 public struct DFlashReferenceGoldenResult {
     public let rowCount: Int
@@ -285,6 +353,32 @@ public struct DFlashReferenceGoldenResult {
     public let selfConsistent: Bool
     public let selfConsistencyRowCount: Int
     public let selfConsistencyDetail: String
+    /// Seed length actually used, i.e. after any `--seed-generate` extension.
+    public let seedTokenCount: Int
+    /// Declared block widths recorded per row, ascending.
+    public let recordedFrameWidths: [Int]
+    /// Where the reconstructed emitted plan was written, if it was.
+    public let planOutputPath: String?
+
+    public init(
+        rowCount: Int,
+        referenceSeedToken: Int,
+        selfConsistent: Bool,
+        selfConsistencyRowCount: Int,
+        selfConsistencyDetail: String,
+        seedTokenCount: Int = 0,
+        recordedFrameWidths: [Int] = [],
+        planOutputPath: String? = nil
+    ) {
+        self.rowCount = rowCount
+        self.referenceSeedToken = referenceSeedToken
+        self.selfConsistent = selfConsistent
+        self.selfConsistencyRowCount = selfConsistencyRowCount
+        self.selfConsistencyDetail = selfConsistencyDetail
+        self.seedTokenCount = seedTokenCount
+        self.recordedFrameWidths = recordedFrameWidths
+        self.planOutputPath = planOutputPath
+    }
 }
 
 extension LagunaRuntime {
@@ -303,6 +397,7 @@ extension LagunaRuntime {
     /// failure is an OPERATOR fault rather than a submission fault.
     public static func experimentalDFlashReferenceGolden(
         plan: DFlashEmittedPlan,
+        chain: DFlashReferenceChainOptions? = nil,
         targetWeightsPath: String,
         drafterPath: String,
         outputPath: String,
@@ -313,10 +408,28 @@ extension LagunaRuntime {
                 "DFlash reference plan has an empty seed"
             )
         }
-        guard !plan.emitted.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "DFlash reference plan has no emitted tokens to verify"
-            )
+        if let chain {
+            guard chain.generateTokenCount > 0 else {
+                throw MLXFastError.invalidInput(
+                    "DFlash reference chain generation needs a positive token "
+                        + "count"
+                )
+            }
+            guard chain.seedExtensionSteps >= 0, chain.roundBlockSize >= 1,
+                  chain.roundBlockSize
+                      <= MLXFastConstants.experimentalDFlashMaxBlockSize
+            else {
+                throw MLXFastError.invalidInput(
+                    "DFlash reference chain generation has an out-of-range "
+                        + "seed extension or block width"
+                )
+            }
+        } else {
+            guard !plan.emitted.isEmpty else {
+                throw MLXFastError.invalidInput(
+                    "DFlash reference plan has no emitted tokens to verify"
+                )
+            }
         }
 
         let client = try RuntimeWorkerClient(
@@ -326,12 +439,23 @@ extension LagunaRuntime {
         )
         defer { client.close() }
 
+        // --- optional seed extension (one process, model resident once) ------
+        var seedTokens = plan.seedTokens
+        if let chain, chain.seedExtensionSteps > 0 {
+            seedTokens += try generateReferenceChain(
+                client: client,
+                context: seedTokens,
+                steps: chain.seedExtensionSteps,
+                label: "seed-generate"
+            )
+        }
+
         // The seed token is the width-1 argmax with the seed as the whole
         // context: row 0 fed the seed's last token. Asking the reference for it
         // avoids trusting any candidate-supplied value.
         let seedProbe = try client.dflashReferenceRows(
-            prefixTokens: plan.seedTokens,
-            startOffset: plan.seedTokens.count - 1,
+            prefixTokens: seedTokens,
+            startOffset: seedTokens.count - 1,
             rowCount: 1,
             declaredBlockWidth: 1
         )
@@ -344,28 +468,72 @@ extension LagunaRuntime {
             )
         }
 
+        // --- the emitted chain: supplied, or generated by the reference ------
+        let emitted: [Int]
+        if let chain {
+            emitted = try generateReferenceChain(
+                client: client,
+                context: seedTokens + [seedArgmax],
+                steps: chain.generateTokenCount,
+                label: "generate"
+            )
+        } else {
+            emitted = plan.emitted
+        }
+
         // Full context the emitted rows were produced against.
-        let context = plan.seedTokens + [seedArgmax] + plan.emitted
+        let context = seedTokens + [seedArgmax] + emitted
         // Row i is fed context[seedLen + i] and predicts context[seedLen+i+1],
-        // i.e. plan.emitted[i].
-        let rowInputBase = plan.seedTokens.count
+        // i.e. emitted[i].
+        let rowInputBase = seedTokens.count
 
         // Rounds give the declared block widths. Absent, treat every row as its
         // own width-1 round so the golden is still usable for a serial control.
-        let rounds = plan.rounds
-            ?? plan.emitted.map { _ in DFlashEmittedPlan.Round(blockSize: 1, count: 1) }
+        let rounds: [DFlashEmittedPlan.Round]
+        if let chain {
+            // Lay the generated rounds out on the SAME parent schedule the run
+            // will use. The parent owns block widths, so with full acceptance
+            // the golden's frame boundaries land exactly where the run's do; a
+            // partially-accepting round shifts them, which is what the capped
+            // residual bucket is for.
+            rounds = scheduledRounds(
+                tokenCount: emitted.count,
+                maxBlockSize: chain.roundBlockSize,
+                scheduleSeed: chain.scheduleSeed
+            )
+        } else {
+            rounds = plan.rounds
+                ?? emitted.map { _ in
+                    DFlashEmittedPlan.Round(blockSize: 1, count: 1)
+                }
+        }
         let plannedRowTotal = rounds.reduce(0) { $0 + $1.count }
-        guard plannedRowTotal == plan.emitted.count else {
+        guard plannedRowTotal == emitted.count else {
             throw MLXFastError.invalidInput(
                 "DFlash reference plan rounds cover \(plannedRowTotal) rows but "
-                    + "\(plan.emitted.count) tokens were emitted"
+                    + "\(emitted.count) tokens were emitted"
             )
         }
 
+        if let path = chain?.planOutputPath {
+            let reconstructed = DFlashEmittedPlan(
+                seedTokens: seedTokens,
+                emitted: emitted,
+                rounds: rounds
+            )
+            let planEncoder = JSONEncoder()
+            planEncoder.outputFormatting = [
+                .prettyPrinted, .sortedKeys, .withoutEscapingSlashes,
+            ]
+            try planEncoder.encode(reconstructed)
+                .write(to: URL(fileURLWithPath: path))
+        }
+
         var goldenRows = [DFlashReferenceGolden.Row]()
-        goldenRows.reserveCapacity(plan.emitted.count)
+        goldenRows.reserveCapacity(emitted.count)
         var replayRequest: (offset: Int, count: Int, width: Int)?
         var replayExpected: RuntimeWorkerResponse?
+        var recordedWidths = Set<Int>([1])
 
         var emittedOffset = 0
         for round in rounds {
@@ -376,33 +544,70 @@ extension LagunaRuntime {
                 )
             }
             let startOffset = rowInputBase + emittedOffset
-            let response = try client.dflashReferenceRows(
-                prefixTokens: context,
-                startOffset: startOffset,
-                rowCount: round.count,
-                declaredBlockWidth: round.blockSize
-            )
-            guard response.ok,
+
+            // Record a GENUINE block frame for every width the parent could
+            // have declared here, not just one.
+            //
+            // The parent picks each round's width from a randomized schedule, and
+            // a round that rejects drafts emits fewer tokens than its declared
+            // width, so the width a row is scored at is not known when the
+            // golden is built. Replaying widths `count ... blockSize` covers
+            // every width the schedule can request. Widening the frame is sound
+            // for the scored rows: attention is causally masked, so rows
+            // `0 ..< count` cannot see the tail rows this widening filled in
+            // with later emitted tokens rather than the candidate's (unknown)
+            // rejected drafts. Kernel tiling can still perturb the last bits of
+            // a wider frame, which is what the top-2 tolerance absorbs.
+            let availableRows = context.count - startOffset
+            let widestFrame = Swift.min(round.blockSize, availableRows)
+            var response: RuntimeWorkerResponse?
+            var frames = [Int: [Int]]()
+            for width in round.count ... Swift.max(round.count, widestFrame) {
+                let framed = try client.dflashReferenceRows(
+                    prefixTokens: context,
+                    startOffset: startOffset,
+                    rowCount: width,
+                    declaredBlockWidth: width
+                )
+                guard framed.ok,
+                      let block = framed.referenceBlockArgmax,
+                      block.count == width
+                else {
+                    throw MLXFastError.invalidInput(
+                        "DFlash reference returned an incomplete width-\(width) "
+                            + "frame: " + (framed.error ?? "shape mismatch")
+                    )
+                }
+                frames[width] = Array(block.prefix(round.count))
+                recordedWidths.insert(width)
+                if width == round.count { response = framed }
+            }
+            guard let response,
                   let k1 = response.referenceK1Argmax,
-                  let block = response.referenceBlockArgmax,
                   let top2Tokens = response.referenceTop2Tokens,
                   let top2Logits = response.referenceTop2Logits,
                   k1.count == round.count,
-                  block.count == round.count,
                   top2Tokens.count == round.count,
                   top2Logits.count == round.count
             else {
                 throw MLXFastError.invalidInput(
-                    "DFlash reference returned an incomplete row batch: "
-                        + (response.error ?? "shape mismatch")
+                    "DFlash reference returned an incomplete row batch"
                 )
             }
 
             for index in 0 ..< round.count {
+                var declaredFrames = [String: Int]()
+                for (width, argmax) in frames where index < argmax.count {
+                    declaredFrames[String(width)] = argmax[index]
+                }
+                // Width 1 needs no request: a one-row frame IS the sequential
+                // frame, so the serial control (max block size 1) always has a
+                // declared-frame entry to be scored against.
+                declaredFrames["1"] = k1[index]
                 goldenRows.append(
                     DFlashReferenceGolden.Row(
                         sequentialArgmax: k1[index],
-                        declaredFrameArgmax: [String(round.blockSize): block[index]],
+                        declaredFrameArgmax: declaredFrames,
                         top2Tokens: top2Tokens[index],
                         top2Logits: top2Logits[index]
                     )
@@ -412,7 +617,7 @@ extension LagunaRuntime {
             // Replay the FIRST round: it is the one whose context is shortest,
             // so a determinism failure there is unambiguous.
             if replayRequest == nil {
-                replayRequest = (startOffset, round.count, round.blockSize)
+                replayRequest = (startOffset, round.count, round.count)
                 replayExpected = response
             }
             emittedOffset += round.count
@@ -449,10 +654,11 @@ extension LagunaRuntime {
         }
 
         let golden = DFlashReferenceGolden(
-            seedTokens: plan.seedTokens,
+            seedTokens: seedTokens,
             referenceSeedToken: seedArgmax,
             rows: goldenRows,
-            referenceSelfConsistent: selfConsistent
+            referenceSelfConsistent: selfConsistent,
+            emittedTokens: chain == nil ? nil : emitted
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
@@ -463,7 +669,81 @@ extension LagunaRuntime {
             referenceSeedToken: seedArgmax,
             selfConsistent: selfConsistent,
             selfConsistencyRowCount: selfConsistencyRowCount,
-            selfConsistencyDetail: selfConsistencyDetail
+            selfConsistencyDetail: selfConsistencyDetail,
+            seedTokenCount: seedTokens.count,
+            recordedFrameWidths: recordedWidths.sorted(),
+            planOutputPath: chain?.planOutputPath
         )
+    }
+
+    /// Generate `steps` tokens by sequential width-1 reference argmax.
+    ///
+    /// Every step is its own stateless reference request, so each generated token
+    /// is produced by EXACTLY the computation the golden's own replay uses -- a
+    /// stateful incremental generator would be faster but would generate the
+    /// chain in a different frame than the one it is later checked in, which is
+    /// the class of mismatch this whole contract exists to detect. The cost is
+    /// quadratic in `steps`; that is an operator-side cost outside any timed
+    /// window, paid once per golden.
+    private static func generateReferenceChain(
+        client: RuntimeWorkerClient,
+        context: [Int],
+        steps: Int,
+        label: String
+    ) throws -> [Int] {
+        guard steps > 0 else { return [] }
+        var context = context
+        var generated = [Int]()
+        generated.reserveCapacity(steps)
+        for index in 0 ..< steps {
+            let response = try client.dflashReferenceRows(
+                prefixTokens: context,
+                startOffset: context.count - 1,
+                rowCount: 1,
+                declaredBlockWidth: 1
+            )
+            guard response.ok,
+                  let token = response.referenceK1Argmax?.first
+            else {
+                throw MLXFastError.invalidInput(
+                    "DFlash reference chain generation failed at \(label) step "
+                        + "\(index): " + (response.error ?? "no row returned")
+                )
+            }
+            generated.append(token)
+            context.append(token)
+            if (index + 1) % 32 == 0 || index + 1 == steps {
+                fputs(
+                    "dflash-reference: \(label) \(index + 1)/\(steps) "
+                        + "(context \(context.count))\n",
+                    stderr
+                )
+            }
+        }
+        return generated
+    }
+
+    /// Round layout for a generated chain, replaying the parent block schedule.
+    private static func scheduledRounds(
+        tokenCount: Int,
+        maxBlockSize: Int,
+        scheduleSeed: UInt64
+    ) -> [DFlashEmittedPlan.Round] {
+        var schedule = DFlashBlockSchedule(
+            seed: scheduleSeed,
+            maxBlockSize: maxBlockSize,
+            minBlockSize: maxBlockSize == 1 ? 1 : 2
+        )
+        var rounds = [DFlashEmittedPlan.Round]()
+        var remaining = tokenCount
+        while remaining > 0 {
+            let width = schedule.nextBlockSize()
+            let count = Swift.min(width, remaining)
+            rounds.append(
+                DFlashEmittedPlan.Round(blockSize: width, count: count)
+            )
+            remaining -= count
+        }
+        return rounds
     }
 }

@@ -111,18 +111,48 @@ public struct DFlashContractViolation: Error, CustomStringConvertible {
 
 /// Tolerance for comparing candidate and reference per-row top-2 logit VALUES.
 ///
-/// These are numeric readouts from two different builds, so they are compared
-/// with a tolerance -- never for equality. The tolerance is deliberately much
-/// tighter than the degradation a cheaper verifier would introduce (a
-/// reduced-depth trunk or coarser dequantization moves these at every row,
-/// including the confident ones where argmax hides it) but loose enough to
-/// absorb benign kernel accumulation-order differences. Calibrate on M5-C
-/// before enabling official scoring.
+/// These are numeric readouts taken in two different frames, so they are compared
+/// with a tolerance -- never for equality.
+///
+/// MEASURED BASIS (M5-C, 2026-07-30, Laguna XS 2.1 NVFP4 target + the pinned
+/// 924 MB BF16 drafter, candidate and reference from the SAME build). Gap =
+/// `|candidate - reference|` per top-2 slot; logits are BF16, so one ULP at these
+/// magnitudes (top-1 ranged 21.4..26.5) is 0.125:
+///
+///     regime                     ctx        n     max    p99   p50   mean
+///     short  K=1                 12..21     18   0.250  0.250 0.125  0.104
+///     seed 509 (ring seam) K=1   509..533   48   3.375  3.375 0.250  0.401
+///     seed 509 (ring seam) K=3   509..533   48   2.750  2.750 0.375  0.495
+///     seed 600 (wrapped)   K=1   600..728  256   2.500  1.750 0.250  0.316
+///
+/// Two things in that table decide the constant. First, the gap is ~1-2 ULP at
+/// short context and up to 27 ULP once the context passes the 512-slot sliding
+/// window -- the divergence is a WINDOW-EDGE frame effect (incremental ring-cache
+/// decode vs. the reference's stateless prefill-and-replay), not arithmetic noise,
+/// and the ranked window sits entirely in the wrapped regime. Second, it is not a
+/// seam transient: in the 256-sample run the 16 gaps above 1.0 are spread across
+/// the whole run, not clustered at the wrap.
+///
+/// So: absolute 5.0 is 1.5x the observed maximum over 352 long-context
+/// comparisons, which buys headroom for the unobserved tail of a sample that
+/// small without doubling it. Relative 0.25 is ~2x the largest observed relative
+/// gap (0.120) -- the old 0.02 was dead code, below even the short-context gaps.
+///
+/// WHAT THIS DOES NOT ESTABLISH, stated because it bounds the claim:
+///   * Candidate and reference were the same build, so the CROSS-BUILD term (a
+///     submission's own kernels) is unmeasured and additive on top of these.
+///   * The false-negative side is unmeasured: no deliberately degraded verifier
+///     was run, so "a cheaper verifier cannot hide inside 5.0" is not a measured
+///     claim. At 5.0 against top-1 logits near 21 the binder prices only GROSS
+///     degradation. It remains a real constraint on a verifier that skips the
+///     per-row lm_head entirely (it then has no values to report at all), but it
+///     does not price a subtly reduced trunk.
+/// Both gaps must be closed before `official_scoring_enabled` is turned on.
 public struct DFlashWorkBindingTolerance: Sendable {
     public let absolute: Double
     public let relative: Double
 
-    public init(absolute: Double = 0.75, relative: Double = 0.02) {
+    public init(absolute: Double = 5.0, relative: Double = 0.25) {
         self.absolute = absolute
         self.relative = relative
     }
@@ -192,6 +222,19 @@ public final class LagunaDFlashBlockValidator {
     /// REJECTED draft rows, so the reference has nothing to score them against
     /// (an L2 follow-up).
     public private(set) var referenceCheckedRowTotal = 0
+    /// Every observed `|candidate - reference|` top-2 logit gap, including the
+    /// ones comfortably inside tolerance.
+    ///
+    /// This is the calibration instrument for contract Amendment 1: the
+    /// tolerance constant is only defensible if it was set from a MEASURED
+    /// distribution of honest gaps, so the parent records the distribution on
+    /// every run rather than asserting a number. It is also a liveness check on
+    /// the binding itself -- a run that recorded no gaps at all compared no
+    /// readouts.
+    public private(set) var workBindingLogitDeltas = [Double]()
+    /// The same gaps divided by the larger of the two magnitudes, i.e. the
+    /// quantity the relative arm of the tolerance actually tests.
+    public private(set) var workBindingLogitRelativeDeltas = [Double]()
 
     public init(
         oracle: any DFlashReferenceOracle,
@@ -349,16 +392,30 @@ public final class LagunaDFlashBlockValidator {
                     candidateLogits.count,
                     referenceLogits.count
                 )
-                for pair in 0 ..< pairCount
-                where !tolerance.matches(
-                    candidate: candidateLogits[pair],
-                    reference: referenceLogits[pair]
-                ) {
-                    throw DFlashContractViolation(
-                        kind: .workBindingLogitMismatch,
-                        step: step + index,
-                        detail: "row readout \(pair) outside tolerance"
+                for pair in 0 ..< pairCount {
+                    let candidateValue = candidateLogits[pair]
+                    let referenceValue = referenceLogits[pair]
+                    // Record first, judge second: the distribution is wanted even
+                    // for the run that is about to fail.
+                    let delta = abs(candidateValue - referenceValue)
+                    workBindingLogitDeltas.append(delta)
+                    let scale = Swift.max(
+                        abs(candidateValue),
+                        abs(referenceValue)
                     )
+                    workBindingLogitRelativeDeltas.append(
+                        scale > 0 ? delta / scale : 0
+                    )
+                    guard tolerance.matches(
+                        candidate: candidateValue,
+                        reference: referenceValue
+                    ) else {
+                        throw DFlashContractViolation(
+                            kind: .workBindingLogitMismatch,
+                            step: step + index,
+                            detail: "row readout \(pair) outside tolerance"
+                        )
+                    }
                 }
             }
         }
@@ -388,6 +445,55 @@ public final class LagunaDFlashBlockValidator {
         let median = sorted[sorted.count / 2]
         guard median > 0, let maximum = sorted.last else { return nil }
         return maximum / median
+    }
+
+    // --- work-binding gap distribution (Amendment 1 calibration input) ------
+
+    /// How many emitted tokens were the reference's own width-1 argmax.
+    public var admissibleExactCount: Int {
+        outcomes.filter { $0 == .admissibleExact }.count
+    }
+    /// How many were admitted only because the reference produces them in the
+    /// declared block frame. A nonzero count on a run scored against a
+    /// PRE-GENERATED golden also means the candidate's chain has diverged from
+    /// the golden's, so every later row is being compared against a differently
+    /// teacher-forced context.
+    public var admissibleDeclaredFrameCount: Int {
+        outcomes.filter { $0 == .admissibleDeclaredFrame }.count
+    }
+
+    public var workBindingComparisonCount: Int { workBindingLogitDeltas.count }
+    public var maxWorkBindingLogitDelta: Double {
+        workBindingLogitDeltas.max() ?? 0
+    }
+    public var meanWorkBindingLogitDelta: Double {
+        guard !workBindingLogitDeltas.isEmpty else { return 0 }
+        return workBindingLogitDeltas.reduce(0, +)
+            / Double(workBindingLogitDeltas.count)
+    }
+    public var p50WorkBindingLogitDelta: Double {
+        workBindingLogitDeltaQuantile(0.50)
+    }
+    public var p99WorkBindingLogitDelta: Double {
+        workBindingLogitDeltaQuantile(0.99)
+    }
+
+    public var maxWorkBindingLogitRelativeDelta: Double {
+        workBindingLogitRelativeDeltas.max() ?? 0
+    }
+    public var p99WorkBindingLogitRelativeDelta: Double {
+        Self.quantile(workBindingLogitRelativeDeltas, 0.99)
+    }
+
+    private func workBindingLogitDeltaQuantile(_ quantile: Double) -> Double {
+        Self.quantile(workBindingLogitDeltas, quantile)
+    }
+
+    private static func quantile(_ values: [Double], _ quantile: Double) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let index = Int((Double(sorted.count - 1) * quantile).rounded())
+        return sorted[Swift.min(Swift.max(index, 0), sorted.count - 1)]
     }
 
     /// Slowest single block request, in seconds.
@@ -437,6 +543,8 @@ public struct ExperimentalDFlashReport: Equatable {
     public let rejectedDraftTotal: Int
     public let declaredRowTotal: Int
     public let residualDivergenceCount: Int
+    public let admissibleExactCount: Int
+    public let admissibleDeclaredFrameCount: Int
     public let maxOverMedianRoundLatency: Double?
     public let allTokensAdmissible: Bool
     // Fields the box measurement wrapper consumes for the L3 ledger and the
@@ -449,6 +557,23 @@ public struct ExperimentalDFlashReport: Equatable {
     public let p50BlockRequestSeconds: Double
     public let blockSize: Int
     public let usesTrainedDrafter: Bool
+    // Measured work-binding gap distribution. Recorded on every run so the
+    // tolerance constant stays traceable to observation (contract Amendment 1),
+    // and so an audit can see whether the binding compared anything at all.
+    public let workBindingComparisonCount: Int
+    public let maxTop2LogitDelta: Double
+    public let meanTop2LogitDelta: Double
+    public let p50Top2LogitDelta: Double
+    public let p99Top2LogitDelta: Double
+    public let maxTop2LogitRelativeDelta: Double
+    public let p99Top2LogitRelativeDelta: Double
+    /// Every recorded gap, for calibration only. The CLI publishes this ONLY on a
+    /// widened-tolerance calibration run (refused on the official path): on a
+    /// ranked run a per-row proximity trace against a hidden prompt is an oracle
+    /// signal, which is exactly what contract layer L6 keeps out of the output.
+    public let workBindingLogitDeltas: [Double]
+    public let workBindingToleranceAbsolute: Double
+    public let workBindingToleranceRelative: Double
 
     public init(
         totalTokenCount: Int,
@@ -458,6 +583,8 @@ public struct ExperimentalDFlashReport: Equatable {
         rejectedDraftTotal: Int,
         declaredRowTotal: Int,
         residualDivergenceCount: Int,
+        admissibleExactCount: Int = 0,
+        admissibleDeclaredFrameCount: Int = 0,
         maxOverMedianRoundLatency: Double?,
         allTokensAdmissible: Bool,
         seedTokenCount: Int = 0,
@@ -467,7 +594,17 @@ public struct ExperimentalDFlashReport: Equatable {
         maxBlockRequestSeconds: Double = 0,
         p50BlockRequestSeconds: Double = 0,
         blockSize: Int = 0,
-        usesTrainedDrafter: Bool = true
+        usesTrainedDrafter: Bool = true,
+        workBindingComparisonCount: Int = 0,
+        maxTop2LogitDelta: Double = 0,
+        meanTop2LogitDelta: Double = 0,
+        p50Top2LogitDelta: Double = 0,
+        p99Top2LogitDelta: Double = 0,
+        maxTop2LogitRelativeDelta: Double = 0,
+        p99Top2LogitRelativeDelta: Double = 0,
+        workBindingLogitDeltas: [Double] = [],
+        workBindingToleranceAbsolute: Double = 0,
+        workBindingToleranceRelative: Double = 0
     ) {
         self.totalTokenCount = totalTokenCount
         self.decodeSeconds = decodeSeconds
@@ -479,6 +616,8 @@ public struct ExperimentalDFlashReport: Equatable {
         self.rejectedDraftTotal = rejectedDraftTotal
         self.declaredRowTotal = declaredRowTotal
         self.residualDivergenceCount = residualDivergenceCount
+        self.admissibleExactCount = admissibleExactCount
+        self.admissibleDeclaredFrameCount = admissibleDeclaredFrameCount
         self.maxOverMedianRoundLatency = maxOverMedianRoundLatency
         self.allTokensAdmissible = allTokensAdmissible
         self.seedTokenCount = seedTokenCount
@@ -489,6 +628,16 @@ public struct ExperimentalDFlashReport: Equatable {
         self.p50BlockRequestSeconds = p50BlockRequestSeconds
         self.blockSize = blockSize
         self.usesTrainedDrafter = usesTrainedDrafter
+        self.workBindingComparisonCount = workBindingComparisonCount
+        self.maxTop2LogitDelta = maxTop2LogitDelta
+        self.meanTop2LogitDelta = meanTop2LogitDelta
+        self.p50Top2LogitDelta = p50Top2LogitDelta
+        self.p99Top2LogitDelta = p99Top2LogitDelta
+        self.maxTop2LogitRelativeDelta = maxTop2LogitRelativeDelta
+        self.p99Top2LogitRelativeDelta = p99Top2LogitRelativeDelta
+        self.workBindingLogitDeltas = workBindingLogitDeltas
+        self.workBindingToleranceAbsolute = workBindingToleranceAbsolute
+        self.workBindingToleranceRelative = workBindingToleranceRelative
     }
 
     public var acceptedDraftRate: Double {
