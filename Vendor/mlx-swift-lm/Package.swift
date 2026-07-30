@@ -40,6 +40,12 @@ let package = Package(
         .library(
             name: "IntegrationTestHelpers",
             targets: ["IntegrationTestHelpers"]),
+        .library(
+            name: "MLXSpeculative",
+            targets: ["MLXSpeculative"]),
+        .executable(
+            name: "mlx-bench",
+            targets: ["mlx-bench"]),
     ],
     dependencies: [
         .package(path: "../mlx-swift"),
@@ -163,6 +169,7 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXSpeculative",
             ],
             path: "Tests/MLXLMTests",
             exclude: [
@@ -171,6 +178,7 @@ let package = Package(
             resources: [
                 .process("Resources/1080p_30.mov"),
                 .process("Resources/audio_only.mov"),
+                .process("Resources/dflash-laguna-xs-2.1-config.json"),
             ]
         ),
         .testTarget(
@@ -239,6 +247,36 @@ let package = Package(
                 .product(name: "Tokenizers", package: "swift-transformers"),
             ],
             path: "Sources/BenchCBv2"
+        ),
+        // DFlash speculative-decoding library (Laguna XS 2.1 draft-model
+        // bring-up; dev-repo / M5-C experimentation only — not in benchmark.json
+        // editablePaths, not wired into mlxfast-runtime-worker, unsubmittable).
+        .target(
+            name: "MLXSpeculative",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Libraries/MLXSpeculative",
+            exclude: ["README.md"]
+        ),
+        // Standalone DFlash benchmark driver (baseline vs block-draft sweep,
+        // parity check). Built with `swift build -c release --product mlx-bench`.
+        .executableTarget(
+            name: "mlx-bench",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXHuggingFace",
+                "MLXSpeculative",
+                .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
+            path: "Sources/mlx-bench"
         ),
     ]
 )
