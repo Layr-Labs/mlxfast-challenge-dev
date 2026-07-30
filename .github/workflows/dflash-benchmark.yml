@@ -151,7 +151,19 @@ jobs:
     # (up to 900s per timed phase) + >=3 alternating timed pairs. Generous
     # until the track has its own timing history.
     timeout-minutes: 360
-    environment: benchmark-private-prompts
+    # MUST match the environment the serial ranked job binds. Both jobs read
+    # the SAME secret NAMES (R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
+    # R2_BUCKET_ENDPOINT), but those resolve per environment -- so binding a
+    # different environment silently hands this job different credentials and
+    # a different endpoint for the same object names.
+    #
+    # This was inherited from the retired MTP job and was stale. Proven by run
+    # 30588892999: "Prepare hidden correctness golden" is a copy of the serial
+    # step, fetching the SAME raw_golden.json that serial fetches
+    # successfully, and it failed with six retried curl HTTP 400s. Same box,
+    # same object, same secret names, different environment -- the binding is
+    # the only variable.
+    environment: benchmark-private-prompts-v2
     env:
       # --- Host contract (see header; operator-provisioned, janitor-audited).
       MLXFAST_BENCH_EXEC: /opt/bench/bench-exec.sh
@@ -1755,6 +1767,15 @@ jobs:
         if: ${{ always() && !inputs.run_benchmark }}
         run: |
           set -euo pipefail
+          # Checked BEFORE the sha comparison below: under set -e an absent
+          # candidate.sha makes that comparison die with a bare
+          # "cat: candidate.sha: No such file or directory", which names the
+          # symptom and not the problem. Since this step is always() it now runs
+          # after aborted runs, where absence is the likely case.
+          if [[ ! -f candidate.sha ]]; then
+            echo "::error::candidate.sha is missing; refusing to stage artifacts for an unidentified workspace" >&2
+            exit 1
+          fi
           test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"
           # public-gate-report.json and gates-score.json are the verdicts of the
           # reused serial gates; without them a correctness-only dispatch
@@ -1763,19 +1784,53 @@ jobs:
           # *correctness_golden*.json, *gpqa_reference_cases*.json and
           # *gpqa_ttft_results*.json, and "Validate sealed gates score" above has
           # already asserted the sealed score carries no hidden token fields.
-          .github/scripts/deny-private-artifacts.sh \
+          # PRESENT-ONLY STAGING. This step is always() on purpose -- a
+          # gates-only run that FAILED is exactly when its diagnostics are
+          # wanted -- but an aborted run has not produced every artifact, and
+          # requiring all of them made THIS step fail too. That cost nothing in
+          # evidence and actively obscured the cause: run 30588892999 died
+          # fetching the hidden golden and reported two red steps, the second
+          # of which was only "gates-score.json does not exist".
+          #
+          # So stage what exists and say what does not. Every name is still
+          # passed through deny-private-artifacts.sh before it is staged, so
+          # tolerating absence does not widen what may be published; a file
+          # that is missing is simply not a candidate for leaking.
+          present=()
+          missing=()
+          suspicious=()
+          for name in \
             candidate.sha \
             public-gate-report.json \
             gates-score.json \
             dflash-gates-report.json \
-            dflash-weights.sha256
+            dflash-weights.sha256; do
+            if [[ -L "${name}" ]]; then
+              # A SYMLINK IS NOT AN ABSENCE. The staging script rejects
+              # symlinked sources outright, and tolerating absence must not
+              # quietly downgrade that to a skip: a symlink where an artifact
+              # belongs is a candidate reaching outside the workspace, which is
+              # the thing artifact staging exists to prevent.
+              suspicious+=("${name}")
+            elif [[ -f "${name}" ]]; then
+              present+=("${name}")
+            else
+              missing+=("${name}")
+            fi
+          done
+          if ((${#suspicious[@]})); then
+            echo "::error::artifact source is a symlink, not a regular file: ${suspicious[*]}" >&2
+            exit 1
+          fi
+          if ((${#missing[@]})); then
+            echo "::notice::DFlash correctness staging: not produced by this run: ${missing[*]}"
+          fi
+          .github/scripts/deny-private-artifacts.sh "${present[@]}"
+          staged=()
+          for name in "${present[@]}"; do staged+=("${name}=${name}"); done
           .github/scripts/stage-benchmark-artifacts.sh \
             "${MLXFAST_ARTIFACT_ROOT}/dflash-correctness-results" \
-            candidate.sha=candidate.sha \
-            public-gate-report.json=public-gate-report.json \
-            gates-score.json=gates-score.json \
-            dflash-gates-report.json=dflash-gates-report.json \
-            dflash-weights.sha256=dflash-weights.sha256
+            "${staged[@]}"
 
       - name: Upload DFlash correctness artifacts
         if: always() && steps.stage_dflash_correctness_artifacts.outcome == 'success'
