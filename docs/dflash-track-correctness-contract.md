@@ -1764,6 +1764,12 @@ Amendment 14's top-2 form. Pinned by
 `anEmittedTokenLogitForADifferentTokenAdmitsNothing` and
 `nearTieRowsWithoutAnEmittedTokenLogitFallBackToTheTopTwoTest`.
 
+A regenerated golden records the three new fields and still replays bit
+identically (R5 now compares them too). Smoke-tested at one row: `top1_logit`
+13.5, `emitted_token` 78 at `emitted_token_logit` 2.3125 -- a distance of 11.19
+that the envelope correctly refuses, which is also the shape of the negative
+below.
+
 ## 2. Both constants were calibrated against contaminated data
 
 Amendment 6 measured a maximum candidate-vs-reference top-2 logit delta of 3.375
