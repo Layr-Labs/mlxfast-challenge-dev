@@ -1005,6 +1005,16 @@ struct RuntimeWorkerResponse: Codable {
     let referenceBlockArgmax: [Int]?
     let referenceTop2Tokens: [[Int]]?
     let referenceTop2Logits: [[Double]]?
+    // Amendment 16: the reference's own top-1 logit per row, plus the token the
+    // row PREDICTS and that token's reference logit. Those last two make the
+    // near-tie test a question about the emitted token itself rather than about
+    // membership in a fixed-size shortlist, which a three-way tie cannot
+    // express. They cover a PREFIX of the requested rows -- a request whose
+    // context stops at its final row has no next token there -- so a consumer
+    // must bound-check instead of assuming one entry per row.
+    let referenceTop1Logits: [Double]?
+    let referenceEmittedTokens: [Int]?
+    let referenceEmittedTokenLogits: [Double]?
     // Every block width the reference replayed for these rows, ascending, and
     // the argmax each one produced. One request covers all of them so the
     // reference can branch each frame off the SAME continuous cache without
@@ -1047,6 +1057,9 @@ struct RuntimeWorkerResponse: Codable {
         referenceBlockArgmax: [Int]? = nil,
         referenceTop2Tokens: [[Int]]? = nil,
         referenceTop2Logits: [[Double]]? = nil,
+        referenceTop1Logits: [Double]? = nil,
+        referenceEmittedTokens: [Int]? = nil,
+        referenceEmittedTokenLogits: [Double]? = nil,
         referenceFrameWidths: [Int]? = nil,
         referenceFrameArgmax: [[Int]]? = nil
     ) {
@@ -1084,6 +1097,9 @@ struct RuntimeWorkerResponse: Codable {
         self.referenceBlockArgmax = referenceBlockArgmax
         self.referenceTop2Tokens = referenceTop2Tokens
         self.referenceTop2Logits = referenceTop2Logits
+        self.referenceTop1Logits = referenceTop1Logits
+        self.referenceEmittedTokens = referenceEmittedTokens
+        self.referenceEmittedTokenLogits = referenceEmittedTokenLogits
         self.referenceFrameWidths = referenceFrameWidths
         self.referenceFrameArgmax = referenceFrameArgmax
     }
@@ -1222,6 +1238,18 @@ struct RuntimeWorkerResponse: Codable {
             [[Double]].self,
             forKey: .referenceTop2Logits
         )
+        referenceTop1Logits = try container.decodeIfPresent(
+            [Double].self,
+            forKey: .referenceTop1Logits
+        )
+        referenceEmittedTokens = try container.decodeIfPresent(
+            [Int].self,
+            forKey: .referenceEmittedTokens
+        )
+        referenceEmittedTokenLogits = try container.decodeIfPresent(
+            [Double].self,
+            forKey: .referenceEmittedTokenLogits
+        )
         referenceFrameWidths = try container.decodeIfPresent(
             [Int].self,
             forKey: .referenceFrameWidths
@@ -1335,6 +1363,18 @@ struct RuntimeWorkerResponse: Codable {
             forKey: .referenceTop2Logits
         )
         try container.encodeIfPresent(
+            referenceTop1Logits,
+            forKey: .referenceTop1Logits
+        )
+        try container.encodeIfPresent(
+            referenceEmittedTokens,
+            forKey: .referenceEmittedTokens
+        )
+        try container.encodeIfPresent(
+            referenceEmittedTokenLogits,
+            forKey: .referenceEmittedTokenLogits
+        )
+        try container.encodeIfPresent(
             referenceFrameWidths,
             forKey: .referenceFrameWidths
         )
@@ -1379,6 +1419,9 @@ struct RuntimeWorkerResponse: Codable {
         case referenceBlockArgmax = "reference_block_argmax"
         case referenceTop2Tokens = "reference_top2_tokens"
         case referenceTop2Logits = "reference_top2_logits"
+        case referenceTop1Logits = "reference_top1_logits"
+        case referenceEmittedTokens = "reference_emitted_tokens"
+        case referenceEmittedTokenLogits = "reference_emitted_token_logits"
         case referenceFrameWidths = "reference_frame_widths"
         case referenceFrameArgmax = "reference_frame_argmax"
     }

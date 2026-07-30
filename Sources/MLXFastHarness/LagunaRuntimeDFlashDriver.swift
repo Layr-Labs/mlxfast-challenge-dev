@@ -18,12 +18,28 @@ public struct DFlashReferenceGolden: Codable {
         public let declaredFrameArgmax: [String: Int]?
         public let top2Tokens: [Int]?
         public let top2Logits: [Double]?
+        /// The reference's own top-1 logit at this row, and the token this row
+        /// predicted in the chain the golden was generated against together with
+        /// that token's reference logit (Amendment 16). Optional so a golden
+        /// written before the field existed still decodes; the validator falls
+        /// back to the top-2 form for such a row.
+        ///
+        /// Note what the recorded token means HERE: it is the GOLDEN's chain, so
+        /// a run whose candidate diverged must not read this logit as a statement
+        /// about the candidate's token. The validator enforces that by comparing
+        /// the id before using the value, which is why the id is stored at all.
+        public let top1Logit: Double?
+        public let emittedToken: Int?
+        public let emittedTokenLogit: Double?
 
         enum CodingKeys: String, CodingKey {
             case sequentialArgmax = "sequential_argmax"
             case declaredFrameArgmax = "declared_frame_argmax"
             case top2Tokens = "top2_tokens"
             case top2Logits = "top2_logits"
+            case top1Logit = "top1_logit"
+            case emittedToken = "emitted_token"
+            case emittedTokenLogit = "emitted_token_logit"
         }
     }
 
@@ -96,7 +112,10 @@ public struct DFlashGoldenReferenceOracle: DFlashReferenceOracle {
                     String(declaredBlockWidth)
                 ],
                 top2Tokens: row.top2Tokens ?? [],
-                top2Logits: row.top2Logits ?? []
+                top2Logits: row.top2Logits ?? [],
+                top1Logit: row.top1Logit,
+                emittedToken: row.emittedToken,
+                emittedTokenLogit: row.emittedTokenLogit
             )
         }
     }
@@ -177,7 +196,11 @@ struct DFlashLiveReferenceOracle: DFlashReferenceOracle {
               k1.count == count,
               top2Tokens.count == count,
               top2Logits.count == count,
-              frameWidths.count == frameArgmax.count
+              frameWidths.count == frameArgmax.count,
+              // The emitted-token readouts cover a prefix of the batch, but the
+              // two arrays must describe the same rows as each other.
+              (response.referenceEmittedTokens?.count ?? 0)
+                  == (response.referenceEmittedTokenLogits?.count ?? 0)
         else {
             throw MLXFastError.invalidInput(
                 "DFlash live reference returned an incomplete row batch at "
@@ -190,6 +213,9 @@ struct DFlashLiveReferenceOracle: DFlashReferenceOracle {
             frames[width] = argmax
         }
         let declaredFrame = frames[declaredBlockWidth]
+        let top1Logits = response.referenceTop1Logits
+        let emittedTokens = response.referenceEmittedTokens ?? []
+        let emittedTokenLogits = response.referenceEmittedTokenLogits ?? []
         return (0 ..< count).map { index in
             DFlashReferenceRow(
                 sequentialArgmax: k1[index],
@@ -197,7 +223,16 @@ struct DFlashLiveReferenceOracle: DFlashReferenceOracle {
                     index < $0.count ? $0[index] : nil
                 },
                 top2Tokens: top2Tokens[index],
-                top2Logits: top2Logits[index]
+                top2Logits: top2Logits[index],
+                top1Logit: top1Logits.flatMap {
+                    index < $0.count ? $0[index] : nil
+                },
+                emittedToken: index < emittedTokens.count
+                    ? emittedTokens[index]
+                    : nil,
+                emittedTokenLogit: index < emittedTokenLogits.count
+                    ? emittedTokenLogits[index]
+                    : nil
             )
         }
     }
@@ -871,12 +906,23 @@ extension LagunaRuntime {
                 // frame, so the serial control (max block size 1) always has a
                 // declared-frame entry to be scored against.
                 declaredFrames["1"] = k1[index]
+                let top1Logit = response.referenceTop1Logits.flatMap {
+                    index < $0.count ? $0[index] : nil
+                }
+                let emittedToken = response.referenceEmittedTokens.flatMap {
+                    index < $0.count ? $0[index] : nil
+                }
+                let emittedTokenLogit = response.referenceEmittedTokenLogits
+                    .flatMap { index < $0.count ? $0[index] : nil }
                 goldenRows.append(
                     DFlashReferenceGolden.Row(
                         sequentialArgmax: k1[index],
                         declaredFrameArgmax: declaredFrames,
                         top2Tokens: top2Tokens[index],
-                        top2Logits: top2Logits[index]
+                        top2Logits: top2Logits[index],
+                        top1Logit: top1Logit,
+                        emittedToken: emittedToken,
+                        emittedTokenLogit: emittedTokenLogit
                     )
                 )
             }
@@ -919,6 +965,13 @@ extension LagunaRuntime {
                 selfConsistencyDetail = "top-2 token ids differed between replays"
             } else if again.referenceTop2Logits != expected.referenceTop2Logits {
                 selfConsistencyDetail = "top-2 logit values differed between replays"
+            } else if again.referenceTop1Logits != expected.referenceTop1Logits
+                || again.referenceEmittedTokens != expected.referenceEmittedTokens
+                || again.referenceEmittedTokenLogits
+                    != expected.referenceEmittedTokenLogits
+            {
+                selfConsistencyDetail =
+                    "emitted-token logit readouts differed between replays"
             } else {
                 selfConsistent = true
                 selfConsistencyDetail =

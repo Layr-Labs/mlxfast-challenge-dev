@@ -466,6 +466,13 @@ extension LagunaRuntime {
                 count: rowCount,
                 widestFrame: widestFrame
             )
+            // The emitted-token readouts exist only for rows whose context
+            // carries a next token, which is a PREFIX of the batch, so they are
+            // reported as a prefix rather than padded with an invented value a
+            // consumer could mistake for a real logit.
+            let emittedPrefix = answer.rows.prefix {
+                $0.emittedToken != nil && $0.emittedTokenLogit != nil
+            }
             return RuntimeWorkerResponse(
                 id: request.id,
                 nonce: sessionNonce,
@@ -474,6 +481,10 @@ extension LagunaRuntime {
                 referenceBlockArgmax: answer.rows.map(\.blockArgmax),
                 referenceTop2Tokens: answer.rows.map(\.top2Tokens),
                 referenceTop2Logits: answer.rows.map(\.top2Logits),
+                referenceTop1Logits: answer.rows.map(\.top1Logit),
+                referenceEmittedTokens: emittedPrefix.compactMap(\.emittedToken),
+                referenceEmittedTokenLogits: emittedPrefix
+                    .compactMap(\.emittedTokenLogit),
                 referenceFrameWidths: answer.frameWidths,
                 referenceFrameArgmax: answer.frameArgmax
             )

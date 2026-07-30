@@ -546,17 +546,19 @@ struct DFlashNearTieAdmissionTests {
         #expect(thrown?.kind == .residualBudgetExhausted)
     }
 
-    /// A token that is not even in the reference's top 2 is rejected at a near-tie
-    /// row exactly as anywhere else: the envelope widens WHICH of two plausible
-    /// tokens is allowed, never how many tokens are.
+    /// LEGACY FORM (Amendment 14). A reference row that carries no emitted-token
+    /// logit -- a golden written before the field existed -- still falls back to
+    /// the top-2 membership test, so a token outside the reference's top 2 is
+    /// rejected there exactly as it always was.
     @Test
-    func nearTieRowsDoNotAdmitTokensOutsideTheReferenceTopTwo() throws {
+    func nearTieRowsWithoutAnEmittedTokenLogitFallBackToTheTopTwoTest() throws {
         let row = DFlashReferenceRow(
             sequentialArgmax: 100,
             declaredFrameArgmax: 100,
             top2Tokens: [100, 200],
             top2Logits: [20.0, 20.0]
         )
+        #expect(row.emittedTokenLogit == nil)
         let v = validator(row: row, tokens: 4)
         // Structurally the round is legal -- in range, one row, ledger consistent.
         // Fabricated output is caught by the REFERENCE pass, not by arithmetic.
@@ -568,6 +570,112 @@ struct DFlashNearTieAdmissionTests {
             thrown = violation
         }
         #expect(thrown?.kind == .tokenNotAdmissible)
+    }
+
+    /// BLOCKER 4c, the row this rule exists for. Three tokens sit inside a
+    /// fraction of a logit and the candidate emitted the reference's #3, so a
+    /// two-member admissible set cannot express the tie. Judged on the emitted
+    /// token's OWN reference logit, the row is admitted -- and costs no residual
+    /// budget, because the reference cannot rank those three either.
+    @Test
+    func aThirdRankedTokenIsAdmittedWhenTheReferenceCannotSeparateIt() throws {
+        // The measured shape at row 109 of the varied golden: reference top-2
+        // [268, 85] at [14.625, 13.875], candidate emitted 1972.
+        let row = DFlashReferenceRow(
+            sequentialArgmax: 268,
+            declaredFrameArgmax: 268,
+            top2Tokens: [268, 85],
+            top2Logits: [14.625, 13.875],
+            top1Logit: 14.625,
+            emittedToken: 1972,
+            emittedTokenLogit: 13.8125
+        )
+        let v = validator(row: row, tokens: 128)
+        try v.acceptStructural(round: round(emitting: 1972, offset: 9))
+        try v.validateJournalAgainstReference()
+        #expect(v.admissibleNearTieCount == 1)
+        #expect(v.residualDivergenceCount == 0)
+    }
+
+    /// The envelope is still the whole control. A token the reference prices
+    /// further than the envelope below its own top-1 is rejected even though the
+    /// reference's top-2 pair is dead flat: the rule widened WHICH tokens a flat
+    /// row can admit, not the distance any row admits.
+    @Test
+    func aTokenPricedBelowTheEnvelopeIsRejectedEvenAtAFlatTopTwo() throws {
+        let envelope = MLXFastConstants.experimentalDFlashNearTieLogitEnvelope
+        let row = DFlashReferenceRow(
+            sequentialArgmax: 100,
+            declaredFrameArgmax: 100,
+            top2Tokens: [100, 200],
+            top2Logits: [20.0, 20.0],
+            top1Logit: 20.0,
+            emittedToken: 999,
+            emittedTokenLogit: 20.0 - envelope - 0.5
+        )
+        let v = validator(row: row, tokens: 128)
+        try v.acceptStructural(round: round(emitting: 999, offset: 9))
+        var thrown: DFlashContractViolation?
+        do {
+            try v.validateJournalAgainstReference()
+        } catch let violation as DFlashContractViolation {
+            thrown = violation
+        }
+        #expect(thrown?.kind == .tokenNotAdmissible)
+        #expect(v.admissibleNearTieCount == 0)
+    }
+
+    /// The emitted-token logit is only a statement about the token it was
+    /// measured for. A stored golden's row was teacher-forced on the GOLDEN's
+    /// chain, so its zero-distance readout must not admit a candidate token the
+    /// row never described -- otherwise every divergence would pass for free the
+    /// moment a golden carried the field.
+    @Test
+    func anEmittedTokenLogitForADifferentTokenAdmitsNothing() throws {
+        let row = DFlashReferenceRow(
+            sequentialArgmax: 100,
+            declaredFrameArgmax: 100,
+            top2Tokens: [100, 200],
+            top2Logits: [20.0, 5.0],
+            top1Logit: 20.0,
+            // The golden's own chain token, at zero distance from top-1.
+            emittedToken: 100,
+            emittedTokenLogit: 20.0
+        )
+        let v = validator(row: row, tokens: 128)
+        try v.acceptStructural(round: round(emitting: 999, offset: 9))
+        var thrown: DFlashContractViolation?
+        do {
+            try v.validateJournalAgainstReference()
+        } catch let violation as DFlashContractViolation {
+            thrown = violation
+        }
+        #expect(thrown?.kind == .tokenNotAdmissible)
+        #expect(v.admissibleNearTieCount == 0)
+    }
+
+    /// The new predicate must SUBSUME Amendment 14's: emitting the reference's
+    /// #2 token at a flat row is exactly the case where `top1 - emitted` IS the
+    /// top-2 gap, so it stays admitted, and it stays capped by the same budget.
+    @Test
+    func theEmittedLogitRuleSubsumesTheTopTwoRule() throws {
+        let gap = MLXFastConstants.experimentalDFlashNearTieLogitEnvelope / 2
+        let row = DFlashReferenceRow(
+            sequentialArgmax: 100,
+            declaredFrameArgmax: 100,
+            top2Tokens: [100, 200],
+            top2Logits: [20.0, 20.0 - gap],
+            top1Logit: 20.0,
+            emittedToken: 200,
+            emittedTokenLogit: 20.0 - gap
+        )
+        let v = validator(row: row, tokens: 128)
+        for i in 0 ..< 4 {
+            try v.acceptStructural(round: round(emitting: 200, offset: 8 + i + 1))
+        }
+        try v.validateJournalAgainstReference()
+        #expect(v.admissibleNearTieCount == 4)
+        #expect(v.residualDivergenceCount == 0)
     }
 
     /// The envelope is derived, not guessed: twice the maximum candidate-vs-

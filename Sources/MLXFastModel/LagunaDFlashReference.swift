@@ -22,6 +22,43 @@ public struct LagunaDFlashReferenceRow: Sendable {
     /// contract: these -- not the hidden-state digest -- are the cross-build
     /// work binder, compared with a tolerance.
     public let top2Logits: [Double]
+    /// The reference's own top-1 logit at this position. Recorded explicitly
+    /// rather than read out of `top2Logits[0]` because it is the DENOMINATOR of
+    /// the near-tie test (Amendment 16) and must survive any future change to
+    /// how many top-k slots the work binder carries.
+    public let top1Logit: Double
+    /// The token that occupies the NEXT position of the supplied context, i.e.
+    /// the token this row predicts. On the live replay path that context is the
+    /// candidate's own emitted chain, so this is the token the candidate
+    /// emitted here. `nil` when the request's context stops at this row (chain
+    /// generation, which has no next token yet).
+    public let emittedToken: Int?
+    /// The REFERENCE's logit for `emittedToken`, indexed straight out of the
+    /// same width-1 logit row the top-2 readout comes from.
+    ///
+    /// This is what lets a near tie be judged on the emitted token itself
+    /// instead of on membership in a fixed-size list: at a flat row the
+    /// reference cannot rank three or more tokens, and a top-2 set cannot
+    /// express that (contract Blocker 4c).
+    public let emittedTokenLogit: Double?
+
+    public init(
+        sequentialArgmax: Int,
+        blockArgmax: Int,
+        top2Tokens: [Int],
+        top2Logits: [Double],
+        top1Logit: Double,
+        emittedToken: Int? = nil,
+        emittedTokenLogit: Double? = nil
+    ) {
+        self.sequentialArgmax = sequentialArgmax
+        self.blockArgmax = blockArgmax
+        self.top2Tokens = top2Tokens
+        self.top2Logits = top2Logits
+        self.top1Logit = top1Logit
+        self.emittedToken = emittedToken
+        self.emittedTokenLogit = emittedTokenLogit
+    }
 }
 
 /// One reference-rows answer: the width-1 rows plus every block frame that was
@@ -244,9 +281,13 @@ public final class LagunaDFlashReference {
         var sequentialArgmax = [Int]()
         var top2Tokens = [[Int]]()
         var top2Logits = [[Double]]()
+        var emittedTokens = [Int?]()
+        var emittedTokenLogits = [Double?]()
         sequentialArgmax.reserveCapacity(count)
         top2Tokens.reserveCapacity(count)
         top2Logits.reserveCapacity(count)
+        emittedTokens.reserveCapacity(count)
+        emittedTokenLogits.reserveCapacity(count)
         for index in 0 ..< count {
             let token = tokens[startOffset + index]
             let step = MLXArray([Int32(token)])[.newAxis, .ellipsis]
@@ -260,6 +301,26 @@ public final class LagunaDFlashReference {
             sequentialArgmax.append(ids.first ?? 0)
             top2Tokens.append(ids)
             top2Logits.append(values)
+            // The token this row PREDICTS sits at the next position of the
+            // supplied context. Read its logit out of the same row the top-2
+            // came from, so the near-tie test compares the emitted token's own
+            // reference value against the reference's own top-1 rather than
+            // asking whether it made a fixed-size shortlist.
+            //
+            // Absent only when the caller's context stops here -- the chain
+            // generator asks for the row that produces the next token -- and
+            // then the field stays nil rather than being invented.
+            let nextIndex = startOffset + index + 1
+            if nextIndex < tokens.count {
+                let emitted = tokens[nextIndex]
+                let emittedLogit = logitRow[emitted]
+                eval(emittedLogit)
+                emittedTokens.append(emitted)
+                emittedTokenLogits.append(Double(emittedLogit.item(Float.self)))
+            } else {
+                emittedTokens.append(nil)
+                emittedTokenLogits.append(nil)
+            }
             walkedTokens.append(token)
         }
 
@@ -283,7 +344,10 @@ public final class LagunaDFlashReference {
                 sequentialArgmax: sequentialArgmax[index],
                 blockArgmax: blockArgmax[index],
                 top2Tokens: top2Tokens[index],
-                top2Logits: top2Logits[index]
+                top2Logits: top2Logits[index],
+                top1Logit: top2Logits[index].first ?? 0,
+                emittedToken: emittedTokens[index],
+                emittedTokenLogit: emittedTokenLogits[index]
             )
         }
         return LagunaDFlashReferenceRows(

@@ -24,17 +24,40 @@ public struct DFlashReferenceRow: Equatable, Sendable {
     public let top2Tokens: [Int]
     /// Reference top-2 logit values, aligned with `top2Tokens`.
     public let top2Logits: [Double]
+    /// The reference's own top-1 logit at this row: the value every near-tie
+    /// distance is measured from.
+    public let top1Logit: Double
+    /// The token this reference row was teacher-forced to PREDICT. On the live
+    /// replay path the reference walks the candidate's own emitted chain, so
+    /// this is the token the candidate emitted here; a pre-generated golden's
+    /// row was forced on the GOLDEN's chain instead, which is why the validator
+    /// re-checks the id before trusting the logit below.
+    public let emittedToken: Int?
+    /// The REFERENCE's logit for `emittedToken`, read out of the same width-1
+    /// row the top-2 readout comes from. This is what makes a near tie a
+    /// question about the emitted token itself rather than about membership in a
+    /// two-slot list, which cannot express a three-way tie (Blocker 4c).
+    public let emittedTokenLogit: Double?
 
     public init(
         sequentialArgmax: Int,
         declaredFrameArgmax: Int? = nil,
         top2Tokens: [Int] = [],
-        top2Logits: [Double] = []
+        top2Logits: [Double] = [],
+        top1Logit: Double? = nil,
+        emittedToken: Int? = nil,
+        emittedTokenLogit: Double? = nil
     ) {
         self.sequentialArgmax = sequentialArgmax
         self.declaredFrameArgmax = declaredFrameArgmax
         self.top2Tokens = top2Tokens
         self.top2Logits = top2Logits
+        // A reference that reports top-2 values but no explicit top-1 is
+        // reporting the top-1 in `top2Logits[0]`; keep the two consistent
+        // rather than defaulting to a zero that would read as a flat row.
+        self.top1Logit = top1Logit ?? top2Logits.first ?? 0
+        self.emittedToken = emittedToken
+        self.emittedTokenLogit = emittedTokenLogit
     }
 
     /// Criterion E admissible set: the reference argmax in either exactly-defined
@@ -298,13 +321,47 @@ public final class LagunaDFlashBlockValidator {
         )
     }
 
-    /// A row the reference cannot break: its own top-2 logits are within the
-    /// measured candidate-vs-reference drift envelope, so their order is not a
-    /// property of the model but of accumulation order.
-    private func referenceRowIsNearTie(_ row: DFlashReferenceRow) -> Bool {
-        guard row.top2Logits.count >= 2 else { return false }
-        return (row.top2Logits[0] - row.top2Logits[1])
-            <= MLXFastConstants.experimentalDFlashNearTieLogitEnvelope
+    /// A row the reference cannot break: the reference's own logit for the
+    /// token the candidate emitted sits within the measured drift envelope of
+    /// the reference's own top-1, so the ordering between them is not a property
+    /// of the model but of accumulation order.
+    ///
+    /// This tests the EMITTED TOKEN'S OWN reference logit rather than membership
+    /// in a fixed-size shortlist (Amendment 16). It subsumes Amendment 14's
+    /// top-2 test -- the #2 token's distance from #1 IS the top-2 gap -- and is
+    /// better shaped in both directions: at a confident row nothing but the
+    /// top-1 qualifies, and at a flat row exactly those tokens the reference
+    /// genuinely cannot separate qualify, however many of them there are. A
+    /// two-member admissible set cannot express a three-way tie (Blocker 4c),
+    /// and at such a row the reference cannot rank those three either.
+    ///
+    /// Still unfarmable for the same reason as before: the logits are the
+    /// REFERENCE's, so a submission can neither manufacture a flat row nor learn
+    /// which positions are flat without doing the reference's own work. And the
+    /// admitted distance is bounded by the envelope, so a token the reference
+    /// prices well below its top-1 is rejected here exactly as anywhere else.
+    private func referenceRowAdmitsNearTie(
+        _ row: DFlashReferenceRow,
+        token: Int
+    ) -> Bool {
+        let envelope = MLXFastConstants.experimentalDFlashNearTieLogitEnvelope
+        // The id is re-checked rather than assumed: the emitted-token logit is
+        // only a statement about the candidate's token when the row was
+        // teacher-forced on the candidate's token. The live replay walks the
+        // candidate's own chain and so it always is; a stored golden's row was
+        // forced on the golden's chain and so it is not, which would otherwise
+        // make a golden row admit any divergence at zero distance.
+        if let emittedTokenLogit = row.emittedTokenLogit,
+           row.emittedToken == token
+        {
+            return row.top1Logit - emittedTokenLogit <= envelope
+        }
+        // Fallback for a reference row that predates the field: Amendment 14's
+        // top-2 membership form, so a pre-generated golden still validates.
+        guard row.top2Tokens.contains(token), row.top2Logits.count >= 2 else {
+            return false
+        }
+        return (row.top2Logits[0] - row.top2Logits[1]) <= envelope
     }
 
     public var remainingTokenCount: Int {
@@ -469,18 +526,18 @@ public final class LagunaDFlashBlockValidator {
                 // Honest frame divergence: the reference itself produces this
                 // token at the width the candidate declared.
                 outcome = .admissibleDeclaredFrame
-            } else if referenceRow.top2Tokens.contains(token),
-                      referenceRowIsNearTie(referenceRow) {
+            } else if referenceRowAdmitsNearTie(referenceRow, token: token) {
                 // Numerical plausibility, not frame equality. At a row where the
-                // reference's own top-1 and top-2 sit within the measured
-                // build-to-build drift envelope, "the reference says X" is not a
-                // fact about correctness -- either token is what the reference
-                // would produce under a differently-ordered accumulation. Rejecting
-                // the candidate here fails honest code for a tie the reference
-                // cannot break. Still capped, so it cannot become a free channel:
-                // near-tie rows are rare (measured 3 per 128 positions on varied
-                // prose, 0 per 128 on repetitive text) and a submission cannot
-                // manufacture them, because the gap is the REFERENCE's own.
+                // reference prices the emitted token within the measured
+                // build-to-build drift envelope of its own top-1, "the reference
+                // says X" is not a fact about correctness -- either token is what
+                // the reference would produce under a differently-ordered
+                // accumulation. Rejecting the candidate here fails honest code for
+                // a tie the reference cannot break. Still capped, so it cannot
+                // become a free channel: near-tie rows are rare (measured 3 per
+                // 128 positions on varied prose, 0 per 128 on repetitive text) and
+                // a submission cannot manufacture them, because the logits are the
+                // REFERENCE's own.
                 nearTieAdmissionCount += 1
                 guard nearTieAdmissionCount <= nearTieBudget else {
                     throw DFlashContractViolation(
