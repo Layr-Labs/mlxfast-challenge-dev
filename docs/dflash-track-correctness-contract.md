@@ -1148,3 +1148,86 @@ that condition is withdrawn as unsatisfiable rather than met. What still blocks
 Until those close, the track is runnable and honest about what it does not yet
 prove, which is the state the pinned
 `officialScoringRequiresAnImplementedTokenFidelityGate` test enforces.
+
+# Amendment 9 (2026-07-30): L5 reframed — the drafter is mostly self-policing
+
+L5 (reference-drafter replay) is the last layer Amendment 8 lists as blocking
+`official_scoring_enabled`. Doing the cross-build analysis BEFORE implementing it
+— the step whose absence produced Amendments 1, 4 and 8 — shows the replay is a
+weak instrument, and that the threat it aims at is better handled the way the
+serial track already handles the identical technique.
+
+## Why the replay is weak
+
+The reference cannot replay the drafter on the candidate's own inputs. The
+drafter's input is the target's hidden-state context, which is megabytes per
+round; it does not cross the JSON protocol, and Amendment 1 already established
+that a digest of it cannot be compared across builds. So a replay must run the
+pinned drafter on the REFERENCE's hidden states, which differ numerically from
+the candidate's. Draft tokens are argmaxes of a 5-layer model — far less
+confident than the target's — so honest candidates would disagree with the
+replay at a substantial and unpredictable rate. The check would need a residual
+bucket wide enough to admit that, at which point a cheaper-but-decent drafter
+fits inside the bucket too. This is Amendment 6 section 3's problem, worse.
+
+## Why most of the threat does not need catching
+
+A degraded drafter is self-punishing. Worse proposals mean a shorter accepted
+prefix, which means more rounds for the same token count, which means a lower
+score — and every emitted token is still produced and verified by the target,
+whose per-row work L2 and L3 bind. There is no version of "cheapen the drafter"
+that raises the score through a mechanism the contract does not already price.
+The saving is bounded anyway: the drafter is 5 layers against the target's 40.
+
+What is left is genuinely adversarial but narrow: a *different and still good*
+proposal source. Concretely, an input-derived one — prompt-lookup, n-gram,
+suffix or token-history drafting — which on repetitive text proposes well while
+skipping the drafter entirely.
+
+## How that is enforced
+
+By rule and static review, which is exactly how the serial track enforces its own
+speculation ban against the same list of techniques. The rule is now stated for
+participants in `AGENTS.md`: every proposed token must come from a forward pass
+of the pinned drafter on that round's bonus token and hidden context; input-derived
+proposal sources are excluded even when generic, production-useful or bit-exact,
+and so are hybrids that fall back to one. Dispatch-level optimisation of the
+drafter remains explicitly allowed.
+
+Note the serial track ranks today with no L2-equivalent instrument at all: it
+relies on exact-token gates plus static review. The DFlash track cannot use
+exact-token gates — that is the premise of this whole contract — which is why it
+carries L1/L2/L3/L6 as well. It is not weaker than the live track here; it is
+strictly stronger, and it uses the live track's mechanism for the one threat that
+mechanism already covers.
+
+## A detector worth building later, and why it is not shipped now
+
+There IS an exact, build-independent instrument for this specific threat, because
+it tests token ids rather than floats: **draft provenance**. An input-derived
+drafter proposes, by construction, n-grams that already occur in the context. So
+journal each round's proposed tokens and measure how often the proposed block
+appears verbatim earlier in the sequence. A trained drafter's proposals do that
+sometimes; a lookup drafter's do it nearly always, and the separation is in the
+token ids, with no cross-build term at all.
+
+It is not shipped because it is a statistical detector and its threshold must
+come from a measured null distribution on the pinned drafter across several
+prompt types — including deliberately repetitive text, where a trained drafter's
+provenance rate legitimately rises. Shipping it with a guessed threshold would
+repeat the mistake this contract has already made three times. The protocol
+field to journal proposed draft tokens is the prerequisite, and is not yet added.
+
+## Effect on the gate
+
+L5 is withdrawn as a *runtime* blocker: it is replaced by a participant rule with
+the same enforcement mechanism the live serial track uses, plus a specified
+future detector. `tokenFidelityGateStatus` therefore turns on the two L2 gaps of
+Amendment 6 section 3 alone — the unmeasured cross-build tolerance term, and the
+absence of any degraded-verifier run to show the tolerance catches cheapening.
+Both are measurable without new design work.
+
+Whether those two gaps must close before the track ranks, or whether they are
+acceptable as documented limits given that the hidden gates remain the fidelity
+authority, is a policy decision for the organizer and deliberately not decided
+here. The pinned test keeps official scoring off until someone decides.

@@ -635,6 +635,21 @@ What it will be, when it is enabled:
   group-16 reference checkpoint the serial track measures) and the drafter are
   organizer-provisioned and hash-pinned. Substituting, re-deriving, or
   re-quantizing the drafter is a fail.
+- **Drafts must come from the pinned drafter, not from the input.** Bypassing the
+  drafter is a distinct violation from substituting its weights, and it is
+  excluded just as firmly. Every proposed token in a block must be produced by a
+  forward pass of the pinned draft model on that round's bonus token and target
+  hidden context. Prompt-lookup drafting, n-gram, suffix or token-history
+  drafting, copying from the seed or from previously emitted tokens, and any
+  other input-derived proposal source are excluded — the same techniques the
+  serial track excludes, for the same reason, and the exclusion holds even where
+  the implementation is generic, production-useful, or bit-exact. Hybrids that
+  fall back to an input-derived proposal when the drafter is slow or its
+  confidence is low are excluded too. You may make the drafter's *dispatch*
+  cheaper (fusion, layout, scheduling); you may not replace what it computes.
+  This is enforced the way the serial track enforces its own speculation ban —
+  by rule and static review — see the DFlash correctness contract's L5 section
+  for why a runtime numerical check is a weaker instrument than it looks.
 - **What is measured is the reference forward.** The DFlash target is the
   vendored `LagunaModel` reached through `LLMModelFactory`, not the serial
   track's scored `Sources/MLXFastModel/LagunaRuntimeModel.swift`. DFlash
