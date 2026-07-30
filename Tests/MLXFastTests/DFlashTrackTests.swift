@@ -883,3 +883,55 @@ struct DFlashWorkBindingHardeningTests {
         try validator().acceptStructural(round: round)
     }
 }
+
+// MARK: - The decode floor must not drift between its declarations
+
+/// The floor lives in four places and only one of them rejects (the box wrapper's
+/// `MIN_ACCEPTED_SPEEDUP`, which no test can reach). These pin the two the repo
+/// owns, so a change to one cannot silently disagree with the other, and pin the
+/// VALUE so a change is a deliberate edit to this test rather than a drift.
+@Suite
+struct DFlashDecodeFloorTests {
+    private func json(_ path: String) throws -> [String: Any] {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        return try #require(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+    }
+
+    /// 0.80, set by operator decision 2026-07-30. NOT 1.0: block decode costs ~16%
+    /// on realistic prose, so an unmodified candidate measures 0.840x, and a 1.0
+    /// floor would reject every honest sub-19% kernel win instead of rejecting
+    /// regressions. Raising this back to 1.0 makes the track reject its own purpose.
+    @Test
+    func decodeFloorIsEightyHundredthsInBothManifests() throws {
+        let manifest = try json("benchmark.dflash.json")
+        let scoring = try #require(manifest["scoring"] as? [String: Any])
+        let floor = try #require(scoring["decodeSpeedupFloor"] as? Double)
+        #expect(floor == 0.80)
+
+        let fixture = try json("fixtures/laguna_xs_2_1_dflash_track.json")
+        let proposed = try #require(fixture["proposed_scoring"] as? [String: Any])
+        let text = try #require(proposed["component_floor"] as? String)
+        #expect(
+            text.contains(">= 0.80"),
+            "the fixture's component_floor must state the same number the manifest enforces"
+        )
+        // The derivation has to travel with the number, or the next reader "fixes"
+        // it back to 1.0.
+        #expect(text.contains("0.840x"))
+        #expect(text.contains("MAX_PLAUSIBLE_SPEEDUP stays 5.0"))
+    }
+
+    /// The workflow's own header comments are what a reviewer reads first, so they
+    /// must not still advertise the old floor.
+    @Test
+    func workflowCommentsDoNotStillAdvertiseAFloorOfOne() throws {
+        let workflow = try String(
+            contentsOfFile: ".github/workflows/dflash-benchmark.yml", encoding: .utf8
+        )
+        #expect(workflow.contains("floor: aggregate >= 0.80"))
+        #expect(!workflow.contains("floor: aggregate >= 1.0"))
+        #expect(!workflow.contains("floor >= 1.0 on that aggregate"))
+    }
+}
