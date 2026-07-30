@@ -1707,7 +1707,12 @@ jobs:
       # ---- correctness-only (run_benchmark=false) artifact path ------------
       - name: Stage DFlash correctness artifacts
         id: stage_dflash_correctness_artifacts
-        if: ${{ !inputs.run_benchmark }}
+        # always() matches serial's "Stage correctness artifacts". Without it a
+        # gates-only run that FAILS skips staging, so the diagnostics are lost
+        # in exactly the case they are wanted. The !run_benchmark half is not a
+        # convenience: on a ranked run these artifacts are withheld, because
+        # they are derived from hidden material.
+        if: ${{ always() && !inputs.run_benchmark }}
         run: |
           set -euo pipefail
           test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"

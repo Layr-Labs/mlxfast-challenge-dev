@@ -542,8 +542,13 @@ LOCAL_RUN_LOCK_OWNED=""
 # weights digest) is about to spawn a ~21.6 GB worker and would otherwise be
 # invisible to this scan until that load has already started. The dflash-*
 # subcommands are listed for the same reason: a DFlash residency is the same
-# target plus the drafter, and benchmark-dflash.sh takes no lock of its own, so
-# this scan is what stops a serial run from starting against a live DFlash one.
+# target plus the drafter.
+#
+# benchmark-dflash.sh now takes THIS lock, by reusing the three functions
+# below rather than reimplementing them, so the two scripts exclude each other
+# in both directions. This scan is still what catches the case no lock can:
+# an ORPHANED model-holding worker from a run that died without releasing --
+# the residency is live but nothing holds the lock.
 readonly RESIDENT_MODEL_PROCESS_PATTERN='runtime-worker[[:space:]]+--weights|mlxfast-swift[[:space:]]+(benchmark|correctness|correctness-trace|generate-golden|generate-gpqa-answers|attach-free-run-gate|dflash-benchmark|dflash-probe|dflash-reference)'
 
 local_run_guard_enabled() {

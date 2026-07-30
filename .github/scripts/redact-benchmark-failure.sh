@@ -110,6 +110,20 @@ if [[ -s "${score_path}" ]]; then
         workBindingLogitMismatch) category="dflash_work_binding_logit_mismatch" ;;
         cacheOffsetDiverged) category="dflash_cache_offset_diverged" ;;
         incompleteRun) category="dflash_incomplete_run" ;;
+        # The rejected-tail kinds (correctness contract Amendment 21). These
+        # are the three detections aimed at a verifier that fabricates rows it
+        # never computed, so they are the ones an audit most needs named: a run
+        # that trips one of these is reporting a probable cheat, not a bug.
+        # Without these arms they collapsed into the generic bucket below --
+        # never a leak, but indistinguishable from an ordinary shape error.
+        fabricatedRejection) category="dflash_fabricated_rejection" ;;
+        rejectedRowReadoutMismatch) category="dflash_rejected_row_readout_mismatch" ;;
+        draftTokenBindingMismatch) category="dflash_draft_token_binding_mismatch" ;;
+        # Fail SAFE, not silent: an unrecognised kind still redacts (it never
+        # reaches the raw detail text), but DFlashRedactorKindCoverageTests
+        # asserts this arm is unreachable, so adding a kind to
+        # DFlashContractViolation.Kind without an arm above fails the suite
+        # rather than quietly degrading the category.
         *) category="dflash_contract_violation" ;;
       esac
       first_failing_step="$(jq -r '.metrics.first_failing_step // ""' "${score_path}")"

@@ -210,7 +210,50 @@ fi
 run_dir=""
 score_tmp=""
 
+# --- local run guard ---------------------------------------------------------
+#
+# Both local modes hold the ~21.6 GB target AND the drafter, so an overlapping
+# local run (serial or DFlash) can out-of-memory the machine, and two runs
+# sharing one GPU invalidate both timings. benchmark.sh guards the serial
+# direction of this: its resident-model scan lists the dflash-* subcommands, so
+# a serial run refuses to start against a live DFlash one. Nothing guarded the
+# REVERSE direction until now -- this script took no lock, so a DFlash run
+# started happily against a live serial run.
+#
+# Take benchmark.sh's OWN lock, at benchmark.sh's OWN path, by reusing its
+# definitions rather than copying them. The path is the part that must not
+# drift: two implementations that disagree about where the lock lives would
+# both "hold a lock" and exclude nothing. Same awk-extract-and-eval idiom the
+# source_hash() reuse above uses, and it fails closed the same way.
+#
+# `local_run_guard_enabled` is defined HERE, before the eval, because
+# benchmark.sh's version tests benchmark.sh's own mode flags. Shell resolves
+# function calls at call time, so the extracted acquire/release use this one.
+# Both of this script's modes are local and model-holding, so the only opt-out
+# is the documented debugging escape hatch, spelled exactly as benchmark.sh
+# spells it.
+LOCAL_RUN_LOCK_OWNED=""
+local_run_guard_enabled() {
+  [[ "${MLXFAST_LOCAL_RUN_GUARD:-1}" != "0" ]]
+}
+run_lock_definitions="$(
+  awk '/^local_run_lock_path\(\) \{/,/^\}/' benchmark.sh
+  awk '/^acquire_local_run_lock\(\) \{/,/^\}/' benchmark.sh
+  awk '/^release_local_run_lock\(\) \{/,/^\}/' benchmark.sh
+)"
+if [[ "${run_lock_definitions}" != *"mlxfast-local-benchmark-"* ]] \
+  || [[ "${run_lock_definitions}" != *"LOCAL_RUN_LOCK_OWNED="* ]]; then
+  echo "benchmark-dflash.sh: could not reuse benchmark.sh's local run lock;" >&2
+  echo "benchmark-dflash.sh: benchmark.sh has been refactored -- refusing to run unguarded" >&2
+  echo "benchmark-dflash.sh: (two overlapping local runs can out-of-memory this machine)" >&2
+  exit 1
+fi
+eval "${run_lock_definitions}"
+
 cleanup() {
+  # Released FIRST: the lock is what another run is waiting on, and a failure
+  # while removing scratch must not strand it.
+  release_local_run_lock
   if [[ -n "${score_tmp}" ]]; then
     rm -f -- "${score_tmp}" || true
   fi
@@ -228,6 +271,12 @@ cleanup() {
 # Armed BEFORE the scratch directory is created, so an abort between mkdir and
 # mktemp still leaves no work root behind.
 trap cleanup EXIT
+
+# Acquired once the trap can release it, and before anything expensive --
+# including the thermal gate. Holding the lock while waiting to cool is the
+# point: the alternative lets a second run start, heat the GPU, and invalidate
+# the wait this run just paid for.
+acquire_local_run_lock
 
 run_dir="$(mktemp -d "${work_root%/}/run.XXXXXX")"
 score_tmp="${score_path}.tmp"
