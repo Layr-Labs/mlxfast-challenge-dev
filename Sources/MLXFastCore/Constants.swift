@@ -35,37 +35,62 @@ public enum MLXFastConstants {
     public static let correctnessMaxAnchorContextTokens = 1_024
     public static let correctnessMaxFreeRunSteps = 256
     public static let correctnessMaxBehaviorPromptTokens = 2_048
-    public static let correctnessMaxBehaviorSteps = 64
-    public static let correctnessGPQACaseCount = 5
+    public static let correctnessMaxBehaviorSteps = 128
+    public static let correctnessGPQACaseCount = 9
     // Cross-machine greedy decode can drift on hidden GPQA even with pinned
     // Swift/MLX. Semantic GPQA behavior captures a short continuation for the
     // private judge; exact token enforcement stays on the long copy gate and
     // non-semantic behavior fixtures.
-    // 64 (was 10, DeepSeek-era): a 2026-07-06 budget capture at 10/32/64
-    // showed shorter budgets cut most candidates off mid-sentence; 64, the
-    // correctnessMaxBehaviorSteps ceiling, gave the judge the most usable
-    // text. Poolside NVFP4 activation runs 30011903540, 30015338806,
-    // 30022640438, and 30027994180 each judged the unmodified baseline 2/5 at
-    // this budget, re-confirming it across the migration.
-    public static let correctnessGPQAMaxNewTokens = 64
+    // 128 (was 64; before that 10, DeepSeek-era): the 10->64 history and its
+    // calibration runs predate the GPQA prompt-encoding (BOS) fix and
+    // measured degenerate no-BOS completions, so they no longer bind. With
+    // BOS the reference answers letter-first and then explains; 128 lets the
+    // explanation finish for the judge instead of cutting mid-sentence.
+    // Generation happens in the untimed gates phase (never the frozen timed
+    // window), so the cost is ~10-15s of job wall-clock, not score.
+    public static let correctnessGPQAMaxNewTokens = 128
     // Semantic judging uses short hidden GPQA answers as a baseline-calibrated
     // gate for optimizations that preserve the exact prefix but damage answer
-    // sense. Five cases keeps the full GitHub job near the 30-minute budget.
+    // sense. 9 (was 5): raised to the full fixture together with the GPQA
+    // prompt-encoding (BOS) fix -- selection takes the first N budget-valid
+    // cases in file order, and the old window of 5 contained only two of the
+    // five cases the correctly-prompted reference answers right. Per-case
+    // cost is one short untimed generation plus one judge call; the 4 extra
+    // cases add roughly a minute to the job.
     // The captured answer is a prefix of the behavior-gate generation, so
     // semanticGPQAMaxNewTokens is only effective up to
     // correctnessGPQAMaxNewTokens (and must stay <= correctnessMaxBehaviorSteps).
-    public static let semanticGPQACaseCount = 5
-    public static let semanticGPQAMaxNewTokens = 64
-    // Poolside NVFP4 calibration: four ranked baseline-equivalent M5 runs
-    // (30011903540, 30015338806, 30022640438, and 30027994180; Opus 4.8
-    // judge) each scored 2/5. min(observed) - 1 therefore re-confirms 1 as the
-    // conservative floor: a one-case judge fluctuation still passes, while a
-    // submission that wrecks answer quality (0/5 judged) fails instead of
-    // merely being recorded. Keep in sync with the workflow env
-    // MLXFAST_SEMANTIC_GPQA_MIN_PASS.
-    // (Historical: the 2026-07-09 Gemma 4 31B-IT calibration observed a
-    // stable 2/5 across five runs and set min(observed) - 1 = 1.)
-    public static let semanticGPQAMinPassCount = 1
+    public static let semanticGPQACaseCount = 9
+    public static let semanticGPQAMaxNewTokens = 128
+    // 7 of 9, set from measurement rather than prediction. The gate compares
+    // the candidate against the pinned reference model's own recorded answers
+    // (accepted_responses in the hidden fixture), so it is a regression check:
+    // an unmodified candidate reproduces the reference on every case by
+    // construction, independent of whether those answers are factually right.
+    // That is the point of the design -- the reference model is at chance on
+    // these questions, so a correctness-based gate could only ever sit on the
+    // noise floor (see the 2026-07-27 measurements: 1-4 of 9 correct depending
+    // on option order, with a single case carrying the entire margin).
+    // Calibration, 2026-07-27, offline against the real gate script:
+    //   self-match (unmodified candidate), 27 runs / 243 judgements: 9/9 every
+    //     run, zero variance, including the one case whose reference output is
+    //     degenerate.
+    //   three answers changed to a different option, 8 runs: exactly 6/9 every
+    //     run, failing only the changed cases.
+    //   answer content preserved but label flipped or tail truncated, 8 runs:
+    //     9/9 -- cosmetic near-tie drift is tolerated.
+    // So judge nondeterminism costs nothing, each damaged answer costs exactly
+    // one case, and a floor of 7 absorbs two independent damaged answers. It
+    // also clears the >= 6 needed to reject a submission that hardcodes one
+    // fixed letter: the reference selects a spread of letters, so a constant
+    // answer matches at most 5 of 9.
+    // Earlier floors of 1 were calibrated against pre-BOS-fix runs whose
+    // reference never answered at all, so they justified nothing.
+    // Keep in sync with the workflow env MLXFAST_SEMANTIC_GPQA_MIN_PASS and
+    // run-semantic-gpqa-gate.sh. Regenerating the fixture's accepted_responses
+    // (new prompts, token budget, or reference checkpoint) invalidates this
+    // calibration -- re-run it.
+    public static let semanticGPQAMinPassCount = 7
     public static let benchmarkPrefillPromptTokens = 512
     // Stable public identifier for the private timed-evaluation prompt. The
     // prompt bytes remain operator-provisioned; changing this identifier is a
