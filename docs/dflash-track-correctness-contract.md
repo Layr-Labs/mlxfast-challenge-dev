@@ -2003,3 +2003,80 @@ The wider lesson, and it is the same one Amendment 8 named: an instrument nobody
 has attacked is not a gate. L2 survived seventeen amendments of scrutiny, three
 independent re-derivations of its constant, and every honest test, because none of
 those was an adversary.
+
+# Amendment 19 (2026-07-30): the hardening holds, and which half actually does the work
+
+Amendment 18's two fixes were re-tested against the same three cheats at `295b9e2`,
+plus two new variants designed to isolate them. **All rejected. Nothing passed, so
+there is no prize to report.** But the two halves are not equally durable, and the
+difference matters more than the pass/fail.
+
+| cheat | width | rejected | kind + step | fatal delta | caught by |
+|---|---|---|---|---|---|
+| A blind-accept, one lm_head, copied readouts | K=3 (ranked) | yes | structural, step 0 | — (died before L2) | **id-bind** |
+| A | K=4 | yes | structural, step 0 | — | id-bind |
+| **A-ids** (same, but per-row ids honest) | K=3 | yes | tolerance, step 28 | **5.125** (ref 28.625, rel 0.179) | **tolerance AND** |
+| C reuse row-0 hidden | K=4 | yes | structural, step 1 | — | id-bind |
+| **C-ids** (same, ids honest) | K=4 | yes | tolerance, step 30 | **5.0** (ref 21.875, rel 0.186) | **tolerance AND** |
+| B truncate trunk 10/40 | K=4 | yes | structural, step 0 | 14.625, rel 0.574 | either (breaches both arms) |
+
+## The AND is the load-bearing half, and that is proven rather than argued
+
+An additive log in the validator — no constant, comparison or control flow changed,
+verified by identical failure step and detail with and without it — recorded both
+arms' verdicts on every live comparison. The fatal comparisons breach **only the
+absolute arm**: `delta=5.125 scale=28.625 rel=0.179 abs_arm_ok=false
+rel_arm_ok=true`, and `delta=5.0 scale=26.875 rel=0.186 abs_arm_ok=false
+rel_arm_ok=true`. **Zero comparisons in either run breached both arms**, so the old
+OR would have rescued every single one.
+
+Independently corroborated: the A-ids run at K=3 reproduces the prior session's
+cheat-A L2 stream byte-identically (256 comparisons, max 6.75, p99 4.625, p50 0.75,
+mean 1.2197), and that stream measured rc=0 before the fix.
+
+## The structural id-bind is defence in depth, not a gate
+
+It fires only because the crude cheats left the anchor row's token ids in place.
+Reporting `top1_id = emitted token` costs a blind-accepting cheater **nothing** — it
+already knows every emitted token, having accepted the drafter's proposals. That is
+exactly what A-ids and C-ids do, and they sail through the entire 128-token window
+until the tolerance stops them. Keep the check: it is free, it needs no reference,
+and it catches the naive version at step 0 or 1 instead of step 28. But it must not
+be mistaken for the thing holding the line.
+
+## Residual exposure, measured and unclosed
+
+The AND catches these by a **thin margin**: 5.125 against 4.875 is 0.25, about two
+BF16 ULPs, on 3 of 256 comparisons; 5.0 against 4.875 is one ULP, on 4 of 256.
+Honest maxima run 0 (K=1) to 2.75 (K=3) to 3.25 (K=8).
+
+So a live band exists between the honest ceiling and the gate — roughly **2.75 to
+4.875 at the ranked width** — in which a less crude fabrication could sit
+undetected. Anchoring on a nearer row rather than a fixed one would plausibly land
+there. Amendment 18's own "tail lottery" criticism of the old K=4 rejection applies
+to the new gate: it is winning on a handful of tail comparisons, not on a
+distributional separation (fabricated rows sit at p50 0.75-1.25).
+
+Note also that 4.875 is already 1.5x the widest honest drift measured (3.25 at
+K=8), so the constant cannot simply be lowered without either shrinking the
+supported block-width range or accepting flakes at wide K.
+
+The shape of the fix, deliberately NOT applied without the measurement to support
+it: **calibrate the absolute arm per block width.** Honest frame divergence is
+provably width-dependent — it is exactly 0 at K=1 and grows monotonically with the
+verify width — whereas a fabrication's error does not scale that way. Per-width
+calibration would put the ranked width's arm near 3.5-4.1 instead of 4.875 and
+shrink the band accordingly. That needs an honest-drift sweep across widths, seeds
+and several prompt kinds first; guessing it is precisely the mistake Amendments 8,
+15 and 18 each recorded.
+
+The second unclosed gap is unchanged from Amendment 18: the rejected tail is still
+unpriced, which needs the parent to journal draft tokens.
+
+## Honest runs, clean rebuild at `295b9e2`
+
+`dflash-probe --tokens 128`: rc=0, 0.018935 s/token, max delta 0, relative 0.
+`dflash-benchmark --tokens 128 --block-size 3 --schedule-seed 7`: rc=0, 0.018365
+s/token, max delta 1.875, relative 0.0884. A same-session control with the cheat
+patch present but its env switch unset: rc=0, max delta 2.75, relative 0.1039, and
+zero cheat lines emitted. All four sit inside BOTH arms with margin.
