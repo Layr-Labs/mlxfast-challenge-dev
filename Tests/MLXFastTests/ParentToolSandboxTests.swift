@@ -123,6 +123,52 @@ struct ParentToolSandboxTests {
     }
 
     @Test
+    func runtimeWorkerProfilesConfineTrustedHarnessReads() throws {
+        let cli = try cliSource()
+        // The fallback worker profile carries the trusted-harness read
+        // confinement (trusted-only source trees + the running trusted
+        // binary) alongside the golden and private-directory denies.
+        let profileRange = try #require(
+            cli.range(of: "private static func writeRuntimeWorkerSandboxProfile(")
+        )
+        let profileTail = String(cli[profileRange.lowerBound...])
+        let writeRange = try #require(profileTail.range(of: "try profile.write("))
+        let profileBody = String(profileTail[..<writeRange.lowerBound])
+        #expect(profileBody.contains("TrustedHarnessReadConfinement.readDenyRules("))
+
+        // The shared renderer pins the trusted-only source scope, and the
+        // exec-rebind choke point guarantees the rules on operator-provided
+        // profiles too.
+        let harness = try String(
+            contentsOfFile: "Sources/MLXFastTrustedHarness/LagunaRuntimeWorker.swift",
+            encoding: .utf8
+        )
+        for directory in [
+            "Sources/MLXFastCLI",
+            "Sources/MLXFastCore",
+            "Sources/MLXFastHarness",
+            "Sources/MLXFastRuntimeWorkerCLI",
+            "Sources/MLXFastTrustedHarness",
+        ] {
+            #expect(harness.contains("\"\(directory)\","))
+        }
+        #expect(harness.contains(
+            "TrustedHarnessReadConfinement.readDenyRules()"
+        ))
+
+        // The sandbox probe asserts the same shape on the host before every
+        // ranked run.
+        let probe = try String(
+            contentsOfFile: ".github/scripts/probe-runtime-worker-sandbox.sh",
+            encoding: .utf8
+        )
+        #expect(probe.contains("expect_read_denied(\"trusted harness source\", argv[6]);"))
+        #expect(probe.contains("expect_read_denied(\"trusted harness binary\", argv[7]);"))
+        #expect(probe.contains("(deny file-read* (subpath \"${trusted_source_dir}\"))"))
+        #expect(probe.contains("(deny file-read* (literal \"${trusted_binary_path}\"))"))
+    }
+
+    @Test
     func workflowArmsParentToolSandboxOnTransformAndAttachSteps() throws {
         let workflow = try workflowSource()
 

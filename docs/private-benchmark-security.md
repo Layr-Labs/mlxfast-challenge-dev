@@ -92,14 +92,27 @@ hardened, merged Seatbelt worker profile into the harness via
 
 The runtime worker — the one child process that executes submitted model
 code — runs under that Seatbelt profile: no network, no fork/exec beyond
-its own binary, writes confined to the workspace, and the hidden golden
-denied by literal path (`BENCH_GOLDEN_PATH`). A sandbox probe step
+its own binary, writes confined to the workspace, the hidden golden
+denied by literal path (`BENCH_GOLDEN_PATH`), and the trusted-harness
+surface inside the workspace copy denied read access — the trusted-only
+source trees (`Sources/MLXFastCLI`, `Sources/MLXFastCore`,
+`Sources/MLXFastHarness`, `Sources/MLXFastRuntimeWorkerCLI`,
+`Sources/MLXFastTrustedHarness`) by subpath and the compiled trusted
+timer/gates/score binary by literal path. The profile is otherwise
+default-allow for reads (weights, tokenizer, frameworks, and the
+participant-editable vendored sources must stay readable), so these are
+targeted denies, not an allowlist. The harness enforces the read
+confinement at every worker launch: the exec-rebind choke point
+(`runtimeWorkerSandboxProfile(rebinding:toExecutableAt:)`) appends any
+missing confinement rule to whichever profile arrives — the operator
+template, `benchmark.sh`'s, or the CLI fallback writer's — so an outdated
+operator template cannot silently drop it. A sandbox probe step
 re-verifies on every run — before any private material is fetched — that
 the host's `sandbox-exec` still denies golden reads, private-directory
-reads, non-workspace writes, network, and fork/exec under a worker-shaped
-profile. A fourth designed layer, a uid-scoped PF network-egress block on
-the bench account, is staged but currently deferred; see "Current posture
-and known gaps".
+reads, trusted-harness source and binary reads, non-workspace writes,
+network, and fork/exec under a worker-shaped profile. A fourth designed
+layer, a uid-scoped PF network-egress block on the bench account, is
+staged but currently deferred; see "Current posture and known gaps".
 
 ## Between jobs: janitor, signed audit, quarantine
 
@@ -225,15 +238,16 @@ written its private answer capture. The Anthropic key never crosses the
 bridge, and only aggregate semantic pass counts and the judge model name
 are patched into `score.json`; prompts, references, candidate answers, and
 judge transcripts stay in private runner paths covered by the artifact
-deny-list. One documented residual: the answer capture (which embeds hidden
-reference answers) is written into the bench workspace by the harness
-parent at the very end of the gates pass, and — unlike on the VM pipeline,
-whose harness profile could subpath-deny it — it is briefly readable by the
-worker in the few seconds between that write and worker teardown. The
-window gains a submission nothing (every behavior verdict is already final
-by then), and a trusted step scrubs the capture — together with the
-augmented golden and all other hidden material — before any later phase
-spawns another worker.
+deny-list. A previously documented residual — the answer capture (which
+embeds hidden reference answers) being briefly readable by the worker
+between its write and worker teardown — is closed by sequencing: the
+harness parent writes the capture into the bench workspace only after the
+correctness worker, the one process running submitted code in that phase,
+has been closed and reaped (`LagunaRuntimeBenchmark` collects the answers
+in memory during the live-worker window and defers the write), so no
+submitted code is alive while the capture exists on disk. A trusted step
+scrubs the capture — together with the augmented golden and all other
+hidden material — before any later phase spawns another worker.
 
 ## Timed measurement and score sealing
 

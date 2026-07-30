@@ -1490,11 +1490,87 @@ func stopRuntimeWorkerProcess(
     return !process.isRunning
 }
 
+/// Trusted-harness read confinement for the runtime-worker Seatbelt profile.
+///
+/// The bench workspace is a full copy of the checkout and the worker profile
+/// is default-allow for file reads (weights, tokenizer, frameworks, and the
+/// participant-editable vendored sources must stay readable), so without
+/// explicit denies the sandboxed worker can read the trusted-harness source
+/// trees and the compiled trusted timer/gates/score binary. These targeted
+/// `(deny file-read* ...)` rules remove exactly that access and nothing
+/// else: weights/, the tokenizer, mlx.metallib, the worker's own build
+/// products, and every editable surface stay readable.
+public enum TrustedHarnessReadConfinement {
+    /// Repo-relative source directories that feed only the trusted binary
+    /// and the trusted worker shell -- the runtime worker never legitimately
+    /// reads any of them at run time. Matches the trusted, non-editable
+    /// source scope ("What Not To Change" in AGENTS.md; the trusted-binary
+    /// subset is additionally pinned by verify-trusted-source-scope.sh).
+    /// Keep in lockstep with the operator worker-profile template on the
+    /// ranked box, .github/scripts/probe-runtime-worker-sandbox.sh, and
+    /// docs/private-benchmark-security.md.
+    public static let trustedSourceDirectories = [
+        "Sources/MLXFastCLI",
+        "Sources/MLXFastCore",
+        "Sources/MLXFastHarness",
+        "Sources/MLXFastRuntimeWorkerCLI",
+        "Sources/MLXFastTrustedHarness",
+    ]
+
+    /// Marker comment written ahead of the deny group so rendered profiles
+    /// stay recognizable to operators and probes.
+    public static let profileMarker =
+        ";; Trusted-harness read confinement (trusted sources + trusted binary)."
+
+    /// Render the targeted read-deny rules for a worker profile rooted at
+    /// `workspaceRoot` -- the launching process's working directory, which is
+    /// the repo root for local runs and the per-job bench workspace on the
+    /// ranked runner. `trustedExecutablePath` is the running trusted binary;
+    /// `nil` skips the binary literal (the source-tree denies still apply).
+    public static func readDenyRules(
+        workspaceRoot: String = FileManager.default.currentDirectoryPath,
+        trustedExecutablePath: String? = Bundle.main.executableURL?.path
+    ) -> [String] {
+        let rootURL = URL(fileURLWithPath: workspaceRoot)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        var rules = trustedSourceDirectories.map { directory -> String in
+            let path = rootURL
+                .appendingPathComponent(directory)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+                .path
+            return "(deny file-read* (subpath \"\(seatbeltRuleEscaped(path))\"))"
+        }
+        if let trustedExecutablePath {
+            let path = URL(fileURLWithPath: trustedExecutablePath)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+                .path
+            rules.append("(deny file-read* (literal \"\(seatbeltRuleEscaped(path))\"))")
+        }
+        return rules
+    }
+
+    private static func seatbeltRuleEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+}
+
 /// Reassert the actual runtime-worker executable as the final Seatbelt exec
 /// rule. Operator-provided profiles can outlive a binary-layout change; a
 /// stale allow would otherwise make sandbox-exec die before the protocol hello.
 /// Strip every earlier exec exception, then append a deny plus one literal
 /// allow so the resulting profile admits exactly this worker.
+///
+/// This choke point is also where the trusted-harness read confinement is
+/// guaranteed: every worker launch (preflight and RuntimeWorkerClient) passes
+/// its profile -- operator-injected via MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE,
+/// benchmark.sh-generated, or the CLI fallback writer's -- through here, so
+/// any confinement rule missing from the incoming profile is appended ahead
+/// of the exec binding. Rules already present verbatim are not duplicated.
 func runtimeWorkerSandboxProfile(
     rebinding profilePath: String,
     toExecutableAt executablePath: String
@@ -1513,7 +1589,15 @@ func runtimeWorkerSandboxProfile(
         }
         retainedLines.append(line)
     }
-    let sourceWithoutExecAllows = retainedLines.joined(separator: "\n")
+    var hardenedSource = retainedLines.joined(separator: "\n")
+    let missingConfinementRules = TrustedHarnessReadConfinement.readDenyRules()
+        .filter { !hardenedSource.contains($0) }
+    if !missingConfinementRules.isEmpty {
+        let confinementSeparator = hardenedSource.hasSuffix("\n") ? "" : "\n"
+        hardenedSource += confinementSeparator
+            + TrustedHarnessReadConfinement.profileMarker + "\n"
+            + missingConfinementRules.joined(separator: "\n")
+    }
     let resolvedExecutablePath = URL(fileURLWithPath: executablePath)
         .standardizedFileURL
         .resolvingSymlinksInPath()
@@ -1521,8 +1605,8 @@ func runtimeWorkerSandboxProfile(
     let escapedExecutablePath = resolvedExecutablePath
         .replacingOccurrences(of: "\\", with: "\\\\")
         .replacingOccurrences(of: "\"", with: "\\\"")
-    let separator = sourceWithoutExecAllows.hasSuffix("\n") ? "" : "\n"
-    let rebound = sourceWithoutExecAllows + separator + """
+    let separator = hardenedSource.hasSuffix("\n") ? "" : "\n"
+    let rebound = hardenedSource + separator + """
     ;; Trusted-harness executable binding (must remain the final exec rules).
     (deny process-exec*)
     (allow process-exec (literal "\(escapedExecutablePath)"))

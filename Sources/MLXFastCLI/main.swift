@@ -1630,6 +1630,19 @@ private enum MLXFastCLI {
                 "(deny file-read* (subpath \"\(seatbeltEscaped(absolutePath(privateDir)))\"))"
             )
         }
+        // The bench workspace is a full copy of the checkout and this profile
+        // is default-allow for reads, so explicitly deny the trusted-harness
+        // surface: the trusted-only source trees under the workspace root and
+        // the running trusted binary itself. The worker needs none of them at
+        // run time; weights/, the tokenizer, mlx.metallib, and every editable
+        // surface stay readable. runtimeWorkerSandboxProfile(rebinding:
+        // toExecutableAt:) appends the same rules to profiles arriving from
+        // other layers (the operator template, benchmark.sh); emitting them
+        // here keeps the fallback profile complete on its own.
+        deniedReadRules.append(contentsOf: TrustedHarnessReadConfinement.readDenyRules(
+            workspaceRoot: FileManager.default.currentDirectoryPath,
+            trustedExecutablePath: try? currentExecutablePath()
+        ))
         // `(deny network*)` blocks the worker's OWN sockets, but getaddrinfo(3)
         // resolves via IPC to mDNSResponder, which egresses from ITS uid -- so a
         // uid/socket-scoped block never sees the DNS query and submitted code

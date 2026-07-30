@@ -181,6 +181,75 @@ func trustedSandboxRebindsExecPermissionToTheRuntimeWorker() throws {
     #expect(denied.terminationStatus == 71)
 }
 
+@Test
+func trustedSandboxRebindAppendsTrustedHarnessReadConfinement() throws {
+    let root = try trustedWorkerTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    // An operator-shaped profile that predates the trusted-harness read
+    // confinement: golden/private denies present, harness denies absent.
+    let operatorProfile = root.appendingPathComponent("operator-worker.sb")
+    try """
+    (version 1)
+    (allow default)
+    (deny network*)
+    (deny process-fork)
+    (deny process-exec*)
+    (allow process-exec (literal "/usr/bin/false"))
+    (deny file-write*)
+    (allow file-write* (literal "/dev/null"))
+    (deny file-read* (literal "/tmp/example-golden.json"))
+    """.write(to: operatorProfile, atomically: true, encoding: .utf8)
+
+    let expectedRules = TrustedHarnessReadConfinement.readDenyRules()
+    #expect(expectedRules.contains { rule in
+        rule.contains("(deny file-read* (subpath")
+            && rule.contains("Sources/MLXFastTrustedHarness")
+    })
+    #expect(expectedRules.contains { rule in
+        rule.hasPrefix("(deny file-read* (literal")
+    })
+
+    let reboundProfilePath = try runtimeWorkerSandboxProfile(
+        rebinding: operatorProfile.path,
+        toExecutableAt: "/usr/bin/true"
+    )
+    defer { try? FileManager.default.removeItem(atPath: reboundProfilePath) }
+    let reboundProfile = try String(
+        contentsOfFile: reboundProfilePath,
+        encoding: .utf8
+    )
+    // Every missing confinement rule is appended, existing denies survive,
+    // and the exec binding remains the profile suffix.
+    for rule in expectedRules {
+        #expect(reboundProfile.contains(rule))
+    }
+    #expect(reboundProfile.contains(TrustedHarnessReadConfinement.profileMarker))
+    #expect(reboundProfile.contains("(deny file-read* (literal \"/tmp/example-golden.json\"))"))
+    #expect(reboundProfile.hasSuffix(
+        """
+        (deny process-exec*)
+        (allow process-exec (literal "/usr/bin/true"))
+        """
+    ))
+
+    // Rebinding a profile that already carries the confinement (the CLI
+    // fallback writer's, or an updated operator template) must not
+    // duplicate the rules.
+    let reboundTwicePath = try runtimeWorkerSandboxProfile(
+        rebinding: reboundProfilePath,
+        toExecutableAt: "/usr/bin/true"
+    )
+    defer { try? FileManager.default.removeItem(atPath: reboundTwicePath) }
+    let reboundTwice = try String(
+        contentsOfFile: reboundTwicePath,
+        encoding: .utf8
+    )
+    for rule in expectedRules {
+        #expect(reboundTwice.components(separatedBy: rule).count == 2)
+    }
+}
+
 private func trustedWorkerTemporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)

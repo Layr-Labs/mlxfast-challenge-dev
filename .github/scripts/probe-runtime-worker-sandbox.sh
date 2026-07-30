@@ -23,6 +23,13 @@ private_path="${private_dir}/gpqa_reference_cases.json"
 outside_write_path="${root}/outside-write.txt"
 private_write_path="${private_dir}/private-write.txt"
 unix_socket_path="${root}/probe.sock"
+# Trusted-harness read confinement fixtures: a stand-in for the trusted-only
+# source trees and for the compiled trusted binary inside the bench
+# workspace, denied by subpath/literal exactly like the worker profile
+# (TrustedHarnessReadConfinement in Sources/MLXFastTrustedHarness).
+trusted_source_dir="${root}/Sources/MLXFastTrustedHarness"
+trusted_source_path="${trusted_source_dir}/LagunaRuntimeWorker.swift"
+trusted_binary_path="${root}/.build/release/mlxfast-swift"
 server_pid=""
 
 cleanup() {
@@ -32,9 +39,11 @@ cleanup() {
   rm -rf "${root}"
 }
 
-mkdir -p "${private_dir}"
+mkdir -p "${private_dir}" "${trusted_source_dir}" "${root}/.build/release"
 printf '%s\n' '{"secret":true}' > "${golden_path}"
 printf '%s\n' '{"secret":true}' > "${private_path}"
+printf '%s\n' '// trusted harness source' > "${trusted_source_path}"
+printf '%s\n' 'trusted harness binary bytes' > "${trusted_binary_path}"
 trap cleanup EXIT
 
 cat > "${probe_source}" <<'C'
@@ -214,8 +223,8 @@ int main(int argc, char **argv) {
   if (argc == 3 && strcmp(argv[1], "--server") == 0) {
     return run_server(argv[2]);
   }
-  if (argc != 6) {
-    fprintf(stderr, "usage: %s golden private outside-write private-write unix-socket\n", argv[0]);
+  if (argc != 8) {
+    fprintf(stderr, "usage: %s golden private outside-write private-write unix-socket trusted-source trusted-binary\n", argv[0]);
     return 2;
   }
   expect_read_denied("golden file", argv[1]);
@@ -225,6 +234,8 @@ int main(int argc, char **argv) {
   expect_dev_null_write_allowed();
   expect_inet_network_denied();
   expect_unix_network_denied(argv[5]);
+  expect_read_denied("trusted harness source", argv[6]);
+  expect_read_denied("trusted harness binary", argv[7]);
   expect_fork_denied();
   expect_spawn_denied();
   printf("runtime worker sandbox probe passed\n");
@@ -259,6 +270,9 @@ cat > "${profile_path}" <<EOF
 (deny file-read* (literal "${golden_path}"))
 (deny file-read* (subpath "${private_dir}"))
 (deny file-write* (subpath "${private_dir}"))
+;; Trusted-harness read confinement (trusted sources + trusted binary).
+(deny file-read* (subpath "${trusted_source_dir}"))
+(deny file-read* (literal "${trusted_binary_path}"))
 EOF
 
 sandbox-exec -f "${profile_path}" "${probe_bin}" \
@@ -266,4 +280,6 @@ sandbox-exec -f "${profile_path}" "${probe_bin}" \
   "${private_path}" \
   "${outside_write_path}" \
   "${private_write_path}" \
-  "${unix_socket_path}"
+  "${unix_socket_path}" \
+  "${trusted_source_path}" \
+  "${trusted_binary_path}"
