@@ -1,48 +1,43 @@
 #!/usr/bin/env bash
-# Provision the separate organizer-pinned Laguna XS 2.1 MTP experiment.
+# Provision the organizer-pinned Laguna XS 2.1 DFlash DRAFTER (assistant slot).
 #
-# This script is intentionally independent from setup.sh: invoking the normal
-# setup path must never switch the base challenge to the MTP target or download
-# an assistant sidecar.
+# This script provisions the drafter and NOTHING else. The DFlash track's target
+# IS the serial track's NVFP4 reference checkpoint (same repo, same revision,
+# same fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256 manifest), which
+# ./setup.sh already downloads and verifies -- so there is no second target
+# download here and no way for this script to switch the base challenge onto a
+# different checkpoint.
 set -euo pipefail
 umask 022
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-TARGET_MODEL_ID="mlx-community/Laguna-XS-2.1-4bit"
-TARGET_REVISION="c42e0a8f8d504ceacde015a535dcb286d65c8799"
 ASSISTANT_MODEL_ID="poolside/Laguna-XS-2.1-DFlash"
 ASSISTANT_REVISION="5c36361aab23c8ed3afbd079c10c426b677bc607"
-TARGET_MANIFEST="${ROOT_DIR}/fixtures/mtp_laguna_xs_2_1_4bit.sha256"
 ASSISTANT_MANIFEST="${ROOT_DIR}/fixtures/dflash_laguna_xs_2_1_drafter.sha256"
 
-DEFAULT_CACHE_ROOT="${HOME}/.cache/mlxfast/laguna-xs-2.1-mtp-v1"
+DEFAULT_CACHE_ROOT="${HOME}/.cache/mlxfast/laguna-xs-2.1-dflash-v1"
 CACHE_ROOT="${MLXFAST_DFLASH_CACHE_ROOT:-${DEFAULT_CACHE_ROOT}}"
-TARGET_DIR="${MLXFAST_DFLASH_TARGET_DIR:-${CACHE_ROOT}/target}"
-ASSISTANT_DIR="${MLXFAST_DFLASH_ASSISTANT_DIR:-${CACHE_ROOT}/assistant}"
+# MLXFAST_DFLASH_DRAFTER_DIR is the name the Swift CLI actually reads
+# (`dflash-benchmark`/`dflash-probe`/`dflash-reference` --drafter default);
+# MLXFAST_DFLASH_ASSISTANT_DIR is the spelling the ranked workflow uses for the
+# same directory and is accepted as an alias. The leaf stays `assistant` so the
+# local default mirrors the runner layout
+# (/opt/bench-runner/cache/dflash/laguna-xs-2.1-dflash-v1/assistant).
+ASSISTANT_DIR="${MLXFAST_DFLASH_DRAFTER_DIR:-${MLXFAST_DFLASH_ASSISTANT_DIR:-${CACHE_ROOT}/assistant}}"
 
-# The target checkpoint is not mirrored yet. Keep Hugging Face primary and the
-# fallback slot empty so a future flat mirror only requires changing/overriding
-# the primary URL (and optionally retaining this Hugging Face URL as fallback).
-DEFAULT_TARGET_BASE_URL="https://huggingface.co/${TARGET_MODEL_ID}/resolve/${TARGET_REVISION}"
-DEFAULT_TARGET_FALLBACK_BASE_URL=""
-TARGET_BASE_URL="${MLXFAST_DFLASH_TARGET_BASE_URL:-${DEFAULT_TARGET_BASE_URL}}"
-if [[ -n "${MLXFAST_DFLASH_TARGET_FALLBACK_BASE_URL+x}" ]]; then
-  TARGET_FALLBACK_BASE_URL="${MLXFAST_DFLASH_TARGET_FALLBACK_BASE_URL}"
-elif [[ "${TARGET_BASE_URL}" == "${DEFAULT_TARGET_BASE_URL}" ]]; then
-  TARGET_FALLBACK_BASE_URL="${DEFAULT_TARGET_FALLBACK_BASE_URL}"
-else
-  TARGET_FALLBACK_BASE_URL=""
-fi
-
-# The assistant slot is the BF16 DFlash draft, downloaded from the pinned
-# Hugging Face upstream and converted to MLX affine 4-bit (group size 64) at
-# setup by the Swift tooling. The manifest pins the BF16 download and fails
-# closed while it is an entry-less placeholder (regenerate it on m5-bench).
+# The assistant slot is the BF16 DFlash draft. The pinned manifest does NOT
+# describe the upstream Hugging Face blob: it describes the MLX repack produced
+# by Vendor/mlx-swift-lm/scripts/convert_laguna_dflash.py (fused qkv split,
+# BF16 preserved, 924137156 bytes vs upstream's 924135848). No conversion runs
+# here -- the runtime feeds this directory straight to --drafter -- so the
+# primary URL has to serve the REPACKED artifact for verification to pass.
 # The fallback slot stays empty; an explicitly overridden primary has no
 # implicit fallback.
-# TODO(operator): add an organizer mirror (e.g. Darkbloom R2) for the DFlash
-# draft and make it the primary once provisioned, optionally retaining this
-# Hugging Face URL as the fallback.
+# TODO(operator): the Hugging Face upstream below cannot satisfy the pinned
+# hashes (different safetensors header). Add an organizer mirror (e.g. Darkbloom
+# R2) of the repacked artifact and make it the primary; until then this script
+# only succeeds with MLXFAST_DFLASH_ASSISTANT_BASE_URL pointed at that mirror,
+# or against an already-provisioned verified cache.
 DEFAULT_ASSISTANT_BASE_URL="https://huggingface.co/${ASSISTANT_MODEL_ID}/resolve/${ASSISTANT_REVISION}"
 DEFAULT_ASSISTANT_FALLBACK_BASE_URL=""
 ASSISTANT_BASE_URL="${MLXFAST_DFLASH_ASSISTANT_BASE_URL:-${DEFAULT_ASSISTANT_BASE_URL}}"
@@ -54,33 +49,31 @@ else
   ASSISTANT_FALLBACK_BASE_URL=""
 fi
 
-MTP_APPEND_DOWNLOAD_QUERY="${MLXFAST_DFLASH_APPEND_DOWNLOAD_QUERY:-auto}"
-MTP_DOWNLOAD_STALL_SECONDS="${MLXFAST_DFLASH_DOWNLOAD_STALL_SECONDS:-120}"
-MTP_DOWNLOAD_MIN_BYTES_PER_SECOND="${MLXFAST_DFLASH_DOWNLOAD_MIN_BYTES_PER_SECOND:-1048576}"
+DFLASH_APPEND_DOWNLOAD_QUERY="${MLXFAST_DFLASH_APPEND_DOWNLOAD_QUERY:-auto}"
+DFLASH_DOWNLOAD_STALL_SECONDS="${MLXFAST_DFLASH_DOWNLOAD_STALL_SECONDS:-120}"
+DFLASH_DOWNLOAD_MIN_BYTES_PER_SECOND="${MLXFAST_DFLASH_DOWNLOAD_MIN_BYTES_PER_SECOND:-1048576}"
 
 VERIFY_ONLY=0
-PROVISION_TARGET=1
-PROVISION_ASSISTANT=1
 PRINT_PATHS=0
 
 usage() {
   cat <<EOF
-Usage: ./setup-dflash.sh [--verify-only] [--target-only|--assistant-only] [--print-paths]
+Usage: ./setup-dflash.sh [--verify-only] [--print-paths]
 
-Provision the explicit experimental Laguna XS 2.1 target and its matched,
-organizer-pinned DFlash MTP assistant. Downloads are resumable and every byte
-is checked against the checked-in SHA256/size manifests.
+Provision the organizer-pinned Laguna XS 2.1 DFlash drafter. Downloads are
+resumable and every byte is checked against the checked-in SHA256/size manifest.
 
-Cache paths:
-  target:    ${TARGET_DIR}
-  assistant: ${ASSISTANT_DIR}
+The DFlash TARGET is not provisioned here: it is the same NVFP4 reference
+checkpoint the serial track uses, which ./setup.sh downloads and verifies
+against fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256. Run ./setup.sh first
+(without MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1), then this script.
+
+Cache path:
+  drafter: ${ASSISTANT_DIR}
 
 Overrides:
   MLXFAST_DFLASH_CACHE_ROOT
-  MLXFAST_DFLASH_TARGET_DIR
-  MLXFAST_DFLASH_ASSISTANT_DIR
-  MLXFAST_DFLASH_TARGET_BASE_URL
-  MLXFAST_DFLASH_TARGET_FALLBACK_BASE_URL
+  MLXFAST_DFLASH_DRAFTER_DIR   (alias: MLXFAST_DFLASH_ASSISTANT_DIR)
   MLXFAST_DFLASH_ASSISTANT_BASE_URL
   MLXFAST_DFLASH_ASSISTANT_FALLBACK_BASE_URL
   MLXFAST_DFLASH_APPEND_DOWNLOAD_QUERY
@@ -96,13 +89,9 @@ while (( "$#" > 0 )); do
     --verify-only)
       VERIFY_ONLY=1
       ;;
-    --target-only)
-      PROVISION_TARGET=1
-      PROVISION_ASSISTANT=0
-      ;;
-    --assistant-only)
-      PROVISION_TARGET=0
-      PROVISION_ASSISTANT=1
+    --assistant-only|--drafter-only)
+      # Accepted no-op: the drafter is now the only thing this script
+      # provisions, so "only the drafter" is the unconditional behavior.
       ;;
     --print-paths)
       PRINT_PATHS=1
@@ -121,8 +110,11 @@ while (( "$#" > 0 )); do
 done
 
 if [[ "${PRINT_PATHS}" == "1" ]]; then
-  printf 'MLXFAST_DFLASH_TARGET_DIR=%q\n' "${TARGET_DIR}"
-  printf 'MLXFAST_DFLASH_ASSISTANT_DIR=%q\n' "${ASSISTANT_DIR}"
+  # MLXFAST_DFLASH_DRAFTER_DIR is what the Swift CLI reads for --drafter, so
+  # `eval "$(./setup-dflash.sh --print-paths)"` is enough to run the DFlash
+  # subcommands without repeating the path.
+  printf 'MLXFAST_DFLASH_DRAFTER_DIR=%q\n' "${ASSISTANT_DIR}"
+  printf 'export MLXFAST_DFLASH_DRAFTER_DIR\n'
   exit 0
 fi
 
@@ -230,8 +222,8 @@ validate_download_settings() {
   local value
 
   for name in \
-    MTP_DOWNLOAD_STALL_SECONDS \
-    MTP_DOWNLOAD_MIN_BYTES_PER_SECOND; do
+    DFLASH_DOWNLOAD_STALL_SECONDS \
+    DFLASH_DOWNLOAD_MIN_BYTES_PER_SECOND; do
     value="${!name}"
     if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
       echo "setup-dflash.sh: ${name} must be a positive integer" >&2
@@ -245,7 +237,7 @@ download_url_for_file() {
   local append_query=0
   local separator="?"
 
-  case "${MTP_APPEND_DOWNLOAD_QUERY}" in
+  case "${DFLASH_APPEND_DOWNLOAD_QUERY}" in
     1|true|TRUE|yes|YES)
       append_query=1
       ;;
@@ -340,8 +332,8 @@ download_file() {
         --retry-all-errors \
         --retry-delay 2 \
         --continue-at - \
-        --speed-limit "${MTP_DOWNLOAD_MIN_BYTES_PER_SECOND}" \
-        --speed-time "${MTP_DOWNLOAD_STALL_SECONDS}" \
+        --speed-limit "${DFLASH_DOWNLOAD_MIN_BYTES_PER_SECOND}" \
+        --speed-time "${DFLASH_DOWNLOAD_STALL_SECONDS}" \
         --output "${partial}" \
         "${url}" || curl_status=$?
       if [[ "${curl_status}" != "0" ]]; then
@@ -364,6 +356,10 @@ download_file() {
   done
 
   echo "setup-dflash.sh: failed to download verified ${label}" >&2
+  echo "setup-dflash.sh: the manifest pins the MLX-repacked drafter, not the upstream Hugging Face blob," >&2
+  echo "setup-dflash.sh: so the Hugging Face default cannot satisfy it; point" >&2
+  echo "setup-dflash.sh: MLXFAST_DFLASH_ASSISTANT_BASE_URL at the organizer mirror of the repacked" >&2
+  echo "setup-dflash.sh: artifact, or provision the verified cache out of band." >&2
   return 1
 }
 
@@ -417,23 +413,24 @@ provision_manifest() {
 
 validate_download_settings
 
-if [[ "${PROVISION_TARGET}" == "1" ]]; then
-  provision_manifest \
-    "${TARGET_MANIFEST}" "${TARGET_DIR}" \
-    "${TARGET_BASE_URL}" "${TARGET_FALLBACK_BASE_URL}" \
-    "Laguna XS 2.1 target"
-fi
-if [[ "${PROVISION_ASSISTANT}" == "1" ]]; then
-  provision_manifest \
-    "${ASSISTANT_MANIFEST}" "${ASSISTANT_DIR}" \
-    "${ASSISTANT_BASE_URL}" "${ASSISTANT_FALLBACK_BASE_URL}" \
-    "Laguna XS 2.1 DFlash assistant"
-fi
+provision_manifest \
+  "${ASSISTANT_MANIFEST}" "${ASSISTANT_DIR}" \
+  "${ASSISTANT_BASE_URL}" "${ASSISTANT_FALLBACK_BASE_URL}" \
+  "Laguna XS 2.1 DFlash drafter"
+
+# Read the payload size back out of the manifest instead of restating it, so the
+# summary can never disagree with the bytes that were actually verified.
+DRAFTER_PAYLOAD_BYTES="$(
+  awk '!/^#/ && $3 == "model.safetensors" { print $2; exit }' "${ASSISTANT_MANIFEST}"
+)"
 
 cat <<EOF
-setup-dflash.sh: MTP artifacts ready
-  target:    ${TARGET_DIR}
-  assistant: ${ASSISTANT_DIR}
-  source bytes: target=18829720326 assistant=924135848 (BF16 draft; converted to MLX 4-bit at setup)
-  official score: disabled until a paired M5 rebaseline is established
+setup-dflash.sh: DFlash drafter ready
+  drafter: ${ASSISTANT_DIR}
+  drafter bytes: ${DRAFTER_PAYLOAD_BYTES:-unknown} (model.safetensors, BF16 MLX repack; no
+    conversion runs at setup -- the runtime passes this directory to --drafter as is)
+  target: not provisioned here; it is the serial track's NVFP4 reference
+    checkpoint provisioned by ./setup.sh
+  official score: disabled (fixtures/laguna_xs_2_1_dflash_track.json has
+    official_scoring_enabled=false); local runs are directional only
 EOF

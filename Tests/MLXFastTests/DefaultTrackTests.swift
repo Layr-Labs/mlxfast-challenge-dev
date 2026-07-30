@@ -234,3 +234,83 @@ struct DefaultTrackTests {
         #expect(!script.contains("mtp_decode_rule"))
     }
 }
+
+// MARK: - The DFlash contract's editable surface must actually be submittable
+
+/// `benchmark.dflash.json` declares nine editable paths that `benchmark.json`
+/// does not — the DFlash runtime a DFlash submitter exists to optimize. Both
+/// surface gates (`overlay-editable-paths.sh` and `enforce-modifiable-surface.sh`)
+/// default to `benchmark.json` and only read the DFlash contract when the job
+/// exports `CONTRACT_PATH`. If the DFlash workflow does not set it, those nine
+/// files are silently dropped by the overlay AND rejected by the surface check,
+/// so the track's whole optimization target is unreachable.
+///
+/// This is the coverage test for that: for every DFlash editable path, either the
+/// serial contract already covers it, or the DFlash contract is genuinely the one
+/// in force.
+@Suite
+struct DFlashEditableSurfaceReachabilityTests {
+    private func editablePaths(_ manifest: String) throws -> [String] {
+        let data = try Data(contentsOf: URL(fileURLWithPath: manifest))
+        let json = try #require(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        return try #require(json["editablePaths"] as? [String])
+    }
+
+    @Test
+    func everyDFlashEditablePathIsReachableUnderTheContractTheJobEnforces() throws {
+        let dflashPaths = try editablePaths("benchmark.dflash.json")
+        let serialPaths = Set(try editablePaths("benchmark.json"))
+        #expect(!dflashPaths.isEmpty)
+
+        let fileManager = FileManager.default
+        for path in dflashPaths {
+            #expect(fileManager.fileExists(atPath: path), "editable path is missing: \(path)")
+        }
+
+        let dflashOnly = dflashPaths.filter { !serialPaths.contains($0) }.sorted()
+        // If this ever becomes empty the track has no distinct optimization
+        // surface, which is itself a regression worth failing on.
+        #expect(
+            !dflashOnly.isEmpty,
+            "benchmark.dflash.json no longer declares any DFlash-specific editable path"
+        )
+        for path in dflashOnly {
+            #expect(
+                path.contains("DFlash") || path.contains("MLXSpeculative"),
+                "unexpected DFlash-only editable path \(path); confirm it belongs to this track"
+            )
+        }
+
+        // Reachability: the DFlash job must put its own contract in force for
+        // BOTH surface gates, or these paths are dropped and rejected. The
+        // wiring goes through a job-env indirection, so resolve it rather than
+        // demanding a literal.
+        let workflow = try String(
+            contentsOfFile: ".github/workflows/dflash-benchmark.yml", encoding: .utf8
+        )
+        let environment = try DFlashGateTextSupport.jobEnvironment(workflow)
+        for stepName in [
+            "Verify submitted commit and modifiable surface",
+            "Overlay submitted editable paths",
+        ] {
+            let step = DFlashGateTextSupport.executable(
+                try DFlashGateTextSupport.stepBody(workflow, stepName)
+            )
+            let resolved = DFlashGateTextSupport.resolvedContractPath(
+                in: step, jobEnvironment: environment
+            )
+            #expect(
+                resolved == "benchmark.dflash.json",
+                """
+                '\(stepName)' puts \(resolved ?? "<CONTRACT_PATH unset>") in \
+                force, not benchmark.dflash.json. These \(dflashOnly.count) \
+                DFlash-only editable paths are therefore dropped by the overlay \
+                and rejected by the modifiable-surface check: \
+                \(dflashOnly.joined(separator: ", "))
+                """
+            )
+        }
+    }
+}

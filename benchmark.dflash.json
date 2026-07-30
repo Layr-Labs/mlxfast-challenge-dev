@@ -95,7 +95,7 @@
   "setupCommand": [
     "bash",
     "-c",
-    "MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh && ./setup-dflash.sh"
+    "./setup.sh && ./setup-dflash.sh"
   ],
   "preSubmitCommand": [
     "bash",

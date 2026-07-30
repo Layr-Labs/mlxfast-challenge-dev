@@ -6191,3 +6191,154 @@ private func benchmarkTestEnvironment(
     }
     return merged
 }
+
+// MARK: - The local DFlash runner must speak the CLI that exists
+
+/// `benchmark-dflash.sh` was restored from the retired MTP scaffolding and only
+/// partially retargeted: it invoked two subcommands that no longer exist
+/// (`mtp-probe`, `mtp-benchmark`), passed five flags the CLI never declared,
+/// defaulted its contract to a deleted fixture and stamped the retired MTP track
+/// id into the score it wrote. None of that is visible until someone runs it,
+/// and every one of those dead references survived review — which is the whole
+/// argument for applying grep discipline mechanically instead of by eye.
+@Suite
+struct LocalDFlashScriptSurfaceTests {
+    private typealias S = DFlashGateTextSupport
+
+    private static let scripts = ["benchmark-dflash.sh", "setup-dflash.sh"]
+
+    @Test
+    func localDFlashScriptsNameNoRetiredMTPSurface() throws {
+        for path in Self.scripts {
+            let script = try S.text(path)
+            for retired in S.retiredMTPNames {
+                #expect(
+                    !script.contains(retired),
+                    """
+                    \(path) references the retired MTP name '\(retired)'. The MTP \
+                    track was retired without going live; every one of these is \
+                    either a subcommand that does not exist, a file that was \
+                    deleted, or a track id nothing will score.
+                    """
+                )
+            }
+        }
+    }
+
+    @Test
+    func localDFlashScriptsInvokeOnlySubcommandsAndFlagsTheCLIDeclares() throws {
+        let declared = try S.cliSubcommandOptions()
+        // Guard the extractor: if the dispatch parse breaks, the loop below
+        // would pass vacuously.
+        #expect(declared["dflash-benchmark"]?.contains("--drafter") == true,
+                "CLI option extraction looks broken: \(declared)")
+        #expect(declared["correctness"] != nil)
+        #expect(declared.count >= 15, "CLI dispatch extraction found only \(declared.count) subcommands")
+
+        for path in Self.scripts {
+            let script = try S.text(path)
+            for (subcommand, command) in S.swiftBinaryInvocations(in: script) {
+                let allowed = declared[subcommand]
+                #expect(
+                    allowed != nil,
+                    """
+                    \(path) invokes `mlxfast-swift \(subcommand)`, which is not a \
+                    case in the CLI dispatch switch — the run aborts with \
+                    "unknown command". Declared: \
+                    \(declared.keys.sorted().joined(separator: ", "))
+                    """
+                )
+                guard let allowed else { continue }
+                for flag in Set(S.captures(#"(\s|^)(--[a-z][a-z0-9-]*)"#, in: command, group: 2)) {
+                    #expect(
+                        allowed.contains(flag),
+                        """
+                        \(path) passes \(flag) to `mlxfast-swift \(subcommand)`, \
+                        which does not declare it — ParsedOptions.validate \
+                        rejects the invocation before any work happens. \
+                        Declared for \(subcommand): \
+                        \(allowed.sorted().joined(separator: " "))
+                        """
+                    )
+                }
+            }
+        }
+    }
+
+    // The local DFlash path must REUSE the existing correctness gate and the
+    // existing cool-down entrypoint rather than growing its own: `correctness`
+    // against the checked-in public fixture is the same directional check the
+    // serial local path runs, and `benchmark.sh --local-cool-gate-only` is the
+    // one implementation of the 40C gate.
+    @Test
+    func localDFlashRunnerReusesTheCorrectnessGateAndTheCoolDownEntrypoint() throws {
+        let script = try S.text("benchmark-dflash.sh")
+
+        let invocations = S.swiftBinaryInvocations(in: script)
+        let correctness = invocations.first { $0.0 == "correctness" }
+        let correctnessCommand = try #require(
+            correctness?.1,
+            """
+            benchmark-dflash.sh never runs the existing `correctness` \
+            subcommand, so a local DFlash iteration has no correctness signal \
+            at all. Call the gate that already exists.
+            """
+        )
+        let goldenToken = try #require(
+            S.captures(#"--golden\s+(\S+)"#, in: correctnessCommand).first,
+            "benchmark-dflash.sh runs `correctness` without a --golden"
+        )
+        let golden = S.resolveShellValue(goldenToken, in: script)
+        #expect(
+            golden.contains("correctness_prompts/public_longcopy_gate_english"),
+            """
+            benchmark-dflash.sh must run `correctness` against the checked-in \
+            public fixture (resolved --golden: \(golden)): it is the only golden \
+            a local run legitimately has.
+            """
+        )
+
+        #expect(
+            script.contains("--local-cool-gate-only"),
+            """
+            benchmark-dflash.sh must gate its timed measurement through \
+            `./benchmark.sh --local-cool-gate-only` — the single existing \
+            implementation of the 40C cool-down. A second cool-gate is a second \
+            calibration.
+            """
+        )
+        #expect(script.contains("benchmark.sh"))
+    }
+}
+
+// The RAM-resident model guard has to SEE a DFlash residency. A DFlash local run
+// holds the ~21.6 GB target plus the drafter, so an overlapping serial run is an
+// out-of-memory, not a slowdown — but the guard's process pattern only listed
+// serial subcommands, so `dflash-benchmark` / `dflash-probe` / `dflash-reference`
+// were invisible to it.
+@Test
+func residentModelGuardPatternCoversTheDFlashSubcommands() throws {
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    let declaration = try #require(
+        script.range(of: "readonly RESIDENT_MODEL_PROCESS_PATTERN="),
+        "benchmark.sh lost RESIDENT_MODEL_PROCESS_PATTERN"
+    )
+    let line = String(
+        script[declaration.lowerBound...]
+            .prefix(while: { $0 != "\n" })
+    )
+    // The pre-existing serial coverage must survive the widening.
+    #expect(line.contains("runtime-worker[[:space:]]+--weights"))
+    #expect(line.contains("correctness"))
+    for subcommand in ["dflash-benchmark", "dflash-probe", "dflash-reference"] {
+        #expect(
+            line.contains(subcommand),
+            """
+            RESIDENT_MODEL_PROCESS_PATTERN does not match `\(subcommand)`, so the \
+            local run guard cannot see a DFlash model residency. Two \
+            simultaneous residencies (~21.6 GB each, plus the drafter) exceed \
+            the documented 40 GiB local minimum. Pattern: \(line)
+            """
+        )
+    }
+}

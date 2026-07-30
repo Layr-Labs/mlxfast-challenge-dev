@@ -540,8 +540,11 @@ LOCAL_RUN_LOCK_OWNED=""
 # subcommands that own an imminent worker. The trusted binary never holds
 # the model in-process, but a run in its pre-worker phase (validation,
 # weights digest) is about to spawn a ~21.6 GB worker and would otherwise be
-# invisible to this scan until that load has already started.
-readonly RESIDENT_MODEL_PROCESS_PATTERN='runtime-worker[[:space:]]+--weights|mlxfast-swift[[:space:]]+(benchmark|correctness|correctness-trace|generate-golden|generate-gpqa-answers|attach-free-run-gate)'
+# invisible to this scan until that load has already started. The dflash-*
+# subcommands are listed for the same reason: a DFlash residency is the same
+# target plus the drafter, and benchmark-dflash.sh takes no lock of its own, so
+# this scan is what stops a serial run from starting against a live DFlash one.
+readonly RESIDENT_MODEL_PROCESS_PATTERN='runtime-worker[[:space:]]+--weights|mlxfast-swift[[:space:]]+(benchmark|correctness|correctness-trace|generate-golden|generate-gpqa-answers|attach-free-run-gate|dflash-benchmark|dflash-probe|dflash-reference)'
 
 local_run_guard_enabled() {
   [[ "${MLXFAST_LOCAL_RUN_GUARD:-1}" != "0" ]] || return 1

@@ -106,6 +106,66 @@ extension LagunaRuntime {
         startRuntimeWorkerOrphanReaper()
         let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
 
+        // Select the startup memory profile BEFORE the target load and the
+        // separate drafter load, mirroring the policy's only other call site
+        // (LagunaRuntimeWeightCache.init on the serial path). This adds no
+        // policy and no threshold: the same 64 GiB boundary, the same
+        // no-overwrite precedence for explicitly exported values, and the same
+        // DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low|auto opt-out -- which does
+        // reach here, because sanitizedRuntimeWorkerEnvironment forwards the
+        // DARKBLOOM_ and MLX_ prefixes into this worker (MLXFAST_ is NOT
+        // forwarded, so no MLXFAST_ spelling would ever arrive). It exists
+        // because the DFlash worker never constructs LagunaRuntimeWeightCache,
+        // so it was the one startup path the policy never reached -- and it is
+        // the path that needs it most: this worker holds the ~21.6 GB target
+        // AND the separate drafter, and warms every legal block width at a
+        // past-the-ring seed, so a <64 GiB machine ran the LARGER resident set
+        // with no allocator-cache cap and stock command buffers. The full
+        // profile stays a deliberate no-op, so the ranked box keeps the stock
+        // allocator behavior the pinned baseline was measured with.
+        let startupMemoryPolicy: RuntimeStartupMemoryPolicy?
+        let resolvedStartupMemoryPolicy = RuntimeStartupMemoryPolicy.resolve(
+            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+            requestedProfile: ProcessInfo.processInfo.environment[
+                RuntimeStartupMemoryPolicy.profileOverrideEnvironmentName
+            ]
+        )
+        if resolvedStartupMemoryPolicy.isLowMemory {
+            // Applied HERE, in trusted non-editable code, rather than by calling
+            // the policy's own `apply()`. That method is `internal`, and it must
+            // stay internal: its file sits under `Sources/MLXFastModel`, a
+            // DIRECTORY entry in both tracks' editablePaths, so `submit` packages
+            // it with every submission. Widening it would mean this trusted worker
+            // failed to compile whenever a submission overlaid an older copy --
+            // including every serial submission in flight today. Every member read
+            // below has been `public` since before the DFlash track existed, so an
+            // older overlay still builds.
+            setenv(
+                "MLX_MAX_MB_PER_BUFFER",
+                String(resolvedStartupMemoryPolicy.maxMegabytesPerCommandBuffer),
+                1
+            )
+            setenv(
+                "MLX_MAX_OPS_PER_BUFFER",
+                String(resolvedStartupMemoryPolicy.maxOperationsPerCommandBuffer),
+                1
+            )
+            // No-overwrite (0): an explicitly exported value always wins, matching
+            // the policy's own semantics for these opt-in flags.
+            for (name, value) in resolvedStartupMemoryPolicy.environmentOverrides {
+                setenv(name, value, 0)
+            }
+            Memory.cacheLimit = resolvedStartupMemoryPolicy.cacheLimitBytes
+            fputs(
+                "mlxfast-worker: low-memory startup profile engaged ("
+                    + resolvedStartupMemoryPolicy.selectionReason + ")\n",
+                stderr
+            )
+            startupMemoryPolicy = resolvedStartupMemoryPolicy
+        } else {
+            startupMemoryPolicy = nil
+        }
+
         // Load the target through the vendored factory: `LagunaModel` is the
         // type that conforms to `DFlashTargetModel` (the scored serial model,
         // LagunaRuntimeModel, deliberately does not), and this is the same load
@@ -141,6 +201,18 @@ extension LagunaRuntime {
         try warmup.warmAllBlockWidths()
 
         let session = try LagunaDFlashBlockSession(target: target, drafter: drafter)
+
+        if startupMemoryPolicy?.clearAllocatorCacheAfterWarmup == true {
+            // The same post-warmup clear the serial path performs, at the point
+            // the policy documents: before the worker protocol hello. Metal
+            // pipeline state is process-lifetime state, while the free buffers
+            // the warm and the session build leave behind are exactly the
+            // pressure a low-memory machine cannot afford to hold across the
+            // hello. The later `dflash_decode_warm` phase-start reset clears
+            // again, but that is the parent's untimed phase boundary and long
+            // after the pre-hello peak this avoids.
+            Memory.clearCache()
+        }
 
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
