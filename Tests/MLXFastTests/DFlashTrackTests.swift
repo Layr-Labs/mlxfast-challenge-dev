@@ -2,6 +2,11 @@ import CryptoKit
 import Foundation
 import Testing
 
+// The validator types live in the harness twin the test target already depends
+// on; the trusted twin is byte-identical for everything used here.
+import MLXFastCore
+import MLXFastHarness
+
 // Structural guards for the EXPERIMENTAL DFlash speculative-decode track
 // (laguna-xs-2.1-dflash-v1). The track is deliberately NOT the default and
 // NOT enabled: it exists in the repository as reviewable scaffolding plus a
@@ -429,5 +434,141 @@ struct DFlashTrackTests {
         ] {
             #expect(!fm.fileExists(atPath: retired), "\(retired) must stay retired")
         }
+    }
+}
+
+// MARK: - Near-tie admission (contract Amendment 14)
+
+/// A row where the reference's own top-2 ordering is inside the measured
+/// build-to-build drift envelope is not evidence about the candidate. These pin
+/// that such rows are admitted WITHOUT spending the residual budget, while a
+/// divergence at a CONFIDENT row still spends it.
+@Suite
+struct DFlashNearTieAdmissionTests {
+    /// Oracle returning one fixed row, so the admission branch under test is the
+    /// only thing that varies.
+    private struct FixedRowOracle: DFlashReferenceOracle {
+        let row: DFlashReferenceRow
+        func referenceRows(
+            emittedPrefix: [Int],
+            startOffset: Int,
+            count: Int,
+            declaredBlockWidth: Int
+        ) throws -> [DFlashReferenceRow] {
+            Array(repeating: row, count: count)
+        }
+    }
+
+    private func round(emitting token: Int, offset: Int) -> DFlashObservedRound {
+        DFlashObservedRound(
+            requestedBlockSize: 1,
+            tokens: [token],
+            declaredRows: 1,
+            perRowTop2Tokens: [[token, 0]],
+            perRowTop2Logits: [[20.0, 10.0]],
+            acceptedDraftCount: 0,
+            rejectedDraftCount: 0,
+            targetCacheOffset: offset,
+            latencySeconds: 0.01
+        )
+    }
+
+    private func validator(row: DFlashReferenceRow, tokens: Int)
+        -> LagunaDFlashBlockValidator
+    {
+        LagunaDFlashBlockValidator(
+            oracle: FixedRowOracle(row: row),
+            seedTokenCount: 8,
+            totalTokenCount: tokens,
+            // Wide work-binding tolerance: these tests are about TOKEN
+            // admissibility, not about the L2 logit comparison.
+            tolerance: DFlashWorkBindingTolerance(absolute: 1e6, relative: 1e6)
+        )
+    }
+
+    /// The reference cannot break a gap inside the envelope, so emitting its
+    /// top-2 token is admissible and costs no residual budget.
+    @Test
+    func nearTieRowsAreAdmittedWithoutSpendingTheResidualBudget() throws {
+        let gap = MLXFastConstants.experimentalDFlashNearTieLogitEnvelope / 2
+        let row = DFlashReferenceRow(
+            sequentialArgmax: 100,
+            declaredFrameArgmax: 100,
+            top2Tokens: [100, 200],
+            top2Logits: [20.0, 20.0 - gap]
+        )
+        // The FROZEN ranked window, deliberately: the per-thousand rate rounds up
+        // to a single slot for any window under 25 tokens, so a toy window would
+        // test the rounding rather than the admission rule. At 128 tokens the cap
+        // is 6, against a measured need of 3.
+        let v = validator(row: row, tokens: 128)
+        // Four divergences in a row: with the old single-slot residual budget the
+        // second would already have thrown.
+        for i in 0 ..< 4 {
+            try v.accept(round: round(emitting: 200, offset: 8 + i + 1))
+        }
+        #expect(v.admissibleNearTieCount == 4)
+        #expect(v.residualDivergenceCount == 0)
+    }
+
+    /// A confident row is a different matter: the reference has a defensible
+    /// answer there, so a top-2 divergence is real drift and still consumes the
+    /// small residual budget until it is exhausted.
+    @Test
+    func confidentRowsStillSpendTheResidualBudgetAndCanExhaustIt() throws {
+        let gap = MLXFastConstants.experimentalDFlashNearTieLogitEnvelope + 5.0
+        let row = DFlashReferenceRow(
+            sequentialArgmax: 100,
+            declaredFrameArgmax: 100,
+            top2Tokens: [100, 200],
+            top2Logits: [40.0, 40.0 - gap]
+        )
+        let v = validator(row: row, tokens: 8)
+        var thrown: DFlashContractViolation?
+        do {
+            for i in 0 ..< 8 {
+                try v.accept(round: round(emitting: 200, offset: 8 + i + 1))
+            }
+        } catch let violation as DFlashContractViolation {
+            thrown = violation
+        }
+        #expect(v.admissibleNearTieCount == 0)
+        #expect(thrown?.kind == .residualBudgetExhausted)
+    }
+
+    /// A token that is not even in the reference's top 2 is rejected at a near-tie
+    /// row exactly as anywhere else: the envelope widens WHICH of two plausible
+    /// tokens is allowed, never how many tokens are.
+    @Test
+    func nearTieRowsDoNotAdmitTokensOutsideTheReferenceTopTwo() throws {
+        let row = DFlashReferenceRow(
+            sequentialArgmax: 100,
+            declaredFrameArgmax: 100,
+            top2Tokens: [100, 200],
+            top2Logits: [20.0, 20.0]
+        )
+        let v = validator(row: row, tokens: 4)
+        var thrown: DFlashContractViolation?
+        do {
+            try v.accept(round: round(emitting: 999, offset: 9))
+        } catch let violation as DFlashContractViolation {
+            thrown = violation
+        }
+        #expect(thrown?.kind == .tokenNotAdmissible)
+    }
+
+    /// The envelope is derived, not guessed: twice the maximum candidate-vs-
+    /// reference logit delta the L2 calibration measured (3.375, Amendment 6),
+    /// because reordering top-1 and top-2 needs a gap below the DIFFERENCE of two
+    /// per-logit drifts. Pinned so a future edit has to restate the derivation.
+    @Test
+    func nearTieEnvelopeIsTwiceTheMeasuredWorkBindingDrift() {
+        #expect(MLXFastConstants.experimentalDFlashNearTieLogitEnvelope == 6.75)
+        // And the cap leaves headroom over the measured density of 3 near-tie
+        // rows per 128 positions on varied prose.
+        let budget =
+            (128 * MLXFastConstants
+                .experimentalDFlashNearTieAdmissionBudgetPerThousand + 999) / 1_000
+        #expect(budget >= 6)
     }
 }

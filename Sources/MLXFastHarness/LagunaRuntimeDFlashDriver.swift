@@ -275,6 +275,7 @@ extension LagunaRuntime {
             residualDivergenceCount: validator.residualDivergenceCount,
             admissibleExactCount: validator.admissibleExactCount,
             admissibleDeclaredFrameCount: validator.admissibleDeclaredFrameCount,
+            admissibleNearTieCount: validator.admissibleNearTieCount,
             maxOverMedianRoundLatency: validator.maxOverMedianRoundLatency(),
             allTokensAdmissible: true,
             seedTokenCount: golden.seedTokens.count,

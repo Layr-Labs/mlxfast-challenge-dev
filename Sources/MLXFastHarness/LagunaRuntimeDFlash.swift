@@ -65,6 +65,12 @@ public protocol DFlashReferenceOracle {
 public enum DFlashValidationOutcome: String, Sendable {
     case admissibleExact
     case admissibleDeclaredFrame
+    /// The reference itself had no defensible answer at this row: its own top-2
+    /// logits are close enough that build-to-build drift can reorder them, and the
+    /// candidate emitted the other member of that pair. Distinguished from
+    /// `residualWithinBudget` because a coin-flip row is not evidence of anything,
+    /// so it must not spend the budget reserved for real drift.
+    case admissibleNearTie
     case residualWithinBudget
     case rejected
 }
@@ -210,10 +216,12 @@ public final class LagunaDFlashBlockValidator {
     private let seedTokenCount: Int
     private let tolerance: DFlashWorkBindingTolerance
     private let residualBudget: Int
+    private let nearTieBudget: Int
 
     public private(set) var committedTokens = [Int]()
     public private(set) var outcomes = [DFlashValidationOutcome]()
     public private(set) var residualDivergenceCount = 0
+    public private(set) var nearTieAdmissionCount = 0
     public private(set) var declaredRowTotal = 0
     public private(set) var roundLatencies = [Double]()
     /// Rows the parent actually obtained a reference verdict for. The box
@@ -254,6 +262,21 @@ public final class LagunaDFlashBlockValidator {
             1,
             (totalTokenCount * perThousand + 999) / 1_000
         )
+        let nearTiePerThousand =
+            MLXFastConstants.experimentalDFlashNearTieAdmissionBudgetPerThousand
+        self.nearTieBudget = Swift.max(
+            1,
+            (totalTokenCount * nearTiePerThousand + 999) / 1_000
+        )
+    }
+
+    /// A row the reference cannot break: its own top-2 logits are within the
+    /// measured candidate-vs-reference drift envelope, so their order is not a
+    /// property of the model but of accumulation order.
+    private func referenceRowIsNearTie(_ row: DFlashReferenceRow) -> Bool {
+        guard row.top2Logits.count >= 2 else { return false }
+        return (row.top2Logits[0] - row.top2Logits[1])
+            <= MLXFastConstants.experimentalDFlashNearTieLogitEnvelope
     }
 
     public var remainingTokenCount: Int {
@@ -362,7 +385,31 @@ public final class LagunaDFlashBlockValidator {
                 // Honest frame divergence: the reference itself produces this
                 // token at the width the candidate declared.
                 outcome = .admissibleDeclaredFrame
+            } else if referenceRow.top2Tokens.contains(token),
+                      referenceRowIsNearTie(referenceRow) {
+                // Numerical plausibility, not frame equality. At a row where the
+                // reference's own top-1 and top-2 sit within the measured
+                // build-to-build drift envelope, "the reference says X" is not a
+                // fact about correctness -- either token is what the reference
+                // would produce under a differently-ordered accumulation. Rejecting
+                // the candidate here fails honest code for a tie the reference
+                // cannot break. Still capped, so it cannot become a free channel:
+                // near-tie rows are rare (measured 3 per 128 positions on varied
+                // prose, 0 per 128 on repetitive text) and a submission cannot
+                // manufacture them, because the gap is the REFERENCE's own.
+                nearTieAdmissionCount += 1
+                guard nearTieAdmissionCount <= nearTieBudget else {
+                    throw DFlashContractViolation(
+                        kind: .residualBudgetExhausted,
+                        step: step + index,
+                        detail: "near-tie admissions exceeded \(nearTieBudget)"
+                    )
+                }
+                outcome = .admissibleNearTie
             } else if referenceRow.top2Tokens.contains(token) {
+                // Top-2 member, but at a row the reference answers confidently.
+                // That is genuine candidate-vs-reference drift and keeps spending
+                // the deliberately small residual budget.
                 residualDivergenceCount += 1
                 guard residualDivergenceCount <= residualBudget else {
                     throw DFlashContractViolation(
@@ -458,6 +505,10 @@ public final class LagunaDFlashBlockValidator {
     /// PRE-GENERATED golden also means the candidate's chain has diverged from
     /// the golden's, so every later row is being compared against a differently
     /// teacher-forced context.
+    public var admissibleNearTieCount: Int {
+        outcomes.filter { $0 == .admissibleNearTie }.count
+    }
+
     public var admissibleDeclaredFrameCount: Int {
         outcomes.filter { $0 == .admissibleDeclaredFrame }.count
     }
@@ -545,6 +596,8 @@ public struct ExperimentalDFlashReport: Equatable {
     public let residualDivergenceCount: Int
     public let admissibleExactCount: Int
     public let admissibleDeclaredFrameCount: Int
+    /// Rows admitted because the REFERENCE could not break its own tie.
+    public let admissibleNearTieCount: Int
     public let maxOverMedianRoundLatency: Double?
     public let allTokensAdmissible: Bool
     // Fields the box measurement wrapper consumes for the L3 ledger and the
@@ -585,6 +638,7 @@ public struct ExperimentalDFlashReport: Equatable {
         residualDivergenceCount: Int,
         admissibleExactCount: Int = 0,
         admissibleDeclaredFrameCount: Int = 0,
+        admissibleNearTieCount: Int = 0,
         maxOverMedianRoundLatency: Double?,
         allTokensAdmissible: Bool,
         seedTokenCount: Int = 0,
@@ -618,6 +672,7 @@ public struct ExperimentalDFlashReport: Equatable {
         self.residualDivergenceCount = residualDivergenceCount
         self.admissibleExactCount = admissibleExactCount
         self.admissibleDeclaredFrameCount = admissibleDeclaredFrameCount
+        self.admissibleNearTieCount = admissibleNearTieCount
         self.maxOverMedianRoundLatency = maxOverMedianRoundLatency
         self.allTokensAdmissible = allTokensAdmissible
         self.seedTokenCount = seedTokenCount

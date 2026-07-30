@@ -1434,6 +1434,7 @@ private enum MLXFastCLI {
             "admissible_exact_count": report.admissibleExactCount,
             "admissible_declared_frame_count":
                 report.admissibleDeclaredFrameCount,
+            "admissible_near_tie_count": report.admissibleNearTieCount,
             // L3 ledger.
             "emitted_token_total": report.totalTokenCount,
             "declared_rows_total": report.declaredRowTotal,

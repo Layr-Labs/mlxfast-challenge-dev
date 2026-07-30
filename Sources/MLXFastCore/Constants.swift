@@ -212,6 +212,32 @@ public enum MLXFastConstants {
     // candidate-vs-reference kernel drift and is deliberately small: a large
     // cap would be spendable by a cheating submission.
     public static let experimentalDFlashResidualDivergenceBudgetPerThousand = 5
+
+    /// Top-2 gap, in logits, below which the REFERENCE's own ordering is not a
+    /// fact about the model. Derived rather than guessed: the L2 work-binding
+    /// calibration measured a maximum candidate-vs-reference logit delta of 3.375
+    /// across 352 long-context comparisons (contract Amendment 6). Reordering
+    /// top-1 and top-2 needs `gap < |e1 - e2|`, which is bounded by twice that
+    /// per-logit drift, so the complete envelope is 2 x 3.375 = 6.75.
+    ///
+    /// Rows inside it are admitted WITHOUT spending the residual budget, because a
+    /// coin-flip the reference cannot break is not evidence about the candidate.
+    /// Measured density: 3 such rows per 128 positions on varied prose, 0 per 128
+    /// on the degenerate self-continuation fixtures -- which is precisely why the
+    /// old single-slot budget survived every test until real text was run
+    /// (Amendment 10).
+    ///
+    /// Note this cannot be gamed: the gap belongs to the reference's own logits,
+    /// so a submission can neither manufacture near-tie rows nor predict which
+    /// positions are near-ties without doing the reference's work.
+    public static let experimentalDFlashNearTieLogitEnvelope = 6.75
+
+    /// Cap on near-tie admissions, as a rate per thousand scored tokens. 40 gives
+    /// 6 slots at the frozen 128-token window against a measured need of 3, i.e.
+    /// 2x headroom. It is a backstop, not the primary control -- the envelope test
+    /// above is what does the work -- but it bounds the blast radius if a prompt
+    /// turns out to be far flatter than anything measured.
+    public static let experimentalDFlashNearTieAdmissionBudgetPerThousand = 40
     // Seed length used ONLY to warm block-decode kernel shapes before the
     // protocol hello. Deliberately far below Laguna's 512-position sliding
     // window: a warmup seeded AT the window size plus a widest-block verify
