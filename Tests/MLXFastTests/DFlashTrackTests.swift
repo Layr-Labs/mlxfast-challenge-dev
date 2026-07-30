@@ -218,6 +218,19 @@ struct DFlashTrackTests {
         // The transform output must be the directory the box wrapper reads
         // (`--weights weights`), not the retired track's mtp-weights.
         #expect(!executable.contains("mtp-weights"))
+
+        // The baseline must be RESOLVED before the wrapper clones it. The wrapper
+        // uses `cp -c -R`, which on a symlink source copies the symlink, so the
+        // clone under the job root becomes a link back into /opt/bench-runner and
+        // bench-exec refuses it as outside the allowed job root. Measured on M5-C:
+        // passing `.../current` fails every pair, passing the resolved sha path
+        // succeeds. Keep `current` as the env indirection, resolve at use.
+        #expect(executable.contains("MLXFAST_DFLASH_BASELINE_RESOLVED"))
+        #expect(executable.contains("readlink -f \"${MLXFAST_DFLASH_BASELINE_WS}\""))
+        #expect(
+            !executable.contains("--baseline \"${MLXFAST_DFLASH_BASELINE_WS}\""),
+            "the wrapper must receive the resolved baseline, not the symlink"
+        )
         // Distinct concurrency domain so a DFlash run cannot cancel or queue
         // behind a serial ranked run under the same key.
         #expect(workflow.contains("mlxfast-dflash-ranked-"))
