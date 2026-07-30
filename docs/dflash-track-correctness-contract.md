@@ -1407,3 +1407,68 @@ Recorded as measurement, not as a recommendation. Whether the track ships with t
 floor removed, ships with a different scored quantity (e.g. excluding prefill from
 the decode metric, which would restore ~1.18x/0.74x separation), or does not ship
 on Laguna, is the organizer's decision.
+
+# Amendment 12 (2026-07-30): the stall guardrail rejects essentially every run
+
+`benchmark.dflash.json`'s scoring block specifies:
+
+> `stall_guardrail`: a run whose max block latency exceeds 4x its p50 block
+> latency is rejected as measurement-invalid with one gated retry
+
+Every run ever recorded on M5-C was audited against that rule using the
+`max_block_request_seconds` and `p50_block_request_seconds` the runs already
+report. **25 of 28 runs violate it.** The three that pass are two single-token
+diagnostics where max and p50 are the same measurement, and one benchmark that
+happened to start with a warm on-disk kernel cache.
+
+Representative figures at the ranked window (512-token seed, 128 decode steps):
+
+| run | K | max block (s) | p50 block (s) | ratio | 4x rule |
+|---|---|---|---|---|---|
+| `r512-k1` (the paired denominator) | 1 | 0.19990 | 0.01303 | **15.34** | rejected |
+| `r512-k3` | 3 | 0.16679 | 0.03128 | **5.33** | rejected |
+| `r512-k4` | 4 | 0.22017 | 0.03155 | **6.98** | rejected |
+| `r512-k6` | 6 | 0.77711 | 0.03360 | **23.13** | rejected |
+| `variedb-bench-k4` (varied prompt) | 4 | 0.36574 | 0.03377 | **10.83** | rejected |
+
+The serial control is the worst offender at 15x, and it is the side the score
+divides by — so the guardrail would reject the denominator of every ranked
+measurement, take its one gated retry, and reject that too.
+
+## Cause, and why it is not the same problem as the prefill dilution
+
+The offending sample is the FIRST block request, which pays first-touch
+compilation for the decode-shaped graphs. For K=1 that is ~0.198 s against a
+0.013 s steady-state round: roughly 0.185 s of one-time cost sitting inside the
+timed window as a single outlier.
+
+This is a DIFFERENT fixed cost from the ~1.07 s seed prefill measured in
+Amendment 11. The prefill is charged into `decode_seconds` deliberately
+(`prefill_component: "none; seed prefill is charged inside the decode
+measurement"`) and, being equal on both sides, only compresses ratios toward 1.0.
+The first-block spike is a single-sample outlier and is what the max/p50 rule
+trips on. Fixing one does not fix the other.
+
+Evidence the cause is first-touch rather than a real stall: `fix-b-bench` ran as
+the second `mlxfast-swift` invocation of its session, with MLX's on-disk kernel
+cache already warm from the first, and its ratio is 2.97 — inside the rule. Every
+cold-start run is outside it.
+
+## Fix, and its status
+
+`LagunaDFlashBlockSession.warmAllBlockWidths()` was changed earlier today to warm
+a seed past the sliding-window ring and EVERY legal block width including width 1,
+from one shared helper used by both warm points. That change targets exactly this
+spike, and it was made before this audit for an unrelated reason (an asymmetric
+first-touch between the width-1 control and the width-K candidate biases the
+ratio, not just its variance). It has not yet been measured against the guardrail.
+
+The bar it has to clear is concrete: for the K=1 control, max block latency must
+fall below 4 x 0.01303 = **0.052 s**, from 0.19990 today. If warming does not get
+there, the remaining options are to move the first request outside the scored
+window, or to change the guardrail from a max/p50 rule to one that tolerates a
+single cold-start sample (for example p99/p50, or discarding the first round from
+the latency statistic while still charging its time).
+
+Recorded here because a guardrail that rejects 25 of 28 honest runs is not a
+guardrail, and `official_scoring_enabled` cannot flip while it stands as written.
