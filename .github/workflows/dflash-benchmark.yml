@@ -13,11 +13,15 @@ name: dflash-benchmark
 # calibration state, and leaderboard namespace are never mixed into this
 # track.
 #
-# ENABLEMENT STATE: the track is live and is the default. The "Enforce MTP
-#   track enablement" step remains the standing fail-closed guard: it rejects
-#   a reverted contract, disabled publication, empty hidden-golden pins, or
-#   an explicitly disabled dispatch. The dispatch input defaults to true
-#   because Yukon's GitHub Actions provider dispatches the manifest workflow
+# ENABLEMENT STATE: this track is INERT and is NOT the default. Three
+#   independent locks hold it shut -- official_scoring_enabled is false in the
+#   contract fixture, tokenFidelityGateStatus is pending-spec, and the hidden
+#   timed-prompt pool is empty (the selection step fails closed on it). The
+#   "Enforce track enablement" step is the standing guard: it rejects a
+#   reverted contract, disabled publication, empty hidden-golden pins, or an
+#   explicitly disabled dispatch. The dispatch input now defaults to FALSE;
+#   the text below describing a true default is retained history from the
+#   retired MTP track, which WAS live
 #   without custom inputs. For submissions/* the contract is read from
 #   trusted main, so a submission cannot flip the track on or off.
 #
@@ -25,14 +29,14 @@ name: dflash-benchmark
 #   track's paired mechanics):
 #   - ranked decode window: 512 parent-counted tokens (contract max);
 #   - aggregation: RATIO-OF-MEANS across accepted pairs —
-#       score = mean(serial s/tok) / mean(mtp s/tok);
+#       score = mean(serial s/tok) / mean(dflash s/tok);
 #   - floor: aggregate >= 0.80 (floor applies to the aggregate, not per pair).
 #     NOT 1.0: block decode itself costs ~16% on realistic prose, so an
 #     unmodified candidate measures 0.840x. See the contract fixture's
 #     proposed_scoring.component_floor for the derivation.
 #   - pairs: minimum 3 accepted, target 4, alternating order;
 #   - stall guardrail: a run with max block latency > 4x its p50 is rejected
-#     as measurement-invalid, with one gated retry (owned by measure-mtp-job,
+#     as measurement-invalid, with one gated retry (owned by measure-dflash-job,
 #     same class as its throttle rejection);
 #   - hard bit-exact token gate across every timed run (parity_all_ok).
 #
@@ -40,9 +44,9 @@ name: dflash-benchmark
 #   1. Verifies the operator-provisioned Laguna target + DFlash drafter caches
 #      against the checked-in byte manifests (every file, every run).
 #   2. Builds the candidate through the bench-exec bridge and transforms the
-#      Laguna target source into mtp-weights (sandboxed, network-denied).
+#      Laguna target source into weights (sandboxed, network-denied).
 #   3. Runs the untimed MTP correctness/parity gate: one full-length
-#      mtp-benchmark pass over the hidden Laguna correctness golden. The trusted
+#      dflash-benchmark pass over the hidden Laguna correctness golden. The trusted
 #      parent (the trusted DFlash harness) owns the timer, the serial oracle, and the
 #      denominator; a single divergent token fails the run. Report stdout is
 #      sealed in the trusted shell exactly like the serial gates score.
@@ -52,17 +56,17 @@ name: dflash-benchmark
 #      MLXFAST_DFLASH_MEASURE_JOB (fixed 40C thermal contract, 2 Hz macmon
 #      telemetry, throttle/telemetry rejection). Pairing discipline mirrors
 #      the serial track: the decode-only denominator is the trusted serial
-#      K=1 target decode (the mtp-probe path) executed from the PINNED,
+#      K=1 target decode (the dflash-probe path) executed from the PINNED,
 #      operator-owned MTP baseline tree; the numerator is the candidate's
-#      mtp-benchmark decode over the SAME hidden benchmark golden, same
+#      dflash-benchmark decode over the SAME hidden benchmark golden, same
 #      session, same silicon, alternating order, at least
 #      MLXFAST_DFLASH_MIN_ACCEPTED_PAIRS accepted pairs. Worker-reported timing
 #      has no authority anywhere; the parent divides its own wall time by
 #      its own configured token total.
 #   6. Applies the decode-only score contract in the trusted shell:
-#        score = mtp_decode_speedup
+#        score = dflash_decode_speedup
 #              = mean(serial s/tok over accepted pairs)
-#                / mean(mtp s/tok over accepted pairs)   [ratio-of-means]
+#                / mean(dflash s/tok over accepted pairs)   [ratio-of-means]
 #        floor >= 0.80 on that aggregate, hard (see above: 1.0 would reject
 #        honest sub-19% kernel wins, not regressions);
 #        bit-exact gate: parity_all_ok must be true across every timed run.
@@ -77,8 +81,8 @@ name: dflash-benchmark
 #       fixtures/dflash_laguna_xs_2_1_drafter.sha256 (setup-dflash.sh
 #       layout).
 #   MLXFAST_DFLASH_BASELINE_WS
-#       Pinned prebuilt challenge-repo tree (trusted ref) with mtp-weights
-#       already transformed; the serial mtp-probe denominator runs from
+#       Pinned prebuilt challenge-repo tree (trusted ref) with weights
+#       already transformed; the serial dflash-probe denominator runs from
 #       here, never from the candidate workspace, so a submission cannot
 #       slow the reference to inflate its ratio.
 #   MLXFAST_DFLASH_BASELINE_CALIBRATION
@@ -107,12 +111,12 @@ on:
   workflow_dispatch:
     inputs:
       confirm_track_enabled:
-        description: "Standing MTP enablement interlock. Defaults on for Yukon; set false only to verify fail-closed rollback."
+        description: "Enablement interlock. Defaults FALSE: this track is inert (official_scoring_enabled is false and the hidden timed-prompt pool is empty, so the guard fails closed anyway). Inherited from the retired MTP track, where it defaulted true because that track was live. When the operator enables DFlash, flip the contract fixture AND this default together."
         required: false
-        default: true
+        default: false
         type: boolean
       run_benchmark:
-        description: "Run the timed paired MTP measurement after the correctness/parity gate. false = correctness/parity only."
+        description: "Run the timed paired DFlash measurement after the correctness/parity gate. false = correctness/parity only."
         required: false
         default: true
         type: boolean
@@ -126,7 +130,7 @@ concurrency:
 
 jobs:
   dflash-ranked:
-    name: "single-machine MTP ranked benchmark (m5-bench)"
+    name: "single-machine DFlash ranked benchmark (m5-bench)"
     runs-on: [self-hosted, m5-bench]
     # Job budget: build (~15m) + IT transform (~10m) + artifact hashing of
     # the 18.4 GB source (~3m) + full-length parity pass (~15m) + cooldowns
@@ -141,22 +145,30 @@ jobs:
       MLXFAST_QUARANTINE_FLAG: /opt/bench/quarantine.flag
       MLXFAST_MACMON: /opt/bench-runner/bin/macmon
       MLXFAST_DFLASH_MEASURE_JOB: /opt/bench-runner/measure-dflash-job.sh
-      MLXFAST_DFLASH_BASELINE_WS: /opt/bench-runner/mtp-baseline/current
-      MLXFAST_DFLASH_BASELINE_CALIBRATION: /opt/bench-runner/state/mtp-baseline-calibration.json
+      # Per-track, and NOT the retired MTP paths this scaffolding was restored
+      # from: /opt/bench-runner/mtp-baseline/current and
+      # /opt/bench-runner/state/mtp-baseline-calibration.json do not exist on any
+      # box, so a ranked run died at the prerequisite check (exit 8). The
+      # calibration path in particular must stay inside the per-track state dir --
+      # measure-dflash-job.sh's own header warns that the bare
+      # /opt/bench-runner/state is the SERIAL track's and that banding DFlash runs
+      # against serial numbers would cross-write the serial oracle cache.
+      MLXFAST_DFLASH_BASELINE_WS: /opt/bench-runner/baseline/laguna-xs-2.1-dflash-v1/current
+      MLXFAST_DFLASH_BASELINE_CALIBRATION: /opt/bench-runner/state/laguna-xs-2.1-dflash-v1/baseline-calibration.json
       MLXFAST_MEASURE_STATE_DIR: /opt/bench-runner/state/laguna-xs-2.1-dflash-v1
       MLXFAST_DFLASH_TARGET_DIR: /opt/bench-runner/cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25
       MLXFAST_DFLASH_ASSISTANT_DIR: /opt/bench-runner/cache/dflash/laguna-xs-2.1-dflash-v1/assistant
       # Bench workspace: distinct stable path from the serial track's
       # ranked-current (same /Users/Shared/bench-jobs confinement contract,
       # same absolute-path build-cache reasoning as serial-benchmark.yml).
-      MLXFAST_JOB_WS: /Users/Shared/bench-jobs/mtp-ranked-current
+      MLXFAST_JOB_WS: /Users/Shared/bench-jobs/dflash-ranked-current
       # --- Runner-only private material (0700 runner).
-      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-mtp-private-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-dflash-private-${{ github.run_id }}-${{ github.run_attempt }}
       # Distinct from the serial track's artifact run root while satisfying
       # stage-benchmark-artifacts.sh's /tmp/mlxfast-artifacts- prefix contract
       # (run component "mtp-<run>-<attempt>").
-      MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-mtp-${{ github.run_id }}-${{ github.run_attempt }}
-      MLXFAST_MEASURE_OUT: /tmp/mlxfast-mtp-measure-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-dflash-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_MEASURE_OUT: /tmp/mlxfast-dflash-measure-${{ github.run_id }}-${{ github.run_attempt }}
       # --- Track contract.
       MLXFAST_DFLASH_TRACK_ID: laguna-xs-2.1-dflash-v1
       MLXFAST_DFLASH_CONTRACT_PATH: fixtures/laguna_xs_2_1_dflash_track.json
@@ -276,7 +288,7 @@ jobs:
       - name: DFlash host preflight
         run: |
           set -euo pipefail
-          test -x "${MLXFAST_DFLASH_MEASURE_JOB}" || { echo "::error::measure-mtp-job missing" >&2; exit 1; }
+          test -x "${MLXFAST_DFLASH_MEASURE_JOB}" || { echo "::error::measure-dflash-job missing" >&2; exit 1; }
           test -x "${MLXFAST_MACMON}" || { echo "::error::macmon missing" >&2; exit 1; }
           test -f "${MLXFAST_DFLASH_TARGET_DIR}/config.json" || { echo "::error::MTP target cache missing" >&2; exit 1; }
           test -f "${MLXFAST_DFLASH_ASSISTANT_DIR}/config.json" || { echo "::error::MTP assistant cache missing" >&2; exit 1; }
@@ -639,7 +651,7 @@ jobs:
           mkdir -p "${MLXFAST_PRIVATE_DIR}"
           chmod 700 "${MLXFAST_PRIVATE_DIR}"
           mkdir -p "${MLXFAST_JOB_WS}/private"
-          mkdir -p "${MLXFAST_JOB_WS}/.mtp-ranked-src"
+          mkdir -p "${MLXFAST_JOB_WS}/.dflash-ranked-src"
           # Resolve dependencies for both SwiftPM roots while still trusted
           # and networked (the bench uid has a PF egress block).
           (cd "${MLXFAST_JOB_WS}" && swift package resolve --force-resolved-versions)
@@ -651,7 +663,7 @@ jobs:
             "${MLXFAST_JOB_WS}/Sources" \
             "${MLXFAST_JOB_WS}/correctness_prompts" \
             "${MLXFAST_JOB_WS}/fixtures" \
-            "${MLXFAST_JOB_WS}/.mtp-ranked-src"
+            "${MLXFAST_JOB_WS}/.dflash-ranked-src"
           /bin/chmod +a "user:bench deny write,append,writeattr,writeextattr,delete,chown" \
             "${MLXFAST_JOB_WS}/benchmark.sh" \
             "${MLXFAST_JOB_WS}/benchmark.json" \
@@ -727,7 +739,7 @@ jobs:
       # scratch root, as two separate bench-exec invocations.
       - name: Build trusted CLI in bench sandbox
         env:
-          BENCH_JOB_ID: mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-build
+          BENCH_JOB_ID: dflash-ranked-${{ github.run_id }}-${{ github.run_attempt }}-build
         run: |
           set -euo pipefail
           sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
@@ -750,7 +762,7 @@ jobs:
 
       - name: Build participant worker in bench sandbox
         env:
-          BENCH_JOB_ID: mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-buildworker
+          BENCH_JOB_ID: dflash-ranked-${{ github.run_id }}-${{ github.run_attempt }}-buildworker
         run: |
           set -euo pipefail
           sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
@@ -785,7 +797,7 @@ jobs:
       # base checkpoint) into the candidate's runtime weights.
       - name: Transform DFlash target in bench sandbox
         env:
-          BENCH_JOB_ID: mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-transform
+          BENCH_JOB_ID: dflash-ranked-${{ github.run_id }}-${{ github.run_attempt }}-transform
         run: |
           set -euo pipefail
           status=0
@@ -797,10 +809,10 @@ jobs:
                 MLXFAST_SANDBOX_PARENT_TOOLS=1 /bin/bash -c '
                 set -euo pipefail
                 cd "${MJOB_WS}"
-                mkdir -p mtp-weights
+                mkdir -p weights
                 exec .build/release/mlxfast-swift transform \
                   --reference "${MLXFAST_DFLASH_TARGET_DIR}" \
-                  --output mtp-weights
+                  --output weights
               ' > "${MLXFAST_PRIVATE_DIR}/transform-private.log" 2>&1 || status=$?
           else
             sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
@@ -808,17 +820,17 @@ jobs:
                 MLXFAST_SANDBOX_PARENT_TOOLS=1 /bin/bash -c '
                 set -euo pipefail
                 cd "${MJOB_WS}"
-                mkdir -p mtp-weights
+                mkdir -p weights
                 exec .build/release/mlxfast-swift transform \
                   --reference "${MLXFAST_DFLASH_TARGET_DIR}" \
-                  --output mtp-weights
+                  --output weights
               ' || status=$?
           fi
           test "${status}" -eq 0
-          test -f "${MLXFAST_JOB_WS}/mtp-weights/config.json"
+          test -f "${MLXFAST_JOB_WS}/weights/config.json"
 
       - name: Hash transformed DFlash weights for ranked audit
-        run: .github/scripts/hash-weights-directory.sh "${MLXFAST_JOB_WS}/mtp-weights" mtp-weights.sha256
+        run: .github/scripts/hash-weights-directory.sh "${MLXFAST_JOB_WS}/weights" dflash-weights.sha256
 
       # Record every file in the bench workspace BEFORE any hidden material
       # enters it, for the allowlist scrub before timing (same design and
@@ -862,11 +874,11 @@ jobs:
 
       # Trusted download + pin of the hidden IT-target goldens. Raw bytes
       # live runner-private; only the correctness golden is installed into
-      # the workspace (into the bench-NON-writable .mtp-ranked-src staging
+      # the workspace (into the bench-NON-writable .dflash-ranked-src staging
       # dir, symlink-guarded), because the bench harness PARENT must read it
       # to drive the oracle. The worker Seatbelt profile denies it by
       # literal path (BENCH_GOLDEN_PATH). The benchmark golden never enters
-      # the workspace here; measure-mtp-job installs and scrubs it per timed
+      # the workspace here; measure-dflash-job installs and scrubs it per timed
       # side.
       # CONTRACT LAYER L6 (anti-lottery). A single frozen hidden prompt makes a
       # failed ranked run free to retry, which degrades every output-side gate
@@ -942,18 +954,18 @@ jobs:
           set -euo pipefail
           .github/scripts/download-r2-object.sh \
             "${MLXFAST_DFLASH_CORRECTNESS_GOLDEN_R2_PATH}" \
-            "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden.json"
-          correctness_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden.json" | awk '{print $1}')"
-          correctness_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden.json" | tr -d ' ')"
+            "${MLXFAST_PRIVATE_DIR}/dflash_correctness_golden.json"
+          correctness_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/dflash_correctness_golden.json" | awk '{print $1}')"
+          correctness_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/dflash_correctness_golden.json" | tr -d ' ')"
           if [[ "${correctness_hash}" != "${MLXFAST_DFLASH_CORRECTNESS_GOLDEN_SHA256}" || "${correctness_bytes}" != "${MLXFAST_DFLASH_CORRECTNESS_GOLDEN_BYTES}" ]]; then
             echo "::error::hidden MTP correctness golden pin mismatch" >&2
             exit 1
           fi
           .github/scripts/download-r2-object.sh \
             "${MLXFAST_DFLASH_BENCH_GOLDEN_R2_PATH}" \
-            "${MLXFAST_PRIVATE_DIR}/mtp_benchmark_golden.json"
-          bench_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/mtp_benchmark_golden.json" | awk '{print $1}')"
-          bench_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/mtp_benchmark_golden.json" | tr -d ' ')"
+            "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json"
+          bench_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json" | awk '{print $1}')"
+          bench_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json" | tr -d ' ')"
           # Verified against the PER-RUN pool selection, not a fixed pin: the
           # pool entry carries its own sha256/bytes and both must match, so a
           # swapped or truncated object fails closed even though the object key
@@ -962,12 +974,12 @@ jobs:
             echo "::error::hidden DFlash timed golden pin mismatch for the sampled pool entry" >&2
             exit 1
           fi
-          golden_dst="${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json"
+          golden_dst="${MLXFAST_JOB_WS}/.dflash-ranked-src/dflash_correctness_golden.json"
           if [[ -e "${golden_dst}" || -L "${golden_dst}" ]]; then
             echo "::error::refusing to place hidden input over pre-existing path ${golden_dst}" >&2
             exit 1
           fi
-          install -m 0444 "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden.json" "${golden_dst}"
+          install -m 0444 "${MLXFAST_PRIVATE_DIR}/dflash_correctness_golden.json" "${golden_dst}"
           echo "dflash-benchmark: hidden goldens verified (correctness ${correctness_hash}, benchmark ${bench_hash})"
 
       # TOCTOU guard: the submitted transform ran with workspace write access
@@ -987,15 +999,15 @@ jobs:
       # burns gated thermal time.
       - name: DFlash correctness and parity gate (untimed)
         env:
-          BENCH_JOB_ID: mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-gates
+          BENCH_JOB_ID: dflash-ranked-${{ github.run_id }}-${{ github.run_attempt }}-gates
           # Worker Seatbelt literal deny for the hidden correctness golden:
           # only the harness parent may read it. Kept through sudo env_reset
           # via the sudoers env_keep list, exactly like the serial pipeline.
-          BENCH_GOLDEN_PATH: ${{ env.MLXFAST_JOB_WS }}/.mtp-ranked-src/mtp_correctness_golden.json
+          BENCH_GOLDEN_PATH: ${{ env.MLXFAST_JOB_WS }}/.dflash-ranked-src/dflash_correctness_golden.json
         run: |
           set -euo pipefail
-          raw_stdout="${MLXFAST_PRIVATE_DIR}/mtp-gates-stdout.raw"
-          gates_log="${MLXFAST_PRIVATE_DIR}/mtp-gates-private.log"
+          raw_stdout="${MLXFAST_PRIVATE_DIR}/dflash-gates-stdout.raw"
+          gates_log="${MLXFAST_PRIVATE_DIR}/dflash-gates-private.log"
           started="${SECONDS}"
           status=0
           # shellcheck disable=SC2024  # trusted shell owns the capture files
@@ -1010,16 +1022,23 @@ jobs:
               /bin/bash -c '
                 set -u
                 cd "${MJOB_WS}" || exit 97
-                exec .build/release/mlxfast-swift mtp-benchmark \
-                  --target-source "${MLXFAST_DFLASH_TARGET_DIR}" \
-                  --weights mtp-weights \
-                  --assistant "${MLXFAST_DFLASH_ASSISTANT_DIR}" \
-                  --contract "${MLXFAST_DFLASH_CONTRACT_PATH}" \
-                  --golden .mtp-ranked-src/mtp_correctness_golden.json \
-                  --block-size "${MLXFAST_DFLASH_BLOCK_SIZE}" \
+                # Flags audited against Sources/MLXFastCLI/main.swift. Five that
+                # the restored MTP scaffolding passed do not exist on this CLI and
+                # would abort the run on argument validation:
+                #   --target-source            (only `transform` consumes a source tree)
+                #   --assistant                (this CLI spells it --drafter)
+                #   --contract                 (enforced by the workflow interlock and
+                #                               the trusted parent, never a CLI flag)
+                #   --target-verification      (superseded by Criterion E; the trusted
+                #                               parent validates, the worker does not)
+                #   --require-trained-assistant (the drafter is hash-pinned by its
+                #                               manifest instead)
+                exec .build/release/mlxfast-swift dflash-benchmark \
+                  --weights weights \
+                  --drafter "${MLXFAST_DFLASH_ASSISTANT_DIR}" \
+                  --golden .dflash-ranked-src/dflash_correctness_golden.json \
                   --tokens "${MLXFAST_DFLASH_CORRECTNESS_TOKENS}" \
-                  --target-verification exact-pair \
-                  --require-trained-assistant
+                  --block-size "${MLXFAST_DFLASH_BLOCK_SIZE}"
               ' > "${raw_stdout}" 2> "${gates_log}" || status=$?
           if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" != "1" ]]; then
             cat "${gates_log}" || true
@@ -1048,33 +1067,33 @@ jobs:
               echo "::error::MTP correctness gate report failed validation (exit=${status})" >&2
               exit 1
             }
-          cp "${raw_stdout}" mtp-gates-report.json
+          cp "${raw_stdout}" dflash-gates-report.json
           echo "dflash-benchmark: correctness/parity gate passed in $((SECONDS - started))s (exit=${status})"
           exit "${status}"
 
       # ---- correctness-only (run_benchmark=false) artifact path ------------
       - name: Stage DFlash correctness artifacts
-        id: stage_mtp_correctness_artifacts
+        id: stage_dflash_correctness_artifacts
         if: ${{ !inputs.run_benchmark }}
         run: |
           set -euo pipefail
           test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"
           .github/scripts/deny-private-artifacts.sh \
             candidate.sha \
-            mtp-gates-report.json \
-            mtp-weights.sha256
+            dflash-gates-report.json \
+            dflash-weights.sha256
           .github/scripts/stage-benchmark-artifacts.sh \
-            "${MLXFAST_ARTIFACT_ROOT}/mtp-correctness-results" \
+            "${MLXFAST_ARTIFACT_ROOT}/dflash-correctness-results" \
             candidate.sha=candidate.sha \
-            mtp-gates-report.json=mtp-gates-report.json \
-            mtp-weights.sha256=mtp-weights.sha256
+            dflash-gates-report.json=dflash-gates-report.json \
+            dflash-weights.sha256=dflash-weights.sha256
 
       - name: Upload DFlash correctness artifacts
-        if: always() && steps.stage_mtp_correctness_artifacts.outcome == 'success'
+        if: always() && steps.stage_dflash_correctness_artifacts.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: mtp-correctness-results-${{ github.run_id }}
-          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/mtp-correctness-results
+          name: dflash-correctness-results-${{ github.run_id }}
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/dflash-correctness-results
           if-no-files-found: error
           overwrite: true
 
@@ -1082,12 +1101,12 @@ jobs:
       # Restore the workspace to its pre-hidden snapshot BEFORE the timed
       # phase: remove the hidden correctness golden, purge bench scratch
       # through the bridge, allowlist-delete every gates-phase file, and
-      # re-verify mtp-weights against its pinned hash.
+      # re-verify weights against its pinned hash.
       - name: Scrub hidden material from bench workspace
         if: ${{ inputs.run_benchmark }}
         run: |
           set -euo pipefail
-          rm -f "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json"
+          rm -f "${MLXFAST_JOB_WS}/.dflash-ranked-src/dflash_correctness_golden.json"
           rm -rf "${MLXFAST_JOB_WS}/private"
           mkdir -p "${MLXFAST_JOB_WS}/private"
           sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
@@ -1102,7 +1121,7 @@ jobs:
           scrub_failed=0
           while IFS= read -r -d '' rel; do
             case "${rel}" in
-              ./mtp-weights/*|./.build/*|./.build-worker/*|./correctness_prompts/*) continue ;;
+              ./weights/*|./.build/*|./.build-worker/*|./correctness_prompts/*) continue ;;
               ./private/*) continue ;;
             esac
             if grep -zqxF -- "${rel}" "${manifest}"; then
@@ -1119,9 +1138,9 @@ jobs:
             echo "::error::allowlist scrub left gates-phase workspace files it could not delete" >&2
             exit 1
           fi
-          test -s mtp-weights.sha256
-          scrub_weights_hash="$(.github/scripts/hash-weights-directory.sh "${MLXFAST_JOB_WS}/mtp-weights")"
-          trusted_weights_hash="$(tr -d '[:space:]' < mtp-weights.sha256)"
+          test -s dflash-weights.sha256
+          scrub_weights_hash="$(.github/scripts/hash-weights-directory.sh "${MLXFAST_JOB_WS}/weights")"
+          trusted_weights_hash="$(tr -d '[:space:]' < dflash-weights.sha256)"
           if [[ "${scrub_weights_hash}" != "${trusted_weights_hash}" ]]; then
             echo "::error::transformed MTP weights changed before timing (hash ${scrub_weights_hash} != ${trusted_weights_hash})" >&2
             exit 1
@@ -1160,7 +1179,7 @@ jobs:
             fi
           done
           temp="$("${MLXFAST_MACMON}" pipe -s1 2>/dev/null | jq -r '.temp.gpu_temp_avg // "?"')"
-          echo "dflash-benchmark: quiescent after ${waited}s (load=${load} gpu_util=${util} gpu_temp=${temp}C); thermal gate is enforced inside measure-mtp-job"
+          echo "dflash-benchmark: quiescent after ${waited}s (load=${load} gpu_util=${util} gpu_temp=${temp}C); thermal gate is enforced inside measure-dflash-job"
 
       - name: Verify trusted harness before timing
         if: ${{ inputs.run_benchmark }}
@@ -1171,10 +1190,10 @@ jobs:
       # THE TIMED MTP MEASUREMENT -- LAST, via the box-owned wrapper with the
       # fixed thermal contract. Per accepted pair, alternating order:
       #   baseline: pinned MTP baseline tree, serial K=1 target decode
-      #             (mtp-probe) over the hidden benchmark golden;
-      #   candidate: this workspace, mtp-benchmark (exact-pair) over the
+      #             (dflash-probe) over the hidden benchmark golden;
+      #   candidate: this workspace, dflash-benchmark (exact-pair) over the
       #             SAME golden, same --tokens denominator.
-      # measure-mtp-job enforces per-phase quiescence + the 40C gate + 2 Hz
+      # measure-dflash-job enforces per-phase quiescence + the 40C gate + 2 Hz
       # telemetry acceptance, requires all_tokens_matched=true from every
       # run, checks the baseline calibration band, and seals results.json.
       - name: Timed paired DFlash benchmark (measure-dflash-job)
@@ -1184,19 +1203,19 @@ jobs:
           MEASURE_STATE_DIR="${MLXFAST_MEASURE_STATE_DIR}" \
           BASELINE_WS="${MLXFAST_DFLASH_BASELINE_WS}" \
           BASELINE_CALIBRATION="${MLXFAST_DFLASH_BASELINE_CALIBRATION}" \
-          MTP_TARGET_DIR="${MLXFAST_DFLASH_TARGET_DIR}" \
-          MTP_ASSISTANT_DIR="${MLXFAST_DFLASH_ASSISTANT_DIR}" \
+          DFLASH_TARGET_DIR="${MLXFAST_DFLASH_TARGET_DIR}" \
+          DFLASH_DRAFTER_DIR="${MLXFAST_DFLASH_ASSISTANT_DIR}" \
           GPU_LOADED_UTIL=0.95 \
             "${MLXFAST_DFLASH_MEASURE_JOB}" \
               --candidate "${MLXFAST_JOB_WS}" \
               --baseline "${MLXFAST_DFLASH_BASELINE_WS}" \
-              --golden "${MLXFAST_PRIVATE_DIR}/mtp_benchmark_golden.json" \
+              --golden "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json" \
               --contract "${MLXFAST_DFLASH_CONTRACT_PATH}" \
               --tokens "${MLXFAST_DFLASH_DECODE_TOKENS}" \
               --block-size "${MLXFAST_DFLASH_BLOCK_SIZE}" \
               --min-pairs "${MLXFAST_DFLASH_MIN_ACCEPTED_PAIRS}" \
               --target-pairs "${MLXFAST_DFLASH_TARGET_PAIRS}" \
-              --tag "mtp-ranked-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+              --tag "dflash-ranked-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
               --out "${MLXFAST_MEASURE_OUT}"
           test -s "${MLXFAST_MEASURE_OUT}/results.json"
           jq -c '{mode, accepted_pair_count, parity_all_ok}' "${MLXFAST_MEASURE_OUT}/results.json"
@@ -1225,9 +1244,9 @@ jobs:
             and ((.pairs | type) == "array")
             and ((.pairs | length) == .accepted_pair_count)
             and (.aggregate.baseline_serial_seconds_per_token_mean | type == "number" and . > 0)
-            and (.aggregate.candidate_mtp_seconds_per_token_mean | type == "number" and . > 0)
-            and (.aggregate.mtp_decode_speedup_median | type == "number")
-            and (.aggregate.mtp_decode_speedup_min | type == "number")
+            and (.aggregate.candidate_dflash_seconds_per_token_mean | type == "number" and . > 0)
+            and (.aggregate.dflash_decode_speedup_median | type == "number")
+            and (.aggregate.dflash_decode_speedup_min | type == "number")
             ' "${results}" >/dev/null || {
               echo "::error::paired MTP results failed validation (bit-exact gate, pair count, or schema)" >&2
               exit 1
@@ -1235,16 +1254,16 @@ jobs:
           # Ratio-of-means: mean serial s/tok over accepted pairs divided by
           # mean MTP s/tok over the same pairs (equivalently total serial
           # decode time / total MTP decode time for the fixed token total).
-          speedup="$(jq -r '.aggregate.baseline_serial_seconds_per_token_mean / .aggregate.candidate_mtp_seconds_per_token_mean' "${results}")"
+          speedup="$(jq -r '.aggregate.baseline_serial_seconds_per_token_mean / .aggregate.candidate_dflash_seconds_per_token_mean' "${results}")"
           floor_ok="$(echo "${speedup} >= ${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR}" | bc -l)"
           if [[ "${floor_ok}" != "1" ]]; then
-            echo "::error::mtp_decode_speedup (ratio-of-means) ${speedup} is below the ${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR} floor; an MTP submission that is not faster than trusted serial decode does not rank" >&2
+            echo "::error::dflash_decode_speedup (ratio-of-means) ${speedup} is below the ${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR} floor; a DFlash submission that is not faster than trusted serial decode does not rank" >&2
             exit 1
           fi
           jq -n \
             --arg track "${MLXFAST_DFLASH_TRACK_ID}" \
             --arg commit "${MLXFAST_CANDIDATE_SHA}" \
-            --arg weights_hash "$(tr -d '[:space:]' < mtp-weights.sha256)" \
+            --arg weights_hash "$(tr -d '[:space:]' < dflash-weights.sha256)" \
             --argjson score "${speedup}" \
             --argjson floor "${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR}" \
             --argjson decode_tokens "${MLXFAST_DFLASH_DECODE_TOKENS}" \
@@ -1264,12 +1283,12 @@ jobs:
                 accepted_pair_count: $results[0].accepted_pair_count,
                 target_pair_count: $target_pairs,
                 parity_all_ok: $results[0].parity_all_ok,
-                mtp_decode_speedup_ratio_of_means: $score,
-                mtp_decode_speedup_median: $results[0].aggregate.mtp_decode_speedup_median,
-                mtp_decode_speedup_min: $results[0].aggregate.mtp_decode_speedup_min,
+                dflash_decode_speedup_ratio_of_means: $score,
+                dflash_decode_speedup_median: $results[0].aggregate.dflash_decode_speedup_median,
+                dflash_decode_speedup_min: $results[0].aggregate.dflash_decode_speedup_min,
                 baseline_serial_seconds_per_token_mean: $results[0].aggregate.baseline_serial_seconds_per_token_mean,
-                candidate_mtp_seconds_per_token_mean: $results[0].aggregate.candidate_mtp_seconds_per_token_mean,
-                mtp_weights_hash: $weights_hash
+                candidate_dflash_seconds_per_token_mean: $results[0].aggregate.candidate_dflash_seconds_per_token_mean,
+                dflash_weights_hash: $weights_hash
               }
             }
             ' > score.json
@@ -1285,11 +1304,11 @@ jobs:
             candidate.sha \
             score.json \
             score.json.sha256 \
-            mtp-gates-report.json \
-            mtp-weights.sha256
+            dflash-gates-report.json \
+            dflash-weights.sha256
 
       - name: Stage DFlash benchmark artifacts
-        id: stage_mtp_benchmark_artifacts
+        id: stage_dflash_benchmark_artifacts
         if: ${{ inputs.run_benchmark }}
         run: |
           set -euo pipefail
@@ -1298,11 +1317,11 @@ jobs:
             candidate.sha=candidate.sha \
             score.json=score.json \
             score.sha256=score.json.sha256 \
-            mtp-gates-report.json=mtp-gates-report.json \
-            mtp-weights.sha256=mtp-weights.sha256
+            dflash-gates-report.json=dflash-gates-report.json \
+            dflash-weights.sha256=dflash-weights.sha256
 
       - name: Upload DFlash benchmark artifacts
-        if: ${{ inputs.run_benchmark && steps.stage_mtp_benchmark_artifacts.outcome == 'success' }}
+        if: ${{ inputs.run_benchmark && steps.stage_dflash_benchmark_artifacts.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: benchmark-results-${{ github.run_id }}
@@ -1314,36 +1333,36 @@ jobs:
       # commit ids, timings, telemetry aggregates only) and the measure
       # verdict. Content-vetted by deny-private-artifacts.
       - name: Stage DFlash audit artifacts
-        id: stage_mtp_audit_artifacts
+        id: stage_dflash_audit_artifacts
         if: ${{ always() && inputs.run_benchmark }}
         run: |
           set -euo pipefail
           staged=()
           if [[ -s "${MLXFAST_MEASURE_OUT}/results.json" ]]; then
-            cp "${MLXFAST_MEASURE_OUT}/results.json" mtp-paired-results.json
-            staged+=(mtp-paired-results.json=mtp-paired-results.json)
+            cp "${MLXFAST_MEASURE_OUT}/results.json" dflash-paired-results.json
+            staged+=(dflash-paired-results.json=dflash-paired-results.json)
           fi
           if [[ -s "${MLXFAST_MEASURE_OUT}/verdict.txt" ]]; then
-            cp "${MLXFAST_MEASURE_OUT}/verdict.txt" mtp-measure-verdict.txt
-            staged+=(mtp-measure-verdict.txt=mtp-measure-verdict.txt)
+            cp "${MLXFAST_MEASURE_OUT}/verdict.txt" dflash-measure-verdict.txt
+            staged+=(dflash-measure-verdict.txt=dflash-measure-verdict.txt)
           fi
-          if [[ -s mtp-weights.sha256 ]]; then
-            staged+=(mtp-weights.sha256=mtp-weights.sha256)
+          if [[ -s dflash-weights.sha256 ]]; then
+            staged+=(dflash-weights.sha256=dflash-weights.sha256)
           fi
           if [[ "${#staged[@]}" -eq 0 ]]; then
             echo "dflash-benchmark: no audit artifacts to stage"
             exit 0
           fi
           .github/scripts/stage-benchmark-artifacts.sh \
-            "${MLXFAST_ARTIFACT_ROOT}/mtp-benchmark-audit" \
+            "${MLXFAST_ARTIFACT_ROOT}/dflash-benchmark-audit" \
             "${staged[@]}"
 
       - name: Upload DFlash audit artifacts
-        if: ${{ always() && inputs.run_benchmark && steps.stage_mtp_audit_artifacts.outcome == 'success' }}
+        if: ${{ always() && inputs.run_benchmark && steps.stage_dflash_audit_artifacts.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: mtp-benchmark-audit-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/mtp-benchmark-audit
+          name: dflash-benchmark-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/dflash-benchmark-audit
           if-no-files-found: ignore
           retention-days: 90
 

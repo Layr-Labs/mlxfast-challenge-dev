@@ -159,6 +159,65 @@ struct DFlashTrackTests {
         #expect(workflow.contains("/opt/bench-runner/state/laguna-xs-2.1-dflash-v1"))
         #expect(!workflow.contains("/opt/bench-runner/state/laguna-xs-2.1-serial-v2"))
         #expect(!workflow.contains("laguna-xs-2.1-serial-v2/current"))
+        // Everything below inspects what the workflow DOES, not what it says:
+        // comment lines are stripped first. The comments deliberately name the dead
+        // MTP paths and flags so a future reader knows what was removed and why,
+        // and asserting against them would make documenting the fix impossible.
+        let executable = workflow
+            .split(separator: "\n")
+            .map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("#") }
+            .joined(separator: "\n")
+
+        // The BARE state dir is the serial track's, and it is where
+        // baseline-calibration.json lives for serial. measure-dflash-job.sh's own
+        // header warns that pointing DFlash at it bands DFlash runs against serial
+        // numbers and cross-writes the serial oracle cache. The earlier version of
+        // this test only excluded the serial PER-TRACK dir, so it passed while the
+        // workflow pointed MLXFAST_DFLASH_BASELINE_CALIBRATION at a
+        // retired-MTP calibration file inside the bare serial state dir.
+        for line in executable.split(separator: "\n") {
+            let text = String(line)
+            guard text.contains("/opt/bench-runner/state/") else { continue }
+            #expect(
+                text.contains("/opt/bench-runner/state/laguna-xs-2.1-dflash-v1"),
+                "every /opt/bench-runner/state path must sit inside the DFlash per-track state dir"
+            )
+        }
+
+        // Retired-MTP paths. The identity test only forbade the MLXFAST_MTP_
+        // variable PREFIX, which let MLXFAST_DFLASH_* variables keep pointing at
+        // mtp-baseline paths that exist on no box -- failing ranked runs at the
+        // prerequisite check with exit 8.
+        #expect(!executable.contains("/opt/bench-runner/mtp-baseline"))
+        #expect(!executable.contains("mtp-baseline-calibration.json"))
+
+        // Every mlxfast-swift invocation must use flags this CLI actually declares.
+        // The restored scaffolding passed five that do not exist, each aborting on
+        // argument validation -- the same drift that had left four dead flags in
+        // the box wrapper. Invisible until a run is dispatched, cheap to pin.
+        // NOTE: --contract is deliberately absent from this list. It does not
+        // exist on the CLI but IS a real measure-dflash-job.sh flag, so banning
+        // the bare string would forbid a correct wrapper invocation. --golden,
+        // --tokens and --block-size are likewise shared by both surfaces.
+        for dead in [
+            "--target-source", "--assistant",
+            "--target-verification", "--require-trained-assistant",
+        ] {
+            #expect(
+                !executable.contains(dead),
+                "the DFlash workflow passes a CLI flag that does not exist"
+            )
+        }
+        // The wrapper reads DFLASH_*, not MTP_*: exporting MTP_TARGET_DIR and
+        // MTP_ASSISTANT_DIR was silently ignored, and only worked because the
+        // wrapper's own defaults happen to be correct.
+        #expect(!executable.contains("MTP_TARGET_DIR"))
+        #expect(!executable.contains("MTP_ASSISTANT_DIR"))
+
+        // The transform output must be the directory the box wrapper reads
+        // (`--weights weights`), not the retired track's mtp-weights.
+        #expect(!executable.contains("mtp-weights"))
         // Distinct concurrency domain so a DFlash run cannot cancel or queue
         // behind a serial ranked run under the same key.
         #expect(workflow.contains("mlxfast-dflash-ranked-"))
