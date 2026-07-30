@@ -111,8 +111,11 @@ struct DFlashTrackTests {
         let trackID = "laguna-xs-2.1-dflash-v1"
         #expect(manifest["trackId"] as? String == trackID)
         #expect(fixture["track_id"] as? String == trackID)
-        #expect(workflow.contains("MLXFAST_DFLASH_TRACK_ID: \(trackID)")
-            || workflow.contains("MLXFAST_MTP_TRACK_ID: \(trackID)"))
+        #expect(workflow.contains("MLXFAST_DFLASH_TRACK_ID: \(trackID)"))
+        // The env surface is namespaced to this track. Leftover MLXFAST_MTP_*
+        // names would mean the revived scaffolding still speaks the retired
+        // track's contract to the box wrapper, which reads MLXFAST_DFLASH_*.
+        #expect(!workflow.contains("MLXFAST_MTP_"))
 
         #expect(manifest["contractPath"] as? String == Self.fixturePath)
         let runner = try #require(manifest["runner"] as? [String: Any])

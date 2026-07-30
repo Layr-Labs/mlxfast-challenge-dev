@@ -88,6 +88,34 @@ if [[ -s "${score_path}" ]]; then
       category="prefill_token_mismatch"
     elif [[ "${error_text}" == "benchmark decode seed token mismatch"* ]]; then
       category="decode_seed_token_mismatch"
+    # DFlash track (laguna-xs-2.1-dflash-v1). The trusted parent authors these
+    # as "DFlash contract violation: <kind>[ at step N]" and, by construction,
+    # they carry NO reference token ids and NO reference logit values -- only a
+    # kind, a step, and counts (see DFlashContractViolation). That property is
+    # what stops the validator becoming a query oracle for the hidden prompt
+    # (contract layer L6), so surface the KIND but never the detail text, and
+    # allowlist the kinds exactly like every other branch here.
+    elif [[ "${error_text}" == "DFlash contract violation: "* ]]; then
+      dflash_kind="${error_text#DFlash contract violation: }"
+      dflash_kind="${dflash_kind%% *}"
+      case "${dflash_kind}" in
+        emptyBlock) category="dflash_empty_block" ;;
+        oversizedBlock) category="dflash_oversized_block" ;;
+        outOfVocabularyToken) category="dflash_out_of_vocabulary_token" ;;
+        tokenNotAdmissible) category="dflash_token_not_admissible" ;;
+        residualBudgetExhausted) category="dflash_residual_budget_exhausted" ;;
+        rowAccountingMismatch) category="dflash_row_accounting_mismatch" ;;
+        declaredRowsMissing) category="dflash_declared_rows_missing" ;;
+        workBindingMissing) category="dflash_work_binding_missing" ;;
+        workBindingLogitMismatch) category="dflash_work_binding_logit_mismatch" ;;
+        cacheOffsetDiverged) category="dflash_cache_offset_diverged" ;;
+        incompleteRun) category="dflash_incomplete_run" ;;
+        *) category="dflash_contract_violation" ;;
+      esac
+      first_failing_step="$(jq -r '.metrics.first_failing_step // ""' "${score_path}")"
+      if [[ "${first_failing_step}" =~ ^[0-9]+$ ]]; then
+        step_bucket="$((first_failing_step / 32 * 32))"
+      fi
     elif [[ "${error_text}" == "benchmark decode token mismatch"* ]]; then
       category="decode_token_mismatch"
       first_failing_step="$(jq -r '.metrics.first_failing_step // ""' "${score_path}")"

@@ -18,10 +18,10 @@ EOF
 mode="${1:---local-iterate}"
 case "${mode}" in
   --local-iterate)
-    token_count="${MLXFAST_MTP_LOCAL_ITERATE_TOKENS:-64}"
+    token_count="${MLXFAST_DFLASH_LOCAL_ITERATE_TOKENS:-64}"
     ;;
   --local-submit)
-    token_count="${MLXFAST_MTP_LOCAL_SUBMIT_TOKENS:-128}"
+    token_count="${MLXFAST_DFLASH_LOCAL_SUBMIT_TOKENS:-128}"
     ;;
   -h|--help)
     usage
@@ -42,11 +42,11 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${repo_root}"
 
 swift_bin="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
-contract_path="${MLXFAST_MTP_CONTRACT_PATH:-fixtures/laguna_xs_2_1_mtp_track.json}"
-prompt_path="${MLXFAST_MTP_LOCAL_PROMPT_PATH:-correctness_prompts/public_longcopy_gate_english.txt}"
+contract_path="${MLXFAST_DFLASH_CONTRACT_PATH:-fixtures/laguna_xs_2_1_mtp_track.json}"
+prompt_path="${MLXFAST_DFLASH_LOCAL_PROMPT_PATH:-correctness_prompts/public_longcopy_gate_english.txt}"
 score_path="${MLXFAST_SCORE_PATH:-score.json}"
-work_root="${MLXFAST_MTP_LOCAL_WORK_DIR:-.mlxfast-local-mtp}"
-block_size="${MLXFAST_MTP_BLOCK_SIZE:-4}"
+work_root="${MLXFAST_DFLASH_LOCAL_WORK_DIR:-.mlxfast-local-mtp}"
+block_size="${MLXFAST_DFLASH_BLOCK_SIZE:-4}"
 
 if ! [[ "${block_size}" =~ ^[2-4]$ ]]; then
   echo "benchmark-mtp: block size must be in 2...4" >&2
@@ -62,9 +62,9 @@ if [[ ! -s "${contract_path}" || ! -s "${prompt_path}" ]]; then
 fi
 
 eval "$(./setup-dflash.sh --print-paths)"
-: "${MLXFAST_MTP_TARGET_DIR:?setup-dflash.sh did not provide the target path}"
-: "${MLXFAST_MTP_ASSISTANT_DIR:?setup-dflash.sh did not provide the assistant path}"
-if [[ ! -s "${MLXFAST_MTP_TARGET_DIR}/config.json" || ! -s "${MLXFAST_MTP_ASSISTANT_DIR}/config.json" ]]; then
+: "${MLXFAST_DFLASH_TARGET_DIR:?setup-dflash.sh did not provide the target path}"
+: "${MLXFAST_DFLASH_ASSISTANT_DIR:?setup-dflash.sh did not provide the assistant path}"
+if [[ ! -s "${MLXFAST_DFLASH_TARGET_DIR}/config.json" || ! -s "${MLXFAST_DFLASH_ASSISTANT_DIR}/config.json" ]]; then
   echo "benchmark-mtp: MTP target or assistant is missing; run ./setup-dflash.sh" >&2
   exit 1
 fi
@@ -87,14 +87,14 @@ score_tmp="${score_path}.tmp"
 
 echo "benchmark-mtp: transforming the pinned Laguna target" >&2
 "${swift_bin}" transform \
-  --reference "${MLXFAST_MTP_TARGET_DIR}" \
+  --reference "${MLXFAST_DFLASH_TARGET_DIR}" \
   --output "${weights_path}"
 
 echo "benchmark-mtp: generating a candidate-local serial oracle (${token_count} tokens)" >&2
 "${swift_bin}" generate-golden \
   --prompt-file "${prompt_path}" \
   --weights "${weights_path}" \
-  --tokenizer "${MLXFAST_MTP_TARGET_DIR}" \
+  --tokenizer "${MLXFAST_DFLASH_TARGET_DIR}" \
   --output "${golden_path}" \
   --name "laguna-xs-2.1-mtp-local" \
   --steps "$((token_count + 1))"
@@ -108,9 +108,9 @@ echo "benchmark-mtp: measuring serial K=1 control" >&2
 
 echo "benchmark-mtp: measuring trained-assistant exact-pair decode" >&2
 "${swift_bin}" mtp-benchmark \
-  --target-source "${MLXFAST_MTP_TARGET_DIR}" \
+  --target-source "${MLXFAST_DFLASH_TARGET_DIR}" \
   --weights "${weights_path}" \
-  --assistant "${MLXFAST_MTP_ASSISTANT_DIR}" \
+  --assistant "${MLXFAST_DFLASH_ASSISTANT_DIR}" \
   --contract "${contract_path}" \
   --golden "${golden_path}" \
   --block-size "${block_size}" \
