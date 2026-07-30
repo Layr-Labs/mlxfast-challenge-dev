@@ -2080,3 +2080,194 @@ unpriced, which needs the parent to journal draft tokens.
 s/token, max delta 1.875, relative 0.0884. A same-session control with the cheat
 patch present but its env switch unset: rc=0, max delta 2.75, relative 0.1039, and
 zero cheat lines emitted. All four sit inside BOTH arms with margin.
+
+# Amendment 20 (2026-07-30): the band cannot be closed, because honest cross-build drift lives in it
+
+Amendment 19 left one gap and prescribed one fix: a live **2.75-4.875 band** at the
+ranked width in which a subtler fabrication could hide, to be closed by calibrating
+the absolute arm **per block width**, on the stated basis that honest frame
+divergence "is provably width-dependent -- it is exactly 0 at K=1 and grows
+monotonically with the verify width -- whereas a fabrication's error does not scale
+that way." It also insisted the measurement come first, because guessing "is
+precisely the mistake Amendments 8, 15 and 18 each recorded."
+
+The measurement was taken. **Both halves of the basis are false, the band is
+occupied by honest traffic, and the arm must not be tightened.** The prescribed fix
+would have rejected honest submissions.
+
+## 1. Honest same-build drift is flat in width from width 2 on
+
+Every per-width number in this contract before now was actually a per-MIXTURE
+number. `DFlashBlockSchedule` draws each round's width uniformly from
+`minBlockSize ... maxBlockSize`, so a `--block-size 8` run contains rounds of width
+2 through 8 and its aggregate maximum attributes to no single width. The parent now
+labels every recorded gap with the declared width of the round that produced it
+(published beside the gaps under the same widened-tolerance calibration gate, so it
+never appears on a ranked run; the width is the parent's own schedule value, not
+anything the worker reports, so it cannot be inflated to buy a wider arm).
+
+50 runs, both fixtures, `--block-size` 1/2/3/4/6/8, up to 8 schedule seeds,
+**12,800 comparisons**, all `rc=0`:
+
+| width | comparisons | runs | max | p99 | p50 | mean |
+|---|---|---|---|---|---|---|
+| 1 | 512 | 2 | **0.0000** | 0.0000 | 0.000 | 0.0000 |
+| 2 | 3182 | 47 | 3.1250 | 1.7500 | 0.250 | 0.3168 |
+| 3 | 2666 | 44 | 3.3750 | 1.7500 | 0.250 | 0.3212 |
+| 4 | 1964 | 36 | 2.4375 | 1.7500 | 0.250 | 0.3442 |
+| 5 | 1194 | 28 | 3.3750 | 2.1250 | 0.250 | 0.3944 |
+| 6 | 1438 | 28 | **4.5000** | 1.8750 | 0.250 | 0.3563 |
+| 7 | 718 | 16 | 2.5000 | 1.5000 | 0.250 | 0.3251 |
+| 8 | 1126 | 16 | 3.2500 | 2.2500 | 0.250 | 0.3635 |
+
+Width 1 is exactly 0, as Amendment 19 said: at width 1 the candidate reproduces the
+reference's own width-1 walk bit for bit. That is the only true part. From width 2
+on there is **no monotone growth** -- 4.5 at width 6 sits above 2.5 at width 7 --
+and the DISTRIBUTION does not move at all: p50 is 0.250 at every width and p99 is
+1.75-2.25 at every width. Only the extreme tail wanders.
+
+Pooled over widths >= 2 (n=12,288) the tail is smooth and heavy: p99 1.875, p99.9
+2.875, p99.99 3.375, max 4.5. So the observed maximum is a function of **how many
+comparisons were drawn**, not of the width. Width 2 has 3,182 comparisons and a max
+of 3.125; width 6 has 1,438 and a max of 4.5, so it is not even sample-count
+monotone -- it is a heavy tail sampled at different depths.
+
+The same width also drifts differently depending on the schedule it sat in: width 3
+maxes at 2.75 inside a `--block-size 3` run and at 3.375 inside a `--block-size 6`
+run. Ring-cache frame state carries across rounds, so "the width of this round" is
+not even the whole input. There is nothing here for a per-width schedule to key on.
+
+Also note the ranked width's honest ceiling was already understated. Amendment 19
+recorded "2.75 at K=3"; the true figure is 3.375 (any schedule) or 3.125 in the
+ranked `--block-size 3` configuration. The band was never 2.75-4.875.
+
+## 2. Cross-build drift, measured for the first time, is LARGER than the frame term
+
+Amendment 6 flagged the cross-build term as unmeasured and additive. It stayed
+unmeasured for thirteen amendments for a structural reason: the candidate and the
+reference worker are spawned from the same `workerOptions`, hence the same binary,
+so every drift number ever recorded here prices the **block-frame term only**. A
+real submission is a different build.
+
+Measured by letting the reference worker be a different binary from the candidate's.
+Two candidate perturbations, one reference (the stock build), same fixtures and
+seeds:
+
+| pairing | width 1 | width 2 | width 3 | width 4 |
+|---|---|---|---|---|
+| same build (control) | 0.0000 | 2.2500 | 2.7500 | -- |
+| `-Ounchecked` candidate | **0.0000** | -- | 2.7500 | -- |
+| one reassociated MoE reduction | **4.6250** | 4.2500 | 4.0000 | 3.0000 |
+
+`swift build -c release -Xswiftc -Ounchecked` produces a different binary hash and
+different Swift codegen, and changes **not one bit of arithmetic**: the numerics
+live in MLX's C++/Metal, which `-Xswiftc` does not touch. It reproduces the
+same-build control exactly. That is the control proving the two-binary plumbing is
+inert, and it is also a finding in its own right -- "a different build" is not
+sufficient to produce cross-build drift; a different *kernel or op* is.
+
+The second perturbation is a single semantics-preserving reassociation: rotate the
+top-K axis of the MoE expert reduction by half, so the same 8 (expert, weight)
+pairs are summed in a different order. Mathematically identical, a summation-order
+change and not a precision change, and exactly the kind of thing a submission does
+when it re-batches the expert gather-GEMM. It produces **4.6250 at width 1**, where
+same-build drift is exactly 0 -- so that number is the cross-build term isolated,
+with the frame term removed by construction. It is the largest honest gap measured
+anywhere in this contract, from a one-site change, and it is **95% of the 4.875
+arm**.
+
+The candidate stayed token-correct throughout -- `all_tokens_matched=true` on every
+cross-build run -- but its admissibility accounting changed shape. The same-build
+controls produced **zero** declared-frame admissions; the cross-build runs on the
+varied fixture produced 1-2 per 128 tokens (`x1_moe_k3_fix3_s0`: 125 exact, 1
+declared-frame, 2 near-tie). So a real submission's numeric footprint shows up in
+the frame accounting, not only in the tolerance, and it consumes admission
+categories that exist to absorb honest divergence.
+
+**This is a lower bound.** One reduction, one site. A submission that touches the
+quantized matmul, the attention kernels and the MoE dispatch has no reason to stay
+under it.
+
+## 3. What that does to the constant, and to the gate
+
+`DFlashWorkBindingTolerance` is **unchanged**: absolute 4.875, relative 0.25. The
+constants move to `MLXFastConstants` with the derivation above, and a test pins the
+measured per-width and cross-build numbers so a future per-width attempt has to
+restate the measurement rather than rediscover it.
+
+Tightening is refused, and the arithmetic says why:
+
+* Amendment 19's proposed ranked-width arm of **3.5-4.1** is below the honest
+  cross-build drift already measured at the ranked widths (4.00 at width 3, 4.25 at
+  width 2) and below honest same-build drift at width 6 (4.5). It would false-reject
+  honest submissions -- which is the failure this track can least afford, because a
+  rejected honest submission is indistinguishable to the participant from a
+  correctness bug in their own code.
+* The 1.5x headroom discipline Amendments 6 and 15 applied is **gone**, and was
+  always measuring the wrong quantity. Against honest cross-build drift the arm is
+  **1.05x** (4.875 / 4.625), i.e. two BF16 ULPs. Against honest same-build drift at
+  width 6 it is 1.08x.
+
+Widening it is an operator decision, not a calibration one, and is deliberately NOT
+taken here: widening an anti-cheat gate is the move this contract exists to
+prevent, and the evidence that would justify it is an honest submission actually
+being rejected. But the record should be plain that the arm is now more likely to
+produce a false rejection than to catch the next cheat.
+
+## 4. Is the 2.75-4.875 band closed?
+
+**No, and it cannot be by this instrument.** The band was misdescribed. What is
+actually in the 2.75-4.875 interval is honest traffic: honest same-build drift
+reaches 3.375 at the ranked width and 4.5 at width 6, and honest cross-build drift
+reaches 4.00-4.25 at the ranked widths and 4.625 at width 1. There is no
+fabrication-only band to close, because the interval Amendment 19 wanted to reclaim
+belongs to honest code.
+
+The measured separation between honest and fabricated on this axis is now:
+
+```
+honest cross-build maximum   4.625
+absolute arm                 4.875   (+0.25, two ULPs above honest)
+cheat C-ids fatal delta      5.000   (+0.125, one ULP above the arm)
+cheat A-ids fatal delta      5.125   (+0.25, two ULPs above the arm)
+```
+
+Four ULPs span the whole honest-to-fabricated range. The absolute arm does not
+separate them by any margin worth calling a margin, and it is sitting between two
+distributions that are each within measurement noise of it. Amendment 19 called the
+gate's win "a tail lottery"; the correct statement after this measurement is that
+**both** the honest pass and the fabricated rejection are tail lotteries drawn from
+overlapping distributions.
+
+## 5. Residual exposure, restated
+
+1. **The absolute arm is not a discriminator.** It is a coarse sanity bound that
+   happens to sit 2-4 ULPs from both honest and fabricated drift. It cannot be
+   tightened (section 3) and cannot be relied on (section 4). L2's discriminating
+   power at long context is weak, and this measurement makes that quantitative
+   rather than suspected.
+2. **A fabrication that anchors on a nearer row still passes.** Amendment 19's
+   observation stands untouched and is now worse: the honest ceiling it would have
+   to stay under is 4.625, not 2.75, so there is more room, not less.
+3. **The structural id-bind remains the only free, reference-independent check**,
+   and remains defence in depth rather than a gate, for the reason Amendment 19
+   gave: reporting `top1_id = emitted token` costs a blind-accepting cheater
+   nothing.
+4. **The rejected tail is still unpriced** (unchanged from Amendments 18 and 19):
+   it needs the parent to journal draft tokens.
+5. **The near-tie envelope's basis has also widened.**
+   `experimentalDFlashNearTieLogitEnvelope` is 2 x the maximum drift, and its stated
+   basis is "at most 2.4375 at K=4" -- which the sweep confirms exactly at width 4
+   but contradicts at width 3 (3.375) and width 6 (4.5). Under its own derivation
+   rule the envelope would be 6.75-9.0. It is NOT changed here, for the same reason
+   the absolute arm is not widened, but the gate is no longer 2x its own basis and
+   that is now on the record as an open item.
+
+The honest conclusion about this layer: L2 was built to price a term (block-frame
+drift) that turns out to be the smaller of the two terms it sees, and the larger one
+is under the participant's control by construction. A tolerance cannot separate
+honest arithmetic reordering from cheap arithmetic when the two produce the same
+magnitude of error. If work binding is to be a gate rather than a sanity bound it
+needs a mechanism that is not a magnitude comparison -- the rejected-tail journal
+and the reference-drafter replay are both closer to that than any further
+recalibration of this constant.
