@@ -1437,6 +1437,19 @@ struct DFlashDecodeFloorTests {
         #expect(text.contains("MAX_PLAUSIBLE_SPEEDUP stays 5.0"))
     }
 
+    /// The workflow ALSO carries the floor as an env value and recomputes the score
+    /// against it in a trusted shell -- a fifth site, found only when a real
+    /// dispatch printed the whole env block. A 1.0 here would silently override the
+    /// 0.80 landed everywhere else at go-live.
+    @Test
+    func workflowEnvFloorMatchesTheManifests() throws {
+        let workflow = try String(
+            contentsOfFile: ".github/workflows/dflash-benchmark.yml", encoding: .utf8
+        )
+        #expect(workflow.contains("MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: \"0.80\""))
+        #expect(!workflow.contains("MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: \"1.0\""))
+    }
+
     /// The workflow's own header comments are what a reviewer reads first, so they
     /// must not still advertise the old floor.
     @Test
