@@ -2271,3 +2271,180 @@ magnitude of error. If work binding is to be a gate rather than a sanity bound i
 needs a mechanism that is not a magnitude comparison -- the rejected-tail journal
 and the reference-drafter replay are both closer to that than any further
 recalibration of this constant.
+
+# Amendment 21 (2026-07-30): the rejected tail is priced, and the bind that works is not a magnitude
+
+Amendments 18, 19 and 20 each closed with the same open item, in the same words:
+"the rejected tail is still unpriced, which needs the parent to journal draft
+tokens." It is priced now. The measurement below also shows that the check doing
+the work on this axis is NOT the tolerance -- it is an exact-id bind that costs a
+cheater everything, which is the opposite of what the same bind cost on the
+emitted rows (Amendment 19) and is the kind of mechanism Amendment 20 said this
+layer needed.
+
+## 1. The gap, and why it was profitable
+
+`validateJournalAgainstReference` requested `round.tokens.count` reference rows
+and `score()` iterated `round.tokens`. So a round that declared K rows and emitted
+`accepted + 1` of them had its last `K - 1 - accepted` rows length-checked by
+`acceptStructural` and then compared to nothing at all.
+
+Honest partial acceptance must COMPUTE those rows, because computing them is HOW
+it discovers the rejection. On the varied fixture at K=4 the frozen window
+declares 160 rows for 128 emitted tokens: 1.25 declared rows per token, of which
+32 (20%) are rejected tail. Nothing looked at those 32.
+
+## 2. What was measured, before the fix
+
+An adversarial verifier at `4eb2da4`: read out the ACCEPTED rows honestly, then
+fabricate every rejected tail row by copying the last honest row's readout (top-2
+ids, top-2 values, hidden digest). Emitted tokens bit-identical, emitted-row
+readouts genuine, drafts genuine -- so Amendment 18's per-row id bind sees nothing
+and there is nothing else to see.
+
+Varied fixture (`fix3-golden.json`, 69% draft acceptance), `--tokens 128
+--block-size 4 --schedule-seed 7`, one binary, the cheat selected by an
+environment variable so the two arms differ by nothing else, A-B-A-B-A-B:
+
+| arm | s/token |
+|---|---|
+| honest | 0.022494, 0.022547, 0.022558 |
+| fabricated tail | 0.022386, 0.022500, 0.022512 |
+
+Every cheat run beat its adjacent honest control. Means 0.0225330 against
+0.0224660, a **1.0030x decode speedup, i.e. +0.22% on `decode_speedup^0.75`**.
+All four pre-fix cheat runs: **rc=0, `all_tokens_matched=true`,
+`max_top2_logit_delta` 1.75 -- byte-identical to the honest run's**, because the
+rows the gate looked at were the honest ones. `reference_checked_row_total` 128 of
+160 declared, which is the gap stated numerically in the published report the
+whole time.
+
+**The prize is 0.30%, not 16%, and that refines the premise rather than the
+finding.** Per fabricated row the saving is 0.268 ms: one `argPartition` over the
+100352-wide logit row, two GPU syncs, one 2880-float host read of the row's hidden
+state, and one SHA-256 over it. The trunk stays K rows wide because Amendment 18
+section 3 is right that token correctness forces it, and the K-row lm_head is one
+GEMM against a 100352x2880 weight, so it is memory-bound on the weight and eliding
+tail rows there saves almost nothing. What is actually recoverable is the per-row
+READOUT -- which is precisely what L2 requires and precisely what was unpriced.
+A verifier that also elided the lm_head rows would have to discover `accepted`
+incrementally, i.e. serialize K single-row GEMMs against one batched one, and at
+K=4 that is slower, not faster.
+
+## 3. The fix
+
+* **The worker reports the round's drafts** (`declaredRows - 1` of them, in
+  verify-input order) and the parent journals them.
+* **Draft binding, reference-free.** The verify input is
+  `[bonus, d0, ..., d_{K-2}]`, so row `i + 1` is fed `d_i` and row `i` is what
+  `d_i` was proposed to predict; the accept walk compares `d_i` to row `i`'s
+  argmax and emits rows `0 ... accepted`. Therefore `emitted[i] == draftTokens[i]`
+  for every `i < acceptedDraftCount`, checkable with no reference, no tolerance
+  and no round-trip. This is what stops a worker journalling a convenient draft
+  list and thereby choosing the block the reference replays. Verified against
+  `DFlashGreedyRound.swift`: the code agrees with this indexing exactly, and
+  `maxEmitCount` never truncates in the session path (it equals `blockSize`, and
+  `walkedTokenCount <= blockSize`), so `accepted == walkedAccepted` always and the
+  first rejected row is a genuine rejection. The parent still bounds the bind by
+  `min(tokens.count, acceptedDraftCount)` because the DRIVER may trim the emitted
+  prefix to fit the scored window.
+* **The tail readouts.** The reference already branched a block frame off a
+  `copy()` of its continuous cache; it now also replays the candidate's ACTUAL
+  verify block, `[bonus] + journalled drafts`, and reads out all K rows. Every
+  declared-but-unemitted row is compared to it: the top-1 id EXACTLY, suppressed
+  only at a row whose own top-1/top-2 gap is inside
+  `experimentalDFlashNearTieLogitEnvelope` (the same envelope, and the same
+  reasoning, as the emitted rows' near-tie admission), plus the top-2 VALUES under
+  the shared `DFlashWorkBindingTolerance`, both arms. No new constant, no looser
+  arm for the tail.
+* **The rejection claim.** At the first rejected row the reference's own argmax in
+  that verify block must not be the draft the candidate says it overruled.
+* The bonus row is the PARENT's committed token, not the worker's: only the drafts
+  are worker-asserted, and the reference refuses a verify block whose row 0
+  disagrees with the context at that offset.
+
+Cost: one extra forward per round, branched off the same cache at the same
+boundary, in the untimed post-run replay. Timing semantics, every tolerance, every
+budget and the 0.80 floor are untouched.
+
+## 4. What was measured, after the fix
+
+Clean rebuild at `0931cf5`, same fixture, same flags.
+
+Honest, twice: **rc=0**, `all_tokens_matched=true`, 0.022575 and 0.022619 s/token
+(inside the pre-fix honest spread, so the added draft-token host read costs nothing
+measurable). `reference_checked_row_total` **160 == `declared_rows_total` 160**,
+`rejected_rows_reference_checked` **32**, `verify_block_replayed_round_count` 56 of
+56 rounds, `rejected_tail_comparison_count` 64, `max_rejected_tail_logit_delta`
+**2.5625** (relative 0.1444). `dflash-probe --tokens 128`: rc=0, 0.018917 s/token,
+max delta 0, tail counters 0 -- the serial control declares one row and has no tail,
+as it should.
+
+Note the pooled `max_top2_logit_delta` moved 1.75 -> 2.5625: the run's largest gap
+is now a TAIL comparison, so honest tail drift is larger than honest emitted-row
+drift on this fixture. It is still inside both arms with real margin.
+
+The two cheats, same fixture, same flags, engagement proven from worker stderr
+(67 fabrication lines per run, unchanged from the pre-fix runs):
+
+| cheat | rejected | kind + step | fatal delta | caught by |
+|---|---|---|---|---|
+| tail (copy the anchor's whole readout) | **yes, rc=1** | `rejectedRowReadoutMismatch`, step 5 | -- (died before the values) | **the exact-id bind** |
+| tail-ids (honest tail ids, copied VALUES) | **yes, rc=1** | `rejectedRowReadoutMismatch`, step 9 | **5.9375** at width 3 | **the shared tolerance** |
+
+Step 5 is the first rejected row of the run: the naive fabrication dies at the
+first opportunity, not on a tail lottery.
+
+## 5. Why this axis separates and the emitted-row axis does not
+
+Amendment 19 was right that on the EMITTED rows the id bind is free to defeat:
+reporting `top1 = emitted token` costs a blind-accepting cheater nothing, because
+it already knows every emitted token -- the drafter proposed most of them. On a
+REJECTED row the same report costs everything. That row's output was never emitted,
+so the candidate has no independent source for it. Its only free guess is the
+drafter's proposal `d_j` for that row, which is wrong by construction at the first
+rejected row (that is what "rejected" means) and conditioned on an overruled prefix
+after it -- and the last declared row has no proposal at all.
+
+The magnitudes separate better here too, and by more than a lottery:
+
+```
+honest tail maximum (fix3, K=4, 64 comparisons)   2.5625
+absolute arm                                      4.875   (+2.3125, 18.5 ULPs above honest)
+fabricated tail fatal delta                       5.9375  (+1.0625, 8.5 ULPs above the arm)
+```
+
+Compare Amendment 20 section 4, where four ULPs spanned the entire
+honest-to-fabricated range on the emitted rows. The tail comparison is width-K
+against width-K on IDENTICAL inputs, so it does not carry the block-frame term
+that dominates the emitted-row comparison; that is why it is a sharper instrument
+even though it uses the same constant.
+
+## 6. Still open
+
+1. **The emitted-row axis is unchanged.** Amendment 20 sections 4 and 5 stand
+   verbatim: the absolute arm is not a discriminator there, it cannot be
+   tightened, and honest cross-build drift (4.625) sits two ULPs under it. Nothing
+   here improves that; the tail is a second, better axis, not a repair of the
+   first.
+2. **Cross-build tail drift is unmeasured.** Every tail number above is
+   same-build. Amendment 20 measured the cross-build term to be the LARGER one on
+   the emitted rows (4.625 against a 2.4375 same-build figure at width 4), and
+   there is no reason to assume the tail is exempt. If cross-build tail drift
+   behaves like the emitted rows', 2.5625 could become ~4.6 and the 18.5-ULP
+   honest margin would shrink to the same two ULPs that make the emitted-row arm
+   useless. That measurement -- one semantics-preserving reassociation in the MoE
+   reduction, reference from the stock build, per Amendment 20 section 2 -- should
+   be taken before this margin is described as comfortable.
+3. **The id bind is suppressed at flat rows.** ~2% of rows on varied prose
+   (measured: 2 near-tie admissions per 128 emitted tokens), so a fabrication that
+   only ever landed on flat rows would survive the id half. It would still face
+   the values.
+4. **The fabricated-rejection check is unexercised by a live cheat.** Both cheats
+   above make genuine rejections, so only the unit tests reach it. A cheat that
+   claims a rejection early to shorten its emitted block is the shape that would,
+   and it loses emitted tokens for the privilege, which is why none was built.
+5. **The tail's ratio is the tax, and the tax is not mostly the readout.** This
+   amendment prices the rows; it does not make the K-wide trunk optional, and
+   Amendment 18 section 3's point stands that the trunk is held in place by token
+   correctness rather than by any gate.

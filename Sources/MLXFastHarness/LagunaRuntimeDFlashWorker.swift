@@ -56,6 +56,7 @@ func validateExperimentalDFlashBlockRequest(
           request.rowCount == nil,
           request.declaredBlockWidth == nil,
           request.seedTokenCount == nil,
+          request.verifyBlockTokens == nil,
           let previousToken = request.token,
           previousToken >= 0,
           previousToken < MLXFastConstants.vocabSize,
@@ -330,6 +331,7 @@ extension LagunaRuntime {
                     perRowHiddenDigest: result.perRowHiddenDigest,
                     perRowTop2Tokens: result.perRowTop2Tokens,
                     perRowTop2Logits: result.perRowTop2Logits,
+                    draftTokens: result.draftTokens,
                     acceptedDraftCount: result.acceptedDraftCount,
                     rejectedDraftCount: result.rejectedDraftCount,
                     targetCacheOffset: result.targetCacheOffset
@@ -385,6 +387,7 @@ extension LagunaRuntime {
                   request.rowCount == nil,
                   request.declaredBlockWidth == nil,
                   request.seedTokenCount == nil,
+                  request.verifyBlockTokens == nil,
                   let seedTokens = request.seedTokens,
                   !seedTokens.isEmpty
             else {
@@ -442,7 +445,16 @@ extension LagunaRuntime {
                   let widestFrame = request.declaredBlockWidth,
                   widestFrame >= rowCount,
                   widestFrame
-                      <= MLXFastConstants.experimentalDFlashMaxBlockSize
+                      <= MLXFastConstants.experimentalDFlashMaxBlockSize,
+                  // The verify block is the parent's reconstruction of the
+                  // candidate's own verify input for this round. Row 0 is the
+                  // parent's committed token; the rest are the journalled drafts.
+                  // Width is bounded exactly like any other frame.
+                  request.verifyBlockTokens.map({
+                      !$0.isEmpty
+                          && $0.count
+                              <= MLXFastConstants.experimentalDFlashMaxBlockSize
+                  }) ?? true
             else {
                 throw MLXFastError.invalidInput(
                     "DFlash reference-rows request is malformed or has "
@@ -464,7 +476,8 @@ extension LagunaRuntime {
                 seedTokenCount: seedTokenCount,
                 startOffset: startOffset,
                 count: rowCount,
-                widestFrame: widestFrame
+                widestFrame: widestFrame,
+                verifyBlockTokens: request.verifyBlockTokens
             )
             // The emitted-token readouts exist only for rows whose context
             // carries a next token, which is a PREFIX of the batch, so they are
@@ -486,7 +499,9 @@ extension LagunaRuntime {
                 referenceEmittedTokenLogits: emittedPrefix
                     .compactMap(\.emittedTokenLogit),
                 referenceFrameWidths: answer.frameWidths,
-                referenceFrameArgmax: answer.frameArgmax
+                referenceFrameArgmax: answer.frameArgmax,
+                referenceVerifyTop2Tokens: answer.verifyBlockTop2Tokens,
+                referenceVerifyTop2Logits: answer.verifyBlockTop2Logits
             )
 
         default:

@@ -1654,6 +1654,55 @@ func runtimeWorkerClientCancelsSuccessfulRequestWatchdogs() throws {
     _ = try client.prefill(promptTokens: [2])
 }
 
+/// The DFlash reference-rows request must actually carry the verify block on the
+/// wire (contract Amendment 21). It is the only field that lets the reference
+/// reach a REJECTED row, and a client that accepted the argument and then dropped
+/// it produced exactly one symptom -- the reference "did not return the replay it
+/// was asked for" -- with no compile error anywhere. Assert the bytes.
+@Test
+func dflashReferenceRowsRequestCarriesTheVerifyBlockOnTheWire() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let requestLog = directory.appendingPathComponent("request.json")
+    let executable = try makeRuntimeWorkerScript("""
+    #!/bin/sh
+    printf '%s\\n' '{"id":0,"nonce":"test-nonce","ok":true}'
+    IFS= read -r request || exit 0
+    printf '%s' "$request" > "\(requestLog.path)"
+    printf '%s\\n' '{"id":1,"nonce":"test-nonce","ok":true,"reference_verify_top2_tokens":[[5,6],[7,8]],"reference_verify_top2_logits":[[2.5,1.5],[2.0,1.0]],"draft_tokens":[11,12]}'
+    IFS= read -r final || exit 0
+    """)
+    let client = try RuntimeWorkerClient(
+        options: RuntimeWorkerOptions(
+            executablePath: executable.path,
+            helloTimeoutSeconds: 2,
+            requestTimeoutSeconds: 5,
+            shutdownTimeoutSeconds: 0.5,
+            terminationGraceSeconds: 0.25
+        ),
+        weightsPath: directory.path
+    )
+    defer { client.close() }
+
+    let response = try client.dflashReferenceRows(
+        prefixTokens: [1, 2, 3, 4],
+        seedTokenCount: 2,
+        startOffset: 2,
+        rowCount: 1,
+        widestFrame: 2,
+        verifyBlockTokens: [3, 99]
+    )
+    let wire = try String(contentsOf: requestLog, encoding: .utf8)
+    #expect(
+        wire.contains("\"verify_block_tokens\":[3,99]"),
+        "the verify block must reach the reference worker: \(wire)"
+    )
+    // And the reference's answer must decode back into the parent's fields.
+    #expect(response.referenceVerifyTop2Tokens == [[5, 6], [7, 8]])
+    #expect(response.referenceVerifyTop2Logits == [[2.5, 1.5], [2.0, 1.0]])
+    #expect(response.draftTokens == [11, 12])
+}
+
 @Test
 func runtimeWorkerClientTimesOutStalledRequest() throws {
     // Bounded stall (see runtimeWorkerClientTimesOutWaitingForHello): the

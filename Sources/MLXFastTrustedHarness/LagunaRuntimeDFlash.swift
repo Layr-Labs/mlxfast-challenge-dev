@@ -73,6 +73,31 @@ public struct DFlashReferenceRow: Equatable, Sendable {
     }
 }
 
+/// One reference answer for a round: the per-emitted-row verdicts, plus -- when
+/// the oracle can produce it -- the reference's own readouts for EVERY row of the
+/// candidate's verify block, including the rejected tail.
+public struct DFlashReferenceBatch: Sendable {
+    /// One entry per emitted token, as before.
+    public let rows: [DFlashReferenceRow]
+    /// Per-row top-2 token ids for all `declaredRows` rows of the candidate's own
+    /// verify block, `nil` when this oracle cannot replay one. A pre-generated
+    /// golden cannot: its rows are the emitted chain and it stores no drafts, so
+    /// the tail simply stays unpriced and the run still validates.
+    public let verifyBlockTop2Tokens: [[Int]]?
+    /// Top-2 logit VALUES aligned with `verifyBlockTop2Tokens`.
+    public let verifyBlockTop2Logits: [[Double]]?
+
+    public init(
+        rows: [DFlashReferenceRow],
+        verifyBlockTop2Tokens: [[Int]]? = nil,
+        verifyBlockTop2Logits: [[Double]]? = nil
+    ) {
+        self.rows = rows
+        self.verifyBlockTop2Tokens = verifyBlockTop2Tokens
+        self.verifyBlockTop2Logits = verifyBlockTop2Logits
+    }
+}
+
 /// Source of reference verdicts for the trusted parent.
 public protocol DFlashReferenceOracle {
     /// Reference rows for `[startOffset, startOffset + count)` of the emitted
@@ -83,6 +108,49 @@ public protocol DFlashReferenceOracle {
         count: Int,
         declaredBlockWidth: Int
     ) throws -> [DFlashReferenceRow]
+
+    /// The same rows PLUS a replay of the candidate's own verify block
+    /// (`[bonus] + draftTokens`, `declaredRows` wide), read out per row.
+    ///
+    /// One call rather than two on purpose: the live reference holds a single
+    /// continuously-advanced cache, and a second request at the same offset would
+    /// be out of order and force a full rebuild -- O(n^2) over a run. The verify
+    /// block is a branch off the same cache at the same boundary, so it costs one
+    /// extra forward and nothing else.
+    func referenceBatch(
+        emittedPrefix: [Int],
+        startOffset: Int,
+        count: Int,
+        declaredBlockWidth: Int,
+        declaredRows: Int,
+        draftTokens: [Int]
+    ) throws -> DFlashReferenceBatch
+}
+
+extension DFlashReferenceOracle {
+    /// Default: answer the emitted rows only, so every existing oracle keeps
+    /// working unchanged and the rejected tail stays unpriced rather than
+    /// failing the run. This is the LEGACY path -- a stored golden, a test
+    /// double -- and the counters say so: `rejected_rows_reference_checked`
+    /// stays 0, which is how an audit tells a tail that was priced from one
+    /// that was skipped.
+    public func referenceBatch(
+        emittedPrefix: [Int],
+        startOffset: Int,
+        count: Int,
+        declaredBlockWidth: Int,
+        declaredRows: Int,
+        draftTokens: [Int]
+    ) throws -> DFlashReferenceBatch {
+        DFlashReferenceBatch(
+            rows: try referenceRows(
+                emittedPrefix: emittedPrefix,
+                startOffset: startOffset,
+                count: count,
+                declaredBlockWidth: declaredBlockWidth
+            )
+        )
+    }
 }
 
 public enum DFlashValidationOutcome: String, Sendable {
@@ -112,6 +180,17 @@ public struct DFlashContractViolation: Error, CustomStringConvertible {
         case declaredRowsMissing
         case workBindingMissing
         case workBindingLogitMismatch
+        /// The round's reported draft list does not bind to its emitted tokens:
+        /// wrong length for the declared width, or an accepted draft that is not
+        /// the token emitted at that index. Needs no reference (Amendment 21).
+        case draftTokenBindingMismatch
+        /// A row the round declared but did not emit -- the rejected tail -- has
+        /// readouts the reference's replay of the SAME verify block contradicts.
+        case rejectedRowReadoutMismatch
+        /// The round claimed a rejection the reference says did not happen: the
+        /// reference's own argmax at the first rejected row IS the draft the
+        /// candidate says it overruled.
+        case fabricatedRejection
         case cacheOffsetDiverged
         case incompleteRun
     }
@@ -203,6 +282,22 @@ public struct DFlashObservedRound: Sendable {
     public let declaredRows: Int
     public let perRowTop2Tokens: [[Int]]
     public let perRowTop2Logits: [[Double]]
+    /// The drafter's proposals for this round in verify-input order, so the
+    /// round's actual verify block is `[bonus] + draftTokens` and
+    /// `draftTokens.count == declaredRows - 1`.
+    ///
+    /// Journalled because the REJECTED TAIL cannot be priced without it. The
+    /// emitted tokens describe the verify input only up to the first rejection;
+    /// after that the candidate fed itself drafts the target overruled, and no
+    /// emitted token records them. Those are exactly the rows an eliding verifier
+    /// can fabricate for nothing -- and at 69% draft acceptance and width 4 they
+    /// are ~0.25 of every 1.25 declared rows per emitted token, i.e. the whole
+    /// speculation tax.
+    ///
+    /// Defaults to empty so a caller predating the field still compiles; the
+    /// structural half then rejects any round wider than one row, which is the
+    /// intended behaviour for a worker that does not report its drafts.
+    public let draftTokens: [Int]
     public let acceptedDraftCount: Int
     public let rejectedDraftCount: Int
     public let targetCacheOffset: Int
@@ -214,6 +309,7 @@ public struct DFlashObservedRound: Sendable {
         declaredRows: Int,
         perRowTop2Tokens: [[Int]],
         perRowTop2Logits: [[Double]],
+        draftTokens: [Int] = [],
         acceptedDraftCount: Int,
         rejectedDraftCount: Int,
         targetCacheOffset: Int,
@@ -224,6 +320,7 @@ public struct DFlashObservedRound: Sendable {
         self.declaredRows = declaredRows
         self.perRowTop2Tokens = perRowTop2Tokens
         self.perRowTop2Logits = perRowTop2Logits
+        self.draftTokens = draftTokens
         self.acceptedDraftCount = acceptedDraftCount
         self.rejectedDraftCount = rejectedDraftCount
         self.targetCacheOffset = targetCacheOffset
@@ -275,12 +372,30 @@ public final class LagunaDFlashBlockValidator {
     public private(set) var nearTieAdmissionCount = 0
     public private(set) var declaredRowTotal = 0
     public private(set) var roundLatencies = [Double]()
-    /// Rows the parent actually obtained a reference verdict for. The box
-    /// wrapper cross-checks this against the emitted total; it cannot yet equal
-    /// `declaredRowTotal` because the worker does not report the token ids of
-    /// REJECTED draft rows, so the reference has nothing to score them against
-    /// (an L2 follow-up).
+    /// Rows the parent actually obtained a reference verdict for: one per
+    /// emitted token, PLUS every rejected-tail row the reference priced against
+    /// the candidate's own replayed verify block. The box wrapper cross-checks
+    /// this against the emitted total (`>=`).
+    ///
+    /// It reaches `declaredRowTotal` on a run where every round journalled its
+    /// drafts and the live reference replayed them; it falls short on a legacy
+    /// golden-only run, and the shortfall is exactly the tail that went unpriced.
     public private(set) var referenceCheckedRowTotal = 0
+    /// Rejected-tail rows priced against the reference's replay of the
+    /// candidate's own verify block. Zero means the tail was NOT priced -- either
+    /// no round rejected anything, or the oracle could not replay a verify block.
+    public private(set) var rejectedRowsReferenceChecked = 0
+    /// Rounds for which a verify-block replay came back at all.
+    public private(set) var verifyBlockReplayedRoundCount = 0
+    /// The tail rows' own `|candidate - reference|` top-2 gaps, kept separately
+    /// as well as pooled into `workBindingLogitDeltas`.
+    ///
+    /// Separate because the two populations answer different questions. An
+    /// emitted row compares the candidate's width-K readout against the
+    /// reference's width-1 walk, so it carries the block-FRAME divergence term.
+    /// A tail row compares width-K against width-K on the SAME inputs, so it
+    /// carries only the build term. Pooling them would hide which one moved.
+    public private(set) var rejectedTailLogitDeltas = [Double]()
     /// Every observed `|candidate - reference|` top-2 logit gap, including the
     /// ones comfortably inside tolerance.
     ///
@@ -426,7 +541,11 @@ public final class LagunaDFlashBlockValidator {
         }
         guard round.acceptedDraftCount >= 0,
               round.rejectedDraftCount >= 0,
-              round.acceptedDraftCount + 1 >= round.tokens.count
+              round.acceptedDraftCount + 1 >= round.tokens.count,
+              // An accepted draft has to BE a draft: the verify block is one
+              // bonus row plus `declaredRows - 1` proposals, so nothing above
+              // that can have been accepted.
+              round.acceptedDraftCount <= round.declaredRows - 1
         else {
             throw DFlashContractViolation(
                 kind: .rowAccountingMismatch,
@@ -496,6 +615,54 @@ public final class LagunaDFlashBlockValidator {
             }
         }
 
+        // DRAFT BINDING, also reference-free, and the precondition for pricing
+        // the rejected tail at all (Amendment 21).
+        //
+        // The verify input is `[bonus, d0, ..., d_{K-2}]`, so row `i + 1` is fed
+        // `d_i` and row `i` is what `d_i` was proposed to predict. The accept walk
+        // compares `d_i` to row `i`'s argmax, and emits rows `0 ... accepted`.
+        // Therefore an ACCEPTED draft IS the emitted token at its own index:
+        // `emitted[i] == d_i` for every `i < acceptedDraftCount`, checkable with
+        // no reference, no tolerance and no round-trip.
+        //
+        // Without it a worker could journal any convenient draft list for the
+        // accepted prefix and thereby choose the verify block the reference
+        // replays. With it the accepted prefix of that block is pinned to tokens
+        // the parent already holds, and only the rejected tail is worker-asserted
+        // -- which the reference then prices row for row.
+        guard round.draftTokens.count == round.declaredRows - 1 else {
+            throw DFlashContractViolation(
+                kind: .draftTokenBindingMismatch,
+                step: step,
+                detail: "reported \(round.draftTokens.count) draft tokens for "
+                    + "\(round.declaredRows) declared rows"
+            )
+        }
+        guard round.draftTokens.allSatisfy({
+            $0 >= 0 && $0 < MLXFastConstants.vocabSize
+        }) else {
+            throw DFlashContractViolation(
+                kind: .outOfVocabularyToken,
+                step: step,
+                detail: "a reported draft token is outside the vocabulary"
+            )
+        }
+        // `min` because the parent may have trimmed the emitted prefix to fit the
+        // scored window; the trimmed-away tokens were still accepted drafts.
+        let boundDraftCount = Swift.min(
+            round.tokens.count,
+            round.acceptedDraftCount
+        )
+        for index in 0 ..< boundDraftCount
+        where round.draftTokens[index] != round.tokens[index] {
+            throw DFlashContractViolation(
+                kind: .draftTokenBindingMismatch,
+                step: step + index,
+                detail: "draft \(index) was reported accepted but is not the "
+                    + "token emitted at that row"
+            )
+        }
+
         journal.append(round)
         committedTokens.append(contentsOf: round.tokens)
         declaredRowTotal += round.declaredRows
@@ -528,12 +695,15 @@ public final class LagunaDFlashBlockValidator {
         emittedPrefix.reserveCapacity(committedTokens.count)
         for round in journal {
             let step = emittedPrefix.count
-            let reference = try oracle.referenceRows(
+            let batch = try oracle.referenceBatch(
                 emittedPrefix: emittedPrefix,
                 startOffset: step,
                 count: round.tokens.count,
-                declaredBlockWidth: round.requestedBlockSize
+                declaredBlockWidth: round.requestedBlockSize,
+                declaredRows: round.declaredRows,
+                draftTokens: round.draftTokens
             )
+            let reference = batch.rows
             guard reference.count == round.tokens.count else {
                 throw DFlashContractViolation(
                     kind: .workBindingMissing,
@@ -543,6 +713,7 @@ public final class LagunaDFlashBlockValidator {
                 )
             }
             try score(round: round, against: reference, step: step)
+            try priceRejectedTail(round: round, against: batch, step: step)
             emittedPrefix.append(contentsOf: round.tokens)
             referenceCheckedRowTotal += reference.count
         }
@@ -666,6 +837,155 @@ public final class LagunaDFlashBlockValidator {
         }
     }
 
+    /// A row the reference cannot rank: its own top-1 and top-2 sit inside the
+    /// measured build-to-build drift envelope, so which one it calls first is a
+    /// property of accumulation order rather than of the model.
+    ///
+    /// Used ONLY to suppress the tail's exact-id check at such a row. It is the
+    /// same envelope the emitted rows' near-tie admission uses and the same
+    /// reasoning: at a row the reference cannot break, a disagreement is not
+    /// evidence about the candidate. No new constant is introduced, and the
+    /// tolerance the tail's VALUES are judged by is the shared
+    /// `DFlashWorkBindingTolerance`, both arms, unchanged.
+    private func referenceVerifyRowIsFlat(_ logits: [Double]) -> Bool {
+        guard logits.count >= 2 else { return false }
+        return (logits[0] - logits[1])
+            <= MLXFastConstants.experimentalDFlashNearTieLogitEnvelope
+    }
+
+    /// L2 over the REJECTED TAIL: the rows the round declared, computed, and then
+    /// rolled back (Amendment 21).
+    ///
+    /// Why this is the gap that mattered. `score()` prices only the emitted rows,
+    /// so the rows after the first rejection carried per-row readouts that were
+    /// length-checked and then compared to nothing. Yet honest partial acceptance
+    /// must COMPUTE those rows -- computing them is HOW it discovers the rejection
+    /// -- so at width 4 and 69% acceptance an honest verifier declares and
+    /// computes about 1.25 rows per emitted token, and that ratio IS the ~16%
+    /// speculation tax. A verifier that runs the per-row lm_head only until the
+    /// walk breaks, then copies an accepted row's readouts into the tail, computes
+    /// 1.0 rows per token and recovers the entire tax while emitting bit-identical
+    /// tokens.
+    ///
+    /// Two independent binds, in increasing order of strength:
+    ///
+    /// 1. THE REJECTION CLAIM. At the first rejected row the reference's own
+    ///    argmax must not be the draft the candidate says it overruled. A
+    ///    candidate that reports a rejection the reference contradicts has
+    ///    asserted work whose result the reference denies.
+    /// 2. THE TAIL READOUTS. Every declared-but-unemitted row is compared to the
+    ///    reference's replay of the SAME verify block: the top-1 id exactly
+    ///    (except at a row the reference itself cannot rank), and the top-2 VALUES
+    ///    under the shared tolerance.
+    ///
+    /// The id half is the strong one, and the asymmetry is worth stating because
+    /// Amendment 19 recorded the opposite for the emitted rows. There, reporting
+    /// `top1 = emitted token` costs a blind-accepting cheater nothing: it already
+    /// knows every emitted token. Here it costs everything -- a rejected row's
+    /// output was never emitted, so the candidate has no independent source for
+    /// it. The nearest free guess is the drafter's own proposal for that row,
+    /// which is wrong by construction at the first rejected row and unreliable
+    /// after it, and the last declared row has no proposal at all.
+    ///
+    /// Degrades gracefully by design: an oracle that cannot replay a verify block
+    /// (a pre-generated golden, a test double) returns no verify readouts and this
+    /// scores nothing rather than failing the run. `rejectedRowsReferenceChecked`
+    /// is how an audit distinguishes the two.
+    private func priceRejectedTail(
+        round: DFlashObservedRound,
+        against batch: DFlashReferenceBatch,
+        step: Int
+    ) throws {
+        guard let referenceTokens = batch.verifyBlockTop2Tokens,
+              let referenceLogits = batch.verifyBlockTop2Logits,
+              referenceTokens.count == round.declaredRows,
+              referenceLogits.count == round.declaredRows
+        else {
+            return
+        }
+        verifyBlockReplayedRoundCount += 1
+
+        // 1. The rejection claim itself.
+        let firstRejectedRow = round.acceptedDraftCount
+        if firstRejectedRow < round.draftTokens.count,
+           let referenceTop1 = referenceTokens[firstRejectedRow].first,
+           referenceTop1 == round.draftTokens[firstRejectedRow],
+           !referenceVerifyRowIsFlat(referenceLogits[firstRejectedRow])
+        {
+            throw DFlashContractViolation(
+                kind: .fabricatedRejection,
+                step: step + firstRejectedRow,
+                detail: "row \(firstRejectedRow) was reported as the first "
+                    + "rejected draft, but the reference's own argmax at that "
+                    + "row in the candidate's verify block IS that draft"
+            )
+        }
+
+        // 2. The tail readouts. Rows the round declared but did not emit.
+        guard round.tokens.count < round.declaredRows else { return }
+        for row in round.tokens.count ..< round.declaredRows {
+            let candidateIDs = round.perRowTop2Tokens[row]
+            let candidateValues = round.perRowTop2Logits[row]
+            let referenceRowIDs = referenceTokens[row]
+            let referenceRowValues = referenceLogits[row]
+            rejectedRowsReferenceChecked += 1
+            referenceCheckedRowTotal += 1
+
+            if !referenceVerifyRowIsFlat(referenceRowValues),
+               let referenceTop1 = referenceRowIDs.first,
+               let candidateTop1 = candidateIDs.first,
+               candidateTop1 != referenceTop1
+            {
+                throw DFlashContractViolation(
+                    kind: .rejectedRowReadoutMismatch,
+                    step: step + row,
+                    detail: "rejected row \(row) of \(round.declaredRows) "
+                        + "reports a top-1 the reference's replay of the same "
+                        + "verify block contradicts at a row the reference "
+                        + "answers confidently (declared width "
+                        + "\(round.requestedBlockSize))"
+                )
+            }
+
+            let pairCount = Swift.min(
+                candidateValues.count,
+                referenceRowValues.count
+            )
+            for pair in 0 ..< pairCount {
+                let candidateValue = candidateValues[pair]
+                let referenceValue = referenceRowValues[pair]
+                let delta = abs(candidateValue - referenceValue)
+                // Pooled into the same distribution as the emitted rows -- the
+                // tolerance is one tolerance -- and also kept separately so the
+                // two populations stay separable in an audit.
+                workBindingLogitDeltas.append(delta)
+                let scale = Swift.max(
+                    abs(candidateValue),
+                    abs(referenceValue)
+                )
+                workBindingLogitRelativeDeltas.append(
+                    scale > 0 ? delta / scale : 0
+                )
+                workBindingComparisonWidths.append(round.requestedBlockSize)
+                rejectedTailLogitDeltas.append(delta)
+                guard tolerance.matches(
+                    candidate: candidateValue,
+                    reference: referenceValue
+                ) else {
+                    throw DFlashContractViolation(
+                        kind: .rejectedRowReadoutMismatch,
+                        step: step + row,
+                        detail: "rejected row \(row) readout \(pair) outside "
+                            + "tolerance (delta \(delta) at declared width "
+                            + "\(round.requestedBlockSize); absolute arm "
+                            + "\(tolerance.absolute), relative arm "
+                            + "\(tolerance.relative))"
+                    )
+                }
+            }
+        }
+    }
+
     /// Require the run to have produced exactly the configured token total.
     public func requireComplete() throws {
         guard committedTokens.count == totalTokenCount else {
@@ -720,6 +1040,13 @@ public final class LagunaDFlashBlockValidator {
     }
     public var p99WorkBindingLogitDelta: Double {
         workBindingLogitDeltaQuantile(0.99)
+    }
+
+    public var maxRejectedTailLogitDelta: Double {
+        rejectedTailLogitDeltas.max() ?? 0
+    }
+    public var rejectedTailComparisonCount: Int {
+        rejectedTailLogitDeltas.count
     }
 
     public var maxWorkBindingLogitRelativeDelta: Double {
@@ -807,6 +1134,18 @@ public struct ExperimentalDFlashReport: Equatable {
     public let seedTokenCount: Int
     public let targetCacheOffsetFinal: Int
     public let referenceCheckedRowTotal: Int
+    /// Rejected-tail rows the reference actually priced (Amendment 21). Zero on a
+    /// run whose oracle could not replay the candidate's verify block, which is
+    /// the legacy fallback rather than a pass.
+    public let rejectedRowsReferenceChecked: Int
+    /// Rounds whose verify block the reference replayed.
+    public let verifyBlockReplayedRoundCount: Int
+    /// Comparisons drawn from tail rows, and their largest gap. Reported beside
+    /// the pooled figures so the block-frame term (emitted rows, width-K against
+    /// the reference's width-1 walk) and the build term (tail rows, width-K
+    /// against width-K on identical inputs) stay separable.
+    public let rejectedTailComparisonCount: Int
+    public let maxRejectedTailLogitDelta: Double
     public let targetTailTotal: Int
     public let maxBlockRequestSeconds: Double
     public let p50BlockRequestSeconds: Double
@@ -850,6 +1189,10 @@ public struct ExperimentalDFlashReport: Equatable {
         seedTokenCount: Int = 0,
         targetCacheOffsetFinal: Int = 0,
         referenceCheckedRowTotal: Int = 0,
+        rejectedRowsReferenceChecked: Int = 0,
+        verifyBlockReplayedRoundCount: Int = 0,
+        rejectedTailComparisonCount: Int = 0,
+        maxRejectedTailLogitDelta: Double = 0,
         targetTailTotal: Int = 0,
         maxBlockRequestSeconds: Double = 0,
         p50BlockRequestSeconds: Double = 0,
@@ -885,6 +1228,10 @@ public struct ExperimentalDFlashReport: Equatable {
         self.seedTokenCount = seedTokenCount
         self.targetCacheOffsetFinal = targetCacheOffsetFinal
         self.referenceCheckedRowTotal = referenceCheckedRowTotal
+        self.rejectedRowsReferenceChecked = rejectedRowsReferenceChecked
+        self.verifyBlockReplayedRoundCount = verifyBlockReplayedRoundCount
+        self.rejectedTailComparisonCount = rejectedTailComparisonCount
+        self.maxRejectedTailLogitDelta = maxRejectedTailLogitDelta
         self.targetTailTotal = targetTailTotal
         self.maxBlockRequestSeconds = maxBlockRequestSeconds
         self.p50BlockRequestSeconds = p50BlockRequestSeconds

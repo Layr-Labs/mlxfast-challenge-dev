@@ -875,12 +875,445 @@ struct DFlashWorkBindingHardeningTests {
             declaredRows: 3,
             perRowTop2Tokens: [[100, 7], [200, 9], [301, 11]],
             perRowTop2Logits: [[23.75, 20.0], [22.0, 19.0], [21.5, 18.0]],
+            // Draft 0 was accepted, so it IS the token emitted at row 0; draft 1
+            // is the one the target overruled (Amendment 21's draft binding).
+            draftTokens: [100, 777],
             acceptedDraftCount: 1,
             rejectedDraftCount: 1,
             targetCacheOffset: 10,
             latencySeconds: 0.02
         )
         try validator().acceptStructural(round: round)
+    }
+}
+
+// MARK: - The rejected tail (contract Amendment 21)
+
+/// L2 used to price only the EMITTED rows. Everything after the first rejected
+/// draft carried per-row readouts that were length-checked and then compared to
+/// nothing -- and those are exactly the rows an honest verifier must COMPUTE
+/// (computing them is how it discovers the rejection) and a cheating one can
+/// fabricate for free. At width 4 and 69% acceptance the ratio is ~1.25 declared
+/// rows per emitted token, so the fabrication recovers the entire ~16%
+/// speculation tax while emitting bit-identical tokens.
+///
+/// These pin the three binds that close it: the reference-free draft binding, the
+/// reference's replay of the candidate's OWN verify block over the tail rows, and
+/// the rejection claim itself.
+@Suite
+struct DFlashRejectedTailBindingTests {
+    /// Oracle that answers the emitted rows AND replays a verify block.
+    private struct ScriptedOracle: DFlashReferenceOracle {
+        let emittedRows: [DFlashReferenceRow]
+        let verifyTop2Tokens: [[Int]]?
+        let verifyTop2Logits: [[Double]]?
+        /// Records what the validator asked for, so a test can prove the verify
+        /// block was reconstructed from the journal rather than invented.
+        let observedDrafts = DraftRecorder()
+
+        final class DraftRecorder: @unchecked Sendable {
+            private(set) var drafts = [[Int]]()
+            func record(_ value: [Int]) { drafts.append(value) }
+        }
+
+        func referenceRows(
+            emittedPrefix: [Int],
+            startOffset: Int,
+            count: Int,
+            declaredBlockWidth: Int
+        ) throws -> [DFlashReferenceRow] {
+            Array(emittedRows[startOffset ..< (startOffset + count)])
+        }
+
+        func referenceBatch(
+            emittedPrefix: [Int],
+            startOffset: Int,
+            count: Int,
+            declaredBlockWidth: Int,
+            declaredRows: Int,
+            draftTokens: [Int]
+        ) throws -> DFlashReferenceBatch {
+            observedDrafts.record(draftTokens)
+            return DFlashReferenceBatch(
+                rows: try referenceRows(
+                    emittedPrefix: emittedPrefix,
+                    startOffset: startOffset,
+                    count: count,
+                    declaredBlockWidth: declaredBlockWidth
+                ),
+                verifyBlockTop2Tokens: verifyTop2Tokens,
+                verifyBlockTop2Logits: verifyTop2Logits
+            )
+        }
+    }
+
+    /// A pre-Amendment-21 oracle: emitted rows only, no verify-block replay. It
+    /// deliberately does NOT implement `referenceBatch`, so it takes the protocol
+    /// default -- which is the legacy path a stored golden falls back to.
+    private struct LegacyRowsOnlyOracle: DFlashReferenceOracle {
+        let emittedRows: [DFlashReferenceRow]
+        func referenceRows(
+            emittedPrefix: [Int],
+            startOffset: Int,
+            count: Int,
+            declaredBlockWidth: Int
+        ) throws -> [DFlashReferenceRow] {
+            Array(emittedRows[startOffset ..< (startOffset + count)])
+        }
+    }
+
+    // Emitted rows the candidate's tokens 100 and 200 are the argmax of. Wide
+    // top-1/top-2 gaps: this model answers confidently almost everywhere (3
+    // near-tie rows per 128 positions measured on varied prose).
+    private static let emittedRows = [
+        DFlashReferenceRow(
+            sequentialArgmax: 100,
+            declaredFrameArgmax: 100,
+            top2Tokens: [100, 7],
+            top2Logits: [23.75, 12.0]
+        ),
+        DFlashReferenceRow(
+            sequentialArgmax: 200,
+            declaredFrameArgmax: 200,
+            top2Tokens: [200, 9],
+            top2Logits: [22.0, 11.0]
+        ),
+    ]
+
+    /// The reference's replay of the candidate's own width-4 verify block. Rows 0
+    /// and 1 are the emitted ones; rows 2 and 3 are the tail rollback discarded.
+    private static let referenceVerifyTokens = [
+        [100, 7], [200, 9], [301, 11], [302, 12],
+    ]
+    private static let referenceVerifyLogits = [
+        [23.75, 12.0], [22.0, 11.0], [21.5, 10.0], [20.5, 9.0],
+    ]
+
+    private func validator(
+        oracle: any DFlashReferenceOracle
+    ) -> LagunaDFlashBlockValidator {
+        LagunaDFlashBlockValidator(
+            oracle: oracle,
+            seedTokenCount: 8,
+            totalTokenCount: 128
+        )
+    }
+
+    /// Width 4, one accepted draft, two rejected rows. `draftTokens[0] == 100`
+    /// because an accepted draft IS the token emitted at its own index.
+    private func round(
+        perRowTop2Tokens: [[Int]] = [[100, 7], [200, 9], [301, 11], [302, 12]],
+        perRowTop2Logits: [[Double]] = [
+            [23.75, 12.0], [22.0, 11.0], [21.5, 10.0], [20.5, 9.0],
+        ],
+        draftTokens: [Int] = [100, 777, 888],
+        acceptedDraftCount: Int = 1
+    ) -> DFlashObservedRound {
+        DFlashObservedRound(
+            requestedBlockSize: 4,
+            tokens: [100, 200],
+            declaredRows: 4,
+            perRowTop2Tokens: perRowTop2Tokens,
+            perRowTop2Logits: perRowTop2Logits,
+            draftTokens: draftTokens,
+            acceptedDraftCount: acceptedDraftCount,
+            rejectedDraftCount: 3 - acceptedDraftCount,
+            targetCacheOffset: 10,
+            latencySeconds: 0.02
+        )
+    }
+
+    private func violation(_ body: () throws -> Void) -> DFlashContractViolation? {
+        do {
+            try body()
+            return nil
+        } catch let violation as DFlashContractViolation {
+            return violation
+        } catch {
+            return nil
+        }
+    }
+
+    // --- 1. the honest round is unaffected, and the tail is now priced -----
+
+    @Test
+    func anHonestRoundPassesAndItsRejectedTailIsActuallyPriced() throws {
+        let oracle = ScriptedOracle(
+            emittedRows: Self.emittedRows,
+            verifyTop2Tokens: Self.referenceVerifyTokens,
+            verifyTop2Logits: Self.referenceVerifyLogits
+        )
+        let validator = validator(oracle: oracle)
+        try validator.acceptStructural(round: round())
+        try validator.validateJournalAgainstReference()
+
+        #expect(validator.rejectedRowsReferenceChecked == 2)
+        #expect(validator.verifyBlockReplayedRoundCount == 1)
+        // Two emitted rows plus two tail rows: the whole declared block is now
+        // covered, which is what the ledger could never claim before.
+        #expect(validator.referenceCheckedRowTotal == 4)
+        #expect(validator.referenceCheckedRowTotal == validator.declaredRowTotal)
+        #expect(validator.rejectedTailComparisonCount == 4)
+        #expect(validator.maxRejectedTailLogitDelta == 0)
+        // The verify block the reference replayed was built from the journalled
+        // drafts, not from anything the reference chose.
+        #expect(oracle.observedDrafts.drafts == [[100, 777, 888]])
+    }
+
+    /// Honest cross-build drift on the tail rows still passes -- the tail is
+    /// judged by the SAME tolerance as the emitted rows, and 4.625 is the largest
+    /// honest cross-build gap Amendment 20 measured.
+    @Test
+    func honestCrossBuildDriftOnTheTailIsAdmissible() throws {
+        let drifted: [[Double]] = [
+            [23.75, 12.0], [22.0, 11.0], [21.5 - 4.625, 10.0], [20.5, 9.0],
+        ]
+        let validator = validator(
+            oracle: ScriptedOracle(
+                emittedRows: Self.emittedRows,
+                verifyTop2Tokens: Self.referenceVerifyTokens,
+                verifyTop2Logits: Self.referenceVerifyLogits
+            )
+        )
+        try validator.acceptStructural(round: round(perRowTop2Logits: drifted))
+        try validator.validateJournalAgainstReference()
+        #expect(validator.rejectedRowsReferenceChecked == 2)
+        #expect(validator.maxRejectedTailLogitDelta == 4.625)
+    }
+
+    // --- 2. the reference-free draft binding ------------------------------
+
+    /// A worker that does not report its drafts cannot have its tail priced, so
+    /// the round is refused rather than admitted unpriced.
+    @Test
+    func aRoundThatReportsNoDraftTokensIsRejected() {
+        let thrown = violation {
+            try validator(
+                oracle: LegacyRowsOnlyOracle(emittedRows: Self.emittedRows)
+            ).acceptStructural(round: round(draftTokens: []))
+        }
+        #expect(thrown?.kind == .draftTokenBindingMismatch)
+        #expect(thrown?.step == 0)
+    }
+
+    /// `emitted[i] == draftTokens[i]` for every accepted draft, checkable with no
+    /// reference at all: row `i + 1`'s input is `d_i`, and the accept walk emits
+    /// row `i`'s own argmax, so an accepted draft equals the emitted token at that
+    /// index by construction. This is what stops a worker choosing a convenient
+    /// draft list for the prefix and thereby choosing the block the reference
+    /// replays.
+    @Test
+    func anAcceptedDraftThatIsNotTheEmittedTokenIsRejected() {
+        let thrown = violation {
+            try validator(
+                oracle: LegacyRowsOnlyOracle(emittedRows: Self.emittedRows)
+            ).acceptStructural(round: round(draftTokens: [999, 777, 888]))
+        }
+        #expect(thrown?.kind == .draftTokenBindingMismatch)
+        #expect(thrown?.step == 0, "fires at the offending row")
+    }
+
+    /// Claiming more accepted drafts than the block proposed is arithmetic.
+    @Test
+    func claimingMoreAcceptedDraftsThanTheBlockProposedIsRejected() {
+        let thrown = violation {
+            try validator(
+                oracle: LegacyRowsOnlyOracle(emittedRows: Self.emittedRows)
+            ).acceptStructural(
+                round: round(draftTokens: [100, 777, 888], acceptedDraftCount: 4)
+            )
+        }
+        #expect(thrown?.kind == .rowAccountingMismatch)
+    }
+
+    // --- 3. THE CHEAT: fabricated rejected-tail readouts ------------------
+
+    /// The speed-profitable fabrication: run the per-row lm_head only until the
+    /// accept walk breaks, then copy an accepted row's readouts into every
+    /// rejected row. Emitted tokens are bit-identical and the emitted rows'
+    /// readouts are genuine, so nothing before Amendment 21 looked at the tail.
+    @Test
+    func aTailFabricatedByCopyingAnAcceptedRowIsRejected() throws {
+        let copiedRowZero: [[Int]] = [[100, 7], [200, 9], [100, 7], [100, 7]]
+        let copiedLogits: [[Double]] = [
+            [23.75, 12.0], [22.0, 11.0], [23.75, 12.0], [23.75, 12.0],
+        ]
+        let validator = validator(
+            oracle: ScriptedOracle(
+                emittedRows: Self.emittedRows,
+                verifyTop2Tokens: Self.referenceVerifyTokens,
+                verifyTop2Logits: Self.referenceVerifyLogits
+            )
+        )
+        // The structural half cannot see it: the emitted rows are honest and the
+        // drafts bind. That is why this needed the reference.
+        try validator.acceptStructural(
+            round: round(
+                perRowTop2Tokens: copiedRowZero,
+                perRowTop2Logits: copiedLogits
+            )
+        )
+        let thrown = violation {
+            try validator.validateJournalAgainstReference()
+        }
+        #expect(thrown?.kind == .rejectedRowReadoutMismatch)
+        #expect(thrown?.step == 2, "the first rejected row")
+    }
+
+    /// And the same round is admitted when the tail is NOT priced. This is the
+    /// gap as it stood, and it is also the legacy fallback: an oracle that cannot
+    /// replay a verify block leaves the tail unpriced rather than failing the run,
+    /// and `rejectedRowsReferenceChecked` is how an audit tells the two apart.
+    @Test
+    func theSameFabricationPassesWhenTheTailIsNotPriced() throws {
+        let validator = validator(
+            oracle: LegacyRowsOnlyOracle(emittedRows: Self.emittedRows)
+        )
+        try validator.acceptStructural(
+            round: round(
+                perRowTop2Tokens: [[100, 7], [200, 9], [100, 7], [100, 7]],
+                perRowTop2Logits: [
+                    [23.75, 12.0], [22.0, 11.0], [23.75, 12.0], [23.75, 12.0],
+                ]
+            )
+        )
+        try validator.validateJournalAgainstReference()
+        #expect(validator.rejectedRowsReferenceChecked == 0)
+        #expect(validator.verifyBlockReplayedRoundCount == 0)
+        #expect(validator.referenceCheckedRowTotal == 2)
+        #expect(
+            validator.referenceCheckedRowTotal < validator.declaredRowTotal,
+            "the shortfall IS the tail that went unpriced"
+        )
+    }
+
+    /// A fabrication whose tail ids happen to be right is still bound by the
+    /// VALUES, under the shared tolerance -- the exact pair that defeated the old
+    /// OR (5.125 against 23.75, relative 0.216).
+    @Test
+    func aTailWithHonestIdsIsStillBoundByTheSharedTolerance() throws {
+        let validator = validator(
+            oracle: ScriptedOracle(
+                emittedRows: Self.emittedRows,
+                verifyTop2Tokens: Self.referenceVerifyTokens,
+                verifyTop2Logits: [
+                    [23.75, 12.0], [22.0, 11.0], [23.75, 10.0], [20.5, 9.0],
+                ]
+            )
+        )
+        try validator.acceptStructural(
+            round: round(
+                perRowTop2Logits: [
+                    [23.75, 12.0], [22.0, 11.0],
+                    [23.75 - 5.125, 10.0], [20.5, 9.0],
+                ]
+            )
+        )
+        let thrown = violation {
+            try validator.validateJournalAgainstReference()
+        }
+        #expect(thrown?.kind == .rejectedRowReadoutMismatch)
+        #expect(thrown?.step == 2)
+    }
+
+    /// The tail's exact-id bind is suppressed exactly where the emitted rows'
+    /// near-tie admission is: at a row the REFERENCE cannot rank. No new constant,
+    /// and the values still have to hold.
+    @Test
+    func aTailIdDisagreementAtAFlatReferenceRowIsNotAViolation() throws {
+        let flat: [[Double]] = [
+            [23.75, 12.0], [22.0, 11.0], [21.5, 21.0], [20.5, 9.0],
+        ]
+        let validator = validator(
+            oracle: ScriptedOracle(
+                emittedRows: Self.emittedRows,
+                verifyTop2Tokens: Self.referenceVerifyTokens,
+                verifyTop2Logits: flat
+            )
+        )
+        try validator.acceptStructural(
+            round: round(
+                // Row 2 reports the reference's #2 token as its top-1 -- which is
+                // what a differently-ordered accumulation produces at a flat row.
+                perRowTop2Tokens: [[100, 7], [200, 9], [11, 301], [302, 12]],
+                perRowTop2Logits: flat
+            )
+        )
+        try validator.validateJournalAgainstReference()
+        #expect(validator.rejectedRowsReferenceChecked == 2)
+    }
+
+    // --- 4. the rejection claim itself ------------------------------------
+
+    /// A round that claims draft `i` was overruled, at a row where the reference's
+    /// own argmax in the candidate's verify block IS that draft, has asserted a
+    /// rejection the reference denies.
+    @Test
+    func aRejectionTheReferenceContradictsIsRejected() throws {
+        let validator = validator(
+            oracle: ScriptedOracle(
+                emittedRows: Self.emittedRows,
+                // Row 1 is the first rejected draft's row, and the reference says
+                // its argmax is 777 -- the very draft the candidate overruled.
+                verifyTop2Tokens: [[100, 7], [777, 9], [301, 11], [302, 12]],
+                verifyTop2Logits: Self.referenceVerifyLogits
+            )
+        )
+        try validator.acceptStructural(round: round())
+        let thrown = violation {
+            try validator.validateJournalAgainstReference()
+        }
+        #expect(thrown?.kind == .fabricatedRejection)
+        #expect(thrown?.step == 1, "the first rejected draft's own row")
+    }
+
+    /// ...but not at a row the reference cannot rank, where "the reference says
+    /// 777" is not a fact about the candidate.
+    @Test
+    func aContradictedRejectionAtAFlatReferenceRowIsAdmitted() throws {
+        let validator = validator(
+            oracle: ScriptedOracle(
+                emittedRows: Self.emittedRows,
+                verifyTop2Tokens: [[100, 7], [777, 200], [301, 11], [302, 12]],
+                verifyTop2Logits: [
+                    [23.75, 12.0], [22.0, 21.5], [21.5, 10.0], [20.5, 9.0],
+                ]
+            )
+        )
+        try validator.acceptStructural(round: round())
+        try validator.validateJournalAgainstReference()
+        #expect(validator.rejectedRowsReferenceChecked == 2)
+    }
+
+    /// A fully-accepted round has no rejected tail, so nothing is priced and
+    /// nothing is claimed -- the checks must not invent a violation there.
+    @Test
+    func aFullyAcceptedRoundHasNoTailToPrice() throws {
+        let validator = validator(
+            oracle: ScriptedOracle(
+                emittedRows: Self.emittedRows,
+                verifyTop2Tokens: [[100, 7], [200, 9]],
+                verifyTop2Logits: [[23.75, 12.0], [22.0, 11.0]]
+            )
+        )
+        try validator.acceptStructural(
+            round: DFlashObservedRound(
+                requestedBlockSize: 2,
+                tokens: [100, 200],
+                declaredRows: 2,
+                perRowTop2Tokens: [[100, 7], [200, 9]],
+                perRowTop2Logits: [[23.75, 12.0], [22.0, 11.0]],
+                draftTokens: [100],
+                acceptedDraftCount: 1,
+                rejectedDraftCount: 0,
+                targetCacheOffset: 10,
+                latencySeconds: 0.02
+            )
+        )
+        try validator.validateJournalAgainstReference()
+        #expect(validator.rejectedRowsReferenceChecked == 0)
+        #expect(validator.verifyBlockReplayedRoundCount == 1)
+        #expect(validator.referenceCheckedRowTotal == 2)
     }
 }
 
