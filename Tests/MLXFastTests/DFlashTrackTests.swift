@@ -238,6 +238,15 @@ struct DFlashTrackTests {
         // ...and the serial pipeline stays ignorant of DFlash.
         let serial = try text(".github/workflows/benchmark.yml")
         #expect(!serial.lowercased().contains("dflash"))
+
+        // RUNNER POOL ISOLATION. Sharing the serial track's `m5-bench` label let a
+        // DFlash dispatch occupy a runner in the LIVE ranked pool for the length of
+        // a DFlash job. A dedicated label makes an unserved dispatch queue rather
+        // than run on the wrong box -- the safe failure for an inert track.
+        #expect(workflow.contains("runs-on: [self-hosted, m5-laguna-dflash]"))
+        #expect(!workflow.contains("runs-on: [self-hosted, m5-bench]"))
+        // The serial workflow keeps its own label, untouched.
+        #expect(serial.contains("runs-on: [self-hosted, m5-bench]"))
     }
 
     // Submitted code runs as the bench uid inside the job workspace; every
