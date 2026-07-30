@@ -1231,3 +1231,94 @@ Whether those two gaps must close before the track ranks, or whether they are
 acceptable as documented limits given that the hidden gates remain the fidelity
 authority, is a policy decision for the organizer and deliberately not decided
 here. The pinned test keeps official scoring off until someone decides.
+
+# Amendment 10 (2026-07-30): every green result so far was measured on degenerate text
+
+This is the most important entry in this document. Two contract defects are
+recorded below, but the framing matters more than either: **the entire validation
+record of this track was established on seed material with no near-ties in it**,
+which is precisely the condition the contract exists to handle.
+
+Every golden used for the e2e passes, the seam-crossing runs, the L2 calibration
+and the K sweep was built from a greedy SELF-continuation of the reference. Greedy
+self-continuation degenerates into repetition, and the resulting goldens are not
+representative in the one dimension that decides admissibility:
+
+| golden | seed len | distinct seed tokens | rows with top-2 gap < 0.25 | min top-2 gap |
+|---|---|---|---|---|
+| `seam-512-golden.json` (ranked-window fixture) | 512 | 122 | **0** | 1.875 |
+| `seam-b-golden.json` | 600 | 122 | **0** | 2.625 |
+| `seam-a-golden.json` | 509 | 122 | **0** | 1.875 |
+| `varied-512b-golden.json` (varied prose/code) | 512 | 317 | 3 | **0.0000** |
+| `varied-512-golden.json` | 512 | 317 | 3 | **0.0000** |
+
+The repetitive goldens contain no row whose top-2 logits are within 1.8 of each
+other. The model is so confident on repetitive text that the near-tie regime —
+the regime Criterion E was designed for, and the reason exact-token matching was
+abandoned — is never entered. Varied text contains EXACT 0.0000 ties, where the
+argmax is decided by tie-break order and is therefore frame-dependent by
+construction.
+
+Consequences: draft acceptance measured 100% on the repetitive fixtures and 69%
+on varied text; the residual bucket was never exercised; and no measurement taken
+against those fixtures should be treated as evidence about ranked behaviour. The
+hidden ranked prompts are prose, not degenerate self-continuations.
+
+## Defect 1: `reference_self_consistent` does not check what its name claims
+
+Three goldens report `reference_self_consistent: true` while containing rows where
+the reference contradicts ITSELF: `emitted_tokens[i]` differs from
+`rows[i].sequential_argmax` for the same position i.
+
+```
+varied-512-golden.json    emitted != sequential_argmax at rows 1, 3
+varied-512b-golden.json   emitted != sequential_argmax at row 5
+varied-512b-k3-golden.json  none  (same seed -- so this is frame/schedule dependent)
+```
+
+The cause is not nondeterminism, it is two frames inside one artifact: the
+reference EMITS by incremental decode and SCORES by stateless prefill replay, and
+those two frames disagree at near-ties — the same divergence Amendment 6 section 3
+measured at up to 27 ULP. The self-consistency check evidently compares repeated
+scoring runs to each other, not the emitted chain to the scored chain, so it
+passes artifacts that contain the contradiction.
+
+The consequence is severe: a golden with such a row REJECTS the honest candidate
+that reproduces the reference's own emitted token, because admissibility is
+checked against `sequential_argmax`. The reference is the authority and it is
+disagreeing with itself.
+
+Fix direction (not yet implemented): anchor the admissibility rows to the frame
+the reference actually emitted in, or compute `sequential_argmax` incrementally
+so the two frames coincide; and make the self-consistency check compare
+`emitted_tokens` against `rows[*].sequential_argmax` so an artifact carrying the
+contradiction cannot be published as consistent.
+
+## Defect 2: the residual budget is 1 slot at the ranked window
+
+`experimentalDFlashResidualDivergenceBudgetPerThousand` is 5, and the budget is
+`max(1, ceil(totalTokenCount * 5 / 1000))`. At the frozen 128-token decode window
+that is `ceil(0.64) = 1`. One slot, for the whole scored run.
+
+The calibration behind 5-per-thousand is recorded in `Constants.swift` as "14
+events across 2,304 emitted positions (<= 0.61%), every one of them explained by
+the declared-frame admission" — i.e. the residual bucket itself was measured as
+essentially unused. That measurement was taken on the degenerate fixtures above,
+where there are no near-ties to diverge at.
+
+On varied text, a 64-token control run already consumes its 1 slot
+(`residual_divergences: 1`), and a 128-token run hit `residualBudgetExhausted`.
+With 3 sub-0.25-gap rows per 128 positions plus the Defect 1 contradictions, an
+honest submission on a realistic hidden prompt is expected to need several slots
+and will instead be failed.
+
+Note also that the budget does not scale within the ranked window: 64 tokens and
+128 tokens both yield exactly 1, because 5-per-thousand rounds to 1 for anything
+under 200 tokens. Whatever the right rate is, the ranked window's budget should
+not be a rounding artifact.
+
+Fix direction (not yet implemented): recalibrate the rate against VARIED goldens,
+and size it from the measured near-tie density rather than from a run that never
+entered the near-tie regime. Both defects must close before
+`official_scoring_enabled` can be considered, and Defect 1 should close first
+because it corrupts the material any recalibration would use.
