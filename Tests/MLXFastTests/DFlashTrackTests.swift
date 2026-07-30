@@ -1449,3 +1449,47 @@ struct DFlashDecodeFloorTests {
         #expect(!workflow.contains("floor >= 1.0 on that aggregate"))
     }
 }
+
+// MARK: - The go-live runbook the workflow points at
+
+/// `.github/workflows/dflash-benchmark.yml` refers operators to a "DFlash go-live
+/// runbook" from four places, including a specific "step B" cited in an error
+/// message an operator only sees when a dispatch fails closed. That reference
+/// dangled at nothing until 2026-07-30. This pins its existence and the sections
+/// the workflow names, so the pointer cannot rot again.
+@Suite
+struct DFlashGoLiveRunbookTests {
+    private static let path = "docs/dflash-go-live-runbook.md"
+
+    @Test
+    func runbookExistsAndCoversTheStepsTheWorkflowCites() throws {
+        let runbook = try String(contentsOfFile: Self.path, encoding: .utf8)
+        // Steps named in the workflow's own error text.
+        #expect(runbook.contains("Step A"))
+        #expect(runbook.contains("Step B"))
+        // The two trusted-contract fields the enablement guard requires.
+        #expect(runbook.contains("official_scoring_enabled"))
+        #expect(runbook.contains("publication_allowed"))
+        // The blocking prerequisite the pool-selection step fails closed on.
+        #expect(runbook.contains("timed_prompt_pool"))
+    }
+
+    /// The runbook must carry the measured limits an operator is accepting by
+    /// flipping the switch, not just the mechanical steps. These are the ones that
+    /// took a full day of measurement to establish and would otherwise be
+    /// rediscovered the hard way.
+    @Test
+    func runbookRecordsTheLimitsBeingAcceptedAtGoLive() throws {
+        let runbook = try String(contentsOfFile: Self.path, encoding: .utf8)
+        // An unmodified candidate scores ~0.87, so the floor is not parity.
+        #expect(runbook.contains("0.87"))
+        // Draft acceptance collapses on realistic prose, which is why the pool
+        // must be varied.
+        #expect(runbook.contains("69%"))
+        // The frequency floor false-reject, with the real throttle figures.
+        #expect(runbook.contains("1447-1455"))
+        // The guard is expected to fail closed before step D.
+        #expect(runbook.lowercased().contains("fail-closed")
+            || runbook.lowercased().contains("fails closed"))
+    }
+}
