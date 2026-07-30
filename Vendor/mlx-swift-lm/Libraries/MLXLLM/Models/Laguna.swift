@@ -298,6 +298,43 @@ private class LagunaModelInner: Module {
         self.slidingAttentionIdx = layerTypes.firstIndex(of: "sliding_attention") ?? 0
     }
 
+    /// Laguna's released checkpoints quantize only the expert / shared-expert
+    /// projections (see the file header comment); every other projection,
+    /// including the dense MLP used by `mlp_only_layers` (layer 0 by
+    /// default), stays full precision. That means the loader's whole-model
+    /// `quantize(model:filter:)` pass (`Load.swift`) produces zero leaf
+    /// replacements for a dense layer's subtree.
+    ///
+    /// `MLXNN.Module.update(modules:...)` decides how to handle the `layers`
+    /// array purely from its first element's replacement shape: an untouched
+    /// layer's slot arrives as `.none`, and if that happens to be the first
+    /// slot, `Module.update` throws `UpdateError.unexpectedStructure` instead
+    /// of recursing into the remaining (quantized) layers. Backfill any
+    /// `.none` layer slot with an empty dictionary so `Module.update`
+    /// recurses into (and correctly leaves unmodified) that layer, matching
+    /// the behavior of a layer that was simply never selected for
+    /// quantization. This changes no computation: a layer updated with zero
+    /// replacements is identical to a layer that update(modules:) never
+    /// visited.
+    @discardableResult
+    override func update(
+        modules: ModuleChildren, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        var modules = modules
+        if let layersItem = modules["layers"], case .array(let values) = layersItem {
+            let backfilled: [NestedItem<String, Module>] = values.map { value in
+                if case .none = value {
+                    return .dictionary([:])
+                }
+                return value
+            }
+            modules["layers"] = .array(backfilled)
+        }
+        return try super.update(
+            modules: modules, verify: verify, path: path, modulePath: modulePath)
+    }
+
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var h = embedTokens(inputs)
 
@@ -311,6 +348,28 @@ private class LagunaModelInner: Module {
         }
 
         return norm(h)
+    }
+
+    func callCapturingDFlashHiddenStates(
+        _ inputs: MLXArray, cache: [KVCache]?, targetLayerIds: [Int]
+    ) throws -> (postNorm: MLXArray, hiddenStates: [MLXArray]) {
+        try DFlashTargetValidation.validateTargetLayerIds(
+            targetLayerIds, layerCount: layers.count)
+        let targetLayerSet = Set(targetLayerIds)
+        var captured = [Int: MLXArray]()
+
+        var h = embedTokens(inputs)
+        let fullMask = createAttentionMask(h: h, cache: cache?[fullAttentionIdx])
+        let slidingMask = createAttentionMask(
+            h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow)
+        for (i, layer) in layers.enumerated() {
+            let mask = layerTypes[i] == "full_attention" ? fullMask : slidingMask
+            h = layer(h, mask: mask, cache: cache?[i])
+            if targetLayerSet.contains(i) {
+                captured[i] = h
+            }
+        }
+        return (norm(h), targetLayerIds.map { captured[$0]! })
     }
 }
 
@@ -389,6 +448,34 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
 extension LagunaModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
+    }
+}
+
+// MARK: - DFlash
+
+extension LagunaModel: DFlashTargetModel {
+    public var dFlashVocabularySize: Int { vocabularySize }
+    public var dFlashHiddenSize: Int { config.hiddenSize }
+    public var dFlashLayerCount: Int { config.numHiddenLayers }
+
+    public func forwardForDFlash(
+        _ inputs: MLXArray, cache: [KVCache]?, targetLayerIds: [Int]
+    ) throws -> DFlashTargetForward {
+        let (postNorm, hiddenStates) = try model.callCapturingDFlashHiddenStates(
+            inputs, cache: cache, targetLayerIds: targetLayerIds)
+        return DFlashTargetForward(
+            logits: logitsForDFlashHidden(postNorm), hiddenStates: hiddenStates)
+    }
+
+    public func embedTokensForDFlash(_ tokens: MLXArray) -> MLXArray {
+        model.embedTokens(tokens)
+    }
+
+    public func logitsForDFlashHidden(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead {
+            return lmHead(hidden)
+        }
+        return model.embedTokens.asLinear(hidden)
     }
 }
 
