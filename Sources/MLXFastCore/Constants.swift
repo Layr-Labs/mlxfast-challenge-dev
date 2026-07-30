@@ -185,4 +185,209 @@ public enum MLXFastConstants {
     // left precise here on purpose; bounding that residual channel is a publishing/
     // rate-limit decision on the scoring backend, not a repo-side change.
     public static let publicDiagnosticSignificantFigures = 2
+
+    // DFlash block-decode track (laguna-xs-2.1-dflash-v1) protocol limits.
+    // The organizer-provisioned DFlash drafter proposes a masked block in ONE
+    // forward, so its ceiling is the checkpoint's own `block_size` (16) rather
+    // than the retired MTP drafter's autoregressive 4. Measured peak speedup on
+    // the m5-bench M5 Max sits near K=8; the ceiling stays at the checkpoint
+    // value so the parent-randomized K schedule (contract layer L6) can sample
+    // the whole legal range. Keep these explicit rather than derived so
+    // widening either bound requires a conscious review.
+    public static let experimentalDFlashMaxBlockSize = 16
+    // Compatibility default for callers that do not select an explicit oracle
+    // length. Mirrors the retired MTP default.
+    public static let experimentalDFlashMaxTotalTokens = 128
+    // Trusted-parent configured runs may exercise longer tail boundaries when
+    // the selected oracle carries enough tokens. 1,536 keeps the diagnostics
+    // able to wrap Laguna's 512-position sliding-window cache three times,
+    // which is what makes the contract's wrap-seam leg (layer L4) reachable.
+    public static let experimentalDFlashMaxConfiguredTotalTokens = 1_536
+    // Criterion E residual bucket: emitted tokens that match NEITHER the
+    // reference K=1 argmax NOR the reference argmax in the candidate-declared
+    // block frame are counted here and must additionally sit inside the
+    // reference top-2. Measured honest divergence on M5-C was 14 events across
+    // 2,304 emitted positions (<= 0.61%), every one of them explained by the
+    // declared-frame admission above, so this bucket exists only for residual
+    // candidate-vs-reference kernel drift and is deliberately small: a large
+    // cap would be spendable by a cheating submission.
+    public static let experimentalDFlashResidualDivergenceBudgetPerThousand = 5
+
+    /// Logit distance below the REFERENCE's own top-1 within which the
+    /// reference's ordering is not a fact about the model. A row is admitted as
+    /// a near tie when the reference prices the EMITTED token inside this
+    /// envelope of its own top-1 (contract Amendment 16); the same number
+    /// bounded the top-1/top-2 gap under the Amendment 14 form it replaces.
+    ///
+    /// Derived, and RE-derived, because the first basis was contaminated.
+    /// Amendment 6 measured a maximum candidate-vs-reference top-2 logit delta
+    /// of 3.375 and 2 x 3.375 = 6.75 was the envelope -- but that statistic was
+    /// taken against a PRE-GENERATED golden, so it folded golden
+    /// pre-generation drift into what was supposed to be build-to-build drift.
+    /// Under the live post-run replay of the candidate's own chain
+    /// (Amendment 15's split) the same statistic drops. Measured on M5-C at the
+    /// frozen 128-token window, live replay, both fixtures, several schedule
+    /// seeds:
+    ///
+    ///     K=1 (serial control)   0        (bit-identical to the reference walk)
+    ///     K=4                    1.75 .. 2.4375
+    ///
+    /// So the envelope is 2 x 2.4375 = **4.875**: reordering top-1 and top-2
+    /// needs `gap < |e1 - e2|`, which is bounded by twice the per-logit drift.
+    ///
+    /// Scope, stated rather than hidden. The same sweep measured 1.5 .. 2.75 at
+    /// K=3 (the ranked width) and 2.625 .. 3.25 at the off-ranked K=8
+    /// diagnostic, so against the ranked-width worst case 4.875 is 1.77x rather
+    /// than the full 2x. It is NOT raised to 5.5 to buy that back: widening an
+    /// admission gate is the move this contract exists to prevent, and every
+    /// near-tie row observed to date has a reference distance under 1 logit --
+    /// far below either candidate value. If a future honest run is rejected at a
+    /// row whose distance falls between 4.875 and 5.5, THAT is the evidence that
+    /// would justify the wider number.
+    ///
+    /// Rows inside it are admitted WITHOUT spending the residual budget, because a
+    /// coin-flip the reference cannot break is not evidence about the candidate.
+    /// Measured density: 2-3 such rows per 128 positions on varied prose, 0 per
+    /// 128 on the degenerate self-continuation fixtures -- which is precisely why
+    /// the old single-slot budget survived every test until real text was run
+    /// (Amendment 10).
+    ///
+    /// Note this cannot be gamed: the logits belong to the reference, so a
+    /// submission can neither manufacture near-tie rows nor predict which
+    /// positions are near-ties without doing the reference's work.
+    public static let experimentalDFlashNearTieLogitEnvelope = 4.875
+
+    /// Cap on near-tie admissions, as a rate per thousand scored tokens. 40 gives
+    /// 6 slots at the frozen 128-token window against a measured need of 3, i.e.
+    /// 2x headroom. It is a backstop, not the primary control -- the envelope test
+    /// above is what does the work -- but it bounds the blast radius if a prompt
+    /// turns out to be far flatter than anything measured.
+    public static let experimentalDFlashNearTieAdmissionBudgetPerThousand = 40
+
+    // MARK: - L2 work-binding tolerance
+
+    /// Absolute arm of the L2 work-binding tolerance: the largest admissible
+    /// `|candidate - reference|` on a per-row top-2 logit VALUE.
+    ///
+    /// UNCHANGED at 4.875 by a calibration that set out to tighten it per block
+    /// width and measured that it must not be tightened at all. The measurement
+    /// is recorded here because the number now means something different from
+    /// what Amendments 6/15/16/19 thought it meant.
+    ///
+    /// WHAT WAS MEASURED (M5, 2026-07-30, frozen 128-token window, live post-run
+    /// replay of the candidate's own chain, Laguna XS 2.1 NVFP4 target + the
+    /// pinned BF16 drafter). Logits are BF16, so one ULP at these magnitudes is
+    /// 0.125.
+    ///
+    /// 1. HONEST SAME-BUILD DRIFT, PER VERIFY WIDTH. 50 runs, both fixtures,
+    ///    widths 1-8, up to 8 schedule seeds, 12,800 comparisons, every gap
+    ///    attributed to the width of the round that produced it (a run's schedule
+    ///    mixes widths, so a per-run aggregate attributes to no single width --
+    ///    which is why every earlier "per width" number in this contract was
+    ///    actually a per-mixture number):
+    ///
+    ///        width  comparisons  runs     max     p99    p50    mean
+    ///          1        512        2    0.0000  0.0000  0.000  0.0000
+    ///          2       3182       47    3.1250  1.7500  0.250  0.3168
+    ///          3       2666       44    3.3750  1.7500  0.250  0.3212
+    ///          4       1964       36    2.4375  1.7500  0.250  0.3442
+    ///          5       1194       28    3.3750  2.1250  0.250  0.3944
+    ///          6       1438       28    4.5000  1.8750  0.250  0.3563
+    ///          7        718       16    2.5000  1.5000  0.250  0.3251
+    ///          8       1126       16    3.2500  2.2500  0.250  0.3635
+    ///
+    ///    The width dependence this table was built to find IS NOT THERE beyond
+    ///    the first step. Width 1 is exactly 0 -- at width 1 the candidate
+    ///    reproduces the reference's own width-1 walk bit for bit -- but from
+    ///    width 2 on the DISTRIBUTION is flat in width (p50 0.25 and p99
+    ///    1.75-2.25 at every width) and only the extreme tail wanders: 3.125 at
+    ///    width 2, 2.4375 at width 4, 4.5 at width 6, 2.5 at width 7. Pooled over
+    ///    widths >= 2 the tail is heavy and smooth -- p99 1.875, p99.9 2.875,
+    ///    p99.99 3.375, max 4.5 -- i.e. the maximum is a function of how many
+    ///    comparisons were drawn, not of the width.
+    ///
+    ///    The same width also drifts differently depending on the SCHEDULE it sat
+    ///    in: width 3 maxes at 2.75 inside a `--block-size 3` run and at 3.375
+    ///    inside a `--block-size 6` run. Ring-cache frame state carries across
+    ///    rounds, so "the width of this round" is not even the whole input.
+    ///
+    /// 2. CROSS-BUILD DRIFT, measured for the first time. Amendment 6 flagged this
+    ///    term as unmeasured and additive and it stayed that way for thirteen
+    ///    amendments, because both the candidate and the reference worker are
+    ///    spawned from the same binary. Measured by giving the reference worker a
+    ///    different binary from the candidate's:
+    ///
+    ///        pairing                          width 1   width 2   width 3
+    ///        same build (control)              0.0000    2.2500    2.7500
+    ///        `-Ounchecked` candidate           0.0000       --     2.7500
+    ///        one reassociated MoE reduction    4.6250    4.2500    4.0000
+    ///
+    ///    `-Ounchecked` changes Swift codegen and the binary hash but NOT one bit
+    ///    of arithmetic: the numerics live in MLX's C++/Metal, so it reproduces
+    ///    the same-build control exactly. That is the control proving the
+    ///    two-binary plumbing itself perturbs nothing.
+    ///
+    ///    One semantics-preserving reassociation -- rotating the top-K axis of the
+    ///    MoE expert reduction, the same 8 (expert, weight) pairs summed in a
+    ///    different order -- produces up to **4.6250** at width 1, where
+    ///    same-build drift is exactly 0. That is the cross-build term isolated,
+    ///    and it is 95% of this constant. At the ranked widths it is 4.25 (width
+    ///    2) and 4.00 (width 3).
+    ///
+    /// WHAT THAT MEANS FOR THE CONSTANT. Cross-build drift dominates the frame
+    /// term and nearly exhausts the arm on its own, from a ONE-SITE change that a
+    /// real submission would consider trivial. So:
+    ///   * The arm must NOT be tightened. Per-width calibration would have put
+    ///     the ranked width near 3.5-4.1 (Amendment 19's estimate); honest
+    ///     cross-build traffic at the ranked widths already reaches 4.0-4.25, so
+    ///     that would false-reject honest submissions.
+    ///   * The arm is NOT 1.5x anything any more. Against the honest cross-build
+    ///     maximum it is 1.05x (4.875 / 4.6250) -- two ULPs. The 1.5x discipline
+    ///     Amendments 6 and 15 applied was computed against a same-build
+    ///     statistic that is not what a submission produces.
+    ///   * Widening it is an operator decision, not a calibration one, and is
+    ///     deliberately NOT taken here: widening an anti-cheat gate is the move
+    ///     this contract exists to prevent, and the evidence that would justify it
+    ///     is an honest submission actually being rejected.
+    ///
+    /// The consequence for the gate's discriminating power is recorded rather than
+    /// hidden: the cheats of Amendment 19 died at 5.125 and 5.0, and honest
+    /// cross-build drift reaches 4.625. Four ULPs separate honest from fabricated,
+    /// so the absolute arm no longer distinguishes them by any margin worth
+    /// calling a margin. See contract Amendment 20.
+    public static let experimentalDFlashWorkBindingLogitToleranceAbsolute = 4.875
+
+    /// Relative arm: the largest admissible `|candidate - reference|` divided by
+    /// the larger of the two magnitudes. BOTH arms must hold (Amendment 18).
+    ///
+    /// Unchanged at 0.25, and deliberately not recalibrated per width. Amendment
+    /// 19 proved by additive instrumentation that every fatal comparison in both
+    /// surviving cheats breached the ABSOLUTE arm only -- zero comparisons
+    /// breached both -- so the absolute arm is the load-bearing half and the
+    /// relative arm's job is to bind at small magnitudes where the absolute arm is
+    /// meaningless. Measured honest relative maxima are 0.1362 same-build at the
+    /// ranked widths, 0.1915 same-build at width 8, and 0.1953 cross-build at
+    /// width 1, all inside 0.25.
+    ///
+    /// A per-width relative calibration is not attempted because the published
+    /// calibration output carries `|delta|` but not the magnitude it was divided
+    /// by, so the per-width relative distribution cannot be reconstructed from a
+    /// calibration run. Tightening it would need that field added first.
+    public static let experimentalDFlashWorkBindingLogitToleranceRelative = 0.25
+    // Seed length used ONLY to warm block-decode kernel shapes before the
+    // protocol hello. Deliberately far below Laguna's 512-position sliding
+    // window: a warmup seeded AT the window size plus a widest-block verify
+    // pushes the rejected rows past the rotating cache's wrap seam, after which
+    // rollback cannot trim them and the round fails with `untrimmableCache`.
+    // That seam is a genuine hazard for the scored window and is the subject of
+    // the contract's wrap-seam leg (layer L4); a shape warmup must not be what
+    // discovers it, and must not fail startup because of it.
+    /// Warmup seed length for DFlash block decode: one full sliding window plus
+    /// one widest block, so the untimed warm compiles the SATURATED ring shapes
+    /// the scored 512-token seed reaches on its first round. Anything shorter
+    /// leaves those to compile inside the timed window.
+    /// 512 is Laguna's sliding window (`LagunaConstants.slidingWindow`, which
+    /// lives in MLXFastModel and so cannot be referenced from this module).
+    public static let experimentalDFlashWarmupSeedTokens =
+        512 + experimentalDFlashMaxBlockSize
 }

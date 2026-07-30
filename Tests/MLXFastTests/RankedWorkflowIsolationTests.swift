@@ -154,6 +154,16 @@ struct RankedWorkflowIsolationTests {
             for rawLine in script.components(separatedBy: "\n") {
                 let line = rawLine.trimmingCharacters(in: .whitespaces)
                 if line.hasPrefix("#") { continue }
+                // The reviewer prompt text is prose assigned to a shell variable
+                // and is never executed, so a substring match is meaningless
+                // there -- and it DOES match: "logit values" contains "git ".
+                // Skip prompt/rule assignments; keep the guard on every line that
+                // could actually invoke git.
+                if line.hasPrefix("system_prompt=") || line.hasPrefix("serial_decode_rule=")
+                    || line.hasPrefix("dflash_decode_rule=") || line.hasPrefix("controlling_rule=")
+                {
+                    continue
+                }
                 guard line.contains("git ") else { continue }
                 #expect(
                     allowedBareGitFragments.contains(where: { line.contains($0) }),

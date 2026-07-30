@@ -2546,7 +2546,16 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
         return
     }
     #expect(totalBytes <= EditableSurfaceByteBudget.defaultMaxTotalBytes)
-    #expect(fileCount == 141)
+    // 143, not 141: the DFlash block-decode session and reference sources live
+        // under Sources/MLXFastModel, which the SERIAL benchmark.json lists as a
+        // directory, so they joined the serial editable surface. They are dead
+        // code on the serial scored path (nothing in LagunaRuntimeModel reaches
+        // them), so this is surface bloat rather than a scoring hazard -- but it
+        // does mean a serial submission may edit DFlash sources, and on promotion
+        // to prod it invalidates in-flight submissions the same way any
+        // non-editable change does. FOLLOW-UP: move them to their own target
+        // (e.g. Sources/MLXFastDFlash) that the serial manifest does not list.
+        #expect(fileCount == 143)
     #expect(staticReview.contains("unmodified surface is 2,139,781 bytes"))
     #expect(staticReview.contains("leaving 860,219 bytes"))
     for path in [

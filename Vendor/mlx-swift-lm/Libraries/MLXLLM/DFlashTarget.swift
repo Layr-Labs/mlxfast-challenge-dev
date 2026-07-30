@@ -250,11 +250,37 @@ extension DFlashTargetModel {
         )
     }
 
+    /// Decide whether this round needs a cache snapshot to be able to roll back.
+    ///
+    /// A trimmable cache needs none: rejecting rows is just moving the write
+    /// offset back. The subtlety is the SLIDING-WINDOW (rotating) cache, whose
+    /// `isTrimmable` is `offset < maxSize` -- and that is correct, not
+    /// conservative: once the ring wraps, rolling the offset back would require
+    /// the entries the wrap just overwrote, which are the oldest rows still
+    /// inside the window.
+    ///
+    /// The trap is that this decision is made BEFORE the block is written while
+    /// the trim happens AFTER. A round that starts trimmable and ends wrapped
+    /// therefore used to find itself both untrimmable and without a snapshot,
+    /// and threw `untrimmableCache`. That is not an edge case for this track:
+    /// Laguna's sliding window is 512 and the ranked window is a 512-token seed
+    /// plus 128 decode steps, so every scored run crosses the seam. (It went
+    /// unnoticed because every bring-up measurement used 26-68 token prompts.)
+    ///
+    /// `plannedWriteCount` is the number of rows the round is about to write
+    /// (the block width). Callers that do not know it get the old behaviour.
     public func makeDefaultDFlashCacheRollbackState(
-        cache: [KVCache]
+        cache: [KVCache],
+        plannedWriteCount: Int = 0
     ) -> (any DFlashTargetRollbackState)? {
-        canTrimPromptCache(cache) ? nil : DFlashCopiedTargetRollbackState(
-            cache: cache.map { $0.copy() })
+        let crossesRingBoundary = cache.contains { entry in
+            guard let maxSize = entry.maxSize else { return false }
+            return entry.offset + plannedWriteCount >= maxSize
+        }
+        if canTrimPromptCache(cache), !crossesRingBoundary {
+            return nil
+        }
+        return DFlashCopiedTargetRollbackState(cache: cache.map { $0.copy() })
     }
 
     public func rollbackDFlashCacheUsingDefault(
@@ -273,10 +299,16 @@ extension DFlashTargetModel {
 
         if canTrimPromptCache(cache) {
             let trimmed = trimPromptCache(cache, numTokens: rejectedTokenCount)
-            guard trimmed == rejectedTokenCount else {
-                throw DFlashTargetError.untrimmableCache
+            if trimmed == rejectedTokenCount {
+                return acceptedHidden
             }
-            return acceptedHidden
+            // A short trim means the cache could not give back every rejected
+            // row (a rotating cache that wrapped mid-round). Fall through to the
+            // snapshot instead of failing the round: the replay below restores
+            // the pre-round cache wholesale, so the partial trim is discarded
+            // rather than compounded. Only throw if no snapshot was taken --
+            // see makeDefaultDFlashCacheRollbackState for why one should have
+            // been.
         }
 
         guard let copiedState = state as? DFlashCopiedTargetRollbackState else {

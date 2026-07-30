@@ -169,7 +169,9 @@ public struct DFlashBenchmarkPhaseTimings: Sendable {
     }
 }
 
-internal final class DFlashPhaseAccumulator {
+// Public only so the (public) runDFlashGreedyRound signature can name it; all
+// members stay internal -- MLXFastModel passes nil and never constructs one.
+public final class DFlashPhaseAccumulator {
     let collectTargetSubphaseTimings: Bool
     var rounds = 0
     var cacheSnapshotSeconds = 0.0
@@ -661,9 +663,13 @@ public func measureBatchedDFlashThroughput(
             let bonusColumn = MLXArray(group.bonus.map { Int32($0) }, [activeB, 1])
             let verifyInput = concatenated([bonusColumn, draftTokens], axis: 1)
             let rollbackProvider = target as? any DFlashTargetCacheRollbackProvider
+            // See makeDefaultDFlashCacheRollbackState: the planned write width is
+            // what lets the snapshot decision catch a sliding-window cache that
+            // is about to wrap mid-round.
             let targetRollbackState =
                 rollbackProvider?.makeDFlashCacheRollbackState(cache: group.targetCache)
-                ?? target.makeDefaultDFlashCacheRollbackState(cache: group.targetCache)
+                ?? target.makeDefaultDFlashCacheRollbackState(
+                    cache: group.targetCache, plannedWriteCount: verifyInput.dim(1))
             let verifyOut = try DFlashTargetRuntimeOptions.withSmallRowVerifyFusionsDisabled {
                 try target.forwardGreedyTokensForDFlash(
                     verifyInput,

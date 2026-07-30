@@ -47,6 +47,10 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                // DFlash block-decode track (laguna-xs-2.1-dflash-v1):
+                // LagunaDFlashBlockSession wraps the vendored speculative round.
+                // The serial track does not reach this code.
+                .product(name: "MLXSpeculative", package: "mlx-swift-lm"),
             ]
         ),
         .target(
@@ -58,6 +62,11 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
+                // DFlash block-decode worker: loads the organizer-pinned target
+                // through the vendored factory (LagunaModel is the type that
+                // conforms to DFlashTargetModel) and the DFlash drafter.
+                .product(name: "MLXSpeculative", package: "mlx-swift-lm"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
             ],
             path: "Sources/MLXFastHarness"
         ),

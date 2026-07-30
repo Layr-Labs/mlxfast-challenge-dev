@@ -610,6 +610,111 @@ Ordinary within-request KV reuse, current-token-only decode, and
 input-independent weight, dequantization, kernel, mask, or RoPE caches remain
 allowed. Multi-row kernels remain allowed when every row is backed by a token
 supplied in that same invocation, such as prefill. Organizer-provided MTP or
-other speculative decoding would require a separate explicit track with a
-trusted variable-length block protocol, correctness contract, and score; no
-such track currently exists.
+other speculative decoding requires a separate explicit track with a trusted
+variable-length block protocol, correctness contract, and score. One such track
+now exists in this repository as scaffolding — see the next section — but it is
+**not enabled**, and nothing about it relaxes the serial rules above.
+
+### Experimental DFlash Speculative-Decode Track (dev only, NOT enabled)
+
+`benchmark.dflash.json` registers a second track, `laguna-xs-2.1-dflash-v1`,
+for organizer-provisioned DFlash speculative decoding. It is **inert**: its
+contract fixture (`fixtures/laguna_xs_2_1_dflash_track.json`) keeps
+`official_scoring_enabled: false`, and its workflow
+(`.github/workflows/dflash-benchmark.yml`) fails closed on that flag. It ranks
+nothing and accepts no submissions today. Do not target it.
+
+What it will be, when it is enabled:
+
+- **Speculation is the point.** A separate organizer-provisioned ~924 MB DFlash
+  draft model proposes tokens, the target verifies the block in one forward, the
+  longest correct draft prefix is accepted, and rejected KV rows are rolled
+  back. The serial track's speculative-decode prohibition is inverted here —
+  and only here.
+- **Participants never supply weights.** Both the target (the same pinned NVFP4
+  group-16 reference checkpoint the serial track measures) and the drafter are
+  organizer-provisioned and hash-pinned. Substituting, re-deriving, or
+  re-quantizing the drafter is a fail.
+- **Drafts must come from the pinned drafter, not from the input.** Bypassing the
+  drafter is a distinct violation from substituting its weights, and it is
+  excluded just as firmly. Every proposed token in a block must be produced by a
+  forward pass of the pinned draft model on that round's bonus token and target
+  hidden context. Prompt-lookup drafting, n-gram, suffix or token-history
+  drafting, copying from the seed or from previously emitted tokens, and any
+  other input-derived proposal source are excluded — the same techniques the
+  serial track excludes, for the same reason, and the exclusion holds even where
+  the implementation is generic, production-useful, or bit-exact. Hybrids that
+  fall back to an input-derived proposal when the drafter is slow or its
+  confidence is low are excluded too. You may make the drafter's *dispatch*
+  cheaper (fusion, layout, scheduling); you may not replace what it computes.
+  This is enforced the way the serial track enforces its own speculation ban —
+  by rule and static review — see the DFlash correctness contract's L5 section
+  for why a runtime numerical check is a weaker instrument than it looks.
+- **What is measured is the reference forward.** The DFlash target is the
+  vendored `LagunaModel` reached through `LLMModelFactory`, not the serial
+  track's scored `Sources/MLXFastModel/LagunaRuntimeModel.swift`. DFlash
+  speedups are therefore relative to the reference implementation and are
+  neither additive with serial-track optimizations nor comparable to serial
+  scores as absolute tokens/second.
+- **Scoring** is decode-only paired speedup: mean serial K=1 seconds/token over
+  mean DFlash seconds/token, ratio-of-means across at least three accepted
+  thermally-gated pairs in alternating order, with a hard floor of 1.0 on the
+  aggregate and a stall guardrail.
+- **Which side runs whose build — read this before planning any work.** The
+  denominator is a `dflash-probe` (serial K=1) run from an APFS copy-on-write
+  clone of the **pinned baseline tree**; the numerator is `dflash-benchmark`
+  (block decode) from **your** workspace. This mirrors the serial track: you are
+  measured against a fixed on-box baseline, not against yourself. So general
+  forward improvements — a better quantized matmul, a faster attention kernel —
+  DO move your score, because they speed the numerator while the pinned
+  denominator stays put. Serial-track techniques transfer.
+  (An earlier revision of this file claimed both sides run the submitter's build
+  and that generic wins therefore cancel. That was wrong; the box wrapper's own
+  contract header is the authority.)
+- **But you start from behind, and this is the important part.** Block decode is
+  not free on this model. Measured on the ranked silicon at the frozen window
+  (512-token seed, 128 decode steps), same build on both sides so that the
+  speculation contribution is isolated:
+
+  | text | draft acceptance | K=1 s/tok | K=4 s/tok | ratio |
+  |---|---|---|---|---|
+  | varied prose/code | 69% | 0.018964 | 0.022575 | **0.840x** |
+  | repetitive (greedy self-continuation) | ~100% | 0.018944 | 0.016966 | 1.117x |
+
+  A verify row costs only about 10% less than a standalone serial step, so
+  speculation wins only while nearly every drafted row is accepted. On realistic
+  prose it does not: acceptance is ~69%, which means 1.25 declared rows per
+  emitted token, and the block path comes out roughly **16% SLOWER** than serial.
+  Break-even needs draft acceptance above ~92%.
+
+  So on realistic text you must find ~19% of general forward speedup just to
+  reach the 1.0 floor, before any of it shows up as score. Work that makes
+  speculation itself cheaper — verify-row batching, KV handling and rollback
+  cost, drafter dispatch, scheduling around the block boundary — reduces that
+  tax and is the highest-leverage work available, but it is not the only work
+  that counts.
+- **Do not tune block size on a self-generated prompt.** A greedy
+  self-continuation of the model is degenerate — measured at 122 distinct tokens
+  in 512, with no row whose top-2 logits are within 1.8 of each other — so a
+  drafter predicts it almost perfectly and every K looks good. Earlier sweeps on
+  such material reported K=3 at 1.09x and, on a 51-token prompt, K=8 at 1.86x.
+  Neither survives on varied text. Measure on real prose, at the ranked window,
+  with matched token counts on both sides.
+- **Correctness is work-honesty, not token identity.** Exact-token equality
+  against a sequential golden is *unsatisfiable* on this model: the target's own
+  block-shaped forward diverges from its sequential forward at near-tie
+  argmaxes, with no drafter involved (measured: 14/14 divergences target-only,
+  max sequential-logit gap 0.625, under 1% of positions). The replacement
+  contract admits the reference argmax in the frame the candidate declared, and
+  separately binds emitted tokens to target compute actually performed for each
+  row — per-row top-2 logit values, row accounting, KV vacancy checks, and a
+  reference replay run by the pinned baseline build on organizer weights after
+  the timed window. `docs/dflash-track-correctness-contract.md` is the
+  specification; read it before assuming any behaviour of this track.
+
+The editable surface for this track is its own (`benchmark.dflash.json`
+`editablePaths`) and centres on the DFlash runtime under
+`Vendor/mlx-swift-lm/Libraries/MLXSpeculative/` plus `DFlashTarget.swift` and
+`DFlashVerifyLinear.swift`. Local scripts are `setup-dflash.sh` and
+`benchmark-dflash.sh`; the retired Gemma-era MTP surface stays retired under its
+own names and must not be revived.

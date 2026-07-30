@@ -1116,3 +1116,20 @@ extension BatchKVCache {
         values = storedV * mask
     }
 }
+
+// DFlash-vendor: per-row tail zeroing for the rotating batched KV cache, used
+// when batched speculative rows accept different token counts within one block.
+// Ported verbatim from the Layr-Labs/mlx-swift-lm fork; lives in MLXLMCommon so
+// it can assign the `public internal(set)` keys/values. Only touches keys/values.
+extension BatchRotatingKVCache {
+    public func zeroTailPerRow(keepLengths: MLXArray) {
+        guard let storedK = keys, let storedV = values else { return }
+        let T = storedK.dim(2)
+        let positions = MLXArray(Int32(0) ..< Int32(T)).reshaped([1, 1, T, 1])
+        let keep = keepLengths.asType(.int32).reshaped([-1, 1, 1, 1])
+        let keepMask = positions .< keep
+        let maskFloat = keepMask.asType(storedK.dtype)
+        keys = storedK * maskFloat
+        values = storedV * maskFloat
+    }
+}

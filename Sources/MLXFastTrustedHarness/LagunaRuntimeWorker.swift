@@ -785,6 +785,22 @@ struct RuntimeWorkerRequest: Codable {
     let steps: Int?
     let topK: Int?
     let expectedToken: Int?
+    let maxBlockSize: Int?
+    // Reference-side only (dflash_reference_rows). The REFERENCE worker -- built
+    // from the pinned baseline tree and loading organizer weights -- is the only
+    // party that receives these. The candidate worker never sees this kind, so
+    // there is no in-band verify opcode for a submission to detect.
+    let prefixTokens: [Int]?
+    let startOffset: Int?
+    let rowCount: Int?
+    let declaredBlockWidth: Int?
+    // How much of `prefixTokens` is the SEED, i.e. the only span the candidate
+    // ever bulk-prefills. The reference needs it to build the width-1 frame the
+    // way the candidate does -- one bulk forward over the seed, then one
+    // single-token forward per position after it. Without it the reference can
+    // only guess, and guessing `prefixTokens[0 ..< start_offset]` is the frame
+    // bug this field exists to remove.
+    let seedTokenCount: Int?
 
     init(
         id: Int,
@@ -794,7 +810,13 @@ struct RuntimeWorkerRequest: Codable {
         seedTokens: [Int]? = nil,
         steps: Int? = nil,
         topK: Int? = nil,
-        expectedToken: Int? = nil
+        expectedToken: Int? = nil,
+        maxBlockSize: Int? = nil,
+        prefixTokens: [Int]? = nil,
+        startOffset: Int? = nil,
+        rowCount: Int? = nil,
+        declaredBlockWidth: Int? = nil,
+        seedTokenCount: Int? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -804,6 +826,12 @@ struct RuntimeWorkerRequest: Codable {
         self.steps = steps
         self.topK = topK
         self.expectedToken = expectedToken
+        self.maxBlockSize = maxBlockSize
+        self.prefixTokens = prefixTokens
+        self.startOffset = startOffset
+        self.rowCount = rowCount
+        self.declaredBlockWidth = declaredBlockWidth
+        self.seedTokenCount = seedTokenCount
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -841,6 +869,24 @@ struct RuntimeWorkerRequest: Codable {
             Int.self,
             forKey: .expectedToken
         )
+        maxBlockSize = try container.decodeIfPresent(
+            Int.self,
+            forKey: .maxBlockSize
+        )
+        prefixTokens = try container.decodeIfPresent(
+            [Int].self,
+            forKey: .prefixTokens
+        )
+        startOffset = try container.decodeIfPresent(Int.self, forKey: .startOffset)
+        rowCount = try container.decodeIfPresent(Int.self, forKey: .rowCount)
+        declaredBlockWidth = try container.decodeIfPresent(
+            Int.self,
+            forKey: .declaredBlockWidth
+        )
+        seedTokenCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .seedTokenCount
+        )
     }
 
     func encode(to encoder: Swift.Encoder) throws {
@@ -853,6 +899,15 @@ struct RuntimeWorkerRequest: Codable {
         try container.encodeIfPresent(steps, forKey: .steps)
         try container.encodeIfPresent(topK, forKey: .topK)
         try container.encodeIfPresent(expectedToken, forKey: .expectedToken)
+        try container.encodeIfPresent(maxBlockSize, forKey: .maxBlockSize)
+        try container.encodeIfPresent(prefixTokens, forKey: .prefixTokens)
+        try container.encodeIfPresent(startOffset, forKey: .startOffset)
+        try container.encodeIfPresent(rowCount, forKey: .rowCount)
+        try container.encodeIfPresent(
+            declaredBlockWidth,
+            forKey: .declaredBlockWidth
+        )
+        try container.encodeIfPresent(seedTokenCount, forKey: .seedTokenCount)
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -864,6 +919,16 @@ struct RuntimeWorkerRequest: Codable {
         case steps
         case topK = "top_k"
         case expectedToken = "expected_token"
+        // DFlash/MTP block decode: the parent-chosen block width for this
+        // round. Deliberately the ONLY block-shaped field on the request --
+        // the worker is never told the remaining or total decode length,
+        // which would let it special-case the tail of the scored window.
+        case maxBlockSize = "max_block_size"
+        case prefixTokens = "prefix_tokens"
+        case startOffset = "start_offset"
+        case rowCount = "count"
+        case declaredBlockWidth = "declared_block_width"
+        case seedTokenCount = "seed_token_count"
     }
 }
 
@@ -924,6 +989,46 @@ struct RuntimeWorkerResponse: Codable {
     let exactPairSegmentCount: Int?
     let exactPairRollbackRowCount: Int?
     let serialVerificationRowCount: Int?
+    // Criterion E work-binding diagnostics (DFlash block decode). The primary
+    // token predicate cannot price a verifier that is cheap at confident steps,
+    // so the parent also binds emitted tokens to executed target compute:
+    // `declaredRows` is what the worker claims it pushed through the target this
+    // round, and the per-row readouts are checked against the pinned reference
+    // for EVERY declared row including rejected ones. The hidden digest forces
+    // the trunk; the top-2 logit VALUES force the lm_head per row.
+    let declaredRows: Int?
+    let perRowHiddenDigest: [String]?
+    let perRowTop2Tokens: [[Int]]?
+    let perRowTop2Logits: [[Double]]?
+    let acceptedDraftCount: Int?
+    let rejectedDraftCount: Int?
+    let rollbackRoundCount: Int?
+    let targetCacheOffset: Int?
+    let kvDigest: String?
+    let kvVacancyDigest: String?
+    // Reference-side verdicts (dflash_reference_rows). Parallel arrays, one
+    // entry per requested row: the width-1 argmax, the block-frame argmax, and
+    // the top-2 ids/VALUES that Amendment 1 makes the cross-build work binder.
+    let referenceK1Argmax: [Int]?
+    let referenceBlockArgmax: [Int]?
+    let referenceTop2Tokens: [[Int]]?
+    let referenceTop2Logits: [[Double]]?
+    // Amendment 16: the reference's own top-1 logit per row, plus the token the
+    // row PREDICTS and that token's reference logit. Those last two make the
+    // near-tie test a question about the emitted token itself rather than about
+    // membership in a fixed-size shortlist, which a three-way tie cannot
+    // express. They cover a PREFIX of the requested rows -- a request whose
+    // context stops at its final row has no next token there -- so a consumer
+    // must bound-check instead of assuming one entry per row.
+    let referenceTop1Logits: [Double]?
+    let referenceEmittedTokens: [Int]?
+    let referenceEmittedTokenLogits: [Double]?
+    // Every block width the reference replayed for these rows, ascending, and
+    // the argmax each one produced. One request covers all of them so the
+    // reference can branch each frame off the SAME continuous cache without
+    // rewinding, which is what keeps the pass O(n) instead of O(n^2).
+    let referenceFrameWidths: [Int]?
+    let referenceFrameArgmax: [[Int]]?
 
     init(
         id: Int,
@@ -945,7 +1050,26 @@ struct RuntimeWorkerResponse: Codable {
         targetVerificationMode: String? = nil,
         exactPairSegmentCount: Int? = nil,
         exactPairRollbackRowCount: Int? = nil,
-        serialVerificationRowCount: Int? = nil
+        serialVerificationRowCount: Int? = nil,
+        declaredRows: Int? = nil,
+        perRowHiddenDigest: [String]? = nil,
+        perRowTop2Tokens: [[Int]]? = nil,
+        perRowTop2Logits: [[Double]]? = nil,
+        acceptedDraftCount: Int? = nil,
+        rejectedDraftCount: Int? = nil,
+        rollbackRoundCount: Int? = nil,
+        targetCacheOffset: Int? = nil,
+        kvDigest: String? = nil,
+        kvVacancyDigest: String? = nil,
+        referenceK1Argmax: [Int]? = nil,
+        referenceBlockArgmax: [Int]? = nil,
+        referenceTop2Tokens: [[Int]]? = nil,
+        referenceTop2Logits: [[Double]]? = nil,
+        referenceTop1Logits: [Double]? = nil,
+        referenceEmittedTokens: [Int]? = nil,
+        referenceEmittedTokenLogits: [Double]? = nil,
+        referenceFrameWidths: [Int]? = nil,
+        referenceFrameArgmax: [[Int]]? = nil
     ) {
         self.id = id
         self.nonce = nonce
@@ -967,6 +1091,25 @@ struct RuntimeWorkerResponse: Codable {
         self.exactPairSegmentCount = exactPairSegmentCount
         self.exactPairRollbackRowCount = exactPairRollbackRowCount
         self.serialVerificationRowCount = serialVerificationRowCount
+        self.declaredRows = declaredRows
+        self.perRowHiddenDigest = perRowHiddenDigest
+        self.perRowTop2Tokens = perRowTop2Tokens
+        self.perRowTop2Logits = perRowTop2Logits
+        self.acceptedDraftCount = acceptedDraftCount
+        self.rejectedDraftCount = rejectedDraftCount
+        self.rollbackRoundCount = rollbackRoundCount
+        self.targetCacheOffset = targetCacheOffset
+        self.kvDigest = kvDigest
+        self.kvVacancyDigest = kvVacancyDigest
+        self.referenceK1Argmax = referenceK1Argmax
+        self.referenceBlockArgmax = referenceBlockArgmax
+        self.referenceTop2Tokens = referenceTop2Tokens
+        self.referenceTop2Logits = referenceTop2Logits
+        self.referenceTop1Logits = referenceTop1Logits
+        self.referenceEmittedTokens = referenceEmittedTokens
+        self.referenceEmittedTokenLogits = referenceEmittedTokenLogits
+        self.referenceFrameWidths = referenceFrameWidths
+        self.referenceFrameArgmax = referenceFrameArgmax
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -1047,6 +1190,82 @@ struct RuntimeWorkerResponse: Codable {
             Int.self,
             forKey: .serialVerificationRowCount
         )
+        declaredRows = try container.decodeIfPresent(
+            Int.self,
+            forKey: .declaredRows
+        )
+        perRowHiddenDigest = try container.decodeIfPresent(
+            [String].self,
+            forKey: .perRowHiddenDigest
+        )
+        perRowTop2Tokens = try container.decodeIfPresent(
+            [[Int]].self,
+            forKey: .perRowTop2Tokens
+        )
+        perRowTop2Logits = try container.decodeIfPresent(
+            [[Double]].self,
+            forKey: .perRowTop2Logits
+        )
+        acceptedDraftCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .acceptedDraftCount
+        )
+        rejectedDraftCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .rejectedDraftCount
+        )
+        rollbackRoundCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .rollbackRoundCount
+        )
+        targetCacheOffset = try container.decodeIfPresent(
+            Int.self,
+            forKey: .targetCacheOffset
+        )
+        kvDigest = try container.decodeIfPresent(
+            String.self,
+            forKey: .kvDigest
+        )
+        kvVacancyDigest = try container.decodeIfPresent(
+            String.self,
+            forKey: .kvVacancyDigest
+        )
+        referenceK1Argmax = try container.decodeIfPresent(
+            [Int].self,
+            forKey: .referenceK1Argmax
+        )
+        referenceBlockArgmax = try container.decodeIfPresent(
+            [Int].self,
+            forKey: .referenceBlockArgmax
+        )
+        referenceTop2Tokens = try container.decodeIfPresent(
+            [[Int]].self,
+            forKey: .referenceTop2Tokens
+        )
+        referenceTop2Logits = try container.decodeIfPresent(
+            [[Double]].self,
+            forKey: .referenceTop2Logits
+        )
+        referenceTop1Logits = try container.decodeIfPresent(
+            [Double].self,
+            forKey: .referenceTop1Logits
+        )
+        referenceEmittedTokens = try container.decodeIfPresent(
+            [Int].self,
+            forKey: .referenceEmittedTokens
+        )
+        referenceEmittedTokenLogits = try container.decodeIfPresent(
+            [Double].self,
+            forKey: .referenceEmittedTokenLogits
+        )
+        referenceFrameWidths = try container.decodeIfPresent(
+            [Int].self,
+            forKey: .referenceFrameWidths
+        )
+        referenceFrameArgmax = try container.decodeIfPresent(
+            [[Int]].self,
+            forKey: .referenceFrameArgmax
+        )
     }
 
     func encode(to encoder: Swift.Encoder) throws {
@@ -1101,6 +1320,76 @@ struct RuntimeWorkerResponse: Codable {
             serialVerificationRowCount,
             forKey: .serialVerificationRowCount
         )
+        try container.encodeIfPresent(declaredRows, forKey: .declaredRows)
+        try container.encodeIfPresent(
+            perRowHiddenDigest,
+            forKey: .perRowHiddenDigest
+        )
+        try container.encodeIfPresent(
+            perRowTop2Tokens,
+            forKey: .perRowTop2Tokens
+        )
+        try container.encodeIfPresent(
+            perRowTop2Logits,
+            forKey: .perRowTop2Logits
+        )
+        try container.encodeIfPresent(
+            acceptedDraftCount,
+            forKey: .acceptedDraftCount
+        )
+        try container.encodeIfPresent(
+            rejectedDraftCount,
+            forKey: .rejectedDraftCount
+        )
+        try container.encodeIfPresent(
+            rollbackRoundCount,
+            forKey: .rollbackRoundCount
+        )
+        try container.encodeIfPresent(
+            targetCacheOffset,
+            forKey: .targetCacheOffset
+        )
+        try container.encodeIfPresent(kvDigest, forKey: .kvDigest)
+        try container.encodeIfPresent(
+            kvVacancyDigest,
+            forKey: .kvVacancyDigest
+        )
+        try container.encodeIfPresent(
+            referenceK1Argmax,
+            forKey: .referenceK1Argmax
+        )
+        try container.encodeIfPresent(
+            referenceBlockArgmax,
+            forKey: .referenceBlockArgmax
+        )
+        try container.encodeIfPresent(
+            referenceTop2Tokens,
+            forKey: .referenceTop2Tokens
+        )
+        try container.encodeIfPresent(
+            referenceTop2Logits,
+            forKey: .referenceTop2Logits
+        )
+        try container.encodeIfPresent(
+            referenceTop1Logits,
+            forKey: .referenceTop1Logits
+        )
+        try container.encodeIfPresent(
+            referenceEmittedTokens,
+            forKey: .referenceEmittedTokens
+        )
+        try container.encodeIfPresent(
+            referenceEmittedTokenLogits,
+            forKey: .referenceEmittedTokenLogits
+        )
+        try container.encodeIfPresent(
+            referenceFrameWidths,
+            forKey: .referenceFrameWidths
+        )
+        try container.encodeIfPresent(
+            referenceFrameArgmax,
+            forKey: .referenceFrameArgmax
+        )
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -1124,6 +1413,25 @@ struct RuntimeWorkerResponse: Codable {
         case exactPairSegmentCount = "exact_pair_segment_count"
         case exactPairRollbackRowCount = "exact_pair_rollback_row_count"
         case serialVerificationRowCount = "serial_verification_row_count"
+        case declaredRows = "declared_rows"
+        case perRowHiddenDigest = "per_row_hidden_digest"
+        case perRowTop2Tokens = "per_row_top2_tokens"
+        case perRowTop2Logits = "per_row_top2_logits"
+        case acceptedDraftCount = "accepted_draft_count"
+        case rejectedDraftCount = "rejected_draft_count"
+        case rollbackRoundCount = "rollback_round_count"
+        case targetCacheOffset = "target_cache_offset"
+        case kvDigest = "kv_digest"
+        case kvVacancyDigest = "kv_vacancy_digest"
+        case referenceK1Argmax = "reference_k1_argmax"
+        case referenceBlockArgmax = "reference_block_argmax"
+        case referenceTop2Tokens = "reference_top2_tokens"
+        case referenceTop2Logits = "reference_top2_logits"
+        case referenceTop1Logits = "reference_top1_logits"
+        case referenceEmittedTokens = "reference_emitted_tokens"
+        case referenceEmittedTokenLogits = "reference_emitted_token_logits"
+        case referenceFrameWidths = "reference_frame_widths"
+        case referenceFrameArgmax = "reference_frame_argmax"
     }
 }
 
@@ -1664,7 +1972,8 @@ final class RuntimeWorkerClient {
 
     init(
         options: RuntimeWorkerOptions,
-        weightsPath: String
+        weightsPath: String,
+        dflashDrafterPath: String? = nil
     ) throws {
         guard options.helloTimeoutSeconds.isFinite,
               options.helloTimeoutSeconds > 0,
@@ -1681,11 +1990,25 @@ final class RuntimeWorkerClient {
         let stdin = Pipe()
         let stdout = Pipe()
         let stderr = Pipe()
-        let workerArguments = [
-            "runtime-worker",
-            "--weights",
-            weightsPath,
-        ]
+        // A drafter path switches the worker to the DFlash block-decode
+        // subcommand. The DFlash worker serves only dflash_* kinds, so a serial
+        // request cannot be smuggled into a block-decode session or vice versa.
+        let workerArguments: [String]
+        if let dflashDrafterPath {
+            workerArguments = [
+                "dflash-runtime-worker",
+                "--weights",
+                weightsPath,
+                "--drafter",
+                dflashDrafterPath,
+            ]
+        } else {
+            workerArguments = [
+                "runtime-worker",
+                "--weights",
+                weightsPath,
+            ]
+        }
         if let configuredSandboxProfilePath = options.sandboxProfilePath {
             let sandboxProfilePath = try runtimeWorkerSandboxProfile(
                 rebinding: configuredSandboxProfilePath,
@@ -1822,6 +2145,80 @@ final class RuntimeWorkerClient {
         try send(kind: "phase_diagnostics")
     }
 
+    // --- DFlash block decode (laguna-xs-2.1-dflash-v1) --------------------
+    // The parent chooses every block width and never tells the worker how much
+    // of the decode window remains.
+
+    /// Untimed phase start: allocator clear plus working-set re-touch. Issued
+    /// before the parent's clock starts, because neither step sees the seed.
+    func warmDFlashDecode() throws -> RuntimeWorkerResponse {
+        try send(kind: "dflash_decode_warm")
+    }
+
+    func beginDFlashDecode(seedTokens: [Int]) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "dflash_decode_begin",
+            seedTokens: seedTokens
+        )
+    }
+
+    func dflashDecodeBlock(
+        previousCommittedToken: Int,
+        maxBlockSize: Int
+    ) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "dflash_decode_block",
+            token: previousCommittedToken,
+            maxBlockSize: maxBlockSize
+        )
+    }
+
+    func dflashPhaseDiagnostics() throws -> RuntimeWorkerResponse {
+        try send(kind: "dflash_phase_diagnostics")
+    }
+
+    /// Reference-side seed prefill (contract layer L1).
+    ///
+    /// Establishes the run's seed token in the candidate's own frame -- one bulk
+    /// forward over the whole seed -- and leaves the reference's continuous
+    /// width-1 frame positioned at the end of the seed, so the first row request
+    /// is a plain continuation rather than a rebuild.
+    func dflashReferencePrefill(
+        seedTokens: [Int]
+    ) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "dflash_reference_prefill",
+            seedTokens: seedTokens
+        )
+    }
+
+    /// Reference-side row request (contract layer L1). Only ever sent to a
+    /// worker spawned from the PINNED BASELINE tree over organizer weights, and
+    /// only after the timed window: the candidate is torn down first, so this
+    /// kind never reaches submitted code.
+    ///
+    /// `rowCount` is how many positions the width-1 frame walks; `widestFrame`
+    /// is the widest block frame to replay for those same positions. The
+    /// reference answers every width in `rowCount ... widestFrame` from one
+    /// request because each is a branch off the same continuous cache -- asking
+    /// for them separately would rewind the walk and force a re-prefill.
+    func dflashReferenceRows(
+        prefixTokens: [Int],
+        seedTokenCount: Int,
+        startOffset: Int,
+        rowCount: Int,
+        widestFrame: Int
+    ) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "dflash_reference_rows",
+            prefixTokens: prefixTokens,
+            startOffset: startOffset,
+            rowCount: rowCount,
+            declaredBlockWidth: widestFrame,
+            seedTokenCount: seedTokenCount
+        )
+    }
+
     private func send(
         kind: String,
         promptTokens: [Int]? = nil,
@@ -1829,7 +2226,13 @@ final class RuntimeWorkerClient {
         seedTokens: [Int]? = nil,
         steps: Int? = nil,
         topK: Int? = nil,
-        expectedToken: Int? = nil
+        expectedToken: Int? = nil,
+        maxBlockSize: Int? = nil,
+        prefixTokens: [Int]? = nil,
+        startOffset: Int? = nil,
+        rowCount: Int? = nil,
+        declaredBlockWidth: Int? = nil,
+        seedTokenCount: Int? = nil
     ) throws -> RuntimeWorkerResponse {
         guard process.isRunning else {
             throw MLXFastError.invalidInput("runtime worker exited before request \(kind): \(workerExitDiagnostic())")
@@ -1844,7 +2247,13 @@ final class RuntimeWorkerClient {
             seedTokens: seedTokens,
             steps: steps,
             topK: topK,
-            expectedToken: expectedToken
+            expectedToken: expectedToken,
+            maxBlockSize: maxBlockSize,
+            prefixTokens: prefixTokens,
+            startOffset: startOffset,
+            rowCount: rowCount,
+            declaredBlockWidth: declaredBlockWidth,
+            seedTokenCount: seedTokenCount
         )
         var data = try encoder.encode(request)
         guard data.count <= BufferedFileLineReader.defaultMaximumLineByteCount else {
