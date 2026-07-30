@@ -186,6 +186,12 @@ public final class LagunaDFlashBlockValidator {
     public private(set) var residualDivergenceCount = 0
     public private(set) var declaredRowTotal = 0
     public private(set) var roundLatencies = [Double]()
+    /// Rows the parent actually obtained a reference verdict for. The box
+    /// wrapper cross-checks this against the emitted total; it cannot yet equal
+    /// `declaredRowTotal` because the worker does not report the token ids of
+    /// REJECTED draft rows, so the reference has nothing to score them against
+    /// (an L2 follow-up).
+    public private(set) var referenceCheckedRowTotal = 0
 
     public init(
         oracle: any DFlashReferenceOracle,
@@ -359,6 +365,7 @@ public final class LagunaDFlashBlockValidator {
 
         committedTokens.append(contentsOf: round.tokens)
         declaredRowTotal += round.declaredRows
+        referenceCheckedRowTotal += reference.count
         roundLatencies.append(round.latencySeconds)
     }
 
@@ -381,6 +388,17 @@ public final class LagunaDFlashBlockValidator {
         let median = sorted[sorted.count / 2]
         guard median > 0, let maximum = sorted.last else { return nil }
         return maximum / median
+    }
+
+    /// Slowest single block request, in seconds.
+    public var maxBlockRequestSeconds: Double { roundLatencies.max() ?? 0 }
+
+    /// Median block request, in seconds. The box wrapper rejects a phase whose
+    /// slowest round exceeds a fixed factor of this.
+    public var p50BlockRequestSeconds: Double {
+        guard !roundLatencies.isEmpty else { return 0 }
+        let sorted = roundLatencies.sorted()
+        return sorted[sorted.count / 2]
     }
 }
 
@@ -421,6 +439,16 @@ public struct ExperimentalDFlashReport: Equatable {
     public let residualDivergenceCount: Int
     public let maxOverMedianRoundLatency: Double?
     public let allTokensAdmissible: Bool
+    // Fields the box measurement wrapper consumes for the L3 ledger and the
+    // stall guardrail.
+    public let seedTokenCount: Int
+    public let targetCacheOffsetFinal: Int
+    public let referenceCheckedRowTotal: Int
+    public let targetTailTotal: Int
+    public let maxBlockRequestSeconds: Double
+    public let p50BlockRequestSeconds: Double
+    public let blockSize: Int
+    public let usesTrainedDrafter: Bool
 
     public init(
         totalTokenCount: Int,
@@ -431,7 +459,15 @@ public struct ExperimentalDFlashReport: Equatable {
         declaredRowTotal: Int,
         residualDivergenceCount: Int,
         maxOverMedianRoundLatency: Double?,
-        allTokensAdmissible: Bool
+        allTokensAdmissible: Bool,
+        seedTokenCount: Int = 0,
+        targetCacheOffsetFinal: Int = 0,
+        referenceCheckedRowTotal: Int = 0,
+        targetTailTotal: Int = 0,
+        maxBlockRequestSeconds: Double = 0,
+        p50BlockRequestSeconds: Double = 0,
+        blockSize: Int = 0,
+        usesTrainedDrafter: Bool = true
     ) {
         self.totalTokenCount = totalTokenCount
         self.decodeSeconds = decodeSeconds
@@ -445,6 +481,14 @@ public struct ExperimentalDFlashReport: Equatable {
         self.residualDivergenceCount = residualDivergenceCount
         self.maxOverMedianRoundLatency = maxOverMedianRoundLatency
         self.allTokensAdmissible = allTokensAdmissible
+        self.seedTokenCount = seedTokenCount
+        self.targetCacheOffsetFinal = targetCacheOffsetFinal
+        self.referenceCheckedRowTotal = referenceCheckedRowTotal
+        self.targetTailTotal = targetTailTotal
+        self.maxBlockRequestSeconds = maxBlockRequestSeconds
+        self.p50BlockRequestSeconds = p50BlockRequestSeconds
+        self.blockSize = blockSize
+        self.usesTrainedDrafter = usesTrainedDrafter
     }
 
     public var acceptedDraftRate: Double {

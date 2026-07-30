@@ -89,9 +89,14 @@ public func runDFlashGreedyRound(
 
     let snapshotStart = dflashTimingStart(phaseAccumulator)
     let rollbackProvider = target as? any DFlashTargetCacheRollbackProvider
+    // Pass the width this round is about to write so the snapshot decision can
+    // see a sliding-window cache that is ABOUT to wrap. Without it the round
+    // that crosses the ring boundary gets no snapshot and then cannot trim,
+    // which is the untrimmableCache failure at a 512-token seed.
     let targetRollbackState =
         rollbackProvider?.makeDFlashCacheRollbackState(cache: targetCache)
-        ?? target.makeDefaultDFlashCacheRollbackState(cache: targetCache)
+        ?? target.makeDefaultDFlashCacheRollbackState(
+            cache: targetCache, plannedWriteCount: blockSize)
     dflashRecord(snapshotStart, into: phaseAccumulator) {
         $0.cacheSnapshotSeconds += $1
     }

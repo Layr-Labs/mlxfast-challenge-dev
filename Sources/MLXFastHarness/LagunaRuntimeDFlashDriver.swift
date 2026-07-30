@@ -125,9 +125,14 @@ extension LagunaRuntime {
             totalTokenCount: options.totalTokenCount,
             tolerance: tolerance
         )
+        // A maxBlockSize of 1 is the SERIAL CONTROL: pin the schedule to width 1
+        // so every round is a one-row target step. Same worker, same protocol,
+        // same forward -- only the width differs, which is what makes the paired
+        // ratio a like-for-like comparison.
         var schedule = DFlashBlockSchedule(
             seed: scheduleSeed,
-            maxBlockSize: options.maxBlockSize
+            maxBlockSize: options.maxBlockSize,
+            minBlockSize: options.maxBlockSize == 1 ? 1 : 2
         )
 
         let client = try RuntimeWorkerClient(
@@ -226,7 +231,239 @@ extension LagunaRuntime {
             declaredRowTotal: validator.declaredRowTotal,
             residualDivergenceCount: validator.residualDivergenceCount,
             maxOverMedianRoundLatency: validator.maxOverMedianRoundLatency(),
-            allTokensAdmissible: true
+            allTokensAdmissible: true,
+            seedTokenCount: golden.seedTokens.count,
+            // Parent-derived, never worker-reported: the ledger the wrapper
+            // checks must not be something the measured party can assert.
+            targetCacheOffsetFinal: golden.seedTokens.count
+                + validator.committedTokens.count,
+            referenceCheckedRowTotal: validator.referenceCheckedRowTotal,
+            // One target-produced tail token per round, by construction.
+            targetTailTotal: validator.roundLatencies.count,
+            maxBlockRequestSeconds: validator.maxBlockRequestSeconds,
+            p50BlockRequestSeconds: validator.p50BlockRequestSeconds,
+            blockSize: options.maxBlockSize,
+            usesTrainedDrafter: options.maxBlockSize > 1
+        )
+    }
+}
+
+// MARK: - L1 reference golden generation
+
+/// The emitted plan a reference pass replays.
+///
+/// Produced by whoever ran the candidate (locally: the bench script; on the box:
+/// the measurement wrapper). It carries only what the reference needs to rebuild
+/// the same positions: the seed prompt, the tokens the candidate emitted, and
+/// the block width the candidate declared per round.
+public struct DFlashEmittedPlan: Codable {
+    public struct Round: Codable {
+        public let blockSize: Int
+        public let count: Int
+
+        enum CodingKeys: String, CodingKey {
+            case blockSize = "block_size"
+            case count
+        }
+    }
+
+    public let seedTokens: [Int]
+    public let emitted: [Int]
+    public let rounds: [Round]?
+
+    enum CodingKeys: String, CodingKey {
+        case seedTokens = "seed_tokens"
+        case emitted
+        case rounds
+    }
+}
+
+/// Outcome of a reference pass, including the self-consistency verdict.
+public struct DFlashReferenceGoldenResult {
+    public let rowCount: Int
+    public let expectedSeedToken: Int
+    public let selfConsistent: Bool
+    public let selfConsistencyRowCount: Int
+    public let selfConsistencyDetail: String
+}
+
+extension LagunaRuntime {
+    /// Generate the DFlash reference golden (contract layer L1).
+    ///
+    /// The worker spawned here MUST be the one built from the pinned baseline
+    /// tree, loading organizer-transformed weights -- never the candidate's. The
+    /// caller enforces that by pointing `workerOptions.executablePath` and
+    /// `targetWeightsPath` at the pinned tree; this function additionally runs
+    /// strictly on its own, after the timed phase, with the candidate gone.
+    ///
+    /// R5 self-consistency: one round is replayed twice in the SAME reference
+    /// build and required to be bit-identical. Without that, the admissible sets
+    /// this golden defines are not well defined -- the retired track measured
+    /// reference-vs-reference instability, so the check is mandatory, and a
+    /// failure is an OPERATOR fault rather than a submission fault.
+    public static func experimentalDFlashReferenceGolden(
+        plan: DFlashEmittedPlan,
+        targetWeightsPath: String,
+        drafterPath: String,
+        outputPath: String,
+        workerOptions: RuntimeWorkerOptions
+    ) throws -> DFlashReferenceGoldenResult {
+        guard !plan.seedTokens.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "DFlash reference plan has an empty seed"
+            )
+        }
+        guard !plan.emitted.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "DFlash reference plan has no emitted tokens to verify"
+            )
+        }
+
+        let client = try RuntimeWorkerClient(
+            options: workerOptions,
+            weightsPath: targetWeightsPath,
+            dflashDrafterPath: drafterPath
+        )
+        defer { client.close() }
+
+        // The seed token is the width-1 argmax with the seed as the whole
+        // context: row 0 fed the seed's last token. Asking the reference for it
+        // avoids trusting any candidate-supplied value.
+        let seedProbe = try client.dflashReferenceRows(
+            prefixTokens: plan.seedTokens,
+            startOffset: plan.seedTokens.count - 1,
+            rowCount: 1,
+            declaredBlockWidth: 1
+        )
+        guard seedProbe.ok,
+              let seedArgmax = seedProbe.referenceK1Argmax?.first
+        else {
+            throw MLXFastError.invalidInput(
+                "DFlash reference could not establish the seed token: "
+                    + (seedProbe.error ?? "no reference row returned")
+            )
+        }
+
+        // Full context the emitted rows were produced against.
+        let context = plan.seedTokens + [seedArgmax] + plan.emitted
+        // Row i is fed context[seedLen + i] and predicts context[seedLen+i+1],
+        // i.e. plan.emitted[i].
+        let rowInputBase = plan.seedTokens.count
+
+        // Rounds give the declared block widths. Absent, treat every row as its
+        // own width-1 round so the golden is still usable for a serial control.
+        let rounds = plan.rounds
+            ?? plan.emitted.map { _ in DFlashEmittedPlan.Round(blockSize: 1, count: 1) }
+        let plannedRowTotal = rounds.reduce(0) { $0 + $1.count }
+        guard plannedRowTotal == plan.emitted.count else {
+            throw MLXFastError.invalidInput(
+                "DFlash reference plan rounds cover \(plannedRowTotal) rows but "
+                    + "\(plan.emitted.count) tokens were emitted"
+            )
+        }
+
+        var goldenRows = [DFlashReferenceGolden.Row]()
+        goldenRows.reserveCapacity(plan.emitted.count)
+        var replayRequest: (offset: Int, count: Int, width: Int)?
+        var replayExpected: RuntimeWorkerResponse?
+
+        var emittedOffset = 0
+        for round in rounds {
+            guard round.count > 0, round.blockSize >= round.count else {
+                throw MLXFastError.invalidInput(
+                    "DFlash reference plan has a round emitting \(round.count) "
+                        + "tokens at declared width \(round.blockSize)"
+                )
+            }
+            let startOffset = rowInputBase + emittedOffset
+            let response = try client.dflashReferenceRows(
+                prefixTokens: context,
+                startOffset: startOffset,
+                rowCount: round.count,
+                declaredBlockWidth: round.blockSize
+            )
+            guard response.ok,
+                  let k1 = response.referenceK1Argmax,
+                  let block = response.referenceBlockArgmax,
+                  let top2Tokens = response.referenceTop2Tokens,
+                  let top2Logits = response.referenceTop2Logits,
+                  k1.count == round.count,
+                  block.count == round.count,
+                  top2Tokens.count == round.count,
+                  top2Logits.count == round.count
+            else {
+                throw MLXFastError.invalidInput(
+                    "DFlash reference returned an incomplete row batch: "
+                        + (response.error ?? "shape mismatch")
+                )
+            }
+
+            for index in 0 ..< round.count {
+                goldenRows.append(
+                    DFlashReferenceGolden.Row(
+                        sequentialArgmax: k1[index],
+                        declaredFrameArgmax: [String(round.blockSize): block[index]],
+                        top2Tokens: top2Tokens[index],
+                        top2Logits: top2Logits[index]
+                    )
+                )
+            }
+
+            // Replay the FIRST round: it is the one whose context is shortest,
+            // so a determinism failure there is unambiguous.
+            if replayRequest == nil {
+                replayRequest = (startOffset, round.count, round.blockSize)
+                replayExpected = response
+            }
+            emittedOffset += round.count
+        }
+
+        // --- R5: self-consistency replay in the same reference build ---------
+        var selfConsistent = false
+        var selfConsistencyDetail = "no round available to replay"
+        var selfConsistencyRowCount = 0
+        if let request = replayRequest, let expected = replayExpected {
+            let again = try client.dflashReferenceRows(
+                prefixTokens: context,
+                startOffset: request.offset,
+                rowCount: request.count,
+                declaredBlockWidth: request.width
+            )
+            selfConsistencyRowCount = request.count
+            if !again.ok {
+                selfConsistencyDetail =
+                    "replay failed: " + (again.error ?? "unknown error")
+            } else if again.referenceK1Argmax != expected.referenceK1Argmax {
+                selfConsistencyDetail = "width-1 argmax differed between replays"
+            } else if again.referenceBlockArgmax != expected.referenceBlockArgmax {
+                selfConsistencyDetail = "block-frame argmax differed between replays"
+            } else if again.referenceTop2Tokens != expected.referenceTop2Tokens {
+                selfConsistencyDetail = "top-2 token ids differed between replays"
+            } else if again.referenceTop2Logits != expected.referenceTop2Logits {
+                selfConsistencyDetail = "top-2 logit values differed between replays"
+            } else {
+                selfConsistent = true
+                selfConsistencyDetail =
+                    "replayed \(request.count) row(s) bit-identically"
+            }
+        }
+
+        let golden = DFlashReferenceGolden(
+            seedTokens: plan.seedTokens,
+            expectedSeedToken: seedArgmax,
+            rows: goldenRows,
+            referenceSelfConsistent: selfConsistent
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        try encoder.encode(golden).write(to: URL(fileURLWithPath: outputPath))
+
+        return DFlashReferenceGoldenResult(
+            rowCount: goldenRows.count,
+            expectedSeedToken: seedArgmax,
+            selfConsistent: selfConsistent,
+            selfConsistencyRowCount: selfConsistencyRowCount,
+            selfConsistencyDetail: selfConsistencyDetail
         )
     }
 }

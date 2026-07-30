@@ -290,9 +290,14 @@ public final class DFlashBatchedTokenGenerator: @unchecked Sendable {
         let bonusColumn = MLXArray(group.bonus.map { Int32($0) }, [activeB, 1])
         let verifyInput = concatenated([bonusColumn, draftTokens], axis: 1)
         let rollbackProvider = target as? any DFlashTargetCacheRollbackProvider
+        // verifyInput is [bonus, drafts...]: its column count is exactly the
+        // number of rows this round writes, which the snapshot decision needs to
+        // see a sliding-window cache about to wrap (see
+        // makeDefaultDFlashCacheRollbackState).
         let targetRollbackState =
             rollbackProvider?.makeDFlashCacheRollbackState(cache: group.targetCache)
-            ?? target.makeDefaultDFlashCacheRollbackState(cache: group.targetCache)
+            ?? target.makeDefaultDFlashCacheRollbackState(
+                cache: group.targetCache, plannedWriteCount: verifyInput.dim(1))
         let verifyOut = try DFlashTargetRuntimeOptions.withSmallRowVerifyFusionsDisabled {
             try target.forwardGreedyTokensForDFlash(
                 verifyInput,

@@ -57,6 +57,13 @@ private enum MLXFastCLI {
             case "dflash-benchmark":
                 try runDFlashBenchmark(options)
                 return 0
+            case "dflash-probe":
+                // Serial K=1 control: the denominator of the paired score.
+                try runDFlashBenchmark(options, serialControl: true)
+                return 0
+            case "dflash-reference":
+                try runDFlashReference(options)
+                return 0
             default:
                 fputs("mlxfast-swift: unknown command '\(command)'\n\n", stderr)
                 printUsage()
@@ -1246,7 +1253,18 @@ private enum MLXFastCLI {
     /// never writes a ranked score. The reference verdicts come from a
     /// pinned-baseline-generated golden (contract layer L1), never from the
     /// candidate binary.
-    private static func runDFlashBenchmark(_ options: ParsedOptions) throws {
+    /// `dflash-benchmark` (block decode) and `dflash-probe` (the serial K=1
+    /// control) share this driver: same worker, same protocol, same forward,
+    /// only the block width differs. That is what makes the paired ratio a
+    /// like-for-like comparison instead of two implementations racing.
+    ///
+    /// The report JSON goes to STDOUT as a single object, which is what the box
+    /// measurement wrapper reads; the human summary goes to stderr.
+    private static func runDFlashBenchmark(
+        _ options: ParsedOptions,
+        serialControl: Bool = false
+    ) throws {
+        let subcommand = serialControl ? "dflash-probe" : "dflash-benchmark"
         try options.validate(
             valueOptions: [
                 "--weights", "--drafter", "--golden", "--block-size",
@@ -1260,30 +1278,34 @@ private enum MLXFastCLI {
                 fallback: MLXFastConstants.defaultWeightsPath
             )
         )
+        // The control loads the drafter too and simply never drafts: keeping ONE
+        // worker binary and ONE load path means the two sides of the ratio
+        // cannot diverge in anything except the block width.
         let drafterPath = options.value(
             for: "--drafter",
             default: environmentValue("MLXFAST_DFLASH_DRAFTER_DIR", fallback: "")
         )
         guard !drafterPath.isEmpty else {
             throw MLXFastError.invalidInput(
-                "dflash-benchmark requires --drafter PATH (or "
+                "\(subcommand) requires --drafter PATH (or "
                     + "MLXFAST_DFLASH_DRAFTER_DIR)"
             )
         }
         let goldenPath = options.value(for: "--golden", default: "")
         guard !goldenPath.isEmpty else {
             throw MLXFastError.invalidInput(
-                "dflash-benchmark requires --golden PATH (the pinned-baseline "
+                "\(subcommand) requires --golden PATH (the pinned-baseline "
                     + "reference golden)"
             )
         }
-        let blockSize = try positiveInteger(
+        let requestedBlockSize = try positiveInteger(
             options.value(
                 for: "--block-size",
                 default: String(MLXFastConstants.experimentalDFlashMaxBlockSize)
             ),
             name: "--block-size"
         )
+        let blockSize = serialControl ? 1 : requestedBlockSize
         let tokens = try positiveInteger(
             options.value(
                 for: "--tokens",
@@ -1300,7 +1322,7 @@ private enum MLXFastCLI {
             blockedGoldenPath: goldenPath
         ) else {
             throw MLXFastError.invalidInput(
-                "dflash-benchmark requires the participant runtime worker"
+                "\(subcommand) requires the participant runtime worker"
             )
         }
 
@@ -1316,42 +1338,134 @@ private enum MLXFastCLI {
             scheduleSeed: scheduleSeed
         )
 
-        print(
-            "dflash-benchmark: tokens=\(report.totalTokenCount) "
+        fputs(
+            "\(subcommand): tokens=\(report.totalTokenCount) "
                 + "rounds=\(report.roundCount) "
+                + "block_size=\(report.blockSize) "
                 + "decode_seconds=\(String(format: "%.4f", report.decodeSeconds)) "
-                + "decode_seconds_per_token="
+                + "seconds_per_token="
                 + "\(String(format: "%.6f", report.decodeSecondsPerToken)) "
                 + "accepted_draft_rate="
                 + "\(String(format: "%.4f", report.acceptedDraftRate)) "
-                + "declared_rows=\(report.declaredRowTotal) "
-                + "residual_divergences=\(report.residualDivergenceCount) "
-                + "official_score_produced=false"
+                + "residual_divergences=\(report.residualDivergenceCount)\n",
+            stderr
         )
+
+        // Field names are the box measurement wrapper contract; see
+        // /opt/bench-runner/measure-dflash-job.sh.
+        var payload: [String: Any] = [
+            "track_id": "laguna-xs-2.1-dflash-v1",
+            "official_score_produced": false,
+            "all_tokens_matched": report.allTokensAdmissible,
+            "parent_measured_seconds_per_token": report.decodeSecondsPerToken,
+            "decode_token_count": report.totalTokenCount,
+            "block_size": report.blockSize,
+            "uses_trained_drafter": report.usesTrainedDrafter,
+            "max_block_request_seconds": report.maxBlockRequestSeconds,
+            "p50_block_request_seconds": report.p50BlockRequestSeconds,
+            "decode_seconds": report.decodeSeconds,
+            "accepted_draft_rate": report.acceptedDraftRate,
+            "residual_divergence_count": report.residualDivergenceCount,
+            // L3 ledger.
+            "emitted_token_total": report.totalTokenCount,
+            "declared_rows_total": report.declaredRowTotal,
+            "reference_checked_row_total": report.referenceCheckedRowTotal,
+            "accepted_draft_total": report.acceptedDraftTotal,
+            "rejected_draft_total": report.rejectedDraftTotal,
+            "target_tail_total": report.targetTailTotal,
+            "round_count": report.roundCount,
+            "seed_token_count": report.seedTokenCount,
+            "target_cache_offset_final": report.targetCacheOffsetFinal,
+        ]
+        if let stall = report.maxOverMedianRoundLatency {
+            payload["max_over_median_round_latency"] = stall
+        }
+        let data = try JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        FileHandle.standardOutput.write(data)
+        FileHandle.standardOutput.write(Data("\n".utf8))
         let outputPath = options.value(for: "--output", default: "")
         if !outputPath.isEmpty {
-            var payload: [String: Any] = [
-                "track_id": "laguna-xs-2.1-dflash-v1",
-                "official_score_produced": false,
-                "total_token_count": report.totalTokenCount,
-                "round_count": report.roundCount,
-                "decode_seconds": report.decodeSeconds,
-                "decode_seconds_per_token": report.decodeSecondsPerToken,
-                "accepted_draft_total": report.acceptedDraftTotal,
-                "rejected_draft_total": report.rejectedDraftTotal,
-                "accepted_draft_rate": report.acceptedDraftRate,
-                "declared_row_total": report.declaredRowTotal,
-                "residual_divergence_count": report.residualDivergenceCount,
-                "all_tokens_admissible": report.allTokensAdmissible,
-            ]
-            if let stall = report.maxOverMedianRoundLatency {
-                payload["max_over_median_round_latency"] = stall
-            }
-            let data = try JSONSerialization.data(
-                withJSONObject: payload,
-                options: [.prettyPrinted, .sortedKeys]
-            )
             try data.write(to: URL(fileURLWithPath: outputPath))
+        }
+    }
+
+    /// `dflash-reference`: generate the pinned-baseline reference golden
+    /// (contract layer L1). Run this AFTER the timed phase, from the pinned
+    /// baseline tree, over organizer-transformed weights.
+    private static func runDFlashReference(_ options: ParsedOptions) throws {
+        try options.validate(
+            valueOptions: ["--weights", "--drafter", "--emitted", "--output"]
+        )
+        let weightsPath = options.value(
+            for: "--weights",
+            default: environmentValue(
+                "MLXFAST_WEIGHTS_PATH",
+                fallback: MLXFastConstants.defaultWeightsPath
+            )
+        )
+        let drafterPath = options.value(
+            for: "--drafter",
+            default: environmentValue("MLXFAST_DFLASH_DRAFTER_DIR", fallback: "")
+        )
+        guard !drafterPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "dflash-reference requires --drafter PATH (or "
+                    + "MLXFAST_DFLASH_DRAFTER_DIR)"
+            )
+        }
+        let emittedPath = options.value(for: "--emitted", default: "")
+        guard !emittedPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "dflash-reference requires --emitted PATH (the emitted plan to "
+                    + "replay)"
+            )
+        }
+        let outputPath = options.value(for: "--output", default: "")
+        guard !outputPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "dflash-reference requires --output PATH (the golden to write)"
+            )
+        }
+        guard let workerOptions = try runtimeWorkerOptions() else {
+            throw MLXFastError.invalidInput(
+                "dflash-reference requires the participant runtime worker"
+            )
+        }
+
+        let plan = try JSONDecoder().decode(
+            DFlashEmittedPlan.self,
+            from: try Data(contentsOf: URL(fileURLWithPath: emittedPath))
+        )
+        let result = try LagunaRuntime.experimentalDFlashReferenceGolden(
+            plan: plan,
+            targetWeightsPath: weightsPath,
+            drafterPath: drafterPath,
+            outputPath: outputPath,
+            workerOptions: workerOptions
+        )
+
+        print(
+            "dflash-reference: rows=\(result.rowCount) "
+                + "expected_seed_token=\(result.expectedSeedToken) "
+                + "reference_self_consistent=\(result.selfConsistent) "
+                + "replayed_rows=\(result.selfConsistencyRowCount) "
+                + "detail=\(result.selfConsistencyDetail)"
+        )
+        guard result.selfConsistent else {
+            // OPERATOR fault, not a submission fault: the admissible sets this
+            // golden defines are undefined if the reference is not
+            // deterministic, so refuse to hand it onward.
+            throw MLXFastError.invalidInput(
+                "DFlash reference failed its self-consistency replay "
+                    + "(\(result.selfConsistencyDetail)); this is an OPERATOR "
+                    + "fault -- the reference build is nondeterministic -- not a "
+                    + "participant failure. The golden was written with "
+                    + "reference_self_consistent=false and must not be scored "
+                    + "against."
+            )
         }
     }
 
@@ -1834,6 +1948,8 @@ private enum MLXFastCLI {
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
               mlxfast-swift dflash-benchmark --drafter PATH --golden PATH [--weights PATH] [--block-size N] [--tokens N] [--schedule-seed N] [--output PATH]
+              mlxfast-swift dflash-probe --drafter PATH --golden PATH [--weights PATH] [--tokens N] [--schedule-seed N] [--output PATH]
+              mlxfast-swift dflash-reference --drafter PATH --emitted PATH --output PATH [--weights PATH]
 
             Swift-only Poolside Laguna XS 2.1 NVFP4 harness entrypoint.
             """

@@ -571,6 +571,79 @@ the observed maximum, and small enough that a degraded verifier cannot hide
 inside it. Until that measurement exists the tolerance is a placeholder and
 `tokenFidelityGateStatus` stays `pending-spec`.
 
+# Amendment 4 (2026-07-30) — L4 corrected: KV digests cannot be compared across builds either
+
+L4 as specified asks for "parent-demanded KV digests at the committed offset with
+vacancy sentinels beyond it". The digest half of that does not work, for exactly
+the reason Amendment 1 gave for hidden states: the candidate build and the
+pinned-reference build do not produce bit-identical tensors, and a KV tensor is
+far larger than a single hidden vector. A candidate-vs-reference KV digest
+comparison would fail honest submissions on the first round.
+
+What L4 can and cannot contribute, corrected:
+
+1. **NOT checkable:** candidate KV digest vs reference KV digest. Dropped. The
+   `kv_digest` / `kv_vacancy_digest` protocol fields stay RESERVED and unused
+   rather than carrying a check that cannot hold — shipping a comparison that
+   fails honest code would be worse than shipping none.
+2. **Already covered, and this is the important realisation:** the *effect* of
+   stale KV rows is caught by L2. If a submission leaves rejected rows in the
+   cache, every subsequent row is computed against polluted state, so its
+   per-row top-2 logit VALUES drift from the reference's — and L2 compares
+   exactly those within a tolerance. Rollback elision does not need its own
+   output test; it needs its numerical consequence to be bound, which it is.
+3. **Genuinely additional and checkable WITHIN a build:** ring-index
+   consistency. `RotatingKVCache.trim` moves `offset` and `idx` together. An
+   elision that decrements the logical offset but leaves the physical write
+   index (and therefore the rejected bytes) in place is visible as
+   `idx != offset mod maxSize`, with no cross-build comparison involved. This is
+   the structural check L4 should carry, alongside the cache-offset ledger the
+   session already enforces.
+4. **The wrap-seam leg is promoted from audit instrument to mandatory
+   regression test** — see Amendment 3. It is where rollback is hardest and
+   where a shortcut is most tempting, and Amendment 3 shows a real defect lived
+   there undetected because no short-prompt run reaches it.
+
+Net: L4's value is (3) plus (4), not the digest comparison it was written
+around. `tokenFidelityGateStatus` stays `pending-spec` until (3) is implemented
+and (4) has actually run green at a 512-token seed.
+
+# Amendment 3 (2026-07-30) — the wrap seam was a real defect, not just an audit target
+
+L4 specified a sliding-window wrap-seam leg as an *audit instrument*, on the
+theory that rollback elision might hide there. Implementation found something
+stronger: **block decode was outright broken at the seam**, and the ranked
+window is precisely where it bites.
+
+Mechanism. `RotatingKVCache.isTrimmable` is `offset < maxCacheSize`, which is
+correct rather than conservative — once the ring wraps, rolling the offset back
+would need the entries the wrap just overwrote, and those are the oldest rows
+still inside the window. So a wrapped cache must be rolled back by snapshot and
+replay, not by trimming. But `makeDefaultDFlashCacheRollbackState` decided
+whether to snapshot *before* the block was written, while the trim happens
+*after*. The single round that STARTS trimmable and ENDS wrapped therefore got no
+snapshot and could not trim, and threw `untrimmableCache`.
+
+Why it was not seen earlier: Laguna's sliding window is 512 and every bring-up
+measurement used a 26-68 token prompt, so the seam was never crossed. The ranked
+window is a 512-token seed plus 128 decode steps — it crosses the seam on the
+first block. **Every scored run would have failed.**
+
+Fix: the snapshot decision now takes the width the round is about to write
+(`plannedWriteCount`) and snapshots when any cache would cross its ring
+boundary; and a short trim falls through to the snapshot instead of throwing, so
+a partial trim is discarded rather than compounded. All three round
+implementations (greedy, batched generator, batched benchmark) pass the width.
+
+Consequences for the contract:
+- L4's wrap-seam leg is now MANDATORY as a *regression test*, not only an audit:
+  a seam-crossing run must be part of validation, because a seam bug is
+  invisible to any short-prompt measurement.
+- The measured 1.56x-1.86x speedups were all obtained on short prompts and are
+  therefore NOT evidence about ranked-window behaviour. Speedup at a 512-token
+  seed must be re-measured, and it may differ: the seam forces a snapshot round
+  whose cost the short-prompt runs never paid.
+
 # Amendment 2 (2026-07-30) — what this track actually measures
 
 The DFlash target is the **vendored** `LagunaModel` (reached through

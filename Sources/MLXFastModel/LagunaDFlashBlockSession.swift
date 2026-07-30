@@ -53,6 +53,19 @@ public final class LagunaDFlashBlockSession {
     public private(set) var rollbackRoundCount = 0
     public private(set) var acceptedDraftTotal = 0
     public private(set) var rejectedDraftTotal = 0
+    public private(set) var roundCount = 0
+
+    /// Every round emits exactly one target-produced tail token (the accepted
+    /// draft prefix plus one). The L3 ledger the box wrapper checks is
+    /// `accepted + rejected + target_tail == declared_rows`, so the tail total
+    /// is the round count by construction.
+    public var targetTailTotal: Int { roundCount }
+
+    /// Reference-side accessors, used ONLY by the reference worker built from
+    /// the pinned baseline tree when it serves `dflash_reference_rows`. The
+    /// candidate never reaches this kind.
+    public var referenceTarget: any DFlashTargetModel { target }
+    public var referenceTargetLayerIds: [Int] { drafter.config.targetLayerIds }
 
     /// When true every round also produces the Criterion E work-binding
     /// readouts. This costs a full-logits verify forward instead of the greedy
@@ -92,10 +105,16 @@ public final class LagunaDFlashBlockSession {
             drafter: drafter,
             collectWorkBinding: collectWorkBinding
         )
+        // Deliberately SHORT. Warming compiles kernel shapes and must not
+        // straddle the rotating sliding-window cache's wrap seam: a seed at the
+        // window size plus a widest-block verify pushes rejected rows past the
+        // ring, after which rollback cannot trim them and the round throws
+        // `untrimmableCache`. The seam is a real hazard for the scored window
+        // (contract layer L4); a warmup must not be what discovers it.
         let seed = try warmupSession.begin(
             seedTokens: Array(
                 repeating: 2,
-                count: MLXFastConstants.correctnessPromptTokens
+                count: MLXFastConstants.experimentalDFlashWarmupSeedTokens
             )
         )
         // Warm the widest legal block so a later narrow round cannot be the
@@ -167,13 +186,23 @@ public final class LagunaDFlashBlockSession {
                     + "but the session's committed token is \(currentBonus)"
             )
         }
-        guard maxBlockSize >= 2,
+        guard maxBlockSize >= 1,
               maxBlockSize <= MLXFastConstants.experimentalDFlashMaxBlockSize
         else {
             throw MLXFastError.invalidInput(
-                "DFlash block size \(maxBlockSize) is outside 2..."
+                "DFlash block size \(maxBlockSize) is outside 1..."
                     + "\(MLXFastConstants.experimentalDFlashMaxBlockSize)"
             )
+        }
+
+        // K=1 is the SERIAL CONTROL the paired score divides by. It runs the
+        // same worker, the same protocol and the same target forward as a real
+        // block round -- just one row and zero drafts -- so the denominator
+        // measures this implementation at width 1 rather than some other
+        // code path. `runDFlashGreedyRound` needs at least one draft, so the
+        // single-row case is handled here.
+        if maxBlockSize == 1 {
+            return try generateSerialRow(previousCommittedToken: currentBonus)
         }
 
         let result = try runDFlashGreedyRound(
@@ -226,6 +255,7 @@ public final class LagunaDFlashBlockSession {
         }
         acceptedDraftTotal += result.accepted
         rejectedDraftTotal += rejected
+        roundCount += 1
 
         let binding = result.workBinding
         return LagunaDFlashBlockResult(
@@ -237,6 +267,63 @@ public final class LagunaDFlashBlockSession {
             perRowHiddenDigest: binding?.hiddenDigest ?? [],
             perRowTop2Tokens: binding?.top2Tokens ?? [],
             perRowTop2Logits: binding?.top2Logits ?? []
+        )
+    }
+
+    /// One width-1 target row: the serial control. Zero drafts, one declared
+    /// row, nothing to roll back.
+    ///
+    /// The full-logits forward is deliberate even though only the argmax is
+    /// needed: the control has to produce the same per-row top-2 readouts the
+    /// block path produces, or the parent could not compare the two sides
+    /// against the same reference.
+    private func generateSerialRow(
+        previousCommittedToken: Int
+    ) throws -> LagunaDFlashBlockResult {
+        let input = MLXArray([Int32(previousCommittedToken)])[.newAxis, .ellipsis]
+        let out = try target.forwardForDFlash(
+            input,
+            cache: targetCache,
+            targetLayerIds: drafter.config.targetLayerIds
+        )
+        let logitRow = out.logits[0, -1, 0...]
+        let (top2Tokens, top2Logits) = LagunaDFlashReference.topTwo(of: logitRow)
+        eval(out.targetHidden)
+        guard let next = top2Tokens.first,
+              next >= 0,
+              next < MLXFastConstants.vocabSize
+        else {
+            throw MLXFastError.invalidInput(
+                "DFlash serial row produced no in-vocabulary token"
+            )
+        }
+
+        bonus = next
+        targetHidden = out.targetHidden
+        decodedTokenCount += 1
+        roundCount += 1
+
+        let observedOffset = targetCache.first?.offset ?? -1
+        let expectedOffset = seedTokenCount + decodedTokenCount
+        guard observedOffset == expectedOffset else {
+            throw MLXFastError.invalidInput(
+                "DFlash serial row target cache offset \(observedOffset) "
+                    + "diverged from the logical position \(expectedOffset)"
+            )
+        }
+
+        return LagunaDFlashBlockResult(
+            tokens: [next],
+            targetCacheOffset: observedOffset,
+            acceptedDraftCount: 0,
+            rejectedDraftCount: 0,
+            declaredRows: 1,
+            // Amendment 1: hidden digests are a SELF-consistency instrument
+            // only, never compared across builds, so the control does not pay
+            // to materialize one.
+            perRowHiddenDigest: [""],
+            perRowTop2Tokens: [top2Tokens],
+            perRowTop2Logits: [top2Logits]
         )
     }
 }

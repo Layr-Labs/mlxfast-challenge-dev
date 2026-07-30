@@ -4,7 +4,9 @@ import MLXFastCore
 import MLXFastModel
 import MLXHuggingFace
 import MLXLLM
+import MLXLMCommon
 import MLXSpeculative
+import Tokenizers  // required for #huggingFaceTokenizerLoader() macro expansion
 
 /// Validated `dflash_decode_block` request.
 struct ExperimentalDFlashBlockRequest: Equatable {
@@ -39,11 +41,17 @@ func validateExperimentalDFlashBlockRequest(
           request.steps == nil,
           request.topK == nil,
           request.expectedToken == nil,
+          request.prefixTokens == nil,
+          request.startOffset == nil,
+          request.rowCount == nil,
+          request.declaredBlockWidth == nil,
           let previousToken = request.token,
           previousToken >= 0,
           previousToken < MLXFastConstants.vocabSize,
           let maxBlockSize = request.maxBlockSize,
-          maxBlockSize >= 2,
+          // 1 is legal: it is the serial control the paired score divides by,
+          // served by the same worker and the same protocol.
+          maxBlockSize >= 1,
           maxBlockSize <= MLXFastConstants.experimentalDFlashMaxBlockSize
     else {
         throw MLXFastError.invalidInput(
@@ -117,7 +125,7 @@ extension LagunaRuntime {
         let warmupSeed = try warmup.begin(
             seedTokens: Array(
                 repeating: 2,
-                count: MLXFastConstants.correctnessPromptTokens
+                count: MLXFastConstants.experimentalDFlashWarmupSeedTokens
             )
         )
         _ = try warmup.generateBlock(
@@ -314,6 +322,54 @@ extension LagunaRuntime {
                     + session.decodedTokenCount
             )
 
+        case "dflash_reference_rows":
+            // REFERENCE SIDE ONLY (contract layer L1). Served by a worker built
+            // from the pinned baseline tree over organizer-transformed weights,
+            // strictly after the timed window with the candidate torn down. It
+            // is stateless on purpose: every request rebuilds its own KV cache
+            // from the supplied context, which is what makes the L1
+            // self-consistency replay meaningful -- two identical requests have
+            // no carried state that could explain a difference away.
+            guard request.token == nil,
+                  request.seedTokens == nil,
+                  request.promptTokens == nil,
+                  request.steps == nil,
+                  request.topK == nil,
+                  request.expectedToken == nil,
+                  request.maxBlockSize == nil,
+                  let prefixTokens = request.prefixTokens,
+                  !prefixTokens.isEmpty,
+                  let startOffset = request.startOffset,
+                  startOffset >= 0,
+                  let rowCount = request.rowCount,
+                  rowCount > 0,
+                  let declaredBlockWidth = request.declaredBlockWidth,
+                  declaredBlockWidth >= rowCount,
+                  declaredBlockWidth
+                      <= MLXFastConstants.experimentalDFlashMaxBlockSize
+            else {
+                throw MLXFastError.invalidInput(
+                    "DFlash reference-rows request is malformed or has "
+                        + "cross-kind fields"
+                )
+            }
+            let rows = try LagunaDFlashReference.rows(
+                target: session.referenceTarget,
+                targetLayerIds: session.referenceTargetLayerIds,
+                tokens: prefixTokens,
+                startOffset: startOffset,
+                count: rowCount
+            )
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                referenceK1Argmax: rows.map(\.sequentialArgmax),
+                referenceBlockArgmax: rows.map(\.blockArgmax),
+                referenceTop2Tokens: rows.map(\.top2Tokens),
+                referenceTop2Logits: rows.map(\.top2Logits)
+            )
+
         default:
             throw MLXFastError.invalidInput(
                 "DFlash worker rejects request kind \(request.kind)"
@@ -327,16 +383,27 @@ private final class ExperimentalDFlashAsyncResultBox<T>: @unchecked Sendable {
 }
 
 /// Bridge the vendored async loaders into the synchronous worker startup path.
-private func waitForExperimentalDFlashAsync<T: Sendable>(
-    _ operation: @escaping @Sendable () async throws -> T
+///
+/// T is deliberately NOT constrained to `Sendable` and the operation is not a
+/// `@Sendable` closure: the values crossing this boundary are the loaded
+/// `ModelContext` and `any DFlashTargetModel`, neither of which is Sendable and
+/// neither of which can be made so from here (both are vendored types). The
+/// hop is safe because this bridge is only ever used during single-threaded
+/// worker startup -- once, before the protocol loop begins -- so the loaded
+/// model is never touched concurrently. `nonisolated(unsafe)` states that
+/// reasoning explicitly instead of hiding it behind a false conformance.
+private func waitForExperimentalDFlashAsync<T>(
+    _ operation: @escaping () async throws -> T
 ) throws -> T {
     let semaphore = DispatchSemaphore(value: 0)
     let box = ExperimentalDFlashAsyncResultBox<T>()
+    nonisolated(unsafe) let unsafeOperation = operation
+    nonisolated(unsafe) let unsafeBox = box
     Task {
         do {
-            box.result = .success(try await operation())
+            unsafeBox.result = .success(try await unsafeOperation())
         } catch {
-            box.result = .failure(error)
+            unsafeBox.result = .failure(error)
         }
         semaphore.signal()
     }

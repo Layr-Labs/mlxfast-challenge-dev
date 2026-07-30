@@ -212,4 +212,13 @@ public enum MLXFastConstants {
     // candidate-vs-reference kernel drift and is deliberately small: a large
     // cap would be spendable by a cheating submission.
     public static let experimentalDFlashResidualDivergenceBudgetPerThousand = 5
+    // Seed length used ONLY to warm block-decode kernel shapes before the
+    // protocol hello. Deliberately far below Laguna's 512-position sliding
+    // window: a warmup seeded AT the window size plus a widest-block verify
+    // pushes the rejected rows past the rotating cache's wrap seam, after which
+    // rollback cannot trim them and the round fails with `untrimmableCache`.
+    // That seam is a genuine hazard for the scored window and is the subject of
+    // the contract's wrap-seam leg (layer L4); a shape warmup must not be what
+    // discovers it, and must not fail startup because of it.
+    public static let experimentalDFlashWarmupSeedTokens = 64
 }
