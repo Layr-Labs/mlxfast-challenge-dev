@@ -355,9 +355,35 @@ jobs:
 
       # Standing fail-closed gate. Order matters: this runs before any secret
       # use, submitted-code handling, or bench execution.
+      # ENABLEMENT IS TWO SEPARATE QUESTIONS, and conflating them made the
+      # pipeline untestable before go-live.
+      #
+      #   may this job RUN?      confirm_track_enabled, a matching track_id,
+      #                          and non-empty golden pins.
+      #   may it PUBLISH a
+      #   ranked score?          official_scoring_enabled AND
+      #                          reference_baseline.publication_allowed, the two
+      #                          trusted-contract fields the go-live runbook
+      #                          flips.
+      #
+      # Requiring the PUBLISH answer in order to RUN meant the only way to
+      # exercise this pipeline was to declare the track live first -- so the
+      # correctness gates, the fail-closed guards, and the reused serial gate
+      # leg could never be validated before the switch they gate was already
+      # thrown. That is backwards, and it is how the fifth copy of the decode
+      # floor survived review: it was only ever found by dispatching for real.
+      #
+      # A gates-only dispatch (run_benchmark=false) produces NO ranked score.
+      # It writes a sealed local gates-score.json and the gates-only
+      # correctness artifacts, and every timed and scoring step is gated on
+      # inputs.run_benchmark. So it is allowed to run against a not-yet-enabled
+      # track. Anything that can publish still requires both flags, checked
+      # here AND again at the scoring step, so a future reordering of these
+      # steps cannot turn a dry run into a publishing one.
       - name: Enforce DFlash track enablement
         env:
           CONFIRM_TRACK_ENABLED: ${{ inputs.confirm_track_enabled && '1' || '0' }}
+          RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
         run: |
           set -euo pipefail
           test -s "${MLXFAST_DFLASH_CONTRACT_PATH}"
@@ -368,9 +394,16 @@ jobs:
           fi
           scoring_enabled="$(jq -r '.official_scoring_enabled' "${MLXFAST_DFLASH_CONTRACT_PATH}")"
           publication_allowed="$(jq -r '.reference_baseline.publication_allowed' "${MLXFAST_DFLASH_CONTRACT_PATH}")"
+          # The PUBLISH question. Enforced for any run that can emit a ranked
+          # score; a dry run is told the track is not yet enabled and carries
+          # on, because it cannot publish one.
           if [[ "${scoring_enabled}" != "true" || "${publication_allowed}" != "true" ]]; then
-            echo "::error::DFlash track ${MLXFAST_DFLASH_TRACK_ID} is NOT enabled (official_scoring_enabled=${scoring_enabled}, reference_baseline.publication_allowed=${publication_allowed}). This workflow is deliberately inert until the operator completes the DFlash go-live runbook and flips both trusted-contract fields on main." >&2
-            exit 1
+            if [[ "${RUN_BENCHMARK}" == "1" ]]; then
+              echo "::error::DFlash track ${MLXFAST_DFLASH_TRACK_ID} is NOT enabled (official_scoring_enabled=${scoring_enabled}, reference_baseline.publication_allowed=${publication_allowed}). A RANKED run is deliberately refused until the operator completes the DFlash go-live runbook and flips both trusted-contract fields on main. Dispatch with run_benchmark=false to validate the gates without producing a score." >&2
+              exit 1
+            fi
+            echo "::notice::DFlash track ${MLXFAST_DFLASH_TRACK_ID} is not enabled for ranked scoring (official_scoring_enabled=${scoring_enabled}, reference_baseline.publication_allowed=${publication_allowed}); proceeding as a GATES-ONLY dry run, which publishes no score."
+            echo "MLXFAST_DFLASH_DRY_RUN_UNENABLED=1" >> "${GITHUB_ENV}"
           fi
           for pin_name in \
             MLXFAST_DFLASH_CORRECTNESS_GOLDEN_SHA256 \
@@ -382,11 +415,18 @@ jobs:
               exit 1
             fi
           done
+          # The RUN question. Unchanged and still mandatory for BOTH kinds of
+          # dispatch: nothing about this job -- gates included -- happens
+          # without the operator ticking the interlock on the dispatch itself.
           if [[ "${CONFIRM_TRACK_ENABLED}" != "1" ]]; then
             echo "::error::DFlash track enablement interlock is disabled; dispatch requires confirm_track_enabled=true" >&2
             exit 1
           fi
-          echo "dflash-benchmark: track ${MLXFAST_DFLASH_TRACK_ID} enablement verified"
+          if [[ "${RUN_BENCHMARK}" == "1" ]]; then
+            echo "dflash-benchmark: track ${MLXFAST_DFLASH_TRACK_ID} enablement verified (RANKED: scoring enabled and publication allowed)"
+          else
+            echo "dflash-benchmark: track ${MLXFAST_DFLASH_TRACK_ID} enablement verified (GATES-ONLY dry run: no ranked score is produced)"
+          fi
 
       # DFlash-specific host contract, asserted only once the track is live.
       - name: DFlash host preflight
@@ -1897,6 +1937,24 @@ jobs:
         if: ${{ inputs.run_benchmark }}
         run: |
           set -euo pipefail
+          # SECOND, INDEPENDENT check of the PUBLISH question, at the step that
+          # actually produces the ranked score rather than 49 steps earlier.
+          # "Enforce DFlash track enablement" already refused a ranked dispatch
+          # against a not-yet-enabled track; this is here so that stays true if
+          # these steps are ever reordered, if this one gains a path that runs
+          # without the earlier gate, or if a dry run is ever taught to reach
+          # scoring. A guard 49 steps upstream of the thing it protects is a
+          # guard whose coverage depends on step order.
+          scoring_enabled="$(jq -r '.official_scoring_enabled' "${MLXFAST_DFLASH_CONTRACT_PATH}")"
+          publication_allowed="$(jq -r '.reference_baseline.publication_allowed' "${MLXFAST_DFLASH_CONTRACT_PATH}")"
+          if [[ "${scoring_enabled}" != "true" || "${publication_allowed}" != "true" ]]; then
+            echo "::error::refusing to compute a ranked DFlash score for a track that is not enabled (official_scoring_enabled=${scoring_enabled}, reference_baseline.publication_allowed=${publication_allowed})" >&2
+            exit 1
+          fi
+          if [[ "${MLXFAST_DFLASH_DRY_RUN_UNENABLED:-0}" == "1" ]]; then
+            echo "::error::a gates-only dry run reached the ranked scoring step; this step must never run for a dispatch that was admitted as unenabled" >&2
+            exit 1
+          fi
           results="${MLXFAST_MEASURE_OUT}/results.json"
           test -s "${results}"
           jq -e \
