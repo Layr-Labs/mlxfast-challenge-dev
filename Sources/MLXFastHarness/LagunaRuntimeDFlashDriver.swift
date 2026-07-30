@@ -28,7 +28,7 @@ public struct DFlashReferenceGolden: Codable {
     }
 
     public let seedTokens: [Int]
-    public let expectedSeedToken: Int
+    public let referenceSeedToken: Int
     public let rows: [Row]
     /// Set by the reference generator once its self-consistency replay passed
     /// (contract layer L1 requirement R5). A run must refuse to score against a
@@ -37,7 +37,7 @@ public struct DFlashReferenceGolden: Codable {
 
     enum CodingKeys: String, CodingKey {
         case seedTokens = "seed_tokens"
-        case expectedSeedToken = "expected_seed_token"
+        case referenceSeedToken = "reference_seed_token"
         case rows
         case referenceSelfConsistent = "reference_self_consistent"
     }
@@ -154,7 +154,7 @@ extension LagunaRuntime {
                     + (begin.error ?? "no seed token returned")
             )
         }
-        guard seedToken == golden.expectedSeedToken else {
+        guard seedToken == golden.referenceSeedToken else {
             throw DFlashContractViolation(
                 kind: .tokenNotAdmissible,
                 step: 0,
@@ -281,7 +281,7 @@ public struct DFlashEmittedPlan: Codable {
 /// Outcome of a reference pass, including the self-consistency verdict.
 public struct DFlashReferenceGoldenResult {
     public let rowCount: Int
-    public let expectedSeedToken: Int
+    public let referenceSeedToken: Int
     public let selfConsistent: Bool
     public let selfConsistencyRowCount: Int
     public let selfConsistencyDetail: String
@@ -450,7 +450,7 @@ extension LagunaRuntime {
 
         let golden = DFlashReferenceGolden(
             seedTokens: plan.seedTokens,
-            expectedSeedToken: seedArgmax,
+            referenceSeedToken: seedArgmax,
             rows: goldenRows,
             referenceSelfConsistent: selfConsistent
         )
@@ -460,7 +460,7 @@ extension LagunaRuntime {
 
         return DFlashReferenceGoldenResult(
             rowCount: goldenRows.count,
-            expectedSeedToken: seedArgmax,
+            referenceSeedToken: seedArgmax,
             selfConsistent: selfConsistent,
             selfConsistencyRowCount: selfConsistencyRowCount,
             selfConsistencyDetail: selfConsistencyDetail

@@ -1449,7 +1449,7 @@ private enum MLXFastCLI {
 
         print(
             "dflash-reference: rows=\(result.rowCount) "
-                + "expected_seed_token=\(result.expectedSeedToken) "
+                + "reference_seed_token=\(result.referenceSeedToken) "
                 + "reference_self_consistent=\(result.selfConsistent) "
                 + "replayed_rows=\(result.selfConsistencyRowCount) "
                 + "detail=\(result.selfConsistencyDetail)"
