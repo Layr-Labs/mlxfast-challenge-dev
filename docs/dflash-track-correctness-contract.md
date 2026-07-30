@@ -2448,3 +2448,79 @@ even though it uses the same constant.
    amendment prices the rows; it does not make the K-wide trunk optional, and
    Amendment 18 section 3's point stands that the trunk is held in place by token
    correctness rather than by any gate.
+
+# Amendment 22 (2026-07-30): the serial floor false-rejects the DFlash denominator
+
+The first end-to-end run of `measure-dflash-job.sh` — the wrapper the ranked
+workflow invokes, never executed before today — rejected its own serial
+denominator as throttled when nothing was throttled.
+
+## Measured
+
+Calibration-bootstrap run, alternating order, 40C gate between every phase:
+
+| side | s/token | max temp | min steady freq |
+|---|---|---|---|
+| serial | 0.020150 | 38.5 C | **1613** |
+| dflash | 0.023272 | 43.4 C | 1606 |
+| dflash | 0.023189 | 43.9 C | 1606 |
+| serial | 0.020202 | 41.1 C | **1604** |
+| serial | — | — | **1598 -> REJECTED** |
+| serial (gated retry) | 0.020230 | — | **1605 -> accepted** |
+
+The serial side's steady clock declines monotonically as the box accumulates heat
+— 1613, 1604, 1598 — and crosses `MIN_FREQ_SERIAL=1600` on the third pair. The
+retry, after a further cool-down, came back at 1605. So the floor sits *inside*
+this workload's normal run-to-run variation.
+
+It is a FALSE reject. The script's own operator record (2026-07-12, quoted in its
+header) puts genuine sustained throttle on this silicon at **1447-1455 MHz**. 1598
+is 145 MHz above that.
+
+## Why the floor is wrong for this side
+
+The header states the premise: "serial side: continuous target work, holds >= 1607
+MHz cold -- same regime as the serial track's 1600 floor." That premise does not
+hold, because the DFlash denominator is not the serial track's workload. It is
+`dflash-probe`: a width-1 forward through the DFlash code path with the drafter
+resident, not the serial track's `benchmark` command. Different workload, lower
+sustained clock. The 1600 floor was inherited from the serial track rather than
+measured for the probe.
+
+The asymmetry is the tell. The dflash side runs at 1606 against a 1500 floor —
+106 MHz of margin, never at risk — while the serial side runs at 1598-1613 against
+1600, i.e. 4-13 MHz. Both sides sit at essentially the SAME clock; only their
+floors differ.
+
+Note the ramp-blending mitigation is already present and is not the issue: the
+DFlash `check_telemetry` computes `min_steady` over samples whose predecessor was
+also loaded, exactly as the serial wrapper does after its own false-trip incident.
+These are steady samples.
+
+## Consequence
+
+With `--min-pairs 3` and one gated retry per rejection class, a ranked run burns
+its retry on this and can then fail outright — intermittently, as a function of
+ambient temperature and how many pairs have already run. A track whose denominator
+is rejected by luck cannot publish a reliable score.
+
+## Recommended fix, NOT applied
+
+`MIN_FREQ_SERIAL=1500`, matching the dflash side. Same value, justified by the same
+operator throttle record the script already cites, and still ~45 MHz above measured
+throttle. One line, plus a manifest re-sign and janitor audit on every box serving
+the track.
+
+Deliberately not applied by the agent: the thermal/telemetry stability contract is
+declared `readonly` with "do not env-override", and is documented as operator-owned
+and non-overridable. A 2 MHz measurement is not grounds to cross that boundary. It
+is recorded here for the operator to decide.
+
+## Method note
+
+This is the fifth gate on this track measured to reject honest work — after the
+exact-token gate (Amendment 2), the stall guardrail rejecting 25 of 28 runs
+(Amendment 12), the one-slot residual budget (Amendment 10), and the 1.0 decode
+floor. Each was inherited or reasoned about rather than measured against the
+workload it would judge. The pattern is now well enough established to state as a
+rule: a threshold copied from a neighbouring track is an untested threshold.
