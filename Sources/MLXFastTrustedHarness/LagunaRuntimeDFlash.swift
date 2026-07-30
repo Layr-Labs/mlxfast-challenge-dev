@@ -143,63 +143,28 @@ public struct DFlashContractViolation: Error, CustomStringConvertible {
 /// These are numeric readouts taken in two different frames, so they are compared
 /// with a tolerance -- never for equality.
 ///
-/// MEASURED BASIS, RE-TAKEN. The first calibration (Amendment 6) compared the
-/// candidate against a PRE-GENERATED golden, so every gap it recorded was the sum
-/// of candidate-vs-reference drift and the golden's own pre-generation drift. Only
-/// the live post-run replay of the candidate's own chain (Amendment 15) isolates
-/// the term this tolerance is supposed to price. Both regimes are kept below,
-/// because the difference between them IS the finding.
+/// The two constants and their full measured derivation live in
+/// `MLXFastConstants.experimentalDFlashWorkBindingLogitTolerance{Absolute,Relative}`.
+/// Read that comment before touching either number: a calibration that set out to
+/// tighten the absolute arm per block width measured that it must not be tightened
+/// at all, and that it is now only two ULPs above honest CROSS-BUILD drift.
 ///
-/// LIVE REPLAY (M5-C, 2026-07-30, frozen 128-token window, 256 comparisons per
-/// run, Laguna XS 2.1 NVFP4 target + the pinned 924 MB BF16 drafter, candidate and
-/// reference from the SAME build). Gap = `|candidate - reference|` per top-2 slot;
-/// logits are BF16, so one ULP at these magnitudes is 0.125:
-///
-///     width  fixture       seeds    max            p99      p50    mean
-///     K=1    both          -        0              0        0      0
-///     K=3    varied        7        1.500          1.375    0.188  0.280
-///     K=3    repetitive    0        2.750          1.500    0.250  0.309
-///     K=4    varied        0, 7     1.750, 2.4375  1.75     0.250  0.320
-///     K=4    repetitive    0, 7     1.750, 2.000   1.688    0.250  0.319
-///     K=8    varied        7        2.625          1.750    0.250  0.386
-///     K=8    repetitive    0        3.250          2.125    0.188  0.365
-///
-/// Read that table before touching the constant. The K=1 control is EXACTLY zero:
-/// at width 1 the candidate reproduces the reference's own width-1 walk bit for
-/// bit, so there is no same-build drift at all. Every nonzero row is a BLOCK-FRAME
-/// effect that grows with the width -- which also means the 3.375 the old
-/// calibration attributed to build-to-build drift was mostly the golden's, and
-/// what survives is a frame effect the reference could not have avoided.
-///
-/// So: absolute **4.875** is 2x the maximum observed at the widths this
-/// recalibration covers (2.4375 at K<=4, both fixtures, several seeds), and 1.5x
-/// the maximum observed at ANY width including the off-ranked K=8 diagnostic
-/// (3.250) -- the same 1.5x discipline Amendment 6 applied, now against an
-/// uncontaminated maximum. It is also strictly below the outgoing 5.0, which is a
-/// hard constraint: a recalibration whose measured basis shrank must not end up
-/// loosening the binder. Relative 0.25 is 1.5x the largest relative gap observed
-/// live (0.166) -- the old 0.02 was dead code, below even the short-context gaps.
-///
-/// STORED-GOLDEN REGIME, retained for provenance because it is what the 5.0 was
-/// built on: max 3.375 over 352 long-context comparisons, concentrated once the
-/// context passed the 512-slot sliding window, spread across the run rather than
-/// clustered at the wrap seam.
-///
-/// WHAT THIS DOES NOT ESTABLISH, stated because it bounds the claim:
-///   * Candidate and reference were the same build, so the CROSS-BUILD term (a
-///     submission's own kernels) is unmeasured and additive on top of these.
-///   * The false-negative side is unmeasured: no deliberately degraded verifier
-///     was run, so "a cheaper verifier cannot hide inside 5.0" is not a measured
-///     claim. At 5.0 against top-1 logits near 21 the binder prices only GROSS
-///     degradation. It remains a real constraint on a verifier that skips the
-///     per-row lm_head entirely (it then has no values to report at all), but it
-///     does not price a subtly reduced trunk.
-/// Both gaps must be closed before `official_scoring_enabled` is turned on.
+/// The one-line summary, because it inverts what Amendments 6 through 19 assumed:
+/// honest same-build drift is flat in verify width from width 2 on (only width 1
+/// is special, and it is exactly 0), while honest cross-build drift -- a single
+/// semantics-preserving reassociation in one MoE reduction -- reaches 4.625 at
+/// width 1 against a 4.875 arm. The block-frame term this tolerance was calibrated
+/// on is the SMALLER of the two, and the larger one had never been measured.
 public struct DFlashWorkBindingTolerance: Sendable {
     public let absolute: Double
     public let relative: Double
 
-    public init(absolute: Double = 4.875, relative: Double = 0.25) {
+    public init(
+        absolute: Double = MLXFastConstants
+            .experimentalDFlashWorkBindingLogitToleranceAbsolute,
+        relative: Double = MLXFastConstants
+            .experimentalDFlashWorkBindingLogitToleranceRelative
+    ) {
         self.absolute = absolute
         self.relative = relative
     }
@@ -215,9 +180,13 @@ public struct DFlashWorkBindingTolerance: Sendable {
     /// 4.875 was never the binding constraint where it mattered.
     ///
     /// With AND the constraint is the MINIMUM of the two arms: absolute binds at
-    /// large magnitudes, relative binds at small ones. Honest runs are unaffected
-    /// -- measured honest maxima are 2.75 absolute and 0.166 relative, inside both
-    /// arms with margin.
+    /// large magnitudes, relative binds at small ones.
+    ///
+    /// Honest runs still pass, but "with margin" is no longer true of the absolute
+    /// arm and the recalibration says so: the honest maxima are 4.5 absolute
+    /// same-build (width 6, 12,800 comparisons) and 4.625 absolute cross-build
+    /// (width 1, one reassociated MoE reduction), against a 4.875 arm. The
+    /// relative arm does keep real margin: 0.1953 observed against 0.25.
     public func matches(candidate: Double, reference: Double) -> Bool {
         let delta = abs(candidate - reference)
         guard delta <= absolute else { return false }
@@ -678,10 +647,18 @@ public final class LagunaDFlashBlockValidator {
                         candidate: candidateValue,
                         reference: referenceValue
                     ) else {
+                        // The declared width is in the message because the
+                        // calibration is width-attributed: a rejection at a wide
+                        // round and one at the ranked width are different events,
+                        // and the width is the parent's own schedule value.
                         throw DFlashContractViolation(
                             kind: .workBindingLogitMismatch,
                             step: step + index,
-                            detail: "row readout \(pair) outside tolerance"
+                            detail: "row readout \(pair) outside tolerance "
+                                + "(delta \(delta) at declared width "
+                                + "\(round.requestedBlockSize); absolute arm "
+                                + "\(tolerance.absolute), relative arm "
+                                + "\(tolerance.relative))"
                         )
                     }
                 }

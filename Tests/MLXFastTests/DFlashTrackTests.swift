@@ -691,10 +691,8 @@ struct DFlashNearTieAdmissionTests {
     /// top-2 needs a gap below the DIFFERENCE of two per-logit drifts, so the
     /// envelope is 2 x 2.4375 = 4.875.
     ///
-    /// The L2 absolute tolerance is re-anchored on the same live maximum: 2x it,
-    /// which is also 1.5x the largest gap seen at ANY width (3.25 at the
-    /// off-ranked K=8) and strictly below the 5.0 it replaces. Pinned together
-    /// so a future edit has to restate the derivation rather than nudge a number.
+    /// The L2 absolute tolerance shares the number but no longer shares the
+    /// derivation: see `workBindingAbsoluteArmIsNotTightenedBecauseCrossBuildDriftDominates`.
     @Test
     func nearTieEnvelopeIsTwiceTheMeasuredWorkBindingDrift() {
         let liveMaximum = 2.4375
@@ -773,8 +771,66 @@ struct DFlashWorkBindingHardeningTests {
         )
     }
 
-    /// Honest drift stays admissible: the measured honest maxima are 2.75
-    /// absolute and 0.166 relative, inside both arms.
+    /// The absolute arm is NOT tightened, and this pins WHY -- so a future
+    /// per-width "improvement" has to restate the measurement rather than
+    /// rediscover it.
+    ///
+    /// Amendment 19 proposed calibrating the absolute arm per block width, on the
+    /// stated basis that honest frame divergence is 0 at width 1 and grows
+    /// monotonically with the verify width, which would have put the ranked width
+    /// near 3.5-4.1. A 50-run, 12,800-comparison sweep with every gap attributed
+    /// to its round's width measured that basis false beyond the first step, and a
+    /// first-ever cross-build measurement measured the proposed arm unsafe.
+    @Test
+    func workBindingAbsoluteArmIsNotTightenedBecauseCrossBuildDriftDominates() {
+        let tolerance = DFlashWorkBindingTolerance()
+
+        // Honest SAME-BUILD maxima, per verify width, from the width-attributed
+        // sweep. Width 1 is exactly 0; from width 2 on there is no monotone growth
+        // -- 4.5 at width 6 sits above 2.5 at width 7 -- so width is not a
+        // predictor and a per-width schedule has nothing to key on.
+        let sameBuildMaxByWidth: [Int: Double] = [
+            1: 0.0, 2: 3.125, 3: 3.375, 4: 2.4375,
+            5: 3.375, 6: 4.5, 7: 2.5, 8: 3.25,
+        ]
+        #expect(sameBuildMaxByWidth[1] == 0.0)
+        #expect(sameBuildMaxByWidth[6]! > sameBuildMaxByWidth[7]!)
+        for (width, drift) in sameBuildMaxByWidth {
+            #expect(
+                tolerance.matches(
+                    candidate: 26.0 - drift,
+                    reference: 26.0
+                ),
+                "honest same-build drift at width \(width) must pass"
+            )
+        }
+
+        // Honest CROSS-BUILD drift, from one semantics-preserving reassociation of
+        // the MoE expert reduction against an otherwise identical reference build.
+        // Width 1 is where same-build drift is exactly 0, so this is the
+        // cross-build term isolated -- and it is the LARGEST honest number
+        // measured anywhere.
+        let crossBuildMaxAtWidthOne = 4.625
+        #expect(crossBuildMaxAtWidthOne > sameBuildMaxByWidth[6]!)
+        #expect(
+            tolerance.matches(
+                candidate: 26.0 - crossBuildMaxAtWidthOne,
+                reference: 26.0
+            ),
+            "an honest cross-build submission must not be rejected"
+        )
+
+        // The arm is only two BF16 ULPs (0.125 each) above that, so the 1.5x
+        // headroom discipline of Amendments 6 and 15 no longer holds against the
+        // term a real submission actually produces. Tightening to Amendment 19's
+        // proposed ranked-width arm would have rejected honest cross-build work.
+        #expect(tolerance.absolute - crossBuildMaxAtWidthOne == 0.25)
+        let amendment19ProposedRankedArm = 4.1
+        #expect(amendment19ProposedRankedArm < crossBuildMaxAtWidthOne)
+        #expect(amendment19ProposedRankedArm < sameBuildMaxByWidth[6]!)
+    }
+
+    /// Honest drift stays admissible.
     @Test
     func measuredHonestDriftStillPassesBothArms() {
         let tolerance = DFlashWorkBindingTolerance()
