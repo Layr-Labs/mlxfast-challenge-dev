@@ -742,6 +742,13 @@ Net: L4's value is (3) plus (4), not the digest comparison it was written
 around. `tokenFidelityGateStatus` stays `pending-spec` until (3) is implemented
 and (4) has actually run green at a 512-token seed.
 
+> **Item (3) is withdrawn by Amendment 8**, and with it this paragraph's gate
+> condition. `idx == offset mod maxSize` is false on `updateConcat`, which is the
+> path every seed prefill and every K>=2 verify takes, so the check would have
+> rejected the first round of every honest ranked run. The gate stays
+> `pending-spec` for the reasons Amendment 8 lists instead. Item (4) stands and
+> has now run.
+
 # Amendment 3 (2026-07-30) — the wrap seam was a real defect, not just an audit target
 
 L4 specified a sliding-window wrap-seam leg as an *audit instrument*, on the
@@ -1059,3 +1066,85 @@ The stale comment on the construction-time `canTrimPromptCache` guard ("the
 round trims the draft cache back to the committed offset every time") is
 corrected. That comment is what makes the wrong fix look right, and it is the
 reason §2 reached for one.
+
+# Amendment 8 (2026-07-30): L4's ring-index check is not implementable as specified
+
+Amendment 4 reduced L4 to two contributions after dropping the KV-digest
+comparison: (3) ring-index consistency, `idx != offset mod maxSize`, as a
+build-independent structural tell for an elision that rewinds the logical offset
+but leaves the rejected bytes resident; and (4) the wrap-seam leg promoted to a
+mandatory regression test. It also made `tokenFidelityGateStatus` conditional on
+(3) being implemented.
+
+(3) cannot be implemented, because the invariant is false on the code path block
+decode takes. `RotatingKVCache.update` dispatches on write width. Only a
+single-row write goes through `updateInPlace`, where `idx` is genuinely a ring
+write index. Every wider write — the seed prefill, and every K>=2 verify block —
+goes through `updateConcat`, which rebuilds the array in TEMPORAL order and sets
+`idx` to the physical row count, which it deliberately lets grow to
+`maxCacheSize + S - 1` so that every row still gets a full window. On that path
+`idx` is not a ring index at all.
+
+Concretely, for the ring the target actually uses (`maxSize` 511), a 600-row
+prefill followed by one K=3 block leaves `offset == 603`, `idx == 513`, and
+`offset % maxSize == 92`. A gate demanding `idx == offset % maxSize` would have
+rejected that honest round — the FIRST round of every ranked run. This is now
+pinned by `multiRowWritesLeaveTheRingInTemporalOrderNotAtOffsetModuloMaxSize` in
+`DFlashRollbackSeamTests`, so the claim is executable rather than asserted.
+
+This is the third time a proposed cross-checking instrument for this track has
+turned out to be unsound on contact with the implementation (Amendment 1: hidden
+digests across builds; Amendment 4: KV digests across builds; here: ring indices
+within a build). The pattern is worth naming: instruments designed from the
+contract's vocabulary rather than from the cache's actual code keep asserting
+invariants the code does not hold. Shipping any of them would have failed honest
+submissions on round 1 while catching nothing.
+
+## What carries L4's weight instead
+
+1. **The cache-offset ledger**, already enforced per round in
+   `LagunaDFlashBlockSession`: physical KV offset must equal
+   `seedTokenCount + decodedTokenCount`. A submission that skips rollback to save
+   time trips this before any of its tokens is scored.
+2. **L2's numerical consequence binding** (Amendment 4 item 2, unchanged and
+   still the strongest argument here): stale rows pollute every subsequent row's
+   logits, and L2 compares per-row top-2 logit VALUES against the reference.
+   Rollback elision does not need its own output test, it needs its consequence
+   priced — with the caveat Amendment 6 section 3 records about how weak that
+   pricing is at long context.
+3. **Snapshot exactness**, newly pinned by
+   `copyingARotatingCacheCapturesRingStateExactlyAcrossTheSeam`. The seam fix
+   falls back on `copy()` whenever a round would cross the ring boundary, so the
+   fix is only as good as that copy: the test asserts offset, ring index,
+   physical row count, `maxSize` and the stored BYTES all survive a write that
+   happens after the snapshot is taken. This is a self-consistency property, so
+   unlike items 1 and 2 of Amendment 4 it is build-independent by construction.
+4. **The mandatory seam leg** (Amendment 4 item 4), which has now actually run:
+   seeds 509 and 600 complete with every token exact, and seed 600 with K=3 is
+   the case that exposed the drafter defect of Amendment 7. A short-prompt suite
+   would have caught none of it.
+
+## Effect on the gate
+
+`tokenFidelityGateStatus` stays `pending-spec`, and the reason is NOT item (3) —
+that condition is withdrawn as unsatisfiable rather than met. What still blocks
+`official_scoring_enabled`:
+
+* **L5 reference-drafter replay is unimplemented.** It is the only layer that
+  binds the DRAFTER to the pinned weights; nothing else does. Note the threat it
+  covers is narrower than it first appears, because a degraded drafter is largely
+  self-punishing: worse drafts mean lower acceptance and therefore a lower score,
+  and every emitted token is still verified by a target whose per-row work L2/L3
+  bind. What L5 uniquely closes is a *different, cheaper* drafter that is still
+  good — most sharply, an excluded input-derived drafter (prompt-lookup, n-gram,
+  token-history) substituted for the trained one. Its design inherits Amendment
+  1's cross-build problem: the reference replays on the candidate's own target
+  hidden states, so draft tokens can differ at near-ties and the check needs a
+  residual bucket rather than equality.
+* **The two L2 gaps of Amendment 6 section 3**: the cross-build tolerance term is
+  unmeasured and additive, and no degraded verifier has been run, so "5.0 is
+  tight enough to catch cheapening" remains unmeasured.
+
+Until those close, the track is runnable and honest about what it does not yet
+prove, which is the state the pinned
+`officialScoringRequiresAnImplementedTokenFidelityGate` test enforces.

@@ -193,4 +193,78 @@ struct DFlashRollbackSeamTests {
             try decisionProbe().makeDefaultDFlashCacheRollbackState(cache: cache) == nil
         )
     }
+
+    // MARK: - L4 ring-index consistency (contract Amendment 8)
+
+    /// Rows shaped the way a KV cache sees them, with distinguishable contents so
+    /// a restore can be compared byte-for-byte rather than only by shape.
+    private func kvRows(_ count: Int, base: Int) -> MLXArray {
+        MLXArray((0 ..< count).map { Float(base + $0) }, [1, 1, count, 1])
+    }
+
+    /// The contract's L4 proposed `idx != offset % maxSize` as the structural
+    /// tell for an elision that rewinds the logical offset but leaves the
+    /// physical write index — and therefore the rejected bytes — in place.
+    ///
+    /// That check is INVALID on the path block decode actually takes, and this
+    /// test is what establishes it. `RotatingKVCache.update` dispatches on width:
+    /// only a single row goes through the in-place ring (`updateInPlace`), where
+    /// `idx` really is a ring write index. Anything wider — the seed prefill, and
+    /// every K>=2 verify — goes through `updateConcat`, which rebuilds the array
+    /// in TEMPORAL order and sets `idx` to the physical row count. On that path
+    /// `idx` is not a ring index at all, so comparing it against `offset % maxSize`
+    /// would fail honest code on the first block.
+    @Test
+    func multiRowWritesLeaveTheRingInTemporalOrderNotAtOffsetModuloMaxSize() {
+        let maxSize = 511
+        let cache = RotatingKVCache(maxSize: maxSize, keep: 0)
+
+        // Seed prefill, wider than the ring.
+        _ = cache.update(keys: kvRows(600, base: 0), values: kvRows(600, base: 1000))
+        // One K=3 verify block.
+        _ = cache.update(keys: kvRows(3, base: 600), values: kvRows(3, base: 1600))
+
+        #expect(cache.offset == 603)
+        // Temporal order, not a ring: `idx` tracks the physical row count, which
+        // `updateConcat` lets grow to maxSize + S - 1.
+        #expect(cache.idx == cache.keys?.dim(2))
+        #expect(cache.idx == 513)
+        // The invariant L4 asked for would have demanded 603 % 511 == 92 here.
+        #expect(cache.offset % maxSize == 92)
+    }
+
+    /// What L4 CAN carry: the snapshot the seam fix falls back on is exact.
+    ///
+    /// This is a self-consistency property, so unlike a candidate-vs-reference KV
+    /// digest (Amendment 4) it holds regardless of build. It is also the property
+    /// the whole wrap-seam fix rests on — if `copy()` were shallow, or lost `idx`
+    /// or the physical row count, rollback past the seam would silently restore
+    /// the wrong window.
+    @Test
+    func copyingARotatingCacheCapturesRingStateExactlyAcrossTheSeam() throws {
+        let maxSize = 511
+        let cache = RotatingKVCache(maxSize: maxSize, keep: 0)
+        _ = cache.update(keys: kvRows(509, base: 0), values: kvRows(509, base: 1000))
+
+        #expect(cache.isTrimmable)
+        let snapshot = try #require(cache.copy() as? RotatingKVCache)
+        let snapshotKeys = try #require(snapshot.keys)
+
+        // Cross the seam: this write takes the ring from trimmable to wrapped, so
+        // the offset can no longer be rewound and only the snapshot can restore it.
+        _ = cache.update(keys: kvRows(3, base: 509), values: kvRows(3, base: 1509))
+        #expect(cache.offset == 512)
+        #expect(cache.isTrimmable == false)
+
+        // Exact in every component the ring's behaviour depends on.
+        #expect(snapshot.offset == 509)
+        #expect(snapshot.idx == 509)
+        #expect(snapshotKeys.dim(2) == 509)
+        #expect(snapshot.maxSize == maxSize)
+
+        // ...and in bytes: the post-snapshot write must not have reached through
+        // into the snapshot's storage.
+        let expected = kvRows(509, base: 0)
+        #expect(MLX.all(snapshotKeys .== expected).item(Bool.self))
+    }
 }
