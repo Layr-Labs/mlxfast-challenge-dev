@@ -130,8 +130,21 @@ concurrency:
 
 jobs:
   dflash-ranked:
-    name: "single-machine DFlash ranked benchmark (m5-bench)"
-    runs-on: [self-hosted, m5-bench]
+    name: "single-machine DFlash ranked benchmark (m5-laguna-dflash)"
+    # DEDICATED label, deliberately NOT the serial track's `m5-bench`.
+    #
+    # Sharing `m5-bench` meant a DFlash dispatch could be picked up by a runner in
+    # the LIVE ranked serial pool and occupy it for the length of a DFlash job --
+    # transform, gates and four thermally-gated pairs. The two tracks also have
+    # different box prerequisites (DFlash needs its own pinned baseline workspace
+    # and per-track calibration), so a serial-pool box would fail the run at the
+    # prerequisite check anyway.
+    #
+    # With a dedicated label an unserved dispatch QUEUES instead of running on the
+    # wrong box, which is the safe failure for an inert track. Registering a runner
+    # under this label is an operator action; until then no DFlash job can start,
+    # which is intentional.
+    runs-on: [self-hosted, m5-laguna-dflash]
     # Job budget: build (~15m) + IT transform (~10m) + artifact hashing of
     # the 18.4 GB source (~3m) + full-length parity pass (~15m) + cooldowns
     # (up to 900s per timed phase) + >=3 alternating timed pairs. Generous
