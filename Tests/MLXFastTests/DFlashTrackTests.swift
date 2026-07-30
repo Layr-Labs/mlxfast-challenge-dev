@@ -267,6 +267,49 @@ struct DFlashTrackTests {
         }
     }
 
+    // CONTRACT LAYER L6 (anti-lottery). A frozen timed prompt makes a failed
+    // ranked run free to retry, which turns every output-side gate into
+    // submit-until-green and lets a drafter-confidence threshold be tuned across
+    // resubmissions. The timed target must therefore be sampled per run from a
+    // pool, using entropy the participant cannot see or influence -- NOT the run
+    // id, which is visible and stable within a run.
+    @Test
+    func timedTargetIsSampledPerRunFromAPoolAndFailsClosedWhenEmpty() throws {
+        let workflow = try text(Self.workflowPath)
+        let fixture = try json(Self.fixturePath)
+
+        // The pool lives in the contract fixture and each entry is verifiable.
+        let pool = try #require(fixture["timed_prompt_pool"] as? [Any])
+        for case let entry as [String: Any] in pool {
+            #expect(entry["r2_path"] as? String != nil)
+            #expect(entry["sha256"] as? String != nil)
+            #expect(entry["bytes"] as? Int != nil)
+        }
+
+        // Selection must draw from kernel entropy, not from the run id.
+        #expect(workflow.contains("/dev/urandom"))
+        #expect(!workflow.contains("github.run_id }} % "))
+        // Rejection sampling rather than a biased plain modulo over the range.
+        #expect(workflow.contains("(65536 / pool_size) * pool_size"))
+        // Fail closed on an empty pool.
+        #expect(workflow.contains("DFlash timed prompt pool is empty"))
+        // The selection is auditable privately and must not be echoed to the
+        // participant-visible job log.
+        #expect(workflow.contains("dflash_timed_target_selection.json"))
+        #expect(workflow.contains("${MLXFAST_PRIVATE_DIR}/dflash_timed_target_selection.json"))
+        // The downloaded object is checked against the SAMPLED entry's own pin,
+        // so a swapped or truncated object still fails closed even though the
+        // key changes per run.
+        #expect(workflow.contains("MLXFAST_DFLASH_BENCH_GOLDEN_SHA256_SELECTED"))
+        #expect(workflow.contains("MLXFAST_DFLASH_BENCH_GOLDEN_BYTES_SELECTED"))
+
+        // Today the pool ships empty on purpose, which keeps the track
+        // unrunnable; that is consistent with official_scoring_enabled == false.
+        if pool.isEmpty {
+            #expect(fixture["official_scoring_enabled"] as? Bool == false)
+        }
+    }
+
     // The retired GEMMA-era MTP surface stays retired under its own names.
     // DFlash carries its own filenames precisely so reviving a speculative
     // track cannot be confused with un-retiring the old one.

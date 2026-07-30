@@ -4,6 +4,8 @@
   "official_scoring_enabled": false,
   "official_scoring_enabled_note": "Fail-closed until the Laguna go-live: hidden goldens, the paired M5 baseline, and the weight manifests must be regenerated on m5-bench with the real Laguna weights (new tokenizer, vocab 100352) before the enablement commit flips this to true, and the token_fidelity_gate below must be fully specified (the DFlash go-live runbook supersedes the retired docs/mtp-track-golive-runbook.md, which was removed with the MTP track).",
   "mlx_swift_lm_revision": "bc1c0ee67d15798343be17c9f8f61f7c0d977149",
+  "timed_prompt_pool": [],
+  "timed_prompt_pool_note": "Contract layer L6 (anti-lottery). The timed target is sampled UNIFORMLY AT RANDOM from this pool once per ranked run, from kernel entropy the participant cannot see or influence; the selected index is recorded only in the private audit dir. A single frozen timed prompt would make a failed ranked run free to retry, degrading every output-side gate into submit-until-green and letting a drafter-confidence threshold be tuned across resubmissions; sampling from a pool of N reduces that to a 1/N chance per attempt. Each entry must be an object {r2_path, sha256, bytes} and is verified byte-for-byte after download. DELIBERATELY EMPTY: the selection step in .github/workflows/dflash-benchmark.yml fails CLOSED on an empty pool, exactly as the weight manifests did before they were regenerated on-box. Populate this with at least 8 distinct hidden timed targets (varied prompt length and domain, so acceptance-rate tuning cannot generalise) before flipping official_scoring_enabled. Hashes are only ever pinned from the uploaded objects, never pre-filled off-box.",
   "editablePaths": [
     "Sources/MLXFastModel",
     "Sources/MLXFastTransform",

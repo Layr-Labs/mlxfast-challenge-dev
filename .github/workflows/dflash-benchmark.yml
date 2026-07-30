@@ -818,14 +818,76 @@ jobs:
       # literal path (BENCH_GOLDEN_PATH). The benchmark golden never enters
       # the workspace here; measure-mtp-job installs and scrubs it per timed
       # side.
+      # CONTRACT LAYER L6 (anti-lottery). A single frozen hidden prompt makes a
+      # failed ranked run free to retry, which degrades every output-side gate
+      # from "must be correct" into "must be correct often enough to eventually
+      # pass" -- and lets a confidence threshold be tuned by submit-until-green.
+      # The defense is to sample the timed target from a POOL, uniformly at
+      # random per run, from entropy the participant cannot see or influence
+      # (not the run id, which is visible and stable within a run). Tuning to
+      # one member then buys a 1/N chance instead of a certainty.
+      #
+      # The pool is declared in the contract fixture
+      # (fixtures/laguna_xs_2_1_dflash_track.json -> timed_prompt_pool[]), each
+      # entry carrying r2_path + sha256 + bytes. This step fails CLOSED when the
+      # pool is missing or empty, exactly like the entry-less weight manifests
+      # did before they were regenerated on-box: the mechanism ships now, the
+      # pool objects must be uploaded to R2 before the track can be enabled.
+      # The chosen index is written to the PRIVATE audit dir only -- echoing it
+      # into a participant-visible log would hand back the sampling.
+      - name: Select hidden DFlash timed target from the pool
+        id: select_dflash_target
+        run: |
+          set -euo pipefail
+          contract="${MLXFAST_DFLASH_CONTRACT_PATH}"
+          test -s "${contract}"
+          pool_size="$(jq '(.timed_prompt_pool // []) | length' "${contract}")"
+          if [[ "${pool_size}" -lt 1 ]]; then
+            echo "::error::DFlash timed prompt pool is empty in ${contract}; upload the pool objects and pin them before enabling this track" >&2
+            exit 1
+          fi
+          # Uniform selection over [0,pool_size) from kernel entropy, rejecting
+          # the biased tail of the RNG range rather than using a plain modulo.
+          limit=$(( (65536 / pool_size) * pool_size ))
+          while :; do
+            draw=$(( $(od -An -N2 -tu2 < /dev/urandom | tr -d ' ') ))
+            if [[ "${draw}" -lt "${limit}" ]]; then break; fi
+          done
+          index=$(( draw % pool_size ))
+          entry="$(jq -c --argjson i "${index}" '.timed_prompt_pool[$i]' "${contract}")"
+          r2_path="$(jq -r '.r2_path' <<<"${entry}")"
+          sha256="$(jq -r '.sha256' <<<"${entry}")"
+          bytes="$(jq -r '.bytes' <<<"${entry}")"
+          for field in "${r2_path}" "${sha256}" "${bytes}"; do
+            if [[ -z "${field}" || "${field}" == "null" ]]; then
+              echo "::error::DFlash timed prompt pool entry ${index} is incomplete" >&2
+              exit 1
+            fi
+          done
+          # Private audit record; never printed to the job log.
+          jq -n --argjson i "${index}" --argjson n "${pool_size}" --arg p "${r2_path}" \
+            '{selected_index:$i, pool_size:$n, r2_path:$p}' \
+            > "${MLXFAST_PRIVATE_DIR}/dflash_timed_target_selection.json"
+          {
+            echo "r2_path=${r2_path}"
+            echo "sha256=${sha256}"
+            echo "bytes=${bytes}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "dflash-benchmark: timed target sampled from a pool of ${pool_size} (selection recorded privately)"
+
       - name: Prepare hidden DFlash goldens
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          # Private object keys scoped to this trusted download step only.
+          # Private object keys scoped to this trusted download step only. The
+          # benchmark (timed) golden comes from the per-run pool selection; the
+          # correctness golden stays fixed because it is an untimed gate and is
+          # not what the lottery would target.
           MLXFAST_DFLASH_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/dflash_correctness_golden_laguna_xs_2_1-v1.json
-          MLXFAST_DFLASH_BENCH_GOLDEN_R2_PATH: correctness_prompts/dflash_benchmark_golden_laguna_xs_2_1-v1.json
+          MLXFAST_DFLASH_BENCH_GOLDEN_R2_PATH: ${{ steps.select_dflash_target.outputs.r2_path }}
+          MLXFAST_DFLASH_BENCH_GOLDEN_SHA256_SELECTED: ${{ steps.select_dflash_target.outputs.sha256 }}
+          MLXFAST_DFLASH_BENCH_GOLDEN_BYTES_SELECTED: ${{ steps.select_dflash_target.outputs.bytes }}
         run: |
           set -euo pipefail
           .github/scripts/download-r2-object.sh \
@@ -842,8 +904,12 @@ jobs:
             "${MLXFAST_PRIVATE_DIR}/mtp_benchmark_golden.json"
           bench_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/mtp_benchmark_golden.json" | awk '{print $1}')"
           bench_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/mtp_benchmark_golden.json" | tr -d ' ')"
-          if [[ "${bench_hash}" != "${MLXFAST_DFLASH_BENCH_GOLDEN_SHA256}" || "${bench_bytes}" != "${MLXFAST_DFLASH_BENCH_GOLDEN_BYTES}" ]]; then
-            echo "::error::hidden MTP benchmark golden pin mismatch" >&2
+          # Verified against the PER-RUN pool selection, not a fixed pin: the
+          # pool entry carries its own sha256/bytes and both must match, so a
+          # swapped or truncated object fails closed even though the object key
+          # differs from run to run.
+          if [[ "${bench_hash}" != "${MLXFAST_DFLASH_BENCH_GOLDEN_SHA256_SELECTED}" || "${bench_bytes}" != "${MLXFAST_DFLASH_BENCH_GOLDEN_BYTES_SELECTED}" ]]; then
+            echo "::error::hidden DFlash timed golden pin mismatch for the sampled pool entry" >&2
             exit 1
           fi
           golden_dst="${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json"
