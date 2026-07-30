@@ -209,8 +209,29 @@ public struct DFlashObservedRound: Sendable {
 }
 
 /// Criterion E validator: primary token predicate + L2 work binding + L3 row
-/// accounting, evaluated round by round against a pinned reference.
+/// accounting -- in TWO halves, deliberately.
+///
+/// `acceptStructural(round:)` is arithmetic on what the worker just reported:
+/// vocabulary range, block bounds, emitted-vs-declared row accounting, the
+/// KV-offset ledger, and the shape of the work-binding readout. None of it needs
+/// a reference, so it runs inline in the timed loop and fails the round that
+/// produced it.
+///
+/// `validateJournalAgainstReference(oracle:)` is everything that needs a
+/// reference verdict: sequential / declared-frame / near-tie / residual
+/// admissibility and the L2 top-2 logit comparison. It CANNOT run inline, and
+/// that is a property of the contract rather than a performance choice. A
+/// reference verdict is only meaningful when it was teacher-forced on the
+/// candidate's OWN emitted prefix; the moment the candidate legitimately
+/// diverges (a near-tie or residual row the contract admits), a pre-generated
+/// file's later rows are anchored to a prefix the candidate no longer has, so
+/// every one of them is scored against the wrong context. The parent therefore
+/// journals the rounds, and the pinned reference replays the candidate's own
+/// chain afterwards. Keeping the oracle out of the timed loop also keeps harness
+/// work off the clock, which is a side benefit, not the reason.
 public final class LagunaDFlashBlockValidator {
+    /// Fallback oracle supplied at init (the golden file). The scored path passes
+    /// a live reference oracle to `validateJournalAgainstReference` instead.
     private let oracle: any DFlashReferenceOracle
     private let totalTokenCount: Int
     private let seedTokenCount: Int
@@ -219,6 +240,13 @@ public final class LagunaDFlashBlockValidator {
     private let nearTieBudget: Int
 
     public private(set) var committedTokens = [Int]()
+    /// Every structurally-accepted round, in emission order. This is the journal
+    /// the post-run reference pass replays; it is what lets the reference be
+    /// teacher-forced on the candidate's own chain instead of a stored one.
+    public private(set) var journal = [DFlashObservedRound]()
+    /// Set once the oracle half has run. A report must not be published without
+    /// it: the structural half alone scores no token.
+    public private(set) var referenceValidated = false
     public private(set) var outcomes = [DFlashValidationOutcome]()
     public private(set) var residualDivergenceCount = 0
     public private(set) var nearTieAdmissionCount = 0
@@ -283,8 +311,10 @@ public final class LagunaDFlashBlockValidator {
         Swift.max(0, totalTokenCount - committedTokens.count)
     }
 
-    /// Validate one observed round. Throws on the first contract violation.
-    public func accept(round: DFlashObservedRound) throws {
+    /// STRUCTURAL half. Runs inline in the timed loop, needs no reference, and
+    /// journals the round for the post-run oracle pass. Throws on the first
+    /// structural contract violation.
+    public func acceptStructural(round: DFlashObservedRound) throws {
         let step = committedTokens.count
 
         guard !round.tokens.isEmpty else {
@@ -361,21 +391,75 @@ public final class LagunaDFlashBlockValidator {
             )
         }
 
-        let reference = try oracle.referenceRows(
-            emittedPrefix: committedTokens,
-            startOffset: step,
-            count: round.tokens.count,
-            declaredBlockWidth: round.requestedBlockSize
-        )
-        guard reference.count == round.tokens.count else {
+        journal.append(round)
+        committedTokens.append(contentsOf: round.tokens)
+        declaredRowTotal += round.declaredRows
+        roundLatencies.append(round.latencySeconds)
+    }
+
+    /// ORACLE half. Replays the journal in order against a reference, scoring
+    /// every emitted token and closing the L2 work binding.
+    ///
+    /// `oracle` defaults to the one supplied at init -- the golden file, kept as
+    /// a fallback for paths that have no live reference. The scored path passes a
+    /// LIVE reference oracle, because reference rows have to be teacher-forced on
+    /// the candidate's own emitted prefix and only a live reference can be.
+    ///
+    /// Replaying strictly in emission order matters twice: it is what makes
+    /// `emittedPrefix` the candidate's actual prefix at that point, and the live
+    /// reference session is a continuously-advanced cache that only stays a pure
+    /// continuation for in-order requests.
+    public func validateJournalAgainstReference(
+        oracle overrideOracle: (any DFlashReferenceOracle)? = nil
+    ) throws {
+        guard !referenceValidated else {
             throw DFlashContractViolation(
                 kind: .workBindingMissing,
-                step: step,
-                detail: "reference returned \(reference.count) rows for "
-                    + "\(round.tokens.count) emitted tokens"
+                detail: "the reference admissibility pass ran twice"
             )
         }
+        let oracle = overrideOracle ?? self.oracle
+        var emittedPrefix = [Int]()
+        emittedPrefix.reserveCapacity(committedTokens.count)
+        for round in journal {
+            let step = emittedPrefix.count
+            let reference = try oracle.referenceRows(
+                emittedPrefix: emittedPrefix,
+                startOffset: step,
+                count: round.tokens.count,
+                declaredBlockWidth: round.requestedBlockSize
+            )
+            guard reference.count == round.tokens.count else {
+                throw DFlashContractViolation(
+                    kind: .workBindingMissing,
+                    step: step,
+                    detail: "reference returned \(reference.count) rows for "
+                        + "\(round.tokens.count) emitted tokens"
+                )
+            }
+            try score(round: round, against: reference, step: step)
+            emittedPrefix.append(contentsOf: round.tokens)
+            referenceCheckedRowTotal += reference.count
+        }
+        referenceValidated = true
+    }
 
+    /// The oracle half must have run before any report is published: on its own,
+    /// the structural half scores no token at all.
+    public func requireReferenceValidated() throws {
+        guard referenceValidated else {
+            throw DFlashContractViolation(
+                kind: .workBindingMissing,
+                detail: "no reference admissibility pass ran for this run"
+            )
+        }
+    }
+
+    private func score(
+        round: DFlashObservedRound,
+        against reference: [DFlashReferenceRow],
+        step: Int
+    ) throws {
         for (index, token) in round.tokens.enumerated() {
             let referenceRow = reference[index]
             let outcome: DFlashValidationOutcome
@@ -466,11 +550,6 @@ public final class LagunaDFlashBlockValidator {
                 }
             }
         }
-
-        committedTokens.append(contentsOf: round.tokens)
-        declaredRowTotal += round.declaredRows
-        referenceCheckedRowTotal += reference.count
-        roundLatencies.append(round.latencySeconds)
     }
 
     /// Require the run to have produced exactly the configured token total.
@@ -566,19 +645,28 @@ public struct ExperimentalDFlashOptions: Equatable {
     public let goldenPath: String
     public let maxBlockSize: Int
     public let totalTokenCount: Int
+    /// Weights the POST-RUN reference replay loads. `nil` means the same tree the
+    /// candidate loaded, which is what a local diagnostic run wants; a ranked run
+    /// points this (and the reference worker executable) at the pinned baseline.
+    public let referenceWeightsPath: String?
+    public let referenceDrafterPath: String?
 
     public init(
         targetWeightsPath: String,
         drafterPath: String,
         goldenPath: String,
         maxBlockSize: Int = MLXFastConstants.experimentalDFlashMaxBlockSize,
-        totalTokenCount: Int = MLXFastConstants.experimentalDFlashMaxTotalTokens
+        totalTokenCount: Int = MLXFastConstants.experimentalDFlashMaxTotalTokens,
+        referenceWeightsPath: String? = nil,
+        referenceDrafterPath: String? = nil
     ) {
         self.targetWeightsPath = targetWeightsPath
         self.drafterPath = drafterPath
         self.goldenPath = goldenPath
         self.maxBlockSize = maxBlockSize
         self.totalTokenCount = totalTokenCount
+        self.referenceWeightsPath = referenceWeightsPath
+        self.referenceDrafterPath = referenceDrafterPath
     }
 }
 

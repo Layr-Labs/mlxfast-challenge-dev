@@ -505,8 +505,17 @@ struct DFlashNearTieAdmissionTests {
         // Four divergences in a row: with the old single-slot residual budget the
         // second would already have thrown.
         for i in 0 ..< 4 {
-            try v.accept(round: round(emitting: 200, offset: 8 + i + 1))
+            try v.acceptStructural(round: round(emitting: 200, offset: 8 + i + 1))
         }
+        // The structural half must have scored NOTHING. Admissibility needs
+        // reference rows teacher-forced on the candidate's own emitted prefix,
+        // which is not knowable until the run has finished; a validator that
+        // reached its oracle inline is the defect this split removes.
+        #expect(v.outcomes.isEmpty)
+        #expect(v.referenceValidated == false)
+
+        try v.validateJournalAgainstReference()
+        #expect(v.referenceValidated)
         #expect(v.admissibleNearTieCount == 4)
         #expect(v.residualDivergenceCount == 0)
     }
@@ -524,11 +533,12 @@ struct DFlashNearTieAdmissionTests {
             top2Logits: [40.0, 40.0 - gap]
         )
         let v = validator(row: row, tokens: 8)
+        for i in 0 ..< 8 {
+            try v.acceptStructural(round: round(emitting: 200, offset: 8 + i + 1))
+        }
         var thrown: DFlashContractViolation?
         do {
-            for i in 0 ..< 8 {
-                try v.accept(round: round(emitting: 200, offset: 8 + i + 1))
-            }
+            try v.validateJournalAgainstReference()
         } catch let violation as DFlashContractViolation {
             thrown = violation
         }
@@ -548,9 +558,12 @@ struct DFlashNearTieAdmissionTests {
             top2Logits: [20.0, 20.0]
         )
         let v = validator(row: row, tokens: 4)
+        // Structurally the round is legal -- in range, one row, ledger consistent.
+        // Fabricated output is caught by the REFERENCE pass, not by arithmetic.
+        try v.acceptStructural(round: round(emitting: 999, offset: 9))
         var thrown: DFlashContractViolation?
         do {
-            try v.accept(round: round(emitting: 999, offset: 9))
+            try v.validateJournalAgainstReference()
         } catch let violation as DFlashContractViolation {
             thrown = violation
         }

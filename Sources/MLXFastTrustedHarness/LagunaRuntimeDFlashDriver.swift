@@ -102,6 +102,107 @@ public struct DFlashGoldenReferenceOracle: DFlashReferenceOracle {
     }
 }
 
+/// Reference oracle backed by a LIVE pinned-baseline reference worker, replaying
+/// the CANDIDATE's OWN emitted chain (contract layer L1).
+///
+/// This is what a stored golden cannot be. A golden's row `i` was teacher-forced
+/// on whatever chain generated the file, so as soon as the candidate emits a
+/// different -- and admissible -- token at some position, every later golden row
+/// answers a question about a prefix the candidate never had. The contract has
+/// always said the parent journals and the pinned reference replays afterwards on
+/// the candidate's own prefix; this is that replay.
+///
+/// Requests must arrive in emission order. The reference session holds one
+/// continuously-advanced width-1 cache (see `LagunaDFlashReference`), so an
+/// in-order walk is a pure continuation; an out-of-order request would force it
+/// to rebuild the frame from scratch. `validateJournalAgainstReference` replays
+/// the journal in order, which satisfies that.
+struct DFlashLiveReferenceOracle: DFlashReferenceOracle {
+    let client: RuntimeWorkerClient
+    /// Length of the seed the candidate bulk-prefilled.
+    let seedTokenCount: Int
+    /// `seed + [seed argmax] + every token the candidate emitted`. Row `j` of a
+    /// request at emitted offset `o` is fed `context[seedTokenCount + o + j]`.
+    let context: [Int]
+
+    func referenceRows(
+        emittedPrefix: [Int],
+        startOffset: Int,
+        count: Int,
+        declaredBlockWidth: Int
+    ) throws -> [DFlashReferenceRow] {
+        guard count > 0 else { return [] }
+        guard startOffset >= 0, emittedPrefix.count == startOffset else {
+            throw MLXFastError.invalidInput(
+                "DFlash live reference replay is out of order: prefix of "
+                    + "\(emittedPrefix.count) at offset \(startOffset)"
+            )
+        }
+        // The whole point of the live path: the rows must be produced against the
+        // candidate's own emitted prefix, so prove that is what is being replayed
+        // rather than assume it.
+        let chainStart = seedTokenCount + 1
+        guard chainStart + startOffset + count <= context.count,
+              context[chainStart ..< (chainStart + startOffset)]
+                  .elementsEqual(emittedPrefix)
+        else {
+            throw MLXFastError.invalidInput(
+                "DFlash live reference context does not carry the candidate's "
+                    + "own emitted prefix at offset \(startOffset)"
+            )
+        }
+
+        let absoluteOffset = seedTokenCount + startOffset
+        // The reference needs an input token for every row of a frame, so a frame
+        // can never be wider than the tokens the candidate actually emitted. This
+        // is the same bound the golden generator applies.
+        let availableRows = context.count - absoluteOffset
+        let widestFrame = Swift.max(
+            count,
+            Swift.min(declaredBlockWidth, availableRows)
+        )
+        let response = try client.dflashReferenceRows(
+            prefixTokens: context,
+            seedTokenCount: seedTokenCount,
+            startOffset: absoluteOffset,
+            rowCount: count,
+            widestFrame: widestFrame
+        )
+        guard response.ok,
+              let k1 = response.referenceK1Argmax,
+              let top2Tokens = response.referenceTop2Tokens,
+              let top2Logits = response.referenceTop2Logits,
+              let frameWidths = response.referenceFrameWidths,
+              let frameArgmax = response.referenceFrameArgmax,
+              k1.count == count,
+              top2Tokens.count == count,
+              top2Logits.count == count,
+              frameWidths.count == frameArgmax.count
+        else {
+            throw MLXFastError.invalidInput(
+                "DFlash live reference returned an incomplete row batch at "
+                    + "offset \(startOffset): "
+                    + (response.error ?? "no reason reported")
+            )
+        }
+        var frames = [Int: [Int]]()
+        for (width, argmax) in zip(frameWidths, frameArgmax) {
+            frames[width] = argmax
+        }
+        let declaredFrame = frames[declaredBlockWidth]
+        return (0 ..< count).map { index in
+            DFlashReferenceRow(
+                sequentialArgmax: k1[index],
+                declaredFrameArgmax: declaredFrame.flatMap {
+                    index < $0.count ? $0[index] : nil
+                },
+                top2Tokens: top2Tokens[index],
+                top2Logits: top2Logits[index]
+            )
+        }
+    }
+}
+
 extension LagunaRuntime {
     /// Run a validated, parent-timed DFlash block-decode measurement.
     ///
@@ -109,11 +210,26 @@ extension LagunaRuntime {
     /// prefill response and stops when the configured token total is committed,
     /// and the denominator is that configured total -- never a worker-reported
     /// count.
+    ///
+    /// Validation happens in two phases, and the split is a contract requirement
+    /// rather than a timing optimization. Inline, per round, the parent checks
+    /// everything that is pure arithmetic on the worker's own report. Then, with
+    /// the candidate torn down, a pinned reference worker replays the journal on
+    /// the candidate's OWN emitted prefix and scores every token. Reference rows
+    /// read from a pre-generated file cannot do this: they are anchored to the
+    /// chain that generated the file, so the first legitimate divergence makes
+    /// every later row a comparison against a prefix the candidate never had.
+    ///
+    /// `referenceWorkerOptions` selects the reference binary; `nil` reuses the
+    /// candidate's worker options, which is what a local diagnostic run wants. A
+    /// ranked run passes the pinned baseline worker together with
+    /// `options.referenceWeightsPath`.
     public static func experimentalDFlashBenchmark(
         options: ExperimentalDFlashOptions,
         workerOptions: RuntimeWorkerOptions,
         scheduleSeed: UInt64,
-        tolerance: DFlashWorkBindingTolerance = DFlashWorkBindingTolerance()
+        tolerance: DFlashWorkBindingTolerance = DFlashWorkBindingTolerance(),
+        referenceWorkerOptions: RuntimeWorkerOptions? = nil
     ) throws -> ExperimentalDFlashReport {
         let goldenData = try Data(
             contentsOf: URL(fileURLWithPath: options.goldenPath)
@@ -138,6 +254,9 @@ extension LagunaRuntime {
             )
         }
 
+        // The golden stays the FALLBACK oracle and keeps two jobs on the scored
+        // path: it supplies the seed-token expectation and it bounds `--tokens`.
+        // The admissibility verdicts come from the live replay below.
         let oracle = DFlashGoldenReferenceOracle(golden: golden)
         let validator = LagunaDFlashBlockValidator(
             oracle: oracle,
@@ -170,6 +289,10 @@ extension LagunaRuntime {
             weightsPath: options.targetWeightsPath,
             dflashDrafterPath: options.drafterPath
         )
+        // Closed EXPLICITLY before the reference worker starts, not just on the
+        // way out: the text tower is ~21.6 GB, so two live residencies would put
+        // the box under memory pressure the measurement never accounted for.
+        // `close()` is idempotent, so this defer only covers the failure paths.
         defer { client.close() }
 
         // Untimed phase start, BEFORE the clock: the allocator clear and the
@@ -254,9 +377,9 @@ extension LagunaRuntime {
                         + validator.committedTokens.count + remaining,
                     latencySeconds: latency
                 )
-                try validator.accept(round: trimmed)
+                try validator.acceptStructural(round: trimmed)
             } else {
-                try validator.accept(round: round)
+                try validator.acceptStructural(round: round)
             }
             acceptedTotal += round.acceptedDraftCount
             rejectedTotal += round.rejectedDraftCount
@@ -264,6 +387,21 @@ extension LagunaRuntime {
         }
         let decodeSeconds = Date().timeIntervalSince(started)
         try validator.requireComplete()
+
+        // --- post-run reference replay (contract layer L1) --------------------
+        //
+        // The clock has stopped and the candidate is gone. Only now is a
+        // reference verdict meaningful, because only now does the parent know the
+        // candidate's own emitted chain to teacher-force the reference on.
+        client.close()
+        try replayDFlashJournalAgainstLiveReference(
+            validator: validator,
+            golden: golden,
+            candidateSeedToken: seedToken,
+            options: options,
+            workerOptions: referenceWorkerOptions ?? workerOptions
+        )
+        try validator.requireReferenceValidated()
 
         return ExperimentalDFlashReport(
             totalTokenCount: options.totalTokenCount,
@@ -301,6 +439,64 @@ extension LagunaRuntime {
             workBindingToleranceAbsolute: tolerance.absolute,
             workBindingToleranceRelative: tolerance.relative
         )
+    }
+
+    /// Open the pinned reference worker and score the journal against it.
+    ///
+    /// Ordering is load-bearing on two axes. Memory: the candidate must already
+    /// be closed, so this is only ever called after `client.close()` -- the two
+    /// workers each hold the ~21.6 GB text tower. Frame: the reference is
+    /// prefilled over the SAME seed the candidate bulk-prefilled, which leaves
+    /// its continuous width-1 cache positioned at the end of the seed, so the
+    /// first row request is a plain continuation and every later one stays one.
+    private static func replayDFlashJournalAgainstLiveReference(
+        validator: LagunaDFlashBlockValidator,
+        golden: DFlashReferenceGolden,
+        candidateSeedToken: Int,
+        options: ExperimentalDFlashOptions,
+        workerOptions: RuntimeWorkerOptions
+    ) throws {
+        let referenceClient = try RuntimeWorkerClient(
+            options: workerOptions,
+            weightsPath: options.referenceWeightsPath
+                ?? options.targetWeightsPath,
+            dflashDrafterPath: options.referenceDrafterPath
+                ?? options.drafterPath
+        )
+        defer { referenceClient.close() }
+
+        let prefill = try referenceClient.dflashReferencePrefill(
+            seedTokens: golden.seedTokens
+        )
+        guard prefill.ok, let referenceSeedToken = prefill.seedToken else {
+            throw MLXFastError.invalidInput(
+                "DFlash reference replay failed its seed prefill: "
+                    + (prefill.error ?? "no seed token returned")
+            )
+        }
+        // The candidate was already checked against the golden's recorded seed
+        // token. If the LIVE reference disagrees with that record, the golden and
+        // the reference build are not the same reference, so the replay would
+        // score against a chain neither party produced. That is an operator
+        // fault -- a mismatched reference tree or weights -- not a submission
+        // fault, and it must fail loudly instead of being scored.
+        guard referenceSeedToken == golden.referenceSeedToken else {
+            throw DFlashContractViolation(
+                kind: .workBindingMissing,
+                step: 0,
+                detail: "the live reference's seed token disagrees with the "
+                    + "golden's record; the reference build or weights do not "
+                    + "match the golden (operator fault)"
+            )
+        }
+
+        let oracle = DFlashLiveReferenceOracle(
+            client: referenceClient,
+            seedTokenCount: golden.seedTokens.count,
+            context: golden.seedTokens + [candidateSeedToken]
+                + validator.committedTokens
+        )
+        try validator.validateJournalAgainstReference(oracle: oracle)
     }
 }
 
