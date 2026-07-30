@@ -524,3 +524,66 @@ width. Nothing in E requires or assumes any particular acceptance pattern.
 ## Residual risks (what this contract still does NOT catch)
 
 ["MICRO-DEGRADATION BELOW DIGEST_TOL. A verifier degraded just enough to stay inside DIGEST_TOL at every row (e.g. dropping the final 1 of 40 layers, or 1 expert of 8, or shaving the last accumulation refinement) is not caught by the work-binding layer. The benefit is correspondingly small, so this is a bounded-gain residual rather than an open door — but it is real and it is the direct price of using a tolerant digest instead of a hash (a hash would false-fail every honest kernel edit). COVERED BY: the measured separation ratios in calibration set the actual boundary, so publish them; the semantic GPQA judge and free-run gates bound the resulting quality loss; static review of the verify path's layer/expert configuration. Explicitly NOT covered by any token-level test.", "PROMPT-INDEPENDENT-LOOKING KERNEL FITTING. A kernel whose reduction tree is hand-fitted to specific row widths, with a fast non-order-preserving path elsewhere, satisfies E at the widths that appear and is junk elsewhere. E's randomized K schedule (6c) plus the declared_block_width replay shrinks this a lot — the participant must be correct at every width the parent might request, and the parent requests K_r=1 through 16 — but a shape-conditional tile selection in mlx-generated/*.cpp still looks like generic C++ to a diff-based review. COVERED BY: 6c randomization, plus static review specifically instructed to flag shape-conditional numeric paths, plus the CLAUDE.md prompt-independence rule as an enforceable review criterion rather than advice.", "T6 IS NOT COVERED BY E AT ALL, AND MUST NOT BE CLAIMED. A memoized or hardcoded continuation for a timed prompt is bit-identical to the reference argmax trajectory and passes E with zero A3 spend — the cleanest possible result — and it would even satisfy the digest layer if the digests were also memoized. E is an admissibility relation between emitted tokens and the reference's own computation; a lookup that reproduces the reference is indistinguishable from perfect verification. COVERED BY: the prompt POOL sampled per run (6a), which is the primary defense and the reason the pool is non-optional; the n-gram susceptibility analyzer (benchmarkMaxPromptLookupHitRate = 0.03); the no-input-keyed-cache rule; static review; and note that a step-indexed table keyed on decode step rather than input tokens slips that rule as literally worded, so the rule text needs widening to 'any cache whose only possible hit is the measurement protocol, however keyed.'", "REFERENCE-VERIFIER NUMERIC DRIFT. The reference worker is pinned by commit and hash, but its output depends on the box's macOS/Metal stack. A macOS update can shift reference frames, moving positions from A1/A2 into A3 and burning budget on unchanged honest code. COVERED BY: the R5 per-run self-consistency assertion catches nondeterminism within a run but NOT a stable shift across an OS update; that needs an operator runbook item — re-measure EPS_REL, B_A3_TIMED, and DIGEST_TOL after any box software change, and treat a reference shift as a ranking-contract change requiring rebaseline (same discipline the existing pipeline applies to the pinned baseline tree).", "JOB COST AND OPERATIONAL FRAGILITY. L-replay roughly doubles the model-bearing work in the ranked job, on a single serially-queued M5, and adds a second 21.6 GB residency. AUDIT_FRACTION is the dial, but a slow job increases queue pressure, which increases the value of a submit-until-green strategy. COVERED BY: AUDIT_FRACTION plus RANKED_FAILURE_LIMIT together; if the job cannot fit, reduce FID_STEPS before reducing L-timed replay coverage, since the timed leg is the one attached to score.", "ADAPTIVE-DEPTH VERIFICATION KEYED ON DRAFTER CONFIDENCE, IN ITS SURVIVING FORM. E kills the version that dispatches zero target rows (the digest cannot be produced) and the version that skips the lm_head (row_top2 values cannot be produced). What survives is a strategy that runs all rows honestly but chooses among honest kernel variants based on drafter confidence — which is legitimate optimization and should survive. Flagging this as residual only to note that the boundary is now drawn at 'was the row's trunk and vocab projection executed', not at 'was the same kernel used', and that is the intended line.", "STATISTICAL, NOT ABSOLUTE, COVERAGE OF LOW-RATE GAMBLING. A cheater who skips verification on a very small fraction of rounds has a small per-token error rate and may pass a given run. E converts this from 'free on a frozen prompt' into 'detected with probability 1-(1-f)^(S*p) per run, against a sampled prompt, with failures rate-limited', which is a genuine economic closure but not a proof. COVERED BY: FID_STEPS x AUDIT_FRACTION detection power (state it numerically in the published contract), R_A3_MAX, 6a prompt sampling, and 6e rate limiting. Do not describe this as airtight.", "WHAT THE CONTRACT GIVES UP DELIBERATELY. 'Correct' no longer means 'matches the model's sequential greedy output' — A2 admits reference block-frame tokens by design, so the emitted text can legitimately differ from a sequential run, and the candidate and the pinned DFlash baseline can emit different text. This forfeits the operator's ability to cross-validate a suspicious submission against a plain sequential run, and it must be stated in the published rules rather than discovered. COVERED BY: the hidden teacher-forced base case, anchor, free-run, and semantic GPQA gates remain the fidelity authority; they are the only remaining independent meaning of 'correct' and therefore cannot stay at their calibration floors."]
+
+---
+
+# Amendment 1 (2026-07-30) — L2 corrected: logit values bind work, hidden digests do not
+
+Implementation of Criterion E surfaced a defect in L2 as specified above.
+
+**What was wrong.** L2 called for per-row pre-`lm_head` hidden-state digests
+"reference-checked for EVERY declared row". That cannot work as an *exact
+cross-build* check, for exactly the reason the primary criterion exists: the
+candidate build and the pinned-reference build do not produce bit-identical
+tensors. The measured near-tie divergence is a scalar-argmax symptom of
+accumulation-order differences; a 10240-dimensional hidden vector diverges
+*more* readily, not less. An exact digest comparison between candidate and
+reference would therefore fail honest submissions on essentially every row.
+
+**What binds work instead.** The load-bearing work binder is
+`per_row_top2_logits` — the per-row top-2 **logit values** — compared against
+the reference within a tolerance (`DFlashWorkBindingTolerance`, initial
+absolute 0.75 / relative 0.02, pending calibration on M5-C by the same method
+that produced the near-tie table above). This retains the property that makes
+L2 valuable: a verifier degraded at *every* step (early exit, reduced layer
+count, coarser dequantization, truncated attention, reduced expert routing)
+perturbs logit VALUES at every row — including the 85-95% confident rows where
+argmax hides the degradation — whereas `lm_head` elision on a row leaves no
+logit values to report at all.
+
+**What the hidden digest is still good for.** `per_row_hidden_digest` remains
+in the protocol but is scoped to *self*-consistency, where bit-identity is a
+valid expectation:
+
+1. Reference determinism (requirement R5): replay a round twice **in the same
+   reference build** and require identical digests. This is what makes the
+   admissible sets well-defined; the retired track measured reference-vs-
+   reference instability, so this assertion is not optional.
+2. Candidate self-replay: the same candidate build re-running the same round
+   must reproduce its own digests, which catches nondeterminism and
+   state-dependent shortcuts inside one build.
+
+It must NOT be compared candidate-against-reference.
+
+**Calibration owed.** `DFlashWorkBindingTolerance` must be set from measured
+honest candidate-vs-reference logit deltas on M5-C, sized with headroom over
+the observed maximum, and small enough that a degraded verifier cannot hide
+inside it. Until that measurement exists the tolerance is a placeholder and
+`tokenFidelityGateStatus` stays `pending-spec`.
+
+# Amendment 2 (2026-07-30) — what this track actually measures
+
+The DFlash target is the **vendored** `LagunaModel` (reached through
+`LLMModelFactory`), because that is the type conforming to `DFlashTargetModel`.
+It is NOT `Sources/MLXFastModel/LagunaRuntimeModel.swift`, the heavily
+optimized forward that the serial ranked track scores. Consequences, which
+belong in any participant-facing description of the track:
+
+- DFlash speedups are measured against the **reference** target forward, so
+  they are not additive with serial-track optimizations and are not comparable
+  to serial-track scores as absolute tokens/second.
+- The track's editable surface is correspondingly the DFlash runtime
+  (`MLXSpeculative/*`, `DFlashTarget.swift`, `DFlashVerifyLinear.swift`) plus
+  the vendored model/kernels — consistent with `benchmark.dflash.json`.
+- Both tracks nonetheless load the SAME NVFP4 group-16 reference checkpoint, so
+  the model under test is identical; only the forward implementation differs.

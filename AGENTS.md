@@ -610,6 +610,56 @@ Ordinary within-request KV reuse, current-token-only decode, and
 input-independent weight, dequantization, kernel, mask, or RoPE caches remain
 allowed. Multi-row kernels remain allowed when every row is backed by a token
 supplied in that same invocation, such as prefill. Organizer-provided MTP or
-other speculative decoding would require a separate explicit track with a
-trusted variable-length block protocol, correctness contract, and score; no
-such track currently exists.
+other speculative decoding requires a separate explicit track with a trusted
+variable-length block protocol, correctness contract, and score. One such track
+now exists in this repository as scaffolding — see the next section — but it is
+**not enabled**, and nothing about it relaxes the serial rules above.
+
+### Experimental DFlash Speculative-Decode Track (dev only, NOT enabled)
+
+`benchmark.dflash.json` registers a second track, `laguna-xs-2.1-dflash-v1`,
+for organizer-provisioned DFlash speculative decoding. It is **inert**: its
+contract fixture (`fixtures/laguna_xs_2_1_dflash_track.json`) keeps
+`official_scoring_enabled: false`, and its workflow
+(`.github/workflows/dflash-benchmark.yml`) fails closed on that flag. It ranks
+nothing and accepts no submissions today. Do not target it.
+
+What it will be, when it is enabled:
+
+- **Speculation is the point.** A separate organizer-provisioned ~924 MB DFlash
+  draft model proposes tokens, the target verifies the block in one forward, the
+  longest correct draft prefix is accepted, and rejected KV rows are rolled
+  back. The serial track's speculative-decode prohibition is inverted here —
+  and only here.
+- **Participants never supply weights.** Both the target (the same pinned NVFP4
+  group-16 reference checkpoint the serial track measures) and the drafter are
+  organizer-provisioned and hash-pinned. Substituting, re-deriving, or
+  re-quantizing the drafter is a fail.
+- **What is measured is the reference forward.** The DFlash target is the
+  vendored `LagunaModel` reached through `LLMModelFactory`, not the serial
+  track's scored `Sources/MLXFastModel/LagunaRuntimeModel.swift`. DFlash
+  speedups are therefore relative to the reference implementation and are
+  neither additive with serial-track optimizations nor comparable to serial
+  scores as absolute tokens/second.
+- **Scoring** is decode-only paired speedup: mean serial K=1 seconds/token over
+  mean DFlash seconds/token, ratio-of-means across at least three accepted
+  thermally-gated pairs in alternating order, with a hard floor of 1.0 on the
+  aggregate and a stall guardrail.
+- **Correctness is work-honesty, not token identity.** Exact-token equality
+  against a sequential golden is *unsatisfiable* on this model: the target's own
+  block-shaped forward diverges from its sequential forward at near-tie
+  argmaxes, with no drafter involved (measured: 14/14 divergences target-only,
+  max sequential-logit gap 0.625, under 1% of positions). The replacement
+  contract admits the reference argmax in the frame the candidate declared, and
+  separately binds emitted tokens to target compute actually performed for each
+  row — per-row top-2 logit values, row accounting, KV vacancy checks, and a
+  reference replay run by the pinned baseline build on organizer weights after
+  the timed window. `docs/dflash-track-correctness-contract.md` is the
+  specification; read it before assuming any behaviour of this track.
+
+The editable surface for this track is its own (`benchmark.dflash.json`
+`editablePaths`) and centres on the DFlash runtime under
+`Vendor/mlx-swift-lm/Libraries/MLXSpeculative/` plus `DFlashTarget.swift` and
+`DFlashVerifyLinear.swift`. Local scripts are `setup-dflash.sh` and
+`benchmark-dflash.sh`; the retired Gemma-era MTP surface stays retired under its
+own names and must not be revived.
