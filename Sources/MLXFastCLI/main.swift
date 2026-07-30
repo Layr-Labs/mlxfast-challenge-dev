@@ -1471,6 +1471,11 @@ private enum MLXFastCLI {
             || tolerance.relative != toleranceDefaults.relative
         {
             payload["work_binding_logit_deltas"] = report.workBindingLogitDeltas
+            // Index-for-index block width behind each gap. The absolute arm is
+            // calibrated per width and a run's schedule mixes widths, so the
+            // gaps alone cannot reproduce the derivation.
+            payload["work_binding_comparison_widths"] =
+                report.workBindingComparisonWidths
         }
         let data = try JSONSerialization.data(
             withJSONObject: payload,

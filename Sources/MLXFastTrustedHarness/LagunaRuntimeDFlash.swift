@@ -325,6 +325,18 @@ public final class LagunaDFlashBlockValidator {
     /// The same gaps divided by the larger of the two magnitudes, i.e. the
     /// quantity the relative arm of the tolerance actually tests.
     public private(set) var workBindingLogitRelativeDeltas = [Double]()
+    /// The declared block width of the round each recorded gap came from, index
+    /// for index with `workBindingLogitDeltas`.
+    ///
+    /// Required, not decorative: the absolute arm is calibrated PER WIDTH, and a
+    /// run's schedule mixes widths (`DFlashBlockSchedule` draws uniformly from
+    /// `minBlockSize ... maxBlockSize`), so a run's aggregate maximum attributes
+    /// to no single width. Without this label the per-width derivation cannot be
+    /// reproduced or re-audited from a calibration run's output -- which is the
+    /// failure mode Amendments 8, 15 and 18 each recorded in a different place.
+    /// Published under exactly the same widened-tolerance gate as the gaps
+    /// themselves, so it never appears on a ranked run.
+    public private(set) var workBindingComparisonWidths = [Int]()
 
     public init(
         oracle: any DFlashReferenceOracle,
@@ -661,6 +673,7 @@ public final class LagunaDFlashBlockValidator {
                     workBindingLogitRelativeDeltas.append(
                         scale > 0 ? delta / scale : 0
                     )
+                    workBindingComparisonWidths.append(round.requestedBlockSize)
                     guard tolerance.matches(
                         candidate: candidateValue,
                         reference: referenceValue
@@ -837,6 +850,10 @@ public struct ExperimentalDFlashReport: Equatable {
     /// ranked run a per-row proximity trace against a hidden prompt is an oracle
     /// signal, which is exactly what contract layer L6 keeps out of the output.
     public let workBindingLogitDeltas: [Double]
+    /// The declared block width behind each entry of `workBindingLogitDeltas`,
+    /// published under the same calibration-only gate. This is what makes the
+    /// per-width absolute arm re-derivable from a calibration run.
+    public let workBindingComparisonWidths: [Int]
     public let workBindingToleranceAbsolute: Double
     public let workBindingToleranceRelative: Double
 
@@ -869,6 +886,7 @@ public struct ExperimentalDFlashReport: Equatable {
         maxTop2LogitRelativeDelta: Double = 0,
         p99Top2LogitRelativeDelta: Double = 0,
         workBindingLogitDeltas: [Double] = [],
+        workBindingComparisonWidths: [Int] = [],
         workBindingToleranceAbsolute: Double = 0,
         workBindingToleranceRelative: Double = 0
     ) {
@@ -903,6 +921,7 @@ public struct ExperimentalDFlashReport: Equatable {
         self.maxTop2LogitRelativeDelta = maxTop2LogitRelativeDelta
         self.p99Top2LogitRelativeDelta = p99Top2LogitRelativeDelta
         self.workBindingLogitDeltas = workBindingLogitDeltas
+        self.workBindingComparisonWidths = workBindingComparisonWidths
         self.workBindingToleranceAbsolute = workBindingToleranceAbsolute
         self.workBindingToleranceRelative = workBindingToleranceRelative
     }

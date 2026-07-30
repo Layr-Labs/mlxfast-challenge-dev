@@ -471,6 +471,7 @@ extension LagunaRuntime {
             maxTop2LogitRelativeDelta: validator.maxWorkBindingLogitRelativeDelta,
             p99Top2LogitRelativeDelta: validator.p99WorkBindingLogitRelativeDelta,
             workBindingLogitDeltas: validator.workBindingLogitDeltas,
+            workBindingComparisonWidths: validator.workBindingComparisonWidths,
             workBindingToleranceAbsolute: tolerance.absolute,
             workBindingToleranceRelative: tolerance.relative
         )
