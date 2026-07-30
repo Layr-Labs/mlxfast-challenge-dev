@@ -42,6 +42,36 @@ private enum ParticipantWorkerCLI {
                 )
                 try LagunaRuntime.runWorker(weightsPath: weightsPath)
 
+            case "dflash-runtime-worker":
+                // DFlash block-decode track worker. Takes the organizer-pinned
+                // target weights and the organizer-provisioned DFlash drafter;
+                // serves dflash_decode_begin/_block/_diagnostics only.
+                try options.requireOnly(
+                    values: ["--weights", "--drafter"]
+                )
+                let weightsPath = options.value(
+                    for: "--weights",
+                    default: ProcessInfo.processInfo.environment[
+                        "MLXFAST_WEIGHTS_PATH"
+                    ] ?? MLXFastConstants.defaultWeightsPath
+                )
+                let drafterPath = options.value(
+                    for: "--drafter",
+                    default: ProcessInfo.processInfo.environment[
+                        "MLXFAST_DFLASH_DRAFTER_DIR"
+                    ] ?? ""
+                )
+                guard !drafterPath.isEmpty else {
+                    throw MLXFastError.invalidInput(
+                        "dflash-runtime-worker requires --drafter (or "
+                            + "MLXFAST_DFLASH_DRAFTER_DIR)"
+                    )
+                }
+                try LagunaRuntime.runExperimentalDFlashWorker(
+                    targetWeightsPath: weightsPath,
+                    drafterPath: drafterPath
+                )
+
             case "preflight":
                 try options.requireOnly(
                     values: ["--weights"]
@@ -73,6 +103,7 @@ private enum ParticipantWorkerCLI {
             """
             Usage:
               mlxfast-runtime-worker runtime-worker [--weights PATH]
+              mlxfast-runtime-worker dflash-runtime-worker [--weights PATH] --drafter PATH
               mlxfast-runtime-worker preflight [--weights PATH]
 
             Participant-side MLX runtime worker for mlxfast-swift.

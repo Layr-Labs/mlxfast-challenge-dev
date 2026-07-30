@@ -13,7 +13,7 @@ TARGET_REVISION="c42e0a8f8d504ceacde015a535dcb286d65c8799"
 ASSISTANT_MODEL_ID="poolside/Laguna-XS-2.1-DFlash"
 ASSISTANT_REVISION="5c36361aab23c8ed3afbd079c10c426b677bc607"
 TARGET_MANIFEST="${ROOT_DIR}/fixtures/mtp_laguna_xs_2_1_4bit.sha256"
-ASSISTANT_MANIFEST="${ROOT_DIR}/fixtures/mtp_laguna_xs_2_1_dflash.sha256"
+ASSISTANT_MANIFEST="${ROOT_DIR}/fixtures/dflash_laguna_xs_2_1_drafter.sha256"
 
 DEFAULT_CACHE_ROOT="${HOME}/.cache/mlxfast/laguna-xs-2.1-mtp-v1"
 CACHE_ROOT="${MLXFAST_MTP_CACHE_ROOT:-${DEFAULT_CACHE_ROOT}}"
@@ -65,7 +65,7 @@ PRINT_PATHS=0
 
 usage() {
   cat <<EOF
-Usage: ./setup-mtp.sh [--verify-only] [--target-only|--assistant-only] [--print-paths]
+Usage: ./setup-dflash.sh [--verify-only] [--target-only|--assistant-only] [--print-paths]
 
 Provision the explicit experimental Laguna XS 2.1 target and its matched,
 organizer-pinned DFlash MTP assistant. Downloads are resumable and every byte
@@ -112,7 +112,7 @@ while (( "$#" > 0 )); do
       exit 0
       ;;
     *)
-      echo "setup-mtp.sh: unknown argument '$1'" >&2
+      echo "setup-dflash.sh: unknown argument '$1'" >&2
       usage >&2
       exit 2
       ;;
@@ -128,7 +128,7 @@ fi
 
 require_tool() {
   if ! command -v "$1" >/dev/null 2>&1; then
-    echo "setup-mtp.sh: required tool not found: $1" >&2
+    echo "setup-dflash.sh: required tool not found: $1" >&2
     exit 1
   fi
 }
@@ -145,16 +145,16 @@ validate_directory() {
   local path="$1"
   local label="$2"
   if [[ -L "${path}" ]]; then
-    echo "setup-mtp.sh: ${label} must not be a symlink: ${path}" >&2
+    echo "setup-dflash.sh: ${label} must not be a symlink: ${path}" >&2
     return 1
   fi
   if [[ -e "${path}" && ! -d "${path}" ]]; then
-    echo "setup-mtp.sh: ${label} is not a directory: ${path}" >&2
+    echo "setup-dflash.sh: ${label} is not a directory: ${path}" >&2
     return 1
   fi
   mkdir -p "${path}"
   if [[ -L "${path}" || ! -d "${path}" ]]; then
-    echo "setup-mtp.sh: failed to create a non-symlink ${label}: ${path}" >&2
+    echo "setup-dflash.sh: failed to create a non-symlink ${label}: ${path}" >&2
     return 1
   fi
 }
@@ -170,7 +170,7 @@ validate_manifest() {
   local entries=0
 
   if [[ ! -f "${manifest}" || -L "${manifest}" ]]; then
-    echo "setup-mtp.sh: ${label} manifest is missing or unsafe: ${manifest}" >&2
+    echo "setup-dflash.sh: ${label} manifest is missing or unsafe: ${manifest}" >&2
     return 1
   fi
   while IFS= read -r line || [[ -n "${line}" ]]; do
@@ -178,18 +178,18 @@ validate_manifest() {
     read -r hash size relative extra <<< "${line}"
     if [[ -n "${extra:-}" || ! "${hash:-}" =~ ^[0-9a-f]{64}$ \
         || ! "${size:-}" =~ ^[1-9][0-9]*$ || -z "${relative:-}" ]]; then
-      echo "setup-mtp.sh: malformed ${label} manifest line: ${line}" >&2
+      echo "setup-dflash.sh: malformed ${label} manifest line: ${line}" >&2
       return 1
     fi
     if [[ "${relative}" == /* || "${relative}" == *"/"* || "${relative}" == *"\\"* \
         || "${relative}" == "." || "${relative}" == ".." ]]; then
-      echo "setup-mtp.sh: unsafe ${label} manifest path: ${relative}" >&2
+      echo "setup-dflash.sh: unsafe ${label} manifest path: ${relative}" >&2
       return 1
     fi
     entries=$((entries + 1))
   done < "${manifest}"
   if (( entries == 0 )); then
-    echo "setup-mtp.sh: ${label} manifest contains no files" >&2
+    echo "setup-dflash.sh: ${label} manifest contains no files" >&2
     return 1
   fi
 }
@@ -208,7 +208,7 @@ verify_file() {
     return 1
   fi
   if [[ "$(single_link_count "${path}")" != "1" ]]; then
-    echo "setup-mtp.sh: ${label} must not be hardlinked: ${path}" >&2
+    echo "setup-dflash.sh: ${label} must not be hardlinked: ${path}" >&2
     return 1
   fi
   actual_size="$(wc -c < "${path}" | tr -d ' ')"
@@ -219,7 +219,7 @@ verify_file() {
   after_signature="$(stat -f '%d:%i:%z:%m:%c' "${path}" 2>/dev/null \
     || stat -c '%d:%i:%s:%Y:%Z' "${path}")"
   if [[ "${before_signature}" != "${after_signature}" ]]; then
-    echo "setup-mtp.sh: ${label} changed while it was being verified" >&2
+    echo "setup-dflash.sh: ${label} changed while it was being verified" >&2
     return 1
   fi
   [[ "${actual_hash}" == "${expected_hash}" ]]
@@ -234,7 +234,7 @@ validate_download_settings() {
     MTP_DOWNLOAD_MIN_BYTES_PER_SECOND; do
     value="${!name}"
     if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
-      echo "setup-mtp.sh: ${name} must be a positive integer" >&2
+      echo "setup-dflash.sh: ${name} must be a positive integer" >&2
       return 1
     fi
   done
@@ -258,7 +258,7 @@ download_url_for_file() {
       fi
       ;;
     *)
-      echo "setup-mtp.sh: MLXFAST_MTP_APPEND_DOWNLOAD_QUERY must be auto, true, or false" >&2
+      echo "setup-dflash.sh: MLXFAST_MTP_APPEND_DOWNLOAD_QUERY must be auto, true, or false" >&2
       return 1
       ;;
   esac
@@ -296,19 +296,19 @@ download_file() {
   source_count="${#base_urls[@]}"
 
   if verify_file "${output}" "${expected_hash}" "${expected_size}" "${label}"; then
-    echo "setup-mtp.sh: using verified ${label}"
+    echo "setup-dflash.sh: using verified ${label}"
     return 0
   fi
   if [[ "${VERIFY_ONLY}" == "1" ]]; then
-    echo "setup-mtp.sh: ${label} is missing or does not match its pinned hash" >&2
+    echo "setup-dflash.sh: ${label} is missing or does not match its pinned hash" >&2
     return 1
   fi
   if [[ -L "${partial}" ]]; then
-    echo "setup-mtp.sh: refusing symlink partial download: ${partial}" >&2
+    echo "setup-dflash.sh: refusing symlink partial download: ${partial}" >&2
     return 1
   fi
   if [[ -e "${partial}" && "$(single_link_count "${partial}")" != "1" ]]; then
-    echo "setup-mtp.sh: refusing hardlinked partial download: ${partial}" >&2
+    echo "setup-dflash.sh: refusing hardlinked partial download: ${partial}" >&2
     return 1
   fi
 
@@ -320,15 +320,15 @@ download_file() {
     fi
 
     if [[ "${source_index}" -gt 1 ]]; then
-      echo "setup-mtp.sh: trying fallback source for ${label}: ${source_base_url}"
+      echo "setup-dflash.sh: trying fallback source for ${label}: ${source_base_url}"
     fi
 
     attempt=1
     while [[ "${attempt}" -le 2 ]]; do
       if [[ "${attempt}" == "1" ]]; then
-        echo "setup-mtp.sh: downloading ${label}"
+        echo "setup-dflash.sh: downloading ${label}"
       else
-        echo "setup-mtp.sh: redownloading ${label} from scratch after hash verification failed"
+        echo "setup-dflash.sh: redownloading ${label} from scratch after hash verification failed"
         rm -f "${partial}"
       fi
 
@@ -345,7 +345,7 @@ download_file() {
         --output "${partial}" \
         "${url}" || curl_status=$?
       if [[ "${curl_status}" != "0" ]]; then
-        echo "setup-mtp.sh: ${label} source failed or stalled (status=${curl_status}, source=${source_base_url})" >&2
+        echo "setup-dflash.sh: ${label} source failed or stalled (status=${curl_status}, source=${source_base_url})" >&2
         break
       fi
 
@@ -363,7 +363,7 @@ download_file() {
     fi
   done
 
-  echo "setup-mtp.sh: failed to download verified ${label}" >&2
+  echo "setup-dflash.sh: failed to download verified ${label}" >&2
   return 1
 }
 
@@ -407,12 +407,12 @@ provision_manifest() {
       fi
     done
     if [[ "${found}" != "1" ]]; then
-      echo "setup-mtp.sh: unexpected file in ${label} cache: ${existing}" >&2
+      echo "setup-dflash.sh: unexpected file in ${label} cache: ${existing}" >&2
       return 1
     fi
   done < <(find "${destination}" -mindepth 1 -maxdepth 1 -print)
 
-  echo "setup-mtp.sh: verified ${label} at ${destination}"
+  echo "setup-dflash.sh: verified ${label} at ${destination}"
 }
 
 validate_download_settings
@@ -431,7 +431,7 @@ if [[ "${PROVISION_ASSISTANT}" == "1" ]]; then
 fi
 
 cat <<EOF
-setup-mtp.sh: MTP artifacts ready
+setup-dflash.sh: MTP artifacts ready
   target:    ${TARGET_DIR}
   assistant: ${ASSISTANT_DIR}
   source bytes: target=18829720326 assistant=924135848 (BF16 draft; converted to MLX 4-bit at setup)

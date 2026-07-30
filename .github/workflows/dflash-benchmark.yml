@@ -70,7 +70,7 @@ name: dflash-benchmark
 #   MLXFAST_MTP_TARGET_DIR / MLXFAST_MTP_ASSISTANT_DIR
 #       Read-only runner-owned caches holding exactly the files pinned by
 #       fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256 and
-#       fixtures/mtp_laguna_xs_2_1_dflash.sha256 (setup-mtp.sh
+#       fixtures/dflash_laguna_xs_2_1_drafter.sha256 (setup-dflash.sh
 #       layout).
 #   MLXFAST_MTP_BASELINE_WS
 #       Pinned prebuilt challenge-repo tree (trusted ref) with mtp-weights
@@ -157,7 +157,7 @@ jobs:
       MLXFAST_MTP_TRACK_ID: laguna-xs-2.1-dflash-v1
       MLXFAST_MTP_CONTRACT_PATH: fixtures/laguna_xs_2_1_dflash_track.json
       MLXFAST_MTP_TARGET_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256
-      MLXFAST_MTP_ASSISTANT_MANIFEST_PATH: fixtures/mtp_laguna_xs_2_1_dflash.sha256
+      MLXFAST_MTP_ASSISTANT_MANIFEST_PATH: fixtures/dflash_laguna_xs_2_1_drafter.sha256
       # Decode-only score contract (adopted 2026-07-14; see header). Keep in
       # sync with the contract fixture's proposed_scoring block; the floor is
       # HARD (an MTP submission that is not actually faster than trusted
@@ -606,8 +606,8 @@ jobs:
             "${MLXFAST_JOB_WS}/benchmark.sh" \
             "${MLXFAST_JOB_WS}/benchmark.json" \
             "${MLXFAST_JOB_WS}/benchmark.dflash.json" \
-            "${MLXFAST_JOB_WS}/benchmark-mtp.sh" \
-            "${MLXFAST_JOB_WS}/setup-mtp.sh" \
+            "${MLXFAST_JOB_WS}/benchmark-dflash.sh" \
+            "${MLXFAST_JOB_WS}/setup-dflash.sh" \
             "${MLXFAST_JOB_WS}/Package.swift" \
             "${MLXFAST_JOB_WS}/Package.resolved"
           echo "mtp-benchmark: bench workspace ready at ${MLXFAST_JOB_WS} (trusted harness surfaces ACL-locked against bench writes)"

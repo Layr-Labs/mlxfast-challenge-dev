@@ -128,7 +128,7 @@
   "assistant": {
     "model_id": "poolside/Laguna-XS-2.1-DFlash",
     "revision": "5c36361aab23c8ed3afbd079c10c426b677bc607",
-    "manifest_path": "fixtures/mtp_laguna_xs_2_1_dflash.sha256",
+    "manifest_path": "fixtures/dflash_laguna_xs_2_1_drafter.sha256",
     "manifest_sha256": "3c87379cd76a9a6296652f1f1e463fe856f926cfbbf52d9cb89ef9bb36df3e34",
     "manifest_sha256_note": "TODO(operator): SHA-256 of the manifest file itself, pinned after the manifest is regenerated on m5-bench (the checked-in manifest is a placeholder header only).",
     "expected_total_bytes": 924135848,
@@ -172,9 +172,7 @@
     ],
     "causal": true,
     "source_dtype": "bfloat16",
-    "quantization_bits": 4,
-    "quantization_group_size": 64,
-    "quantization_note": "The pinned upstream draft ships BF16 (torch_dtype bfloat16); setup-mtp.sh converts it to MLX affine 4-bit (group size 64) on-box. The bits/group fields describe the runtime-converted form.",
+    "quantization_note": "The pinned upstream draft ships BF16 (torch_dtype bfloat16). It is repacked to MLX layout by Vendor/mlx-swift-lm/scripts/convert_laguna_dflash.py with BF16 PRESERVED -- the drafter is NOT quantized. (The retired track's plan to convert it to affine 4-bit group-64 on-box was dropped: at 924 MB the drafter is cheap to keep in BF16, and quantizing it would add draft-side error that lowers the accept rate without materially reducing memory.)",
     "files": [
       {
         "path": "config.json",

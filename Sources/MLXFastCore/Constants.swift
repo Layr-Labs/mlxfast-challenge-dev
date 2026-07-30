@@ -185,4 +185,31 @@ public enum MLXFastConstants {
     // left precise here on purpose; bounding that residual channel is a publishing/
     // rate-limit decision on the scoring backend, not a repo-side change.
     public static let publicDiagnosticSignificantFigures = 2
+
+    // DFlash block-decode track (laguna-xs-2.1-dflash-v1) protocol limits.
+    // The organizer-provisioned DFlash drafter proposes a masked block in ONE
+    // forward, so its ceiling is the checkpoint's own `block_size` (16) rather
+    // than the retired MTP drafter's autoregressive 4. Measured peak speedup on
+    // the m5-bench M5 Max sits near K=8; the ceiling stays at the checkpoint
+    // value so the parent-randomized K schedule (contract layer L6) can sample
+    // the whole legal range. Keep these explicit rather than derived so
+    // widening either bound requires a conscious review.
+    public static let experimentalDFlashMaxBlockSize = 16
+    // Compatibility default for callers that do not select an explicit oracle
+    // length. Mirrors the retired MTP default.
+    public static let experimentalDFlashMaxTotalTokens = 128
+    // Trusted-parent configured runs may exercise longer tail boundaries when
+    // the selected oracle carries enough tokens. 1,536 keeps the diagnostics
+    // able to wrap Laguna's 512-position sliding-window cache three times,
+    // which is what makes the contract's wrap-seam leg (layer L4) reachable.
+    public static let experimentalDFlashMaxConfiguredTotalTokens = 1_536
+    // Criterion E residual bucket: emitted tokens that match NEITHER the
+    // reference K=1 argmax NOR the reference argmax in the candidate-declared
+    // block frame are counted here and must additionally sit inside the
+    // reference top-2. Measured honest divergence on M5-C was 14 events across
+    // 2,304 emitted positions (<= 0.61%), every one of them explained by the
+    // declared-frame admission above, so this bucket exists only for residual
+    // candidate-vs-reference kernel drift and is deliberately small: a large
+    // cap would be spendable by a cheating submission.
+    public static let experimentalDFlashResidualDivergenceBudgetPerThousand = 5
 }

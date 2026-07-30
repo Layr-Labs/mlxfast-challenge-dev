@@ -54,6 +54,9 @@ private enum MLXFastCLI {
             case "checkpoint-shards":
                 try runCheckpointShards(options)
                 return 0
+            case "dflash-benchmark":
+                try runDFlashBenchmark(options)
+                return 0
             default:
                 fputs("mlxfast-swift: unknown command '\(command)'\n\n", stderr)
                 printUsage()
@@ -1236,6 +1239,132 @@ private enum MLXFastCLI {
         return value
     }
 
+    /// DFlash block-decode measurement (track laguna-xs-2.1-dflash-v1).
+    ///
+    /// Unranked and fail-closed while the track contract's
+    /// `official_scoring_enabled` stays false: this emits diagnostics only and
+    /// never writes a ranked score. The reference verdicts come from a
+    /// pinned-baseline-generated golden (contract layer L1), never from the
+    /// candidate binary.
+    private static func runDFlashBenchmark(_ options: ParsedOptions) throws {
+        try options.validate(
+            valueOptions: [
+                "--weights", "--drafter", "--golden", "--block-size",
+                "--tokens", "--schedule-seed", "--output",
+            ]
+        )
+        let weightsPath = options.value(
+            for: "--weights",
+            default: environmentValue(
+                "MLXFAST_WEIGHTS_PATH",
+                fallback: MLXFastConstants.defaultWeightsPath
+            )
+        )
+        let drafterPath = options.value(
+            for: "--drafter",
+            default: environmentValue("MLXFAST_DFLASH_DRAFTER_DIR", fallback: "")
+        )
+        guard !drafterPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "dflash-benchmark requires --drafter PATH (or "
+                    + "MLXFAST_DFLASH_DRAFTER_DIR)"
+            )
+        }
+        let goldenPath = options.value(for: "--golden", default: "")
+        guard !goldenPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "dflash-benchmark requires --golden PATH (the pinned-baseline "
+                    + "reference golden)"
+            )
+        }
+        let blockSize = try positiveInteger(
+            options.value(
+                for: "--block-size",
+                default: String(MLXFastConstants.experimentalDFlashMaxBlockSize)
+            ),
+            name: "--block-size"
+        )
+        let tokens = try positiveInteger(
+            options.value(
+                for: "--tokens",
+                default: String(
+                    MLXFastConstants.experimentalDFlashMaxTotalTokens
+                )
+            ),
+            name: "--tokens"
+        )
+        let scheduleSeed = UInt64(
+            options.value(for: "--schedule-seed", default: "0")
+        ) ?? 0
+        guard let workerOptions = try runtimeWorkerOptions(
+            blockedGoldenPath: goldenPath
+        ) else {
+            throw MLXFastError.invalidInput(
+                "dflash-benchmark requires the participant runtime worker"
+            )
+        }
+
+        let report = try LagunaRuntime.experimentalDFlashBenchmark(
+            options: ExperimentalDFlashOptions(
+                targetWeightsPath: weightsPath,
+                drafterPath: drafterPath,
+                goldenPath: goldenPath,
+                maxBlockSize: blockSize,
+                totalTokenCount: tokens
+            ),
+            workerOptions: workerOptions,
+            scheduleSeed: scheduleSeed
+        )
+
+        print(
+            "dflash-benchmark: tokens=\(report.totalTokenCount) "
+                + "rounds=\(report.roundCount) "
+                + "decode_seconds=\(String(format: "%.4f", report.decodeSeconds)) "
+                + "decode_seconds_per_token="
+                + "\(String(format: "%.6f", report.decodeSecondsPerToken)) "
+                + "accepted_draft_rate="
+                + "\(String(format: "%.4f", report.acceptedDraftRate)) "
+                + "declared_rows=\(report.declaredRowTotal) "
+                + "residual_divergences=\(report.residualDivergenceCount) "
+                + "official_score_produced=false"
+        )
+        let outputPath = options.value(for: "--output", default: "")
+        if !outputPath.isEmpty {
+            var payload: [String: Any] = [
+                "track_id": "laguna-xs-2.1-dflash-v1",
+                "official_score_produced": false,
+                "total_token_count": report.totalTokenCount,
+                "round_count": report.roundCount,
+                "decode_seconds": report.decodeSeconds,
+                "decode_seconds_per_token": report.decodeSecondsPerToken,
+                "accepted_draft_total": report.acceptedDraftTotal,
+                "rejected_draft_total": report.rejectedDraftTotal,
+                "accepted_draft_rate": report.acceptedDraftRate,
+                "declared_row_total": report.declaredRowTotal,
+                "residual_divergence_count": report.residualDivergenceCount,
+                "all_tokens_admissible": report.allTokensAdmissible,
+            ]
+            if let stall = report.maxOverMedianRoundLatency {
+                payload["max_over_median_round_latency"] = stall
+            }
+            let data = try JSONSerialization.data(
+                withJSONObject: payload,
+                options: [.prettyPrinted, .sortedKeys]
+            )
+            try data.write(to: URL(fileURLWithPath: outputPath))
+        }
+    }
+
+    private static func positiveInteger(
+        _ text: String,
+        name: String
+    ) throws -> Int {
+        guard let value = Int(text), value > 0 else {
+            throw MLXFastError.invalidInput("\(name) requires a positive integer")
+        }
+        return value
+    }
+
     private static func runtimeWorkerOptions(
         blockedGoldenPath: String? = nil,
         forwardsWorkerStderr: Bool = false
@@ -1704,6 +1833,7 @@ private enum MLXFastCLI {
               mlxfast-swift analyze-ngram-similarity --golden PATH [--case NAME] [--orders 1,2,3] [--max-hit-rate RATE]
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
+              mlxfast-swift dflash-benchmark --drafter PATH --golden PATH [--weights PATH] [--block-size N] [--tokens N] [--schedule-seed N] [--output PATH]
 
             Swift-only Poolside Laguna XS 2.1 NVFP4 harness entrypoint.
             """

@@ -1,5 +1,6 @@
 // Copyright © 2026 Apple Inc.
 
+import CryptoKit
 import Foundation
 import MLX
 import MLXLLM
@@ -14,14 +15,60 @@ private let dFlashCPUAcceptWalk: Bool = {
     }
 }()
 
-internal struct DFlashGreedyRoundResult {
-    let accepted: Int
-    let tokens: [Int]
-    let bonus: Int
-    let targetHidden: MLXArray
+/// Criterion E work-binding readouts for one verified block.
+///
+/// These exist so a trusted parent can bind emitted tokens to target compute
+/// that actually ran, at EVERY declared row including rejected ones. Token
+/// output alone cannot price a verifier that is degraded everywhere but agrees
+/// at the confident steps; `top2Logits` forces the lm_head per row and
+/// `hiddenDigest` forces the trunk.
+///
+/// COMPARISON SEMANTICS -- read before using these on the parent side:
+///   * `top2Tokens` / `top2Logits` are NUMERIC and must be compared to the
+///     reference with a tolerance. They are the load-bearing work binder.
+///   * `hiddenDigest` is an EXACT SHA-256 over the row's float32 bytes. Two
+///     different builds (a candidate's optimized kernels vs the pinned
+///     reference) do NOT produce bit-identical hidden states -- that is the
+///     same accumulation-order frame divergence that makes exact-token
+///     matching unachievable on this model. So the digest is usable for
+///     SELF-consistency only (reference-vs-reference determinism, or a
+///     candidate replaying its own round), never for candidate-vs-reference
+///     equality.
+public struct DFlashRoundWorkBinding: @unchecked Sendable {
+    /// Rows pushed through the target this round (verify width).
+    public let declaredRows: Int
+    /// Per-row SHA-256 of the captured target hidden state (see caveat above).
+    public let hiddenDigest: [String]
+    /// Per-row top-2 token ids, highest logit first.
+    public let top2Tokens: [[Int]]
+    /// Per-row top-2 logit values, aligned with `top2Tokens`.
+    public let top2Logits: [[Double]]
 }
 
-internal func runDFlashGreedyRound(
+public struct DFlashGreedyRoundResult {
+    public let accepted: Int
+    public let tokens: [Int]
+    public let bonus: Int
+    public let targetHidden: MLXArray
+    /// Populated only when the caller requested `workBinding: true`.
+    public let workBinding: DFlashRoundWorkBinding?
+
+    internal init(
+        accepted: Int,
+        tokens: [Int],
+        bonus: Int,
+        targetHidden: MLXArray,
+        workBinding: DFlashRoundWorkBinding? = nil
+    ) {
+        self.accepted = accepted
+        self.tokens = tokens
+        self.bonus = bonus
+        self.targetHidden = targetHidden
+        self.workBinding = workBinding
+    }
+}
+
+public func runDFlashGreedyRound(
     target: any DFlashTargetModel,
     drafter: DFlashDraftModel,
     targetCache: inout [KVCache],
@@ -32,7 +79,8 @@ internal func runDFlashGreedyRound(
     generatedTokenCount: Int,
     blockSize: Int,
     maxEmitCount: Int,
-    phaseAccumulator: DFlashPhaseAccumulator? = nil
+    phaseAccumulator: DFlashPhaseAccumulator? = nil,
+    workBinding: Bool = false
 ) throws -> DFlashGreedyRoundResult {
     guard blockSize >= 2 else {
         throw DFlashError.invalidBlockSize(blockSize)
@@ -79,8 +127,27 @@ internal func runDFlashGreedyRound(
     let verifyStart = dflashTimingStart(phaseAccumulator)
     let bonusColumn = MLXArray([Int32(bonus)])[.newAxis, .ellipsis]
     let verifyInput = concatenated([bonusColumn, draftTokens], axis: 1)
+    // Criterion E work binding needs the full logits (for per-row top-2), which
+    // the greedy fast path deliberately never materializes. Take the full
+    // forward in that mode and derive the same argmax tokens from it, so every
+    // downstream step (accept walk, rollback, ledger) stays on ONE code path.
+    // Requiring the top-2 VALUES is the point: it forces the per-row lm_head
+    // that an eliding submission would skip.
+    var workBindingLogits: MLXArray?
     let verifyOut: DFlashGreedyTargetForward =
         try DFlashTargetRuntimeOptions.withSmallRowVerifyFusionsEnabled {
+            if workBinding {
+                let full = try target.forwardForDFlash(
+                    verifyInput,
+                    cache: targetCache,
+                    targetLayerIds: drafter.config.targetLayerIds
+                )
+                workBindingLogits = full.logits
+                return DFlashGreedyTargetForward(
+                    tokens: full.logits.argMax(axis: -1),
+                    targetHidden: full.targetHidden
+                )
+            }
             if phaseAccumulator?.collectTargetSubphaseTimings == true,
                 let diagnosticTarget = target as? any DFlashTargetDiagnosticForwardProvider
             {
@@ -183,6 +250,18 @@ internal func runDFlashGreedyRound(
         $0.acceptWalkSeconds += $1
     }
 
+    // Collect the work-binding readouts BEFORE rollback: the verify-time hidden
+    // states and logits describe the rows as executed this round, including the
+    // rejected tail that rollback is about to discard.
+    var roundWorkBinding: DFlashRoundWorkBinding?
+    if workBinding, let logits = workBindingLogits {
+        roundWorkBinding = dflashCollectWorkBinding(
+            logits: logits,
+            targetHidden: verifyOut.targetHidden,
+            declaredRows: verifiedTokenCount
+        )
+    }
+
     let trim = Swift.max(0, verifiedTokenCount - accepted - 1)
     let nextTargetHidden: MLXArray
     let rollbackStart = dflashTimingStart(phaseAccumulator)
@@ -221,8 +300,76 @@ internal func runDFlashGreedyRound(
         accepted: accepted,
         tokens: emitted,
         bonus: emitted.last ?? bonus,
-        targetHidden: nextTargetHidden
+        targetHidden: nextTargetHidden,
+        workBinding: roundWorkBinding
     )
+}
+
+/// Derive the Criterion E per-row readouts from a verified block.
+///
+/// Top-2 uses the same `argPartition` extraction the DFlash parity check
+/// already relies on. The hidden digest is SHA-256 over the row's float32
+/// little-endian bytes -- deterministic for a given build, but see the
+/// comparison caveat on `DFlashRoundWorkBinding`.
+private func dflashCollectWorkBinding(
+    logits: MLXArray,
+    targetHidden: MLXArray,
+    declaredRows: Int
+) -> DFlashRoundWorkBinding {
+    var digests = [String]()
+    var top2Tokens = [[Int]]()
+    var top2Logits = [[Double]]()
+    digests.reserveCapacity(declaredRows)
+    top2Tokens.reserveCapacity(declaredRows)
+    top2Logits.reserveCapacity(declaredRows)
+
+    let hiddenRowCount = targetHidden.ndim >= 2 ? targetHidden.dim(-2) : 0
+    for row in 0 ..< declaredRows {
+        let logitRow = logits[0, row, 0...]
+        let limit = Swift.max(1, Swift.min(2, logitRow.dim(-1)))
+        let indices = argPartition(-logitRow, kth: limit - 1, axis: -1)[0 ..< limit]
+        let scores = logitRow[indices]
+        eval(indices, scores)
+        let ids = indices.asArray(Int32.self).map { Int($0) }
+        let values = scores.asArray(Float.self).map { Double($0) }
+        let ordered = zip(ids, values).sorted { $0.1 > $1.1 }
+        top2Tokens.append(ordered.map(\.0))
+        top2Logits.append(ordered.map(\.1))
+
+        if row < hiddenRowCount {
+            let hiddenRow = targetHidden[0, row, 0...].asType(.float32)
+            eval(hiddenRow)
+            digests.append(dflashFloatRowDigest(hiddenRow.asArray(Float.self)))
+        } else {
+            digests.append("")
+        }
+    }
+
+    return DFlashRoundWorkBinding(
+        declaredRows: declaredRows,
+        hiddenDigest: digests,
+        top2Tokens: top2Tokens,
+        top2Logits: top2Logits
+    )
+}
+
+/// SHA-256 over the little-endian float32 bit patterns of `row`.
+private func dflashFloatRowDigest(_ row: [Float]) -> String {
+    var bytes = [UInt8]()
+    bytes.reserveCapacity(row.count * 4)
+    for value in row {
+        // Normalize the two NaN encodings and -0.0 so a benign signed-zero
+        // difference cannot change the digest.
+        let normalized = value == 0 ? 0 : value
+        let pattern = normalized.isNaN ? Float.nan.bitPattern : normalized.bitPattern
+        bytes.append(UInt8(truncatingIfNeeded: pattern))
+        bytes.append(UInt8(truncatingIfNeeded: pattern >> 8))
+        bytes.append(UInt8(truncatingIfNeeded: pattern >> 16))
+        bytes.append(UInt8(truncatingIfNeeded: pattern >> 24))
+    }
+    return SHA256.hash(data: Data(bytes))
+        .map { String(format: "%02x", $0) }
+        .joined()
 }
 
 @inline(__always)

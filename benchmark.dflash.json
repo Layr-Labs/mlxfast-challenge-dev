@@ -95,17 +95,17 @@
   "setupCommand": [
     "bash",
     "-c",
-    "MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh && ./setup-mtp.sh"
+    "MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh && ./setup-dflash.sh"
   ],
   "preSubmitCommand": [
     "bash",
     "-c",
-    "./benchmark-mtp.sh --local-submit"
+    "./benchmark-dflash.sh --local-submit"
   ],
   "benchmarkCommand": [
     "bash",
     "-c",
-    "MLXFAST_SCORE_PATH=score.json ./benchmark-mtp.sh --local-iterate"
+    "MLXFAST_SCORE_PATH=score.json ./benchmark-dflash.sh --local-iterate"
   ],
   "runner": {
     "provider": "github-actions",

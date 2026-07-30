@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./benchmark-mtp.sh [--local-iterate|--local-submit]
+Usage: ./benchmark-dflash.sh [--local-iterate|--local-submit]
 
 Runs the trained-assistant MTP path against a locally generated serial oracle
 and writes the Yukon score payload to MLXFAST_SCORE_PATH (default: score.json).
@@ -61,11 +61,11 @@ if [[ ! -s "${contract_path}" || ! -s "${prompt_path}" ]]; then
   exit 1
 fi
 
-eval "$(./setup-mtp.sh --print-paths)"
-: "${MLXFAST_MTP_TARGET_DIR:?setup-mtp.sh did not provide the target path}"
-: "${MLXFAST_MTP_ASSISTANT_DIR:?setup-mtp.sh did not provide the assistant path}"
+eval "$(./setup-dflash.sh --print-paths)"
+: "${MLXFAST_MTP_TARGET_DIR:?setup-dflash.sh did not provide the target path}"
+: "${MLXFAST_MTP_ASSISTANT_DIR:?setup-dflash.sh did not provide the assistant path}"
 if [[ ! -s "${MLXFAST_MTP_TARGET_DIR}/config.json" || ! -s "${MLXFAST_MTP_ASSISTANT_DIR}/config.json" ]]; then
-  echo "benchmark-mtp: MTP target or assistant is missing; run ./setup-mtp.sh" >&2
+  echo "benchmark-mtp: MTP target or assistant is missing; run ./setup-dflash.sh" >&2
   exit 1
 fi
 

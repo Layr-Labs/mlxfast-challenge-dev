@@ -779,6 +779,7 @@ struct RuntimeWorkerRequest: Codable {
     let steps: Int?
     let topK: Int?
     let expectedToken: Int?
+    let maxBlockSize: Int?
 
     init(
         id: Int,
@@ -788,7 +789,8 @@ struct RuntimeWorkerRequest: Codable {
         seedTokens: [Int]? = nil,
         steps: Int? = nil,
         topK: Int? = nil,
-        expectedToken: Int? = nil
+        expectedToken: Int? = nil,
+        maxBlockSize: Int? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -798,6 +800,7 @@ struct RuntimeWorkerRequest: Codable {
         self.steps = steps
         self.topK = topK
         self.expectedToken = expectedToken
+        self.maxBlockSize = maxBlockSize
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -835,6 +838,10 @@ struct RuntimeWorkerRequest: Codable {
             Int.self,
             forKey: .expectedToken
         )
+        maxBlockSize = try container.decodeIfPresent(
+            Int.self,
+            forKey: .maxBlockSize
+        )
     }
 
     func encode(to encoder: Swift.Encoder) throws {
@@ -847,6 +854,7 @@ struct RuntimeWorkerRequest: Codable {
         try container.encodeIfPresent(steps, forKey: .steps)
         try container.encodeIfPresent(topK, forKey: .topK)
         try container.encodeIfPresent(expectedToken, forKey: .expectedToken)
+        try container.encodeIfPresent(maxBlockSize, forKey: .maxBlockSize)
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -858,6 +866,11 @@ struct RuntimeWorkerRequest: Codable {
         case steps
         case topK = "top_k"
         case expectedToken = "expected_token"
+        // DFlash/MTP block decode: the parent-chosen block width for this
+        // round. Deliberately the ONLY block-shaped field on the request --
+        // the worker is never told the remaining or total decode length,
+        // which would let it special-case the tail of the scored window.
+        case maxBlockSize = "max_block_size"
     }
 }
 
@@ -916,6 +929,23 @@ struct RuntimeWorkerResponse: Codable {
     let exactPairSegmentCount: Int?
     let exactPairRollbackRowCount: Int?
     let serialVerificationRowCount: Int?
+    // Criterion E work-binding diagnostics (DFlash block decode). The primary
+    // token predicate cannot price a verifier that is cheap at confident steps,
+    // so the parent also binds emitted tokens to executed target compute:
+    // `declaredRows` is what the worker claims it pushed through the target this
+    // round, and the per-row readouts are checked against the pinned reference
+    // for EVERY declared row including rejected ones. The hidden digest forces
+    // the trunk; the top-2 logit VALUES force the lm_head per row.
+    let declaredRows: Int?
+    let perRowHiddenDigest: [String]?
+    let perRowTop2Tokens: [[Int]]?
+    let perRowTop2Logits: [[Double]]?
+    let acceptedDraftCount: Int?
+    let rejectedDraftCount: Int?
+    let rollbackRoundCount: Int?
+    let targetCacheOffset: Int?
+    let kvDigest: String?
+    let kvVacancyDigest: String?
 
     init(
         id: Int,
@@ -937,7 +967,17 @@ struct RuntimeWorkerResponse: Codable {
         targetVerificationMode: String? = nil,
         exactPairSegmentCount: Int? = nil,
         exactPairRollbackRowCount: Int? = nil,
-        serialVerificationRowCount: Int? = nil
+        serialVerificationRowCount: Int? = nil,
+        declaredRows: Int? = nil,
+        perRowHiddenDigest: [String]? = nil,
+        perRowTop2Tokens: [[Int]]? = nil,
+        perRowTop2Logits: [[Double]]? = nil,
+        acceptedDraftCount: Int? = nil,
+        rejectedDraftCount: Int? = nil,
+        rollbackRoundCount: Int? = nil,
+        targetCacheOffset: Int? = nil,
+        kvDigest: String? = nil,
+        kvVacancyDigest: String? = nil
     ) {
         self.id = id
         self.nonce = nonce
@@ -959,6 +999,16 @@ struct RuntimeWorkerResponse: Codable {
         self.exactPairSegmentCount = exactPairSegmentCount
         self.exactPairRollbackRowCount = exactPairRollbackRowCount
         self.serialVerificationRowCount = serialVerificationRowCount
+        self.declaredRows = declaredRows
+        self.perRowHiddenDigest = perRowHiddenDigest
+        self.perRowTop2Tokens = perRowTop2Tokens
+        self.perRowTop2Logits = perRowTop2Logits
+        self.acceptedDraftCount = acceptedDraftCount
+        self.rejectedDraftCount = rejectedDraftCount
+        self.rollbackRoundCount = rollbackRoundCount
+        self.targetCacheOffset = targetCacheOffset
+        self.kvDigest = kvDigest
+        self.kvVacancyDigest = kvVacancyDigest
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -1039,6 +1089,46 @@ struct RuntimeWorkerResponse: Codable {
             Int.self,
             forKey: .serialVerificationRowCount
         )
+        declaredRows = try container.decodeIfPresent(
+            Int.self,
+            forKey: .declaredRows
+        )
+        perRowHiddenDigest = try container.decodeIfPresent(
+            [String].self,
+            forKey: .perRowHiddenDigest
+        )
+        perRowTop2Tokens = try container.decodeIfPresent(
+            [[Int]].self,
+            forKey: .perRowTop2Tokens
+        )
+        perRowTop2Logits = try container.decodeIfPresent(
+            [[Double]].self,
+            forKey: .perRowTop2Logits
+        )
+        acceptedDraftCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .acceptedDraftCount
+        )
+        rejectedDraftCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .rejectedDraftCount
+        )
+        rollbackRoundCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .rollbackRoundCount
+        )
+        targetCacheOffset = try container.decodeIfPresent(
+            Int.self,
+            forKey: .targetCacheOffset
+        )
+        kvDigest = try container.decodeIfPresent(
+            String.self,
+            forKey: .kvDigest
+        )
+        kvVacancyDigest = try container.decodeIfPresent(
+            String.self,
+            forKey: .kvVacancyDigest
+        )
     }
 
     func encode(to encoder: Swift.Encoder) throws {
@@ -1093,6 +1183,40 @@ struct RuntimeWorkerResponse: Codable {
             serialVerificationRowCount,
             forKey: .serialVerificationRowCount
         )
+        try container.encodeIfPresent(declaredRows, forKey: .declaredRows)
+        try container.encodeIfPresent(
+            perRowHiddenDigest,
+            forKey: .perRowHiddenDigest
+        )
+        try container.encodeIfPresent(
+            perRowTop2Tokens,
+            forKey: .perRowTop2Tokens
+        )
+        try container.encodeIfPresent(
+            perRowTop2Logits,
+            forKey: .perRowTop2Logits
+        )
+        try container.encodeIfPresent(
+            acceptedDraftCount,
+            forKey: .acceptedDraftCount
+        )
+        try container.encodeIfPresent(
+            rejectedDraftCount,
+            forKey: .rejectedDraftCount
+        )
+        try container.encodeIfPresent(
+            rollbackRoundCount,
+            forKey: .rollbackRoundCount
+        )
+        try container.encodeIfPresent(
+            targetCacheOffset,
+            forKey: .targetCacheOffset
+        )
+        try container.encodeIfPresent(kvDigest, forKey: .kvDigest)
+        try container.encodeIfPresent(
+            kvVacancyDigest,
+            forKey: .kvVacancyDigest
+        )
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -1116,6 +1240,16 @@ struct RuntimeWorkerResponse: Codable {
         case exactPairSegmentCount = "exact_pair_segment_count"
         case exactPairRollbackRowCount = "exact_pair_rollback_row_count"
         case serialVerificationRowCount = "serial_verification_row_count"
+        case declaredRows = "declared_rows"
+        case perRowHiddenDigest = "per_row_hidden_digest"
+        case perRowTop2Tokens = "per_row_top2_tokens"
+        case perRowTop2Logits = "per_row_top2_logits"
+        case acceptedDraftCount = "accepted_draft_count"
+        case rejectedDraftCount = "rejected_draft_count"
+        case rollbackRoundCount = "rollback_round_count"
+        case targetCacheOffset = "target_cache_offset"
+        case kvDigest = "kv_digest"
+        case kvVacancyDigest = "kv_vacancy_digest"
     }
 }
 
@@ -1603,7 +1737,8 @@ final class RuntimeWorkerClient {
 
     init(
         options: RuntimeWorkerOptions,
-        weightsPath: String
+        weightsPath: String,
+        dflashDrafterPath: String? = nil
     ) throws {
         guard options.helloTimeoutSeconds.isFinite,
               options.helloTimeoutSeconds > 0,
@@ -1620,11 +1755,25 @@ final class RuntimeWorkerClient {
         let stdin = Pipe()
         let stdout = Pipe()
         let stderr = Pipe()
-        let workerArguments = [
-            "runtime-worker",
-            "--weights",
-            weightsPath,
-        ]
+        // A drafter path switches the worker to the DFlash block-decode
+        // subcommand. The DFlash worker serves only dflash_* kinds, so a serial
+        // request cannot be smuggled into a block-decode session or vice versa.
+        let workerArguments: [String]
+        if let dflashDrafterPath {
+            workerArguments = [
+                "dflash-runtime-worker",
+                "--weights",
+                weightsPath,
+                "--drafter",
+                dflashDrafterPath,
+            ]
+        } else {
+            workerArguments = [
+                "runtime-worker",
+                "--weights",
+                weightsPath,
+            ]
+        }
         if let sandboxProfilePath = options.sandboxProfilePath {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
             process.arguments = [
@@ -1757,6 +1906,32 @@ final class RuntimeWorkerClient {
         try send(kind: "phase_diagnostics")
     }
 
+    // --- DFlash block decode (laguna-xs-2.1-dflash-v1) --------------------
+    // The parent chooses every block width and never tells the worker how much
+    // of the decode window remains.
+
+    func beginDFlashDecode(seedTokens: [Int]) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "dflash_decode_begin",
+            seedTokens: seedTokens
+        )
+    }
+
+    func dflashDecodeBlock(
+        previousCommittedToken: Int,
+        maxBlockSize: Int
+    ) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "dflash_decode_block",
+            token: previousCommittedToken,
+            maxBlockSize: maxBlockSize
+        )
+    }
+
+    func dflashPhaseDiagnostics() throws -> RuntimeWorkerResponse {
+        try send(kind: "dflash_phase_diagnostics")
+    }
+
     private func send(
         kind: String,
         promptTokens: [Int]? = nil,
@@ -1764,7 +1939,8 @@ final class RuntimeWorkerClient {
         seedTokens: [Int]? = nil,
         steps: Int? = nil,
         topK: Int? = nil,
-        expectedToken: Int? = nil
+        expectedToken: Int? = nil,
+        maxBlockSize: Int? = nil
     ) throws -> RuntimeWorkerResponse {
         guard process.isRunning else {
             throw MLXFastError.invalidInput("runtime worker exited before request \(kind): \(workerExitDiagnostic())")
@@ -1779,7 +1955,8 @@ final class RuntimeWorkerClient {
             seedTokens: seedTokens,
             steps: steps,
             topK: topK,
-            expectedToken: expectedToken
+            expectedToken: expectedToken,
+            maxBlockSize: maxBlockSize
         )
         var data = try encoder.encode(request)
         guard data.count <= BufferedFileLineReader.defaultMaximumLineByteCount else {
