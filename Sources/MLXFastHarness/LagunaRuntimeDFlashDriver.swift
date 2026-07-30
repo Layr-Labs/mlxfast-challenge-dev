@@ -149,6 +149,16 @@ extension LagunaRuntime {
         // so every round is a one-row target step. Same worker, same protocol,
         // same forward -- only the width differs, which is what makes the paired
         // ratio a like-for-like comparison.
+        //
+        // `minBlockSize` 2 for every non-control run is LOAD-BEARING, not a
+        // stylistic floor. A width-1 round advances the target without feeding the
+        // drafter, whose cross-attention context must be exactly as wide as the
+        // positions the target advanced since it last wrote. One such row still
+        // leaves a gap of 1 and stays legal; two in a row does not, and the
+        // session refuses the following block rather than draft from a prefix the
+        // drafter never saw. If L6's randomized schedule is ever widened to
+        // include width 1 alongside wider blocks, `LagunaDFlashBlockSession` has
+        // to accumulate the skipped hidden rows first.
         var schedule = DFlashBlockSchedule(
             seed: scheduleSeed,
             maxBlockSize: options.maxBlockSize,

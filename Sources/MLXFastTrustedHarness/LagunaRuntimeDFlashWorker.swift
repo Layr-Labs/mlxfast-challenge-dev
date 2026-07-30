@@ -122,17 +122,11 @@ extension LagunaRuntime {
         // Warm the block-decode shapes on throwaway cache state before the
         // hello. The real begin request performs the trusted allocator clear and
         // re-warms the working set it frees.
+        // Same warm the post-allocator-reset re-warm runs, via the same helper:
+        // a seed past the sliding-window ring and EVERY legal block width. These
+        // two warm points used to warm different things.
         let warmup = try LagunaDFlashBlockSession(target: target, drafter: drafter)
-        let warmupSeed = try warmup.begin(
-            seedTokens: Array(
-                repeating: 2,
-                count: MLXFastConstants.experimentalDFlashWarmupSeedTokens
-            )
-        )
-        _ = try warmup.generateBlock(
-            previousCommittedToken: warmupSeed,
-            maxBlockSize: MLXFastConstants.experimentalDFlashMaxBlockSize
-        )
+        try warmup.warmAllBlockWidths()
 
         let session = try LagunaDFlashBlockSession(target: target, drafter: drafter)
 

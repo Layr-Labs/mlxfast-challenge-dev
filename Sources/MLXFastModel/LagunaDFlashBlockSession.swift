@@ -108,23 +108,49 @@ public final class LagunaDFlashBlockSession {
             drafter: drafter,
             collectWorkBinding: collectWorkBinding
         )
-        // Deliberately SHORT. Warming compiles kernel shapes and must not
-        // straddle the rotating sliding-window cache's wrap seam: a seed at the
-        // window size plus a widest-block verify pushes rejected rows past the
-        // ring, after which rollback cannot trim them and the round throws
-        // `untrimmableCache`. The seam is a real hazard for the scored window
-        // (contract layer L4); a warmup must not be what discovers it.
-        let seed = try warmupSession.begin(
+        try warmupSession.warmAllBlockWidths()
+    }
+
+    /// The warm itself, run on THIS session's own throwaway cache state -- so the
+    /// caller must have built a session it is willing to discard.
+    ///
+    /// Both warm points (the worker's pre-hello warm and the post-allocator-reset
+    /// re-warm) go through here. They used to warm different things, which is
+    /// exactly the drift this exists to prevent.
+    public func warmAllBlockWidths() throws {
+        // Deliberately PAST the sliding-window ring. This used to be deliberately
+        // short, to avoid a warmup tripping the wrap seam; with the seam fixed on
+        // both the target side (snapshot rollback) and the drafter side (Amendment
+        // 7) that rationale is inverted. A short warmup leaves the SATURATED ring
+        // shapes -- the wrapped attention mask, the context-truncating drafter
+        // path, the temporal-order rebuild -- to compile inside the timed window,
+        // and the ranked seed is 512, so the scored run hits all of them on its
+        // first round. The seed is the window plus one widest block so every one
+        // of those shapes is compiled here instead.
+        let seed = try begin(
             seedTokens: Array(
                 repeating: 2,
                 count: MLXFastConstants.experimentalDFlashWarmupSeedTokens
             )
         )
-        // Warm the widest legal block so a later narrow round cannot be the
-        // first to compile its shape.
-        _ = try warmupSession.generateBlock(
-            previousCommittedToken: seed,
-            maxBlockSize: MLXFastConstants.experimentalDFlashMaxBlockSize
+        // Warm EVERY legal width, not just the widest. The paired score divides a
+        // width-K run by a width-1 run, so a shape compiled inside one side's
+        // timed window and not the other's is a bias in the ratio itself, not just
+        // noise. Widest first and width 1 last: a width-1 round advances the
+        // target without feeding the drafter, so it must never precede a block.
+        var committed = seed
+        for width in stride(
+            from: MLXFastConstants.experimentalDFlashMaxBlockSize, through: 2, by: -1
+        ) {
+            let round = try generateBlock(
+                previousCommittedToken: committed,
+                maxBlockSize: width
+            )
+            committed = round.tokens.last ?? committed
+        }
+        _ = try generateBlock(
+            previousCommittedToken: committed,
+            maxBlockSize: 1
         )
     }
 

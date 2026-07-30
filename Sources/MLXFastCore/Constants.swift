@@ -220,5 +220,12 @@ public enum MLXFastConstants {
     // That seam is a genuine hazard for the scored window and is the subject of
     // the contract's wrap-seam leg (layer L4); a shape warmup must not be what
     // discovers it, and must not fail startup because of it.
-    public static let experimentalDFlashWarmupSeedTokens = 64
+    /// Warmup seed length for DFlash block decode: one full sliding window plus
+    /// one widest block, so the untimed warm compiles the SATURATED ring shapes
+    /// the scored 512-token seed reaches on its first round. Anything shorter
+    /// leaves those to compile inside the timed window.
+    /// 512 is Laguna's sliding window (`LagunaConstants.slidingWindow`, which
+    /// lives in MLXFastModel and so cannot be referenced from this module).
+    public static let experimentalDFlashWarmupSeedTokens =
+        512 + experimentalDFlashMaxBlockSize
 }
