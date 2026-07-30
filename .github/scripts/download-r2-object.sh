@@ -135,9 +135,23 @@ k_date="$(hmac_hex "key:AWS4${R2_SECRET_ACCESS_KEY}" "${date_stamp}")"
 k_region="$(hmac_hex "hexkey:${k_date}" "${region}")"
 k_service="$(hmac_hex "hexkey:${k_region}" "${service}")"
 k_signing="$(hmac_hex "hexkey:${k_service}" "aws4_request")"
-signature="$(printf '%s' "${string_to_sign}" \
-  | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${k_signing}" \
-  | awk '{print $2}')"
+# Signed through hmac_hex, exactly like the four key-derivation steps above.
+# It used to run its own openssl pipeline WITHOUT -binary and parse the text
+# form with `awk '{print $2}'`, which silently depends on the openssl
+# implementation's output format:
+#
+#   OpenSSL 3.x   "SHA2-256(stdin)= <hex>"  -> $2 is the hex
+#   LibreSSL 3.3  "<hex>"                   -> $2 is EMPTY, the hex is $1
+#
+# macOS ships LibreSSL as /usr/bin/openssl, so on a box without Homebrew
+# OpenSSL ahead of it the signature came out EMPTY and R2 answered
+# "InvalidArgument: Signature element value should not be blank" -- a 400 that
+# looks like a credentials problem and is not one. Diagnosed on M5-C
+# (LibreSSL 3.3.6) 2026-07-30; the serial box worked only because OpenSSL 3 was
+# first on its PATH.
+#
+# -binary sidesteps the text format entirely, so there is no field to index.
+signature="$(hmac_hex "hexkey:${k_signing}" "${string_to_sign}")"
 
 authorization="AWS4-HMAC-SHA256 Credential=${R2_ACCESS_KEY_ID}/${credential_scope}, SignedHeaders=${signed_headers}, Signature=${signature}"
 tmp_path="${output_path}.tmp"
