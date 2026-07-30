@@ -1848,3 +1848,65 @@ the parent's own echo check cannot be what catches it -- is still rejected with
 `tokenNotAdmissible` at both K=1 and K=4 after the widened admission rule. The
 envelope is what does that work: a fabricated token is not a token the reference
 prices within 4.875 of its own top-1.
+
+# Amendment 17 (2026-07-30): which side runs whose build — I had it backwards
+
+An earlier revision of `AGENTS.md` (commit `a626653`) told participants that both
+sides of the paired ratio run the submitter's own build, and therefore that a
+general forward improvement cancels out and only cheaper speculation can move the
+score. That is wrong, and it is participant-facing, so it is corrected here as
+well as there.
+
+The box wrapper's own contract header is the authority:
+
+```
+baseline side:  dflash-probe      (serial K=1 target decode) from an APFS
+                copy-on-write clone of the PINNED baseline tree;
+candidate side: dflash-benchmark  (DFlash draft -> target block verify ->
+                accept walk -> KV rollback) from the candidate workspace;
+```
+
+So the denominator is the PINNED baseline and only the numerator is the
+candidate's build — the same shape as the serial track, where the score is the
+pinned baseline's seconds/token over the candidate's. General forward
+improvements therefore DO count: they speed the numerator against a fixed
+denominator. Serial-track techniques transfer.
+
+## What this does to the viability question
+
+It reframes rather than resolves it. Every ratio measured in Amendments 11-16 ran
+the SAME build on both sides, which isolates the speculation contribution — and
+that contribution is **0.840x on varied prose** (1.117x on degenerate text). Under
+the real scoring shape, an unmodified candidate scores exactly that, because its
+build and the baseline's are identical.
+
+So the honest statement of the track's economics is:
+
+```
+score  ~=  (general forward speedup)  x  (speculation factor)
+speculation factor ~= 0.840 on realistic prose, at K=4
+```
+
+The floor is `MIN_ACCEPTED_SPEEDUP="1.0"`, hardcoded readonly in the wrapper and
+applied to the ratio-of-means aggregate. Clearing it therefore requires about
+**19% of general forward speedup** before a single point of score appears. That is
+a high entry bar, not an impossible one — the serial track's field finds wins of
+that size — but participants are paying a ~16% speculation tax for the privilege
+of being on this track, and they cannot opt out, because the candidate side is
+required to run block decode.
+
+That is a track-design question for the organizer, and a different one from "the
+track cannot rank". Options remain: lower or remove the floor for this track,
+reduce the tax by making speculation cheaper (the highest-leverage engineering
+work available, and the reason the optimisation-surface guidance now points there
+without claiming it is the only thing that counts), or accept a high entry bar.
+
+## Why this was missed for so long
+
+Everything measured up to this point was measured through the CLI directly, with
+one binary serving both sides — which is the correct way to isolate the
+speculation factor and was the right experiment for the questions being asked. The
+scoring SHAPE lives in the box wrapper, not in the CLI, and the wrapper had only
+ever been exercised as far as `--preflight-only`. The lesson generalises: a
+measurement harness and the thing that consumes its numbers can disagree about
+what is being compared, and reading the consumer is not optional.

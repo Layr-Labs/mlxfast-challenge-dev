@@ -660,22 +660,46 @@ What it will be, when it is enabled:
   mean DFlash seconds/token, ratio-of-means across at least three accepted
   thermally-gated pairs in alternating order, with a hard floor of 1.0 on the
   aggregate and a stall guardrail.
-- **The optimisation surface is narrower than the serial track's, and this is
-  the single most important thing to understand before working on it.** Both
-  sides of the paired ratio run YOUR build. A change that speeds up the model
-  forward in general — a better quantized matmul, a faster attention kernel —
-  speeds up the serial denominator and the block numerator alike and therefore
-  cancels out of the score. Only work that makes SPECULATION specifically
-  cheaper moves the number: verify-row batching, KV handling and rollback cost,
-  drafter dispatch, scheduling around the block boundary. Do not expect
-  serial-track techniques to transfer.
-- **Block size is 3, and that is measured, not assumed.** At a 1755-token prompt
-  on the ranked silicon: K=2 0.82x, **K=3 1.09x**, K=4 1.06x, K=6 0.95x, K=8
-  0.92x, K=16 0.79x. Acceptance saturates around 1.33 accepted drafts for every
-  K >= 6, so wider blocks only add wasted verify rows. Beware short-prompt
-  intuition: on a 51-token prompt the same sweep peaks at K=8 with 1.86x, which
-  is *below the floor* at realistic context. Any speedup you measure on a short
-  prompt tells you nothing about the ranked window.
+- **Which side runs whose build — read this before planning any work.** The
+  denominator is a `dflash-probe` (serial K=1) run from an APFS copy-on-write
+  clone of the **pinned baseline tree**; the numerator is `dflash-benchmark`
+  (block decode) from **your** workspace. This mirrors the serial track: you are
+  measured against a fixed on-box baseline, not against yourself. So general
+  forward improvements — a better quantized matmul, a faster attention kernel —
+  DO move your score, because they speed the numerator while the pinned
+  denominator stays put. Serial-track techniques transfer.
+  (An earlier revision of this file claimed both sides run the submitter's build
+  and that generic wins therefore cancel. That was wrong; the box wrapper's own
+  contract header is the authority.)
+- **But you start from behind, and this is the important part.** Block decode is
+  not free on this model. Measured on the ranked silicon at the frozen window
+  (512-token seed, 128 decode steps), same build on both sides so that the
+  speculation contribution is isolated:
+
+  | text | draft acceptance | K=1 s/tok | K=4 s/tok | ratio |
+  |---|---|---|---|---|
+  | varied prose/code | 69% | 0.018964 | 0.022575 | **0.840x** |
+  | repetitive (greedy self-continuation) | ~100% | 0.018944 | 0.016966 | 1.117x |
+
+  A verify row costs only about 10% less than a standalone serial step, so
+  speculation wins only while nearly every drafted row is accepted. On realistic
+  prose it does not: acceptance is ~69%, which means 1.25 declared rows per
+  emitted token, and the block path comes out roughly **16% SLOWER** than serial.
+  Break-even needs draft acceptance above ~92%.
+
+  So on realistic text you must find ~19% of general forward speedup just to
+  reach the 1.0 floor, before any of it shows up as score. Work that makes
+  speculation itself cheaper — verify-row batching, KV handling and rollback
+  cost, drafter dispatch, scheduling around the block boundary — reduces that
+  tax and is the highest-leverage work available, but it is not the only work
+  that counts.
+- **Do not tune block size on a self-generated prompt.** A greedy
+  self-continuation of the model is degenerate — measured at 122 distinct tokens
+  in 512, with no row whose top-2 logits are within 1.8 of each other — so a
+  drafter predicts it almost perfectly and every K looks good. Earlier sweeps on
+  such material reported K=3 at 1.09x and, on a 51-token prompt, K=8 at 1.86x.
+  Neither survives on varied text. Measure on real prose, at the ranked window,
+  with matched token counts on both sides.
 - **Correctness is work-honesty, not token identity.** Exact-token equality
   against a sequential golden is *unsatisfiable* on this model: the target's own
   block-shaped forward diverges from its sequential forward at near-tie
