@@ -1200,15 +1200,26 @@ jobs:
         if: ${{ inputs.run_benchmark }}
         run: |
           set -euo pipefail
+          # RESOLVE the baseline symlink before handing it to the wrapper.
+          # measure-dflash-job.sh clones the baseline with `cp -c -R`, and on a
+          # symlink source that copies the SYMLINK, not its contents -- so the
+          # clone under /Users/Shared/bench-jobs becomes a link pointing back into
+          # /opt/bench-runner, and bench-exec.sh correctly refuses it: "workspace
+          # ... is not under the allowed job root". Measured on M5-C 2026-07-30.
+          # Passing the resolved path keeps `current` as the operator's indirection
+          # while giving the wrapper a real directory to clone.
+          MLXFAST_DFLASH_BASELINE_RESOLVED="$(readlink -f "${MLXFAST_DFLASH_BASELINE_WS}")"
+          test -d "${MLXFAST_DFLASH_BASELINE_RESOLVED}/.build/release" \
+            || { echo "::error::resolved baseline is not a built workspace: ${MLXFAST_DFLASH_BASELINE_RESOLVED}" >&2; exit 1; }
           MEASURE_STATE_DIR="${MLXFAST_MEASURE_STATE_DIR}" \
-          BASELINE_WS="${MLXFAST_DFLASH_BASELINE_WS}" \
+          BASELINE_WS="${MLXFAST_DFLASH_BASELINE_RESOLVED}" \
           BASELINE_CALIBRATION="${MLXFAST_DFLASH_BASELINE_CALIBRATION}" \
           DFLASH_TARGET_DIR="${MLXFAST_DFLASH_TARGET_DIR}" \
           DFLASH_DRAFTER_DIR="${MLXFAST_DFLASH_ASSISTANT_DIR}" \
           GPU_LOADED_UTIL=0.95 \
             "${MLXFAST_DFLASH_MEASURE_JOB}" \
               --candidate "${MLXFAST_JOB_WS}" \
-              --baseline "${MLXFAST_DFLASH_BASELINE_WS}" \
+              --baseline "${MLXFAST_DFLASH_BASELINE_RESOLVED}" \
               --golden "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json" \
               --contract "${MLXFAST_DFLASH_CONTRACT_PATH}" \
               --tokens "${MLXFAST_DFLASH_DECODE_TOKENS}" \
