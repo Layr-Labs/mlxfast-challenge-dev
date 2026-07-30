@@ -1472,3 +1472,80 @@ the latency statistic while still charging its time).
 
 Recorded here because a guardrail that rejects 25 of 28 honest runs is not a
 guardrail, and `official_scoring_enabled` cannot flip while it stands as written.
+
+# Amendment 13 (2026-07-30): the warm move works, and a fourth blocker is structural
+
+## The warm placement is measured and settled
+
+Amendment 12 set a concrete bar: the K=1 control's max block latency had to fall
+under 4 x 0.01303 = 0.052 s. Measured on M5-C at the ranked window:
+
+| binary | K=1 total | K=1 s/token | max/p50 | 4x rule |
+|---|---|---|---|---|
+| `b8795c6` (before any warm change) | 2.743 s | 0.021429 | 15.2 | rejected |
+| `068a940` (warm widened, INSIDE the window) | 3.409 s | 0.026629 | 1.10 | ok, but 24% slower |
+| `598f642` (warm moved OUTSIDE the window) | **2.4135 s** | **0.018855** | **1.10** | **ok, and 12% faster** |
+
+K=4 moves the same way: 2.507 s -> 3.198 s -> 2.1930 s. So the final state passes
+the stall guardrail with a 3.6x margin AND beats the original absolute time,
+because the first-touch spike is now genuinely outside the scored window instead
+of merely relocated within it. The paired ratio on the repetitive fixture is
+1.1005 (0.018855 / 0.017133), against 1.094 before — the warm move helps both
+sides, as a shared cost should.
+
+It also produced, for the first time, a varied-prompt K=1 control at the full
+128-token window: **0.018889 s/token, against the repetitive fixture's 0.018855 —
+0.18% apart.** That independently reconfirms Amendment 11's finding that the
+control is prompt-independent, now with the corrected reference frame and a
+matched token count. The performance verdict is unchanged: the warm move improves
+both sides equally, so varied text stays at ~0.82x.
+
+## Blocker 4: the scored path cannot tolerate ANY candidate divergence
+
+With the reference's width-1 frame corrected (commit `068a940`), the varied-prompt
+K=1 control passes 128 tokens cleanly — `residual_divergences=0`,
+`admissible_exact_count=128`. But the width-4 block run on the same corrected
+golden now fails at step 6, and the cause is not the fix.
+
+Two mechanisms compound:
+
+**4a. The pre-generated golden is teacher-forced on the REFERENCE's chain.** The
+scored path builds its oracle as `DFlashGoldenReferenceOracle(golden:)` — rows
+read from a file — and the ranked wrapper passes that file in
+(`--golden PATH`, "hidden block-decode golden / oracle file", installed
+into the workspace, hash-verified, scrubbed after). So the moment the candidate
+legitimately diverges at one near-tie and the residual bucket admits it, every
+later row is anchored to a prefix the candidate no longer has, and the run
+cascades into `tokenNotAdmissible`. On the corrected varied golden, 108 of 128
+chain tokens differ from the old one starting at index 5.
+
+This contradicts the contract's own stated design: "the parent journals, and the
+pinned reference worker replays afterwards", teacher-forced "on the candidate's
+own emitted prefix". A pre-generated file cannot do that. The live reference path
+(`dflash_reference_rows`, now stateful and correct) can, but the scored path never
+issues a reference request.
+
+**4b. Criterion E's two admitted frames do not cover the frame a block round
+actually runs in.** At the failing row the reference's width-1 frame says 3997 and
+its recorded width-2 declared frame ALSO says 3997, while the candidate's round —
+a 2-row verify plus rollback at `accepted_draft_rate=0.167` — produces 4414, the
+other member of a 2-ULP top-2 pair (margin 0.25).
+
+The declared frame is computed as a clean width-w forward over the prefix. A real
+block round is a width-w verify against a cache that has been continuously
+advanced and rolled back. Those are different constructions, so they differ at
+near-ties. Criterion E admits two frames; honest block decode runs in a third.
+
+## What this means
+
+Blocker 4 is a contract-design gap, not a bug to patch. Fixing 4a means moving
+validation out of the timed loop into a post-run replay against the candidate's
+journal — the design the contract already specifies. Fixing 4b means either
+recording the declared frame in the construction a real round uses, or admitting
+near-tie rows on numerical plausibility (top-2 membership AND a top-2 gap inside
+the measured frame-divergence envelope, which the L2 calibration already puts near
+3.375 logits) rather than on frame equality. Both are needed; neither is small.
+
+Combined with Amendment 11's performance result, the honest summary is that this
+track needs a contract redesign rather than a bug-fix pass — and that it would
+still score ~0.82x on realistic text afterwards.
