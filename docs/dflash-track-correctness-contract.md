@@ -1549,3 +1549,72 @@ the measured frame-divergence envelope, which the L2 calibration already puts ne
 Combined with Amendment 11's performance result, the honest summary is that this
 track needs a contract redesign rather than a bug-fix pass — and that it would
 still score ~0.82x on realistic text afterwards.
+
+# Amendment 14 (2026-07-30): near-tie rows are admitted on plausibility (Blocker 4b)
+
+Criterion E admitted an emitted token only if it matched the reference in one of
+two frames, and charged anything else to a residual budget that Amendment 10
+showed is exactly one slot at the frozen window. Amendment 13 (Blocker 4b) showed
+why that fails honest code: at a row where the reference's OWN top-1 and top-2 sit
+within build-to-build drift, "the reference says X" is not a fact about
+correctness. Either token is what the reference itself would emit under a
+differently-ordered accumulation. The candidate is being failed for a tie the
+reference cannot break.
+
+## The rule
+
+A new outcome, `admissibleNearTie`, sits between the declared-frame admission and
+the residual bucket. A token is admitted under it when BOTH hold:
+
+1. it is one of the reference's top-2 tokens at that row, and
+2. the reference's own top-1-minus-top-2 gap is within
+   `experimentalDFlashNearTieLogitEnvelope`.
+
+Such rows do NOT spend the residual budget. A top-2 divergence at a CONFIDENT row
+is untouched: that is genuine candidate-vs-reference drift, it keeps spending the
+deliberately small residual budget, and it can still exhaust it.
+
+## Where the envelope comes from
+
+Derived, not guessed — the discipline Amendment 8 said this contract kept failing
+to apply. The L2 work-binding calibration (Amendment 6) measured a maximum
+candidate-vs-reference logit delta of **3.375** across 352 long-context
+comparisons. Reordering top-1 and top-2 requires the gap to fall below the
+DIFFERENCE of two such per-logit drifts, which is bounded by `2 x 3.375 = 6.75`.
+That is the envelope.
+
+Measured density of rows inside it: **3 per 128 positions on varied prose, 0 per
+128 on the degenerate self-continuation fixtures.** The second number is why the
+one-slot budget survived every test until real text was finally run.
+
+## Why it cannot be farmed
+
+The gap belongs to the REFERENCE's logits, not the candidate's. A submission can
+neither manufacture near-tie rows nor learn which positions are near-ties without
+doing the reference's own work — and if it did that work, it has not cheapened
+anything. The envelope also widens only WHICH of two already-plausible tokens is
+allowed, never how many: a token outside the reference's top 2 is rejected at a
+near-tie row exactly as anywhere else, which is pinned by
+`nearTieRowsDoNotAdmitTokensOutsideTheReferenceTopTwo`.
+
+A count cap of 40 per thousand tokens (6 slots at the frozen window, against the
+measured need of 3) bounds the blast radius if some prompt turns out flatter than
+anything measured. It is a backstop; the envelope test is the control.
+
+## What this does NOT fix
+
+Blocker 4a is untouched. The scored path's oracle is still a pre-generated golden
+teacher-forced on the reference's chain, so the moment a near-tie divergence is
+admitted — which this amendment makes MORE likely, by design — every later row is
+anchored to a prefix the candidate no longer has. Admitting the divergence and
+then failing three rows later is not progress on its own. 4a needs validation
+moved out of the timed loop into a post-run replay against the candidate's
+journal, which is what the contract specified in the first place.
+
+## Note on the rounding artifact
+
+`(tokens * rate + 999) / 1000` rounds up to one slot for any window under 25
+tokens at rate 40. That is the same artifact Amendment 10 criticised in the
+residual budget, and it is retained rather than special-cased: the ranked window
+is 128 tokens, where the rate gives 6. It is recorded here so that a future short
+diagnostic run that trips the cap is recognised as this, and not as a finding.
