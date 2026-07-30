@@ -645,6 +645,22 @@ What it will be, when it is enabled:
   mean DFlash seconds/token, ratio-of-means across at least three accepted
   thermally-gated pairs in alternating order, with a hard floor of 1.0 on the
   aggregate and a stall guardrail.
+- **The optimisation surface is narrower than the serial track's, and this is
+  the single most important thing to understand before working on it.** Both
+  sides of the paired ratio run YOUR build. A change that speeds up the model
+  forward in general — a better quantized matmul, a faster attention kernel —
+  speeds up the serial denominator and the block numerator alike and therefore
+  cancels out of the score. Only work that makes SPECULATION specifically
+  cheaper moves the number: verify-row batching, KV handling and rollback cost,
+  drafter dispatch, scheduling around the block boundary. Do not expect
+  serial-track techniques to transfer.
+- **Block size is 3, and that is measured, not assumed.** At a 1755-token prompt
+  on the ranked silicon: K=2 0.82x, **K=3 1.09x**, K=4 1.06x, K=6 0.95x, K=8
+  0.92x, K=16 0.79x. Acceptance saturates around 1.33 accepted drafts for every
+  K >= 6, so wider blocks only add wasted verify rows. Beware short-prompt
+  intuition: on a 51-token prompt the same sweep peaks at K=8 with 1.86x, which
+  is *below the floor* at realistic context. Any speedup you measure on a short
+  prompt tells you nothing about the ranked window.
 - **Correctness is work-honesty, not token identity.** Exact-token equality
   against a sequential golden is *unsatisfiable* on this model: the target's own
   block-shaped forward diverges from its sequential forward at near-tie
