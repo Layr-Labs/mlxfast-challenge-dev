@@ -2460,3 +2460,104 @@ func metallibFingerprintRecordVerificationFailsClosedOnStaleRecord() throws {
         return
     }
 }
+
+// MARK: - setup-dflash.sh must provision the target the track actually measures
+
+/// `setup-dflash.sh` was restored from the retired MTP scaffolding and still
+/// described that experiment: it pinned `mlx-community/Laguna-XS-2.1-4bit` as the
+/// target, read the deleted `fixtures/mtp_laguna_xs_2_1_4bit.sha256` manifest, and
+/// claimed the drafter is "converted to MLX affine 4-bit (group size 64) at
+/// setup". The DFlash contract fixture says otherwise: the target is the SAME
+/// NVFP4 reference checkpoint the serial track measures (which is the entire
+/// reason a DFlash speedup is comparable with a serial one), and the drafter is
+/// pinned by its own manifest rather than converted.
+///
+/// A setup script that provisions a different checkpoint than the workflow
+/// measures makes every local number meaningless, so the target identity is
+/// pinned against the contract fixture rather than restated here.
+@Suite
+struct SetupDFlashTargetIdentityTests {
+    @Test
+    func setupDFlashProvisionsTheSharedNVFP4ReferenceAndClaimsNoConversion() throws {
+        let script = try String(contentsOfFile: "setup-dflash.sh", encoding: .utf8)
+
+        for retired in [
+            "fixtures/mtp_laguna_xs_2_1_4bit.sha256",
+            "mtp_laguna_xs_2_1_4bit.sha256",
+            "mlx-community/Laguna-XS-2.1-4bit",
+            "laguna-xs-2.1-mtp-v1",
+        ] {
+            #expect(
+                !script.contains(retired),
+                """
+                setup-dflash.sh still names '\(retired)', which belongs to the \
+                retired MTP experiment. The manifest was deleted, so the script \
+                cannot run; the model id is a different checkpoint from the one \
+                the DFlash workflow measures.
+                """
+            )
+        }
+
+        // No conversion claim: the drafter is hash-pinned by its own manifest.
+        for claim in [
+            "converted to MLX affine 4-bit",
+            "converted to MLX 4-bit",
+            "affine 4-bit (group size 64)",
+        ] {
+            #expect(
+                !script.contains(claim),
+                """
+                setup-dflash.sh claims the drafter is \(claim) at setup. Nothing \
+                in the DFlash path converts it: the drafter is provisioned and \
+                verified against fixtures/dflash_laguna_xs_2_1_drafter.sha256.
+                """
+            )
+        }
+
+        // Whatever it provisions must agree with the contract fixture. The
+        // target is deliberately NOT downloaded here — it is the serial track's
+        // NVFP4 reference, which ./setup.sh already fetches and verifies — so
+        // the invariant is that the script names that shared manifest and
+        // provisions no second target of its own.
+        let fixtureData = try Data(
+            contentsOf: URL(fileURLWithPath: "fixtures/laguna_xs_2_1_dflash_track.json")
+        )
+        let fixture = try #require(
+            try JSONSerialization.jsonObject(with: fixtureData) as? [String: Any]
+        )
+        let target = try #require(fixture["target"] as? [String: Any])
+        let targetManifest = try #require(target["manifest_path"] as? String)
+        let assistant = try #require(fixture["assistant"] as? [String: Any])
+        let assistantManifest = try #require(assistant["manifest_path"] as? String)
+
+        #expect(
+            script.contains(targetManifest),
+            """
+            setup-dflash.sh does not name \(targetManifest). The DFlash target IS \
+            the serial track's NVFP4 reference — that is what makes a DFlash \
+            speedup comparable with a serial one — so the script has to say so \
+            rather than leave a reader to assume a second checkpoint.
+            """
+        )
+        #expect(
+            script.contains(assistantManifest),
+            """
+            setup-dflash.sh does not verify the drafter against \
+            \(assistantManifest), the manifest the contract fixture pins
+            """
+        )
+        // No second target download of any kind.
+        #expect(
+            !script.contains("TARGET_MODEL_ID="),
+            """
+            setup-dflash.sh declares its own TARGET_MODEL_ID. Provisioning a \
+            second target is how the local path ends up measuring a different \
+            checkpoint from the ranked one.
+            """
+        )
+        #expect(
+            !script.contains("mlx-community/"),
+            "setup-dflash.sh must not provision an mlx-community checkpoint"
+        )
+    }
+}

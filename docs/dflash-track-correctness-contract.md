@@ -2524,3 +2524,86 @@ exact-token gate (Amendment 2), the stall guardrail rejecting 25 of 28 runs
 floor. Each was inherited or reasoned about rather than measured against the
 workload it would judge. The pattern is now well enough established to state as a
 rule: a threshold copied from a neighbouring track is an untested threshold.
+
+# Amendment 23 (2026-07-30): two guards were the right shape and the wrong scope
+
+Both of these were found by re-reading shipped code against the enum and the
+script it is supposed to cover, not by any run failing. Both are the same failure
+mode as Amendment 18: a mechanism that exists, looks right, and does not cover
+what it appears to cover. Neither is a leak; both are losses of protection that
+fail silently, which is why neither surfaced in testing.
+
+## 1. Three violation kinds had no arm in the redactor
+
+`redact-benchmark-failure.sh` maps each `DFlashContractViolation.Kind` to a
+stable, auditable `failure_category`. Eleven kinds had an arm. Three did not:
+`fabricatedRejection`, `rejectedRowReadoutMismatch` and
+`draftTokenBindingMismatch` -- the three added by Amendment 21's rejected-tail
+hardening.
+
+Those three fell through to `*) category="dflash_contract_violation"`. That
+fallback is safe: it never reaches the violation's detail text, so the L6
+query-oracle property held throughout. What was lost is resolution, and lost
+precisely where it is worth most. These three kinds are the detections aimed at a
+verifier fabricating rows it never computed; a run tripping one of them is
+reporting a probable cheat, and it was reported in the same bucket as an ordinary
+shape error.
+
+Why it survived review: the redactor's threat model is "does anything escape,"
+and against that question the fallback is correct. Nobody asked the other
+question -- "is what escapes still enough to act on."
+
+**Fixed**, three arms added. The durable half of the fix is
+`DFlashRedactorKindCoverageTests`, which drives the REAL script once per
+`Kind.allCases` entry with the REAL error string
+(`DFlashContractViolation.description`) and fails if any lands in the generic
+bucket, or if two kinds share a category. `Kind` gained `CaseIterable` for this,
+which is load-bearing rather than decoration: a kind added to the enum enters the
+test automatically, so the thing being guarded against -- forgetting -- cannot
+recur. Verified load-bearing by deleting one arm (names the kind) and by pointing
+two kinds at one category (names the collision).
+
+Note what a text-matching test would have done here: passed. The three arms were
+absent, not misspelled, so only executing the script against every real kind
+finds it.
+
+## 2. The local run guard protected one direction only
+
+`benchmark.sh` takes a per-user lock and refuses to start while another
+model-holding run is alive. `benchmark-dflash.sh` -- whose two local modes hold
+the ~21.6 GB target PLUS the drafter -- took no lock at all.
+
+The asymmetry was deliberate and documented: benchmark.sh's resident-process scan
+lists the `dflash-*` subcommands, so a SERIAL run refuses to start against a live
+DFlash one. The reverse was open. A DFlash local run started happily against a
+live serial run, which is two residencies on one machine and two runs sharing one
+GPU -- an OOM risk plus two invalidated measurements.
+
+**Fixed.** `benchmark-dflash.sh` now takes benchmark.sh's own lock, at
+benchmark.sh's own path, by extracting `local_run_lock_path`,
+`acquire_local_run_lock` and `release_local_run_lock` with the same
+awk-extract-and-eval idiom the `source_hash()` reuse already used, and failing
+closed if the extraction stops finding them. The path is the part that must not
+drift: two implementations disagreeing about where the lock lives would both hold
+"a lock" and exclude nothing. `DFlashLocalRunLockTests` pins the reuse from both
+ends -- that DFlash extracts and evals the three definitions, that it never
+spells the lock filename itself, that release happens from the EXIT trap, that
+benchmark.sh still defines all three at top level, and (by running the real
+extraction) that the two computed paths are byte-equal and the lock actually
+excludes a second holder.
+
+The lock is acquired before the thermal gate, deliberately. Holding it while
+waiting to cool is the point: the alternative lets a second run start, heat the
+GPU, and invalidate the wait the first run just paid for.
+
+The resident-process scan is still needed and stays: it catches the one case no
+lock can, an ORPHANED model-holding worker whose run died without releasing.
+
+## Method note
+
+Both findings came from diffing a declared surface against its implementation --
+`Kind.allCases` against the redactor's `case` arms, and one script's guard against
+its sibling's. Neither required a failing run, and neither would have produced
+one. Where Amendment 18's lesson was *attack your gates*, this one is narrower:
+**enumerate what a guard claims to cover and check the list**, because a guard
+that covers eleven of fourteen cases reports success on the eleven.

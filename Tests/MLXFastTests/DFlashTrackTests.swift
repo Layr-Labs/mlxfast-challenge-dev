@@ -515,6 +515,30 @@ struct DFlashTrackTests {
         ] {
             #expect(!fm.fileExists(atPath: retired), "\(retired) must stay retired")
         }
+
+        // Asserting the files are absent is only half the invariant: the two
+        // local DFlash scripts still NAMED two of them
+        // (fixtures/laguna_xs_2_1_mtp_track.json as the default contract,
+        // fixtures/mtp_laguna_xs_2_1_4bit.sha256 as the target manifest), which
+        // means every local invocation failed on a missing file. Pin that the
+        // scripts do not reference them, so the tempting "fix" of recreating the
+        // retired fixtures is closed off from both directions.
+        for script in ["benchmark-dflash.sh", "setup-dflash.sh"] {
+            let body = try text(script)
+            for retired in [
+                "laguna_xs_2_1_mtp_track.json",
+                "mtp_laguna_xs_2_1_4bit.sha256",
+            ] {
+                #expect(
+                    !body.contains(retired),
+                    """
+                    \(script) references the retired fixture \(retired), which \
+                    the test above requires to stay deleted — the script cannot \
+                    run. Retarget the script; do not recreate the fixture.
+                    """
+                )
+            }
+        }
     }
 }
 
@@ -1504,5 +1528,847 @@ struct DFlashGoLiveRunbookTests {
         // The guard is expected to fail closed before step D.
         #expect(runbook.lowercased().contains("fail-closed")
             || runbook.lowercased().contains("fails closed"))
+    }
+}
+
+// MARK: - Reused serial harness gates (drift pins)
+
+/// The operator's governing instruction for the DFlash track is that it must fit
+/// into the harness checks that already work rather than grow a second copy of
+/// them: the serial pipeline's public behavior gate, its GPQA attach +
+/// augmented-golden verification, its hidden gates pass and its semantic GPQA
+/// judge are pointed at the DFlash job's build. That reuse is only trustworthy
+/// if it cannot silently drift back, so every property it depends on is pinned
+/// here — including the concrete bugs the reuse work uncovered.
+///
+/// Nothing in this suite needs a model, hidden material, network access or a
+/// ranked dispatch: every assertion reads checked-in workflow, script, manifest
+/// or source text.
+enum DFlashGateTextSupport {
+    static let dflashWorkflowPath = ".github/workflows/dflash-benchmark.yml"
+    static let serialWorkflowPath = ".github/workflows/benchmark.yml"
+    static let dflashManifestPath = "benchmark.dflash.json"
+    static let dflashFixturePath = "fixtures/laguna_xs_2_1_dflash_track.json"
+    static let cliPath = "Sources/MLXFastCLI/main.swift"
+
+    /// The four serial steps that are REUSED verbatim rather than reimplemented.
+    /// The names are the reuse contract: a rename here means a second copy was
+    /// written instead.
+    static let reusedGateStepNames = [
+        "Public behavior gate",
+        "Attach GPQA gates and verify augmented golden",
+        "Correctness and gates (full base case + hidden gates, no timing)",
+        "Semantic GPQA gate",
+    ]
+
+    static func text(_ path: String) throws -> String {
+        try String(contentsOfFile: path, encoding: .utf8)
+    }
+
+    static func json(_ path: String) throws -> [String: Any] {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        return try #require(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+    }
+
+    /// Comment lines carry deliberate documentation of the dead MTP names that
+    /// were removed, so every "does the workflow DO x" assertion runs against
+    /// this comment-stripped view.
+    static func executable(_ yaml: String) -> String {
+        yaml
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("#") }
+            .joined(separator: "\n")
+    }
+
+    /// The job-level `env:` mapping — the only place these workflows declare the
+    /// values their steps enforce.
+    static func jobEnvironment(_ workflow: String) throws -> [String: String] {
+        let stepsMarker = try #require(
+            workflow.range(of: "\n    steps:"),
+            "workflow has no job `steps:` block"
+        )
+        let header = String(workflow[workflow.startIndex ..< stepsMarker.lowerBound])
+        var out: [String: String] = [:]
+        for raw in header.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(raw)
+            // Exactly the job-level env indentation (6 spaces, not 7+).
+            guard line.hasPrefix("      "), !line.hasPrefix("       ") else { continue }
+            let body = line.dropFirst(6)
+            guard let colon = body.firstIndex(of: ":") else { continue }
+            let key = String(body[body.startIndex ..< colon])
+            guard !key.isEmpty,
+                key.allSatisfy({ $0.isUppercase || $0.isNumber || $0 == "_" })
+            else { continue }
+            var value = String(body[body.index(after: colon)...])
+                .trimmingCharacters(in: .whitespaces)
+            if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
+                value = String(value.dropFirst().dropLast())
+            }
+            out[key] = value
+        }
+        return out
+    }
+
+    /// One workflow step's text, from its `- name:` line to the next step.
+    static func stepBody(_ workflow: String, _ name: String) throws -> String {
+        let start = try #require(
+            workflow.range(of: "- name: \(name)\n"),
+            "workflow is missing the step '\(name)'"
+        )
+        let rest = workflow[start.upperBound...]
+        if let next = rest.range(of: "\n      - name: ") {
+            return String(rest[rest.startIndex ..< next.lowerBound])
+        }
+        return String(rest)
+    }
+
+    /// Byte offset of the first occurrence of `needle`, or nil.
+    static func offset(of needle: String, in haystack: String) -> Int? {
+        guard let range = haystack.range(of: needle) else { return nil }
+        return haystack.distance(from: haystack.startIndex, to: range.lowerBound)
+    }
+
+    static func captures(_ pattern: String, in haystack: String, group: Int = 1) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let ns = haystack as NSString
+        return regex
+            .matches(in: haystack, range: NSRange(location: 0, length: ns.length))
+            .compactMap { match in
+                guard match.numberOfRanges > group else { return nil }
+                let range = match.range(at: group)
+                guard range.location != NSNotFound else { return nil }
+                return ns.substring(with: range)
+            }
+    }
+
+    /// The contract a step puts in force, following one level of workflow-env
+    /// indirection (`CONTRACT_PATH="${VAR}"` or `CONTRACT_PATH: ${{ env.VAR }}`).
+    /// The indirection is the whole point of the wiring, so the test has to
+    /// resolve it rather than demand a literal.
+    static func resolvedContractPath(
+        in stepBody: String, jobEnvironment environment: [String: String]
+    ) -> String? {
+        guard let raw = captures(#"CONTRACT_PATH[:=]\s*(.+)"#, in: stepBody).first
+        else { return nil }
+        var token = raw.trimmingCharacters(in: .whitespaces)
+        if token.hasSuffix("\\") {
+            token = String(token.dropLast()).trimmingCharacters(in: .whitespaces)
+        }
+        if token.count >= 2, token.hasPrefix("\""), token.hasSuffix("\"") {
+            token = String(token.dropFirst().dropLast())
+        }
+        if let name = captures(#"^\$\{\{\s*env\.([A-Z0-9_]+)\s*\}\}$"#, in: token).first {
+            return environment[name]
+        }
+        if let name = captures(#"^\$\{([A-Z0-9_]+)\}$"#, in: token).first {
+            return environment[name]
+        }
+        return token
+    }
+
+    /// Resolve a shell token through at most three `NAME=` assignments so a test
+    /// can assert what an argument actually points at rather than which variable
+    /// happens to hold it.
+    static func resolveShellValue(
+        _ token: String, in script: String, depth: Int = 0
+    ) -> String {
+        var value = token.trimmingCharacters(in: .whitespaces)
+        if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
+            value = String(value.dropFirst().dropLast())
+        }
+        guard depth < 3,
+            let name = captures(#"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$"#, in: value).first,
+            let assignment = captures("(?m)^\\s*\(name)=(.+)$", in: script).first
+        else { return value }
+        return resolveShellValue(assignment, in: script, depth: depth + 1)
+    }
+
+    static func containsMatch(_ pattern: String, in haystack: String) -> Bool {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return false }
+        let ns = haystack as NSString
+        return regex.firstMatch(
+            in: haystack, range: NSRange(location: 0, length: ns.length)
+        ) != nil
+    }
+
+    // MARK: jq assertion / report payload cross-check
+
+    /// Every `jq -e <program> ... >/dev/null` region inside one step.
+    static func jqAssertionPrograms(in stepBody: String) -> [String] {
+        var programs: [String] = []
+        var cursor = stepBody.startIndex
+        while let start = stepBody.range(of: "jq -e", range: cursor ..< stepBody.endIndex) {
+            let tail = stepBody[start.upperBound...]
+            let terminator =
+                tail.range(of: ">/dev/null") ?? tail.range(of: "> /dev/null")
+            let stop = terminator?.lowerBound ?? tail.endIndex
+            programs.append(String(tail[tail.startIndex ..< stop]))
+            cursor = terminator?.upperBound ?? stepBody.endIndex
+        }
+        return programs
+    }
+
+    /// Field names a step's jq programs REQUIRE to exist (`.name`) and field
+    /// names they require to be ABSENT (`has("name") | not`).
+    static func jqAssertedFields(
+        in stepBody: String
+    ) -> (required: Set<String>, forbidden: Set<String>) {
+        var required: Set<String> = []
+        var forbidden: Set<String> = []
+        for program in jqAssertionPrograms(in: stepBody) {
+            for name in captures(
+                #"(?<![A-Za-z0-9_/\-.])\.([a-z][a-z0-9_]*)"#, in: program
+            ) {
+                required.insert(name)
+            }
+            for name in captures(#"has\("([a-z][a-z0-9_]*)"\)"#, in: program) {
+                forbidden.insert(name)
+                required.remove(name)
+            }
+        }
+        return (required, forbidden)
+    }
+
+    /// The keys `runDFlashBenchmark` actually puts in its report payload — the
+    /// authority for what a gate is allowed to assert on.
+    static func dflashReportPayloadKeys() throws -> Set<String> {
+        let cli = try text(cliPath)
+        let function = try #require(
+            cli.range(of: "private static func runDFlashBenchmark("),
+            "runDFlashBenchmark is gone from the CLI"
+        )
+        let tail = cli[function.upperBound...]
+        let literal = try #require(
+            tail.range(of: "var payload: [String: Any] = ["),
+            "runDFlashBenchmark no longer builds a `payload` dictionary"
+        )
+        let serialize = try #require(
+            tail.range(
+                of: "JSONSerialization.data(",
+                range: literal.upperBound ..< tail.endIndex
+            ),
+            "could not find the end of runDFlashBenchmark's payload construction"
+        )
+        let region = String(tail[literal.upperBound ..< serialize.lowerBound])
+        var keys = Set(captures(#""([a-z][a-z0-9_]*)":"#, in: region))
+        for key in captures(#"payload\["([a-z][a-z0-9_]*)"\]"#, in: region) {
+            keys.insert(key)
+        }
+        return keys
+    }
+
+    // MARK: score.json producers
+
+    /// Lines that WRITE `score.json` (redirect target, or cp/mv/install/tee
+    /// destination). Reading it, hashing it and passing it as an artifact name
+    /// are not production.
+    static func scoreJSONProducerLines(_ yaml: String) -> [String] {
+        // `gates-score.json` must NOT count as a `score.json` writer, so the
+        // name is bounded on both sides.
+        let head = #"(?<![A-Za-z0-9_.\-])"#
+        let tail = #"(?![A-Za-z0-9_.\-])"#
+        let patterns = [
+            #">\s*"# + head + #"score\.json"# + tail,
+            #"\b(?:cp|mv|install|tee)\b[^|;]*"# + head + #"score\.json"# + tail,
+        ]
+        return executable(yaml)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+            .filter { line in patterns.contains { containsMatch($0, in: line) } }
+    }
+
+    // MARK: CLI surface
+
+    /// `subcommand -> every option the CLI declares for it`, read out of the
+    /// dispatch switch plus each handler's `options.validate(...)` call.
+    static func cliSubcommandOptions() throws -> [String: Set<String>] {
+        let cli = try text(cliPath)
+        let lines = cli.split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+
+        // 1. dispatch switch: case "name": ... try run<Fn>(
+        var handlerFor: [String: String] = [:]
+        for (index, line) in lines.enumerated() {
+            guard let name = captures(#"^\s*case "([a-z][a-z0-9-]*)":"#, in: line).first
+            else { continue }
+            for lookahead in index ..< min(index + 6, lines.count) {
+                if let handler = captures(
+                    #"try (run[A-Za-z0-9]+)\("#, in: lines[lookahead]
+                ).first {
+                    handlerFor[name] = handler
+                    break
+                }
+            }
+        }
+
+        // 2. each handler's declared options. The search is bounded to the
+        //    handler's own body, so a handler that declared nothing cannot
+        //    silently inherit the next function's option list.
+        var optionsFor: [String: Set<String>] = [:]
+        for handler in Set(handlerFor.values) {
+            guard let declaration = cli.range(
+                of: "private static func \(handler)("
+            ) else { continue }
+            var body = cli[declaration.upperBound...]
+            if let nextFunction = body.range(of: "\n    private static func ") {
+                body = body[body.startIndex ..< nextFunction.lowerBound]
+            }
+            guard let validate = body.range(of: "options.validate(") else {
+                optionsFor[handler] = []
+                continue
+            }
+            // Options are declared inside the validate(...) call; stop at
+            // whichever closing form comes first.
+            let window = String(body[validate.upperBound...])
+            let closings = [window.range(of: "\n        )"), window.range(of: ")\n")]
+                .compactMap { $0?.lowerBound }
+            let stop = closings.min() ?? window.endIndex
+            let region = String(window[window.startIndex ..< stop])
+            optionsFor[handler] = Set(captures(#""(--[a-z][a-z0-9-]*)""#, in: region))
+        }
+
+        var result: [String: Set<String>] = [:]
+        for (name, handler) in handlerFor {
+            result[name] = optionsFor[handler] ?? []
+        }
+        return result
+    }
+
+    /// Every `"${swift_bin}" <subcommand> ... ` invocation in a shell script,
+    /// as (subcommand, full command text including continuation lines).
+    static func swiftBinaryInvocations(in script: String) -> [(String, String)] {
+        // Comment lines are stripped: the scripts document their own pipeline in
+        // a header block that names the same subcommands, and a documented
+        // invocation is not an executed one.
+        let lines = script.split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+            .map { $0.trimmingCharacters(in: .whitespaces).hasPrefix("#") ? "" : $0 }
+        var invocations: [(String, String)] = []
+        var index = 0
+        while index < lines.count {
+            let line = lines[index]
+            let launchers = [
+                #"\$\{swift_bin\}"?\s+([a-z][a-z0-9-]*)"#,
+                #"mlxfast-swift"?\s+([a-z][a-z0-9-]*)"#,
+            ]
+            var subcommand: String?
+            for pattern in launchers {
+                if let hit = captures(pattern, in: line).first {
+                    subcommand = hit
+                    break
+                }
+            }
+            guard let name = subcommand else {
+                index += 1
+                continue
+            }
+            var command = line
+            var cursor = index
+            while command.hasSuffix("\\"), cursor + 1 < lines.count {
+                cursor += 1
+                command += "\n" + lines[cursor]
+            }
+            invocations.append((name, command))
+            index = cursor + 1
+        }
+        return invocations
+    }
+
+    /// Names retired with the MTP track. A local DFlash script naming any of
+    /// them is either calling something that does not exist or reading a file
+    /// that was deleted.
+    static let retiredMTPNames = [
+        "mtp-benchmark",
+        "mtp-probe",
+        "mtp-reference",
+        "laguna-xs-2.1-mtp-v1",
+        "benchmark.mtp.json",
+        "benchmark-mtp.sh",
+        "setup-mtp.sh",
+        "benchmark-mtp:",
+        "fixtures/laguna_xs_2_1_mtp_track.json",
+        "fixtures/mtp_laguna_xs_2_1_4bit.sha256",
+        "laguna_xs_2_1_mtp_track.json",
+        "mtp_laguna_xs_2_1_4bit.sha256",
+    ]
+}
+
+@Suite
+struct DFlashReusedSerialGateTests {
+    private typealias S = DFlashGateTextSupport
+
+    // TASK 1. The DFlash parity gate's jq required `.experimental` and
+    // `.target_verification_mode`; `runDFlashBenchmark` emits NEITHER, so
+    // `jq -e` failed and the step exited 1 on EVERY run — the gate was dead
+    // before it ever gated anything. The workflow's own comment records that
+    // --target-verification was superseded by Criterion E, so the ASSERTION is
+    // the stale artifact: the conjuncts go, the payload does not grow fields.
+    //
+    // The general form of the check is the valuable half: cross-check every
+    // field name the gate's jq asserts against the keys the report actually
+    // emits. That is what would have caught this class of bug originally.
+    @Test
+    func dflashParityGateAssertsOnlyFieldsTheReportActuallyEmits() throws {
+        let workflow = try S.text(S.dflashWorkflowPath)
+        let step = try S.stepBody(
+            workflow, "DFlash correctness and parity gate (untimed)"
+        )
+        let executable = S.executable(step)
+
+        #expect(
+            !executable.contains(".experimental"),
+            """
+            The DFlash parity gate's jq still requires `.experimental`, which \
+            runDFlashBenchmark never emits, so `jq -e` fails and the step exits \
+            1 on every run. Delete the conjunct; do not add the field.
+            """
+        )
+        #expect(
+            !executable.contains("target_verification_mode"),
+            """
+            The DFlash parity gate's jq still requires \
+            `.target_verification_mode`. The workflow's own comment records \
+            that --target-verification was superseded by Criterion E, so the \
+            ASSERTION is the stale artifact, not the missing field.
+            """
+        )
+
+        let emitted = try S.dflashReportPayloadKeys()
+        // Sanity-check the extractor against keys the report demonstrably has,
+        // so a parsing regression cannot make this test vacuously pass.
+        #expect(emitted.contains("track_id"))
+        #expect(emitted.contains("all_tokens_matched"))
+        #expect(emitted.contains("uses_trained_drafter"))
+        #expect(emitted.count > 20, "payload key extraction looks broken: \(emitted)")
+
+        let asserted = S.jqAssertedFields(in: executable)
+        #expect(
+            !asserted.required.isEmpty,
+            "could not locate the DFlash parity gate's jq field assertions"
+        )
+        for field in asserted.required.sorted() {
+            #expect(
+                emitted.contains(field),
+                """
+                the DFlash parity gate asserts `.\(field)`, which \
+                runDFlashBenchmark's report payload does not emit — `jq -e` \
+                fails and the step exits 1 on every run. Emitted keys: \
+                \(emitted.sorted().joined(separator: ", "))
+                """
+            )
+        }
+        for field in asserted.forbidden.sorted() {
+            #expect(
+                !emitted.contains(field),
+                """
+                the DFlash parity gate requires `\(field)` to be ABSENT from \
+                the report, but runDFlashBenchmark emits it
+                """
+            )
+        }
+    }
+
+    // TASK 2. The env var is the ONLY value the workflow rejects on. The
+    // existing tests pin the manifest and the workflow COMMENTS but not this,
+    // which is exactly how a floor of 1.0 survived the operator decision to set
+    // 0.80 — a floor that would reject every honest sub-19% kernel win.
+    @Test
+    func theEnforcedDecodeFloorMatchesTheManifestAndTheFixture() throws {
+        let environment = try S.jobEnvironment(try S.text(S.dflashWorkflowPath))
+        let raw = try #require(
+            environment["MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR"],
+            "the DFlash workflow must declare the floor it enforces"
+        )
+        let enforced = try #require(
+            Double(raw), "MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR is not a number: \(raw)"
+        )
+
+        let manifest = try S.json(S.dflashManifestPath)
+        let scoring = try #require(manifest["scoring"] as? [String: Any])
+        let declared = try #require(scoring["decodeSpeedupFloor"] as? Double)
+        #expect(
+            enforced == declared,
+            """
+            MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR=\(raw) is the only value the \
+            workflow actually rejects on, while \(S.dflashManifestPath) \
+            declares \(declared). The manifest and the workflow comments are \
+            already pinned; this env var was the gap.
+            """
+        )
+
+        let fixture = try S.json(S.dflashFixturePath)
+        let proposed = try #require(fixture["proposed_scoring"] as? [String: Any])
+        let componentFloor = try #require(proposed["component_floor"] as? String)
+        let expected = String(format: ">= %.2f", enforced)
+        #expect(
+            componentFloor.contains(expected),
+            """
+            the contract fixture's component_floor (\(componentFloor)) does not \
+            state the floor the workflow enforces (\(expected))
+            """
+        )
+    }
+
+    // TASK 3a + TASK 10. The four reused steps must EXIST in the DFlash job
+    // under the serial names, and must call the serial implementations rather
+    // than a second copy — a second GPQA path or a second judge is the failure
+    // mode the operator explicitly ruled out. Copying four steps also has to be
+    // a ONE-WAY reference: benchmark.yml stays ignorant of DFlash, and if the
+    // copies are ever factored into a shared composite action that action must
+    // be track-neutral. Both halves live in one test on purpose: the reverse
+    // direction is a preservation invariant that is green on its own, and a
+    // green-only test is a test nobody notices deleting.
+    @Test
+    func theFourReusedSerialGateStepsRunInTheDFlashJobWithoutLeakingBack() throws {
+        let dflash = try S.text(S.dflashWorkflowPath)
+        let serial = try S.text(S.serialWorkflowPath)
+
+        for name in S.reusedGateStepNames {
+            #expect(
+                serial.contains("- name: \(name)\n"),
+                """
+                the serial workflow no longer has the step '\(name)' the DFlash \
+                job reuses; if it was renamed, rename both copies together
+                """
+            )
+            #expect(
+                dflash.contains("- name: \(name)\n"),
+                """
+                the DFlash workflow is missing the reused serial gate step \
+                '\(name)'. Without it a DFlash submission is never checked for \
+                model soundness by the gates the serial harness already runs.
+                """
+            )
+        }
+
+        let executable = S.executable(dflash)
+        // The reused implementations, not reimplementations.
+        for reused in [
+            "mlxfast-swift correctness",
+            "mlxfast-swift attach-gpqa-gates",
+            ".github/scripts/verify-correctness-golden.sh",
+            ".github/scripts/run-semantic-gpqa-gate.sh",
+            "MLXFAST_BENCHMARK_CHECK_GATES=1",
+            "MLXFAST_BENCHMARK_SKIP_TIMED=1",
+            "./benchmark.sh --official",
+        ] {
+            #expect(
+                executable.contains(reused),
+                """
+                the DFlash workflow does not invoke the existing serial gate \
+                implementation '\(reused)'; the reuse contract is to call it, \
+                not to write a parallel one
+                """
+            )
+        }
+        // No second GPQA implementation and no second judge.
+        for forbidden in [
+            "run-dflash-semantic-gpqa-gate.sh",
+            "dflash-gpqa",
+            "attach-dflash-gpqa-gates",
+            "dflash-attach-gpqa-gates",
+        ] {
+            #expect(
+                !executable.contains(forbidden),
+                """
+                '\(forbidden)' is a second GPQA/judge path. GPQA proves the \
+                MODEL is sound; the existing semantic judge is the single \
+                implementation.
+                """
+            )
+        }
+
+        // ---- the reverse direction stays closed ----------------------------
+        #expect(!serial.lowercased().contains("dflash"))
+        for dflashOnly in [
+            "gates-score.json", ".dflash-ranked-src", "benchmark.dflash.json",
+            "measure-dflash-job.sh",
+        ] {
+            #expect(
+                !serial.contains(dflashOnly),
+                "the serial workflow references the DFlash-only literal '\(dflashOnly)'"
+            )
+        }
+        let serialGuard = try S.text(
+            ".github/scripts/enforce-trusted-benchmark-workflow.sh"
+        )
+        #expect(!serialGuard.lowercased().contains("dflash"))
+
+        // Any local composite action used by BOTH workflows must be neutral.
+        var composites: Set<String> = []
+        for workflow in [serial, dflash] {
+            for path in S.captures(
+                #"uses: (\./\.github/actions/[A-Za-z0-9._/-]+)"#, in: workflow
+            ) {
+                composites.insert(path)
+            }
+        }
+        for composite in composites.sorted() {
+            let base = String(composite.dropFirst(2))
+            for candidate in ["\(base)/action.yml", "\(base)/action.yaml", base] {
+                guard FileManager.default.fileExists(atPath: candidate) else { continue }
+                let body = try S.text(candidate)
+                #expect(
+                    !body.contains("laguna-xs-2.1-serial-v2")
+                        && !body.contains("laguna-xs-2.1-dflash-v1"),
+                    """
+                    the shared composite action \(candidate) names a track id; a \
+                    step shared between the serial and DFlash jobs must be \
+                    track-neutral
+                    """
+                )
+                break
+            }
+        }
+    }
+
+    // TASK 3b. Both copies of the gate wiring must be calibrated identically.
+    // Serial's numbers are the calibrated ones (27 self-match runs / 243
+    // judgements for min-pass 7); a DFlash-only retune is how the two tracks
+    // drift into measuring different things.
+    @Test
+    func reusedGateCalibrationIsIdenticalInBothWorkflowsAndMatchesConstants() throws {
+        let dflash = try S.jobEnvironment(try S.text(S.dflashWorkflowPath))
+        let serial = try S.jobEnvironment(try S.text(S.serialWorkflowPath))
+
+        let shared = [
+            "MLXFAST_SEMANTIC_GPQA_MIN_PASS",
+            "MLXFAST_SEMANTIC_GPQA_CASE_COUNT",
+            "MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS",
+            "MLXFAST_SEMANTIC_GPQA_REQUIRED",
+            "MLXFAST_GPQA_CASE_COUNT",
+            "MLXFAST_GPQA_MAX_NEW_TOKENS",
+            "MLXFAST_GPQA_TTFT_CASE_COUNT",
+            "MLXFAST_EXPECTED_CORRECTNESS_STEPS",
+            "MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH",
+            "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH",
+            "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256",
+            "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES",
+        ]
+        for key in shared {
+            let expected = try #require(
+                serial[key], "the serial workflow no longer declares \(key)"
+            )
+            #expect(
+                dflash[key] == expected,
+                """
+                \(key) is '\(dflash[key] ?? "<absent>")' in the DFlash workflow \
+                and '\(expected)' in the serial workflow. The DFlash job reuses \
+                the serial gates, so it must reuse their calibration.
+                """
+            )
+        }
+
+        // The calibrated values themselves, tied to the trusted constants the
+        // harness compiles against.
+        #expect(serial["MLXFAST_SEMANTIC_GPQA_MIN_PASS"]
+            == String(MLXFastConstants.semanticGPQAMinPassCount))
+        #expect(serial["MLXFAST_SEMANTIC_GPQA_CASE_COUNT"]
+            == String(MLXFastConstants.semanticGPQACaseCount))
+        #expect(serial["MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS"]
+            == String(MLXFastConstants.semanticGPQAMaxNewTokens))
+        #expect(serial["MLXFAST_GPQA_CASE_COUNT"]
+            == String(MLXFastConstants.correctnessGPQACaseCount))
+        #expect(serial["MLXFAST_GPQA_MAX_NEW_TOKENS"]
+            == String(MLXFastConstants.correctnessGPQAMaxNewTokens))
+        #expect(serial["MLXFAST_EXPECTED_CORRECTNESS_STEPS"]
+            == String(MLXFastConstants.correctnessSteps))
+        // The TTFT guardrail measures the same cases the GPQA gate scores.
+        #expect(serial["MLXFAST_GPQA_TTFT_CASE_COUNT"] == serial["MLXFAST_GPQA_CASE_COUNT"])
+
+        // The model-soundness guarantee must not be quietly made optional in
+        // either job: run-semantic-gpqa-gate.sh treats REQUIRED=0 as advisory.
+        #expect(
+            serial["MLXFAST_SEMANTIC_GPQA_REQUIRED"] == "1",
+            "the serial semantic GPQA gate must stay required"
+        )
+        #expect(
+            dflash["MLXFAST_SEMANTIC_GPQA_REQUIRED"] == "1",
+            """
+            the DFlash job must set MLXFAST_SEMANTIC_GPQA_REQUIRED=1; anything \
+            else makes the judge advisory and the model-soundness guarantee the \
+            operator asked for optional
+            """
+        )
+
+        // The public fixture the behavior gate teacher-forces really is the
+        // pinned bytes, in both workflows.
+        let fixturePath = try #require(serial["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH"])
+        let fixtureData = try Data(contentsOf: URL(fileURLWithPath: fixturePath))
+        let digest = SHA256.hash(data: fixtureData)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        #expect(serial["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256"] == digest)
+        #expect(serial["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES"] == String(fixtureData.count))
+        #expect(fixturePath == MLXFastConstants.defaultPublicCorrectnessGoldenPath)
+        #expect(serial["MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH"]
+            == MLXFastConstants.defaultPublicCorrectnessPromptPath)
+    }
+
+    // TASK 4. The DFlash job already publishes its own `score.json`. The serial
+    // gates pass seals ITS score to `score.json` too, so copying the step
+    // verbatim makes the gates score and the ranked DFlash score collide — the
+    // later writer wins and the published artifact is whichever ran last.
+    @Test
+    func exactlyOneStepProducesScoreJSONAndTheJudgeReadsTheGatesFile() throws {
+        let workflow = try S.text(S.dflashWorkflowPath)
+
+        let producers = S.scoreJSONProducerLines(workflow)
+        #expect(
+            producers.count == 1,
+            """
+            \(producers.count) steps write score.json in the DFlash workflow; \
+            exactly one (the ranked DFlash score) may. Writers found: \
+            \(producers.map { $0.trimmingCharacters(in: .whitespaces) })
+            """
+        )
+
+        let gates = try S.stepBody(
+            workflow, "Correctness and gates (full base case + hidden gates, no timing)"
+        )
+        #expect(
+            gates.contains("gates-score.json"),
+            """
+            the reused gates pass must seal to gates-score.json; sealing to \
+            score.json collides with the ranked DFlash score
+            """
+        )
+        #expect(
+            S.scoreJSONProducerLines(gates).isEmpty,
+            "the reused gates pass must not write score.json: \(S.scoreJSONProducerLines(gates))"
+        )
+        #expect(gates.contains("benchmark-integrity.gates.json"))
+
+        let judge = try S.stepBody(workflow, "Semantic GPQA gate")
+        #expect(
+            judge.contains("MLXFAST_SCORE_PATH: gates-score.json"),
+            """
+            the semantic judge patches the score it is pointed at. In the \
+            DFlash job it must patch the sealed GATES score (gates-score.json), \
+            not the ranked DFlash score.
+            """
+        )
+        #expect(
+            !judge.contains("MLXFAST_SCORE_PATH: score.json"),
+            "the semantic judge must not be pointed at the ranked DFlash score"
+        )
+        #expect(judge.contains("MLXFAST_INTEGRITY_PATH: benchmark-integrity.gates.json"))
+        // And it stays the existing judge script.
+        #expect(judge.contains(".github/scripts/run-semantic-gpqa-gate.sh"))
+    }
+
+    // TASK 6. `LagunaRuntimeDFlashDriver` guards on
+    // `options.totalTokenCount <= golden.rows.count`, and the pinned hidden
+    // correctness golden (14683 bytes) cannot physically hold 512 rows under any
+    // field population. Until the goldens are regenerated the gate must refuse
+    // to run rather than silently measure a shorter window, so the precondition
+    // is checked before the gate and it FAILS CLOSED.
+    @Test
+    func hiddenDFlashGoldenRowCountIsPreflightedFailClosed() throws {
+        let workflow = try S.text(S.dflashWorkflowPath)
+        let step = S.executable(try S.stepBody(workflow, "Prepare hidden DFlash goldens"))
+
+        #expect(
+            S.containsMatch(#"\.rows"#, in: step) && step.contains("length"),
+            """
+            'Prepare hidden DFlash goldens' does not preflight the golden's row \
+            count. The driver requires rows >= tokens, and the pinned 14683-byte \
+            golden cannot hold MLXFAST_DFLASH_CORRECTNESS_TOKENS=512 rows, so \
+            the gate must fail closed here instead of at the driver.
+            """
+        )
+        #expect(
+            step.contains("MLXFAST_DFLASH_CORRECTNESS_TOKENS"),
+            "the row-count preflight must compare against the tokens the gate requests"
+        )
+
+        // Fail-closed shape: an `exit 1` after the check, never a warning and
+        // never a clamp of the requested token count.
+        let checkStart = try #require(
+            step.range(of: "rows"), "row-count preflight vanished"
+        )
+        let afterCheck = String(step[checkStart.lowerBound...])
+        #expect(
+            afterCheck.contains("exit 1"),
+            "the row-count preflight must exit 1, not warn"
+        )
+        #expect(
+            afterCheck.contains("::error::"),
+            "the row-count preflight must annotate as an error"
+        )
+        #expect(
+            !step.contains("::warning::"),
+            """
+            'Prepare hidden DFlash goldens' warns instead of failing. A short \
+            golden must abort the job: a clamped or warned-past token count \
+            silently measures a different window than the contract declares.
+            """
+        )
+        // A clamp is the other tempting non-fix.
+        #expect(
+            !S.containsMatch(#"MLXFAST_DFLASH_CORRECTNESS_TOKENS="#, in: step),
+            """
+            'Prepare hidden DFlash goldens' reassigns \
+            MLXFAST_DFLASH_CORRECTNESS_TOKENS — clamping the requested window to \
+            whatever the golden happens to hold is not a fail-closed preflight
+            """
+        )
+    }
+
+    // TASK 7a. The nine DFlash-only editable paths are only reachable if BOTH
+    // surface gates read the DFlash contract. overlay-editable-paths.sh and
+    // enforce-modifiable-surface.sh already accept CONTRACT_PATH; the DFlash
+    // workflow never set it, so a DFlash submission was overlaid and judged
+    // against the SERIAL contract and its own runtime files were rejected.
+    @Test
+    func contractPathIsWiredForOverlayAndSurfaceEnforcement() throws {
+        let workflow = try S.text(S.dflashWorkflowPath)
+        let environment = try S.jobEnvironment(workflow)
+
+        let enforcement = S.executable(
+            try S.stepBody(workflow, "Verify submitted commit and modifiable surface")
+        )
+        let enforcementContract = S.resolvedContractPath(
+            in: enforcement, jobEnvironment: environment
+        ) ?? "<CONTRACT_PATH unset>"
+        #expect(
+            enforcementContract == S.dflashManifestPath,
+            """
+            the DFlash surface-enforcement step puts '\(enforcementContract)' in \
+            force, not \(S.dflashManifestPath), so \
+            enforce-modifiable-surface.sh falls back to benchmark.json and \
+            rejects the DFlash-only editable paths
+            """
+        )
+
+        let overlay = S.executable(
+            try S.stepBody(workflow, "Overlay submitted editable paths")
+        )
+        let overlayContract = S.resolvedContractPath(
+            in: overlay, jobEnvironment: environment
+        ) ?? "<CONTRACT_PATH unset>"
+        #expect(
+            overlayContract == S.dflashManifestPath,
+            """
+            the DFlash overlay step puts '\(overlayContract)' in force, not \
+            \(S.dflashManifestPath), so overlay-editable-paths.sh silently drops \
+            the DFlash-only files from the submission
+            """
+        )
+
+        // The scripts stay parameterised: no hardcoded serial contract read.
+        let enforce = try S.text(".github/scripts/enforce-modifiable-surface.sh")
+        #expect(
+            !enforce.contains("${BASE_SHA}:benchmark.json"),
+            "enforce-modifiable-surface.sh must not hardcode a benchmark.json show"
+        )
+        #expect(enforce.contains("CONTRACT_PATH=\"${CONTRACT_PATH:-benchmark.json}\""))
+        #expect(enforce.contains("${BASE_SHA}:${CONTRACT_PATH}"))
+        let overlayScript = try S.text(".github/scripts/overlay-editable-paths.sh")
+        #expect(overlayScript.contains("CONTRACT_PATH=\"${CONTRACT_PATH:-benchmark.json}\""))
+        #expect(overlayScript.contains("\"${CONTRACT_PATH}\""))
     }
 }

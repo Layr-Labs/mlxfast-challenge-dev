@@ -167,6 +167,15 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
         )
     }
 
+    /// MUST STAY `internal`. It was briefly made `public` so the trusted DFlash
+    /// worker could call it, but this file lives under `Sources/MLXFastModel`,
+    /// which is a DIRECTORY entry in both tracks' `editablePaths` -- so `submit`
+    /// packages this file with EVERY submission, including the serial ones in
+    /// flight today that carry the `internal` form. Trusted, non-editable code
+    /// that depends on an access level declared in editable code breaks the build
+    /// of any submission overlaying an older copy, through no fault of the
+    /// submitter. The trusted worker therefore applies the policy itself from the
+    /// long-public scalars below; see the note at its call site.
     func apply() {
         // Command-buffer budgets are per-profile absolutes (the pre-policy
         // code force-set them identically); only the opt-in feature flags

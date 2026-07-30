@@ -170,7 +170,11 @@ public enum DFlashValidationOutcome: String, Sendable {
 /// surfacing those against hidden material would turn the validator into a
 /// query oracle for the hidden prompt (contract layer L6).
 public struct DFlashContractViolation: Error, CustomStringConvertible {
-    public enum Kind: String, Sendable {
+    // CaseIterable is load-bearing, not decoration: it is what makes
+    // DFlashRedactorKindCoverageTests exhaustive, so a kind added here
+    // without a matching arm in redact-benchmark-failure.sh fails the
+    // suite instead of silently redacting to the generic category.
+    public enum Kind: String, Sendable, CaseIterable {
         case emptyBlock
         case oversizedBlock
         case outOfVocabularyToken
