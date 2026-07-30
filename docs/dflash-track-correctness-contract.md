@@ -571,6 +571,47 @@ the observed maximum, and small enough that a degraded verifier cannot hide
 inside it. Until that measurement exists the tolerance is a placeholder and
 `tokenFidelityGateStatus` stays `pending-spec`.
 
+# Validation record (2026-07-30, M5-C)
+
+What has actually been executed, as opposed to written. Everything below ran on
+M5-C against the organizer-provisioned target
+(`/opt/bench-runner/cache/dflash/laguna-xs-2.1-dflash-v1/target`, 13/13 hardlinks
+to the pinned NVFP4 snapshot plus the one audited tokenizer overlay) and drafter
+(`.../assistant`, manifest-pinned).
+
+| check | result |
+|---|---|
+| `swift build` both products (CLI + runtime worker) | clean |
+| root `swift test` | **459 tests, 7 suites, all pass** |
+| vendored `DFlashRollbackSeamTests` | **6/6 pass**, including the crossing-round regression |
+| `dflash-reference` (L1) | golden written; `reference_self_consistent=true`; replay **bit-identical** (R5 satisfied) |
+| `dflash-probe` (serial K=1 control) | rc=0, `all_tokens_matched=true`, report JSON on stdout |
+| `dflash-benchmark` (block, K=8) | rc=0, `all_tokens_matched=true`, rounds=1, accepted=0, rejected=3 |
+| KV ledger (L3) | `target_cache_offset_final=13` == 12 seed + 1 decoded |
+| row accounting (L3) | `declared_rows_total` == `reference_checked_row_total` == 1 |
+| negative path | a plan with fabricated emitted tokens is refused with `tokenNotAdmissible at step 1` — no token id or logit value in the message (L6 redaction holds) |
+
+Both directions are therefore demonstrated: an honest run is admitted, and a run
+whose tokens are not reference-admissible is refused, fail-closed, without
+leaking reference material.
+
+NOT yet validated, and each blocks enablement:
+
+1. **Long-context viability** — see Amendment 5. This is the substantive
+   blocker: the harness is correct but the track may not be rankable.
+2. **A multi-token, seam-crossing timed run.** The passing e2e above is a
+   1-token run, so its timings (0.33 vs 0.18 s/token) are fixed-cost dominated
+   and meaningless, and it does not cross the ring boundary.
+3. **`DFlashWorkBindingTolerance` calibration** (Amendment 1) from measured
+   honest candidate-vs-reference logit deltas.
+4. **L4 ring-index consistency** (Amendment 4) and **L5 reference-drafter
+   replay** are designed but unimplemented.
+5. The box wrapper `/opt/bench-runner/measure-dflash-job.sh` still passes the
+   nonexistent `--contract` and `--require-trained-drafter` flags, omits
+   `--drafter` on the probe side, and asserts
+   `reference_checked_row_total == declared_rows_total` where the reference can
+   only score EMITTED rows (it should be `>= emitted_token_total`).
+
 # Amendment 5 (2026-07-30) — MEASURED AT LONG CONTEXT: DFlash is currently a NET SLOWDOWN
 
 The first measurement ever taken at a long prompt (1755 tokens, K=8, M5-C,
