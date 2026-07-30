@@ -571,6 +571,56 @@ the observed maximum, and small enough that a degraded verifier cannot hide
 inside it. Until that measurement exists the tolerance is a placeholder and
 `tokenFidelityGateStatus` stays `pending-spec`.
 
+# Amendment 5 (2026-07-30) — MEASURED AT LONG CONTEXT: DFlash is currently a NET SLOWDOWN
+
+The first measurement ever taken at a long prompt (1755 tokens, K=8, M5-C,
+`mlx-bench dflash`) shows the drafter losing to plain sequential decode:
+
+| tree | base tok/s | dflash tok/s | speedup | accepted |
+|---|---|---|---|---|
+| pre-fix standalone (`~/projects/laguna-dflash`) | 81.9 | 55.8 | **0.68x** | 1.47/7 |
+| fixed dev-repo tree (organizer target + drafter) | 81.6 | 43.5 | **0.53x** | 1.47/7 |
+
+Compare the short-prompt sweep (51-token prompt, same K=8): 83.4 -> 154.9 tok/s,
+**1.86x**, accepted **3.55/7**.
+
+So acceptance collapses from 3.55/7 to 1.47/7 as context grows, and with it the
+speedup falls from 1.86x to below parity. Fewer accepted drafts means the wasted
+verify rows dominate: at K=8 a round costs an 8-row target forward regardless,
+and emitting ~2.5 tokens for it is worse than emitting 1 token from a 1-row
+forward.
+
+Consequences that the track cannot be enabled without resolving:
+
+1. **The scoring floor rejects everything.** `decodeSpeedupFloor` is a hard 1.0
+   on the ratio-of-means aggregate. At the ranked window (512-token seed) the
+   drafter is far closer to this long-context regime than to the 51-token regime
+   the 1.86x came from, so the expected outcome is REJECT for every submission,
+   including an honest optimal one. A track that cannot rank anything is not
+   ready.
+2. **Every previously reported DFlash number is short-prompt-only.** The 1.56x-
+   1.86x sweep, the K=4..16 acceptance table, and the dev-repo 1.60x figure were
+   all taken at 26-68 token prompts. None of them describes ranked behaviour.
+   They must not be quoted as evidence for this track.
+3. **The cause needs isolating before any go-live.** Candidate explanations, in
+   the order worth testing: (a) the drafter conditions on target hidden states
+   captured at layers [1,13,25,33,39] and its acceptance may simply degrade with
+   sequence length, i.e. an inherent property of this checkpoint; (b) the
+   sliding-window seam forces a cache snapshot every round once the ring has
+   wrapped (see Amendment 3), which is real per-round cost the short runs never
+   paid -- note the fixed tree is SLOWER than the pre-fix one here (0.53x vs
+   0.68x), consistent with paying snapshot cost, though the two runs also differ
+   in target directory and are single samples; (c) block-shaped attention over a
+   wrapped ring may hit a slower kernel path than the 1-row decode.
+4. **Decide the block size from long-context data, not the short sweep.** K=8
+   was chosen because it peaked at 1.86x on short prompts. At low acceptance a
+   smaller K wastes fewer verify rows, so the ranked default may well be lower.
+
+Until (3) is isolated and a long-context configuration clears 1.0 with margin,
+`official_scoring_enabled` must stay false regardless of how complete the harness
+is. The harness being correct and the track being viable are separate questions,
+and this amendment records that the second one is currently unanswered.
+
 # Amendment 4 (2026-07-30) — L4 corrected: KV digests cannot be compared across builds either
 
 L4 as specified asks for "parent-demanded KV digests at the committed offset with
@@ -625,9 +675,22 @@ whether to snapshot *before* the block was written, while the trim happens
 snapshot and could not trim, and threw `untrimmableCache`.
 
 Why it was not seen earlier: Laguna's sliding window is 512 and every bring-up
-measurement used a 26-68 token prompt, so the seam was never crossed. The ranked
-window is a 512-token seed plus 128 decode steps — it crosses the seam on the
-first block. **Every scored run would have failed.**
+measurement used a 26-68 token prompt, so the seam was never crossed.
+
+**CORRECTION (measured after this amendment was first written).** The original
+text claimed "every scored run would have failed". That is WRONG and is retracted.
+A 1755-token prompt runs to completion on the PRE-FIX binary, because by then the
+ring is already wrapped when decode starts: `isTrimmable` is false from the first
+round, so a snapshot is always taken and copy+replay works. The defect requires
+the round to CROSS the boundary mid-flight, i.e. a seed length in roughly
+[maxSize - K + 1, maxSize - 1] — about 505..511 for K=8 — which is exactly what
+the agent's 512-token warmup seed hit. So the hole is real but NARROW, not
+universal.
+
+The fix stands on its own merits (that band includes seeds a ranked run can
+legitimately produce, and failing a run for crossing a ring boundary is never
+correct), but the severity claim was overstated and the seam is not what makes
+this track unready. Amendment 5 records what actually does.
 
 Fix: the snapshot decision now takes the width the round is about to write
 (`plannedWriteCount`) and snapshots when any cache would cross its ring
