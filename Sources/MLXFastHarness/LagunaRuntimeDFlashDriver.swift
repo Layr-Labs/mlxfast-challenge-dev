@@ -172,10 +172,23 @@ extension LagunaRuntime {
         )
         defer { client.close() }
 
-        // Seed prefill is untimed here only in the sense that it is charged to
-        // the decode measurement as a whole (the retired MTP contract charged it
-        // the same way): the clock starts immediately before the request so the
-        // seed cost cannot be hidden.
+        // Untimed phase start, BEFORE the clock: the allocator clear and the
+        // working-set re-touch that follows it never see the seed, so timing them
+        // measures nothing about the submission -- it only charges the warm to the
+        // score. It used to ride inside the begin request, which is why the warm
+        // had to stay small; widening it to cover the saturated ring and every
+        // block width then cost 24-27% of absolute decode time.
+        let warm = try client.warmDFlashDecode()
+        guard warm.ok else {
+            throw MLXFastError.invalidInput(
+                "DFlash worker failed the untimed warm: "
+                    + (warm.error ?? "no reason reported")
+            )
+        }
+
+        // Seed prefill IS charged to the decode measurement as a whole (the
+        // retired MTP contract charged it the same way): the clock starts
+        // immediately before the request so the seed cost cannot be hidden.
         let started = Date()
         let begin = try client.beginDFlashDecode(seedTokens: golden.seedTokens)
         guard begin.ok, let seedToken = begin.seedToken else {

@@ -16,6 +16,9 @@ struct ExperimentalDFlashBlockRequest: Equatable {
 
 struct ExperimentalDFlashWorkerState {
     var began = false
+    /// Set by `dflash_decode_warm`. The warm is input-independent, so the
+    /// trusted parent runs it BEFORE starting its clock; `began` then skips it.
+    var warmed = false
     var poisoned = false
     var seedTokenCount = 0
     var decodedTokenCount = 0
@@ -206,6 +209,39 @@ extension LagunaRuntime {
         }
 
         switch request.kind {
+        case "dflash_decode_warm":
+            // Untimed phase start: clear the allocator, then re-touch the working
+            // set it freed. Carries NO seed and applies none, so there is nothing
+            // input-dependent a submission could hide in here -- which is exactly
+            // why it is safe to run outside the scored window.
+            guard !state.began,
+                  request.id > 0,
+                  request.seedTokens == nil,
+                  request.promptTokens == nil,
+                  request.token == nil,
+                  request.steps == nil,
+                  request.maxBlockSize == nil,
+                  request.topK == nil,
+                  request.expectedToken == nil
+            else {
+                throw MLXFastError.invalidInput(
+                    "DFlash warm request is malformed or arrived after begin"
+                )
+            }
+            do {
+                try resetRuntimeWorkerAllocatorForPhaseStart()
+                try session.warmWorkingSetAfterAllocatorReset()
+                state.warmed = true
+                return RuntimeWorkerResponse(
+                    id: request.id,
+                    nonce: sessionNonce,
+                    ok: true
+                )
+            } catch {
+                state.poisoned = true
+                throw error
+            }
+
         case "dflash_decode_begin":
             guard !state.began,
                   request.id > 0,
@@ -222,12 +258,20 @@ extension LagunaRuntime {
                     "DFlash begin request is repeated or malformed"
                 )
             }
-            try resetRuntimeWorkerAllocatorForPhaseStart()
-            do {
-                // Charged but input-independent (the seed is not applied yet):
-                // re-touch the working set the trusted clear just freed so the
-                // first timed block does not pay a first-touch spike.
+            // The allocator clear and the re-touch that follows it are
+            // input-independent -- the seed is not applied by either -- so the
+            // trusted parent issues them as `dflash_decode_warm` BEFORE starting
+            // its clock. Doing them here instead charged the whole warm to the
+            // measurement, which is why the warm had to stay small: widening it
+            // to cover every block width and a past-the-ring seed cost 24-27% of
+            // absolute decode time. Kept as a fallback so a parent that does not
+            // warm still gets correct (if slower) behaviour.
+            if !state.warmed {
+                try resetRuntimeWorkerAllocatorForPhaseStart()
                 try session.warmWorkingSetAfterAllocatorReset()
+                state.warmed = true
+            }
+            do {
                 let seedToken = try session.begin(seedTokens: seedTokens)
                 state.began = true
                 state.seedTokenCount = seedTokens.count

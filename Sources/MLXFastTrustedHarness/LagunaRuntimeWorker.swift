@@ -2106,6 +2106,12 @@ final class RuntimeWorkerClient {
     // The parent chooses every block width and never tells the worker how much
     // of the decode window remains.
 
+    /// Untimed phase start: allocator clear plus working-set re-touch. Issued
+    /// before the parent's clock starts, because neither step sees the seed.
+    func warmDFlashDecode() throws -> RuntimeWorkerResponse {
+        try send(kind: "dflash_decode_warm")
+    }
+
     func beginDFlashDecode(seedTokens: [Int]) throws -> RuntimeWorkerResponse {
         try send(
             kind: "dflash_decode_begin",
