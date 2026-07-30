@@ -1,9 +1,12 @@
 import Foundation
 import MLX
-import MLXLMCommon
 import Testing
 
+// @testable on both: the stub subclasses BaseKVCache, whose initializer and
+// maxSize are internal/non-open, and the probe builds a LagunaModel from an
+// in-memory LagunaConfiguration.
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 // Regression tests for the sliding-window WRAP SEAM in DFlash rollback.
 //
@@ -129,8 +132,7 @@ struct DFlashRollbackSeamTests {
         )
         #expect(
             state is DFlashCopiedTargetRollbackState,
-            "a round that ends wrapped must carry a snapshot; without one it can "
-                + "neither trim nor replay"
+            "a round that ends wrapped must carry a snapshot; without one it can neither trim nor replay"
         )
     }
 
