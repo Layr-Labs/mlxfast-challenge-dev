@@ -1618,3 +1618,93 @@ tokens at rate 40. That is the same artifact Amendment 10 criticised in the
 residual budget, and it is retained rather than special-cased: the ranked window
 is 128 tokens, where the rate gives 6. It is recorded here so that a future short
 diagnostic run that trips the cap is recognised as this, and not as a finding.
+
+# Amendment 15 (2026-07-30): Blocker 4a is fixed, and it uncovers the next one
+
+Validation is now split in two, which is what the contract said all along:
+"the parent journals, and the pinned reference worker replays afterwards",
+teacher-forced "on the candidate's own emitted prefix".
+
+`LagunaDFlashBlockValidator.acceptStructural(round:)` keeps inline, in the timed
+loop, everything that is arithmetic on the worker's own report: vocabulary range,
+block bounds, emitted-vs-declared row accounting, the KV-offset ledger, and the
+shape of the work-binding readout. It journals the round and scores nothing.
+`validateJournalAgainstReference(oracle:)` runs after the timed loop, with the
+candidate worker closed, and does everything that needs a reference:
+sequential / declared-frame / near-tie / residual admissibility plus the L2 top-2
+logit comparison. A report cannot be published without it
+(`requireReferenceValidated()`).
+
+The replay opens the reference worker only AFTER closing the candidate — two live
+text towers would be 43 GB — prefills it over the same seed, and walks the journal
+in emission order, which keeps the reference's continuous width-1 cache a pure
+continuation. Measured: **zero** `rebuilding the width-1 frame` events across a
+128-token width-4 run, i.e. the whole replay was one continuation.
+
+`DFlashGoldenReferenceOracle` stays the fallback oracle and keeps its two
+remaining scored jobs: the seed-token expectation and the `--tokens` bound.
+
+## Measured on M5-C, `fix3-golden.json` (varied prose, 512-token seed)
+
+| run | before (stored golden) | after (live replay) |
+| --- | --- | --- |
+| K=1 probe, 128 tokens | pass, 128 exact | pass, 128 exact |
+| K=4 `--schedule-seed 7`, 128 tokens | **`tokenNotAdmissible` at step 6** | **`tokenNotAdmissible` at step 109** |
+| K=4, 109 tokens | — | pass: 108 exact + 1 near-tie, 0 residual |
+
+The one near-tie is at row 5 (reference top-2 gap 0.25, logits 15.3125 /
+15.0625) — the exact divergence that used to poison every later golden row. The
+replay absorbs it and then scores 103 more rows exactly, which is what 4a was
+costing.
+
+Timing is unchanged, against the expectation that removing in-loop oracle work
+would lower it. Three runs each on `seam-512-golden.json`, 128 tokens:
+
+| | before | after | delta |
+| --- | --- | --- | --- |
+| K=1 `parent_measured_seconds_per_token` | 0.018887 | 0.018920 | +0.17% |
+| K=4 `parent_measured_seconds_per_token` | 0.017188 | 0.017167 | -0.13% |
+
+Both deltas are inside the run-to-run spread of either set. The in-loop oracle was
+an array index plus a handful of double comparisons per token — microseconds
+against a 17-19 ms token. Wall-clock per invocation roughly doubles (10s -> 20s)
+because a second model load now happens, outside the clock.
+
+## The L2 tolerance was calibrated against an artifact
+
+`max_top2_logit_delta` on the same fixtures, stored golden vs live replay:
+K=1 **2.625 -> 0**, K=4 **3.375 -> 1.75**. The K=1 control is now BIT-IDENTICAL to
+the reference's width-1 walk. So a large part of the 3.375 that Amendment 6 used
+to derive both the 5.0 work-binding tolerance and the 6.75 near-tie envelope was
+golden pre-generation drift, not candidate-vs-reference drift. Both constants are
+now looser than the evidence requires and should be recalibrated against live
+replay before `official_scoring_enabled` is considered.
+
+## Blocker 4c: a two-token admissible set cannot express a three-way tie
+
+The width-4 run still fails, deterministically (bit-identical over three runs),
+and NOT for 4a's reason. At row 109, with the reference teacher-forced on the
+candidate's own prefix:
+
+```
+cand=1972  k1=268  declared frame (width 4)=268
+reference top-2 = [268, 85]    logits [14.625, 13.875]
+candidate top-2 = [1972, 85]   logits [14.5,   13.9375]
+```
+
+Three tokens sit inside 0.75 logits at a row where the reference's top-1 is only
+14.625 — some 7 logits below this model's typical confident top-1 of 21-26. The
+row IS a near-tie by Amendment 14's own predicate (gap 0.75 << 6.75 envelope).
+It is rejected only because the admissible set is built from the reference's
+top-**2**, and the candidate's argmax is the reference's #3. The shared slot
+(token 85) agrees to 1 ULP in both value and rank, so the L2 binding says the
+candidate did the work.
+
+This was masked by 4a: the run never used to reach row 109.
+
+Fixing it means widening what the reference REPORTS (top-k, k>2, or every token
+within the envelope of the reference's top-1) so the near-tie predicate can be
+applied to the set it was always meant to describe. That is a contract amendment
+with its own anti-farming argument to make, not a validator tweak, and it is
+deliberately NOT done here: widening an admissible set to make a run pass is
+exactly the move this document exists to prevent someone making quietly.
