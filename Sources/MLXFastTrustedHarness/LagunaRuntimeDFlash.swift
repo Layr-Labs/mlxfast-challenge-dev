@@ -143,29 +143,47 @@ public struct DFlashContractViolation: Error, CustomStringConvertible {
 /// These are numeric readouts taken in two different frames, so they are compared
 /// with a tolerance -- never for equality.
 ///
-/// MEASURED BASIS (M5-C, 2026-07-30, Laguna XS 2.1 NVFP4 target + the pinned
-/// 924 MB BF16 drafter, candidate and reference from the SAME build). Gap =
-/// `|candidate - reference|` per top-2 slot; logits are BF16, so one ULP at these
-/// magnitudes (top-1 ranged 21.4..26.5) is 0.125:
+/// MEASURED BASIS, RE-TAKEN. The first calibration (Amendment 6) compared the
+/// candidate against a PRE-GENERATED golden, so every gap it recorded was the sum
+/// of candidate-vs-reference drift and the golden's own pre-generation drift. Only
+/// the live post-run replay of the candidate's own chain (Amendment 15) isolates
+/// the term this tolerance is supposed to price. Both regimes are kept below,
+/// because the difference between them IS the finding.
 ///
-///     regime                     ctx        n     max    p99   p50   mean
-///     short  K=1                 12..21     18   0.250  0.250 0.125  0.104
-///     seed 509 (ring seam) K=1   509..533   48   3.375  3.375 0.250  0.401
-///     seed 509 (ring seam) K=3   509..533   48   2.750  2.750 0.375  0.495
-///     seed 600 (wrapped)   K=1   600..728  256   2.500  1.750 0.250  0.316
+/// LIVE REPLAY (M5-C, 2026-07-30, frozen 128-token window, 256 comparisons per
+/// run, Laguna XS 2.1 NVFP4 target + the pinned 924 MB BF16 drafter, candidate and
+/// reference from the SAME build). Gap = `|candidate - reference|` per top-2 slot;
+/// logits are BF16, so one ULP at these magnitudes is 0.125:
 ///
-/// Two things in that table decide the constant. First, the gap is ~1-2 ULP at
-/// short context and up to 27 ULP once the context passes the 512-slot sliding
-/// window -- the divergence is a WINDOW-EDGE frame effect (incremental ring-cache
-/// decode vs. the reference's stateless prefill-and-replay), not arithmetic noise,
-/// and the ranked window sits entirely in the wrapped regime. Second, it is not a
-/// seam transient: in the 256-sample run the 16 gaps above 1.0 are spread across
-/// the whole run, not clustered at the wrap.
+///     width  fixture       seeds    max            p99      p50    mean
+///     K=1    both          -        0              0        0      0
+///     K=3    varied        7        1.500          1.375    0.188  0.280
+///     K=3    repetitive    0        2.750          1.500    0.250  0.309
+///     K=4    varied        0, 7     1.750, 2.4375  1.75     0.250  0.320
+///     K=4    repetitive    0, 7     1.750, 2.000   1.688    0.250  0.319
+///     K=8    varied        7        2.625          1.750    0.250  0.386
+///     K=8    repetitive    0        3.250          2.125    0.188  0.365
 ///
-/// So: absolute 5.0 is 1.5x the observed maximum over 352 long-context
-/// comparisons, which buys headroom for the unobserved tail of a sample that
-/// small without doubling it. Relative 0.25 is ~2x the largest observed relative
-/// gap (0.120) -- the old 0.02 was dead code, below even the short-context gaps.
+/// Read that table before touching the constant. The K=1 control is EXACTLY zero:
+/// at width 1 the candidate reproduces the reference's own width-1 walk bit for
+/// bit, so there is no same-build drift at all. Every nonzero row is a BLOCK-FRAME
+/// effect that grows with the width -- which also means the 3.375 the old
+/// calibration attributed to build-to-build drift was mostly the golden's, and
+/// what survives is a frame effect the reference could not have avoided.
+///
+/// So: absolute **4.875** is 2x the maximum observed at the widths this
+/// recalibration covers (2.4375 at K<=4, both fixtures, several seeds), and 1.5x
+/// the maximum observed at ANY width including the off-ranked K=8 diagnostic
+/// (3.250) -- the same 1.5x discipline Amendment 6 applied, now against an
+/// uncontaminated maximum. It is also strictly below the outgoing 5.0, which is a
+/// hard constraint: a recalibration whose measured basis shrank must not end up
+/// loosening the binder. Relative 0.25 is 1.5x the largest relative gap observed
+/// live (0.166) -- the old 0.02 was dead code, below even the short-context gaps.
+///
+/// STORED-GOLDEN REGIME, retained for provenance because it is what the 5.0 was
+/// built on: max 3.375 over 352 long-context comparisons, concentrated once the
+/// context passed the 512-slot sliding window, spread across the run rather than
+/// clustered at the wrap seam.
 ///
 /// WHAT THIS DOES NOT ESTABLISH, stated because it bounds the claim:
 ///   * Candidate and reference were the same build, so the CROSS-BUILD term (a
@@ -181,7 +199,7 @@ public struct DFlashWorkBindingTolerance: Sendable {
     public let absolute: Double
     public let relative: Double
 
-    public init(absolute: Double = 5.0, relative: Double = 0.25) {
+    public init(absolute: Double = 4.875, relative: Double = 0.25) {
         self.absolute = absolute
         self.relative = relative
     }

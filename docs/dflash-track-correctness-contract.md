@@ -1708,3 +1708,137 @@ applied to the set it was always meant to describe. That is a contract amendment
 with its own anti-farming argument to make, not a validator tweak, and it is
 deliberately NOT done here: widening an admissible set to make a run pass is
 exactly the move this document exists to prevent someone making quietly.
+
+# Amendment 16 (2026-07-30): near ties are judged on the emitted token's own reference logit, and both constants are re-derived from live replay
+
+Two changes, both TIGHTENINGS bought by better measurement.
+
+## 1. Blocker 4c: admit on the emitted token's own logit, not on top-2 membership
+
+Amendment 14 admitted a near-tie divergence only if the emitted token was one of
+the reference's top-2. Blocker 4c is the measured row that rule cannot express.
+At row 109 of the varied fixture, with the reference teacher-forced on the
+candidate's own prefix:
+
+```
+reference top-2 [268, 85]  logits [14.625, 13.875]
+candidate argmax 1972,     candidate logits [14.5, 13.9375]
+```
+
+Three tokens inside 0.75 logits at a row whose top-1 is 14.625 -- some 7 logits
+below this model's typical confident top-1 of 21-26. The row IS a near tie by
+Amendment 14's own predicate; it failed only because the admissible set has two
+slots and the candidate's token was the reference's #3. The reference cannot rank
+those three either.
+
+So the predicate now tests the EMITTED TOKEN'S OWN reference logit:
+
+```
+admit when  reference_top1_logit - reference_logit(emitted) <= envelope
+```
+
+The reference is teacher-forced on the candidate's emitted prefix, so it already
+knows which token the candidate emitted at each row; it indexes that token out of
+the same width-1 logit row the top-2 readout comes from and reports `top1_logit`,
+`emitted_token` and `emitted_token_logit` per row.
+
+This SUBSUMES the top-2 test -- the #2 token's distance from #1 IS the top-2 gap
+-- and is better shaped in both directions. At a confident row nothing but the
+top-1 qualifies, where the old rule admitted the #2 token at any row whose gap
+was under the envelope. At a flat row exactly those tokens the reference
+genuinely cannot separate qualify, however many there are. The count cap
+(`experimentalDFlashNearTieAdmissionBudgetPerThousand`, 6 slots at the frozen
+window) is unchanged and still bounds the blast radius.
+
+Anti-farming is unchanged in kind: the logits are the REFERENCE's, so a
+submission can neither manufacture a flat row nor learn which positions are flat
+without doing the reference's own work.
+
+One new hazard, closed explicitly. The emitted token ID travels with its logit
+and is re-checked before the logit is used. A pre-generated golden's row was
+teacher-forced on the GOLDEN's chain, where the recorded token IS the top-1 and
+the distance is therefore zero; using that value for a candidate token the row
+never described would admit every divergence for free. Rows carrying no
+emitted-token logit -- every golden written before this amendment -- fall back to
+Amendment 14's top-2 form. Pinned by
+`anEmittedTokenLogitForADifferentTokenAdmitsNothing` and
+`nearTieRowsWithoutAnEmittedTokenLogitFallBackToTheTopTwoTest`.
+
+## 2. Both constants were calibrated against contaminated data
+
+Amendment 6 measured a maximum candidate-vs-reference top-2 logit delta of 3.375
+and used it to derive BOTH the L2 work-binding tolerance (1.5x -> absolute 5.0)
+and the near-tie envelope (2x -> 6.75). That measurement was taken against a
+PRE-GENERATED golden, so it was the sum of candidate-vs-reference drift and the
+golden's own pre-generation drift.
+
+Re-measured under live post-run replay of the candidate's own chain. M5-C,
+frozen 128-token window, 256 comparisons per run, all runs `rc=0` with
+`all_tokens_matched=true`:
+
+| width | fixture | seeds | `max_top2_logit_delta` | p99 | p50 | mean |
+| --- | --- | --- | --- | --- | --- | --- |
+| K=1 | varied + repetitive | - | **0** | 0 | 0 | 0 |
+| K=3 | varied | 7 | 1.500 | 1.375 | 0.188 | 0.280 |
+| K=3 | repetitive | 0 | 2.750 | 1.500 | 0.250 | 0.309 |
+| K=4 | varied | 0, 7 | 1.750, **2.4375** | 1.75 | 0.250 | 0.320 |
+| K=4 | repetitive | 0, 7 | 1.750, 2.000 | 1.688 | 0.250 | 0.319 |
+| K=8 | varied | 7 | 2.625 | 1.750 | 0.250 | 0.386 |
+| K=8 | repetitive | 0 | 3.250 | 2.125 | 0.188 | 0.365 |
+
+Amendment 15 reported 0 / 1.75 from two runs at one seed. Across seeds and
+widths the honest maximum is higher than that, and the shape of the table is the
+real finding: **the K=1 control is exactly zero** -- at width 1 the candidate
+reproduces the reference's own width-1 walk bit for bit -- and every nonzero
+entry is a block-frame effect that grows with the width. So most of Amendment 6's
+3.375 was indeed the golden's, but what remains is not noise: it is a frame
+effect that reaches 3.25 at K=8 and 2.75 at K=3, the ranked width.
+
+New constants:
+
+- Near-tie envelope: **2 x 2.4375 = 4.875** (was 6.75). The base is the maximum
+  over the widths this recalibration covers (K=1 and K=4, both fixtures, several
+  seeds); the multiplier is unchanged, because reordering two logits still needs
+  a gap below the difference of two per-logit drifts.
+- L2 absolute work-binding tolerance: **4.875** (was 5.0). That is 2x the same
+  live maximum, and simultaneously 1.5x the largest gap observed at ANY width
+  including the off-ranked K=8 diagnostic (3.25) -- the same 1.5x discipline
+  Amendment 6 applied, now against an uncontaminated maximum.
+- Relative tolerance: unchanged at 0.25, which is 1.5x the largest relative gap
+  observed live (0.166).
+
+Neither number may come out of a recalibration looser than the one it replaces,
+and neither does; the test pins that inequality alongside the arithmetic.
+
+Stated rather than hidden: against the RANKED width's worst case (2.75 at K=3)
+the envelope is 1.77x, not the full 2x that 5.5 would give. It is not raised,
+because widening an admission gate is the move this document exists to prevent
+and because every near-tie row observed to date has a reference distance under 1
+logit. A future honest run rejected at a row whose distance falls between 4.875
+and 5.5 would be the evidence that justifies the wider number.
+
+## Measured after both changes (M5-C, live replay, `--tokens 128`)
+
+| run | before | after |
+| --- | --- | --- |
+| varied, K=4, seed 7 | `tokenNotAdmissible` at step 109 | **pass**: 126 exact + 2 near-tie, 0 residual |
+| varied, K=1 | pass, 128 exact | pass, 128 exact |
+| repetitive, K=4 | pass, 128 exact | pass, 128 exact |
+| repetitive, K=1 | pass, 128 exact | pass, 128 exact |
+
+The varied K=4 leg is what Blocker 4c was blocking: it now completes the frozen
+window, so there is finally a matched varied-prompt pair. It is a SLOWDOWN --
+0.0226 s/token at K=4 against 0.0190 at K=1, a paired ratio of 0.84 -- which is
+consistent with the finding recorded at `3da0323`: block decode wins on
+degenerate self-continuation (0.0169 vs 0.0189, ratio 1.12) and loses on real
+text, where the drafter's acceptance rate falls to 0.69.
+
+## Negative control
+
+A worker patched to emit one token it did not compute on the first block, keeping
+its per-row readouts, `declaredRows`, accepted/rejected counts and KV-offset
+ledger honest and self-consistent -- and keeping its echoed prefix consistent, so
+the parent's own echo check cannot be what catches it -- is still rejected with
+`tokenNotAdmissible` at both K=1 and K=4 after the widened admission rule. The
+envelope is what does that work: a fabricated token is not a token the reference
+prices within 4.875 of its own top-1.

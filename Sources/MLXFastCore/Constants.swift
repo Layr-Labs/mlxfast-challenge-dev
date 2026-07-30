@@ -213,24 +213,49 @@ public enum MLXFastConstants {
     // cap would be spendable by a cheating submission.
     public static let experimentalDFlashResidualDivergenceBudgetPerThousand = 5
 
-    /// Top-2 gap, in logits, below which the REFERENCE's own ordering is not a
-    /// fact about the model. Derived rather than guessed: the L2 work-binding
-    /// calibration measured a maximum candidate-vs-reference logit delta of 3.375
-    /// across 352 long-context comparisons (contract Amendment 6). Reordering
-    /// top-1 and top-2 needs `gap < |e1 - e2|`, which is bounded by twice that
-    /// per-logit drift, so the complete envelope is 2 x 3.375 = 6.75.
+    /// Logit distance below the REFERENCE's own top-1 within which the
+    /// reference's ordering is not a fact about the model. A row is admitted as
+    /// a near tie when the reference prices the EMITTED token inside this
+    /// envelope of its own top-1 (contract Amendment 16); the same number
+    /// bounded the top-1/top-2 gap under the Amendment 14 form it replaces.
+    ///
+    /// Derived, and RE-derived, because the first basis was contaminated.
+    /// Amendment 6 measured a maximum candidate-vs-reference top-2 logit delta
+    /// of 3.375 and 2 x 3.375 = 6.75 was the envelope -- but that statistic was
+    /// taken against a PRE-GENERATED golden, so it folded golden
+    /// pre-generation drift into what was supposed to be build-to-build drift.
+    /// Under the live post-run replay of the candidate's own chain
+    /// (Amendment 15's split) the same statistic drops. Measured on M5-C at the
+    /// frozen 128-token window, live replay, both fixtures, several schedule
+    /// seeds:
+    ///
+    ///     K=1 (serial control)   0        (bit-identical to the reference walk)
+    ///     K=4                    1.75 .. 2.4375
+    ///
+    /// So the envelope is 2 x 2.4375 = **4.875**: reordering top-1 and top-2
+    /// needs `gap < |e1 - e2|`, which is bounded by twice the per-logit drift.
+    ///
+    /// Scope, stated rather than hidden. The same sweep measured 1.5 .. 2.75 at
+    /// K=3 (the ranked width) and 2.625 .. 3.25 at the off-ranked K=8
+    /// diagnostic, so against the ranked-width worst case 4.875 is 1.77x rather
+    /// than the full 2x. It is NOT raised to 5.5 to buy that back: widening an
+    /// admission gate is the move this contract exists to prevent, and every
+    /// near-tie row observed to date has a reference distance under 1 logit --
+    /// far below either candidate value. If a future honest run is rejected at a
+    /// row whose distance falls between 4.875 and 5.5, THAT is the evidence that
+    /// would justify the wider number.
     ///
     /// Rows inside it are admitted WITHOUT spending the residual budget, because a
     /// coin-flip the reference cannot break is not evidence about the candidate.
-    /// Measured density: 3 such rows per 128 positions on varied prose, 0 per 128
-    /// on the degenerate self-continuation fixtures -- which is precisely why the
-    /// old single-slot budget survived every test until real text was run
+    /// Measured density: 2-3 such rows per 128 positions on varied prose, 0 per
+    /// 128 on the degenerate self-continuation fixtures -- which is precisely why
+    /// the old single-slot budget survived every test until real text was run
     /// (Amendment 10).
     ///
-    /// Note this cannot be gamed: the gap belongs to the reference's own logits,
-    /// so a submission can neither manufacture near-tie rows nor predict which
+    /// Note this cannot be gamed: the logits belong to the reference, so a
+    /// submission can neither manufacture near-tie rows nor predict which
     /// positions are near-ties without doing the reference's work.
-    public static let experimentalDFlashNearTieLogitEnvelope = 6.75
+    public static let experimentalDFlashNearTieLogitEnvelope = 4.875
 
     /// Cap on near-tie admissions, as a rate per thousand scored tokens. 40 gives
     /// 6 slots at the frozen 128-token window against a measured need of 3, i.e.

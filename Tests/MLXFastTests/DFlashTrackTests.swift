@@ -678,14 +678,39 @@ struct DFlashNearTieAdmissionTests {
         #expect(v.residualDivergenceCount == 0)
     }
 
-    /// The envelope is derived, not guessed: twice the maximum candidate-vs-
-    /// reference logit delta the L2 calibration measured (3.375, Amendment 6),
-    /// because reordering top-1 and top-2 needs a gap below the DIFFERENCE of two
-    /// per-logit drifts. Pinned so a future edit has to restate the derivation.
+    /// The envelope is derived, not guessed, and its basis was re-taken once the
+    /// contaminated one was found (Amendment 16).
+    ///
+    /// Amendment 6 measured a maximum candidate-vs-reference top-2 logit delta of
+    /// 3.375 against a PRE-GENERATED golden and set the envelope to 2 x 3.375 =
+    /// 6.75. That statistic was the sum of candidate-vs-reference drift and the
+    /// golden's own pre-generation drift. Under the live post-run replay of the
+    /// candidate's own chain the same statistic is 0 at K=1 -- the serial control
+    /// is bit-identical to the reference's width-1 walk -- and at most 2.4375 at
+    /// K=4 across both fixtures and several schedule seeds. Reordering top-1 and
+    /// top-2 needs a gap below the DIFFERENCE of two per-logit drifts, so the
+    /// envelope is 2 x 2.4375 = 4.875.
+    ///
+    /// The L2 absolute tolerance is re-anchored on the same live maximum: 2x it,
+    /// which is also 1.5x the largest gap seen at ANY width (3.25 at the
+    /// off-ranked K=8) and strictly below the 5.0 it replaces. Pinned together
+    /// so a future edit has to restate the derivation rather than nudge a number.
     @Test
     func nearTieEnvelopeIsTwiceTheMeasuredWorkBindingDrift() {
-        #expect(MLXFastConstants.experimentalDFlashNearTieLogitEnvelope == 6.75)
-        // And the cap leaves headroom over the measured density of 3 near-tie
+        let liveMaximum = 2.4375
+        #expect(
+            MLXFastConstants.experimentalDFlashNearTieLogitEnvelope
+                == 2 * liveMaximum
+        )
+        #expect(MLXFastConstants.experimentalDFlashNearTieLogitEnvelope == 4.875)
+        // Neither constant may come out of a recalibration looser than what it
+        // replaced: the measured basis shrank, so the gates must not widen.
+        #expect(MLXFastConstants.experimentalDFlashNearTieLogitEnvelope < 6.75)
+        let tolerance = DFlashWorkBindingTolerance()
+        #expect(tolerance.absolute == 2 * liveMaximum)
+        #expect(tolerance.absolute < 5.0)
+        #expect(tolerance.relative == 0.25)
+        // And the cap leaves headroom over the measured density of 2-3 near-tie
         // rows per 128 positions on varied prose.
         let budget =
             (128 * MLXFastConstants
