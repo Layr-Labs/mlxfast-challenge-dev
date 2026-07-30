@@ -788,6 +788,13 @@ struct RuntimeWorkerRequest: Codable {
     let startOffset: Int?
     let rowCount: Int?
     let declaredBlockWidth: Int?
+    // How much of `prefixTokens` is the SEED, i.e. the only span the candidate
+    // ever bulk-prefills. The reference needs it to build the width-1 frame the
+    // way the candidate does -- one bulk forward over the seed, then one
+    // single-token forward per position after it. Without it the reference can
+    // only guess, and guessing `prefixTokens[0 ..< start_offset]` is the frame
+    // bug this field exists to remove.
+    let seedTokenCount: Int?
 
     init(
         id: Int,
@@ -802,7 +809,8 @@ struct RuntimeWorkerRequest: Codable {
         prefixTokens: [Int]? = nil,
         startOffset: Int? = nil,
         rowCount: Int? = nil,
-        declaredBlockWidth: Int? = nil
+        declaredBlockWidth: Int? = nil,
+        seedTokenCount: Int? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -817,6 +825,7 @@ struct RuntimeWorkerRequest: Codable {
         self.startOffset = startOffset
         self.rowCount = rowCount
         self.declaredBlockWidth = declaredBlockWidth
+        self.seedTokenCount = seedTokenCount
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -868,6 +877,10 @@ struct RuntimeWorkerRequest: Codable {
             Int.self,
             forKey: .declaredBlockWidth
         )
+        seedTokenCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .seedTokenCount
+        )
     }
 
     func encode(to encoder: Swift.Encoder) throws {
@@ -888,6 +901,7 @@ struct RuntimeWorkerRequest: Codable {
             declaredBlockWidth,
             forKey: .declaredBlockWidth
         )
+        try container.encodeIfPresent(seedTokenCount, forKey: .seedTokenCount)
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -908,6 +922,7 @@ struct RuntimeWorkerRequest: Codable {
         case startOffset = "start_offset"
         case rowCount = "count"
         case declaredBlockWidth = "declared_block_width"
+        case seedTokenCount = "seed_token_count"
     }
 }
 
@@ -990,6 +1005,12 @@ struct RuntimeWorkerResponse: Codable {
     let referenceBlockArgmax: [Int]?
     let referenceTop2Tokens: [[Int]]?
     let referenceTop2Logits: [[Double]]?
+    // Every block width the reference replayed for these rows, ascending, and
+    // the argmax each one produced. One request covers all of them so the
+    // reference can branch each frame off the SAME continuous cache without
+    // rewinding, which is what keeps the pass O(n) instead of O(n^2).
+    let referenceFrameWidths: [Int]?
+    let referenceFrameArgmax: [[Int]]?
 
     init(
         id: Int,
@@ -1025,7 +1046,9 @@ struct RuntimeWorkerResponse: Codable {
         referenceK1Argmax: [Int]? = nil,
         referenceBlockArgmax: [Int]? = nil,
         referenceTop2Tokens: [[Int]]? = nil,
-        referenceTop2Logits: [[Double]]? = nil
+        referenceTop2Logits: [[Double]]? = nil,
+        referenceFrameWidths: [Int]? = nil,
+        referenceFrameArgmax: [[Int]]? = nil
     ) {
         self.id = id
         self.nonce = nonce
@@ -1061,6 +1084,8 @@ struct RuntimeWorkerResponse: Codable {
         self.referenceBlockArgmax = referenceBlockArgmax
         self.referenceTop2Tokens = referenceTop2Tokens
         self.referenceTop2Logits = referenceTop2Logits
+        self.referenceFrameWidths = referenceFrameWidths
+        self.referenceFrameArgmax = referenceFrameArgmax
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -1197,6 +1222,14 @@ struct RuntimeWorkerResponse: Codable {
             [[Double]].self,
             forKey: .referenceTop2Logits
         )
+        referenceFrameWidths = try container.decodeIfPresent(
+            [Int].self,
+            forKey: .referenceFrameWidths
+        )
+        referenceFrameArgmax = try container.decodeIfPresent(
+            [[Int]].self,
+            forKey: .referenceFrameArgmax
+        )
     }
 
     func encode(to encoder: Swift.Encoder) throws {
@@ -1301,6 +1334,14 @@ struct RuntimeWorkerResponse: Codable {
             referenceTop2Logits,
             forKey: .referenceTop2Logits
         )
+        try container.encodeIfPresent(
+            referenceFrameWidths,
+            forKey: .referenceFrameWidths
+        )
+        try container.encodeIfPresent(
+            referenceFrameArgmax,
+            forKey: .referenceFrameArgmax
+        )
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -1338,6 +1379,8 @@ struct RuntimeWorkerResponse: Codable {
         case referenceBlockArgmax = "reference_block_argmax"
         case referenceTop2Tokens = "reference_top2_tokens"
         case referenceTop2Logits = "reference_top2_logits"
+        case referenceFrameWidths = "reference_frame_widths"
+        case referenceFrameArgmax = "reference_frame_argmax"
     }
 }
 
@@ -2020,22 +2063,45 @@ final class RuntimeWorkerClient {
         try send(kind: "dflash_phase_diagnostics")
     }
 
+    /// Reference-side seed prefill (contract layer L1).
+    ///
+    /// Establishes the run's seed token in the candidate's own frame -- one bulk
+    /// forward over the whole seed -- and leaves the reference's continuous
+    /// width-1 frame positioned at the end of the seed, so the first row request
+    /// is a plain continuation rather than a rebuild.
+    func dflashReferencePrefill(
+        seedTokens: [Int]
+    ) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "dflash_reference_prefill",
+            seedTokens: seedTokens
+        )
+    }
+
     /// Reference-side row request (contract layer L1). Only ever sent to a
     /// worker spawned from the PINNED BASELINE tree over organizer weights, and
     /// only after the timed window: the candidate is torn down first, so this
     /// kind never reaches submitted code.
+    ///
+    /// `rowCount` is how many positions the width-1 frame walks; `widestFrame`
+    /// is the widest block frame to replay for those same positions. The
+    /// reference answers every width in `rowCount ... widestFrame` from one
+    /// request because each is a branch off the same continuous cache -- asking
+    /// for them separately would rewind the walk and force a re-prefill.
     func dflashReferenceRows(
         prefixTokens: [Int],
+        seedTokenCount: Int,
         startOffset: Int,
         rowCount: Int,
-        declaredBlockWidth: Int
+        widestFrame: Int
     ) throws -> RuntimeWorkerResponse {
         try send(
             kind: "dflash_reference_rows",
             prefixTokens: prefixTokens,
             startOffset: startOffset,
             rowCount: rowCount,
-            declaredBlockWidth: declaredBlockWidth
+            declaredBlockWidth: widestFrame,
+            seedTokenCount: seedTokenCount
         )
     }
 
@@ -2051,7 +2117,8 @@ final class RuntimeWorkerClient {
         prefixTokens: [Int]? = nil,
         startOffset: Int? = nil,
         rowCount: Int? = nil,
-        declaredBlockWidth: Int? = nil
+        declaredBlockWidth: Int? = nil,
+        seedTokenCount: Int? = nil
     ) throws -> RuntimeWorkerResponse {
         guard process.isRunning else {
             throw MLXFastError.invalidInput("runtime worker exited before request \(kind): \(workerExitDiagnostic())")
@@ -2071,7 +2138,8 @@ final class RuntimeWorkerClient {
             prefixTokens: prefixTokens,
             startOffset: startOffset,
             rowCount: rowCount,
-            declaredBlockWidth: declaredBlockWidth
+            declaredBlockWidth: declaredBlockWidth,
+            seedTokenCount: seedTokenCount
         )
         var data = try encoder.encode(request)
         guard data.count <= BufferedFileLineReader.defaultMaximumLineByteCount else {

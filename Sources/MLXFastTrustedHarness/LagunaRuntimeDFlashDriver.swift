@@ -363,6 +363,12 @@ public struct DFlashReferenceGoldenResult {
     public let selfConsistent: Bool
     public let selfConsistencyRowCount: Int
     public let selfConsistencyDetail: String
+    /// Rows whose `sequentialArgmax` disagreed with the emitted token at the
+    /// same index, for a chain the reference generated itself. Must be zero: a
+    /// nonzero count means the reference contradicts its own chain, so the
+    /// admissible sets this golden defines are not the ones a sequential
+    /// decoder lands in. Folded into `selfConsistent`.
+    public let chainRowContradictionCount: Int
     /// Seed length actually used, i.e. after any `--seed-generate` extension.
     public let seedTokenCount: Int
     /// Declared block widths recorded per row, ascending.
@@ -376,6 +382,7 @@ public struct DFlashReferenceGoldenResult {
         selfConsistent: Bool,
         selfConsistencyRowCount: Int,
         selfConsistencyDetail: String,
+        chainRowContradictionCount: Int = 0,
         seedTokenCount: Int = 0,
         recordedFrameWidths: [Int] = [],
         planOutputPath: String? = nil
@@ -385,6 +392,7 @@ public struct DFlashReferenceGoldenResult {
         self.selfConsistent = selfConsistent
         self.selfConsistencyRowCount = selfConsistencyRowCount
         self.selfConsistencyDetail = selfConsistencyDetail
+        self.chainRowContradictionCount = chainRowContradictionCount
         self.seedTokenCount = seedTokenCount
         self.recordedFrameWidths = recordedFrameWidths
         self.planOutputPath = planOutputPath
@@ -400,11 +408,24 @@ extension LagunaRuntime {
     /// `targetWeightsPath` at the pinned tree; this function additionally runs
     /// strictly on its own, after the timed phase, with the candidate gone.
     ///
-    /// R5 self-consistency: one round is replayed twice in the SAME reference
-    /// build and required to be bit-identical. Without that, the admissible sets
-    /// this golden defines are not well defined -- the retired track measured
-    /// reference-vs-reference instability, so the check is mandatory, and a
-    /// failure is an OPERATOR fault rather than a submission fault.
+    /// R5 self-consistency has two halves, and BOTH are mandatory.
+    ///
+    /// First, one round is replayed and required to be bit-identical. The replay
+    /// deliberately targets the first round, whose start offset is behind the
+    /// reference's live walk, so it takes the rebuild-from-scratch path: the
+    /// replay therefore also proves the fallback construction agrees with the
+    /// continuous walk, which is the property that makes a stateful reference
+    /// admissible at all.
+    ///
+    /// Second, when the reference generated the chain itself, every row's
+    /// width-1 argmax must equal the token at that index of the chain. This half
+    /// used to be missing, and its absence is what let goldens ship with
+    /// `reference_self_consistent: true` while `emitted_tokens[i]` disagreed
+    /// with `rows[i].sequential_argmax` -- the reference contradicting itself,
+    /// and with it the honest K=1 serial control being rejected on rows the
+    /// reference's own chain had produced.
+    ///
+    /// Either failure is an OPERATOR fault rather than a submission fault.
     public static func experimentalDFlashReferenceGolden(
         plan: DFlashEmittedPlan,
         chain: DFlashReferenceChainOptions? = nil,
@@ -452,38 +473,59 @@ extension LagunaRuntime {
         // --- optional seed extension (one process, model resident once) ------
         var seedTokens = plan.seedTokens
         if let chain, chain.seedExtensionSteps > 0 {
-            seedTokens += try generateReferenceChain(
+            // Extension tokens are produced the way a decoder produces them:
+            // one bulk forward over the SUPPLIED prompt, then one single-token
+            // forward per position after it. They then become part of the seed
+            // the candidate bulk-prefills, so this span is model-shaped context
+            // for dialling seed length -- every scored row sits after it.
+            let extensionPrefill = try client.dflashReferencePrefill(
+                seedTokens: plan.seedTokens
+            )
+            guard extensionPrefill.ok,
+                  let firstExtensionToken = extensionPrefill.seedToken
+            else {
+                throw MLXFastError.invalidInput(
+                    "DFlash reference seed extension failed its prefill: "
+                        + (extensionPrefill.error ?? "no seed token returned")
+                )
+            }
+            var extended = [firstExtensionToken]
+            extended += try walkReferenceChain(
                 client: client,
-                context: seedTokens,
-                steps: chain.seedExtensionSteps,
+                context: plan.seedTokens + extended,
+                seedTokenCount: plan.seedTokens.count,
+                steps: chain.seedExtensionSteps - 1,
                 label: "seed-generate"
             )
+            seedTokens += extended
         }
 
-        // The seed token is the width-1 argmax with the seed as the whole
-        // context: row 0 fed the seed's last token. Asking the reference for it
-        // avoids trusting any candidate-supplied value.
-        let seedProbe = try client.dflashReferenceRows(
-            prefixTokens: seedTokens,
-            startOffset: seedTokens.count - 1,
-            rowCount: 1,
-            declaredBlockWidth: 1
+        // The seed token is the post-prefill argmax over the WHOLE seed: ONE
+        // bulk forward, argmax of the last row. That is precisely what
+        // `LagunaDFlashBlockSession.begin` computes, so a correct candidate
+        // reproduces it exactly -- where bulk-forwarding all but the last seed
+        // token and then single-stepping it is a different computation that can
+        // disagree at a near tie and fail an honest run at its first check.
+        // Asking the reference for it avoids trusting any candidate-supplied
+        // value, and it primes the reference's continuous width-1 frame at the
+        // end of the seed so the first row request continues the walk.
+        let seedPrefill = try client.dflashReferencePrefill(
+            seedTokens: seedTokens
         )
-        guard seedProbe.ok,
-              let seedArgmax = seedProbe.referenceK1Argmax?.first
-        else {
+        guard seedPrefill.ok, let seedArgmax = seedPrefill.seedToken else {
             throw MLXFastError.invalidInput(
                 "DFlash reference could not establish the seed token: "
-                    + (seedProbe.error ?? "no reference row returned")
+                    + (seedPrefill.error ?? "no seed token returned")
             )
         }
 
         // --- the emitted chain: supplied, or generated by the reference ------
         let emitted: [Int]
         if let chain {
-            emitted = try generateReferenceChain(
+            emitted = try walkReferenceChain(
                 client: client,
                 context: seedTokens + [seedArgmax],
+                seedTokenCount: seedTokens.count,
                 steps: chain.generateTokenCount,
                 label: "generate"
             )
@@ -568,41 +610,46 @@ extension LagunaRuntime {
             // with later emitted tokens rather than the candidate's (unknown)
             // rejected drafts. Kernel tiling can still perturb the last bits of
             // a wider frame, which is what the top-2 tolerance absorbs.
+            //
+            // ONE request covers all of them. Each frame is a `copy()` of the
+            // reference's continuous cache taken at this round boundary, so the
+            // widths are siblings of the width-1 walk rather than a separate
+            // bulk re-prefill -- and asking for them one request at a time would
+            // rewind the walk and force exactly that re-prefill back into
+            // existence, at O(n^2).
             let availableRows = context.count - startOffset
-            let widestFrame = Swift.min(round.blockSize, availableRows)
-            var response: RuntimeWorkerResponse?
-            var frames = [Int: [Int]]()
-            for width in round.count ... Swift.max(round.count, widestFrame) {
-                let framed = try client.dflashReferenceRows(
-                    prefixTokens: context,
-                    startOffset: startOffset,
-                    rowCount: width,
-                    declaredBlockWidth: width
-                )
-                guard framed.ok,
-                      let block = framed.referenceBlockArgmax,
-                      block.count == width
-                else {
-                    throw MLXFastError.invalidInput(
-                        "DFlash reference returned an incomplete width-\(width) "
-                            + "frame: " + (framed.error ?? "shape mismatch")
-                    )
-                }
-                frames[width] = Array(block.prefix(round.count))
-                recordedWidths.insert(width)
-                if width == round.count { response = framed }
-            }
-            guard let response,
+            let widestFrame = Swift.max(
+                round.count,
+                Swift.min(round.blockSize, availableRows)
+            )
+            let response = try client.dflashReferenceRows(
+                prefixTokens: context,
+                seedTokenCount: seedTokens.count,
+                startOffset: startOffset,
+                rowCount: round.count,
+                widestFrame: widestFrame
+            )
+            guard response.ok,
                   let k1 = response.referenceK1Argmax,
                   let top2Tokens = response.referenceTop2Tokens,
                   let top2Logits = response.referenceTop2Logits,
+                  let frameWidths = response.referenceFrameWidths,
+                  let frameArgmax = response.referenceFrameArgmax,
                   k1.count == round.count,
                   top2Tokens.count == round.count,
-                  top2Logits.count == round.count
+                  top2Logits.count == round.count,
+                  frameWidths.count == frameArgmax.count,
+                  frameWidths.contains(round.count),
+                  frameArgmax.allSatisfy({ $0.count == round.count })
             else {
                 throw MLXFastError.invalidInput(
                     "DFlash reference returned an incomplete row batch"
                 )
+            }
+            var frames = [Int: [Int]]()
+            for (width, argmax) in zip(frameWidths, frameArgmax) {
+                frames[width] = argmax
+                recordedWidths.insert(width)
             }
 
             for index in 0 ..< round.count {
@@ -627,7 +674,7 @@ extension LagunaRuntime {
             // Replay the FIRST round: it is the one whose context is shortest,
             // so a determinism failure there is unambiguous.
             if replayRequest == nil {
-                replayRequest = (startOffset, round.count, round.count)
+                replayRequest = (startOffset, round.count, widestFrame)
                 replayExpected = response
             }
             emittedOffset += round.count
@@ -640,9 +687,10 @@ extension LagunaRuntime {
         if let request = replayRequest, let expected = replayExpected {
             let again = try client.dflashReferenceRows(
                 prefixTokens: context,
+                seedTokenCount: seedTokens.count,
                 startOffset: request.offset,
                 rowCount: request.count,
-                declaredBlockWidth: request.width
+                widestFrame: request.width
             )
             selfConsistencyRowCount = request.count
             if !again.ok {
@@ -652,6 +700,11 @@ extension LagunaRuntime {
                 selfConsistencyDetail = "width-1 argmax differed between replays"
             } else if again.referenceBlockArgmax != expected.referenceBlockArgmax {
                 selfConsistencyDetail = "block-frame argmax differed between replays"
+            } else if again.referenceFrameWidths != expected.referenceFrameWidths
+                || again.referenceFrameArgmax != expected.referenceFrameArgmax
+            {
+                selfConsistencyDetail =
+                    "declared-frame argmax differed between replays"
             } else if again.referenceTop2Tokens != expected.referenceTop2Tokens {
                 selfConsistencyDetail = "top-2 token ids differed between replays"
             } else if again.referenceTop2Logits != expected.referenceTop2Logits {
@@ -661,6 +714,33 @@ extension LagunaRuntime {
                 selfConsistencyDetail =
                     "replayed \(request.count) row(s) bit-identically"
             }
+        }
+
+        // --- R5, second half: the rows must reproduce their own chain ---------
+        //
+        // Only meaningful for a chain the REFERENCE generated: a supplied
+        // `emitted` array is the candidate's, and Criterion E exists precisely
+        // because a candidate may legitimately land on a different admissible
+        // token. But when the reference produced the chain by width-1 argmax,
+        // `rows[i].sequentialArgmax` IS that chain, and any disagreement means
+        // the golden's own two halves were computed in different frames.
+        var chainContradictions = [Int]()
+        if chain != nil {
+            for index in 0 ..< Swift.min(emitted.count, goldenRows.count)
+            where goldenRows[index].sequentialArgmax != emitted[index] {
+                chainContradictions.append(index)
+            }
+            if goldenRows.count != emitted.count {
+                chainContradictions.append(Swift.min(goldenRows.count, emitted.count))
+            }
+        }
+        if !chainContradictions.isEmpty {
+            selfConsistent = false
+            selfConsistencyDetail =
+                "replay: \(selfConsistencyDetail); but the reference chain "
+                + "contradicts its own rows at \(chainContradictions.count) of "
+                + "\(emitted.count) position(s), first index "
+                + "\(chainContradictions[0])"
         }
 
         let golden = DFlashReferenceGolden(
@@ -680,24 +760,32 @@ extension LagunaRuntime {
             selfConsistent: selfConsistent,
             selfConsistencyRowCount: selfConsistencyRowCount,
             selfConsistencyDetail: selfConsistencyDetail,
+            chainRowContradictionCount: chainContradictions.count,
             seedTokenCount: seedTokens.count,
             recordedFrameWidths: recordedWidths.sorted(),
             planOutputPath: chain?.planOutputPath
         )
     }
 
-    /// Generate `steps` tokens by sequential width-1 reference argmax.
+    /// Generate `steps` tokens by walking the reference's width-1 frame forward.
     ///
-    /// Every step is its own stateless reference request, so each generated token
-    /// is produced by EXACTLY the computation the golden's own replay uses -- a
-    /// stateful incremental generator would be faster but would generate the
-    /// chain in a different frame than the one it is later checked in, which is
-    /// the class of mismatch this whole contract exists to detect. The cost is
-    /// quadratic in `steps`; that is an operator-side cost outside any timed
-    /// window, paid once per golden.
-    private static func generateReferenceChain(
+    /// `context` is the seed (`seedTokenCount` tokens) followed by the positions
+    /// already walked; step `i` feeds `context.last` and appends the argmax. The
+    /// reference keeps ONE continuously-advanced cache across these requests, so
+    /// every generated token comes out of a genuine one-token decode on the state
+    /// its predecessor left -- the same frame the golden's row replay uses, and
+    /// the same frame a serial decoder runs in.
+    ///
+    /// The previous generator re-prefilled the whole growing prefix on every
+    /// step. That was quadratic, and worse, it generated the chain in a frame
+    /// that no longer matched the one the chain was later checked in the moment
+    /// the prefix passed the seed: bulk-forwarding 517 tokens is not
+    /// bulk-forwarding 512 and single-stepping 5. The visible symptom was a
+    /// golden whose `emitted_tokens` disagreed with its own `sequential_argmax`.
+    private static func walkReferenceChain(
         client: RuntimeWorkerClient,
         context: [Int],
+        seedTokenCount: Int,
         steps: Int,
         label: String
     ) throws -> [Int] {
@@ -708,9 +796,10 @@ extension LagunaRuntime {
         for index in 0 ..< steps {
             let response = try client.dflashReferenceRows(
                 prefixTokens: context,
+                seedTokenCount: seedTokenCount,
                 startOffset: context.count - 1,
                 rowCount: 1,
-                declaredBlockWidth: 1
+                widestFrame: 1
             )
             guard response.ok,
                   let token = response.referenceK1Argmax?.first

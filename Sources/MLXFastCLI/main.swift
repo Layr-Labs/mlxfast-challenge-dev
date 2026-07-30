@@ -1586,6 +1586,8 @@ private enum MLXFastCLI {
                 + " plan_output=\(result.planOutputPath ?? "-") "
                 + "reference_self_consistent=\(result.selfConsistent) "
                 + "replayed_rows=\(result.selfConsistencyRowCount) "
+                + "chain_row_contradictions="
+                + "\(result.chainRowContradictionCount) "
                 + "detail=\(result.selfConsistencyDetail)"
         )
         guard result.selfConsistent else {

@@ -20,6 +20,13 @@ struct ExperimentalDFlashWorkerState {
     var poisoned = false
     var seedTokenCount = 0
     var decodedTokenCount = 0
+    /// Reference-side only. Holds ONE continuously-advanced width-1 cache for
+    /// the whole reference pass, so the frame is built exactly the way the
+    /// candidate builds its own (seed bulk forward, then one single-token
+    /// forward per position) and the pass costs O(n) rather than the O(n^2) a
+    /// per-round bulk re-prefill costs. Created lazily: the candidate worker
+    /// never receives a reference request, so it never allocates this.
+    var referenceSession: LagunaDFlashReference?
 }
 
 /// Strict validation for a DFlash block request.
@@ -46,6 +53,7 @@ func validateExperimentalDFlashBlockRequest(
           request.startOffset == nil,
           request.rowCount == nil,
           request.declaredBlockWidth == nil,
+          request.seedTokenCount == nil,
           let previousToken = request.token,
           previousToken >= 0,
           previousToken < MLXFastConstants.vocabSize,
@@ -317,14 +325,61 @@ extension LagunaRuntime {
                     + session.decodedTokenCount
             )
 
+        case "dflash_reference_prefill":
+            // REFERENCE SIDE ONLY (contract layer L1). Establishes the run's
+            // seed token in the CANDIDATE's frame -- one bulk forward over the
+            // whole seed, argmax of the last row, which is exactly what
+            // `LagunaDFlashBlockSession.begin` computes -- and primes the
+            // continuous width-1 frame at the end of the seed.
+            guard request.token == nil,
+                  request.promptTokens == nil,
+                  request.steps == nil,
+                  request.topK == nil,
+                  request.expectedToken == nil,
+                  request.maxBlockSize == nil,
+                  request.prefixTokens == nil,
+                  request.startOffset == nil,
+                  request.rowCount == nil,
+                  request.declaredBlockWidth == nil,
+                  request.seedTokenCount == nil,
+                  let seedTokens = request.seedTokens,
+                  !seedTokens.isEmpty
+            else {
+                throw MLXFastError.invalidInput(
+                    "DFlash reference-prefill request is malformed or has "
+                        + "cross-kind fields"
+                )
+            }
+            let prefillSession = LagunaDFlashReference(
+                target: session.referenceTarget,
+                targetLayerIds: session.referenceTargetLayerIds
+            )
+            let seedToken = try prefillSession.prefillSeed(seedTokens)
+            state.referenceSession = prefillSession
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                seedToken: seedToken
+            )
+
         case "dflash_reference_rows":
             // REFERENCE SIDE ONLY (contract layer L1). Served by a worker built
             // from the pinned baseline tree over organizer-transformed weights,
-            // strictly after the timed window with the candidate torn down. It
-            // is stateless on purpose: every request rebuilds its own KV cache
-            // from the supplied context, which is what makes the L1
-            // self-consistency replay meaningful -- two identical requests have
-            // no carried state that could explain a difference away.
+            // strictly after the timed window with the candidate torn down.
+            //
+            // Deliberately STATEFUL, against the earlier stateless design. A
+            // stateless request has to reconstruct the prefix somehow, and the
+            // only cheap reconstruction -- one bulk forward over
+            // `prefixTokens[0 ..< startOffset]` -- is not the computation the
+            // candidate performs once `startOffset` passes the seed. The
+            // accumulation order differs, and the sliding-window cache takes a
+            // different code path (`updateConcat` versus `updateInPlace`), so at
+            // a near tie the "sequential" argmax stopped being what a sequential
+            // decoder produces. Keeping one continuously-advanced cache and
+            // walking it forward is both faithful and O(n); determinism is still
+            // provable because an out-of-order replay rebuilds the frame from
+            // scratch with the SAME construction and must agree.
             guard request.token == nil,
                   request.seedTokens == nil,
                   request.promptTokens == nil,
@@ -334,13 +389,16 @@ extension LagunaRuntime {
                   request.maxBlockSize == nil,
                   let prefixTokens = request.prefixTokens,
                   !prefixTokens.isEmpty,
+                  let seedTokenCount = request.seedTokenCount,
+                  seedTokenCount > 0,
+                  seedTokenCount <= prefixTokens.count,
                   let startOffset = request.startOffset,
-                  startOffset >= 0,
+                  startOffset >= seedTokenCount,
                   let rowCount = request.rowCount,
                   rowCount > 0,
-                  let declaredBlockWidth = request.declaredBlockWidth,
-                  declaredBlockWidth >= rowCount,
-                  declaredBlockWidth
+                  let widestFrame = request.declaredBlockWidth,
+                  widestFrame >= rowCount,
+                  widestFrame
                       <= MLXFastConstants.experimentalDFlashMaxBlockSize
             else {
                 throw MLXFastError.invalidInput(
@@ -348,21 +406,33 @@ extension LagunaRuntime {
                         + "cross-kind fields"
                 )
             }
-            let rows = try LagunaDFlashReference.rows(
-                target: session.referenceTarget,
-                targetLayerIds: session.referenceTargetLayerIds,
+            let referenceSession: LagunaDFlashReference
+            if let existing = state.referenceSession {
+                referenceSession = existing
+            } else {
+                referenceSession = LagunaDFlashReference(
+                    target: session.referenceTarget,
+                    targetLayerIds: session.referenceTargetLayerIds
+                )
+                state.referenceSession = referenceSession
+            }
+            let answer = try referenceSession.rows(
                 tokens: prefixTokens,
+                seedTokenCount: seedTokenCount,
                 startOffset: startOffset,
-                count: rowCount
+                count: rowCount,
+                widestFrame: widestFrame
             )
             return RuntimeWorkerResponse(
                 id: request.id,
                 nonce: sessionNonce,
                 ok: true,
-                referenceK1Argmax: rows.map(\.sequentialArgmax),
-                referenceBlockArgmax: rows.map(\.blockArgmax),
-                referenceTop2Tokens: rows.map(\.top2Tokens),
-                referenceTop2Logits: rows.map(\.top2Logits)
+                referenceK1Argmax: answer.rows.map(\.sequentialArgmax),
+                referenceBlockArgmax: answer.rows.map(\.blockArgmax),
+                referenceTop2Tokens: answer.rows.map(\.top2Tokens),
+                referenceTop2Logits: answer.rows.map(\.top2Logits),
+                referenceFrameWidths: answer.frameWidths,
+                referenceFrameArgmax: answer.frameArgmax
             )
 
         default:
