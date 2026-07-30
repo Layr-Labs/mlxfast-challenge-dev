@@ -204,13 +204,26 @@ public struct DFlashWorkBindingTolerance: Sendable {
         self.relative = relative
     }
 
+    /// BOTH arms must hold. This was an OR, and the OR is what made L2
+    /// decorative: an adversarial verifier that ran one lm_head instead of K and
+    /// copied that row's readouts into every other row produced a
+    /// `max_top2_logit_delta` of 5.125 -- OVER the 4.875 absolute arm -- and still
+    /// passed the frozen window at the ranked block width, because
+    /// 5.125 / 23.75 = 0.216 slipped under the 0.25 relative arm. At this model's
+    /// confident rows (top-1 logits 21-29) the relative arm silently raised the
+    /// effective absolute tolerance to 5.25-7.25, so the carefully re-derived
+    /// 4.875 was never the binding constraint where it mattered.
+    ///
+    /// With AND the constraint is the MINIMUM of the two arms: absolute binds at
+    /// large magnitudes, relative binds at small ones. Honest runs are unaffected
+    /// -- measured honest maxima are 2.75 absolute and 0.166 relative, inside both
+    /// arms with margin.
     public func matches(candidate: Double, reference: Double) -> Bool {
         let delta = abs(candidate - reference)
-        if delta <= absolute {
-            return true
-        }
+        guard delta <= absolute else { return false }
         let scale = Swift.max(abs(candidate), abs(reference))
-        return scale > 0 && delta / scale <= relative
+        guard scale > 0 else { return delta == 0 }
+        return delta / scale <= relative
     }
 }
 
@@ -464,6 +477,42 @@ public final class LagunaDFlashBlockValidator {
                     + "\(round.perRowTop2Tokens.count) of \(round.declaredRows) "
                     + "declared rows"
             )
+        }
+
+        // SELF-CONSISTENCY OF THE READOUTS, needing no reference at all.
+        //
+        // Row j's logits are what produced emitted token j, so the candidate's own
+        // reported top-1 for row j must BE emitted token j. Nothing checked this,
+        // and `perRowTop2Tokens` was otherwise only length-checked and then
+        // discarded -- `score()` reads only the logits.
+        //
+        // That gap is what let the measured surviving cheat work: a verifier that
+        // ran ONE lm_head instead of K, blind-accepted every draft, and copied the
+        // one computed row's readouts into all the others. The copied rows reported
+        // the anchor row's token ids while the emitted tokens were the drafter's,
+        // so this check fires on the first fabricated row -- structurally, with no
+        // tolerance to slip through and no reference round-trip to pay for.
+        //
+        // Only the emitted rows are checkable this way: a rejected draft row has no
+        // emitted token to compare against, which is why L2's reference-side
+        // coverage of the rejected tail is still an open gap.
+        for (index, token) in round.tokens.enumerated() {
+            let reported = round.perRowTop2Tokens[index]
+            guard let reportedTop1 = reported.first else {
+                throw DFlashContractViolation(
+                    kind: .workBindingMissing,
+                    step: step + index,
+                    detail: "row \(index) reported no top-1 token"
+                )
+            }
+            guard reportedTop1 == token else {
+                throw DFlashContractViolation(
+                    kind: .workBindingLogitMismatch,
+                    step: step + index,
+                    detail: "row \(index) emitted a token that is not its own "
+                        + "reported top-1"
+                )
+            }
         }
 
         journal.append(round)

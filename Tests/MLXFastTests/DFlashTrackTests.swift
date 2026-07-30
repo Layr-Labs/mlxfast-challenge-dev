@@ -718,3 +718,112 @@ struct DFlashNearTieAdmissionTests {
         #expect(budget >= 6)
     }
 }
+
+// MARK: - What the surviving cheat exploited (contract Amendment 18)
+
+/// A red-team run measured a verifier that ran ONE lm_head instead of K,
+/// blind-accepted every draft, and copied the one computed row's work-binding
+/// readouts into every other row. It passed the frozen window at the ranked block
+/// width with a `max_top2_logit_delta` of 5.125 -- over the 4.875 absolute arm --
+/// because the tolerance was an OR and the relative arm rescued it. These pin both
+/// halves of the fix.
+@Suite
+struct DFlashWorkBindingHardeningTests {
+    private struct FixedRowOracle: DFlashReferenceOracle {
+        let row: DFlashReferenceRow
+        func referenceRows(
+            emittedPrefix: [Int], startOffset: Int, count: Int,
+            declaredBlockWidth: Int
+        ) throws -> [DFlashReferenceRow] {
+            Array(repeating: row, count: count)
+        }
+    }
+
+    private func validator() -> LagunaDFlashBlockValidator {
+        LagunaDFlashBlockValidator(
+            oracle: FixedRowOracle(
+                row: DFlashReferenceRow(
+                    sequentialArgmax: 100,
+                    declaredFrameArgmax: 100,
+                    top2Tokens: [100, 200],
+                    top2Logits: [23.75, 20.0]
+                )
+            ),
+            seedTokenCount: 8,
+            totalTokenCount: 128
+        )
+    }
+
+    /// The exact numbers the surviving cheat produced: 5.125 absolute against a
+    /// 4.875 arm, but 5.125 / 23.75 = 0.216 against a 0.25 relative arm. Under an
+    /// OR this matched. It must not.
+    @Test
+    func theExactDeltaThatDefeatedTheOrIsNowRejected() {
+        let tolerance = DFlashWorkBindingTolerance()
+        let reference = 23.75
+        let candidate = reference - 5.125
+        #expect(abs(candidate - reference) > tolerance.absolute)
+        #expect(
+            abs(candidate - reference) / reference < tolerance.relative,
+            "the relative arm alone would still admit this, which is the point"
+        )
+        #expect(
+            tolerance.matches(candidate: candidate, reference: reference) == false,
+            "both arms must hold; an OR is what made L2 decorative"
+        )
+    }
+
+    /// Honest drift stays admissible: the measured honest maxima are 2.75
+    /// absolute and 0.166 relative, inside both arms.
+    @Test
+    func measuredHonestDriftStillPassesBothArms() {
+        let tolerance = DFlashWorkBindingTolerance()
+        #expect(tolerance.matches(candidate: 23.75 - 2.75, reference: 23.75))
+        // Small magnitudes: the relative arm is the binding one there.
+        #expect(tolerance.matches(candidate: 4.0, reference: 4.4))
+        #expect(tolerance.matches(candidate: 1.0, reference: 4.0) == false)
+    }
+
+    /// Row j's logits produced emitted token j, so the candidate's own reported
+    /// top-1 for row j must be that token. The surviving cheat's copied rows
+    /// reported the anchor row's ids while emitting the drafter's tokens.
+    @Test
+    func aRowWhoseReportedTopOneIsNotItsEmittedTokenIsRejected() {
+        let round = DFlashObservedRound(
+            requestedBlockSize: 3,
+            tokens: [100, 200],
+            declaredRows: 3,
+            // Row 1 reports the row-0 anchor's ids -- the fabrication signature.
+            perRowTop2Tokens: [[100, 7], [100, 7], [100, 7]],
+            perRowTop2Logits: [[23.75, 20.0], [23.75, 20.0], [23.75, 20.0]],
+            acceptedDraftCount: 1,
+            rejectedDraftCount: 1,
+            targetCacheOffset: 10,
+            latencySeconds: 0.02
+        )
+        var thrown: DFlashContractViolation?
+        do { try validator().acceptStructural(round: round) }
+        catch let v as DFlashContractViolation { thrown = v }
+        catch {}
+        #expect(thrown?.kind == .workBindingLogitMismatch)
+        #expect(thrown?.step == 1, "must fire on the first fabricated row")
+    }
+
+    /// The same round with honest per-row ids passes the structural half, so the
+    /// check above is specific to the fabrication and not to the shape.
+    @Test
+    func honestPerRowTopOnesPassTheStructuralHalf() throws {
+        let round = DFlashObservedRound(
+            requestedBlockSize: 3,
+            tokens: [100, 200],
+            declaredRows: 3,
+            perRowTop2Tokens: [[100, 7], [200, 9], [301, 11]],
+            perRowTop2Logits: [[23.75, 20.0], [22.0, 19.0], [21.5, 18.0]],
+            acceptedDraftCount: 1,
+            rejectedDraftCount: 1,
+            targetCacheOffset: 10,
+            latencySeconds: 0.02
+        )
+        try validator().acceptStructural(round: round)
+    }
+}

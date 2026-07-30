@@ -1910,3 +1910,96 @@ scoring SHAPE lives in the box wrapper, not in the CLI, and the wrapper had only
 ever been exercised as far as `--preflight-only`. The lesson generalises: a
 measurement harness and the thing that consumes its numbers can disagree about
 what is being compared, and reading the consumer is not optional.
+
+# Amendment 18 (2026-07-30): L2 was decorative, and the OR was why
+
+Amendment 6 section 3 recorded that no degraded verifier had ever been run, so
+"the tolerance is tight enough to catch cheapening" was not a measured claim. It
+has now been run. The claim is false, and the cause was not the constant everyone
+kept re-deriving.
+
+## What was measured
+
+Three adversarial verifiers, on the repetitive fixture (where honest draft
+acceptance is 100%, so blind-accepting is token-identical to honest output and L1
+cannot be what catches anything), against the honest trusted parent with the
+compiled-in tolerance untouched:
+
+| cheat | width | rejected? | `max_top2_logit_delta` | vs 4.875 |
+|---|---|---|---|---|
+| **A** blind-accept all drafts, one lm_head, copy that row's readouts | **K=3 (ranked)** | **NO, rc=0** | **5.125** | **+0.25 OVER, and it passed** |
+| A, same | K=4 | yes | ~5.0-5.3 | died on 1 comparison of 256 |
+| **C** reuse row-0 hidden for every row's lm_head | K=4 | **NO, rc=0** | **6.5** | **+1.625 OVER (33%), and it passed** |
+| B truncate trunk to 10 of 40 layers | K=4 | yes, at step 0 | 14.625 (p50 10.375) | +9.75 |
+
+Cheat A at the ranked width passed the frozen 128-token window with rc=0,
+`all_tokens_matched=true`, 128/128 tokens bit-exact against the live reference,
+zero near-tie and zero residual budget spent. Its prize, measured A-B-A on the
+same box: 0.017387 / honest 0.018008 / 0.017353 s/token, a **1.036x** decode
+speedup, roughly **+2.7% on `decode_speedup^0.75`** — from an unoptimised cheat,
+so that is a floor.
+
+## The cause
+
+`DFlashWorkBindingTolerance.matches` was an **OR**: within the absolute arm OR
+within the relative arm. At this model's confident rows (top-1 logits 21-29) the
+0.25 relative arm silently raised the effective absolute tolerance to **5.25-7.25**,
+so the 4.875 that Amendments 6, 15 and 16 successively re-derived was never the
+binding constraint where it mattered. Cheat A breached the absolute arm and passed
+anyway; Cheat C breached it by 33% and passed.
+
+The K=4 rejection of Cheat A is luck, not evidence of a working gate. A and C are
+the same fabrication differing only in which row is the anchor; their delta
+distributions are statistically identical (p50 0.75-0.81, mean 1.2) and A at K=4
+died on a single comparison out of 256 whose relative ratio landed near 0.25
+instead of 0.23. Detection was a tail lottery: fabricated rows sit at p50 1.25,
+so ~99% of comparisons never reached the absolute arm at all.
+
+Amendment 6 section 3's specific hope — that L2 "remains a real constraint on a
+verifier that skips the per-row lm_head entirely (it then has no values to report
+at all)" — is measured false. The values are trivially available by copying the one
+row you did compute, and copying was inside tolerance.
+
+## Three structural gaps found in the same path
+
+1. **The reported top-2 token IDS were never compared to anything.** `score()` read
+   only `perRowTop2Logits`; `perRowTop2Tokens` was length-checked and discarded.
+2. **L2 covered only the emitted rows, not every declared row.** The reference
+   request asks for `round.tokens.count` rows, so the rejected tail — which the
+   contract text insists must carry readouts — was compared to nothing.
+3. **The K-wide trunk is forced by token correctness, not by any gate.** KV rows
+   must exist at the right positions, and the drafter's cross-attention context
+   must be exactly as wide as the emitted count. So the only work a cheater can
+   drop is the per-row lm_head, argmax and accept walk — exactly what L2 exists to
+   bind.
+
+## The fix
+
+Two changes, one numerical and one structural:
+
+* **Both tolerance arms must now hold.** AND makes the constraint the minimum of
+  the two: absolute binds at large magnitudes, relative at small ones. Honest runs
+  are unaffected (measured honest maxima 2.75 absolute, 0.166 relative). This
+  alone rejects both surviving cheats: 5.125 and 6.5 are over 4.875.
+* **A row's emitted token must be that row's own reported top-1.** Row j's logits
+  are what produced emitted token j, so this needs no reference, no tolerance and
+  no round-trip — and it fires on the first fabricated row, because a copied
+  readout carries the anchor row's ids while the emitted token is the drafter's.
+  This closes gap 1 for the emitted rows.
+
+Four tests pin them, including the exact 5.125-against-23.75 pair that defeated
+the OR.
+
+## Still open
+
+Gap 2 needs the parent to journal the DRAFT tokens so the reference can price the
+rejected tail; that is the same protocol addition L5's provenance detector wants,
+and it is not done. An aggregate gate on `max_top2_logit_delta` against a
+calibrated honest envelope is also worth having as defence in depth — 5.125
+against an honest 2.75 was sitting in the published report the whole time and
+nothing looked at it.
+
+The wider lesson, and it is the same one Amendment 8 named: an instrument nobody
+has attacked is not a gate. L2 survived seventeen amendments of scrutiny, three
+independent re-derivations of its constant, and every honest test, because none of
+those was an adversary.
