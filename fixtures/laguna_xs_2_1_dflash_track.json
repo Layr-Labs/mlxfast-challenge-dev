@@ -197,7 +197,7 @@
   "protocol": {
     "name": "trusted_dflash_block_v1",
     "maximum_block_size": 16,
-    "maximum_block_size_note": "Raised from 4 (Gemma-MTP assistant era) to 16: the DFlash draft model's config block_size is 16 and it drafts a whole masked block in one forward. Measured on M5 (dev-repo binary, 2026-07-30): peak decode speedup at K=8 (1.60x), K=16 slightly lower (1.53x); K remains a runtime choice bounded by this maximum.",
+    "maximum_block_size_note": "Raised from 4 (Gemma-MTP assistant era) to 16: the DFlash draft model's config block_size is 16 and it drafts a whole masked block in one forward. SUPERSEDED MEASUREMENT: an earlier note here claimed peak decode speedup at K=8 (1.60x) with K=16 at 1.53x. Those came from short and/or self-generated prompts and do NOT reproduce at the frozen window. Measured at a 512-token seed over 128 decode steps with matched token counts on both sides: on varied prose, draft acceptance is 69% and K=4 is 0.840x, i.e. SLOWER than serial; on a degenerate greedy self-continuation (122 distinct tokens in 512) acceptance is ~100% and K=4 is 1.117x. A verify row costs only ~10% less than a standalone serial step, so break-even needs draft acceptance above ~92%. K remains a runtime choice bounded by this maximum, but do not read the maximum as a recommendation.",
     "decode_tokens": 512,
     "maximum_decode_tokens": 1536,
     "parent_oracle_required": true,
