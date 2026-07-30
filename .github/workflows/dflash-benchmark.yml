@@ -164,13 +164,15 @@ jobs:
       # serial decode does not rank) and applies to the ratio-of-means
       # aggregate over the accepted pairs.
       #
-      # Block size 8, not the retired MTP track's 4: the DFlash drafter is
-      # trained for block_size 16 and drafts a whole masked block in ONE
-      # forward, and the measured sweep on this silicon (M5-C, 2026-07-30,
-      # 6 prompts) peaks at K=8 -- 1.86x vs 1.56x at K=4 and 1.80x at K=16,
-      # with mean accepted drafts 3.55/7. Higher K keeps raising acceptance
-      # (4.10/15 at K=16) but pays more wasted verify rows per round.
-      MLXFAST_DFLASH_BLOCK_SIZE: "8"
+      # Block size 3, derived from LONG-CONTEXT measurement -- not from the
+      # short-prompt sweep that originally suggested 8. Measured on M5-C with a
+      # 1755-token prompt (64 decode tokens, base 81.5 tok/s):
+      #   K=2 0.82x | K=3 1.09x | K=4 1.06x | K=6 0.95x | K=8 0.92x | K=16 0.79x
+      # Acceptance saturates at ~1.33 accepted drafts for every K >= 6, so larger
+      # blocks only add wasted verify rows. K=8 -- the short-prompt optimum, where
+      # it reached 1.86x -- sits BELOW the 1.0 floor at realistic context. See
+      # docs/dflash-track-correctness-contract.md Amendment 5.
+      MLXFAST_DFLASH_BLOCK_SIZE: "3"
       MLXFAST_DFLASH_DECODE_TOKENS: "512"
       MLXFAST_DFLASH_CORRECTNESS_TOKENS: "512"
       MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: "1.0"

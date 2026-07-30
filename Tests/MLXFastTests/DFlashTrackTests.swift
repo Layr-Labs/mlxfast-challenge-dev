@@ -297,7 +297,7 @@ struct DFlashTrackTests {
         // must not silently revert to the retired MTP track's 4.
         let maxBlock = try #require(protocolBlock["maximum_block_size"] as? Int)
         #expect(maxBlock == 16)
-        #expect(workflow.contains("MLXFAST_DFLASH_BLOCK_SIZE: \"8\""))
+        #expect(workflow.contains("MLXFAST_DFLASH_BLOCK_SIZE: \"3\""))
     }
 
     // CONTRACT LAYER L6 (anti-lottery). A frozen timed prompt makes a failed

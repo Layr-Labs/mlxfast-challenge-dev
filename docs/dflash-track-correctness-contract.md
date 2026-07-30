@@ -653,14 +653,50 @@ Consequences that the track cannot be enabled without resolving:
    0.68x), consistent with paying snapshot cost, though the two runs also differ
    in target directory and are single samples; (c) block-shaped attention over a
    wrapped ring may hit a slower kernel path than the 1-row decode.
-4. **Decide the block size from long-context data, not the short sweep.** K=8
-   was chosen because it peaked at 1.86x on short prompts. At low acceptance a
-   smaller K wastes fewer verify rows, so the ranked default may well be lower.
+4. **Decide the block size from long-context data, not the short sweep.**
 
-Until (3) is isolated and a long-context configuration clears 1.0 with margin,
-`official_scoring_enabled` must stay false regardless of how complete the harness
-is. The harness being correct and the track being viable are separate questions,
-and this amendment records that the second one is currently unanswered.
+## RESOLVED (same day): the track IS viable, but only at K=3
+
+A K sweep at the same 1755-token prompt (64 decode tokens, base 81.5 tok/s)
+answers the viability question:
+
+| K | 2 | **3** | **4** | 6 | 8 | 16 |
+|---|---|---|---|---|---|---|
+| dflash tok/s | 66.7 | **89.2** | **86.1** | 77.4 | 74.7 | 64.6 |
+| speedup | 0.82x | **1.09x** | **1.06x** | 0.95x | 0.92x | 0.79x |
+| accepted | 0.62/1 | 1.17/2 | 1.25/3 | 1.33/5 | 1.33/7 | 1.33/15 |
+
+Findings:
+
+- **K=3 clears the floor at 1.09x**; K=4 marginally at 1.06x. Everything else,
+  including the short-prompt optimum K=8, is BELOW 1.0.
+- **Acceptance saturates at ~1.33 accepted drafts for every K >= 6.** The drafter
+  reliably gets only about one and a third tokens right at this context length,
+  so wider blocks buy nothing and pay for more verify rows. That is the whole
+  explanation for the ranking above, and it is why the short-prompt sweep (which
+  peaked at K=8 with 3.55/7 accepted) inverts here.
+- The ranked default is therefore **3**, set in the workflow with this table as
+  its recorded basis.
+
+Two consequences the operator must weigh before enabling:
+
+1. **The margin is thin against a hard floor.** 1.09x sits 9% above a
+   pass/fail boundary, and the paired protocol tolerates roughly 0.6% run-to-run
+   variation, so the headroom is real but not generous. Consider whether the
+   floor should be expressed with an explicit tolerance for this track.
+2. **The score measures block-path efficiency only.** Both sides of the ratio
+   run the SAME candidate build, so a generic kernel win that speeds up
+   sequential decode and block verify equally cancels out. Participants can only
+   move the score by making speculation specifically cheaper — verify batching,
+   cache handling, rollback cost — not by optimising the model forward in
+   general. That is a narrower optimisation surface than the serial track, and it
+   should be stated in any participant-facing description.
+
+`official_scoring_enabled` still stays false until the remaining items in the
+validation record are closed (tolerance calibration, L4/L5, the seam-crossing
+timed run, and the box-wrapper flag fixes), but the blocking *question* — is
+there any configuration in which this track can rank — is now answered: yes, at
+K=3.
 
 # Amendment 4 (2026-07-30) — L4 corrected: KV digests cannot be compared across builds either
 
