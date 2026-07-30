@@ -129,7 +129,7 @@
     "model_id": "poolside/Laguna-XS-2.1-DFlash",
     "revision": "5c36361aab23c8ed3afbd079c10c426b677bc607",
     "manifest_path": "fixtures/mtp_laguna_xs_2_1_dflash.sha256",
-    "manifest_sha256": "REGENERATE_ON_M5",
+    "manifest_sha256": "3c87379cd76a9a6296652f1f1e463fe856f926cfbbf52d9cb89ef9bb36df3e34",
     "manifest_sha256_note": "TODO(operator): SHA-256 of the manifest file itself, pinned after the manifest is regenerated on m5-bench (the checked-in manifest is a placeholder header only).",
     "expected_total_bytes": 924135848,
     "expected_total_bytes_note": "The upstream BF16 model.safetensors payload at revision 5c36361 per Hugging Face LFS metadata (config.json adds 963 bytes). The draft is provisioned as BF16 and converted to MLX affine 4-bit (group size 64) at setup. TODO(operator): confirm on m5-bench when the manifest is regenerated.",
@@ -188,7 +188,13 @@
         "bytes": "REGENERATE_ON_M5",
         "TODO_OPERATOR": "Pin on m5-bench. Upstream BF16 model.safetensors at revision 5c36361 is 924135848 bytes, sha256 0b51e20d76200a80e636414f45fb51a5c0e13b0852d977ba2db788214c68f6b8 (Hugging Face LFS oid)."
       }
-    ]
+    ],
+    "upstream_model_id": "poolside/Laguna-XS-2.1-DFlash",
+    "upstream_revision": "5c36361aab23c8ed3afbd079c10c426b677bc607",
+    "runtime_layout": "mlx-bf16-repack",
+    "runtime_note": "Converted by Vendor/mlx-swift-lm/scripts/convert_laguna_dflash.py (stdlib byte repack, splits fused qkv, BF16 preserved, 68 tensors). NOT quantized.",
+    "expected_bytes": 924138277,
+    "provisioned_path": "/opt/bench-runner/cache/dflash/laguna-xs-2.1-dflash-v1/assistant"
   },
   "protocol": {
     "name": "trusted_dflash_block_v1",
