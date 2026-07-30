@@ -54,6 +54,24 @@ public struct DFlashRoundWorkBinding: @unchecked Sendable {
     public let top2Tokens: [[Int]]
     /// Per-row top-2 logit values, aligned with `top2Tokens`.
     public let top2Logits: [[Double]]
+    /// The drafter's proposals for this round, `declaredRows - 1` of them, in
+    /// the order they occupied the verify input: the verify block is
+    /// `[bonus, draftTokens[0], ..., draftTokens[declaredRows - 2]]`.
+    ///
+    /// Reported so the trusted parent can PRICE THE REJECTED TAIL. Without it
+    /// the parent knows only the emitted tokens, so it can reconstruct the
+    /// accepted prefix of the verify input and nothing after it -- and the rows
+    /// after it are exactly the rows an eliding verifier can fabricate for free,
+    /// because no emitted token constrains them. With it the reference can
+    /// replay the candidate's ACTUAL verify block, row for row, including the
+    /// rows rollback discarded.
+    ///
+    /// Note what makes this binding hard to defeat: for a REJECTED row the
+    /// candidate has no independent source for the row's own argmax. It knows
+    /// every emitted token (the drafter proposed most of them), but a rejected
+    /// row's output was never emitted, so reporting it requires having actually
+    /// run that row's lm_head.
+    public let draftTokens: [Int]
 }
 
 public struct DFlashGreedyRoundResult {
@@ -287,10 +305,19 @@ public func runDFlashGreedyRound(
     // rejected tail that rollback is about to discard.
     var roundWorkBinding: DFlashRoundWorkBinding?
     if workBinding, let logits = workBindingLogits {
+        // Read the drafts here rather than reusing the accept walk's slice: the
+        // walk only ever materializes `comparableCount` of them and only on the
+        // CPU path, whereas the parent needs ALL `declaredRows - 1` regardless of
+        // which walk ran. `draftTokens` is already evaluated by this point (the
+        // accept walk waited on it), so this is a host read, not extra compute.
+        let reportedDrafts = proposedCount > 0
+            ? draftTokenIds[0 ..< proposedCount].asArray(Int32.self).map { Int($0) }
+            : []
         roundWorkBinding = dflashCollectWorkBinding(
             logits: logits,
             targetHidden: verifyOut.targetHidden,
-            declaredRows: verifiedTokenCount
+            declaredRows: verifiedTokenCount,
+            draftTokens: reportedDrafts
         )
     }
 
@@ -346,7 +373,8 @@ public func runDFlashGreedyRound(
 private func dflashCollectWorkBinding(
     logits: MLXArray,
     targetHidden: MLXArray,
-    declaredRows: Int
+    declaredRows: Int,
+    draftTokens: [Int]
 ) -> DFlashRoundWorkBinding {
     var digests = [String]()
     var top2Tokens = [[Int]]()
@@ -381,7 +409,8 @@ private func dflashCollectWorkBinding(
         declaredRows: declaredRows,
         hiddenDigest: digests,
         top2Tokens: top2Tokens,
-        top2Logits: top2Logits
+        top2Logits: top2Logits,
+        draftTokens: draftTokens
     )
 }
 

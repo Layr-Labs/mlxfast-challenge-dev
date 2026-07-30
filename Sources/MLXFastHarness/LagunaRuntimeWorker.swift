@@ -795,6 +795,13 @@ struct RuntimeWorkerRequest: Codable {
     // only guess, and guessing `prefixTokens[0 ..< start_offset]` is the frame
     // bug this field exists to remove.
     let seedTokenCount: Int?
+    // Reference-side only (dflash_reference_rows). The candidate's ACTUAL verify
+    // block for the round being replayed: `[bonus, d0, ..., d_{K-2}]`, built by
+    // the trusted parent from its own committed token plus the drafts the round
+    // journalled. It is what lets the reference reach the REJECTED tail rows --
+    // the emitted context stops describing the verify input at the first
+    // rejection, so without this the tail is compared to nothing.
+    let verifyBlockTokens: [Int]?
 
     init(
         id: Int,
@@ -810,7 +817,8 @@ struct RuntimeWorkerRequest: Codable {
         startOffset: Int? = nil,
         rowCount: Int? = nil,
         declaredBlockWidth: Int? = nil,
-        seedTokenCount: Int? = nil
+        seedTokenCount: Int? = nil,
+        verifyBlockTokens: [Int]? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -826,6 +834,7 @@ struct RuntimeWorkerRequest: Codable {
         self.rowCount = rowCount
         self.declaredBlockWidth = declaredBlockWidth
         self.seedTokenCount = seedTokenCount
+        self.verifyBlockTokens = verifyBlockTokens
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -881,6 +890,10 @@ struct RuntimeWorkerRequest: Codable {
             Int.self,
             forKey: .seedTokenCount
         )
+        verifyBlockTokens = try container.decodeIfPresent(
+            [Int].self,
+            forKey: .verifyBlockTokens
+        )
     }
 
     func encode(to encoder: Swift.Encoder) throws {
@@ -902,6 +915,10 @@ struct RuntimeWorkerRequest: Codable {
             forKey: .declaredBlockWidth
         )
         try container.encodeIfPresent(seedTokenCount, forKey: .seedTokenCount)
+        try container.encodeIfPresent(
+            verifyBlockTokens,
+            forKey: .verifyBlockTokens
+        )
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -923,6 +940,7 @@ struct RuntimeWorkerRequest: Codable {
         case rowCount = "count"
         case declaredBlockWidth = "declared_block_width"
         case seedTokenCount = "seed_token_count"
+        case verifyBlockTokens = "verify_block_tokens"
     }
 }
 
@@ -992,6 +1010,13 @@ struct RuntimeWorkerResponse: Codable {
     let perRowHiddenDigest: [String]?
     let perRowTop2Tokens: [[Int]]?
     let perRowTop2Logits: [[Double]]?
+    // The round's drafter proposals, `declaredRows - 1` of them, in verify-input
+    // order. The parent binds them to the emitted tokens with no reference at all
+    // (an accepted draft IS the emitted token at that index) and hands them back
+    // to the reference so it can replay the round's real verify block and price
+    // the REJECTED tail rows. Before this field the tail carried readouts nothing
+    // compared to anything.
+    let draftTokens: [Int]?
     let acceptedDraftCount: Int?
     let rejectedDraftCount: Int?
     let rollbackRoundCount: Int?
@@ -1021,6 +1046,13 @@ struct RuntimeWorkerResponse: Codable {
     // rewinding, which is what keeps the pass O(n) instead of O(n^2).
     let referenceFrameWidths: [Int]?
     let referenceFrameArgmax: [[Int]]?
+    // Per-row top-2 ids/VALUES for EVERY row of the candidate's own verify block,
+    // when the request supplied one. This is the only reference readout that
+    // reaches a REJECTED row: the emitted-context frames stop matching the
+    // candidate's verify input at the first rejection, so before this the
+    // rejected tail's readouts were length-checked and discarded.
+    let referenceVerifyTop2Tokens: [[Int]]?
+    let referenceVerifyTop2Logits: [[Double]]?
 
     init(
         id: Int,
@@ -1047,6 +1079,7 @@ struct RuntimeWorkerResponse: Codable {
         perRowHiddenDigest: [String]? = nil,
         perRowTop2Tokens: [[Int]]? = nil,
         perRowTop2Logits: [[Double]]? = nil,
+        draftTokens: [Int]? = nil,
         acceptedDraftCount: Int? = nil,
         rejectedDraftCount: Int? = nil,
         rollbackRoundCount: Int? = nil,
@@ -1061,7 +1094,9 @@ struct RuntimeWorkerResponse: Codable {
         referenceEmittedTokens: [Int]? = nil,
         referenceEmittedTokenLogits: [Double]? = nil,
         referenceFrameWidths: [Int]? = nil,
-        referenceFrameArgmax: [[Int]]? = nil
+        referenceFrameArgmax: [[Int]]? = nil,
+        referenceVerifyTop2Tokens: [[Int]]? = nil,
+        referenceVerifyTop2Logits: [[Double]]? = nil
     ) {
         self.id = id
         self.nonce = nonce
@@ -1087,6 +1122,7 @@ struct RuntimeWorkerResponse: Codable {
         self.perRowHiddenDigest = perRowHiddenDigest
         self.perRowTop2Tokens = perRowTop2Tokens
         self.perRowTop2Logits = perRowTop2Logits
+        self.draftTokens = draftTokens
         self.acceptedDraftCount = acceptedDraftCount
         self.rejectedDraftCount = rejectedDraftCount
         self.rollbackRoundCount = rollbackRoundCount
@@ -1102,6 +1138,8 @@ struct RuntimeWorkerResponse: Codable {
         self.referenceEmittedTokenLogits = referenceEmittedTokenLogits
         self.referenceFrameWidths = referenceFrameWidths
         self.referenceFrameArgmax = referenceFrameArgmax
+        self.referenceVerifyTop2Tokens = referenceVerifyTop2Tokens
+        self.referenceVerifyTop2Logits = referenceVerifyTop2Logits
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -1198,6 +1236,10 @@ struct RuntimeWorkerResponse: Codable {
             [[Double]].self,
             forKey: .perRowTop2Logits
         )
+        draftTokens = try container.decodeIfPresent(
+            [Int].self,
+            forKey: .draftTokens
+        )
         acceptedDraftCount = try container.decodeIfPresent(
             Int.self,
             forKey: .acceptedDraftCount
@@ -1257,6 +1299,14 @@ struct RuntimeWorkerResponse: Codable {
         referenceFrameArgmax = try container.decodeIfPresent(
             [[Int]].self,
             forKey: .referenceFrameArgmax
+        )
+        referenceVerifyTop2Tokens = try container.decodeIfPresent(
+            [[Int]].self,
+            forKey: .referenceVerifyTop2Tokens
+        )
+        referenceVerifyTop2Logits = try container.decodeIfPresent(
+            [[Double]].self,
+            forKey: .referenceVerifyTop2Logits
         )
     }
 
@@ -1325,6 +1375,7 @@ struct RuntimeWorkerResponse: Codable {
             perRowTop2Logits,
             forKey: .perRowTop2Logits
         )
+        try container.encodeIfPresent(draftTokens, forKey: .draftTokens)
         try container.encodeIfPresent(
             acceptedDraftCount,
             forKey: .acceptedDraftCount
@@ -1382,6 +1433,14 @@ struct RuntimeWorkerResponse: Codable {
             referenceFrameArgmax,
             forKey: .referenceFrameArgmax
         )
+        try container.encodeIfPresent(
+            referenceVerifyTop2Tokens,
+            forKey: .referenceVerifyTop2Tokens
+        )
+        try container.encodeIfPresent(
+            referenceVerifyTop2Logits,
+            forKey: .referenceVerifyTop2Logits
+        )
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -1409,6 +1468,7 @@ struct RuntimeWorkerResponse: Codable {
         case perRowHiddenDigest = "per_row_hidden_digest"
         case perRowTop2Tokens = "per_row_top2_tokens"
         case perRowTop2Logits = "per_row_top2_logits"
+        case draftTokens = "draft_tokens"
         case acceptedDraftCount = "accepted_draft_count"
         case rejectedDraftCount = "rejected_draft_count"
         case rollbackRoundCount = "rollback_round_count"
@@ -1424,6 +1484,8 @@ struct RuntimeWorkerResponse: Codable {
         case referenceEmittedTokenLogits = "reference_emitted_token_logits"
         case referenceFrameWidths = "reference_frame_widths"
         case referenceFrameArgmax = "reference_frame_argmax"
+        case referenceVerifyTop2Tokens = "reference_verify_top2_tokens"
+        case referenceVerifyTop2Logits = "reference_verify_top2_logits"
     }
 }
 
@@ -2137,12 +2199,19 @@ final class RuntimeWorkerClient {
     /// reference answers every width in `rowCount ... widestFrame` from one
     /// request because each is a branch off the same continuous cache -- asking
     /// for them separately would rewind the walk and force a re-prefill.
+    ///
+    /// `verifyBlockTokens`, when supplied, is the candidate's own verify input
+    /// for this round -- `[bonus] + journalled drafts` -- and the reference
+    /// replays it as a further branch off the same cache so the parent can price
+    /// the rejected tail. It is built by the parent from its committed chain plus
+    /// the round journal, so a worker cannot choose the bonus row.
     func dflashReferenceRows(
         prefixTokens: [Int],
         seedTokenCount: Int,
         startOffset: Int,
         rowCount: Int,
-        widestFrame: Int
+        widestFrame: Int,
+        verifyBlockTokens: [Int]? = nil
     ) throws -> RuntimeWorkerResponse {
         try send(
             kind: "dflash_reference_rows",
@@ -2150,7 +2219,8 @@ final class RuntimeWorkerClient {
             startOffset: startOffset,
             rowCount: rowCount,
             declaredBlockWidth: widestFrame,
-            seedTokenCount: seedTokenCount
+            seedTokenCount: seedTokenCount,
+            verifyBlockTokens: verifyBlockTokens
         )
     }
 
@@ -2167,7 +2237,8 @@ final class RuntimeWorkerClient {
         startOffset: Int? = nil,
         rowCount: Int? = nil,
         declaredBlockWidth: Int? = nil,
-        seedTokenCount: Int? = nil
+        seedTokenCount: Int? = nil,
+        verifyBlockTokens: [Int]? = nil
     ) throws -> RuntimeWorkerResponse {
         guard process.isRunning else {
             throw MLXFastError.invalidInput("runtime worker exited before request \(kind): \(workerExitDiagnostic())")
@@ -2188,7 +2259,8 @@ final class RuntimeWorkerClient {
             startOffset: startOffset,
             rowCount: rowCount,
             declaredBlockWidth: declaredBlockWidth,
-            seedTokenCount: seedTokenCount
+            seedTokenCount: seedTokenCount,
+            verifyBlockTokens: verifyBlockTokens
         )
         var data = try encoder.encode(request)
         guard data.count <= BufferedFileLineReader.defaultMaximumLineByteCount else {

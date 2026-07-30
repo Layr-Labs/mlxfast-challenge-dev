@@ -1412,7 +1412,11 @@ private enum MLXFastCLI {
                 + "\(String(format: "%.6f", report.decodeSecondsPerToken)) "
                 + "accepted_draft_rate="
                 + "\(String(format: "%.4f", report.acceptedDraftRate)) "
-                + "residual_divergences=\(report.residualDivergenceCount)\n",
+                + "residual_divergences=\(report.residualDivergenceCount) "
+                + "rejected_rows_reference_checked="
+                + "\(report.rejectedRowsReferenceChecked) "
+                + "max_rejected_tail_logit_delta="
+                + "\(String(format: "%.4f", report.maxRejectedTailLogitDelta))\n",
             stderr
         )
 
@@ -1439,6 +1443,16 @@ private enum MLXFastCLI {
             "emitted_token_total": report.totalTokenCount,
             "declared_rows_total": report.declaredRowTotal,
             "reference_checked_row_total": report.referenceCheckedRowTotal,
+            // Amendment 21: the rejected tail is priced now, so an audit can see
+            // whether it actually was. Zero here on a block-decode run means the
+            // tail went unpriced -- the legacy fallback, not a pass.
+            "rejected_rows_reference_checked":
+                report.rejectedRowsReferenceChecked,
+            "verify_block_replayed_round_count":
+                report.verifyBlockReplayedRoundCount,
+            "rejected_tail_comparison_count":
+                report.rejectedTailComparisonCount,
+            "max_rejected_tail_logit_delta": report.maxRejectedTailLogitDelta,
             "accepted_draft_total": report.acceptedDraftTotal,
             "rejected_draft_total": report.rejectedDraftTotal,
             "target_tail_total": report.targetTailTotal,

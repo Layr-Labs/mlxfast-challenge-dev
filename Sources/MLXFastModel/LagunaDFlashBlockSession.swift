@@ -20,6 +20,10 @@ public struct LagunaDFlashBlockResult {
     public let perRowHiddenDigest: [String]
     public let perRowTop2Tokens: [[Int]]
     public let perRowTop2Logits: [[Double]]
+    /// The drafter's `declaredRows - 1` proposals, in verify-input order, so the
+    /// parent can reconstruct the round's actual verify block
+    /// (`[bonus] + draftTokens`) and have the reference price the rejected tail.
+    public let draftTokens: [Int]
 }
 
 /// Re-entrant DFlash block-decode session for the `laguna-xs-2.1-dflash-v1`
@@ -326,7 +330,8 @@ public final class LagunaDFlashBlockSession {
             declaredRows: binding?.declaredRows ?? 0,
             perRowHiddenDigest: binding?.hiddenDigest ?? [],
             perRowTop2Tokens: binding?.top2Tokens ?? [],
-            perRowTop2Logits: binding?.top2Logits ?? []
+            perRowTop2Logits: binding?.top2Logits ?? [],
+            draftTokens: binding?.draftTokens ?? []
         )
     }
 
@@ -383,7 +388,11 @@ public final class LagunaDFlashBlockSession {
             // to materialize one.
             perRowHiddenDigest: [""],
             perRowTop2Tokens: [top2Tokens],
-            perRowTop2Logits: [top2Logits]
+            perRowTop2Logits: [top2Logits],
+            // One declared row, zero drafts: `declaredRows - 1 == 0`, so the
+            // serial control satisfies the parent's length bind trivially and
+            // has no rejected tail to price.
+            draftTokens: []
         )
     }
 }

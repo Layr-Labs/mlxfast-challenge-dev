@@ -150,7 +150,26 @@ struct DFlashLiveReferenceOracle: DFlashReferenceOracle {
         count: Int,
         declaredBlockWidth: Int
     ) throws -> [DFlashReferenceRow] {
-        guard count > 0 else { return [] }
+        try referenceBatch(
+            emittedPrefix: emittedPrefix,
+            startOffset: startOffset,
+            count: count,
+            declaredBlockWidth: declaredBlockWidth,
+            // No journalled drafts supplied, so no verify block is replayed.
+            declaredRows: count,
+            draftTokens: []
+        ).rows
+    }
+
+    func referenceBatch(
+        emittedPrefix: [Int],
+        startOffset: Int,
+        count: Int,
+        declaredBlockWidth: Int,
+        declaredRows: Int,
+        draftTokens: [Int]
+    ) throws -> DFlashReferenceBatch {
+        guard count > 0 else { return DFlashReferenceBatch(rows: []) }
         guard startOffset >= 0, emittedPrefix.count == startOffset else {
             throw MLXFastError.invalidInput(
                 "DFlash live reference replay is out of order: prefix of "
@@ -180,12 +199,28 @@ struct DFlashLiveReferenceOracle: DFlashReferenceOracle {
             count,
             Swift.min(declaredBlockWidth, availableRows)
         )
+        // The candidate's OWN verify block, reconstructed here rather than taken
+        // from the worker: row 0 is the parent's committed token at this position,
+        // and only the drafts after it are worker-asserted. The emitted-context
+        // frames above cannot reach the rejected tail -- they are fed emitted
+        // tokens, and the emitted chain stops describing the verify input at the
+        // first rejection -- and they are additionally clamped by `availableRows`,
+        // so the final round's tail could not be replayed at all. This one carries
+        // its own inputs, so neither limit applies.
+        var verifyBlockTokens: [Int]?
+        if declaredRows > 1,
+           draftTokens.count == declaredRows - 1,
+           absoluteOffset < context.count
+        {
+            verifyBlockTokens = [context[absoluteOffset]] + draftTokens
+        }
         let response = try client.dflashReferenceRows(
             prefixTokens: context,
             seedTokenCount: seedTokenCount,
             startOffset: absoluteOffset,
             rowCount: count,
-            widestFrame: widestFrame
+            widestFrame: widestFrame,
+            verifyBlockTokens: verifyBlockTokens
         )
         guard response.ok,
               let k1 = response.referenceK1Argmax,
@@ -208,6 +243,26 @@ struct DFlashLiveReferenceOracle: DFlashReferenceOracle {
                     + (response.error ?? "no reason reported")
             )
         }
+        // Asked for and not answered is an operator fault, never a silent
+        // degradation: this is the only readout that reaches a rejected row, so a
+        // scored run must not quietly fall back to leaving the tail unpriced.
+        var verifyTop2Tokens: [[Int]]?
+        var verifyTop2Logits: [[Double]]?
+        if let verifyBlockTokens {
+            guard let tokens = response.referenceVerifyTop2Tokens,
+                  let logits = response.referenceVerifyTop2Logits,
+                  tokens.count == verifyBlockTokens.count,
+                  logits.count == verifyBlockTokens.count
+            else {
+                throw MLXFastError.invalidInput(
+                    "DFlash live reference did not return the "
+                        + "\(verifyBlockTokens.count)-row verify-block replay it "
+                        + "was asked for at offset \(startOffset)"
+                )
+            }
+            verifyTop2Tokens = tokens
+            verifyTop2Logits = logits
+        }
         var frames = [Int: [Int]]()
         for (width, argmax) in zip(frameWidths, frameArgmax) {
             frames[width] = argmax
@@ -216,7 +271,7 @@ struct DFlashLiveReferenceOracle: DFlashReferenceOracle {
         let top1Logits = response.referenceTop1Logits
         let emittedTokens = response.referenceEmittedTokens ?? []
         let emittedTokenLogits = response.referenceEmittedTokenLogits ?? []
-        return (0 ..< count).map { index in
+        let rows = (0 ..< count).map { index in
             DFlashReferenceRow(
                 sequentialArgmax: k1[index],
                 declaredFrameArgmax: declaredFrame.flatMap {
@@ -235,6 +290,11 @@ struct DFlashLiveReferenceOracle: DFlashReferenceOracle {
                     : nil
             )
         }
+        return DFlashReferenceBatch(
+            rows: rows,
+            verifyBlockTop2Tokens: verifyTop2Tokens,
+            verifyBlockTop2Logits: verifyTop2Logits
+        )
     }
 }
 
@@ -388,6 +448,7 @@ extension LagunaRuntime {
                 declaredRows: response.declaredRows ?? 0,
                 perRowTop2Tokens: response.perRowTop2Tokens ?? [],
                 perRowTop2Logits: response.perRowTop2Logits ?? [],
+                draftTokens: response.draftTokens ?? [],
                 acceptedDraftCount: response.acceptedDraftCount ?? 0,
                 rejectedDraftCount: response.rejectedDraftCount ?? 0,
                 targetCacheOffset: response.targetCacheOffset ?? -1,
@@ -404,6 +465,7 @@ extension LagunaRuntime {
                     declaredRows: round.declaredRows,
                     perRowTop2Tokens: round.perRowTop2Tokens,
                     perRowTop2Logits: round.perRowTop2Logits,
+                    draftTokens: round.draftTokens,
                     acceptedDraftCount: round.acceptedDraftCount,
                     rejectedDraftCount: round.rejectedDraftCount,
                     // The worker's offset counts every token it committed; the
@@ -457,6 +519,12 @@ extension LagunaRuntime {
             targetCacheOffsetFinal: golden.seedTokens.count
                 + validator.committedTokens.count,
             referenceCheckedRowTotal: validator.referenceCheckedRowTotal,
+            rejectedRowsReferenceChecked:
+                validator.rejectedRowsReferenceChecked,
+            verifyBlockReplayedRoundCount:
+                validator.verifyBlockReplayedRoundCount,
+            rejectedTailComparisonCount: validator.rejectedTailComparisonCount,
+            maxRejectedTailLogitDelta: validator.maxRejectedTailLogitDelta,
             // One target-produced tail token per round, by construction.
             targetTailTotal: validator.roundLatencies.count,
             maxBlockRequestSeconds: validator.maxBlockRequestSeconds,

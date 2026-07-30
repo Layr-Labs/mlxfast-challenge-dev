@@ -70,6 +70,14 @@ public struct LagunaDFlashReferenceRows: Sendable {
     /// `frameArgmax[i]` is the width-`frameWidths[i]` argmax for the SAME
     /// `rows.count` positions, so every entry has `rows.count` elements.
     public let frameArgmax: [[Int]]
+    /// Per-row top-2 token ids for EVERY row of the candidate's own verify block
+    /// -- the block the caller supplied as `verifyBlockTokens`, i.e.
+    /// `[bonus, d0, ..., d_{K-2}]` -- including the rejected tail rows the
+    /// candidate's rollback discarded and the emitted-context frames cannot
+    /// reach. `nil` when no verify block was supplied.
+    public let verifyBlockTop2Tokens: [[Int]]?
+    /// Top-2 logit VALUES aligned with `verifyBlockTop2Tokens`.
+    public let verifyBlockTop2Logits: [[Double]]?
     /// True when this answer was served by walking the live continuous cache
     /// forward, false when the frame had to be rebuilt from scratch first.
     public let continuedLiveFrame: Bool
@@ -191,21 +199,29 @@ public final class LagunaDFlashReference {
     ///     what keeps the block frame a sibling of the width-1 frame instead of
     ///     a third, unrelated construction.
     ///
+    /// A THIRD frame comes back when `verifyBlockTokens` is supplied: the
+    /// candidate's ACTUAL verify block, `[bonus, d0, ..., d_{K-2}]`, replayed on
+    /// its own `copy()` of the same continuous cache. This is the only frame that
+    /// reaches the REJECTED tail rows, because after the first rejection the
+    /// candidate's verify input stops agreeing with the emitted context: row
+    /// `accepted + 1` was fed a draft the target overruled, and no emitted token
+    /// records it. The caller supplies the drafts from the round journal; the
+    /// bonus is the caller's own committed token, never the worker's.
+    ///
     /// Known approximations, stated because they bound what this can prove.
-    /// The candidate's round may have verified a WIDER block (its rejected
-    /// drafts occupied the tail rows); those draft ids are not emitted, so the
-    /// reference cannot reconstruct that exact width, and it replays the widths
-    /// the parent's schedule could have asked for instead. And the branch is
-    /// taken off a cache written by single rows, whereas the candidate's block
-    /// cache was written by earlier block forwards. Anything the frames do not
-    /// cover falls into the capped residual bucket and must still satisfy the
-    /// top-2 binding.
+    /// The emitted-context frames cannot reconstruct the candidate's rejected
+    /// tail (that is what `verifyBlockTokens` is for). And every branch is taken
+    /// off a cache written by single rows, whereas the candidate's block cache
+    /// was written by earlier block forwards. Anything the frames do not cover
+    /// falls into the capped residual bucket and must still satisfy the top-2
+    /// binding.
     public func rows(
         tokens: [Int],
         seedTokenCount: Int,
         startOffset: Int,
         count: Int,
-        widestFrame: Int
+        widestFrame: Int,
+        verifyBlockTokens: [Int]? = nil
     ) throws -> LagunaDFlashReferenceRows {
         guard count > 0 else {
             throw MLXFastError.invalidInput(
@@ -242,6 +258,31 @@ public final class LagunaDFlashReference {
                 "DFlash reference context contains an out-of-vocabulary token"
             )
         }
+        if let verifyBlockTokens {
+            guard !verifyBlockTokens.isEmpty,
+                  verifyBlockTokens.count
+                      <= MLXFastConstants.experimentalDFlashMaxBlockSize,
+                  verifyBlockTokens.allSatisfy({
+                      $0 >= 0 && $0 < MLXFastConstants.vocabSize
+                  })
+            else {
+                throw MLXFastError.invalidInput(
+                    "DFlash reference verify block is empty, too wide, or "
+                        + "contains an out-of-vocabulary token"
+                )
+            }
+            // Row 0's input is the round's bonus, which is the token the context
+            // already carries at `startOffset`. The caller derives it from its own
+            // committed chain, so a disagreement means the caller's two views of
+            // the same position differ -- refuse rather than replay a block that
+            // is not the one that ran.
+            guard verifyBlockTokens[0] == tokens[startOffset] else {
+                throw MLXFastError.invalidInput(
+                    "DFlash reference verify block starts with a token that is "
+                        + "not the committed token at offset \(startOffset)"
+                )
+            }
+        }
 
         let (cache, continued) = try continuousFrame(
             tokens: tokens,
@@ -275,6 +316,38 @@ public final class LagunaDFlashReference {
             }
             frameWidths.append(width)
             frameArgmax.append(Array(flattened.prefix(count)))
+        }
+
+        // --- the candidate's OWN verify block --------------------------------
+        // Same construction as the block frames above -- a `copy()` of the
+        // continuous cache at this round boundary -- but fed the candidate's
+        // actual verify input instead of the emitted context, and read out for
+        // EVERY row rather than only the argmax. The tail rows are the whole
+        // point: they are the rows the candidate rolled back, so no emitted token
+        // constrains them and nothing previously compared them to anything.
+        var verifyBlockTop2Tokens: [[Int]]?
+        var verifyBlockTop2Logits: [[Double]]?
+        if let verifyBlockTokens {
+            let branch = cache.map { $0.copy() }
+            let inputs = MLXArray(
+                verifyBlockTokens.map { Int32($0) }
+            )[.newAxis, .ellipsis]
+            let out = try target.forwardForDFlash(
+                inputs,
+                cache: branch,
+                targetLayerIds: targetLayerIds
+            )
+            var ids = [[Int]]()
+            var values = [[Double]]()
+            ids.reserveCapacity(verifyBlockTokens.count)
+            values.reserveCapacity(verifyBlockTokens.count)
+            for row in 0 ..< verifyBlockTokens.count {
+                let (rowIDs, rowValues) = Self.topTwo(of: out.logits[0, row, 0...])
+                ids.append(rowIDs)
+                values.append(rowValues)
+            }
+            verifyBlockTop2Tokens = ids
+            verifyBlockTop2Logits = values
         }
 
         // --- width-1 frame: walk the continuous cache forward ---------------
@@ -354,6 +427,8 @@ public final class LagunaDFlashReference {
             rows: rows,
             frameWidths: frameWidths,
             frameArgmax: frameArgmax,
+            verifyBlockTop2Tokens: verifyBlockTop2Tokens,
+            verifyBlockTop2Logits: verifyBlockTop2Logits,
             continuedLiveFrame: continued
         )
     }
