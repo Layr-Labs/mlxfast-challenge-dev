@@ -83,9 +83,12 @@ public final class LagunaDFlashBlockSession {
         self.collectWorkBinding = collectWorkBinding
         self.targetCache = target.newCache(parameters: nil)
         self.draftCache = try drafter.makeCache()
-        // The round trims the draft cache back to the committed offset every
-        // time, so an untrimmable draft cache would silently desynchronize the
-        // drafter from the target. Fail at construction instead.
+        // The round asks the draft cache to trim only when the drafter's
+        // position counter has run PAST the committed offset. Correctly aligned
+        // block decode never needs that trim -- and must not, because the
+        // drafter's rotating window saturates on any seed at or above 511 rows
+        // and a saturated ring cannot rewind. This guard therefore only catches
+        // a cache kind that could not trim even at offset 0.
         guard canTrimPromptCache(self.draftCache) else {
             throw MLXFastError.invalidInput(
                 "DFlash draft cache is not trimmable; block decode cannot "
@@ -205,6 +208,27 @@ public final class LagunaDFlashBlockSession {
             return try generateSerialRow(previousCommittedToken: currentBonus)
         }
 
+        // The drafter re-supplies the target hidden states as cross-attention
+        // context every round and derives its RoPE positions from
+        // `cache.offset + contextLength`. So the context width handed to a round
+        // must be exactly the number of positions the target advanced since the
+        // drafter last wrote: seed width on the first block, then the previous
+        // round's committed row count. A width-1 serial row in the middle of a
+        // session advances the target without feeding the drafter, which would
+        // leave every later draft RoPE'd at the wrong absolute position --
+        // silently, since the target still verifies every emitted token. Refuse
+        // instead of drafting from a desynchronized prefix.
+        let drafterOffset = draftCache.first?.offset ?? 0
+        let drafterContextGap = (seedTokenCount + decodedTokenCount) - drafterOffset
+        guard currentHidden.dim(1) == drafterContextGap else {
+            throw MLXFastError.invalidInput(
+                "DFlash drafter context is \(currentHidden.dim(1)) rows wide but "
+                    + "the target advanced \(drafterContextGap) positions since "
+                    + "the drafter last wrote; block decode cannot keep the "
+                    + "drafter aligned"
+            )
+        }
+
         let result = try runDFlashGreedyRound(
             target: target,
             drafter: drafter,
@@ -213,7 +237,17 @@ public final class LagunaDFlashBlockSession {
             bonus: currentBonus,
             targetHidden: currentHidden,
             promptTokenCount: seedTokenCount,
-            generatedTokenCount: decodedTokenCount,
+            // `generatedTokenCount` counts EMITTED tokens, which includes the
+            // seed prefill's bonus token; the round derives the drafter's
+            // committed position as `prompt + generated - 1` and that has to
+            // equal the target's KV offset (`seed + decoded`). `decodedTokenCount`
+            // counts KV ROWS, one fewer, because the bonus token's row is written
+            // by the round that consumes it. Passing the row count directly asked
+            // the round to trim one row off the drafter's rotating cache, which a
+            // saturated ring refuses -- so every block round threw
+            // `untrimmableCache` once the seed reached the drafter's 511-slot
+            // window. See docs/dflash-track-correctness-contract.md Amendment 7.
+            generatedTokenCount: decodedTokenCount + 1,
             blockSize: maxBlockSize,
             maxEmitCount: maxBlockSize,
             workBinding: collectWorkBinding

@@ -851,7 +851,15 @@ parent-derived KV ledger matching `seed + committed` exactly in every case.
 Amendment 3's fix is therefore confirmed by a run that actually crosses the
 boundary, which is what that amendment asked for.
 
-## 2. NEW DEFECT: the same seam exists on the DRAFTER side and is NOT fixed
+## 2. NEW DEFECT: the drafter-side failure (root-caused and FIXED in §5)
+
+> **Superseded by §5.** The trace and the ranked-impact assessment below are
+> accurate and are kept as the investigation record. The diagnosis is not: this
+> is not a second wrap seam and none of the three fixes proposed at the end of
+> this section was the right one. The drafter never needed to trim at all — the
+> session was asking it to, because of an off-by-one in the argument it passed.
+> Read §5 before acting on anything here.
+
 
 Seed 600 with K=3 fails on its FIRST scored round:
 
@@ -951,3 +959,103 @@ oracle signal, which is what L6 keeps out of published artifacts. Aggregates
 (count, max, p99, p50, mean, and the tolerance actually used) are always
 reported, so an audit can see both the distribution and that the binding
 compared anything at all.
+
+# Amendment 7 (2026-07-30): the drafter failure was an off-by-one, not a seam
+
+§2 reported that seed 600 + K=3 throws `untrimmableCache` from the DRAFT cache
+alignment trim, and that this fires on the ranked 512-token seed. Both facts
+hold. The diagnosis — "the same wrap seam exists on the drafter side" — does
+not, and the three fixes it proposed (snapshot the draft cache, align it at
+`begin()`, relax `RotatingKVCache`'s trim refusal) would all have been wrong.
+The last would have been actively harmful: it would have weakened a guard that
+is protecting a real invariant, for every caller including the serial track's
+sliding-window layers.
+
+## What the drafter's cache actually is
+
+`DFlashDraftModel`'s attention (`DFlashDraftModel.swift`) does not keep a
+conventional autoregressive KV cache. Every round it re-supplies the target
+hidden states as cross-attention context, writes ONLY those context rows to the
+cache (`cache.update(keys: contextKeys, values: contextValues)` — the proposal
+rows are concatenated for attention and never cached), and derives all RoPE
+positions from the cache's offset:
+
+```swift
+queries      = rope(queries,      offset: baseOffset + contextLength)
+contextKeys  = rope(contextKeys,  offset: baseOffset)
+proposalKeys = rope(proposalKeys, offset: baseOffset + contextLength)
+```
+
+So `cache.offset` is a POSITION COUNTER, and the sliding-window truncation a few
+lines above bumps it deliberately (`cache.offset += skip`) when the supplied
+context is wider than the window, precisely to keep absolute positions right.
+For the invariant to hold, `baseOffset + contextLength` must equal the absolute
+position of the round's bonus token, which is the target cache's offset:
+`seedTokenCount + decodedTokenCount`.
+
+## The actual defect
+
+`runDFlashGreedyRound` derives the drafter's committed position as
+`promptTokenCount + generatedTokenCount - 1`, where `generatedTokenCount` counts
+EMITTED tokens — including the seed prefill's bonus token, which is why
+`measureDFlashThroughput` initializes its counter to 1 rather than 0.
+`LagunaDFlashBlockSession` passed `decodedTokenCount`, which counts KV ROWS: one
+fewer, because the bonus token's row is written by the round that consumes it as
+its first verify row. So the session declared a committed position one short of
+the truth, and the round dutifully asked the drafter to give back one row.
+
+Everything in §2's trace follows from that one row:
+
+* `draft_offset=509 committed=508 extra=1` — the drafter is at the correct
+  position; the SESSION's idea of committed is 1 low.
+* Seed 509 "survives by luck" — no: the 1-row trim succeeds while the ring is
+  still unsaturated, and from the next round on `extra` is 0 because the trim
+  itself established the (wrong, 1-low) alignment as self-consistent.
+* Seed 600 throws — the same 1-row trim, now on a ring that has saturated and
+  correctly refuses to rewind.
+
+The fix is the one-line convention correction, in
+`Sources/MLXFastModel/LagunaDFlashBlockSession.swift`:
+
+```swift
+generatedTokenCount: decodedTokenCount + 1,
+```
+
+`committedDraftOffset` then equals `seedTokenCount + decodedTokenCount`, which
+is exactly the target cache offset the session already asserts in its ledger.
+`extra` is 0 on every round including the first, the trim never fires, and the
+saturated-ring refusal is never reached. No snapshot, no new cache API, and no
+change to `RotatingKVCache` — whose `isTrimmable == offset < maxSize` was right
+all along.
+
+## The second, quieter half
+
+The off-by-one also mis-positioned the drafter on every seed, not just seeds past
+the window. Round 1 wrote its context rows at correct absolute positions; the
+1-row trim then pulled the counter back, so from round 2 onward every drafter
+query and context key sat one position low. The shift is uniform, so relative
+geometry within the decode region survived — but the seed-to-decode boundary was
+squeezed by one position (round 2's context key lands on the position the seed's
+last token already occupies). That is a draft-QUALITY defect, not a correctness
+one: the target verifies every emitted token, so a misaligned drafter can only
+lower acceptance. It is a plausible contributor to acceptance saturating at
+1.33 for every K >= 6, and the K sweep that produced the viability numbers ran
+through the fork's own benchmark path, which uses the correct convention — so
+those numbers are NOT invalidated, but the session path was not measuring the
+same drafter alignment they did.
+
+## Hardening
+
+The alignment now has an explicit precondition instead of being an emergent
+property of two counters agreeing. Before each block round the session requires
+the supplied context width to equal the number of positions the target advanced
+since the drafter last wrote, and refuses the block otherwise. That closes a
+related silent failure the old code had no defence against: a width-1 serial row
+in the middle of a session advances the target without feeding the drafter, so
+every later block would have drafted from a prefix the drafter never saw — with
+no symptom except worse acceptance.
+
+The stale comment on the construction-time `canTrimPromptCache` guard ("the
+round trims the draft cache back to the committed offset every time") is
+corrected. That comment is what makes the wrong fix look right, and it is the
+reason §2 reached for one.
