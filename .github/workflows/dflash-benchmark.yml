@@ -176,6 +176,13 @@ jobs:
       MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: "1.0"
       MLXFAST_DFLASH_MIN_ACCEPTED_PAIRS: "3"
       MLXFAST_DFLASH_TARGET_PAIRS: "4"
+      # Contract layer L6: attributable ranked failures allowed per submission
+      # branch before further attempts are refused. Sized so honest iteration
+      # (a genuine correctness or floor miss, fixed and resubmitted) stays
+      # possible while submit-until-green against a sampled prompt pool of N
+      # does not pay: with a pool of 8 and 5 attempts the chance of clearing a
+      # tuned threshold on every sampled target is negligible.
+      MLXFAST_DFLASH_MAX_RANKED_FAILURES: "5"
       # Hidden IT-target golden pins, frozen 2026-07-15 on M5 silicon from the
       # pinned IT target at the post-stall-fix tip (go-live runbook step B;
       # capture record in the operator private store). PENDING box-2 replay
@@ -285,6 +292,36 @@ jobs:
           trusted_main_sha="$(git rev-parse HEAD)"
           printf '%s\n' "${CANDIDATE_SHA}" > candidate.sha
           printf 'trusted_main_sha=%s\n' "${trusted_main_sha}" >> "${GITHUB_OUTPUT}"
+
+      # CONTRACT LAYER L6, second half (the pool is the first half). Sampling a
+      # timed target per run makes a tuned threshold a 1/N gamble; rate limiting
+      # is what stops the gamble being repeated for free. Only failures a
+      # PARTICIPANT is responsible for count -- an overloaded judge API, a
+      # thermal reject or a nondeterministic reference is an operator fault and
+      # must never consume a submitter's budget (see the recorder step near the
+      # end, which only increments for dflash_*/floor/correctness categories).
+      - name: Enforce DFlash ranked-failure rate limit
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        run: |
+          set -euo pipefail
+          limit="${MLXFAST_DFLASH_MAX_RANKED_FAILURES}"
+          counts_dir="${MLXFAST_MEASURE_STATE_DIR}/failure-counts"
+          mkdir -p "${counts_dir}"
+          # Branch names are attacker-influenced, so derive the filename from a
+          # digest rather than from the ref text itself.
+          branch_key="$(printf '%s' "${GITHUB_REF}" | shasum -a 256 | awk '{print $1}')"
+          counter="${counts_dir}/${branch_key}.count"
+          used=0
+          if [[ -s "${counter}" ]]; then
+            used="$(tr -dc '0-9' < "${counter}")"
+            used="${used:-0}"
+          fi
+          printf '%s\n' "${branch_key}" > "${MLXFAST_PRIVATE_DIR}/dflash_branch_key" 2>/dev/null || true
+          if [[ "${used}" -ge "${limit}" ]]; then
+            echo "::error::this submission branch has used ${used} of ${limit} attributable ranked DFlash attempts; further attempts are rate limited" >&2
+            exit 1
+          fi
+          echo "dflash-benchmark: attributable ranked failures for this branch: ${used}/${limit}"
 
       - name: Checkout submitted editable paths
         if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
@@ -1319,6 +1356,39 @@ jobs:
           set -euo pipefail
           .github/scripts/redact-benchmark-failure.sh benchmark-failure.json
           .github/scripts/deny-private-artifacts.sh benchmark-failure.json
+
+      # Charge the branch's rate-limit budget ONLY for failures the participant
+      # is responsible for. The redaction step above has already reduced the
+      # failure to an opaque category; infra categories (a judge API outage, a
+      # thermal reject, a nondeterministic reference) are operator faults and
+      # must be re-dispatchable at no cost, otherwise the rate limit itself
+      # becomes a denial-of-service against honest submitters.
+      - name: Record attributable DFlash ranked failure
+        if: ${{ failure() && steps.redact_dflash_failure.outcome == 'success' && startsWith(github.ref, 'refs/heads/submissions/') }}
+        run: |
+          set -euo pipefail
+          test -s benchmark-failure.json || exit 0
+          category="$(jq -r '.category // ""' benchmark-failure.json)"
+          case "${category}" in
+            dflash_*|floor_failed|correctness_failed|prefill_token_mismatch|decode_seed_token_mismatch|decode_token_mismatch)
+              ;;
+            *)
+              echo "dflash-benchmark: category '${category}' is not participant-attributable; rate-limit budget untouched"
+              exit 0
+              ;;
+          esac
+          counts_dir="${MLXFAST_MEASURE_STATE_DIR}/failure-counts"
+          mkdir -p "${counts_dir}"
+          branch_key="$(printf '%s' "${GITHUB_REF}" | shasum -a 256 | awk '{print $1}')"
+          counter="${counts_dir}/${branch_key}.count"
+          used=0
+          if [[ -s "${counter}" ]]; then
+            used="$(tr -dc '0-9' < "${counter}")"
+            used="${used:-0}"
+          fi
+          printf '%s\n' "$((used + 1))" > "${counter}.tmp"
+          mv "${counter}.tmp" "${counter}"
+          echo "dflash-benchmark: recorded attributable failure ($((used + 1))/${MLXFAST_DFLASH_MAX_RANKED_FAILURES}) for category ${category}"
 
       - name: Upload redacted DFlash failure
         if: ${{ failure() && steps.redact_dflash_failure.outcome == 'success' }}

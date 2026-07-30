@@ -343,6 +343,32 @@ struct DFlashTrackTests {
         }
     }
 
+    // CONTRACT LAYER L6, second half. The pool makes a tuned threshold a 1/N
+    // gamble; the rate limit stops the gamble being repeated for free. The
+    // critical property is that only PARTICIPANT-attributable failures are
+    // charged: if an overloaded judge API or a thermal reject consumed budget,
+    // the rate limit would become a denial of service against honest submitters.
+    @Test
+    func attributableRankedFailuresAreRateLimited() throws {
+        let workflow = try text(Self.workflowPath)
+
+        #expect(workflow.contains("Enforce DFlash ranked-failure rate limit"))
+        #expect(workflow.contains("Record attributable DFlash ranked failure"))
+        #expect(workflow.contains("MLXFAST_DFLASH_MAX_RANKED_FAILURES"))
+        // Counter state lives in this track's own state dir, never the serial
+        // track's.
+        #expect(workflow.contains("${MLXFAST_MEASURE_STATE_DIR}/failure-counts"))
+        // Branch names are attacker-influenced, so the counter filename is a
+        // digest rather than the ref text.
+        #expect(workflow.contains("shasum -a 256 | awk '{print $1}'"))
+        // Operator faults must not be charged: the recorder allowlists
+        // participant categories and exits 0 for anything else.
+        #expect(workflow.contains("is not participant-attributable"))
+        #expect(workflow.contains("dflash_*|floor_failed|correctness_failed"))
+        // Both halves must be present for either to be meaningful.
+        #expect(workflow.contains("timed_prompt_pool"))
+    }
+
     // The retired GEMMA-era MTP surface stays retired under its own names.
     // DFlash carries its own filenames precisely so reviving a speculative
     // track cannot be confused with un-retiring the old one.
