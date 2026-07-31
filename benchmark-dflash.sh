@@ -28,14 +28,15 @@
 #     against organizer-pinned hidden goldens on the M5 box and is the only
 #     authority for both fidelity and score.
 #
-# ONE MODEL-HOLDING RUN AT A TIME. This script takes NO run lock: the per-user
-# lock lives in benchmark.sh and extracting it is deliberately out of scope here.
-# A DFlash residency is the ~21.6 GB NVFP4 target PLUS the ~0.9 GB drafter, so
-# two overlapping runs do not fit the documented ~40 GiB local minimum.
-# benchmark.sh's memory guard now recognises the dflash-* subcommands, so a
-# serial local run refuses to start while this one is alive -- but not the other
-# way round. Do not start this while any other model-holding mlxfast process is
-# running.
+# ONE MODEL-HOLDING RUN AT A TIME. A DFlash residency is the ~21.6 GB NVFP4
+# target PLUS the ~0.9 GB drafter, so two overlapping runs do not fit the
+# documented ~40 GiB local minimum. This script reuses BOTH halves of
+# benchmark.sh's memory guard (see the "local run guard" section below):
+#   * the per-user run lock, which excludes a concurrent local run in either
+#     direction (serial vs DFlash);
+#   * the resident-model scan, which catches the case no lock can -- an
+#     ORPHANED model-holding worker from a run that died without releasing,
+#     where the residency is live but nothing holds the lock.
 set -euo pipefail
 
 usage() {
@@ -202,53 +203,95 @@ EOF
   exit 1
 fi
 
-# --- scratch -----------------------------------------------------------------
-mkdir -p "${work_root}"
-if [[ "$(dirname "${score_path}")" != "." ]]; then
-  mkdir -p "$(dirname "${score_path}")"
-fi
-run_dir=""
-score_tmp=""
-
-# --- local run guard ---------------------------------------------------------
+# --- local run guard: reuse ---------------------------------------------------
 #
 # Both local modes hold the ~21.6 GB target AND the drafter, so an overlapping
 # local run (serial or DFlash) can out-of-memory the machine, and two runs
-# sharing one GPU invalidate both timings. benchmark.sh guards the serial
-# direction of this: its resident-model scan lists the dflash-* subcommands, so
-# a serial run refuses to start against a live DFlash one. Nothing guarded the
-# REVERSE direction until now -- this script took no lock, so a DFlash run
-# started happily against a live serial run.
+# sharing one GPU invalidate both timings. benchmark.sh's guard is TWO
+# mechanisms, and reusing only one of them leaves a real hole:
 #
-# Take benchmark.sh's OWN lock, at benchmark.sh's OWN path, by reusing its
-# definitions rather than copying them. The path is the part that must not
-# drift: two implementations that disagree about where the lock lives would
-# both "hold a lock" and exclude nothing. Same awk-extract-and-eval idiom the
-# source_hash() reuse above uses, and it fails closed the same way.
+#   * the per-user run lock excludes a concurrent local run. It guarded only
+#     the serial direction until #814 -- benchmark.sh's resident-model scan
+#     lists the dflash-* subcommands, so a serial run refuses to start against
+#     a live DFlash one, but this script took no lock, so a DFlash run started
+#     happily against a live serial run.
+#   * the resident-model scan catches what NO lock can, and #814 did not
+#     import it: an ORPHANED model-holding worker from a run that died without
+#     releasing. The residency is live, nothing holds the lock, so the lock is
+#     free and a DFlash run starts a second ~21.6 GB copy on top of it. That
+#     is precisely the ppid-1 case benchmark.sh's own comment calls out.
+#
+# So reuse BOTH, at benchmark.sh's OWN lock path and with benchmark.sh's OWN
+# process pattern, by extracting its definitions rather than copying them.
+# What must not drift: the lock path (two implementations that disagree about
+# where the lock lives would both "hold a lock" and exclude nothing) and the
+# resident-process pattern (a second, staler pattern would miss exactly the
+# subcommands benchmark.sh has since learned about). Same awk-extract-and-eval
+# idiom the source_hash() reuse above uses.
+#
+# RESIDENT_MODEL_PROCESS_PATTERN is declared `readonly` in benchmark.sh.
+# Re-evaluating that declaration here is fine: `readonly` only errors when the
+# name is ALREADY readonly, and this is a fresh shell that has never set it.
 #
 # `local_run_guard_enabled` is defined HERE, before the eval, because
 # benchmark.sh's version tests benchmark.sh's own mode flags. Shell resolves
-# function calls at call time, so the extracted acquire/release use this one.
-# Both of this script's modes are local and model-holding, so the only opt-out
-# is the documented debugging escape hatch, spelled exactly as benchmark.sh
-# spells it.
+# function calls at call time, so the extracted acquire/release/scan use this
+# one. Both of this script's modes are local and model-holding, so the only
+# opt-out is the documented debugging escape hatch, spelled exactly as
+# benchmark.sh spells it.
 LOCAL_RUN_LOCK_OWNED=""
 local_run_guard_enabled() {
   [[ "${MLXFAST_LOCAL_RUN_GUARD:-1}" != "0" ]]
 }
 run_lock_definitions="$(
+  awk '/^readonly RESIDENT_MODEL_PROCESS_PATTERN=/' benchmark.sh
   awk '/^local_run_lock_path\(\) \{/,/^\}/' benchmark.sh
   awk '/^acquire_local_run_lock\(\) \{/,/^\}/' benchmark.sh
   awk '/^release_local_run_lock\(\) \{/,/^\}/' benchmark.sh
+  awk '/^list_resident_model_processes\(\) \{/,/^\}/' benchmark.sh
+  awk '/^abort_if_model_already_resident\(\) \{/,/^\}/' benchmark.sh
 )"
-if [[ "${run_lock_definitions}" != *"mlxfast-local-benchmark-"* ]] \
-  || [[ "${run_lock_definitions}" != *"LOCAL_RUN_LOCK_OWNED="* ]]; then
-  echo "benchmark-dflash.sh: could not reuse benchmark.sh's local run lock;" >&2
+# Fail closed PER ARM. The previous check tested two sentinel strings against
+# the CONCATENATION of the extractions, which is satisfied as long as ANY arm
+# still contributes them: if the extraction of one function alone broke, both
+# sentinels were still present, the eval succeeded, and the missing function
+# surfaced later as `command not found` -- for release_local_run_lock, inside
+# the EXIT trap, which under `set -e` abandons the rest of cleanup(), stranding
+# the lock and the scratch directory the trap exists to remove. Ask each name
+# whether it is actually defined instead, so no arm can be covered by another.
+if ! eval "${run_lock_definitions}"; then
+  echo "benchmark-dflash.sh: could not evaluate benchmark.sh's local run guard definitions;" >&2
   echo "benchmark-dflash.sh: benchmark.sh has been refactored -- refusing to run unguarded" >&2
   echo "benchmark-dflash.sh: (two overlapping local runs can out-of-memory this machine)" >&2
   exit 1
 fi
-eval "${run_lock_definitions}"
+for reused_definition in \
+  local_run_lock_path \
+  acquire_local_run_lock \
+  release_local_run_lock \
+  list_resident_model_processes \
+  abort_if_model_already_resident
+do
+  if ! declare -F "${reused_definition}" >/dev/null 2>&1; then
+    echo "benchmark-dflash.sh: could not reuse benchmark.sh's ${reused_definition}();" >&2
+    echo "benchmark-dflash.sh: benchmark.sh has been refactored -- refusing to run unguarded" >&2
+    echo "benchmark-dflash.sh: (two overlapping local runs can out-of-memory this machine)" >&2
+    exit 1
+  fi
+done
+# An empty pattern is worse than a missing one: `pgrep -f ''` under `set -u`
+# aborts inside the scan's `|| true`, the scan reports a clean machine, and the
+# guard passes silently. Check the value, not just the name.
+if [[ -z "${RESIDENT_MODEL_PROCESS_PATTERN:-}" ]]; then
+  echo "benchmark-dflash.sh: could not reuse benchmark.sh's RESIDENT_MODEL_PROCESS_PATTERN;" >&2
+  echo "benchmark-dflash.sh: benchmark.sh has been refactored -- refusing to run unguarded" >&2
+  echo "benchmark-dflash.sh: (an empty pattern matches nothing, so the orphan scan would pass silently)" >&2
+  exit 1
+fi
+
+# --- scratch and local run guard: acquire -------------------------------------
+run_dir=""
+score_tmp=""
 
 cleanup() {
   # Released FIRST: the lock is what another run is waiting on, and a failure
@@ -271,6 +314,23 @@ cleanup() {
 # Armed BEFORE the scratch directory is created, so an abort between mkdir and
 # mktemp still leaves no work root behind.
 trap cleanup EXIT
+
+# Scratch, under the trap and only after the reuse above was validated -- so
+# the fail-closed arms abort before there is anything to leave behind, and
+# every abort after this point is swept up. A surviving work root is exactly
+# what `git add -A` sweeps into a submission diff.
+mkdir -p "${work_root}"
+if [[ "$(dirname "${score_path}")" != "." ]]; then
+  mkdir -p "$(dirname "${score_path}")"
+fi
+
+# Scanned BEFORE the lock is taken. An orphan holds no lock, so the lock would
+# be granted and the abort would come one step later anyway; running the scan
+# first means the run never takes a lock it is about to give back, and the
+# operator sees the accurate diagnosis (a live pid to inspect and kill) rather
+# than a lock message about a run that is already dead. WARN-AND-ABORT only --
+# benchmark.sh's rule, and it is benchmark.sh's function doing the aborting.
+abort_if_model_already_resident
 
 # Acquired once the trap can release it, and before anything expensive --
 # including the thermal gate. Holding the lock while waiting to cool is the
