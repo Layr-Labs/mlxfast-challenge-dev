@@ -1622,7 +1622,7 @@ jobs:
           # benchmark (timed) golden comes from the per-run pool selection; the
           # correctness golden stays fixed because it is an untimed gate and is
           # not what the lottery would target.
-          MLXFAST_DFLASH_CORRECTNESS_GOLDEN_R2_PATH: gautham-experiments/correctness_prompts/laguna-xs-2.1-dflash/dflash_correctness_golden_hidden.json
+          MLXFAST_DFLASH_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-dflash/dflash_correctness_golden_hidden.json
           MLXFAST_DFLASH_BENCH_GOLDEN_R2_PATH: ${{ steps.select_dflash_target.outputs.r2_path }}
           MLXFAST_DFLASH_BENCH_GOLDEN_SHA256_SELECTED: ${{ steps.select_dflash_target.outputs.sha256 }}
           MLXFAST_DFLASH_BENCH_GOLDEN_BYTES_SELECTED: ${{ steps.select_dflash_target.outputs.bytes }}

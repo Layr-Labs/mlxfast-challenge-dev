@@ -1,21 +1,30 @@
 import Foundation
 import Testing
 
-/// The R2 keys the DFlash goldens actually live under.
+/// The R2 keys the DFlash goldens actually live under, PROVEN rather than inferred.
 ///
-/// This exists because the prefix was dropped twice. The operator uploaded to
-/// `gautham-experiments/correctness_prompts/laguna-xs-2.1-dflash/`, and I twice
-/// pinned the key without the leading segment — first by assuming it was the
-/// bucket name already carried by `R2_BUCKET_ENDPOINT` (the serial keys are
-/// written with no bucket segment, which made the assumption feel safe), and
-/// then again when the corrected commit missed the merge.
+/// This constant was wrong twice, in opposite directions, because the operator's
+/// phrase "gautham-experiments/correctness_prompts/laguna-xs-2.1-dflash/" is
+/// ambiguous between a bucket-plus-key and a key: R2_BUCKET_ENDPOINT carries the
+/// bucket, and the serial keys are written with no bucket segment. I stripped the
+/// segment, then restored it when corrected, then had to strip it again.
 ///
-/// A wrong key costs a full 30–40 minute ranked dispatch to discover, so it is
-/// worth pinning rather than re-deriving. If the objects genuinely move, change
-/// this test in the same commit that moves them.
+/// Probe run 30613434387 settled it in about a minute:
+///
+///     correctness_prompts/laguna-xs-2.1-dflash/dflash_correctness_golden_hidden.json  FOUND 185394b
+///     correctness_prompts/laguna-xs-2.1-dflash/dflash_benchmark_golden_hidden.json    FOUND 185433b
+///     gautham-experiments/correctness_prompts/...                                     404 NoSuchKey
+///
+/// Those byte counts are exactly the generated goldens', and the serial control
+/// key was FOUND in the same run, so the credentials and bucket were never in
+/// question. `gautham-experiments` is the BUCKET.
+///
+/// A wrong key costs a 30-40 minute ranked dispatch to discover, which is why
+/// this is pinned and why dflash-probe-r2-keys.yml exists. If the objects move,
+/// probe first, then change this test in the same commit that moves them.
 @Suite("DFlash golden R2 keys")
 struct DFlashGoldenKeyTests {
-    private static let prefix = "gautham-experiments/correctness_prompts/laguna-xs-2.1-dflash"
+    private static let prefix = "correctness_prompts/laguna-xs-2.1-dflash"
 
     @Test
     func theCorrectnessGoldenKeyMatchesWhereItWasUploaded() throws {
