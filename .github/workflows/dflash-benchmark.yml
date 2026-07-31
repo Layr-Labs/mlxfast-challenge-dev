@@ -251,10 +251,10 @@ jobs:
       # before this change merges. The enablement gate fails closed if any
       # pin is emptied. (The R2 object KEYS are deliberately scoped to the
       # one trusted download step, exactly like the serial pipeline.)
-      MLXFAST_DFLASH_CORRECTNESS_GOLDEN_SHA256: d4fff3fe015123c395be68cb19401709ec288e44a04e52c2ea36c32220356862
-      MLXFAST_DFLASH_CORRECTNESS_GOLDEN_BYTES: "14683"
-      MLXFAST_DFLASH_BENCH_GOLDEN_SHA256: a472d6e40c3bada936fa39535753fec609d836e709db03274222a4a303ae6f58
-      MLXFAST_DFLASH_BENCH_GOLDEN_BYTES: "14982"
+      MLXFAST_DFLASH_CORRECTNESS_GOLDEN_SHA256: b991333b5a96664b2187422894dad0b0bfbe7ce3c9f4fc6b29fc0512710cfd31
+      MLXFAST_DFLASH_CORRECTNESS_GOLDEN_BYTES: "185394"
+      MLXFAST_DFLASH_BENCH_GOLDEN_SHA256: 5b9e2c4a09904391213fd2d80f4b5d1ccde39a163b88de22990ec34f3f781ad8
+      MLXFAST_DFLASH_BENCH_GOLDEN_BYTES: "185433"
       # --- REUSED SERIAL GATE CONTRACT --------------------------------------
       # Copied VERBATIM from .github/workflows/benchmark.yml. This track does not
       # own a second correctness/GPQA implementation: the four gate steps below
@@ -1566,6 +1566,24 @@ jobs:
             echo "::error::DFlash timed prompt pool is empty in ${contract}; upload the pool objects and pin them before enabling this track" >&2
             exit 1
           fi
+          # ANTI-LOTTERY FLOOR, enforced only for a run that can PUBLISH.
+          #
+          # The pool exists so a failed ranked run is not free to retry: with a
+          # single target, a submission can be resubmitted against a prompt it
+          # has already seen, which degrades every output-side gate into
+          # submit-until-green and lets a drafter-confidence threshold be tuned
+          # across attempts. The fixture's own timed_prompt_pool_note sets the
+          # floor at 8 varied targets, and nothing enforced it until now -- a
+          # one-entry pool would have ranked.
+          #
+          # A gates-only dispatch is exempt on purpose: it publishes no score,
+          # so there is no lottery to win, and requiring 8 targets to validate
+          # the pipeline would recreate exactly the chicken-and-egg the
+          # enablement split removed.
+          if [[ "${MLXFAST_RUN_BENCHMARK:-0}" == "1" && "${pool_size}" -lt 8 ]]; then
+            echo "::error::DFlash timed prompt pool has ${pool_size} target(s); a RANKED run requires at least 8 varied targets (see timed_prompt_pool_note in ${contract}). Dispatch with run_benchmark=false to validate the pipeline against a smaller pool." >&2
+            exit 1
+          fi
           # Uniform selection over [0,pool_size) from kernel entropy, rejecting
           # the biased tail of the RNG range rather than using a plain modulo.
           limit=$(( (65536 / pool_size) * pool_size ))
@@ -1604,7 +1622,7 @@ jobs:
           # benchmark (timed) golden comes from the per-run pool selection; the
           # correctness golden stays fixed because it is an untimed gate and is
           # not what the lottery would target.
-          MLXFAST_DFLASH_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/dflash_correctness_golden_laguna_xs_2_1-v1.json
+          MLXFAST_DFLASH_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-dflash/dflash_correctness_golden_hidden.json
           MLXFAST_DFLASH_BENCH_GOLDEN_R2_PATH: ${{ steps.select_dflash_target.outputs.r2_path }}
           MLXFAST_DFLASH_BENCH_GOLDEN_SHA256_SELECTED: ${{ steps.select_dflash_target.outputs.sha256 }}
           MLXFAST_DFLASH_BENCH_GOLDEN_BYTES_SELECTED: ${{ steps.select_dflash_target.outputs.bytes }}
