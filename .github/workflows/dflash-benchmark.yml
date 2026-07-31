@@ -1825,6 +1825,68 @@ jobs:
           if ((${#missing[@]})); then
             echo "::notice::DFlash correctness staging: not produced by this run: ${missing[*]}"
           fi
+
+          # CONTENT GATE. deny-private-artifacts.sh is NAME- and SIZE-based; it
+          # cannot see hidden values INSIDE a permitted filename. That is fine
+          # on the happy path, where "Validate sealed gates score" has already
+          # asserted the sealed score carries no hidden token fields -- but this
+          # step is always(), so it runs precisely when that validation did NOT.
+          #
+          # On a FAILED hidden-gates run the gates pass writes gates-score.json
+          # and exits nonzero; the validation step is then skipped, and staging
+          # would upload the raw file. Its .metrics can carry first_failing_step,
+          # expected_token and actual_token -- values derived FROM THE HIDDEN
+          # GOLDEN. Because a gates-only failure also charges no attributable-
+          # failure budget, repeating it would return one hidden token per run:
+          # an iterated oracle, which is exactly what the redactor's own header
+          # forbids ("a failing score.json must never be uploaded raw").
+          #
+          # So re-assert the sealed-score predicate HERE, inline, with the same
+          # jq that "Validate sealed gates score" uses. A score that does not
+          # satisfy it is dropped from the upload rather than failing the step:
+          # the run has already failed for its own reason, and the remaining
+          # artifacts are still worth having.
+          keep=()
+          for name in "${present[@]}"; do
+            case "${name}" in
+              gates-score.json)
+                if jq -e '
+                  .passed == true
+                  and (.metrics.error == "")
+                  and (.metrics.first_failing_case == null)
+                  and (.metrics.first_failing_layer == null)
+                  and (.metrics.first_failing_step == null)
+                  and (.metrics.expected_token == null)
+                  and (.metrics.actual_token == null)
+                  and (.metrics.expected_token_logit == null)
+                  and (.metrics.expected_token_rank == null)
+                  and (.metrics.passed_correctness == true)
+                ' "${name}" >/dev/null 2>&1; then
+                  keep+=("${name}")
+                else
+                  echo "::notice::withholding ${name}: it did not pass the sealed-score predicate, so it may carry hidden-golden token fields"
+                fi
+                ;;
+              public-gate-report.json)
+                # Its .error can embed sandboxed-worker stderr, i.e. text the
+                # SUBMITTED code controls. Serial guards the same file on
+                # submission branches; mirror that rather than inventing a
+                # weaker rule. On a non-submission ref the report is organizer
+                # output and is kept even when it records a failure.
+                if [[ "${MLXFAST_IS_SUBMISSION_BRANCH:-0}" != "1" ]] \
+                  || jq -e '(.error // "") == ""' "${name}" >/dev/null 2>&1; then
+                  keep+=("${name}")
+                else
+                  echo "::notice::withholding ${name}: non-empty .error on a submission branch may carry submitted-code output"
+                fi
+                ;;
+              *)
+                keep+=("${name}")
+                ;;
+            esac
+          done
+          present=("${keep[@]}")
+
           .github/scripts/deny-private-artifacts.sh "${present[@]}"
           staged=()
           for name in "${present[@]}"; do staged+=("${name}=${name}"); done
