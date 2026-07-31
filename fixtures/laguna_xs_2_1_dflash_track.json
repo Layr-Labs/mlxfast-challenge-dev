@@ -6,7 +6,7 @@
   "mlx_swift_lm_revision": "bc1c0ee67d15798343be17c9f8f61f7c0d977149",
   "timed_prompt_pool": [
     {
-      "r2_path": "correctness_prompts/laguna-xs-2.1-dflash/dflash_benchmark_golden_hidden.json",
+      "r2_path": "gautham-experiments/correctness_prompts/laguna-xs-2.1-dflash/dflash_benchmark_golden_hidden.json",
       "sha256": "5b9e2c4a09904391213fd2d80f4b5d1ccde39a163b88de22990ec34f3f781ad8",
       "bytes": 185433
     }
