@@ -336,6 +336,48 @@ struct DFlashEnablementInterlockTests {
         return body.joined(separator: "\n")
     }
 
+    /// A one-entry pool must not be enough to RANK, but must still be enough to
+    /// validate the pipeline. That asymmetry is the anti-lottery floor.
+    ///
+    /// Why it matters: with a single timed target a failed ranked run is free to
+    /// retry against a prompt it has already seen, which turns every output-side
+    /// gate into submit-until-green and lets a drafter-confidence threshold be
+    /// tuned across attempts. The fixture's timed_prompt_pool_note has always
+    /// said 8; nothing enforced it, so a one-entry pool would have ranked.
+    @Test
+    func aRankedRunRequiresTheFullPoolButADryRunDoesNot() throws {
+        let step = try Self.executableBody(
+            try Self.workflow(), "Select hidden DFlash timed target from the pool"
+        )
+
+        let floor = try #require(
+            step.range(of: #"pool_size}" -lt 8"#),
+            """
+            the pool-selection step has no 8-target floor, so a ranked run could \
+            be scored against a pool small enough to memorise.
+            """
+        )
+        let branch = String(step[floor.lowerBound...])
+        #expect(
+            branch.contains("exit 1"),
+            "the anti-lottery floor warns instead of refusing"
+        )
+
+        // Scoped to ranked runs: gating a DRY run on 8 targets would recreate the
+        // chicken-and-egg the enablement split removed.
+        let before = String(step[..<floor.lowerBound])
+        #expect(
+            before.hasSuffix("MLXFAST_RUN_BENCHMARK:-0}\" == \"1\" && \"${")
+                || step.contains(#"MLXFAST_RUN_BENCHMARK:-0}" == "1" && "${pool_size}" -lt 8"#),
+            """
+            the 8-target floor is not conditioned on MLXFAST_RUN_BENCHMARK, so it \
+            either blocks gates-only validation or does not protect ranked runs.
+            """
+        )
+        // The >= 1 check must survive: an EMPTY pool still fails both modes.
+        #expect(step.contains(#"pool_size}" -lt 1"#))
+    }
+
     /// The fixture must stay inert on main. This is the assertion that would
     /// catch the split being "completed" by simply flipping the flags.
     @Test
@@ -357,12 +399,40 @@ struct DFlashEnablementInterlockTests {
         let baseline = try #require(object["reference_baseline"] as? [String: Any])
         #expect(baseline["publication_allowed"] as? Bool == false)
 
-        // And the pool it fails closed on is still empty, so a ranked run could
-        // not produce a score even if both flags were flipped by accident.
+        // The pool used to be asserted EMPTY here. That was the right property
+        // expressed the wrong way: what makes the track inert is that a ranked
+        // run cannot produce a score, and "empty" was merely how it happened to
+        // be true. An empty pool also made the pipeline unvalidatable, which is
+        // the same chicken-and-egg the enablement split above removed -- so the
+        // pool now carries the generated timed golden, and the ANTI-LOTTERY
+        // FLOOR in "Select hidden DFlash timed target from the pool" is what
+        // keeps a ranked run from using it.
+        //
+        // Assert the property, not its old accident: fewer than 8 targets means
+        // no ranked run can proceed, while a gates-only dispatch can.
         let pool = object["timed_prompt_pool"] as? [Any] ?? []
         #expect(
-            pool.isEmpty,
-            "timed_prompt_pool is populated; if the operator provisioned it, update this test"
+            pool.count < 8,
+            """
+            timed_prompt_pool has \(pool.count) targets, so a RANKED run is no \
+            longer blocked by the anti-lottery floor. That is the go-live \
+            threshold: if the operator has provisioned the full pool, this test \
+            and the two flags above should change in one commit, deliberately.
+            """
         )
+        // Every entry must still be complete, or the selection step fails
+        // mid-run rather than at dispatch.
+        for (index, raw) in pool.enumerated() {
+            let entry = try #require(raw as? [String: Any], "pool entry \(index) is not an object")
+            let path = entry["r2_path"] as? String ?? ""
+            let sha = entry["sha256"] as? String ?? ""
+            let bytes = entry["bytes"] as? Int ?? 0
+            #expect(!path.isEmpty, "pool entry \(index) has no r2_path")
+            #expect(
+                sha.count == 64 && sha.allSatisfy(\.isHexDigit),
+                "pool entry \(index) sha256 is not a 64-char hex digest"
+            )
+            #expect(bytes > 0, "pool entry \(index) has no positive byte count")
+        }
     }
 }
