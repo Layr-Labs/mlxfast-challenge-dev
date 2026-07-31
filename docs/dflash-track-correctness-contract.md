@@ -2607,3 +2607,154 @@ its sibling's. Neither required a failing run, and neither would have produced
 one. Where Amendment 18's lesson was *attack your gates*, this one is narrower:
 **enumerate what a guard claims to cover and check the list**, because a guard
 that covers eleven of fourteen cases reports success on the eleven.
+
+# Amendment 24 (2026-07-30): the go-live runbook told the operator to build ranked goldens out of the material this contract condemns
+
+Amendment 10 is the most important entry in this document: it established that
+every green result on this track had been measured on greedy self-continuations,
+material with 122 distinct tokens in 512, **zero** rows with a top-2 gap below
+0.25, and a minimum gap of 1.875-2.625. Amendment 11 priced the consequence at
+**1.117x on that material versus 0.840x on prose**.
+
+`docs/dflash-go-live-runbook.md` step B — the step the ranked workflow's own
+fail-closed message points operators at, from four places — said, in full:
+
+> `dflash-reference` builds them; `--seed-generate N` extends a seed and
+> `--generate N` produces the emitted chain.
+
+`--seed-generate N` extends the seed by N **reference-generated** tokens. It is
+greedy self-continuation. So the runbook instructed the operator to freeze the
+ranked goldens out of precisely the material this contract had already measured
+and rejected, fourteen amendments earlier, in the same repository. A golden built
+that way would have advertised a speedup that does not exist, and every gate on
+this track would have passed on it — as they did before, which is the whole
+finding of Amendment 10.
+
+Nobody wrote a wrong instruction on purpose. The two documents were written for
+different readers: the contract records what was *measured*, the runbook records
+what to *do*, and `--seed-generate` is the only lever that dials seed length in a
+binary that links no tokenizer, so it is the natural thing to reach for. The
+defect is that the constraint lived only as prose in a document that was not the
+one being followed.
+
+## Resolution
+
+1. **Step B no longer describes `--seed-generate` as the way to build a seed.**
+   It marks the flag as producing degenerate material, states that the seed must
+   be pre-tokenized real prose supplied by the operator as token ids, and
+   cross-references this amendment's predecessor (Amendment 10) with the measured
+   table. Step A now describes what a seed object is, so the fail-closed pointer
+   lands somewhere that answers the question.
+
+2. **The instruction is no longer trusted to be followed.**
+   `.github/workflows/dflash-provision-goldens.yml` performs step B, and
+   `.github/scripts/check-dflash-golden-degeneracy.sh` refuses degenerate
+   material mechanically — on the operator's seed *before* ~40 minutes of
+   generation, on each golden *after* generation, and once more on the bytes
+   re-downloaded from R2. The provisioning job also asserts its own generation
+   argv contains no `--seed-generate`, and there is no dispatch input that could
+   reach the flag. With no seed named the job fails closed; it never falls back.
+
+## The thresholds, and which are measured
+
+Derived from Amendment 10's table. Stated here because a threshold whose
+justification lives only in a shell comment is a threshold that gets "cleaned up".
+
+| check | measured | threshold | measured or judgement |
+|---|---|---|---|
+| seed distinct fraction | degenerate 122/509-600 = 0.203-0.240; prose 317/512 = 0.619, and the public English fixture 276/512 = 0.539 | **≥ 0.40** | **judgement** — roughly the midpoint of the empty interval (0.240, 0.539] |
+| rows with top-2 gap < 0.25 | degenerate **0** in every sample; prose 3 per 128 positions | **≥ 1** | threshold **measured** (0 is the degenerate value; ≥ 1 is the smallest value that is not it). The `< 0.25` predicate is this document's own column |
+| minimum top-2 gap | degenerate 1.875 / 1.875 / 2.625; prose 0.0000 | **≤ 1.0** | **judgement** — roughly the midpoint of (0, 1.875) |
+
+Stated plainly, because the alternative is a guard that reads as three
+independent barriers and is not: **at these values the minimum-gap check is
+implied by the near-tie-count check.** `near_tie_rows ≥ 1` forces
+`min_gap < 0.25 < 1.0`, so the minimum gap can never be the sole cause of a
+rejection. It is retained because it is the statistic an operator reads to judge
+*how* confident the material is — 0.24 and 0.0000 pass the count check
+identically and are not the same artifact — and because it becomes load-bearing
+the moment the count check is retuned to a density or scoped to a row window. All
+three are printed on every run, pass or fail.
+
+## Attacked, not just reviewed
+
+Amendment 18's lesson was that L2 survived seventeen amendments and fell to the
+first real attack, because all the scrutiny had gone into whether it rejected
+honest work and none into whether it accepted dishonest work. So this guard was
+built the other way round: the degenerate profile was constructed from the real
+numbers in Amendment 10's table — 512 seed tokens with exactly 122 distinct, 128
+rows with no gap below 0.25 and a minimum of exactly 1.875, plus the 600/122/2.625
+`seam-b` variant — and the guard was run against it before it was run against
+anything honest. It rejects both, naming all three arms. It then accepts two
+prose profiles: Amendment 10's own 317/512 varied fixture (3 near-tie rows,
+minimum gap 0.0000) and a profile seeded with the *actual token ids* of the
+checked-in public English fixture (276/512). `DFlashGoldenProvisioningTests`
+executes the real script against all four, so the claim is re-proved on every
+`swift test` rather than resting on this paragraph.
+
+Then the guard was attacked on the side that actually matters — **what does it
+accept?** — and two answers came back, both recorded under "Residual exposure"
+rather than smoothed over:
+
+| attack | result |
+|---|---|
+| degenerate rows, seed **padded** from 122 to 384 distinct in 512 to clear the variety floor | **rejected** (exit 1) by the two row checks; the seed check passed at 0.75 |
+| prose-variety seed, exactly **one** row at gap 0.10, 127 rows at gap 8.0 | **accepted** (exit 0) — the measured-minimal `≥ 1` threshold is satisfied by one row |
+
+The first says the seed check is a pre-screen and not a verdict. The second is a
+real hole in that single check, closed only because the *seed* check is
+independent of it: a genuine greedy self-continuation cannot get 122/512 = 0.238
+past the variety floor. Neither check is sufficient alone and neither is claimed
+to be. Attacking a guard by attacking its most-cited arm is what Amendment 18
+records going wrong; the finding here is that the *conjunction* is load-bearing,
+not any one number.
+
+One more defect was found by executing rather than reading, and it was not in the
+thresholds at all: `enforce-trusted-dflash-provision-workflow.sh` was committed
+without its executable bit, so the trusted-context step would have died with exit
+126 on the first dispatch — before the interlock, and with an error naming no
+cause. A test that asserted on the workflow's text would have passed. The test
+that ran the script caught it.
+
+## Residual exposure
+
+1. **Character, not provenance.** The guard screens what the tokens look like,
+   not where they came from. Synthetic ids shaped to pass are not detected. The
+   seed is hidden operator material and its provenance stays an operator
+   responsibility. Measured by attacking the script: a degenerate golden whose
+   122-distinct seed is **padded to 384/512 with unique ids** clears the seed
+   check at 0.75 and is still rejected — by the two ROW checks. The seed check is
+   a cheap pre-screen; the row checks are the defense.
+2. **One near-tie row is enough, by design.** A prose-variety seed with exactly
+   one row at gap 0.10 and 127 rows at 8.0 is **accepted** (attacked, exit 0).
+   That is what choosing the measured-minimal threshold over a density buys: a
+   density floor would reject honest prose that runs confidently, and one prose
+   sample cannot set one. What makes it tolerable is not this check — a real
+   greedy self-continuation must also get its seed past the variety floor, and
+   122/512 = 0.238 does not. The near-tie count is not sufficient on its own and
+   is not claimed to be.
+3. **Chain-tail drift is reported, not gated.** A 512-token greedy chain grown
+   from an honest prose seed can still drift toward repetition near its tail. No
+   measurement in this document sizes that drift, so the emitted chain's distinct
+   count is printed and explicitly not thresholded. Inventing a number here would
+   be the same mistake in the other direction.
+4. **The prose side rests on two samples.** 317/512 and 276/512. A third prose
+   sample below 0.40 means 0.40 is too high, not that the sample is degenerate;
+   re-derive the constant rather than overriding it at a call site. The constants
+   are `readonly` in the script and are deliberately not env-overridable.
+5. **The provisioning job itself is unexecuted.** It could not be dispatched
+   while writing this (a dispatch costs 30-40 minutes of the single DFlash
+   runner, and would fail immediately on the missing seed objects). Its
+   interlock, input, seed-shape, verification and degeneracy steps are executed
+   in tests against staged files; its bench-exec generation step, its R2 upload
+   and its re-download are not. The first real dispatch is step B, and it should
+   be treated as such.
+
+## Method note
+
+This was found by reading the runbook against the contract — one document's
+instructions against the other's measurements — not by running anything. The
+generalisation is narrow and worth keeping: **an instruction is part of the
+contract's attack surface.** A measured prohibition that lives only in the
+document nobody is following at the moment of the decision is not a control, and
+it took fourteen amendments for anyone to read the two side by side.
