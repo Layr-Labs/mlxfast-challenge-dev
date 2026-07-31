@@ -169,6 +169,19 @@ struct DFlashDryRunReachesItsGateTests {
             ("empty pool", #"{"timed_prompt_pool":[]}"#),
             ("pool key absent", #"{"track_id":"laguna-xs-2.1-dflash-v1"}"#),
             ("pool is null", #"{"timed_prompt_pool":null}"#),
+            // Not an array: `length` on an object counts its keys, so a mapping
+            // with 8 keys would clear a length floor while `[$i]` indexes
+            // nothing.
+            ("pool is an object", #"{"timed_prompt_pool":{"a":1,"b":2}}"#),
+            ("entry is not an object", #"{"timed_prompt_pool":["p/a.json"]}"#),
+            (
+                "entry sha256 is not a 64-char hex digest",
+                #"{"timed_prompt_pool":[{"r2_path":"p/a.json","sha256":"aa","bytes":10}]}"#
+            ),
+            (
+                "entry bytes is zero",
+                #"{"timed_prompt_pool":[{"r2_path":"p/a.json","sha256":"\#(String(repeating: "a", count: 64))","bytes":0}]}"#
+            ),
             (
                 "entry missing sha256",
                 #"{"timed_prompt_pool":[{"r2_path":"p/a.json","bytes":10}]}"#
@@ -179,43 +192,55 @@ struct DFlashDryRunReachesItsGateTests {
             ),
         ]
 
+        // Run each case BOTH ways. The 8-distinct-target floor is ranked-only,
+        // so asserting refusal on a ranked dispatch alone would not distinguish
+        // "this pool is unusable" from "this pool is merely too small" -- every
+        // case here has at most one entry. A pool with nothing to sample from is
+        // unusable in both modes.
         for (label, contract) in cases {
-            let result = try runSelectionStep(contract: contract)
-            #expect(
-                result.exitStatus != 0,
-                """
-                'Select hidden DFlash timed target from the pool' ADMITTED a \
-                ranked run with \(label). Scoping this step to the ranked path \
-                must not relax it: an unusable pool on a ranked dispatch means \
-                there is no per-run sampling, which is contract layer L6's whole \
-                defence against submit-until-green.
-                """
-            )
-            #expect(
-                result.output.contains("::error::"),
-                "\(label): the refusal must annotate as an error"
-            )
-            #expect(
-                result.githubOutput.isEmpty,
-                """
-                \(label): the step emitted step outputs while refusing, so \
-                'Prepare hidden DFlash goldens' would receive a half-formed \
-                selection.
-                """
-            )
+            for ranked in [true, false] {
+                let mode = ranked ? "ranked" : "gates-only"
+                let result = try runSelectionStep(contract: contract, ranked: ranked)
+                #expect(
+                    result.exitStatus != 0,
+                    """
+                    'Select hidden DFlash timed target from the pool' ADMITTED a \
+                    \(mode) run with \(label). Scoping this step to the ranked \
+                    path must not relax it: an unusable pool on a ranked dispatch \
+                    means there is no per-run sampling, which is contract layer \
+                    L6's whole defence against submit-until-green -- and an \
+                    unusable pool on a dry run means the dry run validated a \
+                    selection that cannot happen.
+                    """
+                )
+                #expect(
+                    result.output.contains("::error::"),
+                    "\(label) (\(mode)): the refusal must annotate as an error"
+                )
+                #expect(
+                    result.githubOutput.isEmpty,
+                    """
+                    \(label) (\(mode)): the step emitted step outputs while \
+                    refusing, so 'Prepare hidden DFlash goldens' would receive a \
+                    half-formed selection.
+                    """
+                )
+            }
         }
     }
 
     /// ...and still samples successfully from a real pool, privately.
+    ///
+    /// Eight distinct, well-formed entries, because that is what a ranked
+    /// dispatch is now required to have: the anti-lottery floor counts distinct
+    /// sha256 digests and distinct r2_path keys, and every entry must carry a
+    /// 64-character lowercase hex digest and a positive byte count. The
+    /// three-entry pool with `"sha256":"aaa"` this replaces was only accepted
+    /// because the case ran with `MLXFAST_RUN_BENCHMARK` unset -- i.e. it was
+    /// never testing the ranked path its name claims.
     @Test
     func aRankedSelectionSamplesFromAPopulatedPool() throws {
-        let contract = """
-            {"timed_prompt_pool":[
-              {"r2_path":"correctness_prompts/dflash-timed-a.json","sha256":"aaa","bytes":11},
-              {"r2_path":"correctness_prompts/dflash-timed-b.json","sha256":"bbb","bytes":22},
-              {"r2_path":"correctness_prompts/dflash-timed-c.json","sha256":"ccc","bytes":33}
-            ]}
-            """
+        let contract = DFlashWorkflowStep.distinctPool(8)
         var seenPaths = Set<String>()
         for _ in 0 ..< 12 {
             let result = try runSelectionStep(contract: contract)
@@ -225,7 +250,7 @@ struct DFlashDryRunReachesItsGateTests {
             let path = try #require(outputs["r2_path"], "no r2_path output")
             #expect(outputs["sha256"] != nil && outputs["bytes"] != nil)
             #expect(
-                ["a", "b", "c"].contains(where: { path.hasSuffix("dflash-timed-\($0).json") }),
+                (0 ..< 8).contains(where: { path.hasSuffix("timed-\($0).json") }),
                 "selection returned a path that is not in the pool: \(path)"
             )
             // The sampled index must never reach the participant-visible log.
@@ -239,8 +264,8 @@ struct DFlashDryRunReachesItsGateTests {
         #expect(
             seenPaths.count > 1,
             """
-            12 ranked selections over a 3-entry pool returned one entry every \
-            time (p < 1e-5 if uniform). Per-run sampling is contract layer L6; \
+            12 ranked selections over an 8-entry pool returned one entry every \
+            time (p ~ 1e-10 if uniform). Per-run sampling is contract layer L6; \
             a constant selection is a frozen timed prompt with extra steps.
             """
         )
@@ -365,45 +390,16 @@ struct DFlashDryRunReachesItsGateTests {
 
     // MARK: - execution harnesses
 
-    private struct StepResult {
-        var exitStatus: Int32
-        var output: String
-        var githubOutput: String
-        var selectionAudit: String?
-    }
-
-    private func runSelectionStep(contract: String) throws -> StepResult {
-        let sandbox = try Sandbox()
-        defer { sandbox.destroy() }
-
-        let contractURL = sandbox.root.appendingPathComponent("contract.json")
-        try contract.write(to: contractURL, atomically: true, encoding: .utf8)
-        let privateDir = sandbox.root.appendingPathComponent("private")
-        try FileManager.default.createDirectory(at: privateDir, withIntermediateDirectories: true)
-        let githubOutput = sandbox.root.appendingPathComponent("github_output")
-        FileManager.default.createFile(atPath: githubOutput.path, contents: nil)
-
-        let body = try Self.rawRunBody(try Self.workflow(), Self.selectionStep)
-        let run = try Self.bash(
-            body,
-            cwd: sandbox.root,
-            env: [
-                "MLXFAST_DFLASH_CONTRACT_PATH": contractURL.path,
-                "MLXFAST_PRIVATE_DIR": privateDir.path,
-                "GITHUB_OUTPUT": githubOutput.path,
-            ]
-        )
-        return StepResult(
-            exitStatus: run.status,
-            output: run.output,
-            githubOutput: (try? String(contentsOf: githubOutput, encoding: .utf8)) ?? "",
-            selectionAudit: try? String(
-                contentsOf: privateDir.appendingPathComponent(
-                    "dflash_timed_target_selection.json"
-                ),
-                encoding: .utf8
-            )
-        )
+    /// The selection step's runner lives in `DFlashWorkflowStep` because
+    /// `DFlashEnablementInterlockTests` runs the same step for the anti-lottery
+    /// floor. `ranked: true` sets `MLXFAST_RUN_BENCHMARK=1` the way the job env
+    /// does -- these cases are all named "ranked", and before this they left the
+    /// variable unset, which silently exercised the dry-run arm of the body.
+    private func runSelectionStep(
+        contract: String,
+        ranked: Bool = true
+    ) throws -> DFlashWorkflowStep.SelectionResult {
+        try DFlashWorkflowStep.runSelection(contract: contract, ranked: ranked)
     }
 
     private struct Selection {

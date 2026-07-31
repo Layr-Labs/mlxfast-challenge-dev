@@ -336,46 +336,321 @@ struct DFlashEnablementInterlockTests {
         return body.joined(separator: "\n")
     }
 
-    /// A one-entry pool must not be enough to RANK, but must still be enough to
-    /// validate the pipeline. That asymmetry is the anti-lottery floor.
+    // MARK: - behavioural: the anti-lottery floor, executed
+
+    /// A pool the participant could memorise must not be enough to RANK, but
+    /// must still be enough to validate the pipeline. That asymmetry is the
+    /// anti-lottery floor.
     ///
     /// Why it matters: with a single timed target a failed ranked run is free to
     /// retry against a prompt it has already seen, which turns every output-side
     /// gate into submit-until-green and lets a drafter-confidence threshold be
     /// tuned across attempts. The fixture's timed_prompt_pool_note has always
-    /// said 8; nothing enforced it, so a one-entry pool would have ranked.
+    /// said 8 DISTINCT targets.
+    ///
+    /// This test RUNS the step. The version it replaces read the step's text,
+    /// and that is exactly why it is gone. It extracted everything from the
+    /// floor's comparison to the END of the step and asserted the slice
+    /// contained "exit 1" -- which the per-entry completeness check further down
+    /// satisfies all by itself. Replacing the floor's own `exit 1` with a
+    /// `::warning::`, so that a one-entry pool RANKS, left all four of its
+    /// assertions passing and the whole 582-test suite green. Prose cannot
+    /// satisfy an exit status.
     @Test
-    func aRankedRunRequiresTheFullPoolButADryRunDoesNot() throws {
-        let step = try Self.executableBody(
-            try Self.workflow(), "Select hidden DFlash timed target from the pool"
+    func aRankedRunRequiresEightDistinctTimedTargets() throws {
+        // (label, contract, expect the step to admit the dispatch)
+        let cases: [(String, String, Bool)] = [
+            ("a one-entry pool", DFlashWorkflowStep.distinctPool(1), false),
+            ("seven distinct targets", DFlashWorkflowStep.distinctPool(7), false),
+            // F3: pool LENGTH 8, anti-lottery value zero. Eight dispatches of
+            // dflash-provision-goldens.yml against one bench_seed_r2_path
+            // produce exactly this, so it is the operator-error case, not just
+            // the adversarial one.
+            (
+                "today's single golden listed eight times",
+                DFlashWorkflowStep.clonedPool(8), false
+            ),
+            // The same content re-uploaded under eight different keys. Distinct
+            // r2_path, one distinct digest: still one prompt.
+            (
+                "eight keys, one digest",
+                DFlashWorkflowStep.pool(
+                    (0 ..< 8).map {
+                        #"{"r2_path":"correctness_prompts/laguna-xs-2.1-dflash/k\#($0).json","#
+                            + #""sha256":"5b9e2c4a09904391213fd2d80f4b5d1ccde39a163b88de22990ec34f3f781ad8","#
+                            + #""bytes":185433}"#
+                    }
+                ), false
+            ),
+            // One key listed eight times with eight digests: not a wider pool,
+            // and it biases the sampling toward whichever object that key holds.
+            (
+                "one key, eight digests",
+                DFlashWorkflowStep.pool(
+                    (0 ..< 8).map {
+                        #"{"r2_path":"correctness_prompts/laguna-xs-2.1-dflash/same.json","#
+                            + #""sha256":"\#(String(repeating: "\($0)", count: 64))","#
+                            + #""bytes":\#(1000 + $0)}"#
+                    }
+                ), false
+            ),
+            // F4: eight distinct targets, one of them malformed. Under the old
+            // sample-then-validate order this ranked on 7 dispatches in 8.
+            (
+                "eight distinct targets, one with no sha256",
+                DFlashWorkflowStep.pool(
+                    (0 ..< 8).map {
+                        $0 == 3
+                            ? #"{"r2_path":"correctness_prompts/laguna-xs-2.1-dflash/timed-3.json","bytes":1003}"#
+                            : DFlashWorkflowStep.entry(seed: $0)
+                    }
+                ), false
+            ),
+            // The pool the floor exists to admit.
+            ("eight distinct well-formed targets", DFlashWorkflowStep.distinctPool(8), true),
+        ]
+
+        for (label, contract, expectAdmit) in cases {
+            let result = try DFlashWorkflowStep.runSelection(contract: contract, ranked: true)
+            #expect(
+                result.admitted == expectAdmit,
+                """
+                the timed-target selection step \(result.admitted ? "ADMITTED" : "REFUSED") \
+                a RANKED dispatch against \(label), expected \
+                \(expectAdmit ? "ADMIT" : "REFUSE"). The anti-lottery floor must \
+                count DISTINCT targets -- unique sha256 AND unique r2_path -- \
+                because pool length is satisfiable without widening the pool at \
+                all, and every entry must be well formed BEFORE sampling, \
+                because validating only the sampled entry gives a pool of N \
+                one-in-N coverage. Output:
+                \(result.output)
+                """
+            )
+            guard !expectAdmit else { continue }
+            #expect(
+                result.output.contains("::error::"),
+                "\(label): the refusal must annotate as a workflow error"
+            )
+            #expect(
+                result.githubOutput.isEmpty,
+                """
+                \(label): the step emitted selection outputs while refusing, so \
+                'Prepare hidden DFlash goldens' would receive a target the floor \
+                rejected.
+                """
+            )
+        }
+    }
+
+    /// A malformed pool must be refused on EVERY dispatch, not on one in N.
+    ///
+    /// The step used to validate only the SAMPLED entry, which gives a pool of
+    /// N one-in-N coverage. Measured against an 8-entry pool whose entry[3]
+    /// carried no sha256: 39 of 40 ranked selections were ADMITTED. The one that
+    /// was not died ~25 minutes into a ranked job and read as a flake.
+    ///
+    /// One draw cannot distinguish "validated the pool" from "happened to draw
+    /// the bad entry", so this draws repeatedly. Under sample-then-validate the
+    /// probability of 24 consecutive refusals is 8^-24; under validate-then-
+    /// sample it is 1.
+    @Test
+    func aMalformedPoolEntryIsRefusedOnEveryDispatchNotOneInEight() throws {
+        let contract = DFlashWorkflowStep.pool(
+            (0 ..< 8).map {
+                $0 == 3
+                    ? #"{"r2_path":"correctness_prompts/laguna-xs-2.1-dflash/timed-3.json","bytes":1003}"#
+                    : DFlashWorkflowStep.entry(seed: $0)
+            }
+        )
+        var admitted = 0
+        for _ in 0 ..< 24 {
+            let result = try DFlashWorkflowStep.runSelection(contract: contract, ranked: true)
+            if result.admitted { admitted += 1 }
+        }
+        #expect(
+            admitted == 0,
+            """
+            \(admitted) of 24 ranked selections were ADMITTED against an \
+            8-entry pool whose entry[3] has no sha256. Per-entry completeness \
+            must be checked over EVERY entry BEFORE sampling: a pool is either \
+            well formed or it is not, and that is a property of the dispatch, \
+            not of the draw. Validating only the sampled entry turns a fixture \
+            bug into an intermittent mid-run failure that costs a ranked slot \
+            and looks like flake.
+            """
+        )
+    }
+
+    /// The refusal has to say WHICH coordinate is short and BY HOW MUCH, or the
+    /// operator's next move is a guess. "8 targets" and "8 distinct targets"
+    /// look identical from a log line that only reports the length.
+    @Test
+    func theFloorNamesTheCoordinateThatIsShort() throws {
+        let cloned = try DFlashWorkflowStep.runSelection(
+            contract: DFlashWorkflowStep.clonedPool(8), ranked: true
+        )
+        #expect(cloned.output.contains("distinct sha256"))
+        #expect(cloned.output.contains("distinct r2_path"))
+        #expect(
+            cloned.output.contains("short by 7"),
+            """
+            the refusal does not quantify the shortfall, so a pool of 8 clones \
+            and a pool of 7 distinct targets read the same in the log. Output:
+            \(cloned.output)
+            """
         )
 
-        let floor = try #require(
-            step.range(of: #"pool_size}" -lt 8"#),
+        let malformed = try DFlashWorkflowStep.runSelection(
+            contract: DFlashWorkflowStep.pool([
+                DFlashWorkflowStep.entry(seed: 0),
+                #"{"r2_path":"correctness_prompts/laguna-xs-2.1-dflash/timed-1.json","bytes":1001}"#,
+            ]),
+            ranked: true
+        )
+        // A missing sha256 must be diagnosed as MALFORMED, not laundered into
+        // the distinct count. `[null, "aa..."] | unique | length` is 2, so an
+        // entry-less digest would otherwise read as "one fewer distinct target"
+        // -- a true number attached to the wrong diagnosis, which is how a
+        // malformed pool gets "fixed" by adding more entries.
+        #expect(
+            malformed.output.contains("malformed") && malformed.output.contains("entry 1"),
             """
-            the pool-selection step has no 8-target floor, so a ranked run could \
-            be scored against a pool small enough to memorise.
+            an entry with no sha256 was not reported as malformed by index. \
+            Output:
+            \(malformed.output)
             """
         )
-        let branch = String(step[floor.lowerBound...])
+    }
+
+    /// The exemption a gates-only dispatch enjoys comes from the step's own
+    /// `if:`, NOT from the `MLXFAST_RUN_BENCHMARK` conjunct inside it.
+    ///
+    /// The test this replaces asserted the conjunct with the rationale that
+    /// without it the floor "either blocks gates-only validation or does not
+    /// protect ranked runs". That rationale was false: the step-level
+    /// `if: ${{ inputs.run_benchmark }}` already means a gates-only dispatch
+    /// never reaches the body, so the conjunct can never be false where it is
+    /// evaluated. Keeping it is defence in depth for a future in which the `if:`
+    /// is widened or the body is lifted elsewhere -- but the `if:` is the thing
+    /// that actually grants the exemption, so the `if:` is what gets pinned.
+    ///
+    /// Stated honestly: the first assertion here reads the condition rather
+    /// than executing GitHub's evaluation of it. The executed form lives in
+    /// `DFlashDryRunReachesItsGateTests`, whose step-set evaluator computes the
+    /// real `if:` expressions and asserts that a `run_benchmark=false` dispatch
+    /// does not run this step at all. What this test adds is the exact
+    /// condition, so a rewrite to something that happens to evaluate true for a
+    /// dry run does not slip past a step-set that only checks membership.
+    @Test
+    func aGatesOnlyDispatchIsExemptedByTheStepsOwnCondition() throws {
+        let condition = try DFlashWorkflowStep.condition(
+            try Self.workflow(), DFlashWorkflowStep.selectionStep
+        )
         #expect(
-            branch.contains("exit 1"),
-            "the anti-lottery floor warns instead of refusing"
+            condition == "${{ inputs.run_benchmark }}",
+            """
+            '\(DFlashWorkflowStep.selectionStep)' no longer carries \
+            `if: ${{ inputs.run_benchmark }}` (found \(condition ?? "no condition")). \
+            That condition is what exempts a gates-only dry run from the \
+            8-distinct-target floor; without it the dry run dies red on main's \
+            deliberately sub-floor pool, one step short of the only \
+            DFlash-specific gate it exists to exercise.
+            """
         )
 
-        // Scoped to ranked runs: gating a DRY run on 8 targets would recreate the
-        // chicken-and-egg the enablement split removed.
-        let before = String(step[..<floor.lowerBound])
+        // Defence in depth, executed: with the step-level `if:` bypassed -- as
+        // it is here, and as it would be by a future edit that widens it -- the
+        // env conjunct still lets a sub-floor pool through for validation.
+        let dryRun = try DFlashWorkflowStep.runSelection(
+            contract: DFlashWorkflowStep.distinctPool(1), ranked: false
+        )
         #expect(
-            before.hasSuffix("MLXFAST_RUN_BENCHMARK:-0}\" == \"1\" && \"${")
-                || step.contains(#"MLXFAST_RUN_BENCHMARK:-0}" == "1" && "${pool_size}" -lt 8"#),
+            dryRun.admitted,
             """
-            the 8-target floor is not conditioned on MLXFAST_RUN_BENCHMARK, so it \
-            either blocks gates-only validation or does not protect ranked runs.
+            the anti-lottery floor refused a NON-ranked invocation of the step \
+            body against a one-entry pool. Requiring 8 targets to validate the \
+            pipeline recreates exactly the chicken-and-egg the enablement split \
+            removed. Output:
+            \(dryRun.output)
             """
         )
-        // The >= 1 check must survive: an EMPTY pool still fails both modes.
-        #expect(step.contains(#"pool_size}" -lt 1"#))
+
+        // ...but the >= 1 fail-closed check is NOT ranked-scoped: an empty pool
+        // still fails both modes.
+        for (label, contract) in [
+            ("an empty pool", #"{"timed_prompt_pool":[]}"#),
+            ("a missing pool", #"{"track_id":"laguna-xs-2.1-dflash-v1"}"#),
+        ] {
+            let result = try DFlashWorkflowStep.runSelection(contract: contract, ranked: false)
+            #expect(
+                !result.admitted,
+                """
+                the step admitted a non-ranked dispatch against \(label). The \
+                >= 1 fail-closed check must survive the ranked-only scoping of \
+                the floor: there is nothing to sample from. Output:
+                \(result.output)
+                """
+            )
+            // Non-zero is not enough. Delete the >= 1 check and the step still
+            // exits non-zero -- but as `division by 0` from the rejection-
+            // sampling range, or as a raw jq error, ~25 minutes into a job.
+            // Requiring the annotation is what keeps the refusal NAMED.
+            #expect(
+                result.output.contains("::error::"),
+                """
+                \(label) was refused without a ::workflow error:: annotation, so \
+                the run summary shows a bash or jq crash rather than "the pool \
+                is empty". Output:
+                \(result.output)
+                """
+            )
+        }
+    }
+
+    /// Everything in this suite that reads the contract reads the HARDCODED
+    /// path `fixtures/laguna_xs_2_1_dflash_track.json`. The workflow does not:
+    /// both publish checks, the `>= 1` fail-closed check and the anti-lottery
+    /// floor all resolve the contract through `MLXFAST_DFLASH_CONTRACT_PATH`.
+    ///
+    /// Nothing pinned that binding, so the inertness argument rested on an
+    /// unpinned indirection. Measured: repointing that one workflow line at a
+    /// second JSON with `official_scoring_enabled: true`,
+    /// `publication_allowed: true` and an eight-entry pool defeats all four
+    /// locks with 582/582 still green. Pin the binding, and the file this suite
+    /// reads is the file the workflow uses.
+    @Test
+    func theWorkflowResolvesTheContractToTheFixtureThisSuiteReads() throws {
+        for path in [Self.workflowPath, ".github/workflows/dflash-provision-goldens.yml"] {
+            let text = try String(contentsOfFile: path, encoding: .utf8)
+            let bindings = Self.contractPathBindings(text)
+            #expect(
+                bindings == [Self.fixturePath],
+                """
+                \(path) binds MLXFAST_DFLASH_CONTRACT_PATH to \(bindings), not \
+                exactly [\(Self.fixturePath)]. Every DFlash lock -- the two \
+                enablement flag checks, the >= 1 fail-closed check and the \
+                anti-lottery floor -- reads whatever that variable names, while \
+                theTrackFixtureRemainsInertOnMain reads the hardcoded fixture. \
+                If the two can diverge, the inertness this suite asserts is \
+                about a file the ranked job does not read.
+                """
+            )
+        }
+    }
+
+    /// Every `MLXFAST_DFLASH_CONTRACT_PATH: <value>` YAML binding in a workflow.
+    ///
+    /// Matched with a colon, so the shell assignment
+    /// `MLXFAST_DFLASH_CONTRACT_PATH="${MLXFAST_DFLASH_CONTRACT_PATH}"` that
+    /// forwards the value into a sandboxed command is correctly ignored -- it
+    /// re-exports the binding rather than choosing it.
+    private static func contractPathBindings(_ workflow: String) -> [String] {
+        let pattern = "(?m)^[ ]*MLXFAST_DFLASH_CONTRACT_PATH:[ ]*(\\S+)[ ]*$"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(workflow.startIndex..., in: workflow)
+        return regex.matches(in: workflow, range: range).compactMap {
+            Range($0.range(at: 1), in: workflow).map { String(workflow[$0]) }
+        }
     }
 
     /// The fixture must stay inert on main. This is the assertion that would
@@ -408,29 +683,38 @@ struct DFlashEnablementInterlockTests {
         // FLOOR in "Select hidden DFlash timed target from the pool" is what
         // keeps a ranked run from using it.
         //
-        // Assert the property, not its old accident: fewer than 8 targets means
-        // no ranked run can proceed, while a gates-only dispatch can.
+        // Assert the property, not its old accident: fewer than 8 DISTINCT
+        // targets means no ranked run can proceed, while a gates-only dispatch
+        // can. Distinctness, not length -- the floor counts unique sha256 and
+        // unique r2_path, so "8 entries" is not the go-live threshold and a
+        // length-only assertion here would call a pool of 8 clones ready.
         let pool = object["timed_prompt_pool"] as? [Any] ?? []
+        let entries = pool.compactMap { $0 as? [String: Any] }
+        let distinctDigests = Set(entries.compactMap { $0["sha256"] as? String }).count
+        let distinctKeys = Set(entries.compactMap { $0["r2_path"] as? String }).count
         #expect(
-            pool.count < 8,
+            distinctDigests < 8 || distinctKeys < 8,
             """
-            timed_prompt_pool has \(pool.count) targets, so a RANKED run is no \
-            longer blocked by the anti-lottery floor. That is the go-live \
-            threshold: if the operator has provisioned the full pool, this test \
-            and the two flags above should change in one commit, deliberately.
+            timed_prompt_pool has \(distinctDigests) distinct digests over \
+            \(distinctKeys) distinct keys, so a RANKED run is no longer blocked \
+            by the anti-lottery floor. That is the go-live threshold: if the \
+            operator has provisioned the full pool, this test and the two flags \
+            above should change in one commit, deliberately.
             """
         )
-        // Every entry must still be complete, or the selection step fails
-        // mid-run rather than at dispatch.
-        for (index, raw) in pool.enumerated() {
-            let entry = try #require(raw as? [String: Any], "pool entry \(index) is not an object")
+        // Every entry must still be complete -- in the same shape the selection
+        // step enforces, so the fixture and the workflow cannot disagree about
+        // what "well formed" means. A dispatch-time refusal there would be a
+        // fixture bug this test should have caught.
+        #expect(entries.count == pool.count, "a pool entry is not a JSON object")
+        for (index, entry) in entries.enumerated() {
             let path = entry["r2_path"] as? String ?? ""
             let sha = entry["sha256"] as? String ?? ""
             let bytes = entry["bytes"] as? Int ?? 0
             #expect(!path.isEmpty, "pool entry \(index) has no r2_path")
             #expect(
-                sha.count == 64 && sha.allSatisfy(\.isHexDigit),
-                "pool entry \(index) sha256 is not a 64-char hex digest"
+                sha.count == 64 && sha.allSatisfy { "0123456789abcdef".contains($0) },
+                "pool entry \(index) sha256 is not a 64-character LOWERCASE hex digest"
             )
             #expect(bytes > 0, "pool entry \(index) has no positive byte count")
         }
