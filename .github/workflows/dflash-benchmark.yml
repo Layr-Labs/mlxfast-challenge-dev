@@ -38,12 +38,14 @@ name: dflash-benchmark
 #   - ranked decode window: 512 parent-counted tokens (contract max);
 #   - aggregation: RATIO-OF-MEANS across accepted pairs —
 #       score = mean(serial s/tok) / mean(dflash s/tok);
-#   - floor: aggregate >= 0.52 (floor applies to the aggregate, not per pair).
+#   - floor: aggregate >= 0.55 (floor applies to the aggregate, not per pair).
 #     NOT 1.0: block decode spends compute per DECLARED row, and the ranked
 #     golden's ~34% draft acceptance does not amortise it, so an unmodified
-#     candidate measures 0.5493 (measured M5 2026-07-31, 4/4 pairs). See the
-#     contract fixture's proposed_scoring.component_floor for the derivation,
-#     and Amendment 26 for why the earlier 0.80/0.840x derivation did not hold.
+#     candidate measures 0.5882 at the ranked window (512 tokens, K=2, 4/4
+#     pairs, M5 2026-07-31). See the contract fixture's
+#     proposed_scoring.component_floor for the derivation, Amendment 26 for why
+#     0.80 did not hold, and Amendment 28 for why 0.52 (derived at a 128-token
+#     window) did not either.
 #   - pairs: minimum 3 accepted, target 4, alternating order;
 #   - stall guardrail: a run with max block latency > 4x its p50 is rejected
 #     as measurement-invalid, with one gated retry (owned by measure-dflash-job,
@@ -77,7 +79,7 @@ name: dflash-benchmark
 #        score = dflash_decode_speedup
 #              = mean(serial s/tok over accepted pairs)
 #                / mean(dflash s/tok over accepted pairs)   [ratio-of-means]
-#        floor >= 0.52 on that aggregate, hard (see above: 1.0 -- and the
+#        floor >= 0.55 on that aggregate, hard (see above: 1.0 -- and the
 #        superseded 0.80 -- reject a CORRECT no-op here, not regressions);
 #        bit-exact gate: parity_all_ok must be true across every timed run.
 #      There is no prefill component: the DFlash protocol charges seed prefill
@@ -224,31 +226,35 @@ jobs:
       # serial decode does not rank) and applies to the ratio-of-means
       # aggregate over the accepted pairs.
       #
-      # Block size 3, derived from LONG-CONTEXT measurement -- not from the
-      # short-prompt sweep that originally suggested 8. Measured on M5-C with a
-      # 1755-token prompt (64 decode tokens, base 81.5 tok/s):
-      #   K=2 0.82x | K=3 1.09x | K=4 1.06x | K=6 0.95x | K=8 0.92x | K=16 0.79x
-      # Acceptance saturates at ~1.33 accepted drafts for every K >= 6, so larger
-      # blocks only add wasted verify rows. K=8 -- the short-prompt optimum, where
-      # it reached 1.86x -- sits BELOW the 1.0 floor at realistic context. See
-      # docs/dflash-track-correctness-contract.md Amendment 5.
-      MLXFAST_DFLASH_BLOCK_SIZE: "3"
+      # Block size 2, measured on the RANKED HIDDEN GOLDEN 2026-07-31 -- the
+      # third re-derivation of K, each time because the optimum follows the
+      # material's draft-acceptance rate: the short-prompt sweep said 8 (1.86x),
+      # the 1755-token fixture said 3 (K=2 0.82x | K=3 1.09x | K=4 1.06x |
+      # K=8 0.92x, Amendment 5), and the ranked golden at ~34% acceptance says 2
+      # (no-op 0.6201 vs K=3's 0.5493 at 128 tokens, confirmed at the ranked
+      # 512-token window -- Amendment 28). At 34% acceptance the third verify row
+      # is almost always wasted compute. K must be RE-DERIVED across the whole
+      # pool when timed_prompt_pool is populated, exactly like the floor: a K
+      # tuned to one prompt is the same trap as a floor tuned to one prompt.
+      MLXFAST_DFLASH_BLOCK_SIZE: "2"
       MLXFAST_DFLASH_DECODE_TOKENS: "512"
       MLXFAST_DFLASH_CORRECTNESS_TOKENS: "512"
-      # 0.52, matching scoring.decodeSpeedupFloor in benchmark.dflash.json, the
+      # 0.55, matching scoring.decodeSpeedupFloor in benchmark.dflash.json, the
       # contract fixture, and MIN_ACCEPTED_SPEEDUP in the box wrapper. This is a
       # FIFTH place the floor lives: the score is recomputed here in the trusted
       # shell from the sealed per-side means and gated against this value, so a
-      # 1.0 here would override the 0.52 everywhere else at go-live. On this track
+      # 1.0 here would override the 0.55 everywhere else at go-live. On this track
       # 1.0 is not the no-change line -- block decode spends compute per DECLARED
-      # row, and the ranked golden's ~34% draft acceptance does not amortise it:
-      # 1.8125 declared rows per emitted token against a 1.8206 observed slowdown,
-      # agreeing to under 0.5%, so per-row cost dominates. An unmodified candidate
-      # measures 0.5493 (measured end-to-end 2026-07-31 on the ranked golden:
-      # 4/4 pairs, 0.5484/0.5496/0.5509/0.5482) and 0.6201 at K=2. The former 0.80
-      # came from 0.840x at ~69% acceptance on a DIFFERENT golden and rejected a
-      # correct no-op -- see contract Amendment 26.
-      MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: "0.52"
+      # row, and the ranked golden's ~34% draft acceptance does not amortise it.
+      # Derived at the ACTUAL ranked window (512 decode tokens, K=2, 4/4 pairs,
+      # measured 2026-07-31 on the ranked golden): an unmodified candidate scores
+      # 0.5882 (pairs 0.5873/0.5868/0.5889/0.5898, spread 0.5%), and the floor is
+      # 0.5882 x 0.952 = 0.560, floored to 0.55. Two superseded derivations, both
+      # measured at the WRONG WINDOW: 0.80 came from 0.840x at ~69% acceptance on
+      # a different golden; 0.52 came from 0.5493 at K=3 over a 128-token window,
+      # and s/token ratios do not transfer across window lengths because the seed
+      # prefill is charged inside the decode window. See Amendments 26 and 28.
+      MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: "0.55"
       MLXFAST_DFLASH_MIN_ACCEPTED_PAIRS: "3"
       MLXFAST_DFLASH_TARGET_PAIRS: "4"
       # Contract layer L6: attributable ranked failures allowed per submission
@@ -2298,7 +2304,7 @@ jobs:
           speedup="$(jq -r '.aggregate.baseline_serial_seconds_per_token_mean / .aggregate.candidate_dflash_seconds_per_token_mean' "${results}")"
           floor_ok="$(echo "${speedup} >= ${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR}" | bc -l)"
           if [[ "${floor_ok}" != "1" ]]; then
-            echo "::error::dflash_decode_speedup (ratio-of-means) ${speedup} is below the ${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR} floor; block decode spends compute per declared row and the ranked golden's ~34% draft acceptance does not amortise it, so this floor is the unmodified-candidate score (0.5493, measured 2026-07-31) with room for variation, NOT parity with serial decode" >&2
+            echo "::error::dflash_decode_speedup (ratio-of-means) ${speedup} is below the ${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR} floor; block decode spends compute per declared row and the ranked golden's ~34% draft acceptance does not amortise it, so this floor is the unmodified-candidate score (0.5882 at the ranked 512-token window, K=2, measured 2026-07-31) with room for variation, NOT parity with serial decode" >&2
             exit 1
           fi
           jq -n \

@@ -378,12 +378,15 @@ struct DFlashTrackTests {
         let ceiling = try #require(protocolBlock["maximum_decode_tokens"] as? Int)
         #expect(ceiling >= window)
 
-        // Block size: the drafter is trained for 16 and the measured peak on M5
-        // is K=8, so the ranked default must be within the protocol maximum and
-        // must not silently revert to the retired MTP track's 4.
+        // Block size: the drafter is trained for 16, but the ranked K follows the
+        // timed material's draft-acceptance rate -- K=8 won short prompts, K=3 won
+        // the 1755-token fixture, and K=2 wins the ranked hidden golden at ~34%
+        // acceptance (Amendment 28). The ranked default must stay within the
+        // protocol maximum and must not silently revert to the retired MTP
+        // track's 4 or to an optimum measured on non-ranked material.
         let maxBlock = try #require(protocolBlock["maximum_block_size"] as? Int)
         #expect(maxBlock == 16)
-        #expect(workflow.contains("MLXFAST_DFLASH_BLOCK_SIZE: \"3\""))
+        #expect(workflow.contains("MLXFAST_DFLASH_BLOCK_SIZE: \"2\""))
     }
 
     // CONTRACT LAYER L6 (anti-lottery). A frozen timed prompt makes a failed
@@ -1437,35 +1440,39 @@ struct DFlashDecodeFloorTests {
         )
     }
 
-    /// 0.52, re-derived 2026-07-31 from a MEASURED no-op on the ranked golden
-    /// (0.5493 at K=3 over 4/4 accepted pairs; 0.6201 at K=2), superseding the 0.80
-    /// that came from 0.840x at ~69% draft acceptance on a DIFFERENT golden. 0.80
-    /// rejected a CORRECT no-op. Neither 1.0 nor 0.80 is the no-change line on this
-    /// material: block decode spends compute per declared row, 1.8125 rows per
-    /// emitted token against a 1.8206 slowdown. Raising this back makes the track
-    /// reject its own purpose -- see contract Amendment 26.
+    /// 0.55, derived 2026-07-31 from a MEASURED no-op at the ACTUAL ranked window
+    /// (0.5882: 512 decode tokens, K=2, 4/4 pairs, PARITY_OK over 8 reports).
+    /// Two predecessors were both measured under non-ranked conditions and both
+    /// failed: 0.80 (0.840x at ~69% acceptance, different golden) rejected a
+    /// correct no-op; 0.52 (0.5493 at K=3 over a 128-token window) did not
+    /// survive the ranked window, because s/token ratios do not transfer across
+    /// window lengths -- the seed prefill is charged inside the decode window.
+    /// Raising this back makes the track reject its own purpose -- see contract
+    /// Amendments 26 and 28.
     @Test
-    func decodeFloorIsFiftyTwoHundredthsInBothManifests() throws {
+    func decodeFloorIsFiftyFiveHundredthsInBothManifests() throws {
         let manifest = try json("benchmark.dflash.json")
         let scoring = try #require(manifest["scoring"] as? [String: Any])
         let floor = try #require(scoring["decodeSpeedupFloor"] as? Double)
-        #expect(floor == 0.52)
+        #expect(floor == 0.55)
 
         let fixture = try json("fixtures/laguna_xs_2_1_dflash_track.json")
         let proposed = try #require(fixture["proposed_scoring"] as? [String: Any])
         let text = try #require(proposed["component_floor"] as? String)
         #expect(
-            text.contains(">= 0.52"),
+            text.contains(">= 0.55"),
             "the fixture's component_floor must state the same number the manifest enforces"
         )
         // The derivation has to travel with the number, or the next reader "fixes"
-        // it back to 1.0. Both derivations must be present: the live measurement,
-        // and the superseded 0.840x it replaced -- a bare number invites exactly the
-        // mis-calibration that made 0.80 reject a correct no-op.
+        // it back to 1.0. All three derivations must be present: the live
+        // ranked-window measurement, and the two superseded ones it replaced --
+        // a bare number invites exactly the mis-calibration that made 0.80 reject
+        // a correct no-op and made 0.52 not survive the ranked window.
+        #expect(text.contains("0.5882"))
         #expect(text.contains("0.5493"))
         #expect(text.contains("0.840x"))
         // The floor is provisional until timed_prompt_pool is populated: no-op
-        // scores span 0.55 to 1.117 by material, so one floor across a varied pool
+        // scores span 0.59 to 1.117 by material, so one floor across a varied pool
         // is a lottery. That caveat must not be dropped when the number moves.
         #expect(text.contains("PROVISIONAL"))
         #expect(text.contains("MAX_PLAUSIBLE_SPEEDUP stays 5.0"))
@@ -1474,13 +1481,13 @@ struct DFlashDecodeFloorTests {
     /// The workflow ALSO carries the floor as an env value and recomputes the score
     /// against it in a trusted shell -- a fifth site, found only when a real
     /// dispatch printed the whole env block. A 1.0 here would silently override the
-    /// 0.52 landed everywhere else at go-live.
+    /// 0.55 landed everywhere else at go-live.
     @Test
     func workflowEnvFloorMatchesTheManifests() throws {
         let workflow = try String(
             contentsOfFile: ".github/workflows/dflash-benchmark.yml", encoding: .utf8
         )
-        #expect(workflow.contains("MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: \"0.52\""))
+        #expect(workflow.contains("MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: \"0.55\""))
         #expect(!workflow.contains("MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: \"1.0\""))
     }
 
