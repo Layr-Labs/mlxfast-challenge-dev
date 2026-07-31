@@ -109,11 +109,30 @@ jobs:
           if [[ -z "${CANDIDATE_KEYS//[[:space:]]/}" ]]; then
             echo "  (none supplied)"
           else
-            printf '%s' "${CANDIDATE_KEYS}" | tr ',' '\n' | while IFS= read -r key; do
+            # printf '%s\n', NOT '%s': without a trailing newline `read` drops
+            # the final line, so the LAST key was silently skipped. Measured --
+            # probe run 30613434387 reported 4 results for 5 keys and run
+            # 30614611778 probed 1 of 2, and neither said anything was missing.
+            # A diagnostic that silently drops input is worse than none, because
+            # its silence reads as "checked and fine".
+            #
+            # Counted, too: a probe that examines fewer keys than it was handed
+            # now says so rather than leaving it to be noticed.
+            supplied=0
+            probed=0
+            while IFS= read -r key; do
               key="$(printf '%s' "${key}" | tr -d '[:space:]')"
               [[ -z "${key}" ]] && continue
+              supplied=$(( supplied + 1 ))
               probe "${key}" candidate
-            done
+              probed=$(( probed + 1 ))
+            done < <(printf '%s\n' "${CANDIDATE_KEYS}" | tr ',' '\n')
+            echo
+            echo "  probed ${probed} of ${supplied} supplied key(s)"
+            if (( probed != supplied )); then
+              echo "::error::probe examined ${probed} of ${supplied} keys; results are incomplete" >&2
+              exit 1
+            fi
           fi
 
           echo
