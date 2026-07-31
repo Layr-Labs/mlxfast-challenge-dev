@@ -122,8 +122,22 @@ amz_date="$(date -u +%Y%m%dT%H%M%SZ)"
 date_stamp="${amz_date:0:8}"
 payload_hash="$(shasum -a 256 "${input_path}" | awk '{print $1}')"
 signed_headers="host;x-amz-content-sha256;x-amz-date"
-canonical_headers="$(printf 'host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n' "${host}" "${payload_hash}" "${amz_date}")"
-canonical_request="$(printf 'PUT\n%s\n\n%s\n%s\n%s' "${request_path}" "${canonical_headers}" "${signed_headers}" "${payload_hash}")"
+# SigV4 CanonicalRequest is
+#   METHOD \n URI \n QUERY \n CanonicalHeaders \n SignedHeaders \n PayloadHash
+# and CanonicalHeaders is itself "name:value\n" per header -- so a BLANK LINE
+# separates the last header from SignedHeaders. This used to spell that
+# terminating newline inside canonical_headers' own printf, where command
+# substitution ATE it (`$(...)` strips every trailing newline), producing a
+# canonical request one line short of the one R2 computes and a 403
+# SignatureDoesNotMatch with a well-formed signature. See the twin comment in
+# download-r2-object.sh; that script is where the fault was observed, and this
+# one had the identical construction.
+#
+# Both newlines are therefore spelled in the canonical_request format string
+# ("...%s\n\n%s..."), where nothing can strip them: one terminates the last
+# header line, one is the blank separator.
+canonical_headers="$(printf 'host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s' "${host}" "${payload_hash}" "${amz_date}")"
+canonical_request="$(printf 'PUT\n%s\n\n%s\n\n%s\n%s' "${request_path}" "${canonical_headers}" "${signed_headers}" "${payload_hash}")"
 credential_scope="${date_stamp}/${region}/${service}/aws4_request"
 canonical_request_hash="$(printf '%s' "${canonical_request}" | shasum -a 256 | awk '{print $1}')"
 string_to_sign="$(printf 'AWS4-HMAC-SHA256\n%s\n%s\n%s' "${amz_date}" "${credential_scope}" "${canonical_request_hash}")"
@@ -152,8 +166,14 @@ k_signing="$(hmac_hex "hexkey:${k_service}" "aws4_request")"
 # OpenSSL ahead of it the signature came out EMPTY and R2 answered
 # "InvalidArgument: Signature element value should not be blank" -- a 400 that
 # looks like a credentials problem and is not one. Diagnosed on M5-C
-# (LibreSSL 3.3.6) 2026-07-30; the serial box worked only because OpenSSL 3 was
-# first on its PATH.
+# (LibreSSL 3.3.6) 2026-07-30.
+#
+# That diagnosis originally added "the serial box worked only because OpenSSL 3
+# was first on its PATH." That is FALSE, and believing it sends the next
+# debugger to audit PATH ordering on a box that never runs this code. The
+# serial box has the aws CLI on its runner PATH, so upload_with_aws_cli() below
+# returns 0 and the signer is never reached. Whichever openssl it ships is
+# irrelevant. Treat this signed path as covered ONLY by the box that lacks aws.
 #
 # -binary sidesteps the text format entirely, so there is no field to index.
 signature="$(hmac_hex "hexkey:${k_signing}" "${string_to_sign}")"

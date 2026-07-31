@@ -15,8 +15,13 @@ import Testing
 /// macOS ships LibreSSL as `/usr/bin/openssl`. On a box without Homebrew
 /// OpenSSL ahead of it the signature came out empty, and R2 answered HTTP 400
 /// `InvalidArgument: Signature element value should not be blank` — which reads
-/// like a credentials fault and is not one. Measured on M5-C (LibreSSL 3.3.6);
-/// the serial box only worked because OpenSSL 3 was first on its PATH.
+/// like a credentials fault and is not one. Measured on M5-C (LibreSSL 3.3.6).
+///
+/// Not because the serial box had a better openssl — the serial box has the aws
+/// CLI on its runner PATH, so `download_with_aws_cli()` short-circuits and the
+/// signer never runs there at all. Every successful hidden-golden fetch in
+/// either repo announced "using AWS CLI S3 path-style download". These tests
+/// are the only coverage this signing path has.
 ///
 /// Two guards, because either alone is weak: a structural one (no `openssl
 /// dgst` may parse the text form) and a behavioural known-answer test (the
@@ -147,6 +152,161 @@ struct R2SignatureTests {
                 The SigV4 key derivation changed meaning; a wrong-but-nonempty \
                 signature fails as SignatureDoesNotMatch instead of a blank \
                 element, which is harder to recognise.
+                """
+            )
+        }
+    }
+
+    /// What the two tests above do NOT cover, and the gap that cost a second
+    /// failed run.
+    ///
+    /// `theScriptSigningChainReproducesThePinnedSignature` signs a string-to-sign
+    /// ending in the literal `deadbeef` — a stand-in for the canonical-request
+    /// hash. So it proves the HMAC chain is right while saying nothing about the
+    /// canonical request being hashed, and both scripts built a MALFORMED one:
+    ///
+    ///     canonical_headers="$(printf 'host:%s\n...\nx-amz-date:%s\n' ...)"
+    ///     canonical_request="$(printf 'GET\n%s\n\n%s\n%s\n%s' ...)"
+    ///
+    /// SigV4 is `METHOD \n URI \n QUERY \n CanonicalHeaders \n SignedHeaders \n
+    /// PayloadHash`, and CanonicalHeaders is `name:value\n` per header — so a
+    /// BLANK LINE must separate the last header from SignedHeaders. The scripts
+    /// spelled that terminating newline inside `canonical_headers`' own printf,
+    /// where `$(...)` ATE it (command substitution strips every trailing
+    /// newline). The canonical request went out one line short, hashed
+    /// differently from the one R2 computed for the same bytes, and R2 answered
+    /// HTTP 403 SignatureDoesNotMatch — with a perfectly well-formed signature,
+    /// which reads like a bucket-permission fault and is not one.
+    ///
+    /// It survived because it was never executed: `download_with_aws_cli()`
+    /// short-circuits the signer whenever `aws` is on PATH, and the serial
+    /// ranked box has it. M5-C's runner PATH is `/usr/bin:/bin:/usr/sbin:/sbin`,
+    /// so it became the first box to run this code at all. The aws CLI fallback
+    /// must not be what makes R2 work.
+    ///
+    /// Reference hashes are botocore's own `CanonicalRequest` for the identical
+    /// request (aws-cli 2.35.21, `--debug`, path-style endpoint), so this pins
+    /// against an independent SigV4 implementation rather than against a
+    /// restatement of the script.
+    @Test
+    func theCanonicalRequestMatchesAnIndependentSigV4Implementation() throws {
+        // (script, HTTP method, request path, payload hash, x-amz-date,
+        //  botocore's canonical-request hash for exactly those inputs)
+        let cases:
+            [(
+                path: String, method: String, requestPath: String, payloadHash: String,
+                amzDate: String, expected: String
+            )] = [
+                (
+                    ".github/scripts/download-r2-object.sh",
+                    "GET",
+                    "/mybucket/correctness_prompts/x.json",
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "20260731T000829Z",
+                    "18ec091efbf67625090e1e4b4faa2909228244578b5802a1b8222ad60a7096ad"
+                ),
+                (
+                    ".github/scripts/upload-r2-object.sh",
+                    "PUT",
+                    "/mybucket/up/x.json",
+                    "e38af85860a1452206b018e69c01595e89ce0626bd0068d69ea1b270e993cd41",
+                    "20260731T001036Z",
+                    "48c8f7da8097d5493dcb5140f1f66b1fd9c609d67a70c68637127dc60ab6651a"
+                ),
+            ]
+
+        for testCase in cases {
+            let text = try String(contentsOfFile: testCase.path, encoding: .utf8)
+
+            // Pull the REAL assignments out of the script so this test tracks
+            // the shipped construction instead of a copy of it.
+            let assignments = text
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .filter {
+                    $0.hasPrefix("canonical_headers=") || $0.hasPrefix("canonical_request=")
+                }
+                .joined(separator: "\n")
+            #expect(
+                assignments.contains("canonical_headers=")
+                    && assignments.contains("canonical_request="),
+                """
+                \(testCase.path) no longer assigns canonical_headers/canonical_request \
+                at top level; if the canonical request moved, retarget this test rather \
+                than deleting it.
+                """
+            )
+
+            let program = """
+                set -euo pipefail
+                host='acct.r2.cloudflarestorage.com'
+                request_path='\(testCase.requestPath)'
+                payload_hash='\(testCase.payloadHash)'
+                amz_date='\(testCase.amzDate)'
+                signed_headers='host;x-amz-content-sha256;x-amz-date'
+                \(assignments)
+                printf '%s' "${canonical_request}" | shasum -a 256 | awk '{print $1}'
+                printf '%s' "${canonical_request}" >&2
+                """
+
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = ["-c", program]
+            let out = Pipe()
+            let err = Pipe()
+            process.standardOutput = out
+            process.standardError = err
+            try process.run()
+            let hash = String(
+                decoding: out.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            let rendered = String(
+                decoding: err.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+            process.waitUntilExit()
+
+            #expect(
+                process.terminationStatus == 0,
+                "\(testCase.path) canonical request failed to build: \(rendered)"
+            )
+
+            // The blank separator is the byte that was missing, so assert it
+            // directly too: a hash mismatch alone does not say which line moved.
+            let lines = rendered.split(separator: "\n", omittingEmptySubsequences: false)
+            #expect(
+                lines.count == 9,
+                """
+                \(testCase.path) canonical request has \(lines.count) lines, expected 9 \
+                (method, uri, empty query, 3 headers, BLANK separator, signed headers, \
+                payload hash). Rendered:
+                \(rendered)
+                """
+            )
+            if lines.count == 9 {
+                #expect(
+                    lines[2].isEmpty,
+                    "\(testCase.path) line 3 must be the empty canonical query string"
+                )
+                #expect(
+                    lines[6].isEmpty,
+                    """
+                    \(testCase.path) line 7 must be the BLANK line that terminates \
+                    CanonicalHeaders and separates it from SignedHeaders. Omitting it \
+                    yields HTTP 403 SignatureDoesNotMatch with a well-formed signature. \
+                    Do not spell that newline inside canonical_headers' printf -- \
+                    command substitution strips trailing newlines.
+                    """
+                )
+            }
+
+            #expect(
+                hash == testCase.expected,
+                """
+                \(testCase.path) canonical-request hash \(hash), expected \
+                \(testCase.expected) (botocore's own CanonicalRequest for the same \
+                \(testCase.method) request). Rendered:
+                \(rendered)
                 """
             )
         }
