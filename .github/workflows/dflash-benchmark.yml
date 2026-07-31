@@ -1535,8 +1535,28 @@ jobs:
       # pool objects must be uploaded to R2 before the track can be enabled.
       # The chosen index is written to the PRIVATE audit dir only -- echoing it
       # into a participant-visible log would hand back the sampling.
+      #
+      # RANKED-ONLY, and the guard is load-bearing rather than a convenience.
+      # The pool is deliberately EMPTY on main (pinned by
+      # DFlashEnablementInterlockTests.theTrackFixtureRemainsInertOnMain), so
+      # before go-live this step fails closed on EVERY dispatch -- including the
+      # gates-only dry run that #815 split the enablement interlock apart to
+      # make possible. And it sits ABOVE "DFlash correctness and parity gate
+      # (untimed)", so leaving it unguarded made that gate UNREACHABLE: the dry
+      # run always died red one step short of the only DFlash-specific gate it
+      # exists to exercise, which both defeated the split and trained operators
+      # to read a red dry run as success.
+      #
+      # A dry run times nothing, so it needs no timed target. Guarding on
+      # inputs.run_benchmark does NOT weaken the ranked path: a RANKED dispatch
+      # still runs this step and still fails closed on an empty, missing or
+      # malformed pool, and "Prepare hidden DFlash goldens" independently
+      # refuses a ranked run whose selection outputs are empty, so mis-widening
+      # this guard fails loudly and by name instead of quietly. Both directions
+      # are executed, not read, by DFlashDryRunReachesItsGateTests.
       - name: Select hidden DFlash timed target from the pool
         id: select_dflash_target
+        if: ${{ inputs.run_benchmark }}
         run: |
           set -euo pipefail
           contract="${MLXFAST_DFLASH_CONTRACT_PATH}"
@@ -1599,18 +1619,59 @@ jobs:
             echo "::error::hidden DFlash correctness golden pin mismatch" >&2
             exit 1
           fi
-          .github/scripts/download-r2-object.sh \
-            "${MLXFAST_DFLASH_BENCH_GOLDEN_R2_PATH}" \
-            "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json"
-          bench_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json" | awk '{print $1}')"
-          bench_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json" | tr -d ' ')"
-          # Verified against the PER-RUN pool selection, not a fixed pin: the
-          # pool entry carries its own sha256/bytes and both must match, so a
-          # swapped or truncated object fails closed even though the object key
-          # differs from run to run.
-          if [[ "${bench_hash}" != "${MLXFAST_DFLASH_BENCH_GOLDEN_SHA256_SELECTED}" || "${bench_bytes}" != "${MLXFAST_DFLASH_BENCH_GOLDEN_BYTES_SELECTED}" ]]; then
-            echo "::error::hidden DFlash timed golden pin mismatch for the sampled pool entry" >&2
-            exit 1
+          # THE TIMED GOLDEN IS RANKED-ONLY. It is consumed by exactly one
+          # step -- "Timed paired DFlash benchmark (measure-dflash-job)", which
+          # is itself `if: inputs.run_benchmark` -- and it is addressed by the
+          # per-run pool selection, which is now ranked-only for the reasons
+          # given above that step. Downloading it on a gates-only dispatch was
+          # therefore pointless work AND a second reason a dry run could never
+          # go green: the selection it depends on had already failed closed on
+          # the empty pool. The correctness golden above is pinned
+          # INDEPENDENTLY of the pool, which is what lets the untimed leg --
+          # including the DFlash correctness and parity gate -- run at all
+          # before the operator provisions pool objects.
+          bench_hash="not downloaded (gates-only dispatch)"
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
+            # FAIL CLOSED if the ranked path ever reaches here without a
+            # selection. A SKIPPED step yields EMPTY outputs, not an error, so
+            # widening the guard on "Select hidden DFlash timed target from the
+            # pool" by mistake would silently produce a ranked run with no
+            # sampled target -- and losing per-run sampling is losing contract
+            # layer L6 (anti-lottery) itself.
+            #
+            # Honest scope: this is defence in depth plus a named diagnostic,
+            # NOT the only barrier. download-r2-object.sh already refuses an
+            # empty object key (exit 2), and an empty SHA256/BYTES pin would
+            # mismatch a real digest and fail the pin check below. What this
+            # buys is that the job says WHY -- "the selection step did not run"
+            # -- instead of dying on a generic argument-validation exit 2 in a
+            # helper script, and that the refusal survives any future change to
+            # either of those two downstream behaviours. There is no honest
+            # ranked run with an empty selection.
+            for selected in \
+              "${MLXFAST_DFLASH_BENCH_GOLDEN_R2_PATH}" \
+              "${MLXFAST_DFLASH_BENCH_GOLDEN_SHA256_SELECTED}" \
+              "${MLXFAST_DFLASH_BENCH_GOLDEN_BYTES_SELECTED}"; do
+              if [[ -z "${selected}" ]]; then
+                echo "::error::ranked DFlash dispatch reached the golden download with no timed-target selection; 'Select hidden DFlash timed target from the pool' did not run or produced no outputs" >&2
+                exit 1
+              fi
+            done
+            .github/scripts/download-r2-object.sh \
+              "${MLXFAST_DFLASH_BENCH_GOLDEN_R2_PATH}" \
+              "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json"
+            bench_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json" | awk '{print $1}')"
+            bench_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json" | tr -d ' ')"
+            # Verified against the PER-RUN pool selection, not a fixed pin: the
+            # pool entry carries its own sha256/bytes and both must match, so a
+            # swapped or truncated object fails closed even though the object key
+            # differs from run to run.
+            if [[ "${bench_hash}" != "${MLXFAST_DFLASH_BENCH_GOLDEN_SHA256_SELECTED}" || "${bench_bytes}" != "${MLXFAST_DFLASH_BENCH_GOLDEN_BYTES_SELECTED}" ]]; then
+              echo "::error::hidden DFlash timed golden pin mismatch for the sampled pool entry" >&2
+              exit 1
+            fi
+          else
+            echo "dflash-benchmark: gates-only dispatch; the timed golden is not downloaded and no timed target is sampled"
           fi
           # FAIL-CLOSED ROW-COUNT PRECONDITION on the existing gate's input, run
           # on the runner-private copies before either golden is installed.
@@ -1644,9 +1705,16 @@ jobs:
           check_golden_rows \
             "${MLXFAST_PRIVATE_DIR}/dflash_correctness_golden.json" \
             "${MLXFAST_DFLASH_CORRECTNESS_TOKENS}" correctness
-          check_golden_rows \
-            "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json" \
-            "${MLXFAST_DFLASH_DECODE_TOKENS}" benchmark
+          # Ranked-only for the same reason the download is: on a gates-only
+          # dispatch there is no timed golden on disk to preflight, and nothing
+          # downstream will read one. The check stays UNCONDITIONALLY BINDING on
+          # the ranked path -- it is not relaxed, only scoped to the dispatch
+          # kind that actually times.
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
+            check_golden_rows \
+              "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json" \
+              "${MLXFAST_DFLASH_DECODE_TOKENS}" benchmark
+          fi
           golden_dst="${MLXFAST_JOB_WS}/.dflash-ranked-src/dflash_correctness_golden.json"
           if [[ -e "${golden_dst}" || -L "${golden_dst}" ]]; then
             echo "::error::refusing to place hidden input over pre-existing path ${golden_dst}" >&2
