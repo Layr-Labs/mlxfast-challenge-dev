@@ -234,21 +234,39 @@ struct DFlashLocalRunLockTests {
             """
         )
 
-        let lines = dflash.split(separator: "\n", omittingEmptySubsequences: false)
-        func callSite(_ name: String) -> Int? {
-            lines.firstIndex { $0.trimmingCharacters(in: .whitespaces) == name }
-        }
+        // "Is it CALLED, and in what order" is answered by RUNNING the script
+        // under xtrace, not by finding its name in the source.
+        //
+        // Reading the source cannot answer it. Both names also appear as
+        // word-list items in the `for reused_definition in ...` fail-closed
+        // loop, and `abort_if_model_already_resident` is that list's last item,
+        // so it sits on a line of its own that trims to exactly the function
+        // name -- ABOVE the real call site and above `acquire_local_run_lock`.
+        // A source scan for "a line that is just this name" therefore matched
+        // the LIST, and both this assertion and the ordering one below stayed
+        // green with the real call deleted: the guard imported the orphan scan,
+        // never ran it, and the test that exists to say so said nothing.
+        //
+        // A trace line is emitted only by a command that actually executed, so
+        // the list item cannot forge one.
+        let clean = try GuardSandbox.traced(orphanScan: "true")
+        // Bound first for the same reason the flags above are: `#require`
+        // renders every sub-expression it evaluates, and `clean` is the entire
+        // xtrace of a shell script that evals two files' worth of functions.
+        let tracedScanCall = clean.callIndex("abort_if_model_already_resident")
+        let tracedAcquireCall = clean.callIndex("acquire_local_run_lock")
         let scanCall = try #require(
-            callSite("abort_if_model_already_resident"),
+            tracedScanCall,
             """
             benchmark-dflash.sh never CALLS abort_if_model_already_resident. \
             Importing the scan without calling it leaves the orphan case -- the \
-            one no lock can catch -- unguarded.
+            one no lock can catch -- unguarded. Trace tail:
+            \(clean.tail)
             """
         )
         let acquireCall = try #require(
-            callSite("acquire_local_run_lock"),
-            "benchmark-dflash.sh never calls acquire_local_run_lock"
+            tracedAcquireCall,
+            "benchmark-dflash.sh never calls acquire_local_run_lock. Trace tail:\n\(clean.tail)"
         )
         #expect(
             scanCall < acquireCall,
@@ -640,10 +658,40 @@ private struct GuardSandbox {
         return process
     }
 
+    /// The executed call trace of a run: `bash -x` over the REAL script, so a
+    /// name appears here only because the shell actually ran that command.
+    ///
+    /// This is what source scanning could not do. `declare -F name`, a
+    /// `for x in ... name` word list and a comment mentioning the name are all
+    /// present in the text and none of them can produce `+ name` on the trace.
+    struct Trace {
+        let lines: [String]
+
+        /// Position of the top-level invocation of `name`, nil if it never ran.
+        func callIndex(_ name: String) -> Int? {
+            lines.firstIndex { $0.trimmingCharacters(in: .whitespaces) == "+ \(name)" }
+        }
+
+        var tail: String { lines.suffix(40).joined(separator: "\n") }
+    }
+
+    /// Traces a whole run in a throwaway sandbox.
+    static func traced(orphanScan: String?) throws -> Trace {
+        let sandbox = try GuardSandbox()
+        defer { sandbox.destroy() }
+        let run = try sandbox.runGuard(orphanScan: orphanScan, xtrace: true)
+        return Trace(
+            lines: run.output
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map(String.init)
+        )
+    }
+
     /// Runs the real `benchmark-dflash.sh --local-iterate` in this sandbox.
     /// `orphanScan` drives benchmark.sh's documented
     /// MLXFAST_LOCAL_ORPHAN_SCAN_CMD seam; pass nil to exercise real pgrep.
-    func runGuard(orphanScan: String?) throws -> Run {
+    /// `xtrace` adds `bash -x`, which is how callers see what actually ran.
+    func runGuard(orphanScan: String?, xtrace: Bool = false) throws -> Run {
         var environment = ProcessInfo.processInfo.environment
         // The developer's own MLXFAST_*/DARKBLOOM_* exports must not decide
         // what this test measures -- MLXFAST_LOCAL_RUN_GUARD=0 in particular
@@ -674,9 +722,13 @@ private struct GuardSandbox {
             environment["MLXFAST_LOCAL_ORPHAN_SCAN_CMD"] = orphanScan
         }
 
+        // Pinned so the trace format does not depend on the developer's shell.
+        environment["PS4"] = "+ "
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["./benchmark-dflash.sh", "--local-iterate"]
+        process.arguments =
+            (xtrace ? ["-x"] : []) + ["./benchmark-dflash.sh", "--local-iterate"]
         process.currentDirectoryURL = root
         process.environment = environment
         let pipe = Pipe()
