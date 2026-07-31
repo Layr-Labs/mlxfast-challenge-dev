@@ -32,7 +32,16 @@ permissions:
   contents: read
 
 concurrency:
-  # Never queue behind or alongside a ranked run: it is the same single runner.
+  # A group of its own, so two probes cannot overlap each other.
+  #
+  # It does NOT keep the probe away from a ranked run -- an earlier comment
+  # here claimed it did, which was wrong: a DISTINCT concurrency group is
+  # exactly what lets two workflows run at the same time. What actually
+  # serialises them is that both target the single m5-laguna-dflash runner,
+  # so GitHub queues one behind the other regardless of grouping. The probe
+  # is read-only and ~1 minute, so queueing behind a ranked run costs
+  # nothing; the point of naming this is that the protection comes from the
+  # runner, not from this stanza.
   group: mlxfast-dflash-r2-probe
   cancel-in-progress: false
 
