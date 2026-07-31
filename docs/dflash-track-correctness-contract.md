@@ -640,7 +640,10 @@ forward.
 
 Consequences that the track cannot be enabled without resolving:
 
-1. **The scoring floor rejects everything.** `decodeSpeedupFloor` is a hard 1.0
+1. **The scoring floor rejects everything.** [SUPERSEDED BY AMENDMENT 25 — the
+   floor was lowered to 0.80 by operator decision on 2026-07-30, which resolves
+   this consequence. The paragraph is retained as the reasoning that produced
+   that decision.] `decodeSpeedupFloor` is a hard 1.0
    on the ratio-of-means aggregate. At the ranked window (512-token seed) the
    drafter is far closer to this long-context regime than to the 51-token regime
    the 1.86x came from, so the expected outcome is REJECT for every submission,
@@ -1398,7 +1401,9 @@ control, which the prompt-independence measurement above licenses. Break-even
 needs `declared/emitted < 1.092`, i.e. draft acceptance above roughly 92%.
 
 So the track produces a speedup on repetitive text and a ~1.2x SLOWDOWN on
-realistic text, against a hard 1.0 floor. This is not a tuning problem: the
+realistic text, against a hard 1.0 floor. [The floor is no longer 1.0: see
+Amendment 25. The measurement below stands; only the floor it is compared
+against changed.] This is not a tuning problem: the
 drafter is already accepting ~100% on easy text, so the ~10% per-row economy is
 the entire ceiling, and every rejected row spends it. The hidden ranked prompts
 are prose.
@@ -1887,8 +1892,10 @@ score  ~=  (general forward speedup)  x  (speculation factor)
 speculation factor ~= 0.840 on realistic prose, at K=4
 ```
 
-The floor is `MIN_ACCEPTED_SPEEDUP="1.0"`, hardcoded readonly in the wrapper and
-applied to the ratio-of-means aggregate. Clearing it therefore requires about
+The floor **was** `MIN_ACCEPTED_SPEEDUP="1.0"`, hardcoded readonly in the wrapper
+and applied to the ratio-of-means aggregate. **It is now `"0.80"` — see Amendment
+25. Do not quote the 1.0 or the 19% below as current.** At the time of writing,
+clearing it therefore requires about
 **19% of general forward speedup** before a single point of score appears. That is
 a high entry bar, not an impossible one — the serial track's field finds wins of
 that size — but participants are paying a ~16% speculation tax for the privilege
@@ -2758,3 +2765,61 @@ generalisation is narrow and worth keeping: **an instruction is part of the
 contract's attack surface.** A measured prohibition that lives only in the
 document nobody is following at the moment of the decision is not a control, and
 it took fourteen amendments for anyone to read the two side by side.
+
+# Amendment 25 (2026-07-31): the decode floor is 0.80, and this document said 1.0 in three places
+
+Found by an independent consistency audit, not by new measurement. The floor
+decision was made by the operator on 2026-07-30 and applied to all five
+enforcing sites, but **this document was never amended**, so its own dedicated
+discussions of the floor still read `1.0` in the present tense — including the
+sentence that names the box variable by name (Amendment 17's
+"The floor is `MIN_ACCEPTED_SPEEDUP="1.0"`, hardcoded readonly in the wrapper").
+An operator grepping these docs for the floor got the wrong number from the most
+quotable passage in them. Those three sites now carry supersede markers pointing
+here; the measurements around them are unchanged and still stand.
+
+## The decision
+
+`MIN_ACCEPTED_SPEEDUP` / `decodeSpeedupFloor` / `MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR`
+= **0.80**, applied to the ratio-of-means aggregate. `MAX_PLAUSIBLE_SPEEDUP`
+stays 5.0. Deliberately NOT 1.0.
+
+## Why 1.0 was the wrong number, restated from the measurements above
+
+On this track 1.0 is **not** the no-change line. Amendments 11, 17 and 21
+establish why:
+
+* Block decode itself costs about **16%** on realistic prose: a verify row is
+  only ~10% cheaper than a standalone serial step, and at 69% draft acceptance
+  the block path declares ~1.25 rows per emitted token.
+* An **unmodified** candidate therefore measures **0.8705** end-to-end
+  (median 0.8712, min 0.8658, 4/4 pairs ACCEPT — go-live runbook §0), because
+  the denominator is a clone of the PINNED baseline and only the numerator is
+  the candidate's build.
+* The same measurement gives 1.117x on a degenerate greedy self-continuation,
+  which is why earlier sweeps looked healthy (Amendment 10).
+
+So a floor at 1.0 **would not reject regressions** — it would reject every
+submission whose general kernel improvement is under about **19%**, including
+honest 10% wins, which is precisely this track's stated purpose. 0.80 is the
+unmodified-candidate score with room for run-to-run variation: a no-op sits just
+above the floor, and any real kernel gain ranks.
+
+## What this does NOT change
+
+The floor is the only thing that moved. Every tolerance, every budget, the
+near-tie envelope, the work-binding tolerances, the stall guardrail, the
+acceptance band, and `MAX_PLAUSIBLE_SPEEDUP` are untouched. Lowering the floor
+does not weaken any correctness gate: token fidelity is enforced by the reused
+serial gates (public behaviour, hidden correctness golden, hidden anchor,
+free-run, and the semantic GPQA judge at min-pass 7 of 9), none of which consult
+the speedup.
+
+## Method note
+
+Five sites agreed with each other and all five disagreed with the prose that
+justified them. The generalisation, which is the same one Amendment 24 reached
+from the other direction: **a constant is not consistent because its enforcing
+sites match — it is consistent when the document that explains it matches too.**
+Grep the docs for a constant's OLD value as part of changing it, not just for
+its new one.

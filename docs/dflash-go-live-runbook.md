@@ -10,7 +10,7 @@ change to an operator-owned measurement contract.
 ## 0. What is already done and verified (do not redo)
 
 Measured on M5-C, 2026-07-30. Contract detail in
-`docs/dflash-track-correctness-contract.md` (Amendments 1-22).
+`docs/dflash-track-correctness-contract.md` (Amendments 1-25).
 
 | thing | state |
 |---|---|
@@ -19,14 +19,19 @@ Measured on M5-C, 2026-07-30. Contract detail in
 | baseline calibration | `/opt/bench-runner/state/laguna-xs-2.1-dflash-v1/baseline-calibration.json`, authored by `/Users/gaj/author-dflash-calibration.sh` (the wrapper does NOT write it) |
 | runner | `m5-laguna-dflash-3-*` online on **mlxfast-challenge-dev**, labels `[self-hosted, m5-laguna-dflash]` only |
 | dispatch chain | verified: job scheduled -> host preflight -> trusted context -> enablement guard fails CLOSED on the contract |
-| decode floor | 0.80 in all five sites (manifest, fixture, two workflow comments, workflow env, box wrapper) |
-| janitor audit | clean after re-signing |
+| decode floor | 0.80, agreeing in all five sites: `benchmark.dflash.json` manifest, contract fixture, workflow comments, workflow env `MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR`, and `MIN_ACCEPTED_SPEEDUP` in the box wrapper. Rationale is Amendment 25. |
+| janitor audit | clean after re-signing; re-verified on all three boxes 2026-07-31 |
+| hidden goldens | ONE pair provisioned, uploaded and pinned (correctness `185394`b, bench `185433`b). R2 keys settled by probe: the prefix is `correctness_prompts/laguna-xs-2.1-dflash/`, with NO `gautham-experiments` segment -- that is the BUCKET, carried by `R2_BUCKET_ENDPOINT`. Pinned by `DFlashGoldenKeyTests`; probe with `.github/workflows/dflash-probe-r2-keys.yml` before changing. |
 
 ## Step A — hidden timed-prompt pool (BLOCKING)
 
-`fixtures/laguna_xs_2_1_dflash_track.json` -> `timed_prompt_pool` is `[]` and the
-workflow's "Select hidden DFlash timed target from the pool" step fails closed on an
-empty pool. No ranked run can start until this is populated.
+`fixtures/laguna_xs_2_1_dflash_track.json` -> `timed_prompt_pool` holds **ONE**
+entry as of 2026-07-31 (it was `[]` when this runbook was written). That is
+enough for a gates-only dry run and **not** enough to rank: the workflow's
+"Select hidden DFlash timed target from the pool" step fails closed on an empty
+pool AND refuses a run with `run_benchmark=true` while the pool is below **8**.
+So **7 more entries are still required**, and the single existing entry must not
+be mistaken for readiness.
 
 Requirements, from the fixture's own `timed_prompt_pool_note`:
 
@@ -106,6 +111,18 @@ downloaded bytes**, and prints the four pins. It does not edit
 `dflash-benchmark.yml`: apply the pins by hand, in a reviewed commit. Re-dispatch
 once per `timed_prompt_pool` entry (step A wants at least 8, each from a
 different prose seed).
+
+**Already done once** (2026-07-31): the correctness golden and the first timed
+golden are provisioned, uploaded and pinned. Do not redo that pair; dispatch this
+for entries 2-8.
+
+**Object paths are keys, not bucket-qualified paths.** Pass
+`correctness_prompts/laguna-xs-2.1-dflash/<name>.json`, with **no**
+`gautham-experiments/` segment -- `gautham-experiments` is the bucket and is
+carried by `R2_BUCKET_ENDPOINT`. This cost three ranked dispatches to learn, in
+both directions; probe run 30613434387 settled it. If a key is ever in doubt, run
+`.github/workflows/dflash-probe-r2-keys.yml` (about a minute) instead of a
+dispatch (30-40 minutes).
 
 ### The seed must be PRE-TOKENIZED REAL PROSE. Never `--seed-generate`.
 
