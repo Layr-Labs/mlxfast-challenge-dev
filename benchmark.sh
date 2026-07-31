@@ -544,11 +544,15 @@ LOCAL_RUN_LOCK_OWNED=""
 # subcommands are listed for the same reason: a DFlash residency is the same
 # target plus the drafter.
 #
-# benchmark-dflash.sh now takes THIS lock, by reusing the three functions
-# below rather than reimplementing them, so the two scripts exclude each other
-# in both directions. This scan is still what catches the case no lock can:
-# an ORPHANED model-holding worker from a run that died without releasing --
-# the residency is live but nothing holds the lock.
+# benchmark-dflash.sh reuses THIS guard -- both halves of it -- by extracting
+# the pattern below plus local_run_lock_path/acquire_local_run_lock/
+# release_local_run_lock/list_resident_model_processes/
+# abort_if_model_already_resident rather than reimplementing them, so the two
+# scripts exclude each other in both directions AND both refuse to start
+# against the case no lock can catch: an ORPHANED model-holding worker from a
+# run that died without releasing -- the residency is live but nothing holds
+# the lock. Renaming any of those, or moving them off the top level, breaks
+# that extraction; DFlashLocalRunLockTests fails when it does.
 readonly RESIDENT_MODEL_PROCESS_PATTERN='runtime-worker[[:space:]]+--weights|mlxfast-swift[[:space:]]+(benchmark|correctness|correctness-trace|generate-golden|generate-gpqa-answers|attach-free-run-gate|dflash-benchmark|dflash-probe|dflash-reference)'
 
 local_run_guard_enabled() {
