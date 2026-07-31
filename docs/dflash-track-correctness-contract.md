@@ -2996,3 +2996,80 @@ when a constant is bound across its sites, ask what MEASUREMENT the constant is
 compared against, and whether that measurement records the conditions under which
 it is valid. A band with no conditions attached is not a band — it is a number
 that happens to have been true once.
+
+# Amendment 28 (2026-07-31): the 0.52 floor was derived at the wrong window; measured at the ranked one, the floor is 0.55 and the block size is 2
+
+Amendment 26 derived the 0.52 floor from no-op measurements taken with
+`--tokens 128`. The ranked window is **512** decode tokens
+(`MLXFAST_DFLASH_DECODE_TOKENS`, pinned across three repo sites). Seconds/token
+ratios do not transfer across window lengths — Amendment 27 established the
+mechanism the same day, for the calibration band: the seed prefill (~0.9 s,
+roughly equal on both sides) is charged inside the decode window, padding
+short-window ratios toward 1.0 and diluting at 512. Amendment 26 made the very
+mistake Amendment 27 documented, hours apart. Amendment 25's was the same
+failure on different material. Three derivations of one constant, three
+calibrations against conditions that were not the ranked ones.
+
+## Measured at the actual ranked window (512 decode tokens, ranked hidden golden, M5-C)
+
+| | K=2 | K=3 |
+|---|---|---|
+| 128-token window (Amendment 26 era) | 0.6201 | 0.5493 |
+| **512-token window (ranked)** | **0.5882** | ~0.475 (projected only, never measured) |
+
+The K=2 aggregate is from 4/4 accepted pairs — 0.5873 / 0.5868 / 0.5889 /
+0.5898, spread 0.5% — serial mean 0.014873 s/token against dflash mean
+0.025285, with `PARITY_OK` re-read from all 8 contributing phase reports. The
+serial mean also validates Amendment 27's projection (0.01479 projected,
+0.014873 measured) and was authored into the calibration band with
+`decode_tokens: 512`. Two subsequent unflagged runs then exercised
+Amendment 27's guard in BOTH directions the same day: the first ran against
+the stale 128-token band and was refused — `FATAL(code=6)`, naming the stale
+field and the re-authoring command, after 8/8 phases had accepted — and the
+second, against the 512-authored band and the 0.55 floor, produced the
+track's first full `ACCEPT` at the shipping configuration: aggregate 0.5892,
+`CALIBRATION_OK` (serial mean 0.014868 against the band's 0.014873),
+`PARITY_OK` over 8 reports. Three same-day runs agree to 0.3%:
+0.5882 / 0.5875 / 0.5892 across 12 pairs.
+
+**Floor: 0.5882 × 0.952 = 0.560, floored to 0.55** — the same margin and the
+same flooring convention every derivation of this constant has used.
+
+## The block size moves with it: K=2 replaces K=3
+
+K's derivation history is the floor's in miniature: the short-prompt sweep said
+K=8 (1.86x), the 1755-token fixture said K=3 (Amendment 5), and the ranked
+golden at ~34% draft acceptance says **K=2** — measured better at both windows
+(0.6201 vs 0.5493 at 128; 0.5882 vs a ~0.475 projection at 512). At 34%
+acceptance the third verify row is almost always wasted compute. The K=3 switch
+was deferred this morning because the parity gate had only been verified at
+K=3; this run verified parity at K=2 at the full ranked length (8/8 reports),
+which removes that objection.
+
+**Both K and the floor are functions of the timed material.** When
+`timed_prompt_pool` is populated, re-derive both across the whole pool — the
+floor from the worst per-prompt no-op, K from pool-wide measurement — at the
+ranked window only. Per-prompt no-op normalisation (Amendment 26) remains the
+durable fix, and would make the score robust to both dependencies at once.
+
+## Also closed today, same investigation
+
+* `MIN_FREQ_SERIAL=1600` → **1500** by operator decision (go-live runbook Step
+  C, previously BLOCKING): at the 512-token window the serial denominator's
+  healthy steady clocks are 1585–1588 MHz, so 1600 rejected pair 1
+  deterministically, twice, at 42–44 °C — nowhere near the 1447–1455 MHz real
+  throttle record. Validated across a warm box to 50.1 °C: every clock held
+  >85 MHz above the new floor. The floors are now symmetric across the two
+  sides of the score.
+
+## Method note
+
+The window is now part of the floor's identity: the fixture's
+`component_floor` text names 512 tokens and K=2 as the conditions of
+measurement, and the calibration band carries `decode_tokens` enforced
+fail-closed. What Amendment 25 said about values ("grep for the OLD value")
+and Amendment 27 said about bands ("a number with no conditions attached")
+generalises once more: **a derived constant is only meaningful as
+(value, conditions-of-measurement), and every site that states the value must
+state the conditions.** A reviewer who cannot see the conditions cannot see
+that the number is wrong.
