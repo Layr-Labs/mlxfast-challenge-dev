@@ -46,6 +46,34 @@ Two measured reasons the variety requirement is load-bearing, not boilerplate:
    moves the score from 1.117x to 0.840x (Amendment 11). A pool of easy prompts
    would advertise a speedup that does not exist.
 
+### What a pool entry is made of: a pre-tokenized prose SEED
+
+A `timed_prompt_pool` entry's `r2_path` points at a frozen **golden**, and step B
+builds that golden from a **seed**. Both are operator material and both live in
+R2.
+
+The trusted binary links no tokenizer, so a seed is **token ids, not text**: an
+R2 object holding a seed-only `DFlashEmittedPlan`,
+
+```json
+{ "seed_tokens": [ 1234, 5678, ... ], "emitted": [] }
+```
+
+where `seed_tokens` is the tokenization of **real prose**. The public fixture
+`correctness_prompts/public_longcopy_gate_english_512_256.json` →
+`cases[0].prompt_tokens` is a checked-in example of the shape and the character
+(512 tokens, 276 distinct English-prose tokens); the hidden seeds are yours and
+must never be derived from the model's own greedy continuation — see step B, and
+Amendment 10.
+
+Provision one such seed object per intended pool entry (at least 8, varied in
+length and domain), plus one more for the untimed correctness golden. Then run
+step B once per pair. If step B's job reports
+
+> `no operator seed named ... Provision them per docs/dflash-go-live-runbook.md step A`
+
+it is this list that is missing.
+
 ## Step B — freeze and pin the IT-target goldens (BLOCKING)
 
 The workflow refuses to run with an empty hidden-golden pin:
@@ -53,15 +81,81 @@ The workflow refuses to run with an empty hidden-golden pin:
 > `hidden DFlash golden pin <name> is empty; freeze the IT-target goldens (go-live
 > runbook step B) and pin them here before enabling the track`
 
-Generate each golden with the pinned baseline binary, then pin
-`MLXFAST_DFLASH_CORRECTNESS_GOLDEN_SHA256` / `_BYTES` and
-`MLXFAST_DFLASH_BENCH_GOLDEN_SHA256` / `_BYTES` from the frozen objects.
+**Do not run `dflash-reference` by hand for this.** Dispatch
+`.github/workflows/dflash-provision-goldens.yml`, which does the whole of step B
+inside a job bound to the `benchmark-private-prompts-v2` environment — the only
+place the R2 credentials exist. (Generation and upload cannot be split: the
+credentials are GitHub environment secrets injected per run, and are on no dev
+machine and on no runner's disk. That is why run 30604267251 hit
+`404 NoSuchKey` with every other gate green — nothing had ever uploaded the
+objects.)
 
-`dflash-reference` builds them; `--seed-generate N` extends a seed and `--generate N`
-produces the emitted chain. Verify each carries `reference_self_consistent: true`
-AND that `emitted_tokens[i] == rows[i].sequential_argmax` for every row — the
+```
+gh workflow run dflash-provision-goldens.yml --repo Layr-Labs/mlxfast-challenge-dev \
+  --ref main \
+  -f confirm_provision_goldens=true \
+  -f correctness_seed_r2_path=<R2 key of a prose seed plan> \
+  -f correctness_object_path=<R2 key to write the correctness golden to> \
+  -f bench_seed_r2_path=<R2 key of a DIFFERENT prose seed plan> \
+  -f bench_object_path=<R2 key to write this timed golden to>
+```
+
+It generates both goldens from the **pinned baseline tree**, verifies them,
+uploads them, **re-downloads each object and computes `sha256` + `bytes` from the
+downloaded bytes**, and prints the four pins. It does not edit
+`dflash-benchmark.yml`: apply the pins by hand, in a reviewed commit. Re-dispatch
+once per `timed_prompt_pool` entry (step A wants at least 8, each from a
+different prose seed).
+
+### The seed must be PRE-TOKENIZED REAL PROSE. Never `--seed-generate`.
+
+This step used to read, in full: "`dflash-reference` builds them;
+`--seed-generate N` extends a seed and `--generate N` produces the emitted
+chain." **That instruction was wrong and it contradicted this track's own
+correctness contract.**
+
+`--seed-generate N` extends the seed by N **reference-generated** tokens — greedy
+self-continuation. `docs/dflash-track-correctness-contract.md` **Amendment 10**
+measured exactly that material and condemned it:
+
+| golden | seed len | distinct seed tokens | rows w/ top-2 gap < 0.25 | min top-2 gap |
+|---|---|---|---|---|
+| `seam-512-golden.json` | 512 | 122 | **0** | 1.875 |
+| `seam-b-golden.json` | 600 | 122 | **0** | 2.625 |
+| `seam-a-golden.json` | 509 | 122 | **0** | 1.875 |
+| `varied-512-golden.json` (prose) | 512 | 317 | 3 | **0.0000** |
+
+Greedy self-continuation degenerates into repetition; the near-tie regime
+Criterion E exists to handle is never entered; draft acceptance measures ~100%
+against 69% on varied prose; and **Amendment 11** prices the difference at
+**1.117x versus 0.840x**. A ranked golden built that way would advertise a
+speedup that does not exist. The hidden ranked prompts are prose.
+
+So: **the seed is operator-supplied, pre-tokenized real prose.** The trusted
+binary links no tokenizer, so a seed arrives as **token ids**, not text — an R2
+object holding `{"seed_tokens": [...], "emitted": []}`. The shape of a
+legitimate one is visible in the public fixture
+`correctness_prompts/public_longcopy_gate_english_512_256.json` →
+`cases[0].prompt_tokens` (512 tokens, 276 distinct: the tokenization of real
+English prose). Hidden prose seeds come from the operator's private store; the
+provisioning job never invents one, and **fails closed** with no seed named
+rather than falling back to `--seed-generate`.
+
+This is enforced, not merely written down. `.github/scripts/check-dflash-golden-degeneracy.sh`
+screens the operator's seed **before** generation and both goldens **after** it,
+against thresholds derived from the table above (seed variety ≥ 0.40 distinct
+fraction; at least one row with a top-2 gap < 0.25; minimum top-2 gap ≤ 1.0). It
+prints all three statistics on every run, pass or fail. The provisioning job also
+asserts its own generation argv contains no `--seed-generate`.
+
+### What the provisioning job verifies before it uploads
+
+Each golden must carry `reference_self_consistent: true` **and**
+`emitted_tokens[i] == rows[i].sequential_argmax` for every row — the
 self-consistency flag alone did not check that until Amendment 10, and three
-goldens shipped with the contradiction.
+goldens shipped with the contradiction. It must also carry at least as many rows
+as the gate will request (512), and it must pass the degeneracy screen. Any of
+those failing aborts before anything is uploaded.
 
 ## Step C — the serial frequency floor (RECOMMENDED, not applied)
 
