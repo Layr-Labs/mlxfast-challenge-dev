@@ -1,0 +1,114 @@
+# Diagnostic: which R2 keys actually resolve?
+#
+# WHY THIS EXISTS. A wrong hidden-golden key is only discoverable ~25 minutes
+# into dflash-benchmark.yml, after build, transform and the whole reused serial
+# gate leg have been paid for. Three separate dispatches were spent learning
+# nothing but "404 NoSuchKey" against three different guesses at one key. This
+# answers the same question in about a minute.
+#
+# It reads. It never writes, never uploads, never scores, and prints only an
+# HTTP status and a byte count per key -- never a single byte of object content,
+# because the objects it probes are hidden competition material.
+#
+# The known-good serial key is probed FIRST as a control. If that one fails,
+# the problem is the credentials or the bucket, not the key under test, and the
+# rest of the results mean nothing.
+name: dflash probe r2 keys
+
+on:
+  workflow_dispatch:
+    inputs:
+      keys:
+        description: >-
+          Newline- or comma-separated R2 object keys to probe, relative to
+          whatever bucket R2_BUCKET_ENDPOINT names. The known-good serial
+          correctness golden is always probed first as a control, so leaving
+          this empty still tells you whether the credentials and bucket work.
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never queue behind or alongside a ranked run: it is the same single runner.
+  group: mlxfast-dflash-r2-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: probe R2 keys (m5-laguna-dflash)
+    runs-on: [self-hosted, m5-laguna-dflash]
+    timeout-minutes: 15
+    # MUST match dflash-benchmark.yml's binding, or the probe tests different
+    # credentials than the ranked job uses and its answer is worthless.
+    environment: benchmark-private-prompts-v2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Probe
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          # Keys are attacker-irrelevant here (operator-supplied) but still pass
+          # through the signer's charset guard, so a typo fails loudly.
+          CANDIDATE_KEYS: ${{ inputs.keys }}
+          # download-r2-object.sh hardcodes 6 attempts and there is no env knob,
+          # so each missing key costs 6 immediate 404s. That is cheap (a 404
+          # returns at once) and the summary below collapses them to one line,
+          # so it is not worth plumbing an override for a diagnostic.
+        run: |
+          set -uo pipefail
+
+          if [[ -z "${R2_ACCESS_KEY_ID}" || -z "${R2_SECRET_ACCESS_KEY}" || -z "${R2_BUCKET_ENDPOINT}" ]]; then
+            echo "::error::R2 credentials are not bound; this workflow must run in the same environment as dflash-benchmark.yml" >&2
+            exit 1
+          fi
+
+          work="$(mktemp -d)"
+          trap 'rm -rf "${work}"' EXIT
+
+          # The control. This exact key is fetched successfully by the serial
+          # ranked job, so it proves the credentials and the bucket.
+          control='correctness_prompts/laguna-xs-2.1-serial-v2/hidden-correctness-golden-94239d59b435eb8f370c82bcf8c86822d1bbc1094e3650aeff3abc5558137023.json'
+
+          probe() {
+            local key="$1" label="$2" out="${work}/probe.bin"
+            rm -f "${out}"
+            local log="${work}/probe.log" rc=0
+            .github/scripts/download-r2-object.sh "${key}" "${out}" >"${log}" 2>&1 || rc=$?
+            local status
+            status="$(grep -oE 'HTTP [0-9]{3}' "${log}" | tail -1 || true)"
+            local code
+            code="$(grep -oE '<Code>[A-Za-z]+</Code>' "${log}" | tail -1 | tr -d '<>/' | sed 's/^Code//;s/Code$//' || true)"
+            if (( rc == 0 )) && [[ -s "${out}" ]]; then
+              printf '  FOUND    %-9s %s\n' "$(wc -c < "${out}" | tr -d ' ')b" "${key}"
+            else
+              printf '  missing  %-9s %s  (%s)\n' "${status:-?}" "${key}" "${code:-no code}"
+            fi
+            # Never keep hidden bytes around, even briefly.
+            rm -f "${out}"
+          }
+
+          echo "=== control: the key the SERIAL ranked job fetches successfully ==="
+          probe "${control}" control
+
+          echo
+          echo "=== candidates ==="
+          if [[ -z "${CANDIDATE_KEYS//[[:space:]]/}" ]]; then
+            echo "  (none supplied)"
+          else
+            printf '%s' "${CANDIDATE_KEYS}" | tr ',' '\n' | while IFS= read -r key; do
+              key="$(printf '%s' "${key}" | tr -d '[:space:]')"
+              [[ -z "${key}" ]] && continue
+              probe "${key}" candidate
+            done
+          fi
+
+          echo
+          echo "Read the control line first: if the control is 'missing', the"
+          echo "credentials or the bucket are wrong and every candidate result"
+          echo "below it is meaningless."
