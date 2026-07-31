@@ -467,8 +467,35 @@ extract_review_json() {
 }
 
 review_json_text=""
+# HTTP failures must stay INSIDE this loop.
+#
+# curl previously ran unguarded under `set -euo pipefail`, so any non-zero exit
+# -- every HTTP error, since --fail-with-body -- aborted the whole script at
+# this line. The step exited with 22, curl's own status, which is the proof that
+# nothing below ever ran: this loop only ever retried UNPARSEABLE JSON, never an
+# HTTP error. curl's own --retry 3 --retry-delay 2 was therefore the entire
+# defence, about four attempts across ~6 seconds.
+#
+# That is far too short for a transient upstream window. On 2026-07-30 a ~41
+# minute period of API 400s failed NINE consecutive ranked submissions, each
+# labelled "Review submitted code for benchmark bypasses" -- i.e. participants
+# were recorded as probable cheats because of an infrastructure blip -- and then
+# it recovered on its own.
+#
+# So: capture curl's status instead of dying on it, and let the outer loop own
+# the backoff at a timescale that matches how long upstream incidents actually
+# last. Attempts are spaced 0s / 60s / 300s.
+readonly HTTP_BACKOFF_SECONDS=(0 60 300)
+http_status=0
 for attempt in 1 2 3; do
   response_path="${work_dir}/response-${attempt}.json"
+  backoff="${HTTP_BACKOFF_SECONDS[$((attempt - 1))]}"
+  if (( backoff > 0 )); then
+    echo "submission-review: waiting ${backoff}s before attempt ${attempt}" >&2
+    sleep "${backoff}"
+  fi
+
+  http_status=0
   env -u ANTHROPIC_API_KEY curl \
     --config "${curl_config}" \
     --silent \
@@ -477,9 +504,27 @@ for attempt in 1 2 3; do
     --retry 3 \
     --retry-all-errors \
     --retry-delay 2 \
+    --connect-timeout 30 \
+    --max-time 900 \
     --data @"${request_path}" \
     --output "${response_path}" \
-    https://api.anthropic.com/v1/messages
+    https://api.anthropic.com/v1/messages || http_status=$?
+
+  if (( http_status != 0 )); then
+    # --fail-with-body has already written the API's explanation to
+    # response_path. NOTHING used to print it: the script died here and the
+    # mktemp work_dir was discarded, so the operator saw a bare "curl exit 22"
+    # and could not tell a bad model id from an overload from a payload
+    # problem. Surface it -- truncated, since it is upstream text.
+    echo "submission-review: attempt ${attempt} failed (curl exit ${http_status}); API said:" >&2
+    head -c 2000 "${response_path}" >&2 || true
+    echo >&2
+    if (( attempt < 3 )); then
+      continue
+    fi
+    echo "::error::submission static review could not reach the judge after 3 attempts (last curl exit ${http_status}). This is an INFRASTRUCTURE failure, not a finding about the submission; re-run the job." >&2
+    exit 1
+  fi
 
   review_text="$(jq -r '[.content[]? | select(.type == "text") | .text] | join("\n")' "${response_path}")"
   review_json_text="$(printf '%s' "${review_text}" | extract_review_json)"
