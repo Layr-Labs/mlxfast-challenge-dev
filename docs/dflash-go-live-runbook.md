@@ -16,7 +16,7 @@ Measured on M5-C, 2026-07-30. Contract detail in
 |---|---|
 | harness end-to-end | `ACCEPT`, 4/4 pairs, `dflash_decode_speedup` **0.8705** (median 0.8712, min 0.8658), band check LIVE, sealed `results.json`. **That was a DIFFERENT golden.** On the ranked hidden golden a no-op measures **0.5493** (4/4 pairs, `CALIBRATION_OK`, `PARITY_OK`) — see Amendment 26 |
 | pinned baseline | `/opt/bench-runner/baseline/laguna-xs-2.1-dflash-v1/<sha>` + `current` symlink, 23 GB, weights APFS-cloned from the serial baseline |
-| baseline calibration | `/opt/bench-runner/state/laguna-xs-2.1-dflash-v1/baseline-calibration.json`, authored by `/Users/gaj/author-dflash-calibration.sh` (the wrapper does NOT write it) |
+| baseline calibration | `/opt/bench-runner/state/laguna-xs-2.1-dflash-v1/baseline-calibration.json`, authored by `/Users/gaj/author-dflash-calibration.sh` (the wrapper does NOT write it). **The band is only valid at the decode token count it was measured at** — the seed prefill is charged inside the decode window, so the same baseline reads 0.0201 s/token at 128 tokens and ~0.0148 at 512. It must record `decode_tokens`; `measure-dflash-job.sh` fails closed if that field is absent or disagrees with the run. Re-author whenever the ranked window OR the pinned baseline binary changes — see Amendment 27. |
 | runner | `m5-laguna-dflash-3-*` online on **mlxfast-challenge-dev**, labels `[self-hosted, m5-laguna-dflash]` only |
 | dispatch chain | verified: job scheduled -> host preflight -> trusted context -> enablement guard fails CLOSED on the contract |
 | decode floor | **0.52** (re-derived 2026-07-31 from a measured no-op; supersedes 0.80, which rejected a correct no-op), agreeing in all five sites: `benchmark.dflash.json` manifest, contract fixture, workflow comments, workflow env `MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR`, and `MIN_ACCEPTED_SPEEDUP` in the box wrapper. Rationale is Amendment 26. **PROVISIONAL** — re-derive from the worst no-op across the pool once `timed_prompt_pool` is populated. |
@@ -174,13 +174,35 @@ goldens shipped with the contradiction. It must also carry at least as many rows
 as the gate will request (512), and it must pass the degeneracy screen. Any of
 those failing aborts before anything is uploaded.
 
-## Step C — the serial frequency floor (RECOMMENDED, not applied)
+## Step C — the serial frequency floor (BLOCKING at the ranked window, not applied)
 
-`MIN_FREQ_SERIAL=1600` in `/opt/bench-runner/measure-dflash-job.sh` false-rejects
-the honest serial denominator. Measured across one run as the box warmed:
-1613 -> 1604 -> **1598** MHz, crossing the floor on the third pair; the gated retry
-returned 1605. Genuine sustained throttle on this silicon is **1447-1455 MHz**
-(operator record 2026-07-12), so 1598 was 145 MHz clear of throttle.
+**Escalated 2026-07-31 from "intermittent" to BLOCKING.** Previously this was seen
+only as the box warmed across pairs. Measured at the RANKED window (512 decode
+tokens, K=3, the value the workflow passes), it rejects **deterministically on the
+first pair and on the gated retry**:
+
+```
+pair1-serial.a1   loaded=91  steady_n=84  min=1589 MHz  max=1620 MHz  -> REJECT
+pair1-serial.a2   loaded=96  steady_n=87  min=1592 MHz  max=1620 MHz  -> REJECT
+                                                        FATAL(code=5) pair 1
+```
+
+The floor sits **inside the machine's normal loaded range** (1589-1620 MHz) once a
+phase runs the ranked length: a 512-token serial phase takes ~52 s against ~13 s at
+128 tokens, so it settles into a 2% lower steady clock. At 128 tokens the same
+baseline passed at 1603 MHz — 3 MHz of margin, which is why this read as
+intermittent. Sample counts are healthy (91-96 loaded), so this is purely the
+frequency arm, not the sample-count arm that bit the serial production wrapper.
+
+**Consequence: the calibration band cannot be re-authored at the ranked window
+until this is resolved**, because authoring needs four accepted pairs. That makes
+this blocking for go-live, and it blocks Amendment 27's fix from being completed.
+
+Original measurement, as the box warmed at 128 tokens: 1613 -> 1604 -> **1598** MHz,
+crossing the floor on the third pair; the gated retry returned 1605. Genuine
+sustained throttle on this silicon is **1447-1455 MHz** (operator record
+2026-07-12), so every one of these figures — including 1589 — is well over 130 MHz
+clear of real throttle.
 
 Both sides run at ~1606 MHz, but dflash is judged against 1500 (106 MHz margin) and
 serial against 1600 (4-13 MHz). The 1600 value was inherited from the serial
@@ -193,8 +215,12 @@ record, still ~45 MHz above measured throttle. One line, then
 serving the track.
 
 Not applied by an agent: the thermal/telemetry stability contract is declared
-`readonly` with "do not env-override" and is operator-owned. Left at 1600 the track
-carries an intermittent false-reject that consumes a run's single gated retry.
+`readonly` with "do not env-override" and is operator-owned. That has not changed
+with the escalation — a throttle floor is exactly the kind of gate an agent must
+not relax on its own authority, even with the measurement in hand. Left at 1600 the
+track does not merely carry an intermittent false-reject: **no ranked run can
+complete pair 1 at the 512-token window**, and the calibration band cannot be
+authored, so go-live is blocked on this one line.
 
 ## Step D — flip the two trusted-contract fields
 

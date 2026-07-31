@@ -2920,3 +2920,79 @@ value** instead of a literal, so a header comment cannot silently disagree with
 the number the trusted shell rejects on. Pin constants by derivation from the
 enforcing site wherever a test can reach it; enumeration by hand does not
 converge.
+
+# Amendment 27 (2026-07-31): the calibration band would have false-rejected every ranked run
+
+The serial-denominator sanity band in `measure-dflash-job.sh` compares the run's
+measured `serial_mean` against `serial_decode_seconds_per_token_mean` from
+`/opt/bench-runner/state/laguna-xs-2.1-dflash-v1/baseline-calibration.json`,
+requiring `mean × 0.95 <= observed <= mean × 1.05`.
+
+**A seconds-per-token band is only valid at the decode token count it was
+measured at**, because the seed prefill is charged INSIDE the decode window
+(`prefill_component: "none"` in the fixture is the same fact stated from the
+other side). Measured 2026-07-31 from a retained serial phase report:
+
+```
+decode_seconds 2.5740 / decode_token_count 128 = 0.020110 s/token   (seed 512)
+p50_block_request_seconds 0.013015 × 128 rounds =  1.666 s of decode
+window − decode                                 =  0.908 s of seed prefill (35%)
+```
+
+So the same pinned baseline reads **0.0201 s/token at 128 tokens** and
+`(0.908 + 512 × 0.013015)/512` = **~0.0148 at 512** — a ratio of **0.73** against
+a band authored at 128. Far outside ±5%.
+
+The installed band was authored at 128 tokens. The ranked workflow passes
+`MLXFAST_DFLASH_DECODE_TOKENS=512`. **Every ranked run would therefore have
+measured all four pairs, passed parity, and then died `exit 6` "serial
+denominator outside calibration band"** — reading as a candidate failure, or as
+box drift, when it was a calibration mismatch. The band check runs after the
+pair loop, so the full measurement cost is paid before the rejection.
+
+## Why it was stale: a correction that did not propagate
+
+The fixture's own `decode_tokens_note` records that the ranked window "was 128
+(inherited from the retired track's local-iterate default)" while
+`ranked_decode_window_tokens` and `scoring.decodeTokens` both said 512 — three
+places disagreeing, since corrected to 512 and pinned by `DFlashTrackTests`. The
+band was authored during that 128 era and **never re-authored when the window
+moved**. The repo-side fix bound the three repo sites to each other and stopped
+there; nothing connected them to the measurement artefact on the box.
+
+## The fix binds them
+
+* `measure-dflash-job.sh` now **fails closed, before trusting the band**, if the
+  calibration omits `decode_tokens` or records a count that disagrees with the
+  run — naming which number is wrong instead of blaming the denominator.
+* `author-dflash-calibration.sh` now records `decode_tokens` **taken from the
+  sealed results**, never from an argument, so the recorded window cannot
+  disagree with the measurement it describes.
+* Verified across four cases: band absent → refuse; authored-128 against a
+  512-token run → refuse; 512 against 512 → pass; 512 against a 128-token probe
+  → refuse. (Extracted-logic test; the integrated path is exercised by the
+  re-authoring run.)
+
+Re-author the band whenever the ranked window changes, not only when the pinned
+baseline binary changes — the existing `note` field only warned about the binary.
+
+## Secondary: `--baseline current` silently produces a symlink clone
+
+`make_baseline_clone` copies with `cp -c -R`, which on BSD copies a symlink AS a
+symlink. Passing the `current` symlink therefore yields a "clone" pointing back
+into `/opt`, which `bench-exec` refuses for sitting outside the job root — three
+lines into pair 1, with an error naming `/opt` rather than the cause. Two runs
+were lost to this. The ranked workflow already passes a `readlink -f`'d path
+(`MLXFAST_DFLASH_BASELINE_RESOLVED`), so the ranked path was never affected; the
+wrapper now resolves `BASELINE_WS` to a physical path so the **manual**
+calibration-authoring path this runbook documents is safe too.
+
+## Method note
+
+Both failures in this amendment are the same shape as Amendment 26's and as the
+two production `measure-job.sh` guards: **a threshold calibrated against material
+that is not what gets measured.** The generalisation to add to Amendment 25's:
+when a constant is bound across its sites, ask what MEASUREMENT the constant is
+compared against, and whether that measurement records the conditions under which
+it is valid. A band with no conditions attached is not a band — it is a number
+that happens to have been true once.
