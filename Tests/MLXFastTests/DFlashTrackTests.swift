@@ -1437,40 +1437,50 @@ struct DFlashDecodeFloorTests {
         )
     }
 
-    /// 0.80, set by operator decision 2026-07-30. NOT 1.0: block decode costs ~16%
-    /// on realistic prose, so an unmodified candidate measures 0.840x, and a 1.0
-    /// floor would reject every honest sub-19% kernel win instead of rejecting
-    /// regressions. Raising this back to 1.0 makes the track reject its own purpose.
+    /// 0.52, re-derived 2026-07-31 from a MEASURED no-op on the ranked golden
+    /// (0.5493 at K=3 over 4/4 accepted pairs; 0.6201 at K=2), superseding the 0.80
+    /// that came from 0.840x at ~69% draft acceptance on a DIFFERENT golden. 0.80
+    /// rejected a CORRECT no-op. Neither 1.0 nor 0.80 is the no-change line on this
+    /// material: block decode spends compute per declared row, 1.8125 rows per
+    /// emitted token against a 1.8206 slowdown. Raising this back makes the track
+    /// reject its own purpose -- see contract Amendment 26.
     @Test
-    func decodeFloorIsEightyHundredthsInBothManifests() throws {
+    func decodeFloorIsFiftyTwoHundredthsInBothManifests() throws {
         let manifest = try json("benchmark.dflash.json")
         let scoring = try #require(manifest["scoring"] as? [String: Any])
         let floor = try #require(scoring["decodeSpeedupFloor"] as? Double)
-        #expect(floor == 0.80)
+        #expect(floor == 0.52)
 
         let fixture = try json("fixtures/laguna_xs_2_1_dflash_track.json")
         let proposed = try #require(fixture["proposed_scoring"] as? [String: Any])
         let text = try #require(proposed["component_floor"] as? String)
         #expect(
-            text.contains(">= 0.80"),
+            text.contains(">= 0.52"),
             "the fixture's component_floor must state the same number the manifest enforces"
         )
         // The derivation has to travel with the number, or the next reader "fixes"
-        // it back to 1.0.
+        // it back to 1.0. Both derivations must be present: the live measurement,
+        // and the superseded 0.840x it replaced -- a bare number invites exactly the
+        // mis-calibration that made 0.80 reject a correct no-op.
+        #expect(text.contains("0.5493"))
         #expect(text.contains("0.840x"))
+        // The floor is provisional until timed_prompt_pool is populated: no-op
+        // scores span 0.55 to 1.117 by material, so one floor across a varied pool
+        // is a lottery. That caveat must not be dropped when the number moves.
+        #expect(text.contains("PROVISIONAL"))
         #expect(text.contains("MAX_PLAUSIBLE_SPEEDUP stays 5.0"))
     }
 
     /// The workflow ALSO carries the floor as an env value and recomputes the score
     /// against it in a trusted shell -- a fifth site, found only when a real
     /// dispatch printed the whole env block. A 1.0 here would silently override the
-    /// 0.80 landed everywhere else at go-live.
+    /// 0.52 landed everywhere else at go-live.
     @Test
     func workflowEnvFloorMatchesTheManifests() throws {
         let workflow = try String(
             contentsOfFile: ".github/workflows/dflash-benchmark.yml", encoding: .utf8
         )
-        #expect(workflow.contains("MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: \"0.80\""))
+        #expect(workflow.contains("MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: \"0.52\""))
         #expect(!workflow.contains("MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: \"1.0\""))
     }
 
@@ -1481,7 +1491,38 @@ struct DFlashDecodeFloorTests {
         let workflow = try String(
             contentsOfFile: ".github/workflows/dflash-benchmark.yml", encoding: .utf8
         )
-        #expect(workflow.contains("floor: aggregate >= 0.80"))
+        // Derived from the ENFORCED env value, not a literal. A bare literal here is
+        // exactly how the header comment and the value the trusted shell rejects on
+        // drift apart: the 0.80 decision reached all four ENFORCING sites while every
+        // PROSE site still described the floor it replaced, and the 0.52
+        // re-derivation of 2026-07-31 found the same split. Pinning the comment to
+        // whatever is enforced makes that class of drift a test failure.
+        let marker = "MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: \""
+        let enforcedLine = try #require(
+            workflow.split(separator: "\n").first {
+                $0.contains(marker)
+                    && !$0.trimmingCharacters(in: .whitespaces).hasPrefix("#")
+            },
+            "the workflow must declare MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR"
+        )
+        let enforced = try #require(
+            String(enforcedLine).components(separatedBy: "\"").dropFirst().first,
+            "MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR must be a quoted value"
+        )
+        #expect(
+            workflow.contains("floor: aggregate >= \(enforced)"),
+            """
+            the workflow header comment does not state the floor the trusted shell \
+            enforces (\(enforced))
+            """
+        )
+        #expect(
+            workflow.contains("floor >= \(enforced) on that aggregate"),
+            """
+            the scoring-contract comment does not state the floor the trusted shell \
+            enforces (\(enforced))
+            """
+        )
         #expect(!workflow.contains("floor: aggregate >= 1.0"))
         #expect(!workflow.contains("floor >= 1.0 on that aggregate"))
     }
