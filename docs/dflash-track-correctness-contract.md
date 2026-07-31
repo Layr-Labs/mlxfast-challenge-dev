@@ -3,8 +3,10 @@
 **Status: DESIGN, not yet implemented.** The DFlash track is fail-closed
 (`fixtures/laguna_xs_2_1_dflash_track.json` -> `official_scoring_enabled: false`)
 and MUST stay so until every layer below is implemented and validated on M5-C.
-`benchmark.dflash.json` carries `tokenFidelityGateStatus: "pending-spec"`; that
-key flips to `"implemented"` only when L1-L6 are in place.
+`benchmark.dflash.json` carries `tokenFidelityGateStatus:
+"proposed-awaiting-operator-signoff"` (it read `"pending-spec"` until the spec
+was written — Amendment 29); that key flips to `"implemented"` only when L1-L6
+are in place, by the operator, at go-live.
 
 ## Why the retired MTP contract cannot be reused
 
@@ -3073,3 +3075,87 @@ generalises once more: **a derived constant is only meaningful as
 (value, conditions-of-measurement), and every site that states the value must
 state the conditions.** A reviewer who cannot see the conditions cannot see
 that the number is wrong.
+
+# Amendment 29 (2026-07-31): the token-fidelity gate is specified — PROPOSED, awaiting operator sign-off
+
+The fixture's `token_fidelity_gate` carried `PENDING SPEC` since the Gemma-MTP
+`bit_exact_gate` was withdrawn, and the fixture makes full specification a hard
+precondition for `official_scoring_enabled`. The spec is now WRITTEN — this
+amendment records what it says, what evidence each number traces to, and what
+adopting it accepts. **Writing it adopts nothing.** The lifecycle is explicit:
+`pending-spec` → `proposed-awaiting-operator-signoff` (this change, both in the
+fixture and in `benchmark.dflash.json`'s `tokenFidelityGateStatus`) →
+`implemented` (the operator, at runbook Step D, in the same change that flips
+the contract fields — `trackCannotBeEnabledWhileTheFidelityGateIsUnspecified`
+holds the lock).
+
+## What is specified
+
+The criterion the manifest has always named:
+`trusted-sequential-reverification-with-bounded-near-tie-budget`, exactly as
+implemented in `Sources/MLXFastTrustedHarness/LagunaRuntimeDFlash.swift` and
+exercised by every accepted run to date. Per emitted token, first match wins:
+
+| outcome | predicate | bound |
+|---|---|---|
+| exact | token == reference K=1 sequential argmax | — |
+| declared-frame | token == reference's own argmax at the DECLARED width (L1) | — |
+| near-tie | `ref_top1_logit − ref_logit(emitted) <= 4.875` | 40/1000 scored tokens (21 @ 512) |
+| residual | reference top-2 member at a confident row | 5/1000 (3 @ 512) |
+| — | anything else | **reject**, `tokenNotAdmissible` |
+
+Budget exhaustion is a `residualBudgetExhausted` violation; no report publishes
+without the reference pass (`requireReferenceValidated`); the reference is
+teacher-forced on the candidate's own emitted prefix, so a divergence
+re-anchors every later row; the rejected tail stays priced (Amendment 21).
+
+## Where each number comes from
+
+* **4.875 envelope** = `2 × 2.4375`, twice the maximum live
+  candidate-vs-reference top-2 logit delta under post-run replay across widths,
+  fixtures and seeds (Amendment 16's recalibration table; the multiplier is 2
+  because reordering two logits needs a gap below the difference of two
+  per-logit drifts). The motivating divergence measurement — max sequential
+  gap 0.625 at 14/14 block-vs-sequential divergences — sits well inside it.
+* **40/1000 near-tie budget**: Amendment 16 kept it as the blast-radius
+  backstop; the envelope is the working control. Measured need at authoring:
+  3 per 128 rows on varied prose, 0 on repetitive.
+* **5/1000 residual budget**: Amendment 20 measured honest cross-build drift
+  occupying the band (12,800 comparisons) — the budget cannot be zero for a
+  candidate that legitimately edits kernels, and the serial track records the
+  same accumulation-order reality.
+
+## Measured state at the shipping configuration (the conditions travel with the numbers)
+
+K=2, 512 decode tokens, ranked hidden golden, M5-C, 2026-07-31 — three
+consecutive accepted timed runs, plus gates-only CI run 30664724953 on the
+correctness golden: `all_tokens_matched == true` throughout; on the timed
+golden the **unmodified baseline consumes 9 of its 21 near-tie slots — the
+same 9 in all three runs** — and 0 of 3 residual slots. The determinism matters: the no-op's consumption is frame
+divergence, a property of the material, not run noise. Prior evidence run
+30613617340 (2026-07-30, different golden): 512/512 admissible as 503 exact +
+6 near-tie + 3 declared-frame, `max_top2_logit_delta` 1.875 vs 4.875.
+
+A directive drafting this spec asserted the no-op passes "with ZERO budget
+consumed." **Measurement refuted that** — 9/21 — and the spec records the
+measured figure. The zero-consumption claim would have shipped a false
+baseline expectation into the contract, and anyone later observing 9 would
+have read the no-op itself as suspect.
+
+## What adopting this accepts (unchanged from the runbook, now quantified)
+
+1. The budget VALUE is untested near its limit: highest observed utilisation
+   is 9/21 (43%). Enforcement is proven (the counter and violation fire in
+   tests); the headroom number is not adversarially probed.
+2. The gate has never faced an adversarially-motivated candidate
+   (Amendments 18–23: every gate on this track looked sound until attacked).
+3. **Near-tie consumption is a property of the timed material** — 0/128
+   repetitive, 3/128 varied prose, 9/512 ranked golden. Whoever populates
+   `timed_prompt_pool` must re-measure baseline utilisation per entry and
+   confirm headroom, or a flat-material prompt rejects honest candidates: the
+   floor's Amendment 28 failure mode, transplanted to fidelity.
+
+The spec prose is pinned to the enforcing constants by
+`theFidelityGateSpecStatesTheConstantsTheImplementationEnforces` — the
+Amendment 28 derived-pin pattern — so `Constants.swift` and the fixture cannot
+drift apart silently.

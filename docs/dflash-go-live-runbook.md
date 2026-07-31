@@ -237,20 +237,26 @@ The guard requires BOTH, on `main`:
 - `fixtures/laguna_xs_2_1_dflash_track.json` -> `official_scoring_enabled: true`
 - the same fixture's `reference_baseline.publication_allowed: true`
 
-`benchmark.dflash.json` -> `scoring.tokenFidelityGateStatus` is `pending-spec`; the
-pinned test `trackCannotBeEnabledWhileTheFidelityGateIsUnspecified` fails the build
-if official scoring is enabled while that is not `implemented`. Decide deliberately
-what that word means for this track — see "known limits" below — and set it in the
-same change.
+`benchmark.dflash.json` -> `scoring.tokenFidelityGateStatus` is
+`proposed-awaiting-operator-signoff`: the full spec is WRITTEN (fixture
+`token_fidelity_gate`, rationale and evidence in contract Amendment 29 — every
+number traces to a measurement, and the prose is pinned to the enforcing
+constants by test). The pinned test
+`trackCannotBeEnabledWhileTheFidelityGateIsUnspecified` fails the build if
+official scoring is enabled while the status is not `implemented`. Flipping it
+to `implemented` is the sign-off — read Amendment 29's "what adopting this
+accepts" first, then set it in the same change as the contract fields.
 
-### Evidence for that decision, assembled 2026-07-31 (status NOT changed)
+### Evidence for that decision, assembled 2026-07-31 (spec since written — Amendment 29)
 
 The declared gate is
 `trusted-sequential-reverification-with-bounded-near-tie-budget`. Each of its
-three clauses now has an implementation and a live measurement behind it. The
-status was deliberately left at `pending-spec` — flipping it is the go-live
-judgement and belongs to whoever throws the switch — but the evidence is
-recorded here so that call does not have to be re-derived.
+three clauses has an implementation and a live measurement behind it. The spec
+text was written the same day (fixture `token_fidelity_gate` + Amendment 29)
+and the status advanced to `proposed-awaiting-operator-signoff`; flipping it to
+`implemented` remains the go-live judgement and belongs to whoever throws the
+switch. The evidence is recorded here so that call does not have to be
+re-derived.
 
 | clause | implementation | observed in run `30613617340` |
 |---|---|---|
@@ -266,10 +272,14 @@ Supporting: `all_tokens_matched: true` with 512/512 rows admissible (503 exact +
 **What this evidence does NOT settle.** Two questions remain judgement, not
 measurement:
 
-1. The near-tie budget of 40/1000 has only ever been exercised at 6 admissions
-   per 512 rows — roughly a third of the bound. Nothing has probed what happens
-   near the limit, so the bound's *value* is untested even though its
-   *enforcement* is demonstrated.
+1. The near-tie budget of 40/1000 has never been probed near its limit, so the
+   bound's *value* is untested even though its *enforcement* is demonstrated.
+   Highest observed utilisation: **9 of 21 slots (43%) on the ranked timed
+   golden** — the same 9 in three consecutive runs at the shipping
+   configuration (K=2, 512 tokens, 2026-07-31), i.e. deterministic frame
+   divergence that scales with how flat the material is (6 per 512 on the
+   2026-07-30 golden, 9 per 512 on the ranked one). Pool entries must each be
+   checked for baseline utilisation headroom — see Amendment 29.
 2. Everything above was measured with the candidate being unmodified reference
    code. A ranked run's candidate is adversarially motivated; the gate has never
    faced one. Contract Amendments 18-21 record that this track's gates have

@@ -85,9 +85,61 @@ struct DFlashTrackTests {
         }
 
         // Today the track ships inert. If this flips, the assertion above is
-        // what keeps it honest.
+        // what keeps it honest. The status advanced pending-spec ->
+        // proposed-awaiting-operator-signoff when the spec text was written
+        // (Amendment 29); only the OPERATOR moves it to implemented, at
+        // runbook Step D, in the same change that flips the contract fields.
         #expect(officialScoring == false)
-        #expect(gateStatus == "pending-spec")
+        #expect(gateStatus == "proposed-awaiting-operator-signoff")
+
+        // The fixture carries the same status string, so the two files cannot
+        // describe different lifecycle states for one gate.
+        let proposed = try #require(fixture["proposed_scoring"] as? [String: Any])
+        #expect(
+            proposed["token_fidelity_gate_status"] as? String == gateStatus,
+            "fixture token_fidelity_gate_status disagrees with the manifest"
+        )
+    }
+
+    /// The proposed fidelity spec (Amendment 29) is prose describing an
+    /// implementation, which is exactly the shape that drifted three times on
+    /// the decode floor (Amendments 25/26/28). So the prose is pinned to the
+    /// ENFORCING constants, not to literals: if the envelope or a budget moves
+    /// in Constants.swift, this fails until the spec text moves with it.
+    @Test
+    func theFidelityGateSpecStatesTheConstantsTheImplementationEnforces() throws {
+        let fixture = try json(Self.fixturePath)
+        let proposed = try #require(fixture["proposed_scoring"] as? [String: Any])
+        let spec = try #require(
+            proposed["token_fidelity_gate"] as? String,
+            "the fixture must carry the fidelity-gate spec text"
+        )
+        #expect(spec.contains("PROPOSED SPEC"))
+        // Derived from the constants the trusted verifier actually enforces.
+        #expect(
+            spec.contains(
+                "<= \(MLXFastConstants.experimentalDFlashNearTieLogitEnvelope)"),
+            "the spec must state the near-tie envelope the verifier enforces"
+        )
+        #expect(
+            spec.contains(
+                "\(MLXFastConstants.experimentalDFlashNearTieAdmissionBudgetPerThousand)/1000"
+            ),
+            "the spec must state the near-tie budget rate"
+        )
+        #expect(
+            spec.contains(
+                "\(MLXFastConstants.experimentalDFlashResidualDivergenceBudgetPerThousand)/1000"
+            ),
+            "the spec must state the residual budget rate"
+        )
+        // The measured baseline utilisation travels with the numbers: a budget
+        // whose headroom is unstated is Amendment 27's "number with no
+        // conditions attached".
+        #expect(spec.contains("9 of its 21 near-tie slots"))
+        // And the adoption rationale is in the contract, not only here.
+        let doc = try text("docs/dflash-track-correctness-contract.md")
+        #expect(doc.contains("# Amendment 29"))
     }
 
     // The written contract must stay in the repository: it is the only record
