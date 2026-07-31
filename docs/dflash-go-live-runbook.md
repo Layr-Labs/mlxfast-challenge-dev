@@ -209,6 +209,38 @@ if official scoring is enabled while that is not `implemented`. Decide deliberat
 what that word means for this track — see "known limits" below — and set it in the
 same change.
 
+### Evidence for that decision, assembled 2026-07-31 (status NOT changed)
+
+The declared gate is
+`trusted-sequential-reverification-with-bounded-near-tie-budget`. Each of its
+three clauses now has an implementation and a live measurement behind it. The
+status was deliberately left at `pending-spec` — flipping it is the go-live
+judgement and belongs to whoever throws the switch — but the evidence is
+recorded here so that call does not have to be re-derived.
+
+| clause | implementation | observed in run `30613617340` |
+|---|---|---|
+| **trusted** | verifier lives in `Sources/MLXFastTrustedHarness/LagunaRuntimeDFlash*.swift`; participant code cannot reach it (it links no MLX/model code) | gate ran inside the trusted parent, candidate confined to the bench sandbox |
+| **sequential reverification** | `DFlashReferenceRow.sequentialArgmax` — "reference argmax in the K=1 sequential frame" — plus post-run replay | `reference_checked_row_total: 858`, `verify_block_replayed_round_count: 335` |
+| **bounded near-tie budget** | `nearTieBudget` / `residualBudget`, bound `experimentalDFlashNearTieAdmissionBudgetPerThousand = 40`, enforced by the `residualBudgetExhausted` violation | `admissible_near_tie_count: 6`, `residual_divergence_count: 0`, i.e. the budget was exercised and not exhausted |
+
+Supporting: `all_tokens_matched: true` with 512/512 rows admissible (503 exact +
+6 near-tie + 3 declared-frame), `work_binding_comparison_count: 1716`,
+`rejected_rows_reference_checked: 346`, `max_top2_logit_delta` 1.875 against the
+4.875 tolerance.
+
+**What this evidence does NOT settle.** Two questions remain judgement, not
+measurement:
+
+1. The near-tie budget of 40/1000 has only ever been exercised at 6 admissions
+   per 512 rows — roughly a third of the bound. Nothing has probed what happens
+   near the limit, so the bound's *value* is untested even though its
+   *enforcement* is demonstrated.
+2. Everything above was measured with the candidate being unmodified reference
+   code. A ranked run's candidate is adversarially motivated; the gate has never
+   faced one. Contract Amendments 18-21 record that this track's gates have
+   repeatedly looked sound until first attacked.
+
 Also flip `confirm_track_enabled`'s default to `true` in the workflow if Yukon will
 dispatch with defaults; it is currently `false` precisely because the track is
 inert.
