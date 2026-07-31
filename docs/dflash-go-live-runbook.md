@@ -14,12 +14,12 @@ Measured on M5-C, 2026-07-30. Contract detail in
 
 | thing | state |
 |---|---|
-| harness end-to-end | `ACCEPT`, 4/4 pairs, `dflash_decode_speedup` **0.8705** (median 0.8712, min 0.8658), band check LIVE, sealed `results.json` |
+| harness end-to-end | `ACCEPT`, 4/4 pairs, `dflash_decode_speedup` **0.8705** (median 0.8712, min 0.8658), band check LIVE, sealed `results.json`. **That was a DIFFERENT golden.** On the ranked hidden golden a no-op measures **0.5493** (4/4 pairs, `CALIBRATION_OK`, `PARITY_OK`) — see Amendment 26 |
 | pinned baseline | `/opt/bench-runner/baseline/laguna-xs-2.1-dflash-v1/<sha>` + `current` symlink, 23 GB, weights APFS-cloned from the serial baseline |
 | baseline calibration | `/opt/bench-runner/state/laguna-xs-2.1-dflash-v1/baseline-calibration.json`, authored by `/Users/gaj/author-dflash-calibration.sh` (the wrapper does NOT write it) |
 | runner | `m5-laguna-dflash-3-*` online on **mlxfast-challenge-dev**, labels `[self-hosted, m5-laguna-dflash]` only |
 | dispatch chain | verified: job scheduled -> host preflight -> trusted context -> enablement guard fails CLOSED on the contract |
-| decode floor | 0.80, agreeing in all five sites: `benchmark.dflash.json` manifest, contract fixture, workflow comments, workflow env `MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR`, and `MIN_ACCEPTED_SPEEDUP` in the box wrapper. Rationale is Amendment 25. |
+| decode floor | **0.52** (re-derived 2026-07-31 from a measured no-op; supersedes 0.80, which rejected a correct no-op), agreeing in all five sites: `benchmark.dflash.json` manifest, contract fixture, workflow comments, workflow env `MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR`, and `MIN_ACCEPTED_SPEEDUP` in the box wrapper. Rationale is Amendment 26. **PROVISIONAL** — re-derive from the worst no-op across the pool once `timed_prompt_pool` is populated. |
 | janitor audit | clean after re-signing; re-verified on all three boxes 2026-07-31 |
 | hidden goldens | ONE pair provisioned, uploaded and pinned (correctness `185394`b, bench `185433`b). R2 keys settled by probe: the prefix is `correctness_prompts/laguna-xs-2.1-dflash/`, with NO `gautham-experiments` segment -- that is the BUCKET, carried by `R2_BUCKET_ENDPOINT`. Pinned by `DFlashGoldenKeyTests`; probe with `.github/workflows/dflash-probe-r2-keys.yml` before changing. |
 
@@ -269,7 +269,17 @@ dispatch; nothing needs unwinding on the box. The runner can be parked with
 
 These are documented, measured, and unresolved. Enabling scoring accepts them.
 
-1. **An unmodified candidate scores ~0.87.** Because the denominator is the pinned
+1. **An unmodified candidate scores 0.5493 on the ranked golden**, so the entry bar
+   is far steeper than the ~0.87/~16% figures below — those were measured on a
+   DIFFERENT golden at ~69% draft acceptance and are **superseded by Amendment 26**.
+   On the material this track actually ranks against, draft acceptance is ~34%, the
+   block path declares **1.8125 rows of compute per emitted token** against a 1.8206
+   observed slowdown, and a no-op measures 0.5493 at K=3 / 0.6201 at K=2. The floor
+   is 0.52 accordingly. An entrant must therefore find roughly **1.8x of general
+   forward speedup before they rank above a no-op**, which is a far less attractive
+   track than the 19% figure implied — that is the decision being accepted here, and
+   it is the strongest argument for per-prompt no-op normalisation before go-live.
+   The historical reasoning: because the denominator is the pinned
    baseline and only the numerator is the candidate's build, general kernel wins DO
    count — but block decode itself costs ~16% on realistic prose, so entrants need
    roughly **19% of general forward speedup before they rank at all**. That is an

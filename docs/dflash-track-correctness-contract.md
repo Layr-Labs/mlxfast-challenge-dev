@@ -2768,6 +2768,12 @@ it took fourteen amendments for anyone to read the two side by side.
 
 # Amendment 25 (2026-07-31): the decode floor is 0.80, and this document said 1.0 in three places
 
+> **SUPERSEDED by Amendment 26 — the floor is now 0.52.** Everything below about
+> *why the floor is not 1.0* still holds. What did not hold is the specific value
+> 0.80 and its `0.840x`-at-69%-acceptance derivation: both were measured on a
+> different golden, and on the golden this track actually ranks against, 0.80
+> rejects a correct no-op.
+
 Found by an independent consistency audit, not by new measurement. The floor
 decision was made by the operator on 2026-07-30 and applied to all five
 enforcing sites, but **this document was never amended**, so its own dedicated
@@ -2823,3 +2829,94 @@ from the other direction: **a constant is not consistent because its enforcing
 sites match — it is consistent when the document that explains it matches too.**
 Grep the docs for a constant's OLD value as part of changing it, not just for
 its new one.
+
+# Amendment 26 (2026-07-31): 0.80 rejected a correct no-op, so the floor is 0.52
+
+Amendment 25 set `MIN_ACCEPTED_SPEEDUP` / `decodeSpeedupFloor` /
+`MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR` to **0.80**, derived from an unmodified
+candidate measuring **0.8705** end-to-end at ~69% draft acceptance and 1.25
+declared rows per emitted token. That measurement was taken on a **different
+golden** from the one this track ranks against.
+
+On the ranked hidden golden, measured end-to-end on M5-C at the frozen window
+(512-token seed, 128 decode steps, matched token counts on both sides, 40C gate,
+ratio-of-means), a no-op candidate — a build that prices the rejected tail per
+Amendment 21 — measures:
+
+| block size | accepted pairs | aggregate |
+|---|---|---|
+| K=3 (shipped) | 0.5484 / 0.5496 / 0.5509 / 0.5482 | **0.5493** |
+| K=2 (probe) | 0.6191 / 0.6212 | **0.6201** |
+
+Serial mean 0.020156 s/token against a K=3 dflash mean of 0.036695 s/token. Both
+runs reached `CALIBRATION_OK` and `PARITY_OK` on every contributing phase report
+and then died on `FATAL(code=5)` at the 0.80 floor. **The floor rejected a
+correct no-op** — the one thing a floor must never do. Its job is to reject
+regressions, not to set a skill bar.
+
+The cause is arithmetic, not tuning. The ledger reports 128 emitted tokens
+against **232 declared rows in 91 rounds = 1.8125 rows of compute per emitted
+token**, against an observed slowdown of **1.8206** — agreeing to under 0.5%.
+Per-row cost dominates; batching does not amortise it. Draft acceptance is
+**~34%** on this material versus the ~69% behind the 0.840x figure. At K=3 you
+compute 3 rows and emit ~1.41 tokens, and the batching economy is roughly
+consumed by the drafter's own cost.
+
+**New value: 0.52** = `0.5493 × 0.952`, where 0.952 is the same margin
+Amendment 25 used (`0.80 / 0.840`) — the precedent is preserved rather than a new
+number invented. Observed run-to-run spread is under 0.5%, so 0.52 leaves ~5%
+headroom.
+
+## This floor is PROVISIONAL, and that is the real open problem
+
+A no-op scores **0.55** on this prompt, **0.840x** on the fixture Amendment 25
+measured, and **1.117x** on degenerate greedy self-continuation (Amendments 10,
+11, 21). One floor across a varied 8-prompt `timed_prompt_pool` therefore means
+**the same submission can pass or fail depending on which index is sampled** —
+the anti-lottery guarantee the pool exists to provide does not extend to the
+floor. L6 removed the retry lottery and left a scoring lottery in its place.
+
+Two consequences, both binding on go-live:
+
+1. Whoever populates `timed_prompt_pool` **must re-derive this floor from the
+   WORST no-op across all entries**, never from a single prompt.
+2. The durable fix is **normalising each prompt by its own measured no-op**, so
+   the score means "faster than a no-op on this prompt" regardless of material.
+   That is a scoring-contract change, not a constant edit.
+
+## The entry bar is much steeper than Amendment 25 advertised
+
+Amendment 25 told entrants they needed ~19% of general forward speedup to rank.
+At 1.8125 rows per emitted token the real figure is closer to **1.8×**. That is a
+materially less attractive track, and it is the strongest argument for doing the
+per-prompt normalisation above before scoring is enabled rather than after.
+
+## K=2 measured 13% better and was deliberately NOT shipped here
+
+K=2 scores 0.6201 against K=3's 0.5493 on identical material.
+`MLXFAST_DFLASH_BLOCK_SIZE` was left at 3 because the untimed parity gate is
+currently green at K=3 against a **K=3-generated golden**, and re-verifying it at
+K=2 costs a full ranked-length dispatch. Shipping it here would have traded a
+verified gate for a score improvement under time pressure. It is the right next
+change, with that dispatch.
+
+## Where the floor lives — the enumeration is the hard part
+
+`benchmark.dflash.json` `scoring.decodeSpeedupFloor`; the contract fixture's
+`proposed_scoring.component_floor`; the workflow env
+`MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR`; the workflow's header comments and its
+operator-facing rejection message; and `MIN_ACCEPTED_SPEEDUP` in
+`/opt/bench-runner/measure-dflash-job.sh` on every serving box — the only site
+that actually rejects, and the only one no test can reach. It is now covered by
+the signed integrity manifest (57 entries), so a floor edit on the box is
+auditable for the first time.
+
+Amendment 25's method note said to grep for a constant's OLD value when changing
+it. Doing that here found **~40 lines across 6 files**, against an initial
+enumeration of 6 — including two test pins and two workflow comments that a
+first pass missed entirely. So the note needed strengthening, not just following:
+the comment pin in `DFlashDecodeFloorTests` is now **derived from the enforced env
+value** instead of a literal, so a header comment cannot silently disagree with
+the number the trusted shell rejects on. Pin constants by derivation from the
+enforcing site wherever a test can reach it; enumeration by hand does not
+converge.
