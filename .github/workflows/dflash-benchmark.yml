@@ -18,10 +18,13 @@ name: dflash-benchmark
 #   contract fixture, reference_baseline.publication_allowed is false, and
 #   tokenFidelityGateStatus is pending-spec. A FOURTH lock stops a ranked run
 #   even if those were flipped: the hidden timed-prompt pool holds ONE entry
-#   and the selection step refuses a RANKED run on a pool below 8 (it also
-#   fails closed on an empty pool). Do NOT describe the pool as empty -- it
-#   stopped being empty on 2026-07-31, and the lock that matters now is the
-#   anti-lottery floor of 8, not emptiness.
+#   and the selection step refuses a RANKED run unless the pool carries at
+#   least 8 DISTINCT targets -- distinct sha256 AND distinct r2_path (it also
+#   fails closed on an empty pool, and on any malformed entry). Do NOT describe
+#   the pool as empty -- it stopped being empty on 2026-07-31, and the lock that
+#   matters now is the anti-lottery floor of 8 DISTINCT targets, not emptiness.
+#   Nor is it a floor on pool LENGTH: eight copies of one golden have length 8
+#   and anti-lottery value zero.
 #   The "Enforce track enablement" step is the standing guard: it rejects a
 #   reverted contract, disabled publication, empty hidden-golden pins, or an
 #   explicitly disabled dispatch. The dispatch input now defaults to FALSE;
@@ -117,7 +120,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm_track_enabled:
-        description: "Enablement interlock. Defaults FALSE: this track is inert (official_scoring_enabled and reference_baseline.publication_allowed are both false, so a RANKED dispatch is refused; a gates-only dispatch is admitted on purpose). The hidden timed-prompt pool now holds ONE entry, which is below the anti-lottery floor of 8, so a ranked run is refused there too. Inherited from the retired MTP track, where it defaulted true because that track was live. When the operator enables DFlash, flip the contract fixture AND this default together."
+        description: "Enablement interlock. Defaults FALSE: this track is inert (official_scoring_enabled and reference_baseline.publication_allowed are both false, so a RANKED dispatch is refused; a gates-only dispatch is admitted on purpose). The hidden timed-prompt pool now holds ONE entry, which is below the anti-lottery floor of 8 DISTINCT targets (distinct sha256 AND distinct r2_path -- not pool length), so a ranked run is refused there too. Inherited from the retired MTP track, where it defaulted true because that track was live. When the operator enables DFlash, flip the contract fixture AND this default together."
         required: false
         default: false
         type: boolean
@@ -1535,11 +1538,16 @@ jobs:
       # The pool is declared in the contract fixture
       # (fixtures/laguna_xs_2_1_dflash_track.json -> timed_prompt_pool[]), each
       # entry carrying r2_path + sha256 + bytes. This step fails CLOSED when the
-      # pool is missing or empty, exactly like the entry-less weight manifests
-      # did before they were regenerated on-box: the mechanism ships now, the
-      # pool objects must be uploaded to R2 before the track can be enabled.
-      # The chosen index is written to the PRIVATE audit dir only -- echoing it
-      # into a participant-visible log would hand back the sampling.
+      # pool is missing, empty, or carries ANY malformed entry, exactly like the
+      # entry-less weight manifests did before they were regenerated on-box: the
+      # mechanism ships now, the pool objects must be uploaded to R2 before the
+      # track can be enabled. The chosen index is written to the PRIVATE audit
+      # dir only -- echoing it into a participant-visible log would hand back
+      # the sampling.
+      #
+      # "Tuning to one member buys 1/N" is only true if the N members are
+      # DISTINCT, so the ranked floor counts distinct sha256 digests and
+      # distinct r2_path keys rather than pool length.
       #
       # RANKED-ONLY, and the guard is load-bearing rather than a convenience.
       # The pool is deliberately EMPTY on main (pinned by
@@ -1566,9 +1574,58 @@ jobs:
           set -euo pipefail
           contract="${MLXFAST_DFLASH_CONTRACT_PATH}"
           test -s "${contract}"
+          pool_type="$(jq -r '(.timed_prompt_pool // []) | type' "${contract}")"
+          if [[ "${pool_type}" != "array" ]]; then
+            echo "::error::DFlash timed prompt pool in ${contract} is a ${pool_type}, not an array; every check below indexes it positionally" >&2
+            exit 1
+          fi
           pool_size="$(jq '(.timed_prompt_pool // []) | length' "${contract}")"
           if [[ "${pool_size}" -lt 1 ]]; then
             echo "::error::DFlash timed prompt pool is empty in ${contract}; upload the pool objects and pin them before enabling this track" >&2
+            exit 1
+          fi
+          # PER-ENTRY COMPLETENESS, for EVERY entry, BEFORE sampling.
+          #
+          # This used to validate only the SAMPLED entry (the loop further down,
+          # which is kept as a belt-and-braces check on what actually leaves
+          # this step). Validating one of N entries gives one-in-N coverage of
+          # the pool: an 8-entry pool whose entry[3] carried no sha256 was
+          # ACCEPTED on 39 of 40 measured dispatches and died on the fortieth,
+          # ~25 minutes into a ranked job, looking exactly like a flake. A pool
+          # is either well formed or it is not; that is a property of the
+          # dispatch, not of the draw.
+          malformed="$(jq -r '
+            .timed_prompt_pool
+            | to_entries
+            | map(
+                .key as $i
+                | .value as $e
+                | if ($e | type) != "object" then
+                    ["entry \($i) is a \($e | type), not an object"]
+                  else
+                    [ (if (($e.r2_path? // null) | type) != "string" then
+                         "entry \($i): r2_path is missing or not a string"
+                       elif ($e.r2_path == "") then
+                         "entry \($i): r2_path is empty"
+                       else empty end),
+                      (if (($e.sha256? // null) | type) != "string" then
+                         "entry \($i): sha256 is missing or not a string"
+                       elif ($e.sha256 | test("^[0-9a-f]{64}$") | not) then
+                         "entry \($i): sha256 is not a 64-character lowercase hex digest"
+                       else empty end),
+                      (if (($e.bytes? // null) | type) != "number" then
+                         "entry \($i): bytes is missing or not a number"
+                       elif ($e.bytes <= 0) or ($e.bytes != ($e.bytes | floor)) then
+                         "entry \($i): bytes is not a positive integer"
+                       else empty end) ]
+                  end
+              )
+            | add // []
+            | .[]' "${contract}")"
+          if [[ -n "${malformed}" ]]; then
+            while IFS= read -r problem; do
+              echo "::error::DFlash timed prompt pool is malformed in ${contract}: ${problem}" >&2
+            done <<<"${malformed}"
             exit 1
           fi
           # ANTI-LOTTERY FLOOR, enforced only for a run that can PUBLISH.
@@ -1581,13 +1638,51 @@ jobs:
           # floor at 8 varied targets, and nothing enforced it until now -- a
           # one-entry pool would have ranked.
           #
-          # A gates-only dispatch is exempt on purpose: it publishes no score,
-          # so there is no lottery to win, and requiring 8 targets to validate
-          # the pipeline would recreate exactly the chicken-and-egg the
-          # enablement split removed.
-          if [[ "${MLXFAST_RUN_BENCHMARK:-0}" == "1" && "${pool_size}" -lt 8 ]]; then
-            echo "::error::DFlash timed prompt pool has ${pool_size} target(s); a RANKED run requires at least 8 varied targets (see timed_prompt_pool_note in ${contract}). Dispatch with run_benchmark=false to validate the pipeline against a smaller pool." >&2
-            exit 1
+          # The floor counts DISTINCT targets, not pool LENGTH. Length buys
+          # nothing on its own: listing TODAY'S SINGLE GOLDEN eight times has
+          # length 8, passes a length check, and has anti-lottery value zero.
+          # The realistic path there is not malice -- an operator dispatches
+          # dflash-provision-goldens.yml eight times with the same
+          # bench_seed_r2_path, gets eight byte-identical goldens at eight
+          # different keys, and a length check cannot tell that from eight real
+          # prompts. BOTH coordinates must be unique: sha256 catches identical
+          # CONTENT at different keys, and r2_path catches the same key listed
+          # twice, which is a different bug (it biases the sampling toward the
+          # duplicate rather than merely failing to widen the pool).
+          #
+          # A missing sha256 cannot launder the distinct count, because the
+          # completeness check ABOVE runs first and rejects it as MALFORMED.
+          # Without that ordering three entries with no sha256 would collapse to
+          # one `null` under `unique` and be reported as "fewer distinct
+          # targets" -- a true number attached to the wrong diagnosis, which is
+          # how a malformed pool gets "fixed" by adding more entries.
+          #
+          # A gates-only dispatch is exempt, and the exemption comes from this
+          # step's own `if: inputs.run_benchmark` -- not from the
+          # MLXFAST_RUN_BENCHMARK conjunct below, which can never be false where
+          # it is evaluated. The conjunct is kept as defence in depth for a
+          # future in which the step-level `if:` is widened or this body is
+          # lifted somewhere else; DFlashEnablementInterlockTests asserts the
+          # `if:`, which is the thing that actually grants the exemption.
+          # (Why exempt at all: a dry run publishes no score, so there is no
+          # lottery to win, and requiring 8 targets to validate the pipeline
+          # would recreate exactly the chicken-and-egg the enablement split
+          # removed.)
+          required_distinct=8
+          distinct_sha="$(jq '[.timed_prompt_pool[].sha256] | unique | length' "${contract}")"
+          distinct_path="$(jq '[.timed_prompt_pool[].r2_path] | unique | length' "${contract}")"
+          if [[ "${MLXFAST_RUN_BENCHMARK:-0}" == "1" ]]; then
+            shortfall=""
+            if [[ "${distinct_sha}" -lt "${required_distinct}" ]]; then
+              shortfall="${shortfall} ${distinct_sha} distinct sha256 digest(s), short by $(( required_distinct - distinct_sha ));"
+            fi
+            if [[ "${distinct_path}" -lt "${required_distinct}" ]]; then
+              shortfall="${shortfall} ${distinct_path} distinct r2_path key(s), short by $(( required_distinct - distinct_path ));"
+            fi
+            if [[ -n "${shortfall}" ]]; then
+              echo "::error::DFlash timed prompt pool has length ${pool_size} but a RANKED run requires at least ${required_distinct} DISTINCT varied targets:${shortfall%;} (see timed_prompt_pool_note in ${contract}). Listing one golden N times has length N and anti-lottery value zero. Dispatch with run_benchmark=false to validate the pipeline against a smaller pool." >&2
+              exit 1
+            fi
           fi
           # Uniform selection over [0,pool_size) from kernel entropy, rejecting
           # the biased tail of the RNG range rather than using a plain modulo.
@@ -1601,22 +1696,30 @@ jobs:
           r2_path="$(jq -r '.r2_path' <<<"${entry}")"
           sha256="$(jq -r '.sha256' <<<"${entry}")"
           bytes="$(jq -r '.bytes' <<<"${entry}")"
+          # Redundant with the whole-pool check above, deliberately: this one
+          # guards the three values that actually leave the step, so a future
+          # edit to the extraction (a renamed key, a jq filter typo) still fails
+          # closed rather than exporting an empty pin.
           for field in "${r2_path}" "${sha256}" "${bytes}"; do
             if [[ -z "${field}" || "${field}" == "null" ]]; then
               echo "::error::DFlash timed prompt pool entry ${index} is incomplete" >&2
               exit 1
             fi
           done
-          # Private audit record; never printed to the job log.
-          jq -n --argjson i "${index}" --argjson n "${pool_size}" --arg p "${r2_path}" \
-            '{selected_index:$i, pool_size:$n, r2_path:$p}' \
+          # Private audit record; never printed to the job log. The distinct
+          # counts are recorded alongside pool_size so an audit can tell a pool
+          # of 8 targets from one golden listed 8 times after the fact.
+          jq -n --argjson i "${index}" --argjson n "${pool_size}" \
+            --argjson ds "${distinct_sha}" --argjson dp "${distinct_path}" \
+            --arg p "${r2_path}" \
+            '{selected_index:$i, pool_size:$n, distinct_sha256:$ds, distinct_r2_path:$dp, r2_path:$p}' \
             > "${MLXFAST_PRIVATE_DIR}/dflash_timed_target_selection.json"
           {
             echo "r2_path=${r2_path}"
             echo "sha256=${sha256}"
             echo "bytes=${bytes}"
           } >> "${GITHUB_OUTPUT}"
-          echo "dflash-benchmark: timed target sampled from a pool of ${pool_size} (selection recorded privately)"
+          echo "dflash-benchmark: timed target sampled from a pool of ${pool_size} entries / ${distinct_sha} distinct targets (selection recorded privately)"
 
       - name: Prepare hidden DFlash goldens
         env:
