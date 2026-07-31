@@ -2382,6 +2382,10 @@ func downloadR2ObjectWithholdsBodyUnlessServerErrorStatus() throws {
         "R2_SECRET_ACCESS_KEY": "testsecret",
         "R2_BUCKET_ENDPOINT": "https://r2.example.test",
         "PATH": shimDir + ":" + inheritedPath,
+        // The script retries in bash now (re-signing each attempt; see
+        // R2RequestExecutionTests), so a failing case walks the full attempt
+        // budget. Keep the attempt count and drop only the delay between them.
+        "R2_RETRY_DELAY_SECONDS": "0",
     ]
 
     // 200-then-truncated (curl exit 18 after all retries): the temp file is

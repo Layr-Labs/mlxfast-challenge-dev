@@ -32,6 +32,29 @@ if [[ "${object_path}" =~ [[:cntrl:]] ]]; then
   echo "download-r2-object: object path must not contain control characters" >&2
   exit 2
 fi
+# Nothing here percent-encodes. The same raw key bytes are signed into the
+# SigV4 canonical request AND handed to curl, so the script is only correct
+# while identity encoding is the right encoding. For the keys the workflows
+# actually fetch ([A-Za-z0-9._/-]) it is. Outside that set it is not, and each
+# way it breaks is quiet:
+#
+#   ' '        curl exit 3, "URL rejected: Malformed input"
+#   '#'        curl truncates the URL at the fragment -> wrong key, or 403
+#   '?'        the tail becomes a query string, but the canonical query
+#              string is signed as EMPTY -> 403 SignatureDoesNotMatch
+#   non-ASCII  curl percent-encodes it on the wire AFTER it was signed raw
+#              -> 403 SignatureDoesNotMatch against a healthy bucket
+#
+# The fix is NOT to add an RFC 3986 encoder: the aws-CLI branch below encodes
+# by botocore's rules, and a second encoder here that disagreed with it would
+# be a fresh divergence between the two branches for the same key. Enforce the
+# assumption instead, so an unsupported key is a clear refusal before any
+# request rather than a 403 that reads like a credentials fault.
+object_path_pattern='^[A-Za-z0-9._/-]+$'
+if [[ ! "${object_path}" =~ ${object_path_pattern} ]]; then
+  echo "download-r2-object: object path must match [A-Za-z0-9._/-]+ because the key bytes are signed and sent verbatim with no percent-encoding: ${object_path}" >&2
+  exit 2
+fi
 
 : "${R2_ACCESS_KEY_ID:?R2_ACCESS_KEY_ID is required}"
 : "${R2_BUCKET_ENDPOINT:?R2_BUCKET_ENDPOINT is required}"
@@ -113,31 +136,8 @@ url="https://${host}${request_path}"
 
 region="${R2_REGION:-auto}"
 service="s3"
-amz_date="$(date -u +%Y%m%dT%H%M%SZ)"
-date_stamp="${amz_date:0:8}"
 payload_hash="$(printf '' | shasum -a 256 | awk '{print $1}')"
 signed_headers="host;x-amz-content-sha256;x-amz-date"
-# SigV4 CanonicalRequest is
-#   METHOD \n URI \n QUERY \n CanonicalHeaders \n SignedHeaders \n PayloadHash
-# and CanonicalHeaders is itself "name:value\n" per header -- so a BLANK LINE
-# separates the last header from SignedHeaders. This used to spell that
-# terminating newline inside canonical_headers' own printf, where command
-# substitution ATE it: `$(...)` strips every trailing newline, so the canonical
-# request went on the wire one line short, hashed differently from what R2
-# computed for the same request, and R2 answered HTTP 403 SignatureDoesNotMatch
-# with a well-formed signature. Never reached on the serial box because its
-# runner PATH has the aws CLI, which takes download_with_aws_cli() instead;
-# M5-C's runner PATH is /usr/bin:/bin:/usr/sbin:/sbin, so it is the first box to
-# execute this signer at all (2026-07-30).
-#
-# Both newlines are therefore spelled in the canonical_request format string
-# ("...%s\n\n%s..."), where nothing can strip them: one terminates the last
-# header line, one is the blank separator.
-canonical_headers="$(printf 'host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s' "${host}" "${payload_hash}" "${amz_date}")"
-canonical_request="$(printf 'GET\n%s\n\n%s\n\n%s\n%s' "${request_path}" "${canonical_headers}" "${signed_headers}" "${payload_hash}")"
-credential_scope="${date_stamp}/${region}/${service}/aws4_request"
-canonical_request_hash="$(printf '%s' "${canonical_request}" | shasum -a 256 | awk '{print $1}')"
-string_to_sign="$(printf 'AWS4-HMAC-SHA256\n%s\n%s\n%s' "${amz_date}" "${credential_scope}" "${canonical_request_hash}")"
 
 hmac_hex() {
   local key_opt="$1"
@@ -147,37 +147,87 @@ hmac_hex() {
     | xxd -p -c 256
 }
 
-k_date="$(hmac_hex "key:AWS4${R2_SECRET_ACCESS_KEY}" "${date_stamp}")"
-k_region="$(hmac_hex "hexkey:${k_date}" "${region}")"
-k_service="$(hmac_hex "hexkey:${k_region}" "${service}")"
-k_signing="$(hmac_hex "hexkey:${k_service}" "aws4_request")"
-# Signed through hmac_hex, exactly like the four key-derivation steps above.
-# It used to run its own openssl pipeline WITHOUT -binary and parse the text
-# form with `awk '{print $2}'`, which silently depends on the openssl
-# implementation's output format:
+# Produce a COMPLETE, self-consistent SigV4 signature for one network attempt:
+# amz_date, the canonical request built from it, and the Authorization header
+# that covers both. Every retry calls this again.
 #
-#   OpenSSL 3.x   "SHA2-256(stdin)= <hex>"  -> $2 is the hex
-#   LibreSSL 3.3  "<hex>"                   -> $2 is EMPTY, the hex is $1
-#
-# macOS ships LibreSSL as /usr/bin/openssl, so on a box without Homebrew
-# OpenSSL ahead of it the signature came out EMPTY and R2 answered
-# "InvalidArgument: Signature element value should not be blank" -- a 400 that
-# looks like a credentials problem and is not one. Diagnosed on M5-C
-# (LibreSSL 3.3.6) 2026-07-30.
-#
-# That diagnosis originally added "the serial box worked only because OpenSSL 3
-# was first on its PATH." That is FALSE, and believing it sends the next
-# debugger to audit PATH ordering on a box that never runs this code. The
-# serial box has the aws CLI on its runner PATH, so download_with_aws_cli()
-# below returns 0 and the signer is never reached: every successful hidden-
-# golden fetch in either repo announced "using AWS CLI S3 path-style download",
-# never "using signed HTTPS download". Whichever openssl it ships is
-# irrelevant. Treat this signed path as covered ONLY by the box that lacks aws.
-#
-# -binary sidesteps the text format entirely, so there is no field to index.
-signature="$(hmac_hex "hexkey:${k_signing}" "${string_to_sign}")"
+# It used to run once, before curl, and curl owned the retry (`--retry 5
+# --retry-all-errors`). curl replays the argv it was handed, and the
+# Authorization / x-amz-date headers are already fixed in that argv -- measured
+# against real R2, all six attempts carried the SAME x-amz-date. A SigV4
+# signature is only accepted inside R2's ~15 minute clock-skew window, so a run
+# that spends long enough in retries turns a transient 503 into a
+# permanent-looking 403 RequestTimeTooSkewed. curl cannot fix that: only the
+# caller can re-sign. Nothing that varies per attempt may be hoisted out of
+# this function.
+sign_request() {
+  amz_date="$(date -u +%Y%m%dT%H%M%SZ)"
+  date_stamp="${amz_date:0:8}"
+  # SigV4 CanonicalRequest is
+  #   METHOD \n URI \n QUERY \n CanonicalHeaders \n SignedHeaders \n PayloadHash
+  # and CanonicalHeaders is itself "name:value\n" per header -- so a BLANK LINE
+  # separates the last header from SignedHeaders. This used to spell that
+  # terminating newline inside canonical_headers' own printf, where command
+  # substitution ATE it: `$(...)` strips every trailing newline, so the canonical
+  # request went on the wire one line short, hashed differently from what R2
+  # computed for the same request, and R2 answered HTTP 403 SignatureDoesNotMatch
+  # with a well-formed signature. Never reached on the serial box because its
+  # runner PATH has the aws CLI, which takes download_with_aws_cli() instead;
+  # M5-C's runner PATH is /usr/bin:/bin:/usr/sbin:/sbin, so it is the first box to
+  # execute this signer at all (2026-07-30).
+  #
+  # Both newlines are therefore spelled in the canonical_request format string
+  # ("...%s\n\n%s..."), where nothing can strip them: one terminates the last
+  # header line, one is the blank separator.
+  canonical_headers="$(printf 'host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s' "${host}" "${payload_hash}" "${amz_date}")"
+  canonical_request="$(printf 'GET\n%s\n\n%s\n\n%s\n%s' "${request_path}" "${canonical_headers}" "${signed_headers}" "${payload_hash}")"
+  credential_scope="${date_stamp}/${region}/${service}/aws4_request"
+  canonical_request_hash="$(printf '%s' "${canonical_request}" | shasum -a 256 | awk '{print $1}')"
+  string_to_sign="$(printf 'AWS4-HMAC-SHA256\n%s\n%s\n%s' "${amz_date}" "${credential_scope}" "${canonical_request_hash}")"
+  k_date="$(hmac_hex "key:AWS4${R2_SECRET_ACCESS_KEY}" "${date_stamp}")"
+  k_region="$(hmac_hex "hexkey:${k_date}" "${region}")"
+  k_service="$(hmac_hex "hexkey:${k_region}" "${service}")"
+  k_signing="$(hmac_hex "hexkey:${k_service}" "aws4_request")"
+  # Signed through hmac_hex, exactly like the four key-derivation steps above.
+  # It used to run its own openssl pipeline WITHOUT -binary and parse the text
+  # form with `awk '{print $2}'`, which silently depends on the openssl
+  # implementation's output format:
+  #
+  #   OpenSSL 3.x   "SHA2-256(stdin)= <hex>"  -> $2 is the hex
+  #   LibreSSL 3.3  "<hex>"                   -> $2 is EMPTY, the hex is $1
+  #
+  # macOS ships LibreSSL as /usr/bin/openssl, so on a box without Homebrew
+  # OpenSSL ahead of it the signature came out EMPTY and R2 answered
+  # "InvalidArgument: Signature element value should not be blank" -- a 400 that
+  # looks like a credentials problem and is not one. Diagnosed on M5-C
+  # (LibreSSL 3.3.6) 2026-07-30.
+  #
+  # That diagnosis originally added "the serial box worked only because OpenSSL 3
+  # was first on its PATH." That is FALSE, and believing it sends the next
+  # debugger to audit PATH ordering on a box that never runs this code. The
+  # serial box has the aws CLI on its runner PATH, so download_with_aws_cli()
+  # below returns 0 and the signer is never reached: every successful hidden-
+  # golden fetch in either repo announced "using AWS CLI S3 path-style download",
+  # never "using signed HTTPS download". Whichever openssl it ships is
+  # irrelevant. R2_FORCE_SIGNED=1 now gives this path an execution environment
+  # that is not a production run; use it, and keep using it.
+  #
+  # -binary sidesteps the text format entirely, so there is no field to index.
+  signature="$(hmac_hex "hexkey:${k_signing}" "${string_to_sign}")"
+  authorization="AWS4-HMAC-SHA256 Credential=${R2_ACCESS_KEY_ID}/${credential_scope}, SignedHeaders=${signed_headers}, Signature=${signature}"
+}
 
-authorization="AWS4-HMAC-SHA256 Credential=${R2_ACCESS_KEY_ID}/${credential_scope}, SignedHeaders=${signed_headers}, Signature=${signature}"
+# Attempt budget. Six attempts is what `--retry 5` gave, kept so the change is
+# to WHO retries, not to how many times. The delay is overridable so tests can
+# exercise the loop's shape without its wall clock.
+max_attempts=6
+retry_delay_seconds="${R2_RETRY_DELAY_SECONDS:-2}"
+retry_delay_pattern='^[0-9]+$'
+if [[ ! "${retry_delay_seconds}" =~ ${retry_delay_pattern} ]]; then
+  echo "download-r2-object: R2_RETRY_DELAY_SECONDS must be a non-negative integer" >&2
+  exit 2
+fi
+
 tmp_path="${output_path}.tmp"
 
 umask 077
@@ -216,7 +266,21 @@ download_with_aws_cli() {
       --no-progress
 }
 
-if download_with_aws_cli; then
+# Which implementation actually performs a transfer is NOT fixed:
+#
+#   * `aws` absent (or the endpoint has no bucket path) -> signed path;
+#   * `aws` present and succeeds                        -> aws path;
+#   * `aws` present but FAILS (missing plugin, bad config, transient error)
+#     -> download_with_aws_cli returns non-zero and this script falls
+#     through to the signed path SILENTLY.
+#
+# So a box can take either branch on different runs of the same workflow, and
+# the only record of which one ran is the banner each branch prints. That is
+# also how the signer stayed unexecuted long enough to ship two signing bugs:
+# it is PREFERRED against, never selected. R2_FORCE_SIGNED=1 skips the
+# fallback so the signed path can be exercised deliberately -- by the tests in
+# Tests/MLXFastTests/R2RequestExecutionTests.swift, and by hand on any box.
+if [[ "${R2_FORCE_SIGNED:-0}" != "1" ]] && download_with_aws_cli; then
   chmod 600 "${tmp_path}"
   mv "${tmp_path}" "${output_path}"
   trap - EXIT
@@ -226,22 +290,57 @@ fi
 
 echo "download-r2-object: using signed HTTPS download"
 curl_rc=0
-http_status="$(
-  curl \
-    --fail-with-body \
-    --silent \
-    --show-error \
-    --location \
-    --retry 5 \
-    --retry-all-errors \
-    --retry-delay 2 \
-    --write-out '%{http_code}' \
-    -H "Authorization: ${authorization}" \
-    -H "x-amz-content-sha256: ${payload_hash}" \
-    -H "x-amz-date: ${amz_date}" \
-    --output "${tmp_path}" \
-    "${url}"
-)" || curl_rc=$?
+http_status=""
+attempt=1
+while :; do
+  # Truncate before every attempt. curl truncates --output only once it OPENS
+  # that file, which it never does when the attempt dies at connect time or
+  # times out -- so without this a failed attempt's <Error> document survives
+  # under, or ahead of, the bytes the next attempt writes. The caller verifies
+  # a pinned sha256 and would report a golden mismatch for a transport
+  # artefact.
+  : > "${tmp_path}"
+  # Fresh amz_date, canonical request and signature for THIS attempt.
+  sign_request
+  curl_rc=0
+  # --connect-timeout / --max-time are what make an attempt terminate at all.
+  # There was no bound: a peer that accepts the connection and then sends
+  # nothing triggers neither a retry nor a timeout, so the transfer "succeeds"
+  # with an empty body, or the job hangs to its 30-minute limit with no
+  # diagnosis. --retry/--retry-all-errors/--retry-delay are deliberately gone:
+  # a curl-level retry replays fixed argv and therefore cannot re-sign.
+  # --location is deliberately gone too: on a cross-host redirect curl DROPS
+  # the custom Authorization header but FORWARDS x-amz-date and
+  # x-amz-content-sha256, so the follow-up arrives unsigned with signing
+  # headers attached, and on a same-host redirect it re-sends a signature
+  # bound to the OLD path. R2 path-style issues no legitimate redirects, so
+  # following one can only turn a loud failure into a confusing one.
+  http_status="$(
+    curl \
+      --fail-with-body \
+      --silent \
+      --show-error \
+      --connect-timeout 30 \
+      --max-time 600 \
+      --write-out '%{http_code}' \
+      -H "Authorization: ${authorization}" \
+      -H "x-amz-content-sha256: ${payload_hash}" \
+      -H "x-amz-date: ${amz_date}" \
+      --output "${tmp_path}" \
+      "${url}"
+  )" || curl_rc=$?
+  if [[ "${curl_rc}" -eq 0 ]]; then
+    break
+  fi
+  if [[ "${attempt}" -ge "${max_attempts}" ]]; then
+    break
+  fi
+  echo "download-r2-object: attempt ${attempt}/${max_attempts} failed (curl exit ${curl_rc}, HTTP ${http_status:-none}); re-signing and retrying" >&2
+  attempt=$((attempt + 1))
+  if [[ "${retry_delay_seconds}" -gt 0 ]]; then
+    sleep "${retry_delay_seconds}"
+  fi
+done
 if [[ "${curl_rc}" -ne 0 ]]; then
   # --fail-with-body keeps --fail's retry/exit semantics but preserves the
   # response body for diagnostics. The body is only PROVABLY an R2/S3 error

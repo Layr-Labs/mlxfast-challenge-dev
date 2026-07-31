@@ -33,6 +33,60 @@ struct R2SignatureTests {
         ".github/scripts/upload-r2-object.sh",
     ]
 
+    /// Lift the named shell assignments out of a script, de-indented, in source
+    /// order, so a test can re-run the SHIPPED construction rather than a
+    /// restatement of it.
+    ///
+    /// De-indenting matters: the signing steps live inside `sign_request()`
+    /// now (they must be recomputed per network attempt, see
+    /// R2RequestExecutionTests), so they are no longer at column 0.
+    private static func assignments(in text: String, named names: [String]) -> String {
+        text
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { line in names.contains { line.hasPrefix("\($0)=") } }
+            .joined(separator: "\n")
+    }
+
+    /// The script's own `hmac_hex()` definition, extracted verbatim.
+    private static func hmacDefinition(in text: String, path: String) throws -> String {
+        let start = try #require(
+            text.range(of: "hmac_hex() {"),
+            "\(path) no longer defines hmac_hex()"
+        )
+        let tail = text[start.lowerBound...]
+        let end = try #require(
+            tail.range(of: "\n}"),
+            "\(path) hmac_hex() definition is unterminated"
+        )
+        return String(tail[..<end.upperBound])
+    }
+
+    private struct ShellResult {
+        var status: Int32
+        var stdout: String
+        var stderr: String
+    }
+
+    private static func runBash(_ program: String) throws -> ShellResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["-c", program]
+        let out = Pipe()
+        let err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+        try process.run()
+        let outData = out.fileHandleForReading.readDataToEndOfFile()
+        let errData = err.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return ShellResult(
+            status: process.terminationStatus,
+            stdout: String(decoding: outData, as: UTF8.self),
+            stderr: String(decoding: errData, as: UTF8.self)
+        )
+    }
+
     /// Every `openssl dgst` must use `-binary`, so no output-format field index
     /// exists to get wrong.
     @Test
@@ -95,16 +149,7 @@ struct R2SignatureTests {
 
             // Extract the real hmac_hex definition rather than restating it, so
             // this test tracks the script instead of a copy of it.
-            let start = try #require(
-                text.range(of: "hmac_hex() {"),
-                "\(path) no longer defines hmac_hex()"
-            )
-            let tail = text[start.lowerBound...]
-            let end = try #require(
-                tail.range(of: "\n}"),
-                "\(path) hmac_hex() definition is unterminated"
-            )
-            let definition = String(tail[..<end.upperBound])
+            let definition = try Self.hmacDefinition(in: text, path: path)
 
             let program = """
                 set -euo pipefail
@@ -220,12 +265,8 @@ struct R2SignatureTests {
 
             // Pull the REAL assignments out of the script so this test tracks
             // the shipped construction instead of a copy of it.
-            let assignments = text
-                .split(separator: "\n", omittingEmptySubsequences: false)
-                .filter {
-                    $0.hasPrefix("canonical_headers=") || $0.hasPrefix("canonical_request=")
-                }
-                .joined(separator: "\n")
+            let assignments = Self.assignments(
+                in: text, named: ["canonical_headers", "canonical_request"])
             #expect(
                 assignments.contains("canonical_headers=")
                     && assignments.contains("canonical_request="),
@@ -307,6 +348,271 @@ struct R2SignatureTests {
                 \(testCase.expected) (botocore's own CanonicalRequest for the same \
                 \(testCase.method) request). Rendered:
                 \(rendered)
+                """
+            )
+        }
+    }
+
+    /// The remaining seam: nothing asserted the `string_to_sign=` CONSTRUCTION.
+    ///
+    /// The two tests above meet either side of it and never touch it. The
+    /// canonical-request test stops at the CR hash; the HMAC test starts from a
+    /// hand-written string-to-sign whose last line is the literal `deadbeef`.
+    /// So the line that assembles
+    ///
+    ///     AWS4-HMAC-SHA256 \n <amz_date> \n <credential_scope> \n <CR hash>
+    ///
+    /// could lose a newline, swap the date and the scope, or interpolate
+    /// `canonical_request` where it means `canonical_request_hash`, and every
+    /// existing assertion would still pass. Each of those is another 403
+    /// SignatureDoesNotMatch with a well-formed signature — the failure mode
+    /// that has now cost two runs.
+    ///
+    /// Pinned against the worked example in the AWS SigV4 documentation
+    /// ("Task 1/2/3: create a canonical request / string to sign / calculate
+    /// the signature"), whose published CanonicalRequest, StringToSign and
+    /// Signature this reproduces byte for byte. The script's own
+    /// `credential_scope=`, `canonical_request_hash=`, `string_to_sign=` lines
+    /// and `hmac_hex()` do the work; only the inputs come from the docs.
+    @Test
+    func theStringToSignMatchesTheAWSDocumentationWorkedExample() throws {
+        // AWS docs, "Task 1: Create a canonical request".
+        let canonicalRequest = """
+            GET
+            /
+            Action=ListUsers&Version=2010-05-08
+            content-type:application/x-www-form-urlencoded; charset=utf-8
+            host:iam.amazonaws.com
+            x-amz-date:20150830T123600Z
+
+            content-type;host;x-amz-date
+            e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+            """
+        // AWS docs, "Task 2: Create a string to sign".
+        let expectedHash = "f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59"
+        let expectedStringToSign = """
+            AWS4-HMAC-SHA256
+            20150830T123600Z
+            20150830/us-east-1/iam/aws4_request
+            \(expectedHash)
+            """
+        // AWS docs, "Task 3: Calculate the signature".
+        let expectedSignature =
+            "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7"
+
+        for path in Self.scripts {
+            let text = try String(contentsOfFile: path, encoding: .utf8)
+            let steps = Self.assignments(
+                in: text,
+                named: [
+                    "credential_scope", "canonical_request_hash", "string_to_sign",
+                    "k_date", "k_region", "k_service", "k_signing", "signature",
+                ]
+            )
+            for required in [
+                "credential_scope=", "canonical_request_hash=", "string_to_sign=",
+                "k_signing=", "signature=",
+            ] {
+                #expect(
+                    steps.contains(required),
+                    """
+                    \(path) no longer assigns \(required); if the signing chain moved, \
+                    retarget this test rather than deleting it.
+                    """
+                )
+            }
+
+            let program = """
+                set -euo pipefail
+                \(try Self.hmacDefinition(in: text, path: path))
+                region='us-east-1'
+                service='iam'
+                amz_date='20150830T123600Z'
+                date_stamp="${amz_date:0:8}"
+                R2_SECRET_ACCESS_KEY='wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY'
+                canonical_request="$(cat <<'MLXFAST_CR_EOF'
+                \(canonicalRequest)
+                MLXFAST_CR_EOF
+                )"
+                \(steps)
+                printf '%s\\n%s\\n---STRING-TO-SIGN---\\n' \
+                    "${canonical_request_hash}" "${signature}"
+                printf '%s' "${string_to_sign}"
+                """
+
+            let result = try Self.runBash(program)
+            #expect(
+                result.status == 0,
+                "\(path) signing chain failed to run: \(result.stderr)")
+
+            let parts = result.stdout.components(separatedBy: "---STRING-TO-SIGN---\n")
+            #expect(parts.count == 2, "unexpected harness output: \(result.stdout)")
+            guard parts.count == 2 else { continue }
+            let head = parts[0].split(separator: "\n", omittingEmptySubsequences: false)
+            let stringToSign = parts[1]
+            #expect(head.count >= 2, "unexpected harness output: \(result.stdout)")
+            guard head.count >= 2 else { continue }
+
+            #expect(
+                String(head[0]) == expectedHash,
+                "\(path) hashed the AWS docs canonical request to \(head[0]), expected \(expectedHash)"
+            )
+
+            #expect(
+                stringToSign == expectedStringToSign,
+                """
+                \(path) built a string-to-sign the AWS documentation does not \
+                recognise.
+
+                got:
+                \(stringToSign.debugDescription)
+
+                AWS docs worked example:
+                \(expectedStringToSign.debugDescription)
+                """
+            )
+
+            // Say WHICH line moved; a signature mismatch alone does not.
+            let lines = stringToSign.split(separator: "\n", omittingEmptySubsequences: false)
+            #expect(
+                lines.count == 4,
+                """
+                \(path) string-to-sign has \(lines.count) lines, expected 4 \
+                (algorithm, x-amz-date, credential scope, canonical-request HASH).
+                """
+            )
+            if lines.count == 4 {
+                #expect(lines[0] == "AWS4-HMAC-SHA256", "\(path) line 1 must be the algorithm")
+                #expect(
+                    lines[1] == "20150830T123600Z",
+                    "\(path) line 2 must be the full x-amz-date, not the date stamp")
+                #expect(
+                    lines[2] == "20150830/us-east-1/iam/aws4_request",
+                    "\(path) line 3 must be the credential scope")
+                #expect(
+                    lines[3] == expectedHash,
+                    """
+                    \(path) line 4 must be the HASH of the canonical request, not the \
+                    canonical request itself.
+                    """
+                )
+            }
+
+            #expect(
+                String(head[1]) == expectedSignature,
+                """
+                \(path) produced signature \(head[1]) for the AWS documentation's \
+                worked example, expected \(expectedSignature).
+                """
+            )
+        }
+    }
+
+    /// One pinned end-to-end signature per script, composing every step.
+    ///
+    /// The other tests each cover a link: canonical request (vs botocore),
+    /// string-to-sign (vs the AWS docs), HMAC derivation (vs a pinned digest).
+    /// None composes them, so a mismatch BETWEEN links — `string_to_sign` fed a
+    /// stale `canonical_request_hash`, `credential_scope` built from a
+    /// different region than the one keyed into `k_region`, `authorization`
+    /// advertising SignedHeaders the canonical request did not use — passes
+    /// every one of them.
+    ///
+    /// This runs the shipped chain start to finish over R2-shaped inputs and
+    /// pins the final Signature. The intermediate canonical-request hashes are
+    /// the same botocore-verified values pinned above, so the end-to-end pin
+    /// inherits that independent verification rather than restating the script.
+    @Test
+    func theWholeSigningChainReproducesOnePinnedEndToEndSignature() throws {
+        let cases:
+            [(
+                path: String, requestPath: String, payloadHash: String, amzDate: String,
+                canonicalRequestHash: String, signature: String
+            )] = [
+                (
+                    ".github/scripts/download-r2-object.sh",
+                    "/mybucket/correctness_prompts/x.json",
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "20260731T000829Z",
+                    "18ec091efbf67625090e1e4b4faa2909228244578b5802a1b8222ad60a7096ad",
+                    "01223ee753030a5657b87ba4ea367e8e3d637ba79daf09687433c00fefcefbd8"
+                ),
+                (
+                    ".github/scripts/upload-r2-object.sh",
+                    "/mybucket/up/x.json",
+                    "e38af85860a1452206b018e69c01595e89ce0626bd0068d69ea1b270e993cd41",
+                    "20260731T001036Z",
+                    "48c8f7da8097d5493dcb5140f1f66b1fd9c609d67a70c68637127dc60ab6651a",
+                    "22f0a1d8193784980b800a5da2d86ffcd2188239b1f3c7c84b17e4725d810c75"
+                ),
+            ]
+
+        for testCase in cases {
+            let text = try String(contentsOfFile: testCase.path, encoding: .utf8)
+            let chain = Self.assignments(
+                in: text,
+                named: [
+                    "canonical_headers", "canonical_request", "credential_scope",
+                    "canonical_request_hash", "string_to_sign", "k_date", "k_region",
+                    "k_service", "k_signing", "signature", "authorization",
+                ]
+            )
+            #expect(
+                chain.contains("authorization="),
+                "\(testCase.path) no longer assembles the Authorization header")
+
+            let program = """
+                set -euo pipefail
+                \(try Self.hmacDefinition(in: text, path: testCase.path))
+                host='acct.r2.cloudflarestorage.com'
+                region='auto'
+                service='s3'
+                request_path='\(testCase.requestPath)'
+                payload_hash='\(testCase.payloadHash)'
+                amz_date='\(testCase.amzDate)'
+                date_stamp="${amz_date:0:8}"
+                signed_headers='host;x-amz-content-sha256;x-amz-date'
+                R2_ACCESS_KEY_ID='AKIAIOSFODNN7EXAMPLE'
+                R2_SECRET_ACCESS_KEY='wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY'
+                \(chain)
+                printf '%s\\n%s\\n%s\\n' \
+                    "${canonical_request_hash}" "${signature}" "${authorization}"
+                """
+
+            let result = try Self.runBash(program)
+            #expect(
+                result.status == 0,
+                "\(testCase.path) signing chain failed to run: \(result.stderr)")
+            let lines = result.stdout.split(separator: "\n", omittingEmptySubsequences: false)
+            #expect(lines.count >= 3, "unexpected harness output: \(result.stdout)")
+            guard lines.count >= 3 else { continue }
+
+            #expect(
+                String(lines[0]) == testCase.canonicalRequestHash,
+                """
+                \(testCase.path) canonical-request hash \(lines[0]), expected \
+                \(testCase.canonicalRequestHash) (botocore's value for the same request).
+                """
+            )
+            #expect(
+                String(lines[1]) == testCase.signature,
+                """
+                \(testCase.path) end-to-end signature \(lines[1]), expected \
+                \(testCase.signature). Every link is pinned separately and they all \
+                still pass when the chain is wired up wrong, so this is the assertion \
+                that catches a step feeding the wrong value to the next one.
+                """
+            )
+            #expect(
+                String(lines[2]) == """
+                    AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/\
+                    \(testCase.amzDate.prefix(8))/auto/s3/aws4_request, \
+                    SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+                    Signature=\(testCase.signature)
+                    """,
+                """
+                \(testCase.path) Authorization header is not the one the signature \
+                belongs to: \(lines[2])
                 """
             )
         }
