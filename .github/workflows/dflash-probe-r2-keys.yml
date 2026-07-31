@@ -85,7 +85,15 @@ jobs:
             local code
             code="$(grep -oE '<Code>[A-Za-z]+</Code>' "${log}" | tail -1 | tr -d '<>/' | sed 's/^Code//;s/Code$//' || true)"
             if (( rc == 0 )) && [[ -s "${out}" ]]; then
-              printf '  FOUND    %-9s %s\n' "$(wc -c < "${out}" | tr -d ' ')b" "${key}"
+              # sha256 as well as the byte count, because a byte count alone
+              # cannot confirm a PIN. The bench golden in particular is only
+              # downloaded by a RANKED run, so its pin was never verified
+              # against the stored object by any pipeline that has actually run
+              # -- a gates-only dispatch skips it entirely. This closes that.
+              printf '  FOUND    %-9s %s  %s\n' \
+                "$(wc -c < "${out}" | tr -d ' ')b" \
+                "$(shasum -a 256 "${out}" | cut -d' ' -f1)" \
+                "${key}"
             else
               printf '  missing  %-9s %s  (%s)\n' "${status:-?}" "${key}" "${code:-no code}"
             fi
