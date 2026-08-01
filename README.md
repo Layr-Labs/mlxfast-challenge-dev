@@ -186,7 +186,7 @@ kernels it runs on. The authoritative list is `editablePaths` in
 |---|---|
 | `Sources/MLXFastModel/` | Laguna XS 2.1 runtime: weight loading, attention, MoE MLP, KV caches, prefill/decode execution. **Primary target.** |
 | `Sources/MLXFastTransform/` | Offline reference-checkpoint transform into benchmark-ready `weights/`. |
-| `Vendor/mlx-swift-lm/Libraries/` (listed files) | The vendored Laguna model (`MLXLLM/Models/Laguna.swift`), the DFlash target adapters (`MLXLLM/DFlashTarget.swift`, `MLXLLM/DFlashVerifyLinear.swift`), the DFlash block-decode runtime this track adds (`MLXSpeculative/DFlash*.swift` — draft dispatch, batched multi-row verification, greedy rounds, KV rollback of rejected rows, draft-model configuration), and the `MLXLMCommon` plumbing they use directly (MoE/attention dispatch helpers, KV caches, RoPE utilities/application, compiled decode, evaluation). |
+| `Vendor/mlx-swift-lm/Libraries/` (listed files) | The vendored Laguna model (`MLXLLM/Models/Laguna.swift`), the DFlash target adapters (`MLXLLM/DFlashTarget.swift`, `MLXLLM/DFlashVerifyLinear.swift`), the DFlash block-decode runtime this track adds (the eight `MLXSpeculative/DFlash*.swift` files listed in `benchmark.json` — draft dispatch, batched multi-row verification, greedy rounds, KV rollback of rejected rows, draft-model configuration; `DFlashBenchmark.swift` matches the glob but is not editable), and the `MLXLMCommon` plumbing they use directly (MoE/attention dispatch helpers, KV caches, RoPE utilities/application, compiled decode, evaluation). |
 | `Vendor/mlx-swift/Source/Cmlx/` (listed files) | The MLX Metal kernels Laguna dispatches — SDPA (`steel/attn`, `sdpa_vector`), NVFP4 `fp_quantized` matmul plus shared quantized dispatch (incl. `_nax`), MoE gather GEMM (`steel_gemm_gather*`), `steel/gemm`, `gemv`, `rope`, `rms_norm`, `softmax`, `sort`, `reduce`, `copy`, elementwise, `arg_reduce`, gather indexing — as AOT `.metal`/`.h` sources and their JIT `mlx-generated/*.cpp` twins. |
 
 Two build forms matter for kernel edits, because the vendored MLX package
@@ -201,8 +201,10 @@ the runtime-effective source, so edit it (and keep the readable
 vendored `.metal` sources — rerun it after editing those. `_nax` names are
 the M5-generation kernel variants the ranked runner selects. After a kernel
 edit: rerun the metallib build for AOT edits, then
-`./benchmark-dflash.sh --local-iterate`, which rebuilds both binaries for you
-whenever a build input is newer than them. A bare `swift build -c release`
+`./benchmark.sh --local-iterate` (which rebuilds both binaries whenever a
+build input is newer than them and refreshes the cached `weights/`), followed
+by `./benchmark-dflash.sh --local-iterate` (which reuses those binaries and
+never rebuilds them). A bare `swift build -c release`
 is not enough on its own — without `--scratch-path .build-worker` it writes
 `.build/release`, while the scored binary is
 `.build-worker/release/mlxfast-runtime-worker`. Prioritize kernels reached
@@ -279,8 +281,10 @@ Use these modes for local development:
 | `./benchmark-dflash.sh --local-iterate` | Fast directional edit loop. | Public-fixture correctness (teacher-forced) plus a short local DFlash decode timing pass. | `score.json` with a local estimated score. |
 | `./benchmark-dflash.sh --local-submit` | Longer pre-submit signal. | Same correctness over a longer local DFlash decode timing pass. | `score.json` with a local estimated score. |
 
-Both modes transform the reference checkpoint if needed, stage the DFlash
-draft model, run the checked-in public correctness fixture, and time DFlash
+Both modes require the transformed `weights/` tree that
+`./benchmark.sh --local-iterate` produces and caches, and the drafter staged
+by `./setup-dflash.sh` (each mode aborts with instructions if either is
+missing), then run the checked-in public correctness fixture and time DFlash
 block decode locally. Local scores are estimates for direction only; the
 official paired decode speedup exists only on the ranked M5 runner, measured
 against the trusted serial K=1 target oracle.
@@ -342,7 +346,7 @@ Sources/
   MLXFastRuntimeWorkerCLI/   sandboxed participant worker (mlxfast-runtime-worker)
 Vendor/
   mlx-swift/                 pinned MLX fork; the listed kernel sources are editable
-  mlx-swift-lm/              pinned mlx-swift-lm fork; the Laguna model, the DFlash runtime (MLXSpeculative/DFlash*, DFlashTarget/DFlashVerifyLinear), and the listed MLXLMCommon files are editable
+  mlx-swift-lm/              pinned mlx-swift-lm fork; the Laguna model, the DFlash runtime (the listed MLXSpeculative/DFlash* files, DFlashTarget/DFlashVerifyLinear), and the listed MLXLMCommon files are editable
 weights/                     transformed weights (harness loads from here)
   config.json                 runtime-authored text-tower config
   model.safetensors.index.json

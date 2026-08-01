@@ -1,38 +1,34 @@
 name: dflash-benchmark
 
-# EXPERIMENTAL RANKED TRACK: Poolside Laguna XS 2.1 DFlash (track id
-# laguna-xs-2.1-dflash-v1). NOT ENABLED -- see the fail-closed track
-# enablement interlock below.
+# DEFAULT RANKED TRACK: Poolside Laguna XS 2.1 DFlash (track id
+# laguna-xs-2.1-dflash-v1). LIVE since go-live 2026-07-31 (contract
+# Amendment 31); scoring per-prompt normalised since 2026-08-01 (Amendment 32).
 #
-# This is the ranked entrypoint declared by benchmark.json. It runs the
-# trusted organizer-drafter block protocol pinned by
-# fixtures/laguna_xs_2_1_dflash_track.json, using the organizer-provisioned
-# DFlash draft model (a separate ~881 MB EAGLE-style speculator) against the
-# pinned Laguna target. The DEFAULT serial ranked workflow remains
-# benchmark.yml with its own manifest, benchmark.json; its score, baseline,
-# calibration state, and leaderboard namespace are never mixed into this
-# track.
+# This is the ranked entrypoint declared by benchmark.json (which IS the
+# DFlash manifest). It runs the trusted organizer-drafter block protocol
+# pinned by fixtures/laguna_xs_2_1_dflash_track.json, using the
+# organizer-provisioned DFlash draft model (a separate ~924 MB EAGLE-style
+# speculator) against the pinned Laguna target. The retired serial track's
+# ranked workflow (benchmark.yml) was DELETED at go-live; its score,
+# baseline, calibration state, and leaderboard namespace were never mixed
+# into this track.
 #
-# ENABLEMENT STATE: this track is INERT and is NOT the default. Three
-#   independent locks hold it shut -- official_scoring_enabled is false in the
-#   contract fixture, reference_baseline.publication_allowed is false, and
-#   tokenFidelityGateStatus is proposed-awaiting-operator-signoff (the spec is
-#   written, Amendment 29; only the operator moves it to the "implemented" the
-#   lock requires). A FOURTH lock stops a ranked run
-#   even if those were flipped: the hidden timed-prompt pool holds ONE entry
-#   and the selection step refuses a RANKED run unless the pool carries at
-#   least 8 DISTINCT targets -- distinct sha256 AND distinct r2_path (it also
-#   fails closed on an empty pool, and on any malformed entry). Do NOT describe
-#   the pool as empty -- it stopped being empty on 2026-07-31, and the lock that
-#   matters now is the anti-lottery floor of 8 DISTINCT targets, not emptiness.
-#   Nor is it a floor on pool LENGTH: eight copies of one golden have length 8
-#   and anti-lottery value zero.
+# ENABLEMENT STATE (LIVE): official_scoring_enabled is true in the contract
+#   fixture, reference_baseline.publication_allowed is true, and
+#   tokenFidelityGateStatus is "implemented" (flipped together at go-live,
+#   Amendment 31 -- flipping all three back takes the track offline again;
+#   the enablement guard fails closed on a reverted contract). The
+#   anti-lottery lock stands independently: the selection step refuses a
+#   RANKED run unless the hidden timed-prompt pool carries at least 8
+#   DISTINCT targets -- distinct sha256 AND distinct r2_path (it also fails
+#   closed on an empty pool, and on any malformed entry; the pool has held 8
+#   distinct entries since 2026-07-31). It is not a floor on pool LENGTH:
+#   eight copies of one golden have length 8 and anti-lottery value zero.
 #   The "Enforce track enablement" step is the standing guard: it rejects a
 #   reverted contract, disabled publication, empty hidden-golden pins, or an
-#   explicitly disabled dispatch. The dispatch input now defaults to FALSE;
-#   the text below describing a true default is retained history from the
-#   retired MTP track, which WAS live
-#   without custom inputs. For submissions/* the contract is read from
+#   explicitly disabled dispatch. Both dispatch inputs default to TRUE
+#   (Amendment 31: Yukon omits custom inputs, so the defaults must arm a
+#   scored run). For submissions/* the contract is read from
 #   trusted main, so a submission cannot flip the track on or off.
 #
 # ADOPTED SCORING (2026-07-14 scoring-decision memo; mirrors the serial
@@ -55,7 +51,10 @@ name: dflash-benchmark
 #   - stall guardrail: a run with max block latency > 4x its p50 is rejected
 #     as measurement-invalid, with one gated retry (owned by measure-dflash-job,
 #     same class as its throttle rejection);
-#   - hard bit-exact token gate across every timed run (parity_all_ok).
+#   - token gate across every timed run: parity_all_ok from the measure job,
+#     plus the adopted token-fidelity gate (trusted sequential re-verification
+#     with a bounded near-tie budget -- Amendment 29/31; strict bit-exactness
+#     alone is unachievable for block-vs-sequential frames at near-tie argmaxes).
 #
 # WHAT A LIVE RUN DOES (after go-live):
 #   1. Verifies the operator-provisioned Laguna target + DFlash drafter caches
@@ -255,10 +254,10 @@ jobs:
       # score is recomputed here in the trusted shell from the sealed per-side means
       # and the pinned reference, then gated against this value, so a 1.0 here would
       # override the 0.95 everywhere else. The box wrapper's MIN_ACCEPTED_SPEEDUP
-      # MUST be decoupled from this to a LOOSE RAW measurement-sanity floor -- a
-      # PENDING operator action; UNTIL APPLIED the box still enforces the raw 0.83
-      # floor -- because the box measures raw speedup and has no reference; a box
-      # raw floor at 0.83 would false-reject a Russell-drawn candidate whose raw sits
+      # is DECOUPLED from this to a LOOSE RAW measurement-sanity floor (0.50,
+      # APPLIED on the serving box 2026-08-01 with a manifest re-sign) because the
+      # box measures raw speedup and has no reference; the raw 0.83 it previously
+      # enforced would false-reject a Russell-drawn candidate whose raw sits
       # in [0.829, 0.83) but normalises to >= 0.95. Supersedes the raw floor 0.83
       # (worst no-op 0.8726 x 0.952 across the 8-prompt pool 0.8726-0.8939, M5
       # 2026-07-31), which was correct only for the worst prompt. On this track

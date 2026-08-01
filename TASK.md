@@ -128,7 +128,8 @@ overlay by changing both `Sources/MLXFastTransform/` and
 not byte equality with the baseline layout.
 
 The DFlash track adds one more provisioned asset: the organizer-provided
-DFlash draft model (an EAGLE-style speculator with ~fixed weights, block size
+DFlash draft model (an EAGLE-style speculator with its own fixed weights
+(~924 MB BF16), block size
 16, conditioned on target hidden states and borrowing the target embedding and
 lm_head). It is provisioned by `./setup-dflash.sh` on top of `./setup.sh`.
 Both the target checkpoint and the drafter weights are fixed — they are not a
@@ -162,9 +163,9 @@ The active editable surface is Swift-only and is defined by `benchmark.json`:
 
 | Path | Scope |
 |---|---|
-| `Sources/MLXFastModel/` | Laguna XS 2.1 NVFP4 model implementation: attention (sliding-window + full, GQA, YaRN partial-rotary RoPE on full-attention layers), MoE MLP (256 routed experts + shared expert, per-head gating), RMSNorm, KV caches, weight loading, and prefill/decode execution. |
+| `Sources/MLXFastModel/` | Laguna XS 2.1 NVFP4 model implementation: attention (sliding-window + full, GQA, YaRN partial-rotary RoPE on full-attention layers), MoE MLP (256 routed experts + shared expert, per-token top-k routing; the per-head gate belongs to attention), RMSNorm, KV caches, weight loading, and prefill/decode execution. |
 | `Sources/MLXFastTransform/` | Offline safetensors transform (text-tensor selection, config/tokenizer emission). |
-| `Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlash*.swift`, `Vendor/mlx-swift-lm/Libraries/MLXLLM/DFlashTarget.swift`, `DFlashVerifyLinear.swift` | DFlash drafting/verification runtime: block dispatch, multi-row target verification, longest-correct-prefix acceptance, and KV rollback of the rows behind rejected draft tokens. |
+| `Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlash*.swift` (the eight files listed in `benchmark.json` — `DFlashBenchmark.swift` is NOT editable), `Vendor/mlx-swift-lm/Libraries/MLXLLM/DFlashTarget.swift`, `DFlashVerifyLinear.swift` | DFlash drafting/verification runtime: block dispatch, multi-row target verification, longest-correct-prefix acceptance, and KV rollback of the rows behind rejected draft tokens. |
 | Vendored Laguna model + `MLXLMCommon` plumbing + MLX Metal kernels (per `benchmark.json` `editablePaths`) | `Laguna.swift`, the KV-cache/RoPE/decode helpers, and the SDPA / quantized-matmul (NVFP4 `fp_quantized*`, `_nax`) / MoE gather-GEMM / `rope` / `rms_norm` / `softmax` / etc. kernel families the forward pass dispatches. |
 
 `Sources/MLXFastCore/`, `Sources/MLXFastHarness/`,
@@ -177,7 +178,8 @@ that trusted harness layer.
 Account and submission management — login, clone, submit, and listing
 submissions — are handled by the **Yukon CLI (`mlxfast`)**, not by
 `mlxfast-swift`. The Swift binary now runs the benchmark domain only (transform,
-correctness, benchmark, preflight, verify-transform); it no longer logs in or
+correctness, benchmark, preflight, verify-transform, and the DFlash-track
+`dflash-benchmark`/`dflash-probe`/`dflash-reference`); it no longer logs in or
 uploads. The CLI installer defaults to `~/.local/bin`, so expose that directory
 in the current shell before using it. Submit with:
 

@@ -8,7 +8,7 @@ import MLX
 /// full-profile minimum get a 6 GiB MLX allocator-cache cap, shorter
 /// command buffers, and a free-warmup-buffer clear before the worker
 /// protocol hello -- headroom insurance that lets the ~21.6 GB Poolside
-/// NVFP4 checkpoint run down to the documented 40 GiB local minimum.
+/// NVFP4 checkpoint run down to the documented 36 GiB local minimum.
 /// Compiled decode and every other ranked code path stay enabled on every
 /// machine, matching the ranked 128 GiB box.
 ///

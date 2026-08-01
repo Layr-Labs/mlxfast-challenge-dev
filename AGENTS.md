@@ -60,8 +60,9 @@ Because the candidate and the pinned on-box baseline are measured back to
 back on the same silicon behind the same thermal gate, the paired speedup
 ratio cancels host drift; the score is that ratio, not a comparison against a
 stored constant. Poolside Laguna XS 2.1 NVFP4 is a fine-grained MoE model (256 routed
-experts plus one shared expert per sparse layer, 8 experts per token,
-per-head gating; layer 0 is a dense MLP): the text tower is about
+experts plus one shared expert per sparse layer, 8 experts per token routed
+per-token top-k; attention carries a per-head output gate; layer 0 is a dense
+MLP): the text tower is about
 21.6 GB in Poolside NVFP4, fully RAM-resident on the ranked box — the runtime loads
 every text-tower tensor, including all experts, once during untimed
 initialization and keeps it
@@ -112,8 +113,10 @@ MoE expert gather-GEMM dispatch, the `AttentionUtils.swift` attention dispatch
 and masking, RoPE utilities and application, compiled decode, evaluation
 plumbing) and the DFlash
 draft/verify runtime added for this track:
-`Libraries/MLXSpeculative/DFlash*.swift` (block dispatch, drafter, batched
-engine, KV rollback) plus `Libraries/MLXLLM/DFlashTarget.swift` and
+the eight `Libraries/MLXSpeculative/DFlash*.swift` runtime files listed in
+`benchmark.json` (block dispatch, drafter, batched engine, KV rollback —
+note `DFlashBenchmark.swift` matches that glob but is NOT editable) plus
+`Libraries/MLXLLM/DFlashTarget.swift` and
 `DFlashVerifyLinear.swift` (multi-row target verification). The exact file
 list is in `benchmark.json`.
 
@@ -287,9 +290,10 @@ reference, not applied per pair); the DFlash token-fidelity gate
 maximum block latency exceeds 4x its p50 block latency as
 measurement-invalid, with one gated retry. A run that misses the floor,
 fails token fidelity, or trips the stall guardrail publishes no score. The
-floor is derived from the worst measured no-op across the 8-prompt timed
-pool (the no-ops cluster at 0.8726-0.8939), so an unoptimized block-decode
-build already clears it with margin.
+floor is a uniform 0.952 margin against the sampled prompt's own pinned
+no-op reference — a correct no-op normalises to exactly 1.0 on every prompt
+(the raw no-ops cluster at 0.8726-0.8939) — so an unoptimized block-decode
+build already clears it with ~5% margin.
 
 The timed measurement runs last in the ranked job, after all correctness and
 gate work and after every hidden byte is scrubbed from the bench workspace,
@@ -394,7 +398,9 @@ behaviors are expected, not bugs:
  ceiling applies even while the GPU is still slowly cooling.) If `macmon`
  is not installed the gate warns and skips; `./setup.sh` installs it (or
  `brew install macmon`). The gate mirrors the ranked runner's fixed
- 40C / 1600 MHz / 900 s thermal contract, which is operator-owned and
+ 40C / 1500 MHz / 900 s thermal contract (the serial-side frequency floor
+ was set to 1500 by operator decision 2026-07-31 — at 1600 no ranked run
+ could complete at the 512-token window), which is operator-owned and
  non-overridable.
 - **Optional fan boost for a stalled local cool-down.** If the local gate
  sits hot for ~60 seconds with no cooling progress, it offers — once per
@@ -455,8 +461,10 @@ behaviors are expected, not bugs:
  and the worker exits if its parent dies, so the guard should fire
  rarely. Know its scope: the lock lives in `benchmark-dflash.sh` (and the
  `benchmark.sh` it invokes internally), so direct `mlxfast-swift` model
- commands (`correctness`, `correctness-trace`,
- `generate-golden`, and `generate-gpqa-answers`) take no lock
+ commands (`correctness`, `correctness-trace`, `generate-golden`,
+ `generate-gpqa-answers`, and the DFlash-track `dflash-benchmark`,
+ `dflash-probe`, and `dflash-reference` — all model-holding: the ~21.6 GB
+ target plus the drafter) take no lock
  and do not check for other runs -- run one model-holding command at a
  time, never concurrently with a local benchmark or with each other.
  (`swift test` never loads the real model and is safe alongside.)
@@ -686,7 +694,11 @@ true`, and `token_fidelity_gate_status: implemented`, and the workflow
 - **Participants never supply weights.** Both the target (the same pinned NVFP4
   group-16 reference checkpoint the serial track measures) and the drafter are
   organizer-provisioned and hash-pinned. Substituting, re-deriving, or
-  re-quantizing the drafter is a fail.
+  re-quantizing the drafter is a fail (it stays BF16). The retired serial
+  rules' frozen TARGET-quantization envelope carries over unchanged to this
+  track's target handling: the same accepted representations, nothing beyond
+  that envelope — the DFlash track changed the decode protocol, not what may
+  be done to the target's weights.
 - **Drafts must come from the pinned drafter, not from the input.** Bypassing the
   drafter is a distinct violation from substituting its weights, and it is
   excluded just as firmly. Every proposed token in a block must be produced by a

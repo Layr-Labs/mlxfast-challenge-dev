@@ -4973,7 +4973,7 @@ func residentModelGuardPatternCoversTheDFlashSubcommands() throws {
             RESIDENT_MODEL_PROCESS_PATTERN does not match `\(subcommand)`, so the \
             local run guard cannot see a DFlash model residency. Two \
             simultaneous residencies (~21.6 GB each, plus the drafter) exceed \
-            the documented 40 GiB local minimum. Pattern: \(line)
+            the documented 36 GiB local minimum. Pattern: \(line)
             """
         )
     }

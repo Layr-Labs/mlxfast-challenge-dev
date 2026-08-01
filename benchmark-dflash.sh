@@ -22,15 +22,17 @@
 #   * the reference golden is produced by the CANDIDATE's own build, not by the
 #     pinned baseline, so it checks DFlash block/serial parity and speed
 #     direction -- not target fidelity;
-#   * fixtures/laguna_xs_2_1_dflash_track.json has official_scoring_enabled
-#     false and an empty timed_prompt_pool, so no ranked run exists yet;
+#   * the ranked run (fixtures/laguna_xs_2_1_dflash_track.json is LIVE:
+#     official_scoring_enabled true, 8-entry timed_prompt_pool) samples a
+#     hidden pool prompt and scores per-prompt normalised -- none of which
+#     this local loop can reproduce;
 #   * the ranked pipeline (.github/workflows/dflash-benchmark.yml) measures
 #     against organizer-pinned hidden goldens on the M5 box and is the only
 #     authority for both fidelity and score.
 #
 # ONE MODEL-HOLDING RUN AT A TIME. A DFlash residency is the ~21.6 GB NVFP4
 # target PLUS the ~0.9 GB drafter, so two overlapping runs do not fit the
-# documented ~40 GiB local minimum. This script reuses BOTH halves of
+# documented ~36 GiB local minimum. This script reuses BOTH halves of
 # benchmark.sh's memory guard (see the "local run guard" section below):
 #   * the per-user run lock, which excludes a concurrent local run in either
 #     direction (serial vs DFlash);
@@ -58,7 +60,7 @@ Environment:
   MLXFAST_SCORE_PATH                     score payload path (default score.json)
   MLXFAST_WEIGHTS_PATH                   transformed weights tree (default weights)
   MLXFAST_SWIFT_BIN                      trusted CLI (default .build/release/mlxfast-swift)
-  MLXFAST_DFLASH_BLOCK_SIZE              declared block width, 2..16 (default 3,
+  MLXFAST_DFLASH_BLOCK_SIZE              declared block width, 2..16 (default 2,
                                          the ranked workflow's value)
   MLXFAST_DFLASH_LOCAL_ITERATE_TOKENS    decode tokens for --local-iterate (default 64)
   MLXFAST_DFLASH_LOCAL_SUBMIT_TOKENS     decode tokens for --local-submit (default 128)
@@ -117,8 +119,10 @@ weights_path="${MLXFAST_WEIGHTS_PATH:-weights}"
 score_path="${MLXFAST_SCORE_PATH:-score.json}"
 work_root="${MLXFAST_DFLASH_LOCAL_WORK_DIR:-.mlxfast-local-dflash}"
 # Same env name (and same default) the ranked workflow uses for the declared
-# block width, so a local run and a ranked run describe the same schedule.
-block_size="${MLXFAST_DFLASH_BLOCK_SIZE:-3}"
+# block width, so a local run and a ranked run describe the same schedule
+# (ranked dispatches MLXFAST_DFLASH_BLOCK_SIZE: "2" -- Amendment 28's K
+# re-derivation; the old local default of 3 predated it).
+block_size="${MLXFAST_DFLASH_BLOCK_SIZE:-2}"
 workflow_path=".github/workflows/dflash-benchmark.yml"
 # Reuse the serial local loop's thermal gate rather than reimplementing it. This
 # branch of benchmark.sh returns before the metallib check, the builds, the

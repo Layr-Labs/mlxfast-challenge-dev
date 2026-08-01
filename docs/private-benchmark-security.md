@@ -251,7 +251,8 @@ in the script itself — readonly, not environment-overridable: every timed
 phase (pinned baseline and candidate, plus any oracle generation) starts
 only once the GPU has cooled below 40C (waiting up to 900 seconds), runs
 under 100 ms macmon GPU telemetry, and is rejected if any loaded sample
-shows GPU clocks below 1600 MHz (throttling), if telemetry is missing, or if the
+shows GPU clocks below the per-side frequency floor (1500 MHz since the
+2026-07-31 operator decision — throttling), if telemetry is missing, or if the
 sealed score shows token mismatches; one gated retry is allowed.
 
 The measurement is paired: the pinned reference baseline tree provisioned

@@ -3391,21 +3391,22 @@ per-run selection step's output and is consumed only inside this trusted step �
 never echoed to the log, preserving the "selection recorded only in the private
 audit dir" posture of Amendment 30.
 
-## The box gate must be decoupled (PENDING operator action)
+## The box gate is decoupled (APPLIED 2026-08-01)
 
 The box wrapper's `MIN_ACCEPTED_SPEEDUP` in
 `/opt/bench-runner/measure-dflash-job.sh` was previously pinned EQUAL to the
-ranked floor. It MUST be decoupled to a LOOSE RAW measurement-sanity floor (well
-below the worst raw no-op, ~0.50), because the box measures raw speedup and has
-no reference; the ranked floor is enforced NORMALISED in the trusted workflow.
-**This is a PENDING operator action** (a root, inode-preserving edit to the
-box-owned script plus a janitor baseline re-sign, on every box serving the track)
-— **until it is applied the box still enforces the raw 0.83 floor.** It is
-required, not cosmetic: a box raw floor left at 0.83 false-rejects a
-Russell-drawn candidate whose raw speedup sits in [0.829, 0.83) even though it
-normalises to ≥ 0.95 — the Amendment 28 false-reject failure mode transplanted to
-the box gate (fail-safe: it only ever over-REJECTS, never over-accepts).
-`MAX_PLAUSIBLE_SPEEDUP` stays raw on the box.
+ranked floor. It is now decoupled to a LOOSE RAW measurement-sanity floor of
+**0.50** (well below the worst raw no-op), because the box measures raw speedup
+and has no reference; the ranked floor is enforced NORMALISED in the trusted
+workflow. **APPLIED 2026-08-01 on the serving box** by the operator: root,
+inode-preserving edit (backup `measure-dflash-job.sh.pre-decouple050`), followed
+by `gen-manifest.sh` re-sign and a clean `janitor.sh --audit-only` — the
+protected-surface contract. Any additional box brought to serve this track must
+apply the same decouple. It was required, not cosmetic: a box raw floor left at
+0.83 false-rejects a Russell-drawn candidate whose raw speedup sits in
+[0.829, 0.83) even though it normalises to ≥ 0.95 — the Amendment 28
+false-reject failure mode transplanted to the box gate (fail-safe: it only ever
+over-REJECTS, never over-accepts). `MAX_PLAUSIBLE_SPEEDUP` stays raw on the box.
 
 ## Published score and the (accepted) post-hoc inferability
 

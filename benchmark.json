@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "name": "mlxfast-challenge-dev-dflash",
   "trackId": "laguna-xs-2.1-dflash-v1",
-  "description": "Poolside Laguna XS 2.1 DFlash track: optimize target-verified block decode driven by the organizer-provisioned DFlash draft model (a separate ~881 MB EAGLE-style speculator: 5 sliding-window layers, block size 16, conditioned on target hidden states, borrowing the target embedding and lm_head). The drafter and target weights are fixed; the editable surface is the drafting/verification runtime -- block dispatch, multi-row verification kernels, KV rollback, and cache handling. Decode-only paired scoring against the trusted serial K=1 target oracle, with parent-owned token fidelity verification.",
+  "description": "Poolside Laguna XS 2.1 DFlash track: optimize target-verified block decode driven by the organizer-provisioned DFlash draft model (a separate ~924 MB EAGLE-style speculator: 5 sliding-window layers, block size 16, conditioned on target hidden states, borrowing the target embedding and lm_head). The drafter and target weights are fixed; the editable surface is the drafting/verification runtime -- block dispatch, multi-row verification kernels, KV rollback, and cache handling. Decode-only paired scoring against the trusted serial K=1 target oracle, with parent-owned token fidelity verification.",
   "category": "swift",
   "direction": "+",
   "editablePaths": [
@@ -130,7 +130,7 @@
     "aggregation": "ratio_of_means",
     "scoreNormalization": "per-prompt no-op reference: the ratio-of-means aggregate is divided by the sampled prompt's pinned noop_decode_speedup (fixtures/laguna_xs_2_1_dflash_track.json timed_prompt_pool[]) before the floor is applied and the score published. See proposed_scoring.normalized_scoring and Amendment 32.",
     "decodeSpeedupFloor": 0.95,
-    "decodeSpeedupFloorNote": "NORMALISED floor (adopted 2026-08-01, Amendment 32): >= 0.95 on the per-prompt-normalised aggregate == within 5% of the sampled prompt's own no-op. Supersedes the raw 0.83 (worst pool no-op 0.8726 x 0.952), which was correct only for the worst prompt. Pinned equal to the fixture component_floor and the workflow MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR by test; the box MIN_ACCEPTED_SPEEDUP is a separate LOOSE RAW sanity floor, not this value.",
+    "decodeSpeedupFloorNote": "NORMALISED floor (adopted 2026-08-01, Amendment 32): >= 0.95 on the per-prompt-normalised aggregate == within 5% of the sampled prompt's own no-op. Supersedes the raw 0.83 (worst pool no-op 0.8726 x 0.952), which was correct only for the worst prompt. Pinned equal to the fixture component_floor and the workflow MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR by test; the box MIN_ACCEPTED_SPEEDUP is a separate LOOSE RAW sanity floor (0.50, decoupled and APPLIED on the box 2026-08-01), not this value.",
     "minAcceptedPairs": 3,
     "targetPairs": 4,
     "tokenFidelityGate": "trusted-sequential-reverification-with-bounded-near-tie-budget",
