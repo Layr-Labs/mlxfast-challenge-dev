@@ -321,16 +321,19 @@ func participantDocsExposeDefaultCLIInstallDirectory() throws {
 }
 
 @Test
-func participantDocsDescribeDefaultSerialScoreAndFloors() throws {
+func participantDocsDescribeDefaultDFlashScoreAndFloor() throws {
     let readme = try String(contentsOfFile: "README.md", encoding: .utf8)
     let challenge = try String(contentsOfFile: "TASK.md", encoding: .utf8)
 
     for document in [readme, challenge] {
-        // The default (and only) ranked track is the serial prefill+decode
-        // weighted paired speedup with the 0.95 floors.
-        #expect(document.contains("decode_speedup^0.75 * prefill_speedup^0.25"))
-        #expect(document.contains("0.95"))
+        // The default (and only) ranked track is DFlash: a DECODE-ONLY paired
+        // speedup with a single 0.83 floor over a 512-token window. The retired
+        // serial weighted formula and its 0.95 floors must be gone.
+        #expect(document.contains("dflash_decode_speedup"))
+        #expect(document.lowercased().contains("decode-only"))
+        #expect(document.contains("0.83"))
         #expect(document.contains("512"))
+        #expect(!document.contains("decode_speedup^0.75 * prefill_speedup^0.25"))
         // The retired MTP track's score description must be gone.
         #expect(!document.contains("MTP_seconds_per_token"))
         #expect(!document.contains("serial_K1_seconds_per_token"))

@@ -1,70 +1,73 @@
-# mlxfast — Poolside Laguna XS 2.1 Serial Swift Challenge
+# mlxfast — Poolside Laguna XS 2.1 DFlash Swift Challenge
 
-Optimize serial (one token per decode request) inference for Poolside Laguna
-XS 2.1 (MoE text tower, Poolside NVFP4) on Apple Silicon while preserving the model's
-exact greedy output.
+Optimize target-verified block speculative decode (DFlash) for Poolside Laguna
+XS 2.1 (MoE text tower, Poolside NVFP4) on Apple Silicon while preserving the
+model's exact greedy output. An organizer-provided DFlash draft model proposes
+tokens, the Laguna target verifies K rows per forward, the longest correct
+prefix is accepted, and the KV rows behind rejected draft tokens are rolled
+back.
 
 ## Default ranked contract
 
-`benchmark.json` and `.github/workflows/benchmark.yml` define the default —
-and only — Yukon track, `laguna-xs-2.1-serial-v2`.
+`benchmark.json` and `.github/workflows/dflash-benchmark.yml` define the
+default — and only — Yukon track, `laguna-xs-2.1-dflash-v1` (manifest name
+`mlxfast-challenge-dev-dflash`). The former serial track
+`laguna-xs-2.1-serial-v2` is retired: its ranked workflow
+`.github/workflows/benchmark.yml` was deleted, and `benchmark.json` is now
+the DFlash manifest. The track is live: `official_scoring_enabled`,
+`reference_baseline.publication_allowed`, and
+`token_fidelity_gate_status=implemented` are all set.
 
-A ranked run on the self-hosted M5 box:
+A ranked run on the self-hosted M5 box (runner label `m5-laguna-dflash`, the
+dedicated DFlash label — not the serial track's `m5-bench`; the label in
+`.github/` is the source of truth):
 
 1. Verifies the pre-provisioned reference checkpoint against the pinned
-   manifest, builds the trusted CLI and the sandboxed participant worker,
-   and transforms the reference checkpoint into `weights/`.
-2. Runs the public drift tripwire, then the hidden 512-token-prompt
-   teacher-forced base case plus anchor/free-run/behavior/GPQA gates and the
-   semantic GPQA judge.
+   manifest and provisions the pinned DFlash drafter, builds the trusted CLI
+   and the sandboxed participant worker, and transforms the reference
+   checkpoint into `weights/`.
+2. Runs the shared correctness stack (public drift tripwire, then the hidden
+   512-token-prompt teacher-forced base case plus anchor/free-run/behavior/
+   GPQA gates and the semantic GPQA judge) reused from the serial track, plus
+   the DFlash token-fidelity gate (trusted sequential re-verification of every
+   emitted token against the candidate's own emitted prefix, with a bounded
+   near-tie budget; the rejected tail is priced).
 3. Scrubs every hidden byte from the bench workspace, then runs the timed
-   paired measurement LAST behind the fixed 40C thermal gate: the pinned
-   baseline tree and the candidate are measured back to back on the same
-   silicon (`measure-job.sh`, telemetry-validated).
+   paired measurement LAST behind the fixed 40C thermal gate: the trusted
+   serial K=1 target baseline and the candidate's DFlash decode are measured
+   back to back on the same silicon by the box-owned `measure-dflash-job.sh`
+   (telemetry-validated). The hidden timed prompt is sampled uniformly at
+   random once per ranked run from an 8-entry, domain-varied
+   `timed_prompt_pool` (anti-lottery).
 
-Timing measures a 512-token prompt prefill and a teacher-forced decode window
-(512-token decode seed, 128 decode steps; see
-`docs/benchmark-window-freeze.md` for the frozen knobs). The published score
-is the paired prefill+decode weighted speedup:
-
-```text
-score = decode_speedup^0.75 * prefill_speedup^0.25
-decode_speedup_floor = 0.95
-prefill_speedup_floor = 0.95
-```
-
-Both floors are hard: a run below either floor, or with any token mismatch,
-publishes no score.
-
-A second, two-sided **acceptance band** also applies on the ranked path, and
-it is tighter than the floors in both directions:
+Timing measures a decode-only window: 512 decode tokens with the seed prefill
+charged inside the window (block size K=2 at the ranked dispatch, a runtime
+choice bounded by the drafter's trained block size of 16; see the contract
+fixture `fixtures/laguna_xs_2_1_dflash_track.json` and
+`docs/dflash-track-correctness-contract.md`). The published score is the
+decode-only paired speedup:
 
 ```text
-decode_speedup  vs the pinned calibration reference: [0.980, 1.053]
-prefill_speedup vs the pinned calibration reference: [0.952, 1.053]
+score = dflash_decode_speedup = mean(serial K=1 s/token) / mean(dflash s/token)
 ```
 
-The banded quantity is each timed run's measured seconds/token relative to
-the pinned calibration reference (the `officialBaseline*` constants in
-`Sources/MLXFastCore/Constants.swift`), not the same-session paired
-baseline that produces the published `decode_speedup`/`prefill_speedup` —
-the published paired ratio is checked only against the 0.95 floors and can
-land slightly outside the band window when the box's session baseline
-drifts from the pinned reference.
+a ratio-of-means over the accepted, thermal-gated pairs (minimum 3, target 4).
+There is a single hard component floor and no prefill component:
 
-The upper bound caps how much a single submission may gain (about 5%): a
-larger measured win is either a lucky reading or too big to trust in one
-shot, so **chunk it across submissions** — the cap is per submission, not
-cumulative. The lower decode bound is deliberately tighter than the 0.95
-decode floor. Local modes never fail on the band: `--local-iterate` /
-`--local-submit` print a warning when their estimate exceeds it but still
-publish the estimate; see `docs/benchmark-window-freeze.md`. A ranked run
-that trips the band fails with failure category `acceptance_band_failed`.
+```text
+decode_speedup_floor = 0.83
+```
 
-Run `./setup.sh`, then `./benchmark.sh --local-iterate`
-or `--local-submit` locally; local modes write an estimated local
-`score.json` only — the official paired score comes exclusively from the
-ranked M5 run.
+A run below the 0.83 floor, or with any token-fidelity failure, or that trips
+the stall guardrail (max block latency > 4x p50 rejects the run, with one
+gated retry), publishes no score. There is no two-sided acceptance band on the
+DFlash track — the 0.83 decode floor, the token-fidelity gate, and the stall
+guardrail are the ranked gates.
+
+Run `./setup.sh && ./setup-dflash.sh` (the second provisions the pinned DFlash
+drafter), then `./benchmark-dflash.sh --local-iterate` or `--local-submit`
+locally; local modes write an estimated local `score.json` only — the official
+paired score comes exclusively from the ranked M5 run.
 
 ## Model Artifacts
 
@@ -120,6 +123,13 @@ overlay by changing both `Sources/MLXFastTransform/` and
 `Sources/MLXFastModel/`; correctness and benchmark results are the authority,
 not byte equality with the baseline layout.
 
+The DFlash track adds one more provisioned asset: the organizer-provided
+DFlash draft model (an EAGLE-style speculator with ~fixed weights, block size
+16, conditioned on target hidden states and borrowing the target embedding and
+lm_head). It is provisioned by `./setup-dflash.sh` on top of `./setup.sh`.
+Both the target checkpoint and the drafter weights are fixed — they are not a
+submission surface; only the drafting/verification runtime around them is.
+
 The public correctness-only prompt and Laguna-tokenized golden are committed
 under `correctness_prompts/` so participants can run a local correctness smoke
 test. The official correctness golden
@@ -150,6 +160,8 @@ The active editable surface is Swift-only and is defined by `benchmark.json`:
 |---|---|
 | `Sources/MLXFastModel/` | Laguna XS 2.1 NVFP4 model implementation: attention (sliding-window + full, GQA, YaRN partial-rotary RoPE on full-attention layers), MoE MLP (256 routed experts + shared expert, per-head gating), RMSNorm, KV caches, weight loading, and prefill/decode execution. |
 | `Sources/MLXFastTransform/` | Offline safetensors transform (text-tensor selection, config/tokenizer emission). |
+| `Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlash*.swift`, `Vendor/mlx-swift-lm/Libraries/MLXLLM/DFlashTarget.swift`, `DFlashVerifyLinear.swift` | DFlash drafting/verification runtime: block dispatch, multi-row target verification, longest-correct-prefix acceptance, and KV rollback of the rows behind rejected draft tokens. |
+| Vendored Laguna model + `MLXLMCommon` plumbing + MLX Metal kernels (per `benchmark.json` `editablePaths`) | `Laguna.swift`, the KV-cache/RoPE/decode helpers, and the SDPA / quantized-matmul (NVFP4 `fp_quantized*`, `_nax`) / MoE gather-GEMM / `rope` / `rms_norm` / `softmax` / etc. kernel families the forward pass dispatches. |
 
 `Sources/MLXFastCore/`, `Sources/MLXFastHarness/`,
 `Sources/MLXFastCLI/`, scripts, tests, `benchmark.json`, generated
@@ -179,7 +191,7 @@ benchmark checkout and re-enforces the editable surface server-side before
 running hidden validation. `--model` is required and is recorded for the
 leaderboard; pass `--note-file PATH` or `--claimed-score N` as needed.
 The benchmark contract also declares a local `preSubmitCommand`:
-`./benchmark.sh --local-submit`. `mlxfast submit` does not run it — the upload
+`./benchmark-dflash.sh --local-submit`. `mlxfast submit` does not run it — the upload
 goes directly to official validation, and no local run blocks it. Running that
 command yourself before submitting is the recommended local correctness and
 timing check, without running the official hidden golden.
@@ -250,61 +262,90 @@ normalization than token-level or logit-anchor checks.
 VLM/image and audio inputs remain out of scope. Only the Laguna text tower
 executes.
 
-### Serial non-speculative rule (default track)
+### DFlash token-fidelity gate
 
-In `benchmark.json`, each model
-invocation may compute logits and KV rows only for tokens supplied in that
-invocation, and must advance logical and physical KV position by exactly the
-supplied input length. A one-token decode request therefore advances exactly
-one position and leaves no pending future token, logits, or KV state for a
-later request.
+On top of the shared gates above, the DFlash track adds a token-fidelity gate
+that keeps speculative decode honest. In the trusted parent, every emitted
+token of every round is re-verified against a reference teacher-forced on the
+candidate's own emitted prefix (a divergent token re-anchors every later row
+to the candidate's actual chain), declared rows are re-checked in full, and
+the rejected tail is priced rather than being free. No report publishes
+without that reference pass — the gate fails closed. An emitted token is
+admissible only if it matches the reference's own argmax (exact or at the
+declared block width) or falls inside a bounded, per-thousand-token near-tie /
+residual budget measured against the reference's own logits; anything else
+rejects the run. `token_fidelity_gate_status` is `implemented`.
 
-This excludes prompt-lookup decoding; n-gram, suffix, or other token-history
-drafting; same-target lookahead; and any other mechanism that selects or
-evaluates an unsupplied future token. It also excludes two-, three-, or
-more-row target-model execution used to verify a draft from a one-token
-request, plus cross-request future-logit/KV buffering, deferred cache rows,
-and commit, rollback, recommit, or discard markers for such rows. These
-mechanisms remain excluded when they are generic, bit-exact, or useful in
-production. Warming an excluded speculative pipeline before the worker
-protocol hello or during model initialization does not make it eligible.
+### DFlash block-decode rules (default track)
 
-Ordinary within-request KV reuse remains allowed, as do current-token-only
-decode execution and input-independent caches for weights, dequantized
-tensors, kernels, masks, or RoPE tables. Multi-row kernels are allowed when
-every row corresponds to a token actually supplied in that same invocation,
-such as ordinary prefill; the prohibited case is using extra rows to compute
-or verify future tokens for a serial one-token request.
+DFlash is the declared, trusted block-decode track, so target-verified block
+speculative decode is the required ranked path, not an excluded one. Each
+target forward may verify K draft rows proposed by the organizer-provided
+drafter; the runtime accepts the longest correct prefix and rolls back the KV
+rows behind rejected draft tokens, advancing logical and physical KV position
+by exactly the number of accepted tokens. The trusted block protocol
+(`trusted_dflash_block_v1`) and the token-fidelity gate above define what a
+valid round is; the drafter and target weights are fixed.
 
-Organizer-provided MTP or other speculative decoding would require a
-separately declared trusted block protocol, correctness contract, and score;
-no such track currently exists, so these
-restrictions apply to every ranked submission.
+What stays excluded is drafting that is not the provisioned DFlash drafter:
+prompt-lookup decoding; n-gram, suffix, or other token-history drafting; and
+any mechanism that manufactures or hardcodes an unsupplied future token
+outside the trusted draft/verify protocol. Warming the pipeline before the
+worker protocol hello or during model initialization does not exempt it from
+the gates.
+
+Ordinary within-request KV reuse remains allowed, as do input-independent
+caches for weights, dequantized tensors, kernels, masks, or RoPE tables.
+Multi-row kernels are the normal case here: every row is backed either by a
+token supplied in that invocation (prefill) or by a drafted row the target
+then verifies under the protocol.
+
+The experimental trained-assistant MTP block-decode track
+(`laguna-xs-2.1-mtp-v1`) that once required a separately declared trusted
+block protocol was retired without going live; DFlash is that declared track,
+and the rules above govern every ranked submission.
+
+### Excluded on every track, and what the static-review gate cites
+
+Two rule sets bind every submission and are what the trusted submission
+static-review reads:
+
+- No caches or memos keyed on a request's input tokens whose only possible hit
+  is the benchmark harness repeating an identical computation — bit-identical
+  output does not make that legitimate; the benchmark measures single-pass
+  inference. Input-independent caches (weights, dequantized tensors, RoPE/mask
+  tables keyed on shapes and offsets) and within-request KV reuse stay fine.
+- The retired serial non-speculative track rules remain the reference the
+  static review cites for UNsanctioned speculation: prompt-lookup decoding,
+  n-gram / suffix / token-history drafting, same-target lookahead, cross-request
+  future-logit/KV buffers, deferred cache rows, and commit / rollback / recommit
+  markers are all excluded. Under that serial track a one-token decode request
+  advances exactly one position and leaves no pending future token; DFlash's
+  sanctioned organizer-drafter + target-verify block decode is the deliberate
+  exception (above), but every unsanctioned future-token path stays excluded.
 
 ## Score
 
 ```text
-score = decode_speedup^0.75 * prefill_speedup^0.25
+score = dflash_decode_speedup = mean(serial K=1 s/token) / mean(dflash s/token)
 ```
 
-Higher is better. Each speedup is the pinned baseline's seconds/token divided
-by the candidate's, with both sides measured on the same M5 in the same
-session behind the same fixed thermal/telemetry acceptance (the paired
-baseline cancels host drift). The hard component floors are:
+Higher is better. This is a decode-only paired speedup: the trusted serial
+K=1 target baseline's mean seconds/token divided by the candidate's DFlash
+mean seconds/token, aggregated as a ratio-of-means over the accepted pairs,
+with both sides measured on the same M5 in the same session behind the same
+fixed 40C thermal / telemetry acceptance (the paired baseline cancels host
+drift). There is a single hard component floor and no prefill component:
 
 ```text
-decode_speedup >= 0.95
-prefill_speedup >= 0.95
+dflash_decode_speedup >= 0.83
 ```
 
-A run below either floor or with any token mismatch is ineligible. The score
-is null when any gate fails. The two-sided acceptance band described above
-(speedup vs the pinned calibration reference in `[0.980, 1.053]` for
-decode, `[0.952, 1.053]` for prefill) applies on top of the floors and is
-evaluated against that pinned reference, not the paired session baseline;
-local modes warn when their estimate exceeds it but never fail on it.
-`score.json` also carries prefill and decode
-seconds/token, speedups, floor verdicts, gate results, and
+A run below the 0.83 floor, or with any token-fidelity failure, or that trips
+the stall guardrail (max block latency > 4x p50, one gated retry), is
+ineligible; the score is null when any gate fails. There is no two-sided
+acceptance band on the DFlash track. `score.json` also carries decode
+seconds/token, the paired speedup, the floor verdict, gate results, and
 transformed-weight identity.
 
 ## Useful Commands
@@ -313,9 +354,9 @@ transformed-weight identity.
 swift test --force-resolved-versions
 MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test --force-resolved-versions
 swift build -c release --force-resolved-versions
-./setup.sh
-./benchmark.sh --local-iterate
-./benchmark.sh --local-submit
+./setup.sh && ./setup-dflash.sh      # setup-dflash.sh provisions the pinned DFlash drafter
+./benchmark-dflash.sh --local-iterate
+./benchmark-dflash.sh --local-submit
 
 # Submitting is done with the Yukon CLI (mlxfast), not mlxfast-swift:
 mlxfast clone <benchmark-id-or-name>
@@ -325,6 +366,6 @@ mlxfast submissions
 
 Always pass `--force-resolved-versions` to direct `swift build` / `swift
 test` runs: the dependency graph is frozen, and a bare invocation can
-silently rewrite `Package.resolved`, after which `./setup.sh` and
-`./benchmark.sh` refuse to run until you restore it with
-`git checkout -- Package.resolved`.
+silently rewrite `Package.resolved`, after which `./setup.sh` and the
+benchmark scripts (`./benchmark-dflash.sh`, which delegates to `./benchmark.sh`)
+refuse to run until you restore it with `git checkout -- Package.resolved`.
