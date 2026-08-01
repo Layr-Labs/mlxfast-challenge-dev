@@ -69,7 +69,7 @@ struct DefaultTrackTests {
         )
         let editablePaths = try #require(track["editablePaths"] as? [String])
         #expect(!editablePaths.isEmpty)
-        #expect(editablePaths.count == 84)
+        #expect(editablePaths.count == 95)
         #expect(Set(editablePaths).count == editablePaths.count, "editablePaths must be unique")
         for guidePath in ["README.md", "AGENTS.md", "CLAUDE.md"] {
             let guide = try String(contentsOfFile: guidePath, encoding: .utf8)
@@ -93,6 +93,28 @@ struct DefaultTrackTests {
                 "DFlash speculative runtime path \(path) must remain editable"
             )
         }
+
+        // Scored-path hot surfaces added 2026-08-01 after the editable-surface
+        // review: the MoE router dispatches `sort` (top-8 argPartition) and
+        // `reduce` (top-k weight norm + expert-output combine) on every sparse
+        // layer, and the target forward runs the `SwitchLayers`/`AttentionUtils`
+        // Swift dispatch wrappers on every layer. All were dispatched on the
+        // scored path but previously not editable; keep them editable.
+        let requiredHotPathPaths = [
+            "Vendor/mlx-swift/Source/Cmlx/mlx-generated/sort.cpp",
+            "Vendor/mlx-swift/Source/Cmlx/mlx-generated/reduce.cpp",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/sort.metal",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/reduce.metal",
+            "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/AttentionUtils.swift",
+            "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift",
+        ]
+        for path in requiredHotPathPaths {
+            #expect(
+                editablePaths.contains(path),
+                "scored-path optimization surface \(path) must be editable"
+            )
+        }
+
         #expect(
             !editablePaths.contains(
                 "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal"

@@ -95,7 +95,7 @@ official benchmark for ranking.
 ## What You May Optimize
 
 The submitted editable surface is defined by `editablePaths` in
-`benchmark.json` — that list (currently 84 entries) is the source of truth.
+`benchmark.json` — that list (currently 95 entries) is the source of truth.
 It covers four groups:
 
 ```text
@@ -106,8 +106,10 @@ Vendor/mlx-swift/ the MLX Metal kernels Laguna dispatches
 ```
 
 The vendored model surface is `Libraries/MLXLLM/Models/Laguna.swift` plus
-the `MLXLMCommon` files it uses directly (KV caches, RoPE utilities and
-application, compiled decode, evaluation plumbing) and the DFlash
+the `MLXLMCommon` files it uses directly (KV caches, the `SwitchLayers.swift`
+MoE expert gather-GEMM dispatch, the `AttentionUtils.swift` attention dispatch
+and masking, RoPE utilities and application, compiled decode, evaluation
+plumbing) and the DFlash
 draft/verify runtime added for this track:
 `Libraries/MLXSpeculative/DFlash*.swift` (block dispatch, drafter, batched
 engine, KV rollback) plus `Libraries/MLXLLM/DFlashTarget.swift` and

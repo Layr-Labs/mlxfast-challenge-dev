@@ -139,7 +139,18 @@
     "Vendor/mlx-swift/Source/Cmlx/mlx-generated/steel_gemm_gather_nax.cpp",
     "Vendor/mlx-swift/Source/Cmlx/mlx-generated/steel_attention.cpp",
     "Vendor/mlx-swift/Source/Cmlx/mlx-generated/steel_attention_nax.cpp",
-    "Vendor/mlx-swift/Source/Cmlx/mlx-generated/gemv.cpp"
+    "Vendor/mlx-swift/Source/Cmlx/mlx-generated/gemv.cpp",
+    "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/sort.metal",
+    "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/sort.h",
+    "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/reduce.metal",
+    "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/reduce.h",
+    "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/reduce_utils.h",
+    "Vendor/mlx-swift/Source/Cmlx/mlx-generated/sort.cpp",
+    "Vendor/mlx-swift/Source/Cmlx/mlx-generated/reduce.cpp",
+    "Vendor/mlx-swift/Source/Cmlx/mlx-generated/reduce_utils.cpp",
+    "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/AttentionUtils.swift",
+    "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift",
+    "Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlashError.swift"
   ],
   "target": {
     "upstream_model_id": "poolside/Laguna-XS-2.1",

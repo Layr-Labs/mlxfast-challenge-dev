@@ -1,22 +1,28 @@
 // Copyright © 2025 Apple Inc.
 
 // ============================================================================
-// REFERENCE IMPLEMENTATION — the scored forward pass runs
-// `Sources/MLXFastModel/LagunaRuntimeModel.swift`; edits here do not affect
-// your score unless called by the runtime.
+// SCORED TARGET (DFlash track) — on `laguna-xs-2.1-dflash-v1`, THIS file's
+// `LagunaModel` IS the timed forward pass. The runtime worker loads it via
+// `LLMModelFactory` ("laguna"), casts it to `DFlashTargetModel`, and the block
+// verifier scores it (`forwardForDFlash` / `forwardGreedyTokensForDFlash` /
+// `callCapturingDFlashHiddenStates`, plus `newCache`). Edits here DO affect your
+// score.
 //
-// This vendored model is the behavior oracle for the gated
-// upstream-equivalence cross-check
-// (`Sources/MLXFastModel/LagunaUpstreamEquivalence.swift`, exercised by the
-// `MLXFAST_RUN_LAGUNA_UPSTREAM_EQUIVALENCE=1` test in
-// `Tests/MLXFastTests/LagunaCorrectnessTests.swift`) and backs the
-// `LLMModelFactory` "laguna" registration, so it must keep compiling — but
-// the benchmark's timed prefill/decode path never executes it. The vendored
-// `MLXLMCommon` helpers the runtime does execute (`SwitchLayers.swift`,
-// `AttentionUtils.swift`, `KVCache.swift`, `RoPEUtils.swift` /
-// `RoPEApplication.swift`, `CompiledDecode.swift` and its compilable caches)
-// and the `Vendor/mlx-swift` kernels are the vendored surfaces where
-// optimization affects the score.
+// (The RETIRED serial track scored `Sources/MLXFastModel/LagunaRuntimeModel.swift`
+// instead; that model deliberately does NOT conform to `DFlashTargetModel`, so it
+// is NOT on the DFlash scored path. An earlier version of this header described
+// that serial arrangement — it is wrong for DFlash.)
+//
+// This model is also the behavior oracle for the gated upstream-equivalence
+// cross-check (`Sources/MLXFastModel/LagunaUpstreamEquivalence.swift`, exercised
+// by the `MLXFAST_RUN_LAGUNA_UPSTREAM_EQUIVALENCE=1` test in
+// `Tests/MLXFastTests/LagunaCorrectnessTests.swift`), so it must keep compiling
+// and matching upstream behavior. The other vendored `MLXLMCommon` helpers the
+// scored path executes — `SwitchLayers.swift` (MoE expert gather-GEMM dispatch),
+// `AttentionUtils.swift` (attention dispatch + masking), `KVCache.swift`
+// (`KVCacheSimple` + the sliding-window `RotatingKVCache` ring buffer),
+// `RoPEUtils.swift` / `RoPEApplication.swift` — and the `Vendor/mlx-swift`
+// kernels are the other vendored surfaces where optimization affects the score.
 // ============================================================================
 
 // port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/laguna.py
