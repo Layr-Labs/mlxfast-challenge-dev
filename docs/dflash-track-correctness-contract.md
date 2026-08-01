@@ -3319,3 +3319,105 @@ commit. Yukon's next baseline/submission dispatch is then refused at the
 enablement step exactly as before go-live. The `confirm_track_enabled` default
 stays true (harmless while inert — the contract check refuses scored runs
 regardless).
+
+# Amendment 32 (2026-08-01): per-prompt no-op normalisation of the ranked score
+
+## The problem
+
+The anti-lottery sampler (Amendment 30, contract layer L6) draws ONE pool prompt
+uniformly at random per ranked run. The eight pool prompts' unmodified no-op
+speedups cluster at 0.8726–0.8939 — a 2.4% spread driven purely by per-prompt
+draft-acceptance difficulty. Because the ranked score was the raw ratio-of-means,
+a submission's published score swung up to ~2.4% run-to-run depending only on
+WHICH prompt was drawn, dwarfing the <0.5% measurement noise. The single raw
+floor 0.83 (Amendment 30) was worst-prompt-exact — correct for Russell
+(0.8726 × 0.952) but up to ~7% lenient for the easier prompts.
+
+Fixing the prompt is off the table: a frozen timed prompt re-opens the
+submit-until-green retry hole the pool exists to close (Amendment 30). The
+anti-lottery property that must be preserved is UNPREDICTABLE, UNBIASABLE
+selection — not post-hoc secrecy of which prompt was drawn.
+
+## The fix (adopted)
+
+The trusted scoring step now divides the raw ratio-of-means by the sampled
+prompt's OWN pinned no-op reference:
+
+    raw   = mean(serial K=1 s/tok) / mean(dflash s/tok)     [ratio of means]
+    score = dflash_decode_speedup = raw / noop_reference[sampled prompt]
+
+Every pool prompt's no-op maps to exactly 1.0 by construction, so per-prompt
+difficulty is removed from the ranked score and run-to-run variance collapses to
+measurement noise (<0.5%). A submission that genuinely helps some prompts more
+than others still shows per-prompt spread — that is real signal, not the
+difficulty noise removed here.
+
+## The floor becomes 0.95 (normalised), uniform across the pool
+
+With every no-op at 1.0, the floor is `1.0 × 0.952 = 0.95` — the SAME 0.952
+competitive margin every prior derivation used, now applied per-prompt instead of
+only to the worst prompt. This supersedes the raw 0.83. It is STRICTER than the
+old floor on the easy prompts (it removes their up-to-7% slack) and unchanged on
+Russell. Pinned equal in three repo sites (test-enforced): `benchmark.json`
+`scoring.decodeSpeedupFloor`, the fixture `proposed_scoring.component_floor`, and
+the workflow env `MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR`.
+
+## The reference source
+
+`timed_prompt_pool[].noop_decode_speedup`, one per entry, keyed by sha256. Each
+is the prompt's unmodified end-to-end no-op ratio-of-means at the ranked window
+(512 decode tokens, K=2, matched token counts, 40C entry gate, PARITY_OK per
+entry), from the Amendment 30 pool-characterisation campaign on m5-bench:
+Darwin 0.8834, Herodotus 0.8833, Plutarch 0.8822, Hume 0.8939, Russell 0.8726,
+Plato 0.8848, Sophocles 0.8891, Smith 0.8921. These are pinned reference
+CONSTANTS tied to the pinned reference baseline and the ranked window/K. If the
+baseline, window, K, or pool is ever re-measured or refreshed, RE-PIN every
+reference (and re-derive the block size) across the whole pool at the ranked
+window — the same "re-derive both together" discipline the floor always carried.
+
+## Where it is applied (trusted, candidate-immutable)
+
+`.github/workflows/dflash-benchmark.yml` step "Compute DFlash score and enforce
+floor" looks up the sampled prompt's reference by sha256 from the TRUSTED
+contract checkout (`fixtures/laguna_xs_2_1_dflash_track.json` under
+`GITHUB_WORKSPACE`, NOT the candidate-writable job-workspace copy — `fixtures/`
+is outside `editablePaths`), computes `normalized = raw / reference`, and
+enforces the floor on the normalised value. It fails closed if the sampled sha
+has no single positive pinned reference. The sampled sha comes from the trusted
+per-run selection step's output and is consumed only inside this trusted step —
+never echoed to the log, preserving the "selection recorded only in the private
+audit dir" posture of Amendment 30.
+
+## The box gate is decoupled
+
+The box wrapper's `MIN_ACCEPTED_SPEEDUP` in
+`/opt/bench-runner/measure-dflash-job.sh` was previously pinned EQUAL to the
+ranked floor. It is now DECOUPLED to a LOOSE RAW measurement-sanity floor (well
+below the worst raw no-op, ~0.50), because the box measures raw speedup and has
+no reference; the ranked floor is enforced NORMALISED in the trusted workflow.
+This is required, not cosmetic: a box raw floor left at 0.83 would false-reject a
+Russell-drawn candidate whose raw speedup sits in [0.829, 0.83) even though it
+normalises to ≥ 0.95 — the Amendment 28 false-reject failure mode transplanted to
+the box gate. `MAX_PLAUSIBLE_SPEEDUP` stays raw on the box.
+
+## Published score and the (accepted) post-hoc inferability
+
+`score` is the normalised value; `score.json` metrics carry the raw ratio, the
+no-op reference used, and the normalised value, for audit. Because raw and
+reference are both auditable and the per-prompt references are public in the
+fixture, the sampled prompt is post-hoc inferable from a published near-no-op
+run. This does NOT weaken anti-lottery — selection remains unpredictable and
+unbiasable — and it matches the pre-existing inferability from the already-
+published per-side seconds/token means. The prompt TEXT stays hidden (only shas
+and no-op speedups are public), so post-hoc identification of a draw reveals
+nothing that enables targeting a future draw.
+
+## Known limits this accepts
+
+The eight references were measured in the Amendment 30 campaign (2-pair probes
+per entry); a confirming 4-pair re-measurement on m5-bench is the recommended
+follow-up before the references are treated as final. Normalisation is only as
+good as the pinned references: a stale reference (baseline re-measured without
+re-pinning) would bias every run on that prompt. The floor value 0.95 is
+otherwise mechanically derived (1.0 × 0.952) and is not itself a fresh
+measurement.

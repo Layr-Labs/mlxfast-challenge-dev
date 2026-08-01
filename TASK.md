@@ -48,21 +48,25 @@ fixture `fixtures/laguna_xs_2_1_dflash_track.json` and
 decode-only paired speedup:
 
 ```text
-score = dflash_decode_speedup = mean(serial K=1 s/token) / mean(dflash s/token)
+raw   = mean(serial K=1 s/token) / mean(dflash s/token)   # ratio of means
+score = dflash_decode_speedup = raw / noop_reference[sampled prompt]
 ```
 
-a ratio-of-means over the accepted, thermal-gated pairs (minimum 3, target 4).
-There is a single hard component floor and no prefill component:
+The raw ratio-of-means over the accepted, thermal-gated pairs (minimum 3,
+target 4) is normalised by the sampled prompt's own pinned no-op reference, so
+every prompt's no-op maps to 1.0 and the score does not depend on which of the
+8 hidden prompts was drawn. There is a single hard component floor on the
+normalised speedup and no prefill component:
 
 ```text
-decode_speedup_floor = 0.83
+dflash_decode_speedup >= 0.95      # within 5% of this prompt's own no-op
 ```
 
-A run below the 0.83 floor, or with any token-fidelity failure, or that trips
+A run below the 0.95 floor, or with any token-fidelity failure, or that trips
 the stall guardrail (max block latency > 4x p50 rejects the run, with one
 gated retry), publishes no score. There is no two-sided acceptance band on the
-DFlash track — the 0.83 decode floor, the token-fidelity gate, and the stall
-guardrail are the ranked gates.
+DFlash track — the 0.95 normalised decode floor, the token-fidelity gate, and
+the stall guardrail are the ranked gates.
 
 Run `./setup.sh && ./setup-dflash.sh` (the second provisions the pinned DFlash
 drafter), then `./benchmark-dflash.sh --local-iterate` or `--local-submit`
@@ -327,7 +331,8 @@ static-review reads:
 ## Score
 
 ```text
-score = dflash_decode_speedup = mean(serial K=1 s/token) / mean(dflash s/token)
+raw   = mean(serial K=1 s/token) / mean(dflash s/token)   # ratio of means
+score = dflash_decode_speedup = raw / noop_reference[sampled prompt]
 ```
 
 Higher is better. This is a decode-only paired speedup: the trusted serial
@@ -335,18 +340,23 @@ K=1 target baseline's mean seconds/token divided by the candidate's DFlash
 mean seconds/token, aggregated as a ratio-of-means over the accepted pairs,
 with both sides measured on the same M5 in the same session behind the same
 fixed 40C thermal / telemetry acceptance (the paired baseline cancels host
-drift). There is a single hard component floor and no prefill component:
+drift). That raw ratio is then normalised by the sampled prompt's own pinned
+no-op reference (fixtures/laguna_xs_2_1_dflash_track.json
+timed_prompt_pool[].noop_decode_speedup), so every prompt's no-op maps to 1.0
+and the score does not depend on which hidden prompt was drawn. There is a
+single hard component floor on the normalised speedup and no prefill component:
 
 ```text
-dflash_decode_speedup >= 0.83
+dflash_decode_speedup >= 0.95      # within 5% of this prompt's own no-op
 ```
 
-A run below the 0.83 floor, or with any token-fidelity failure, or that trips
+A run below the 0.95 floor, or with any token-fidelity failure, or that trips
 the stall guardrail (max block latency > 4x p50, one gated retry), is
 ineligible; the score is null when any gate fails. There is no two-sided
-acceptance band on the DFlash track. `score.json` also carries decode
-seconds/token, the paired speedup, the floor verdict, gate results, and
-transformed-weight identity.
+acceptance band on the DFlash track. `score.json` also carries the raw ratio,
+the no-op reference used, the normalised paired speedup, decode
+seconds/token, the floor verdict, gate results, and transformed-weight
+identity.
 
 ## Useful Commands
 

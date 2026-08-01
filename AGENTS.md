@@ -20,11 +20,14 @@ score = dflash_decode_speedup = mean(serial K=1 seconds/token) / mean(dflash sec
 
 Higher is better. The score is a decode-only paired speedup: the trusted
 serial K=1 target's seconds/token over the candidate's DFlash seconds/token,
-aggregated as a ratio of means across the accepted thermally-gated pairs,
-both measured on the same machine behind the same thermal gate. There is no
-prefill component — the seed prefill is charged inside the decode window. The
-single decode-speedup floor is `0.83`, hard, block size is `K=2`, and every
-emitted token must clear the DFlash token-fidelity gate. `benchmark.json`
+aggregated as a ratio of means across the accepted thermally-gated pairs, then
+normalised by the sampled prompt's own pinned no-op reference so the score is
+independent of which hidden prompt was drawn (every prompt's no-op maps to
+1.0). Both sides are measured on the same machine behind the same thermal gate.
+There is no prefill component — the seed prefill is charged inside the decode
+window. The single normalised decode-speedup floor is `0.95` (within 5% of the
+prompt's own no-op), hard, block size is `K=2`, and every emitted token must
+clear the DFlash token-fidelity gate. `benchmark.json`
 registers the DFlash track (name `mlxfast-challenge-dev-dflash`) and
 `.github/workflows/dflash-benchmark.yml` is the ranked pipeline. The former
 serial track `laguna-xs-2.1-serial-v2` is retired: its ranked workflow
@@ -255,11 +258,13 @@ diverge on other Apple Silicon generations even for correct code.
 
 The official benchmark measures DFlash decode seconds/token for the candidate
 and the trusted serial K=1 target's decode seconds/token in the same session,
-then publishes the decode-only paired speedup `dflash_decode_speedup =
-mean(serial K=1 seconds/token) / mean(dflash seconds/token)`, aggregated as a
-ratio of means over at least three accepted thermally-gated pairs (target
-four) run in alternating order. The single decode-speedup floor is `0.83`,
-hard. There is no prefill component — the seed prefill is charged inside the
+then publishes the decode-only paired speedup: the raw ratio of means
+`raw = mean(serial K=1 seconds/token) / mean(dflash seconds/token)` over at
+least three accepted thermally-gated pairs (target four) run in alternating
+order, normalised by the sampled prompt's own pinned no-op reference
+(`dflash_decode_speedup = raw / noop_reference`) so every prompt's no-op maps
+to 1.0 and the score is independent of which hidden prompt was drawn. The
+single normalised decode-speedup floor is `0.95`, hard. There is no prefill component — the seed prefill is charged inside the
 decode window — and there is no separate acceptance band. The denominator is
 the trusted serial K=1 target decode (the `dflash-probe` path) over the same
 golden, same session, same thermal gate, same box, so the paired ratio
@@ -268,8 +273,9 @@ cancels host drift.
 There is no two-sided acceptance band on this track; the retired serial
 track's `[0.980, 1.053]` / `[0.952, 1.053]` window and its
 `acceptance_band_failed` failure category do not apply. The ranked timing
-gates are: the hard `0.83` floor on the aggregate decode speedup (applied to
-the ratio-of-means aggregate, not per pair); the DFlash token-fidelity gate
+gates are: the hard `0.95` floor on the normalised aggregate decode speedup
+(the ratio-of-means aggregate divided by the sampled prompt's pinned no-op
+reference, not applied per pair); the DFlash token-fidelity gate
 (see "Correctness Gates"); and a stall guardrail that rejects a run whose
 maximum block latency exceeds 4x its p50 block latency as
 measurement-invalid, with one gated retry. A run that misses the floor,
@@ -698,7 +704,9 @@ true`, and `token_fidelity_gate_status: implemented`, and the workflow
 - **Scoring** is decode-only paired speedup: mean serial K=1 seconds/token over
   mean DFlash seconds/token, ratio-of-means across at least three accepted
   thermally-gated pairs (target four) in alternating order, with a hard floor
-  of `0.83` on the aggregate ratio-of-means (not per pair) and a stall
+  of `0.95` on the per-prompt-normalised aggregate ratio-of-means (not per
+  pair; the raw ratio divided by the sampled prompt's pinned no-op reference)
+  and a stall
   guardrail (a run whose maximum block latency exceeds 4x its p50 is rejected
   as measurement-invalid, one gated retry). Block size is `K=2` and the ranked
   decode window is 512 parent-counted tokens; there is no prefill component.
@@ -715,14 +723,17 @@ true`, and `token_fidelity_gate_status: implemented`, and the workflow
   contract header is the authority.)
 - **Block decode is not free, but the floor sits below a no-op.** A verify row
   costs only about 10% less than a standalone serial step, so raw block
-  speculation reaches serial parity (ratio 1.0) only when draft acceptance is
-  above ~92%. On the moderate-difficulty prose in the timed pool acceptance is
-  ~75%, and an unoptimized (no-op) block-decode build measured at the ranked
+  speculation reaches serial parity (raw ratio 1.0) only when draft acceptance
+  is above ~92%. On the moderate-difficulty prose in the timed pool acceptance
+  is ~75%, and an unoptimized (no-op) block-decode build measured at the ranked
   configuration (512-token seed, 512 parent-counted decode tokens, `K=2`) lands
-  at 0.8726-0.8939 across the eight pool prompts — below serial parity. The
-  `0.83` floor was derived from the worst of those no-ops (Russell 0.8726 x
-  0.952 ≈ 0.8307), so a correct no-op already clears the floor with margin; the
-  job is to push the ratio up from there. The highest-leverage work makes
+  at a RAW 0.8726-0.8939 across the eight pool prompts — below serial parity.
+  The score you are ranked on is that raw ratio NORMALISED by the sampled
+  prompt's own pinned no-op reference, so a correct no-op normalises to 1.0 on
+  every prompt and the `0.95` floor (within 5% of the prompt's own no-op)
+  clears with margin; the job is to push the normalised ratio up from there.
+  (The retired raw floor was `0.83` = worst no-op Russell 0.8726 x 0.952, which
+  was correct only for the hardest prompt.) The highest-leverage work makes
   speculation itself cheaper — multi-row verify batching, KV handling and
   rollback cost, drafter dispatch, scheduling around the block boundary. General
   forward speedups (a better quantized matmul, a faster attention kernel) count

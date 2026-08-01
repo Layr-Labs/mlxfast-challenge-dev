@@ -1489,51 +1489,109 @@ struct DFlashDecodeFloorTests {
         )
     }
 
-    /// 0.83, derived 2026-07-31 from the WORST no-op across the whole 8-prompt
-    /// pool at the ranked window (512 decode tokens, K=2): the 8 no-op aggregates
-    /// cluster 0.8726-0.8939, worst = Russell 0.8726, floor = 0.8726 x 0.952 =
-    /// 0.83. THREE predecessors were each measured off the ranked conditions: 0.80
-    /// (0.840x at ~69% acceptance, different golden), 0.52 (K=3 over a 128-token
-    /// window), 0.55 (a single deliberately-hard lowsim prompt, since dropped).
-    /// Raising this back to 1.0 makes the track reject its own purpose -- see
-    /// contract Amendments 26, 28, 30.
+    /// 0.95 NORMALISED (adopted 2026-08-01, Amendment 32): the ranked score is the
+    /// raw ratio-of-means DIVIDED by the sampled prompt's own pinned no-op reference,
+    /// so every pool prompt's no-op maps to 1.0 and 0.95 == within 5% of that
+    /// prompt's own no-op, uniformly across the pool (1.0 x 0.952, the same
+    /// competitive margin, applied per-prompt instead of only to the worst prompt).
+    /// Supersedes the raw 0.83 (worst pool no-op 0.8726 x 0.952), which was correct
+    /// only for Russell and lenient on the easier prompts. THREE raw predecessors
+    /// were each measured off the ranked conditions: 0.80 (0.840x at ~69%
+    /// acceptance, different golden), 0.52 (K=3 over a 128-token window), 0.55 (a
+    /// single deliberately-hard lowsim prompt, since dropped). Dropping normalisation
+    /// re-introduces the ~2.4% prompt-draw variance; raising the floor to 1.0
+    /// over-rejects (a no-op is exactly 1.0). See contract Amendments 26, 28, 30, 32.
     @Test
-    func decodeFloorIsEightyThreeHundredthsInBothManifests() throws {
+    func normalizedDecodeFloorIsNinetyFiveHundredthsInBothManifests() throws {
         let manifest = try json("benchmark.json")
         let scoring = try #require(manifest["scoring"] as? [String: Any])
         let floor = try #require(scoring["decodeSpeedupFloor"] as? Double)
-        #expect(floor == 0.83)
+        #expect(floor == 0.95)
 
         let fixture = try json("fixtures/laguna_xs_2_1_dflash_track.json")
         let proposed = try #require(fixture["proposed_scoring"] as? [String: Any])
         let text = try #require(proposed["component_floor"] as? String)
         #expect(
-            text.contains(">= 0.83"),
-            "the fixture's component_floor must state the same number the manifest enforces"
+            text.contains(">= 0.95"),
+            "the fixture's component_floor must state the same NORMALISED number the manifest enforces"
         )
-        // The derivation has to travel with the number, or the next reader "fixes"
-        // it back to 1.0. The live derivation (worst pool no-op) AND the superseded
-        // values must both be present -- a bare number invites exactly the
-        // mis-calibration that made 0.80 reject a correct no-op.
+        // The mechanism and the derivation have to travel with the number, or the
+        // next reader "fixes" it back to 1.0 or to the raw 0.83. The live mechanism
+        // (per-prompt normalisation) AND the superseded raw values must both be
+        // present -- a bare number invites exactly the mis-calibration that made the
+        // raw 0.80 reject a correct no-op and the raw 0.83 lenient on easy prompts.
+        #expect(text.contains("normalis"))
         #expect(text.contains("0.8726"))
         #expect(text.contains("0.840x"))
-        // The floor is provisional on the pool's difficulty character: a harder
-        // (low-similarity) pool would lower it. That caveat must travel with it.
+        // The floor is provisional on the pool's difficulty character and on the
+        // pinned references. That caveat must travel with it.
         #expect(text.contains("PROVISIONAL"))
         #expect(text.contains("MAX_PLAUSIBLE_SPEEDUP stays 5.0"))
+        // The normalisation contract itself must be documented, keyed to the
+        // per-entry reference field the trusted scoring step divides by.
+        let normalized = try #require(
+            proposed["normalized_scoring"] as? [String: Any],
+            "proposed_scoring must carry a normalized_scoring block (Amendment 32)"
+        )
+        let refSource = try #require(normalized["reference_source"] as? String)
+        #expect(refSource.contains("noop_decode_speedup"))
+    }
+
+    /// Every timed_prompt_pool entry must carry a pinned per-prompt no-op reference
+    /// (noop_decode_speedup): the trusted scoring step divides the raw ratio-of-means
+    /// by it (Amendment 32), and a missing or non-positive reference makes that step
+    /// fail closed. Pin the invariant here so the pool and its references cannot
+    /// drift apart, and so the normalisation actually tightened the old easy-prompt
+    /// slack rather than loosening it.
+    @Test
+    func everyPoolEntryHasAPositiveNoopReferenceAndTheFloorTightensSlack() throws {
+        let fixture = try json("fixtures/laguna_xs_2_1_dflash_track.json")
+        let pool = try #require(fixture["timed_prompt_pool"] as? [[String: Any]])
+        #expect(pool.count == 8)
+        var refs: [Double] = []
+        for entry in pool {
+            let sha = try #require(entry["sha256"] as? String)
+            let ref = try #require(
+                entry["noop_decode_speedup"] as? Double,
+                "pool entry \(sha) is missing its pinned noop_decode_speedup"
+            )
+            // Measured pool no-ops cluster 0.8726-0.8939; a reference outside a sane
+            // band is a mis-pin that would silently distort the normalised score.
+            #expect(
+                ref > 0.80 && ref < 1.00,
+                "noop_decode_speedup \(ref) for \(sha) is outside the plausible no-op band"
+            )
+            refs.append(ref)
+        }
+        let manifest = try json("benchmark.json")
+        let scoring = try #require(manifest["scoring"] as? [String: Any])
+        let floor = try #require(scoring["decodeSpeedupFloor"] as? Double)
+        let worst = try #require(refs.min())
+        // A no-op on any prompt normalises to ref/ref = 1.0, which must clear the
+        // floor with margin.
+        #expect(1.0 >= floor)
+        // Normalisation must have TIGHTENED the old raw floor's easy-prompt slack:
+        // the normalised floor exceeds the worst raw no-op (0.95 > 0.8726), so no
+        // prompt now enjoys the up-to-7% leniency the single raw 0.83 gave the easy
+        // ones.
+        #expect(
+            floor > worst,
+            "normalised floor \(floor) must exceed the worst raw no-op \(worst)"
+        )
     }
 
     /// The workflow ALSO carries the floor as an env value and recomputes the score
-    /// against it in a trusted shell -- a fifth site, found only when a real
-    /// dispatch printed the whole env block. A 1.0 here would silently override the
-    /// 0.83 landed everywhere else at go-live.
+    /// against it in a trusted shell -- the enforcing site, found only when a real
+    /// dispatch printed the whole env block. A 1.0 (or the retired raw 0.83) here
+    /// would silently override the normalised 0.95 landed everywhere else.
     @Test
     func workflowEnvFloorMatchesTheManifests() throws {
         let workflow = try String(
             contentsOfFile: ".github/workflows/dflash-benchmark.yml", encoding: .utf8
         )
-        #expect(workflow.contains("MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: \"0.83\""))
+        #expect(workflow.contains("MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: \"0.95\""))
         #expect(!workflow.contains("MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: \"1.0\""))
+        #expect(!workflow.contains("MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: \"0.83\""))
     }
 
     /// The workflow's own header comments are what a reviewer reads first, so they

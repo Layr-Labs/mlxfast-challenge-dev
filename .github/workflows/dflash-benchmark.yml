@@ -40,14 +40,17 @@ name: dflash-benchmark
 #   - ranked decode window: 512 parent-counted tokens (contract max);
 #   - aggregation: RATIO-OF-MEANS across accepted pairs —
 #       score = mean(serial s/tok) / mean(dflash s/tok);
-#   - floor: aggregate >= 0.83 (floor applies to the aggregate, not per pair).
-#     NOT 1.0: block decode spends compute per DECLARED row, so even at this
-#     pool's ~75% draft acceptance a no-op is ~12% slower than serial K=1.
-#     Derived from the WORST no-op across the whole 8-prompt pool at the ranked
-#     window (512 tokens, K=2, M5 2026-07-31): no-ops cluster 0.8726-0.8939,
-#     floor = worst 0.8726 x 0.952 = 0.83. See the contract fixture's
-#     proposed_scoring.component_floor and Amendment 30; 26/28 explain the
-#     superseded 0.80/0.52 values.
+#   - floor: aggregate >= 0.95 (floor applies to the aggregate, not per pair).
+#     The aggregate is NORMALISED per-prompt (Amendment 32): the raw ratio-of-means
+#     is divided by the sampled prompt's own pinned no-op reference, so every pool
+#     prompt's no-op maps to 1.0 and 0.95 is a uniform 'within 5% of this prompt's
+#     own no-op' threshold. NOT parity with serial: block decode spends compute per
+#     DECLARED row, so at this pool's ~75% draft acceptance a no-op is ~12% slower
+#     than serial K=1 (raw ~0.87) and normalises to 1.0. Supersedes the raw 0.83
+#     (worst no-op 0.8726 x 0.952 across the 8-prompt pool, M5 2026-07-31, no-ops
+#     0.8726-0.8939). See the contract fixture's proposed_scoring.normalized_scoring
+#     and component_floor and Amendments 30/32; 26/28 explain the superseded
+#     0.80/0.52 values.
 #   - pairs: minimum 3 accepted, target 4, alternating order;
 #   - stall guardrail: a run with max block latency > 4x its p50 is rejected
 #     as measurement-invalid, with one gated retry (owned by measure-dflash-job,
@@ -78,11 +81,13 @@ name: dflash-benchmark
 #      has no authority anywhere; the parent divides its own wall time by
 #      its own configured token total.
 #   6. Applies the decode-only score contract in the trusted shell:
-#        score = dflash_decode_speedup
-#              = mean(serial s/tok over accepted pairs)
+#        raw   = mean(serial s/tok over accepted pairs)
 #                / mean(dflash s/tok over accepted pairs)   [ratio-of-means]
-#        floor >= 0.83 on that aggregate, hard (worst pool no-op 0.8726 x 0.952;
-#        1.0 would reject a CORRECT no-op here, this floor rejects regressions);
+#        score = dflash_decode_speedup
+#              = raw / noop_reference[sampled_prompt]        [per-prompt normalised]
+#        floor >= 0.95 on that aggregate, hard (normalised: every prompt's no-op is
+#        1.0, so 0.95 == within 5% of the sampled prompt's own no-op; Amendment 32.
+#        Supersedes the raw floor 0.83 = worst pool no-op 0.8726 x 0.952);
 #        bit-exact gate: parity_all_ok must be true across every timed run.
 #      There is no prefill component: the DFlash protocol charges seed prefill
 #      inside the decode measurement.
@@ -241,21 +246,28 @@ jobs:
       MLXFAST_DFLASH_BLOCK_SIZE: "2"
       MLXFAST_DFLASH_DECODE_TOKENS: "512"
       MLXFAST_DFLASH_CORRECTNESS_TOKENS: "512"
-      # 0.83, matching scoring.decodeSpeedupFloor in benchmark.json, the
-      # contract fixture, and MIN_ACCEPTED_SPEEDUP in the box wrapper. This is a
-      # FIFTH place the floor lives: the score is recomputed here in the trusted
-      # shell from the sealed per-side means and gated against this value, so a
-      # 1.0 here would override the 0.83 everywhere else at go-live. On this track
-      # 1.0 is not the no-change line -- block decode spends compute per DECLARED
-      # row, and even at this pool's ~75% draft acceptance a no-op is ~12% slower
-      # than serial K=1. Derived from the WORST no-op across the whole 8-prompt
-      # pool at the ranked window (512 decode tokens, K=2, measured 2026-07-31):
-      # the 8 no-op aggregates cluster 0.8726-0.8939 (2.4% spread, worst = Russell
-      # 0.8726), floor = 0.8726 x 0.952 = 0.8307 -> 0.83. THREE superseded values,
-      # each measured off the ranked conditions: 0.80 (0.840x @69% on a different
-      # golden), 0.52 (K=3 over a 128-token window), 0.55 (a single deliberately-
-      # hard lowsim prompt @34%, since dropped). See contract Amendments 26, 28, 30.
-      MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: "0.83"
+      # 0.95 NORMALISED (Amendment 32): the score is the raw ratio-of-means DIVIDED
+      # by the sampled prompt's own pinned no-op reference, so every pool prompt's
+      # no-op maps to 1.0 and 0.95 == within 5% of the sampled prompt's own no-op,
+      # uniformly across the pool. Matches scoring.decodeSpeedupFloor in
+      # benchmark.json and the contract fixture's proposed_scoring.component_floor
+      # (all three pinned equal by test). This is the trusted enforcing site: the
+      # score is recomputed here in the trusted shell from the sealed per-side means
+      # and the pinned reference, then gated against this value, so a 1.0 here would
+      # override the 0.95 everywhere else. The box wrapper's MIN_ACCEPTED_SPEEDUP is
+      # NO LONGER equal to this -- it is a LOOSE RAW measurement-sanity floor,
+      # decoupled, because the box measures raw speedup and has no reference; a box
+      # raw floor at 0.83 would false-reject a Russell-drawn candidate whose raw sits
+      # in [0.829, 0.83) but normalises to >= 0.95. Supersedes the raw floor 0.83
+      # (worst no-op 0.8726 x 0.952 across the 8-prompt pool 0.8726-0.8939, M5
+      # 2026-07-31), which was correct only for the worst prompt. On this track
+      # parity with serial is NOT the no-change line: block decode spends compute per
+      # DECLARED row, so at ~75% draft acceptance a no-op is ~12% slower than serial
+      # K=1 (raw ~0.87) and normalises to 1.0. THREE superseded raw values: 0.80
+      # (0.840x @69% on a different golden), 0.52 (K=3 over a 128-token window), 0.55
+      # (a single deliberately-hard lowsim prompt @34%, since dropped). See contract
+      # Amendments 26, 28, 30, 32.
+      MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: "0.95"
       MLXFAST_DFLASH_MIN_ACCEPTED_PAIRS: "3"
       MLXFAST_DFLASH_TARGET_PAIRS: "4"
       # Contract layer L6: attributable ranked failures allowed per submission
@@ -2266,6 +2278,14 @@ jobs:
       # track.
       - name: Compute DFlash score and enforce floor
         if: ${{ inputs.run_benchmark }}
+        env:
+          # The sampled pool entry's sha256, from the trusted per-run selection
+          # (not the candidate). Used to look up this prompt's pinned no-op
+          # reference so the score is normalised per-prompt (Amendment 32). It is
+          # consumed only inside this trusted step and never echoed to the log,
+          # preserving the "selection recorded only in the private audit dir"
+          # posture of the selection step.
+          MLXFAST_DFLASH_SELECTED_SHA256: ${{ steps.select_dflash_target.outputs.sha256 }}
         run: |
           set -euo pipefail
           # SECOND, INDEPENDENT check of the PUBLISH question, at the step that
@@ -2305,13 +2325,37 @@ jobs:
               echo "::error::paired DFlash results failed validation (bit-exact gate, pair count, or schema)" >&2
               exit 1
             }
-          # Ratio-of-means: mean serial s/tok over accepted pairs divided by
-          # mean DFlash s/tok over the same pairs (equivalently total serial
+          # Ratio-of-means (RAW): mean serial s/tok over accepted pairs divided
+          # by mean DFlash s/tok over the same pairs (equivalently total serial
           # decode time / total DFlash decode time for the fixed token total).
-          speedup="$(jq -r '.aggregate.baseline_serial_seconds_per_token_mean / .aggregate.candidate_dflash_seconds_per_token_mean' "${results}")"
+          speedup_raw="$(jq -r '.aggregate.baseline_serial_seconds_per_token_mean / .aggregate.candidate_dflash_seconds_per_token_mean' "${results}")"
+          # PER-PROMPT NORMALISATION (Amendment 32). Divide the raw ratio-of-means
+          # by the sampled prompt's OWN pinned no-op reference so every pool prompt's
+          # no-op maps to 1.0 and the ranked score does not depend on which prompt
+          # the anti-lottery sampler drew (that per-prompt difficulty spread was
+          # ~2.4% across the pool, vs <0.5% measurement noise). The reference is read
+          # from the TRUSTED contract checkout (${MLXFAST_DFLASH_CONTRACT_PATH} under
+          # GITHUB_WORKSPACE, NOT the candidate-writable job workspace copy -- fixtures/
+          # is outside editablePaths), keyed by the sha256 of the per-run selection.
+          # Fail closed if the sampled sha has no single positive pinned reference.
+          if [[ ! "${MLXFAST_DFLASH_SELECTED_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::the per-run timed-target selection did not provide a sha256; cannot normalise the score (Amendment 32)" >&2
+            exit 1
+          fi
+          noop_ref="$(jq -r --arg s "${MLXFAST_DFLASH_SELECTED_SHA256}" '[.timed_prompt_pool[] | select(.sha256 == $s) | .noop_decode_speedup] | if length == 1 then (.[0] | tostring) else "MISSING" end' "${MLXFAST_DFLASH_CONTRACT_PATH}")"
+          if [[ "${noop_ref}" == "MISSING" || "${noop_ref}" == "null" || -z "${noop_ref}" ]]; then
+            echo "::error::no single pinned no-op reference (noop_decode_speedup) for the sampled timed prompt in ${MLXFAST_DFLASH_CONTRACT_PATH}; the pool and its per-prompt references must be re-pinned together (Amendment 32)" >&2
+            exit 1
+          fi
+          if [[ "$(echo "${noop_ref} > 0" | bc -l)" != "1" ]]; then
+            echo "::error::pinned no-op reference ${noop_ref} for the sampled timed prompt is not a positive number" >&2
+            exit 1
+          fi
+          # score = raw / reference (full precision via jq, not bc scale).
+          speedup="$(jq -rn --argjson raw "${speedup_raw}" --argjson ref "${noop_ref}" '$raw / $ref')"
           floor_ok="$(echo "${speedup} >= ${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR}" | bc -l)"
           if [[ "${floor_ok}" != "1" ]]; then
-            echo "::error::dflash_decode_speedup (ratio-of-means) ${speedup} is below the ${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR} floor; block decode spends compute per declared row, so even at this pool's ~75% draft acceptance a no-op is ~12% slower than serial K=1; this floor is the WORST no-op across the 8-prompt pool (0.8726 x 0.952, measured 2026-07-31) with room for variation, NOT parity with serial decode" >&2
+            echo "::error::normalised dflash_decode_speedup ${speedup} (raw ${speedup_raw} / no-op reference ${noop_ref}) is below the ${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR} floor; the normalised floor means 'within 5% of THIS prompt's own no-op' uniformly across the pool (Amendment 32), NOT parity with serial decode -- block decode spends compute per declared row, so at this pool's ~75% draft acceptance a no-op is ~12% slower than serial K=1 and normalises to 1.0" >&2
             exit 1
           fi
           jq -n \
@@ -2319,6 +2363,8 @@ jobs:
             --arg commit "${MLXFAST_CANDIDATE_SHA}" \
             --arg weights_hash "$(tr -d '[:space:]' < dflash-weights.sha256)" \
             --argjson score "${speedup}" \
+            --argjson raw "${speedup_raw}" \
+            --argjson noop_ref "${noop_ref}" \
             --argjson floor "${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR}" \
             --argjson decode_tokens "${MLXFAST_DFLASH_DECODE_TOKENS}" \
             --argjson target_pairs "${MLXFAST_DFLASH_TARGET_PAIRS}" \
@@ -2331,13 +2377,16 @@ jobs:
               metrics: {
                 mode: "dflash-paired-decode-only",
                 aggregation: "ratio_of_means",
+                scoring_normalized: true,
                 commit: $commit,
                 decode_tokens: $decode_tokens,
                 decode_speedup_floor: $floor,
                 accepted_pair_count: $results[0].accepted_pair_count,
                 target_pair_count: $target_pairs,
                 parity_all_ok: $results[0].parity_all_ok,
-                dflash_decode_speedup_ratio_of_means: $score,
+                dflash_decode_speedup_normalized: $score,
+                noop_reference_decode_speedup: $noop_ref,
+                dflash_decode_speedup_ratio_of_means: $raw,
                 dflash_decode_speedup_median: $results[0].aggregate.dflash_decode_speedup_median,
                 dflash_decode_speedup_min: $results[0].aggregate.dflash_decode_speedup_min,
                 baseline_serial_seconds_per_token_mean: $results[0].aggregate.baseline_serial_seconds_per_token_mean,

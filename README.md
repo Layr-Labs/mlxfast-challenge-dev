@@ -105,13 +105,17 @@ target oracle back to back on the same silicon over that prompt; the paired
 ratio cancels host drift. The published score is decode-only:
 
 ```text
-score = dflash_decode_speedup = mean(serial K=1 s/token) / mean(dflash s/token)
+raw   = mean(serial K=1 s/token) / mean(dflash s/token)   # ratio of means
+score = dflash_decode_speedup = raw / this prompt's pinned no-op reference
 ```
 
-aggregated as a ratio of means over the accepted thermal-gated pairs. The one
-hard component floor is `0.83`; a token-fidelity failure, throttled sample, or
-invalid telemetry fails the run. `score.json` publishes the paired decode
-speedup and floor verdict. See
+The raw paired ratio of means over the accepted thermal-gated pairs is
+normalised by the sampled prompt's own pinned no-op speedup, so every prompt's
+no-op maps to 1.0 and the score does not depend on which hidden prompt was
+drawn. The one hard component floor is `0.95` (within 5% of the prompt's own
+no-op); a token-fidelity failure, throttled sample, or invalid telemetry fails
+the run. `score.json` publishes the raw ratio, the reference used, the
+normalised speedup, and the floor verdict. See
 [`docs/private-benchmark-security.md`](docs/private-benchmark-security.md)
 for isolation details and
 [`docs/dflash-track-correctness-contract.md`](docs/dflash-track-correctness-contract.md)
@@ -284,7 +288,8 @@ against the trusted serial K=1 target oracle.
 ## Scoring
 
 ```text
-score = dflash_decode_speedup = mean(serial K=1 s/token) / mean(dflash s/token)
+raw   = mean(serial K=1 s/token) / mean(dflash s/token)   # ratio of means
+score = dflash_decode_speedup = raw / noop_reference[sampled prompt]
 ```
 
 Higher is better. The score is decode-only: the DFlash candidate and the
@@ -293,12 +298,14 @@ same M5 in the same session, behind the same fixed 40C thermal gate and
 telemetry acceptance, and the ratio of their mean seconds/token cancels host
 drift. There is no separate prefill component — the seed prefill is charged
 inside the decode window. The ranked decode window is 512 parent-counted
-tokens at block size K=2. The result aggregates as a ratio of means over the
-accepted thermal-gated pairs (at least 3 accepted, target 4), and there is a
-single hard component floor:
+tokens at block size K=2. The raw paired ratio of means over the accepted
+thermal-gated pairs (at least 3 accepted, target 4) is then normalised by the
+sampled prompt's own pinned no-op reference, so every prompt's no-op maps to
+1.0 and your score does not depend on which of the 8 hidden prompts was drawn.
+There is a single hard component floor on the normalised speedup:
 
 ```text
-dflash_decode_speedup >= 0.83
+dflash_decode_speedup >= 0.95      # within 5% of this prompt's own no-op
 ```
 
 A run below the floor, a throttled or telemetry-invalid sample, or a block

@@ -327,12 +327,17 @@ func participantDocsDescribeDefaultDFlashScoreAndFloor() throws {
 
     for document in [readme, challenge] {
         // The default (and only) ranked track is DFlash: a DECODE-ONLY paired
-        // speedup with a single 0.83 floor over a 512-token window. The retired
-        // serial weighted formula and its 0.95 floors must be gone.
+        // speedup, per-prompt NORMALISED by each prompt's pinned no-op reference,
+        // with a single 0.95 normalised floor over a 512-token window (Amendment
+        // 32). The retired serial weighted formula must be gone; so must the raw
+        // 0.83 floor as the stated ranked floor.
         #expect(document.contains("dflash_decode_speedup"))
         #expect(document.lowercased().contains("decode-only"))
-        #expect(document.contains("0.83"))
+        #expect(document.contains("0.95"))
+        #expect(document.lowercased().contains("normalis"))
+        #expect(document.lowercased().contains("no-op reference"))
         #expect(document.contains("512"))
+        #expect(!document.contains("dflash_decode_speedup >= 0.83"))
         #expect(!document.contains("decode_speedup^0.75 * prefill_speedup^0.25"))
         // The retired MTP track's score description must be gone.
         #expect(!document.contains("MTP_seconds_per_token"))

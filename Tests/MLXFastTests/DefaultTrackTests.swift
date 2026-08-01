@@ -41,7 +41,7 @@ struct DefaultTrackTests {
         )
         let scoring = try #require(track["scoring"] as? [String: Any])
         #expect(scoring["mode"] as? String == "dflash-paired-decode-only")
-        #expect(scoring["decodeSpeedupFloor"] as? Double == 0.83)
+        #expect(scoring["decodeSpeedupFloor"] as? Double == 0.95)
         let leaderboard = try #require(track["leaderboard"] as? [String: Any])
         #expect(leaderboard["namespace"] as? String == "laguna-xs-2.1-dflash-v1")
         // The DFlash track has its own contract fixture (the serial track never
