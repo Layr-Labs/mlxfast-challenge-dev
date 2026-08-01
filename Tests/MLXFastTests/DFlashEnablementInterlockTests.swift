@@ -674,32 +674,33 @@ struct DFlashEnablementInterlockTests {
         let baseline = try #require(object["reference_baseline"] as? [String: Any])
         #expect(baseline["publication_allowed"] as? Bool == false)
 
-        // The pool used to be asserted EMPTY here. That was the right property
-        // expressed the wrong way: what makes the track inert is that a ranked
-        // run cannot produce a score, and "empty" was merely how it happened to
-        // be true. An empty pool also made the pipeline unvalidatable, which is
-        // the same chicken-and-egg the enablement split above removed -- so the
-        // pool now carries the generated timed golden, and the ANTI-LOTTERY
-        // FLOOR in "Select hidden DFlash timed target from the pool" is what
-        // keeps a ranked run from using it.
+        // History of this assertion. The pool was first asserted EMPTY, then
+        // asserted BELOW 8 distinct -- both were proxies for "a ranked run cannot
+        // produce a score." The pool is now fully STAGED (8 distinct entries,
+        // 2026-07-31), so that proxy no longer holds and this test asserts the
+        // REAL inert gate instead: the two trusted-contract flags above. They are
+        // decisive on their own -- the "Enforce DFlash track enablement" step
+        // refuses any run_benchmark=true dispatch when either flag is false, and
+        // that refusal happens BEFORE the pool-selection step runs, so a fully
+        // populated pool with the flags false is still inert. Inertness now rests
+        // on the flags; the pool is staged for launch, awaiting only the operator
+        // uploading the goldens to R2 and flipping the two flags in one commit.
         //
-        // Assert the property, not its old accident: fewer than 8 DISTINCT
-        // targets means no ranked run can proceed, while a gates-only dispatch
-        // can. Distinctness, not length -- the floor counts unique sha256 and
-        // unique r2_path, so "8 entries" is not the go-live threshold and a
-        // length-only assertion here would call a pool of 8 clones ready.
+        // The pool is still checked for the anti-lottery property and shape, so a
+        // regression BELOW 8 distinct (which would make the track unrankable even
+        // after go-live) or a malformed entry is still caught here.
         let pool = object["timed_prompt_pool"] as? [Any] ?? []
         let entries = pool.compactMap { $0 as? [String: Any] }
         let distinctDigests = Set(entries.compactMap { $0["sha256"] as? String }).count
         let distinctKeys = Set(entries.compactMap { $0["r2_path"] as? String }).count
         #expect(
-            distinctDigests < 8 || distinctKeys < 8,
+            distinctDigests >= 8 && distinctKeys >= 8,
             """
             timed_prompt_pool has \(distinctDigests) distinct digests over \
-            \(distinctKeys) distinct keys, so a RANKED run is no longer blocked \
-            by the anti-lottery floor. That is the go-live threshold: if the \
-            operator has provisioned the full pool, this test and the two flags \
-            above should change in one commit, deliberately.
+            \(distinctKeys) distinct keys; the staged pool must keep at least 8 \
+            of each or a ranked run cannot proceed even after go-live. Inertness \
+            before go-live is held by official_scoring_enabled / \
+            publication_allowed, both asserted false above.
             """
         )
         // Every entry must still be complete -- in the same shape the selection
