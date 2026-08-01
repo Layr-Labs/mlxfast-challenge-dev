@@ -653,42 +653,38 @@ struct DFlashEnablementInterlockTests {
         }
     }
 
-    /// The fixture must stay inert on main. This is the assertion that would
-    /// catch the split being "completed" by simply flipping the flags.
+    /// The fixture is LIVE on main as of go-live (2026-07-31, Amendment 31).
+    /// This was `theTrackFixtureRemainsInertOnMain`, which asserted the flags
+    /// were false; the go-live commit flipped them here in the same change, as
+    /// that test's own message instructed. It now pins the enabled state, so a
+    /// silent REVERT to inert (which would break Yukon imports) is caught, and
+    /// it pins the go-live invariant: scoring may be enabled only with the
+    /// fidelity gate implemented (mirrors trackCannotBeEnabledWhileTheFidelityGateIsUnspecified).
     @Test
-    func theTrackFixtureRemainsInertOnMain() throws {
+    func theTrackFixtureIsEnabledForGoLive() throws {
         let data = try Data(contentsOf: URL(fileURLWithPath: Self.fixturePath))
         let object = try #require(
             try JSONSerialization.jsonObject(with: data) as? [String: Any]
         )
 
         #expect(
-            object["official_scoring_enabled"] as? Bool == false,
-            """
-            official_scoring_enabled is true on main. Splitting the interlock \
-            was meant to make the track testable WITHOUT going live; if the \
-            operator has completed the go-live runbook, update this test in the \
-            same commit that flips the flag.
-            """
+            object["official_scoring_enabled"] as? Bool == true,
+            "official_scoring_enabled is not true; the track is offline and Yukon scored dispatches will be refused"
         )
         let baseline = try #require(object["reference_baseline"] as? [String: Any])
-        #expect(baseline["publication_allowed"] as? Bool == false)
+        #expect(baseline["publication_allowed"] as? Bool == true)
 
-        // History of this assertion. The pool was first asserted EMPTY, then
-        // asserted BELOW 8 distinct -- both were proxies for "a ranked run cannot
-        // produce a score." The pool is now fully STAGED (8 distinct entries,
-        // 2026-07-31), so that proxy no longer holds and this test asserts the
-        // REAL inert gate instead: the two trusted-contract flags above. They are
-        // decisive on their own -- the "Enforce DFlash track enablement" step
-        // refuses any run_benchmark=true dispatch when either flag is false, and
-        // that refusal happens BEFORE the pool-selection step runs, so a fully
-        // populated pool with the flags false is still inert. Inertness now rests
-        // on the flags; the pool is staged for launch, awaiting only the operator
-        // uploading the goldens to R2 and flipping the two flags in one commit.
-        //
-        // The pool is still checked for the anti-lottery property and shape, so a
-        // regression BELOW 8 distinct (which would make the track unrankable even
-        // after go-live) or a malformed entry is still caught here.
+        // Go-live invariant: enabling scoring REQUIRES the fidelity gate signed
+        // off (status implemented). This mirrors the manifest-side build gate so
+        // the two cannot drift.
+        let proposed = try #require(object["proposed_scoring"] as? [String: Any])
+        #expect(
+            proposed["token_fidelity_gate_status"] as? String == "implemented",
+            "official scoring is enabled while the token-fidelity gate is not implemented"
+        )
+
+        // The anti-lottery pool must stay at >= 8 DISTINCT targets or a ranked
+        // run cannot proceed. Distinctness, not length. Still checked post-go-live.
         let pool = object["timed_prompt_pool"] as? [Any] ?? []
         let entries = pool.compactMap { $0 as? [String: Any] }
         let distinctDigests = Set(entries.compactMap { $0["sha256"] as? String }).count

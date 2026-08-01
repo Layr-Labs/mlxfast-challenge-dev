@@ -3276,3 +3276,46 @@ opposite of the dropped lowsim entry, which alone consumed 9/21. The declared-
 frame hits (1 each on three entries) are unbudgeted and expected. So the pool is
 safe on the fidelity axis as well as the floor axis, and Amendment 29's known-
 limit (5) is discharged for this specific pool with data.
+
+# Amendment 31 (2026-07-31): go-live — the track is enabled, and the manual arming interlock is Yukon-compatible
+
+The DFlash track is now the default benchmark (`benchmark.json`) and is ENABLED
+for ranked scoring. Three fields flipped together in one commit — the go-live
+signature:
+
+* `official_scoring_enabled`: false → **true**
+* `reference_baseline.publication_allowed`: false → **true**
+* `token_fidelity_gate_status` (fixture and benchmark.json): proposed-awaiting-operator-signoff → **implemented**
+
+The fidelity flip is the operator's sign-off — it accepts the Amendment 29
+known-limits (near-tie budget never probed near its ceiling; gate never faced an
+adversarial candidate). The build gate `trackCannotBeEnabledWhileTheFidelityGateIsUnspecified`
+requires exactly this pairing (enabled ⇒ implemented), so the two cannot drift.
+
+## Why the `confirm_track_enabled` default flipped false → true
+
+Yukon drives every real dispatch — baseline validation on `yukon/baseline/*` at
+import, and each participant submission on `submissions/*` — and it OMITS this
+custom workflow input, so the input takes its DEFAULT. With the default false,
+Yukon's automated dispatches arrived `CONFIRM_TRACK_ENABLED=0` and were refused
+at the enablement step (observed: baseline-validation run 30682378037 for commit
+be33bb3). Yukon's dispatch shape cannot change, so our side adapts: the default
+is now true, so an omitted input arms the dispatch.
+
+This did NOT weaken the load-bearing gate. The guard LOGIC is unchanged — it
+still refuses any dispatch that EXPLICITLY passes `confirm_track_enabled=false`
+(the interlock truth table and `confirmTrackEnabledIsRequiredEvenForAGatesOnlyDryRun`
+still pass, because they set the value explicitly). And the real
+"no score before go-live" gate was never this flag: it is the contract check
+(`official_scoring_enabled`/`publication_allowed` + `RUN_BENCHMARK`) earlier in
+the same step, plus the anti-lottery pool floor. Both are untouched. The
+`confirm_track_enabled` interlock was only ever a manual-dispatch convenience;
+against an automated dispatcher it was dead weight that blocked import.
+
+## Taking the track back offline
+
+Flip the three fields back to false / proposed-awaiting-operator-signoff in one
+commit. Yukon's next baseline/submission dispatch is then refused at the
+enablement step exactly as before go-live. The `confirm_track_enabled` default
+stays true (harmless while inert — the contract check refuses scored runs
+regardless).
