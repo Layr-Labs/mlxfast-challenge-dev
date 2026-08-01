@@ -84,13 +84,14 @@ struct DFlashTrackTests {
             )
         }
 
-        // Today the track ships inert. If this flips, the assertion above is
-        // what keeps it honest. The status advanced pending-spec ->
-        // proposed-awaiting-operator-signoff when the spec text was written
-        // (Amendment 29); only the OPERATOR moves it to implemented, at
-        // runbook Step D, in the same change that flips the contract fields.
-        #expect(officialScoring == false)
-        #expect(gateStatus == "proposed-awaiting-operator-signoff")
+        // The track is LIVE as of go-live (2026-07-31, Amendment 31). The
+        // status advanced pending-spec -> proposed-awaiting-operator-signoff
+        // (spec written, Amendment 29) -> implemented (operator sign-off, this
+        // commit, flipped together with the contract fields). The enabled ->
+        // implemented invariant checked above is the load-bearing guard; these
+        // pin the current live state so a silent revert to inert is caught.
+        #expect(officialScoring == true)
+        #expect(gateStatus == "implemented")
 
         // The fixture carries the same status string, so the two files cannot
         // describe different lifecycle states for one gate.
@@ -472,8 +473,9 @@ struct DFlashTrackTests {
         #expect(workflow.contains("MLXFAST_DFLASH_BENCH_GOLDEN_SHA256_SELECTED"))
         #expect(workflow.contains("MLXFAST_DFLASH_BENCH_GOLDEN_BYTES_SELECTED"))
 
-        // Today the pool ships empty on purpose, which keeps the track
-        // unrunnable; that is consistent with official_scoring_enabled == false.
+        // Defensive invariant (the pool is populated post-go-live, so this
+        // branch is normally inert): an EMPTY pool would make the track
+        // unrunnable, which must only ever coincide with scoring disabled.
         if pool.isEmpty {
             #expect(fixture["official_scoring_enabled"] as? Bool == false)
         }
