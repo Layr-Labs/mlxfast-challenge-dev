@@ -7,17 +7,21 @@ single-machine pipeline: how private material is handled, what confines
 submitted code while it runs, which output channels are closed, and which
 gaps are known and stated rather than papered over.
 
-The serial track is the default — and only — ranked track; the serial
-ranked pipeline runs under the
-canonical workflow name `benchmark.yml` (it previously ran as
-`serial-benchmark.yml`). The GPQA and teacher-forced base-model gates below
-describe that live default path.
+The DFlash track (`laguna-xs-2.1-dflash-v1`) is the default — and only — ranked
+track; its ranked pipeline runs under `.github/workflows/dflash-benchmark.yml`
+(the retired serial track's `benchmark.yml` was deleted). The DFlash pipeline
+REUSES the serial-era security architecture described below — the same sandboxing,
+GPQA and teacher-forced base-model gates, and closed output channels — driven from
+the trusted DFlash harness. This document was written for the serial track;
+where it says "serial track", `benchmark.yml`, or runner `m5-bench`, read the live
+DFlash track, `dflash-benchmark.yml`, and runner `m5-laguna-dflash` unless the text
+is explicitly describing retired/historical behavior.
 
 ## Single-machine ranked topology
 
-Ranked runs execute through `.github/workflows/benchmark.yml` as one
-serial-track job on a single operator-supervised, self-hosted Apple M5 Max
-machine (runner label `m5-bench`). Build, reference-checkpoint transform,
+Ranked runs execute through `.github/workflows/dflash-benchmark.yml` as one
+job on a single operator-supervised, self-hosted Apple M5 Max
+machine (runner label `m5-laguna-dflash`). Build, reference-checkpoint transform,
 hidden correctness/gates, and the paired baseline/candidate timing all run
 in order on that box. The
 previous multi-VM topology — parallel correctness slices, a separate

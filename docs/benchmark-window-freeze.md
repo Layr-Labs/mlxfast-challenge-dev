@@ -1,5 +1,17 @@
 # Benchmark Window Freeze
 
+> **RETIRED / HISTORICAL — serial track.** This document froze the timed window
+> for the retired serial track (`laguna-xs-2.1-serial-v2`): a prefill + decode
+> window scored as `decode_speedup^0.75 * prefill_speedup^0.25` over 128 decode
+> steps, runner `m5-bench`. That track is retired. The LIVE ranked track is DFlash
+> (`laguna-xs-2.1-dflash-v1`): a DECODE-ONLY window of 512 parent-counted tokens at
+> block size K=2, scored as a per-prompt-normalised decode speedup with a 0.95
+> floor (no prefill component — the seed prefill is charged inside the decode
+> window), runner `m5-laguna-dflash`. For the live window and scoring see
+> `docs/dflash-track-correctness-contract.md` (esp. Amendments 30–32) and
+> `benchmark.json`. Everything below is retained as the serial-era record; read
+> "current track / ranked window / score formula" here as the serial track's.
+
 This document is the frozen definition of the **timed benchmark window** -- the
 exact work the official runner charges to the prefill and decode scores -- and
 the protocol for changing it. It exists because the ranked score is paired

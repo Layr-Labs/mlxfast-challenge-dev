@@ -15,7 +15,8 @@ DFlash target-verified block speculative-decode track. It rewards faster
 decode against a paired on-box serial baseline measured in the same session:
 
 ```text
-score = dflash_decode_speedup = mean(serial K=1 seconds/token) / mean(dflash seconds/token)
+raw   = mean(serial K=1 seconds/token) / mean(dflash seconds/token)   # ratio of means
+score = dflash_decode_speedup = raw / noop_reference[sampled prompt]
 ```
 
 Higher is better. The score is a decode-only paired speedup: the trusted
@@ -212,7 +213,11 @@ They are trusted harness/operator code and are not packaged by submit:
 - Everything in `Vendor/` not listed in `editablePaths`: other model
  families, shared model-factory/tokenizer plumbing, and kernels Laguna
  does not dispatch
-- `.github/`, scripts, tests, docs, and `benchmark.json`
+- `.github/`, `fixtures/` (the DFlash track contract
+ `laguna_xs_2_1_dflash_track.json` and the pinned reference/drafter `.sha256`
+ manifests — trusted, outside `editablePaths`; the scoring step reads the
+ contract from the trusted checkout precisely because `fixtures/` is not
+ editable), scripts, tests, docs, and `benchmark.json`
 - `weights/`, reference checkpoints, scores, golden files, local caches
 
 Do not try to hardcode hidden prompts, hidden token IDs, GPQA answers, timing

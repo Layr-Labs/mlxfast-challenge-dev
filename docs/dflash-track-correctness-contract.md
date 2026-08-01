@@ -1,12 +1,15 @@
 # DFlash ranked track — correctness contract (Criterion E)
 
-**Status: DESIGN, not yet implemented.** The DFlash track is fail-closed
-(`fixtures/laguna_xs_2_1_dflash_track.json` -> `official_scoring_enabled: false`)
-and MUST stay so until every layer below is implemented and validated on M5-C.
-`benchmark.json` carries `tokenFidelityGateStatus:
-"proposed-awaiting-operator-signoff"` (it read `"pending-spec"` until the spec
-was written — Amendment 29); that key flips to `"implemented"` only when L1-L6
-are in place, by the operator, at go-live.
+**Status: LIVE — go-live 2026-07-31 (Amendment 31); scoring updated 2026-08-01
+(Amendment 32).** This document was authored as a DESIGN; the fail-closed
+pre-go-live state it describes here — `official_scoring_enabled: false`,
+`tokenFidelityGateStatus: "proposed-awaiting-operator-signoff"` (which read
+`"pending-spec"` until Amendment 29) — is HISTORY. CURRENT reality: the fixture
+carries `official_scoring_enabled: true` and `benchmark.json` carries
+`tokenFidelityGateStatus: "implemented"`; the track is enabled and ranked. Read
+the design layers below for the rationale, and see **Amendment 31** (go-live) and
+**Amendment 32** (per-prompt normalisation; ranked floor 0.95 on the normalised
+aggregate) for the current contract.
 
 ## Why the retired MTP contract cannot be reused
 
@@ -3388,17 +3391,21 @@ per-run selection step's output and is consumed only inside this trusted step �
 never echoed to the log, preserving the "selection recorded only in the private
 audit dir" posture of Amendment 30.
 
-## The box gate is decoupled
+## The box gate must be decoupled (PENDING operator action)
 
 The box wrapper's `MIN_ACCEPTED_SPEEDUP` in
 `/opt/bench-runner/measure-dflash-job.sh` was previously pinned EQUAL to the
-ranked floor. It is now DECOUPLED to a LOOSE RAW measurement-sanity floor (well
+ranked floor. It MUST be decoupled to a LOOSE RAW measurement-sanity floor (well
 below the worst raw no-op, ~0.50), because the box measures raw speedup and has
 no reference; the ranked floor is enforced NORMALISED in the trusted workflow.
-This is required, not cosmetic: a box raw floor left at 0.83 would false-reject a
+**This is a PENDING operator action** (a root, inode-preserving edit to the
+box-owned script plus a janitor baseline re-sign, on every box serving the track)
+— **until it is applied the box still enforces the raw 0.83 floor.** It is
+required, not cosmetic: a box raw floor left at 0.83 false-rejects a
 Russell-drawn candidate whose raw speedup sits in [0.829, 0.83) even though it
 normalises to ≥ 0.95 — the Amendment 28 false-reject failure mode transplanted to
-the box gate. `MAX_PLAUSIBLE_SPEEDUP` stays raw on the box.
+the box gate (fail-safe: it only ever over-REJECTS, never over-accepts).
+`MAX_PLAUSIBLE_SPEEDUP` stays raw on the box.
 
 ## Published score and the (accepted) post-hoc inferability
 

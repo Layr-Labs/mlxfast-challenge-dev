@@ -254,9 +254,10 @@ jobs:
       # (all three pinned equal by test). This is the trusted enforcing site: the
       # score is recomputed here in the trusted shell from the sealed per-side means
       # and the pinned reference, then gated against this value, so a 1.0 here would
-      # override the 0.95 everywhere else. The box wrapper's MIN_ACCEPTED_SPEEDUP is
-      # NO LONGER equal to this -- it is a LOOSE RAW measurement-sanity floor,
-      # decoupled, because the box measures raw speedup and has no reference; a box
+      # override the 0.95 everywhere else. The box wrapper's MIN_ACCEPTED_SPEEDUP
+      # MUST be decoupled from this to a LOOSE RAW measurement-sanity floor -- a
+      # PENDING operator action; UNTIL APPLIED the box still enforces the raw 0.83
+      # floor -- because the box measures raw speedup and has no reference; a box
       # raw floor at 0.83 would false-reject a Russell-drawn candidate whose raw sits
       # in [0.829, 0.83) but normalises to >= 0.95. Supersedes the raw floor 0.83
       # (worst no-op 0.8726 x 0.952 across the 8-prompt pool 0.8726-0.8939, M5

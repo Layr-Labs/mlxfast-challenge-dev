@@ -387,7 +387,7 @@ decode target is drawn uniformly at random per run from the 8-entry
 science, history, biography, philosophy, political philosophy, drama, and
 economics), every entry independently pinned by SHA-256 and byte count and
 re-verified byte-for-byte after download. The workflow merges the GPQA
-reference into the local golden as 5 hidden behavior checks. Generate final
+reference into the local golden as 9 hidden behavior checks. Generate final
 hidden benchmark goldens outside the public repository and upload the
 resulting files to those protected private R2 paths. `dflash-benchmark.yml`
 keeps raw hidden material in a runner-only private directory, not the

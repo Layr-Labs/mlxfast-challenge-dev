@@ -7,10 +7,21 @@ Everything below is the work that CANNOT be done by an agent: it needs hidden
 material, a judgement about whether the anti-cheat is sound enough to rank on, or a
 change to an operator-owned measurement contract.
 
+> **GO-LIVE COMPLETE — 2026-07-31 (Amendment 31); scoring updated 2026-08-01
+> (Amendment 32).** Steps A–E below were EXECUTED; this runbook is retained as the
+> record and as the procedure for taking the track back offline. Current live
+> state: `official_scoring_enabled: true`, `reference_baseline.publication_allowed:
+> true`, `tokenFidelityGateStatus: "implemented"`, `confirm_track_enabled` default
+> `true`, and the ranked score is PER-PROMPT NORMALISED with a 0.95 normalised
+> floor (Amendment 32). The pre-go-live "pending / false / inert" phrasing in the
+> steps below is HISTORY. ONE genuinely-pending item remains: the box
+> `MIN_ACCEPTED_SPEEDUP` decouple (see the decode-floor row and Amendment 32) — the
+> box still enforces the raw 0.83 floor until an operator applies it.
+
 ## 0. What is already done and verified (do not redo)
 
 Measured on M5-C, 2026-07-30. Contract detail in
-`docs/dflash-track-correctness-contract.md` (Amendments 1-25).
+`docs/dflash-track-correctness-contract.md` (Amendments 1-32).
 
 | thing | state |
 |---|---|
@@ -19,7 +30,7 @@ Measured on M5-C, 2026-07-30. Contract detail in
 | baseline calibration | `/opt/bench-runner/state/laguna-xs-2.1-dflash-v1/baseline-calibration.json`, authored by `/Users/gaj/author-dflash-calibration.sh` (the wrapper does NOT write it). **The band is only valid at the decode token count it was measured at** — the seed prefill is charged inside the decode window, so the same baseline reads 0.0201 s/token at 128 tokens and ~0.0148 at 512. It must record `decode_tokens`; `measure-dflash-job.sh` fails closed if that field is absent or disagrees with the run. Re-author whenever the ranked window OR the pinned baseline binary changes — see Amendment 27. **Authored 2026-07-31 at the ranked window**: `decode_tokens: 512`, mean 0.014873 s/token from 4 accepted pairs, integrated path exercised live (`CALIBRATION_OK`). |
 | runner | `m5-laguna-dflash-3-*` online on **mlxfast-challenge-dev**, labels `[self-hosted, m5-laguna-dflash]` only |
 | dispatch chain | verified: job scheduled -> host preflight -> trusted context -> enablement guard fails CLOSED on the contract |
-| decode floor | **0.83** (derived 2026-07-31 from the WORST no-op across the full 8-prompt pool at the ranked window: 0.8726 × 0.952, floored; supersedes 0.55/0.52/0.80, each measured off the ranked conditions), agreeing in all five sites: `benchmark.json` manifest, contract fixture, workflow comments, workflow env `MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR`, and `MIN_ACCEPTED_SPEEDUP` in the box wrapper. Rationale is Amendment 30. **SUPERSEDED by Amendment 32 (2026-08-01):** the ranked score is now per-prompt NORMALISED (raw ratio-of-means ÷ the sampled prompt's pinned no-op reference), the floor is **0.95** on the normalised aggregate (pinned equal in `benchmark.json`, the fixture, and the workflow env), and the box `MIN_ACCEPTED_SPEEDUP` is DECOUPLED to a loose raw measurement-sanity floor — no longer equal to the ranked floor. Pool no-ops cluster 0.8726–0.8939 (2.4% spread) so the lottery risk is small. **PROVISIONAL on character**: moderate-difficulty prose (~75% acceptance); a harder lowsim pool would lower the floor. Re-derive floor + K if the pool changes. |
+| decode floor | **0.83** (derived 2026-07-31 from the WORST no-op across the full 8-prompt pool at the ranked window: 0.8726 × 0.952, floored; supersedes 0.55/0.52/0.80, each measured off the ranked conditions), agreeing in all five sites: `benchmark.json` manifest, contract fixture, workflow comments, workflow env `MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR`, and `MIN_ACCEPTED_SPEEDUP` in the box wrapper. Rationale is Amendment 30. **SUPERSEDED by Amendment 32 (2026-08-01):** the ranked score is now per-prompt NORMALISED (raw ratio-of-means ÷ the sampled prompt's pinned no-op reference), the floor is **0.95** on the normalised aggregate (pinned equal in `benchmark.json`, the fixture, and the workflow env), and the box `MIN_ACCEPTED_SPEEDUP` MUST be decoupled to a loose raw measurement-sanity floor — no longer equal to the ranked floor — a PENDING operator action (the box still enforces the raw 0.83 floor until applied). Pool no-ops cluster 0.8726–0.8939 (2.4% spread) so the lottery risk is small. **PROVISIONAL on character**: moderate-difficulty prose (~75% acceptance); a harder lowsim pool would lower the floor. Re-derive floor + K if the pool changes. |
 | janitor audit | clean after re-signing; re-verified on all three boxes 2026-07-31 |
 | hidden goldens | Correctness pair provisioned + pinned. TIMED POOL: **8 distinct entries pinned** (2026-07-31, one per domain — Amendment 30), goldens generated on M5-C and staged locally for operator R2 upload to the pinned `pool-*.json` keys; each sha re-verified after download. R2 prefix `correctness_prompts/laguna-xs-2.1-dflash/`, NO `gautham-experiments` segment (that is the BUCKET, carried by `R2_BUCKET_ENDPOINT`). Probe with `.github/workflows/dflash-probe-r2-keys.yml` before changing. |
 
@@ -241,8 +252,9 @@ The guard requires BOTH, on `main`:
 - `fixtures/laguna_xs_2_1_dflash_track.json` -> `official_scoring_enabled: true`
 - the same fixture's `reference_baseline.publication_allowed: true`
 
-`benchmark.json` -> `scoring.tokenFidelityGateStatus` is
-`proposed-awaiting-operator-signoff`: the full spec is WRITTEN (fixture
+`benchmark.json` -> `scoring.tokenFidelityGateStatus` was
+`proposed-awaiting-operator-signoff` when this step was written and is now
+`implemented` (flipped at go-live 2026-07-31, Amendment 31): the full spec is WRITTEN (fixture
 `token_fidelity_gate`, rationale and evidence in contract Amendment 29 — every
 number traces to a measurement, and the prose is pinned to the enforcing
 constants by test). The pinned test
@@ -289,9 +301,10 @@ measurement:
    faced one. Contract Amendments 18-21 record that this track's gates have
    repeatedly looked sound until first attacked.
 
-Also flip `confirm_track_enabled`'s default to `true` in the workflow if Yukon will
-dispatch with defaults; it is currently `false` precisely because the track is
-inert.
+Also flip `confirm_track_enabled`'s default to `true` in the workflow so Yukon
+dispatches with defaults (DONE at go-live 2026-07-31 — the default is now `true`;
+it was `false` while the track was inert, which made Yukon's automated dispatches
+unarmable — see Amendment 31).
 
 ## Step E — verification dispatch
 
