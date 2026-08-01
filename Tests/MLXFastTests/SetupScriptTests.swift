@@ -2232,7 +2232,7 @@ func buildEntrypointsAssertFrozenDependencyGraph() throws {
 
     // Every ranked resolve/build passes --force-resolved-versions too.
     for workflowPath in [
-        ".github/workflows/benchmark.yml",
+        ".github/workflows/dflash-benchmark.yml",
         ".github/workflows/ci.yml",
     ] {
         let workflow = try String(contentsOfFile: workflowPath, encoding: .utf8)

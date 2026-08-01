@@ -92,7 +92,7 @@ official benchmark for ranking.
 ## What You May Optimize
 
 The submitted editable surface is defined by `editablePaths` in
-`benchmark.json` — that list (currently 97 entries) is the source of truth.
+`benchmark.json` — that list (currently 84 entries) is the source of truth.
 It covers four groups:
 
 ```text
@@ -617,7 +617,7 @@ now exists in this repository as scaffolding — see the next section — but it
 
 ### Experimental DFlash Speculative-Decode Track (dev only, NOT enabled)
 
-`benchmark.dflash.json` registers a second track, `laguna-xs-2.1-dflash-v1`,
+`benchmark.json` registers a second track, `laguna-xs-2.1-dflash-v1`,
 for organizer-provisioned DFlash speculative decoding. It is **inert**: its
 contract fixture (`fixtures/laguna_xs_2_1_dflash_track.json`) keeps
 `official_scoring_enabled: false`, and its workflow
@@ -712,7 +712,7 @@ What it will be, when it is enabled:
   the timed window. `docs/dflash-track-correctness-contract.md` is the
   specification; read it before assuming any behaviour of this track.
 
-The editable surface for this track is its own (`benchmark.dflash.json`
+The editable surface for this track is its own (`benchmark.json`
 `editablePaths`) and centres on the DFlash runtime under
 `Vendor/mlx-swift-lm/Libraries/MLXSpeculative/` plus `DFlashTarget.swift` and
 `DFlashVerifyLinear.swift`. Local scripts are `setup-dflash.sh` and

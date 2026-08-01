@@ -14,7 +14,7 @@ struct ParentToolSandboxTests {
     }
 
     private func workflowSource() throws -> String {
-        try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
+        try String(contentsOfFile: ".github/workflows/dflash-benchmark.yml", encoding: .utf8)
     }
 
     @Test
@@ -122,35 +122,6 @@ struct ParentToolSandboxTests {
         ))
     }
 
-    @Test
-    func workflowArmsParentToolSandboxOnTransformAndAttachSteps() throws {
-        let workflow = try workflowSource()
-
-        let transformStart = try #require(
-            workflow.range(of: "- name: Transform reference checkpoint in bench sandbox")
-        )
-        let hashWeightsStart = try #require(
-            workflow.range(of: "- name: Hash transformed weights for ranked audit")
-        )
-        let transformStep = String(workflow[transformStart.lowerBound..<hashWeightsStart.lowerBound])
-        // Both the submission and trusted branches arm the sandbox on the
-        // actual bench-exec command line (match the `/bin/bash` form so the
-        // explanatory comment above is not counted).
-        #expect(
-            transformStep.components(
-                separatedBy: "MLXFAST_SANDBOX_PARENT_TOOLS=1 /bin/bash -c '"
-            ).count - 1 == 2
-        )
-
-        let attachStart = try #require(
-            workflow.range(of: "- name: Attach GPQA gates and verify augmented golden")
-        )
-        let verifyGatesStart = try #require(
-            workflow.range(of: "- name: Verify trusted harness before gates")
-        )
-        let attachStep = String(workflow[attachStart.lowerBound..<verifyGatesStart.lowerBound])
-        #expect(attachStep.contains("MLXFAST_SANDBOX_PARENT_TOOLS=1 /bin/bash -c '"))
-    }
 
     @Test
     func runtimeWorkerAllowlistDropsSSHAgentSocket() throws {

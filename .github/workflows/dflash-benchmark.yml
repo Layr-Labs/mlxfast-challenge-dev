@@ -4,7 +4,7 @@ name: dflash-benchmark
 # laguna-xs-2.1-dflash-v1). NOT ENABLED -- see the fail-closed track
 # enablement interlock below.
 #
-# This is the ranked entrypoint declared by benchmark.dflash.json. It runs the
+# This is the ranked entrypoint declared by benchmark.json. It runs the
 # trusted organizer-drafter block protocol pinned by
 # fixtures/laguna_xs_2_1_dflash_track.json, using the organizer-provisioned
 # DFlash draft model (a separate ~881 MB EAGLE-style speculator) against the
@@ -219,7 +219,7 @@ jobs:
       # submission is judged and overlaid against the DFlash editable surface
       # (which includes nine DFlash-only files benchmark.json does not list)
       # rather than the serial track's.
-      MLXFAST_DFLASH_EDITABLE_SURFACE_CONTRACT: benchmark.dflash.json
+      MLXFAST_DFLASH_EDITABLE_SURFACE_CONTRACT: benchmark.json
       MLXFAST_DFLASH_TARGET_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256
       MLXFAST_DFLASH_ASSISTANT_MANIFEST_PATH: fixtures/dflash_laguna_xs_2_1_drafter.sha256
       # Decode-only score contract (adopted 2026-07-14; see header). Keep in
@@ -241,7 +241,7 @@ jobs:
       MLXFAST_DFLASH_BLOCK_SIZE: "2"
       MLXFAST_DFLASH_DECODE_TOKENS: "512"
       MLXFAST_DFLASH_CORRECTNESS_TOKENS: "512"
-      # 0.83, matching scoring.decodeSpeedupFloor in benchmark.dflash.json, the
+      # 0.83, matching scoring.decodeSpeedupFloor in benchmark.json, the
       # contract fixture, and MIN_ACCEPTED_SPEEDUP in the box wrapper. This is a
       # FIFTH place the floor lives: the score is recomputed here in the trusted
       # shell from the sealed per-side means and gated against this value, so a
@@ -890,7 +890,6 @@ jobs:
           /bin/chmod +a "user:bench deny write,append,writeattr,writeextattr,delete,chown" \
             "${MLXFAST_JOB_WS}/benchmark.sh" \
             "${MLXFAST_JOB_WS}/benchmark.json" \
-            "${MLXFAST_JOB_WS}/benchmark.dflash.json" \
             "${MLXFAST_JOB_WS}/benchmark-dflash.sh" \
             "${MLXFAST_JOB_WS}/setup-dflash.sh" \
             "${MLXFAST_JOB_WS}/Package.swift" \
