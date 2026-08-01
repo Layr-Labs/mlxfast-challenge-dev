@@ -14,24 +14,28 @@ Measured on M5-C, 2026-07-30. Contract detail in
 
 | thing | state |
 |---|---|
-| harness end-to-end | **Full `ACCEPT` at the shipping configuration** (K=2, 512 decode tokens, 512-authored band, 0.55 floor, ranked hidden golden, 2026-07-31): aggregate **0.5892**, 4/4 pairs, `CALIBRATION_OK` through the integrated `decode_tokens` guard, `PARITY_OK` over 8 reports, sealed verdict `ACCEPT`. Three independent same-day runs agree to 0.3% (0.5882 / 0.5875 / 0.5892, 12 pairs) — see Amendment 28. Historical: 0.8705 on a different golden (Amendment 25 era); 0.5493 at K=3 over a 128-token window (Amendment 26 era) |
+| harness end-to-end | **Full `ACCEPT` at the shipping configuration** (K=2, 512 decode tokens, band-enforced, 0.83 floor): a band-enforced run on the WORST pool entry (Russell, no-op 0.8726) clears the floor; the gates path is green end-to-end in CI (run 30664724953). Each of the 8 pool entries measured no-op at the ranked window with `PARITY_OK`, aggregates 0.8726–0.8939 — see Amendment 30. Historical: 0.5892 single-lowsim-prompt (Amendment 28 era); 0.8705 on a different golden (Amendment 25 era) |
 | pinned baseline | `/opt/bench-runner/baseline/laguna-xs-2.1-dflash-v1/<sha>` + `current` symlink, 23 GB, weights APFS-cloned from the serial baseline |
 | baseline calibration | `/opt/bench-runner/state/laguna-xs-2.1-dflash-v1/baseline-calibration.json`, authored by `/Users/gaj/author-dflash-calibration.sh` (the wrapper does NOT write it). **The band is only valid at the decode token count it was measured at** — the seed prefill is charged inside the decode window, so the same baseline reads 0.0201 s/token at 128 tokens and ~0.0148 at 512. It must record `decode_tokens`; `measure-dflash-job.sh` fails closed if that field is absent or disagrees with the run. Re-author whenever the ranked window OR the pinned baseline binary changes — see Amendment 27. **Authored 2026-07-31 at the ranked window**: `decode_tokens: 512`, mean 0.014873 s/token from 4 accepted pairs, integrated path exercised live (`CALIBRATION_OK`). |
 | runner | `m5-laguna-dflash-3-*` online on **mlxfast-challenge-dev**, labels `[self-hosted, m5-laguna-dflash]` only |
 | dispatch chain | verified: job scheduled -> host preflight -> trusted context -> enablement guard fails CLOSED on the contract |
-| decode floor | **0.55** (derived 2026-07-31 from the measured no-op at the ACTUAL ranked window: 0.5882 × 0.952, floored; supersedes 0.52, derived at a 128-token window, and 0.80, derived on a different golden — each predecessor failed by being measured under non-ranked conditions), agreeing in all five sites: `benchmark.dflash.json` manifest, contract fixture, workflow comments, workflow env `MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR`, and `MIN_ACCEPTED_SPEEDUP` in the box wrapper. Rationale is Amendments 26 + 28. **PROVISIONAL** — re-derive BOTH the floor (worst no-op) AND the block size (best K) across the pool once `timed_prompt_pool` is populated. |
+| decode floor | **0.83** (derived 2026-07-31 from the WORST no-op across the full 8-prompt pool at the ranked window: 0.8726 × 0.952, floored; supersedes 0.55/0.52/0.80, each measured off the ranked conditions), agreeing in all five sites: `benchmark.dflash.json` manifest, contract fixture, workflow comments, workflow env `MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR`, and `MIN_ACCEPTED_SPEEDUP` in the box wrapper. Rationale is Amendment 30. Pool no-ops cluster 0.8726–0.8939 (2.4% spread) so the lottery risk is small. **PROVISIONAL on character**: moderate-difficulty prose (~75% acceptance); a harder lowsim pool would lower the floor. Re-derive floor + K if the pool changes. |
 | janitor audit | clean after re-signing; re-verified on all three boxes 2026-07-31 |
-| hidden goldens | ONE pair provisioned, uploaded and pinned (correctness `185394`b, bench `185433`b). R2 keys settled by probe: the prefix is `correctness_prompts/laguna-xs-2.1-dflash/`, with NO `gautham-experiments` segment -- that is the BUCKET, carried by `R2_BUCKET_ENDPOINT`. Pinned by `DFlashGoldenKeyTests`; probe with `.github/workflows/dflash-probe-r2-keys.yml` before changing. |
+| hidden goldens | Correctness pair provisioned + pinned. TIMED POOL: **8 distinct entries pinned** (2026-07-31, one per domain — Amendment 30), goldens generated on M5-C and staged locally for operator R2 upload to the pinned `pool-*.json` keys; each sha re-verified after download. R2 prefix `correctness_prompts/laguna-xs-2.1-dflash/`, NO `gautham-experiments` segment (that is the BUCKET, carried by `R2_BUCKET_ENDPOINT`). Probe with `.github/workflows/dflash-probe-r2-keys.yml` before changing. |
 
-## Step A — hidden timed-prompt pool (BLOCKING)
+## Step A — hidden timed-prompt pool (DONE 2026-07-31; operator R2 upload pending)
 
-`fixtures/laguna_xs_2_1_dflash_track.json` -> `timed_prompt_pool` holds **ONE**
-entry as of 2026-07-31 (it was `[]` when this runbook was written). That is
-enough for a gates-only dry run and **not** enough to rank: the workflow's
-"Select hidden DFlash timed target from the pool" step fails closed on an empty
-pool AND refuses a run with `run_benchmark=true` while the pool is below **8**.
-So **7 more entries are still required**, and the single existing entry must not
-be mistaken for readiness.
+`fixtures/laguna_xs_2_1_dflash_track.json` -> `timed_prompt_pool` now holds
+**8 distinct entries**, one per domain (Amendment 30), pinned by sha256/bytes.
+The goldens were generated on M5-C and are staged locally at
+`~/Downloads/dflash-pool-seeds/out/` with `pool-manifest.json`. **The only
+remaining Step-A action is the operator uploading those 8 files to their pinned
+`pool-*.json` R2 keys** (the workflow re-verifies each sha after download). The
+"Select hidden DFlash timed target from the pool" step will then sample from all
+8; until the flags are flipped (Step D) a ranked dispatch is still refused by
+the enablement guard, so the pinned pool is inert and safe on main.
+
+Historical requirements this satisfied (from the fixture `timed_prompt_pool_note`):
 
 Requirements, from the fixture's own `timed_prompt_pool_note`:
 
@@ -313,24 +317,18 @@ dispatch; nothing needs unwinding on the box. The runner can be parked with
 
 These are documented, measured, and unresolved. Enabling scoring accepts them.
 
-1. **An unmodified candidate scores 0.5882 at the ranked window** (512 decode
-   tokens, K=2, measured 2026-07-31 — Amendment 28), so the entry bar is far
-   steeper than the ~0.87/~16% figures below, which were measured on a DIFFERENT
-   golden at ~69% draft acceptance and are **superseded by Amendments 26 + 28**.
-   On the material this track actually ranks against, draft acceptance is ~34%
-   and per-row compute dominates (at 128 tokens: 1.8125 declared rows per emitted
-   token against a 1.8206 slowdown). The floor is 0.55 accordingly. An entrant
-   must find roughly **1.7x of general forward speedup before they rank above a
-   no-op**, which is a far less attractive track than the 19% figure implied —
-   that is the decision being accepted here, and it is the strongest argument for
-   per-prompt no-op normalisation before go-live. (Intermediate figures from the
-   0.52 era — 0.5493 at K=3, 0.6201 at K=2 — were measured over a 128-token
-   window and do not transfer to the ranked one.)
-   The historical reasoning: because the denominator is the pinned
-   baseline and only the numerator is the candidate's build, general kernel wins DO
-   count — but block decode itself costs ~16% on realistic prose, so entrants need
-   roughly **19% of general forward speedup before they rank at all**. That is an
-   entry bar, not a bug, and it decides whether the track is attractive to enter.
+1. **The pool is moderate-difficulty prose, not lowsim** (Amendment 30). The 8
+   shipped entries have no-op speedups 0.8726–0.8939 (~75% draft acceptance), so
+   a no-op is only ~12% slower than serial K=1 and the floor is **0.83**. This is
+   a materially EASIER benchmark than the original `lowsim-prose-v1` intent (that
+   single prompt scored 0.5882 no-op at ~34% acceptance, floor would have been
+   0.55). The easier pool means the entry bar to rank above a no-op is lower and
+   the spread between submissions is compressed. **This is the character being
+   shipped, and the operator chose it** when delegating prompt selection; a harder
+   benchmark needs curated low-similarity prompts and would lower the floor. The
+   tight 2.4% no-op spread does, however, nearly eliminate the cross-prompt
+   lottery that a mixed-difficulty pool would create. Per-prompt no-op
+   normalisation remains the durable fix if a wider-difficulty pool is ever used.
 2. **L2's cross-build tail term is unmeasured.** Every rejected-tail number is
    same-build; cross-build was the larger term on the emitted rows (Amendment 21 §6).
 3. **The L2 drift band cannot be closed by tightening** — it is occupied by honest

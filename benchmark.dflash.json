@@ -117,7 +117,7 @@
     "mode": "dflash-paired-decode-only",
     "decodeTokens": 512,
     "aggregation": "ratio_of_means",
-    "decodeSpeedupFloor": 0.55,
+    "decodeSpeedupFloor": 0.83,
     "minAcceptedPairs": 3,
     "targetPairs": 4,
     "tokenFidelityGate": "trusted-sequential-reverification-with-bounded-near-tie-budget",

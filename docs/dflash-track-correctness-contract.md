@@ -3159,3 +3159,120 @@ The spec prose is pinned to the enforcing constants by
 `theFidelityGateSpecStatesTheConstantsTheImplementationEnforces` — the
 Amendment 28 derived-pin pattern — so `Constants.swift` and the fixture cannot
 drift apart silently.
+
+# Amendment 30 (2026-07-31): the timed_prompt_pool is populated (8 domains) and the floor is 0.83
+
+(Amendment 29 above is the token-fidelity-gate specification, PR #839; this
+followed it in the merge.)
+
+The pool went from ONE entry to **EIGHT distinct entries**, one per domain, and
+the decode floor moved **0.55 -> 0.83** as a direct consequence. Both changes are
+in one commit because the floor is a property of the pool.
+
+## The pool
+
+Eight low-memorization prose seeds, continued by the reference at K=2 over 512
+rows, one per domain: science (Darwin), history (Herodotus), biography
+(Plutarch), empiricist philosophy (Hume), analytic philosophy (Russell),
+political philosophy (Plato), drama (Sophocles), economics (Adam Smith). The
+original single `lowsim-prose-v1` entry (seeded from the serial correctness
+prompt) was **dropped**, which decouples this pool from the live serial
+competition and removes an outlier-hard prompt.
+
+**Selection was not "any prose."** A first batch of canonical books (Austen,
+Shakespeare, Gibbon, the Federalist Papers) was screened and 6 of 7 REJECTED by
+`.github/scripts/check-dflash-golden-degeneracy.sh` as degenerate: the model has
+those texts memorized, so its greedy continuation never enters the near-tie
+regime (0 rows with top-2 gap < 0.25), which is the same signature as the
+degenerate self-continuations Amendment 10 condemned. Only low-memorization
+descriptive/argumentative prose induces the uncertainty the screen requires. The
+eight shipped entries each pass all three screen thresholds.
+
+## The floor: 0.83, from the worst no-op across the whole pool
+
+Every entry was measured no-op at the ranked window (512 decode tokens, K=2, 40C
+gate, ratio-of-means, PARITY_OK per entry). The aggregates cluster tightly:
+
+| entry | domain | no-op | serial mean |
+|---|---|---|---|
+| Russell | analytic philosophy | **0.8726** (worst) | 0.014880 |
+| Plutarch | biography | 0.8822 | 0.014870 |
+| Herodotus | history | 0.8833 | 0.014863 |
+| Darwin | science | 0.8834 | 0.014885 |
+| Plato | political philosophy | 0.8848 | 0.014851 |
+| Sophocles | drama | 0.8891 | 0.014869 |
+| Smith | economics | 0.8921 | 0.014874 |
+| Hume | empiricist philosophy | 0.8939 | 0.014864 |
+
+**Floor = worst 0.8726 x 0.952 = 0.8307 -> 0.83** (the 0.952 margin every
+derivation has used; 4.9% above the worst no-op, run-to-run spread < 0.5%). This
+is the per-prompt-safe floor: on every entry a no-op clears 0.83.
+
+The 2.4% no-op spread is the important structural result. The provisional-floor
+lottery warned about in Amendment 26 (no-ops ranging 0.55/0.84/1.117 across
+mixed material) is nearly gone within this pool, because all eight are
+moderate-difficulty prose. That is also the caveat: **this pool is
+moderate-difficulty (~75% draft acceptance), not the low-acceptance lowsim
+character the target-id name implies.** A no-op is ~12% slower than serial K=1
+here (0.88), versus the dropped lowsim entry's ~1.7x (0.59). A harder benchmark
+would lower this floor and requires curated low-similarity prompts; the operator
+was told this is the character being shipped and chose it. The floor remains
+PROVISIONAL on that character choice.
+
+## Band compatibility (verified, not assumed)
+
+The single top-level calibration band (mean 0.014873, Amendment 28) was checked
+against every pool entry's measured serial mean: all eight fall in
+0.01485-0.01489, i.e. ratio 0.9985-1.0008 against the band centre, comfortably
+inside +-5%. So one band covers the whole pool; no per-entry band keying is
+needed. The serial denominator is a K=1 decode and is near-prompt-independent,
+which this confirms rather than assumes.
+
+## Superseded floor values (all measured off the ranked conditions)
+
+0.80 (0.840x at ~69% acceptance, different golden -- Amendment 25/26); 0.52
+(0.5493 at K=3 over a 128-token window -- Amendment 26/28); 0.55 (0.5882 at the
+ranked window but from the single deliberately-hard lowsim prompt, now dropped
+-- Amendment 28). The through-line is Amendment 28's rule: a derived constant is
+(value, conditions-of-measurement). 0.83's conditions are: worst of 8
+moderate-difficulty prose prompts, ranked window, K=2.
+
+## Provisioning method note
+
+The pool goldens were generated on M5-C from operator-independent public-domain
+prose (random-offset slices, kernel entropy) rather than authored by the agent,
+so the timed material does not originate in the same context that produced the
+scored code. Hashes were computed from the generated files; the operator uploads
+those exact bytes to the pinned r2_path keys and the workflow re-verifies each
+sha256 after download, so a wrong upload fails closed. Inertness until go-live
+rests on the two trusted-contract flags, not on starving the pool -- the
+enablement guard refuses a ranked dispatch on the flags before pool selection
+runs (see DFlashEnablementInterlockTests.theTrackFixtureRemainsInertOnMain,
+updated in this commit).
+
+## Amendment 30 addendum — fidelity headroom measured across the pool
+
+Amendment 29's known-limit (5) required re-measuring per-entry baseline near-tie
+utilisation before go-live, because a pool prompt whose own no-op approaches the
+near-tie budget would reject honest candidates (the Amendment 28 floor failure,
+transplanted to fidelity). Measured for all 8 entries at the ranked window (the
+no-op campaign's retained dflash phase reports, 2026-07-31):
+
+| entry | exact / 512 | near-tie (/21) | declared-frame | residual (/3) |
+|---|---|---|---|---|
+| Darwin | 512 | 0 | 0 | 0 |
+| Herodotus | 511 | 0 | 1 | 0 |
+| Plutarch | 512 | 0 | 0 | 0 |
+| Hume | 512 | 0 | 0 | 0 |
+| Russell | 511 | 0 | 1 | 0 |
+| Plato | 512 | 0 | 0 | 0 |
+| Sophocles | 512 | 0 | 0 | 0 |
+| Smith | 511 | 0 | 1 | 0 |
+
+Every entry consumes **0 of 21 near-tie and 0 of 3 residual budget**;
+`all_tokens_matched` is true for all. Moderate-difficulty prose produces almost
+no block-vs-sequential near-ties, so the fidelity headroom is maximal — the
+opposite of the dropped lowsim entry, which alone consumed 9/21. The declared-
+frame hits (1 each on three entries) are unbudgeted and expected. So the pool is
+safe on the fidelity axis as well as the floor axis, and Amendment 29's known-
+limit (5) is discharged for this specific pool with data.
