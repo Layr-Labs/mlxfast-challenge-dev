@@ -16,7 +16,9 @@ name: dflash-benchmark
 # ENABLEMENT STATE: this track is INERT and is NOT the default. Three
 #   independent locks hold it shut -- official_scoring_enabled is false in the
 #   contract fixture, reference_baseline.publication_allowed is false, and
-#   tokenFidelityGateStatus is pending-spec. A FOURTH lock stops a ranked run
+#   tokenFidelityGateStatus is proposed-awaiting-operator-signoff (the spec is
+#   written, Amendment 29; only the operator moves it to the "implemented" the
+#   lock requires). A FOURTH lock stops a ranked run
 #   even if those were flipped: the hidden timed-prompt pool holds ONE entry
 #   and the selection step refuses a RANKED run unless the pool carries at
 #   least 8 DISTINCT targets -- distinct sha256 AND distinct r2_path (it also
@@ -124,7 +126,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm_track_enabled:
-        description: "Enablement interlock. Defaults FALSE: this track is inert (official_scoring_enabled and reference_baseline.publication_allowed are both false, so a RANKED dispatch is refused; a gates-only dispatch is admitted on purpose). The hidden timed-prompt pool now holds ONE entry, which is below the anti-lottery floor of 8 DISTINCT targets (distinct sha256 AND distinct r2_path -- not pool length), so a ranked run is refused there too. Inherited from the retired MTP track, where it defaulted true because that track was live. When the operator enables DFlash, flip the contract fixture AND this default together."
+        description: "ARMING interlock, required TRUE for EVERY dispatch -- gates-only included: nothing runs on the operator's box unless the operator ticks this on the dispatch itself (pinned by confirmTrackEnabledIsRequiredEvenForAGatesOnlyDryRun). Left false, the dispatch is refused at 'Enforce DFlash track enablement'. What KIND of run a ticked dispatch gets is decided SEPARATELY, by the trusted contract: official_scoring_enabled and reference_baseline.publication_allowed are both false, so run_benchmark=true is refused and the dispatch proceeds as a gates-only dry run that publishes no score; the timed-prompt pool (ONE entry, below the anti-lottery floor of 8 DISTINCT targets -- distinct sha256 AND distinct r2_path, not pool length) refuses ranked independently. An earlier description here read as if gates-only dispatches were admitted with this flag false; that misreading cost a dispatch on 2026-07-31 -- the flag ARMS the run, the contract fields choose ranked-vs-gates-only. Defaults false while the track is inert; when the operator enables DFlash, flip the contract fixture AND this default together."
         required: false
         default: false
         type: boolean

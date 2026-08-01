@@ -121,7 +121,7 @@
     "minAcceptedPairs": 3,
     "targetPairs": 4,
     "tokenFidelityGate": "trusted-sequential-reverification-with-bounded-near-tie-budget",
-    "tokenFidelityGateStatus": "pending-spec",
+    "tokenFidelityGateStatus": "proposed-awaiting-operator-signoff",
     "stallGuardrail": "max block latency > 4x p50 rejects the run (one gated retry)"
   },
   "leaderboard": {
