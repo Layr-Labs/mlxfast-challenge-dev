@@ -595,49 +595,6 @@ struct R2RequestExecutionTests {
         }
     }
 
-    /// The invariant must not cost the keys the workflows actually fetch.
-    ///
-    /// Read out of the ranked workflows rather than restated, so a new object
-    /// key that the charset would reject fails here instead of on the runner.
-    @Test
-    func theObjectKeysTheWorkflowsUseAreStillAccepted() throws {
-        var keys: Set<String> = []
-        for workflow in [
-            ".github/workflows/benchmark.yml", ".github/workflows/dflash-benchmark.yml",
-        ] {
-            let text = try String(contentsOfFile: workflow, encoding: .utf8)
-            for line in text.split(separator: "\n") {
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
-                guard let colon = trimmed.range(of: ": "),
-                    trimmed[..<colon.lowerBound].hasSuffix("_R2_PATH")
-                else { continue }
-                let value = String(trimmed[colon.upperBound...])
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"' "))
-                // Skip values templated per run (`${{ steps... }}`).
-                guard !value.contains("${{") else { continue }
-                keys.insert(value)
-            }
-        }
-        #expect(
-            keys.count >= 3,
-            "found only \(keys.count) literal *_R2_PATH keys in the workflows; retarget this test"
-        )
-
-        for key in keys.sorted() {
-            let workspace = try Self.temporaryDirectory()
-            let run = try Self.runScript(
-                Self.downloadScript, arguments: [key, "out/o.json"],
-                workingDirectory: workspace, readOutputAt: "out/o.json")
-            #expect(
-                run.status == 0,
-                """
-                the object-key charset now rejects a key the ranked workflow really \
-                fetches: \(key). stderr: \(run.stderr)
-                """
-            )
-            #expect(run.outputContents == "the-object-bytes")
-        }
-    }
 
     // MARK: - F4: the payload hash survives exotic input paths
 

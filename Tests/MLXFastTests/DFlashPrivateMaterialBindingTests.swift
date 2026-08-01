@@ -22,7 +22,12 @@ import Testing
 @Suite("DFlash private material binding")
 struct DFlashPrivateMaterialBindingTests {
     private static let dflashWorkflow = ".github/workflows/dflash-benchmark.yml"
-    private static let serialWorkflow = ".github/workflows/benchmark.yml"
+    // The private-material environment the ranked job must bind. The serial
+    // ranked workflow (benchmark.yml) was retired 2026-07-31, so there is no
+    // second job to compare against; the binding is pinned to the expected
+    // environment name directly instead. When the operator rotates to a `-v3`,
+    // this fails until the DFlash job moves.
+    private static let expectedEnvironment = "benchmark-private-prompts-v2"
 
     /// The `environment:` of the workflow's single ranked job.
     private static func jobEnvironment(_ path: String) throws -> String {
@@ -42,18 +47,18 @@ struct DFlashPrivateMaterialBindingTests {
     }
 
     @Test
-    func dflashBindsTheSamePrivateMaterialEnvironmentAsSerial() throws {
+    func dflashBindsThePrivateMaterialEnvironment() throws {
         let dflash = try Self.jobEnvironment(Self.dflashWorkflow)
-        let serial = try Self.jobEnvironment(Self.serialWorkflow)
 
         #expect(
-            dflash == serial,
+            dflash == Self.expectedEnvironment,
             """
-            DFlash binds environment '\(dflash)' but the serial ranked job binds \
-            '\(serial)'. Both read the same R2 secret NAMES, which resolve per \
-            environment, so the DFlash job would fetch the same hidden objects \
-            with different credentials and a different endpoint -- curl HTTP 400 \
-            with nothing naming the cause. Move BOTH jobs together.
+            DFlash binds environment '\(dflash)' but must bind \
+            '\(Self.expectedEnvironment)'. The R2 secret NAMES resolve per \
+            environment, so a mismatched binding fetches the hidden objects with \
+            different credentials and a different endpoint -- curl HTTP 400 with \
+            nothing naming the cause. When the operator rotates the environment, \
+            update expectedEnvironment here in the same change.
             """
         )
         #expect(!dflash.isEmpty)
@@ -64,7 +69,7 @@ struct DFlashPrivateMaterialBindingTests {
     /// resolves to empty and produces the same unexplained 400.
     @Test
     func everyR2SecretReferenceLivesInTheEnvironmentBoundJob() throws {
-        for path in [Self.dflashWorkflow, Self.serialWorkflow] {
+        for path in [Self.dflashWorkflow] {
             let text = try String(contentsOfFile: path, encoding: .utf8)
             let jobCount = text
                 .split(separator: "\n", omittingEmptySubsequences: false)

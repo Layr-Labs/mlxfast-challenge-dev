@@ -3,7 +3,7 @@
 **Status: DESIGN, not yet implemented.** The DFlash track is fail-closed
 (`fixtures/laguna_xs_2_1_dflash_track.json` -> `official_scoring_enabled: false`)
 and MUST stay so until every layer below is implemented and validated on M5-C.
-`benchmark.dflash.json` carries `tokenFidelityGateStatus:
+`benchmark.json` carries `tokenFidelityGateStatus:
 "proposed-awaiting-operator-signoff"` (it read `"pending-spec"` until the spec
 was written — Amendment 29); that key flips to `"implemented"` only when L1-L6
 are in place, by the operator, at go-live.
@@ -816,7 +816,7 @@ belong in any participant-facing description of the track:
   to serial-track scores as absolute tokens/second.
 - The track's editable surface is correspondingly the DFlash runtime
   (`MLXSpeculative/*`, `DFlashTarget.swift`, `DFlashVerifyLinear.swift`) plus
-  the vendored model/kernels — consistent with `benchmark.dflash.json`.
+  the vendored model/kernels — consistent with `benchmark.json`.
 - Both tracks nonetheless load the SAME NVFP4 group-16 reference checkpoint, so
   the model under test is identical; only the forward implementation differs.
 
@@ -1417,7 +1417,7 @@ on Laguna, is the organizer's decision.
 
 # Amendment 12 (2026-07-30): the stall guardrail rejects essentially every run
 
-`benchmark.dflash.json`'s scoring block specifies:
+`benchmark.json`'s scoring block specifies:
 
 > `stall_guardrail`: a run whose max block latency exceeds 4x its p50 block
 > latency is rejected as measurement-invalid with one gated retry
@@ -2904,7 +2904,7 @@ change, with that dispatch.
 
 ## Where the floor lives — the enumeration is the hard part
 
-`benchmark.dflash.json` `scoring.decodeSpeedupFloor`; the contract fixture's
+`benchmark.json` `scoring.decodeSpeedupFloor`; the contract fixture's
 `proposed_scoring.component_floor`; the workflow env
 `MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR`; the workflow's header comments and its
 operator-facing rejection message; and `MIN_ACCEPTED_SPEEDUP` in
@@ -3084,7 +3084,7 @@ precondition for `official_scoring_enabled`. The spec is now WRITTEN — this
 amendment records what it says, what evidence each number traces to, and what
 adopting it accepts. **Writing it adopts nothing.** The lifecycle is explicit:
 `pending-spec` → `proposed-awaiting-operator-signoff` (this change, both in the
-fixture and in `benchmark.dflash.json`'s `tokenFidelityGateStatus`) →
+fixture and in `benchmark.json`'s `tokenFidelityGateStatus`) →
 `implemented` (the operator, at runbook Step D, in the same change that flips
 the contract fields — `trackCannotBeEnabledWhileTheFidelityGateIsUnspecified`
 holds the lock).

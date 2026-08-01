@@ -490,7 +490,7 @@ jq -e 'type == "number" and . > 0' <<<"${score}" >/dev/null
 
 # --- 6. report the RANKED floor, and only ever a directional score ------------
 # The floor that actually rejects is the workflow's env value (mirrored by the
-# box wrapper's MIN_ACCEPTED_SPEEDUP); benchmark.dflash.json's
+# box wrapper's MIN_ACCEPTED_SPEEDUP); benchmark.json's
 # scoring.decodeSpeedupFloor is documentation and is not enforced anywhere. Read
 # the enforced value straight out of the workflow so this line cannot drift from
 # it.

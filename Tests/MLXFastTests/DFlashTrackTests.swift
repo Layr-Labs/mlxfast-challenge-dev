@@ -20,7 +20,7 @@ import MLXFastHarness
 // replaces it.
 @Suite
 struct DFlashTrackTests {
-    private static let manifestPath = "benchmark.dflash.json"
+    private static let manifestPath = "benchmark.json"
     private static let fixturePath = "fixtures/laguna_xs_2_1_dflash_track.json"
     private static let workflowPath = ".github/workflows/dflash-benchmark.yml"
     private static let guardPath =
@@ -287,18 +287,13 @@ struct DFlashTrackTests {
         // behind a serial ranked run under the same key.
         #expect(workflow.contains("mlxfast-dflash-ranked-"))
 
-        // ...and the serial pipeline stays ignorant of DFlash.
-        let serial = try text(".github/workflows/benchmark.yml")
-        #expect(!serial.lowercased().contains("dflash"))
-
-        // RUNNER POOL ISOLATION. Sharing the serial track's `m5-bench` label let a
-        // DFlash dispatch occupy a runner in the LIVE ranked pool for the length of
-        // a DFlash job. A dedicated label makes an unserved dispatch queue rather
-        // than run on the wrong box -- the safe failure for an inert track.
+        // RUNNER POOL ISOLATION. The DFlash job keeps its dedicated
+        // `m5-laguna-dflash` label rather than the serial track's former
+        // `m5-bench`, so an unserved dispatch queues rather than running on the
+        // wrong box. (The serial ranked workflow was retired 2026-07-31, so there
+        // is no longer a serial workflow to cross-check.)
         #expect(workflow.contains("runs-on: [self-hosted, m5-laguna-dflash]"))
         #expect(!workflow.contains("runs-on: [self-hosted, m5-bench]"))
-        // The serial workflow keeps its own label, untouched.
-        #expect(serial.contains("runs-on: [self-hosted, m5-bench]"))
     }
 
     // Submitted code runs as the bench uid inside the job workspace; every
@@ -308,7 +303,7 @@ struct DFlashTrackTests {
     func benchUidCannotWriteTheDFlashTrustedSurface() throws {
         let workflow = try text(Self.workflowPath)
         for locked in [
-            "benchmark.dflash.json", "benchmark-dflash.sh", "setup-dflash.sh",
+            "benchmark.json", "benchmark-dflash.sh", "setup-dflash.sh",
         ] {
             #expect(
                 workflow.contains("${MLXFAST_JOB_WS}/\(locked)"),
@@ -1502,7 +1497,7 @@ struct DFlashDecodeFloorTests {
     /// contract Amendments 26, 28, 30.
     @Test
     func decodeFloorIsEightyThreeHundredthsInBothManifests() throws {
-        let manifest = try json("benchmark.dflash.json")
+        let manifest = try json("benchmark.json")
         let scoring = try #require(manifest["scoring"] as? [String: Any])
         let floor = try #require(scoring["decodeSpeedupFloor"] as? Double)
         #expect(floor == 0.83)
@@ -1642,8 +1637,7 @@ struct DFlashGoLiveRunbookTests {
 /// or source text.
 enum DFlashGateTextSupport {
     static let dflashWorkflowPath = ".github/workflows/dflash-benchmark.yml"
-    static let serialWorkflowPath = ".github/workflows/benchmark.yml"
-    static let dflashManifestPath = "benchmark.dflash.json"
+    static let dflashManifestPath = "benchmark.json"
     static let dflashFixturePath = "fixtures/laguna_xs_2_1_dflash_track.json"
     static let cliPath = "Sources/MLXFastCLI/main.swift"
 
@@ -2120,16 +2114,13 @@ struct DFlashReusedSerialGateTests {
     @Test
     func theFourReusedSerialGateStepsRunInTheDFlashJobWithoutLeakingBack() throws {
         let dflash = try S.text(S.dflashWorkflowPath)
-        let serial = try S.text(S.serialWorkflowPath)
 
+        // The serial ranked workflow was retired 2026-07-31, so there is no
+        // serial workflow left to cross-check; the reused gate IMPLEMENTATIONS
+        // (benchmark.sh --official and the gate scripts) still exist and are
+        // asserted below. Here we only require the DFlash job to carry each
+        // reused gate step.
         for name in S.reusedGateStepNames {
-            #expect(
-                serial.contains("- name: \(name)\n"),
-                """
-                the serial workflow no longer has the step '\(name)' the DFlash \
-                job reuses; if it was renamed, rename both copies together
-                """
-            )
             #expect(
                 dflash.contains("- name: \(name)\n"),
                 """
@@ -2177,25 +2168,12 @@ struct DFlashReusedSerialGateTests {
             )
         }
 
-        // ---- the reverse direction stays closed ----------------------------
-        #expect(!serial.lowercased().contains("dflash"))
-        for dflashOnly in [
-            "gates-score.json", ".dflash-ranked-src", "benchmark.dflash.json",
-            "measure-dflash-job.sh",
-        ] {
-            #expect(
-                !serial.contains(dflashOnly),
-                "the serial workflow references the DFlash-only literal '\(dflashOnly)'"
-            )
-        }
-        let serialGuard = try S.text(
-            ".github/scripts/enforce-trusted-benchmark-workflow.sh"
-        )
-        #expect(!serialGuard.lowercased().contains("dflash"))
+        // (The reverse-direction check — that the serial workflow stays ignorant
+        // of DFlash — is retired with the serial workflow itself.)
 
-        // Any local composite action used by BOTH workflows must be neutral.
+        // Any local composite action the DFlash job uses must be track-neutral.
         var composites: Set<String> = []
-        for workflow in [serial, dflash] {
+        for workflow in [dflash] {
             for path in S.captures(
                 #"uses: (\./\.github/actions/[A-Za-z0-9._/-]+)"#, in: workflow
             ) {
@@ -2226,11 +2204,14 @@ struct DFlashReusedSerialGateTests {
     // judgements for min-pass 7); a DFlash-only retune is how the two tracks
     // drift into measuring different things.
     @Test
-    func reusedGateCalibrationIsIdenticalInBothWorkflowsAndMatchesConstants() throws {
+    func reusedGateCalibrationInTheDFlashWorkflowMatchesConstants() throws {
         let dflash = try S.jobEnvironment(try S.text(S.dflashWorkflowPath))
-        let serial = try S.jobEnvironment(try S.text(S.serialWorkflowPath))
 
-        let shared = [
+        // The serial ranked workflow was retired 2026-07-31, so there is no
+        // second workflow to compare against; the DFlash job now carries the
+        // reused gate calibration, and every value is tied to the trusted
+        // constants directly below. Require each key to be present first.
+        for key in [
             "MLXFAST_SEMANTIC_GPQA_MIN_PASS",
             "MLXFAST_SEMANTIC_GPQA_CASE_COUNT",
             "MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS",
@@ -2243,42 +2224,31 @@ struct DFlashReusedSerialGateTests {
             "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH",
             "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256",
             "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES",
-        ]
-        for key in shared {
-            let expected = try #require(
-                serial[key], "the serial workflow no longer declares \(key)"
-            )
-            #expect(
-                dflash[key] == expected,
-                """
-                \(key) is '\(dflash[key] ?? "<absent>")' in the DFlash workflow \
-                and '\(expected)' in the serial workflow. The DFlash job reuses \
-                the serial gates, so it must reuse their calibration.
-                """
-            )
+        ] {
+            #expect(dflash[key] != nil, "the DFlash workflow no longer declares \(key)")
         }
 
         // The calibrated values themselves, tied to the trusted constants the
         // harness compiles against.
-        #expect(serial["MLXFAST_SEMANTIC_GPQA_MIN_PASS"]
+        #expect(dflash["MLXFAST_SEMANTIC_GPQA_MIN_PASS"]
             == String(MLXFastConstants.semanticGPQAMinPassCount))
-        #expect(serial["MLXFAST_SEMANTIC_GPQA_CASE_COUNT"]
+        #expect(dflash["MLXFAST_SEMANTIC_GPQA_CASE_COUNT"]
             == String(MLXFastConstants.semanticGPQACaseCount))
-        #expect(serial["MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS"]
+        #expect(dflash["MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS"]
             == String(MLXFastConstants.semanticGPQAMaxNewTokens))
-        #expect(serial["MLXFAST_GPQA_CASE_COUNT"]
+        #expect(dflash["MLXFAST_GPQA_CASE_COUNT"]
             == String(MLXFastConstants.correctnessGPQACaseCount))
-        #expect(serial["MLXFAST_GPQA_MAX_NEW_TOKENS"]
+        #expect(dflash["MLXFAST_GPQA_MAX_NEW_TOKENS"]
             == String(MLXFastConstants.correctnessGPQAMaxNewTokens))
-        #expect(serial["MLXFAST_EXPECTED_CORRECTNESS_STEPS"]
+        #expect(dflash["MLXFAST_EXPECTED_CORRECTNESS_STEPS"]
             == String(MLXFastConstants.correctnessSteps))
         // The TTFT guardrail measures the same cases the GPQA gate scores.
-        #expect(serial["MLXFAST_GPQA_TTFT_CASE_COUNT"] == serial["MLXFAST_GPQA_CASE_COUNT"])
+        #expect(dflash["MLXFAST_GPQA_TTFT_CASE_COUNT"] == dflash["MLXFAST_GPQA_CASE_COUNT"])
 
         // The model-soundness guarantee must not be quietly made optional in
         // either job: run-semantic-gpqa-gate.sh treats REQUIRED=0 as advisory.
         #expect(
-            serial["MLXFAST_SEMANTIC_GPQA_REQUIRED"] == "1",
+            dflash["MLXFAST_SEMANTIC_GPQA_REQUIRED"] == "1",
             "the serial semantic GPQA gate must stay required"
         )
         #expect(
@@ -2292,15 +2262,15 @@ struct DFlashReusedSerialGateTests {
 
         // The public fixture the behavior gate teacher-forces really is the
         // pinned bytes, in both workflows.
-        let fixturePath = try #require(serial["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH"])
+        let fixturePath = try #require(dflash["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH"])
         let fixtureData = try Data(contentsOf: URL(fileURLWithPath: fixturePath))
         let digest = SHA256.hash(data: fixtureData)
             .map { String(format: "%02x", $0) }
             .joined()
-        #expect(serial["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256"] == digest)
-        #expect(serial["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES"] == String(fixtureData.count))
+        #expect(dflash["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256"] == digest)
+        #expect(dflash["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES"] == String(fixtureData.count))
         #expect(fixturePath == MLXFastConstants.defaultPublicCorrectnessGoldenPath)
-        #expect(serial["MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH"]
+        #expect(dflash["MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH"]
             == MLXFastConstants.defaultPublicCorrectnessPromptPath)
     }
 

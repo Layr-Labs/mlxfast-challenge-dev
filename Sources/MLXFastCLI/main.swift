@@ -362,13 +362,19 @@ private enum MLXFastCLI {
             ),
             optionName: "MLXFAST_BENCHMARK_CORRECTNESS_STEPS"
         )
-        // Phase controls for the single-machine ranked pipeline: benchmark.yml's
-        // gates pass runs with CHECK_GATES=1 SKIP_TIMED=1 (base case + hidden gates,
-        // no timing), and the timed measurement runs later through measure-job's
-        // own ./benchmark.sh --official invocation. Both default to the original
-        // everything-in-one-run behavior.
+        // Phase controls. The SERIAL timed benchmark is retired: DFlash is the
+        // default track (benchmark.json), its timed score comes from
+        // measure-dflash-job.sh, and this `mlxfast-swift benchmark` command exists
+        // now only to drive the SHARED correctness/GPQA gates (the teacher-forced
+        // base case that proves the model is still sound, track-independent).
+        // So SKIP_TIMED defaults to "1": a bare invocation runs gates only and
+        // never the serial timed phase. checkGates defaults on, so the pair
+        // (checkGates=true, skipTimed=true) satisfies the "check or time
+        // something" guard. To deliberately run the retired serial timing, set
+        // MLXFAST_BENCHMARK_SKIP_TIMED=0 explicitly. The DFlash gates step already
+        // passes CHECK_GATES=1 SKIP_TIMED=1 and is unaffected.
         let checkGates = environmentValue("MLXFAST_BENCHMARK_CHECK_GATES", fallback: "1") != "0"
-        let skipTimedBenchmark = environmentValue("MLXFAST_BENCHMARK_SKIP_TIMED", fallback: "0") == "1"
+        let skipTimedBenchmark = environmentValue("MLXFAST_BENCHMARK_SKIP_TIMED", fallback: "1") == "1"
         let payload = LagunaRuntime.benchmark(
             BenchmarkOptions(
                 weightsPath: weightsPath,
