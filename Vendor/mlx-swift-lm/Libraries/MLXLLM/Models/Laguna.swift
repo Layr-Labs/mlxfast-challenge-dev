@@ -42,6 +42,89 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// MARK: - Compiled decode fusions
+//
+// `compile(shapeless: true)` closures ported from the retired serial-track
+// model (`Sources/MLXFastModel/LagunaRuntimeModel.swift`), where they ran under
+// that track's exact-token gates. Each keeps the eager expression tree — the
+// same functors in the same order, no reassociation of any reduction — so the
+// results are bit-exact against the unfused code. `compile` only fuses
+// elementwise work into its consumer; the `.sum(axis:)` reductions still
+// dispatch the same stock reduce kernels they always did.
+//
+// Shapeless means row-count polymorphic: one trace serves the 1-row serial
+// frame, the K-row DFlash verify frame, and the 512-row seed prefill.
+//
+// What this buys is launch overhead, not FLOPs. At 1-2 decode rows the forward
+// reads ~1.4 GB of weights in ~15 ms, i.e. well under a fifth of unified-memory
+// bandwidth — it is dispatch-bound, not bandwidth-bound. Removing ~400 kernel
+// launches and their intermediate allocations per token therefore maps close to
+// linearly onto decode seconds/token.
+
+/// Per-head attention output gate: f32 cast -> softplus -> cast back, fused.
+private let lagunaCompiledSoftplusGate: @Sendable (MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray) -> MLXArray = { gate in
+        softplus(gate.asType(.float32)).asType(gate.dtype)
+    }
+    return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
+/// Router tail: f32 cast -> sigmoid -> add correction bias -> negate, fused.
+/// Returns the pre-bias scores (which are the mixture weights) and the exact
+/// `-(scores + bias)` operand the eager code hands `argPartition`, so both
+/// expert selection and the weights are unchanged.
+private let lagunaCompiledRouterTail: @Sendable ([MLXArray]) -> [MLXArray] = {
+    let body: @Sendable ([MLXArray]) -> [MLXArray] = { inputs in
+        let scores = sigmoid(inputs[0].asType(.float32))
+        let scoresForChoice = scores + inputs[1].asType(scores.dtype)
+        return [scores, -scoresForChoice]
+    }
+    return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
+/// `normTopkProb` renormalization, for the paths that do not defer it into the
+/// expert combine below.
+private let lagunaCompiledTopKNormalize: @Sendable (MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray) -> MLXArray = { weights in
+        weights / weights.sum(axis: -1, keepDims: true)
+    }
+    return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
+/// Laguna XS's pinned routed scaling factor. The combine closures below bake it
+/// in as a compile-time constant, so every call site must first confirm the
+/// loaded config actually carries this value — see `usesFusedCombine`.
+private let lagunaPinnedRoutedScalingFactor: Float = 2.5
+
+/// Sparse-MoE tail with the top-k renormalization deferred into the same graph:
+/// normalize (f32) -> cast -> weighted expert reduction -> * 2.5 -> + shared.
+/// Same order as the eager tail, which normalizes in the gate and casts in the
+/// block.
+private let lagunaCompiledNormalizedExpertCombine: @Sendable (
+    MLXArray, MLXArray, MLXArray
+) -> MLXArray = compile(shapeless: true) { outputs, weights, shared in
+    let normalized = weights / weights.sum(axis: -1, keepDims: true)
+    let typedWeights = normalized.asType(outputs.dtype)
+    let routed =
+        (outputs * MLX.expandedDimensions(typedWeights, axis: -1))
+        .sum(axis: -2)
+    return routed * lagunaPinnedRoutedScalingFactor + shared
+}
+
+/// As above, plus the outer decoder residual add. Grouping matches the eager
+/// layer exactly: `residual + ((reduction * 2.5) + shared)`.
+private let lagunaCompiledNormalizedExpertCombineWithResidual: @Sendable (
+    MLXArray, MLXArray, MLXArray, MLXArray
+) -> MLXArray = compile(shapeless: true) { outputs, weights, shared, residual in
+    let normalized = weights / weights.sum(axis: -1, keepDims: true)
+    let typedWeights = normalized.asType(outputs.dtype)
+    let routed =
+        (outputs * MLX.expandedDimensions(typedWeights, axis: -1))
+        .sum(axis: -2)
+    let moe = routed * lagunaPinnedRoutedScalingFactor + shared
+    return residual + moe
+}
+
 // MARK: - Attention
 
 private class LagunaAttention: Module {
@@ -137,7 +220,14 @@ private class LagunaAttention: Module {
         if gatingEnabled, let gProj {
             // Per-head softplus gate computed in float32, then broadcast across
             // the head dimension (or applied elementwise for a per-element gate).
-            let gate = softplus(gProj(x).asType(.float32)).asType(output.dtype)
+            // The fused form is only taken when the projection already carries
+            // the output dtype, which keeps the compiled trace monomorphic and
+            // preserves the eager fallback's cast semantics exactly.
+            let projectedGate = gProj(x)
+            let gate =
+                projectedGate.dtype == output.dtype
+                ? lagunaCompiledSoftplusGate(projectedGate)
+                : softplus(projectedGate.asType(.float32)).asType(output.dtype)
             if gatePerHead {
                 output =
                     (output.reshaped(B, L, nHeads, headDim) * gate[.ellipsis, .newAxis])
@@ -165,7 +255,7 @@ private class LagunaMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(silu(gateProj(x)) * upProj(x))
+        downProj(compiledSiluProduct(gateProj(x), upProj(x)))
     }
 }
 
@@ -187,18 +277,34 @@ private class LagunaMoEGate: Module {
         self.e_score_correction_bias = zeros([config.numExperts])
     }
 
-    func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        var logits = x.matmul(weight.T).asType(.float32)
-        if routerLogitSoftcapping > 0 {
-            logits = tanh(logits / routerLogitSoftcapping) * routerLogitSoftcapping
+    func callAsFunction(
+        _ x: MLXArray, normalizeWeights: Bool = true
+    ) -> (MLXArray, MLXArray) {
+        if routerLogitSoftcapping <= 0 {
+            // Pinned Laguna XS contract (the checkpoint ships no router
+            // softcap): the raw matmul feeds the compiled tail, which yields
+            // the pre-bias sigmoid scores and the negated bias-corrected scores
+            // `argPartition` selects on. Selection and weights are untouched.
+            let tail = lagunaCompiledRouterTail([x.matmul(weight.T), e_score_correction_bias])
+            let scores = tail[0]
+            let inds = argPartition(tail[1], kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+            var weights = takeAlong(scores, inds, axis: -1)
+            if normTopkProb && normalizeWeights {
+                weights = lagunaCompiledTopKNormalize(weights)
+            }
+            return (inds, weights)
         }
+
+        // Softcapped router (not the Laguna XS contract): the original tail.
+        var logits = x.matmul(weight.T).asType(.float32)
+        logits = tanh(logits / routerLogitSoftcapping) * routerLogitSoftcapping
 
         let scores = sigmoid(logits)
         let scoresForChoice = scores + e_score_correction_bias.asType(scores.dtype)
 
         let inds = argPartition(-scoresForChoice, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
         var weights = takeAlong(scores, inds, axis: -1)
-        if normTopkProb {
+        if normTopkProb && normalizeWeights {
             weights = weights / weights.sum(axis: -1, keepDims: true)
         }
         return (inds, weights)
@@ -207,6 +313,12 @@ private class LagunaMoEGate: Module {
 
 private class LagunaSparseMoeBlock: Module, UnaryLayer {
     let routedScalingFactor: Float
+    /// True when the loaded config matches the routing contract the compiled
+    /// combine closures bake in: top-k renormalization on, no router softcap,
+    /// routed scale exactly 2.5. When false every fused tail is skipped and the
+    /// stock eager tail runs, so a differently-configured checkpoint stays
+    /// correct.
+    let usesFusedCombine: Bool
 
     @ModuleInfo(key: "gate") var gate: LagunaMoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -214,6 +326,10 @@ private class LagunaSparseMoeBlock: Module, UnaryLayer {
 
     init(_ config: LagunaConfiguration) {
         self.routedScalingFactor = config.moeRoutedScalingFactor
+        self.usesFusedCombine =
+            config.normTopkProb
+            && config.moeRouterLogitSoftcapping <= 0
+            && config.moeRoutedScalingFactor == lagunaPinnedRoutedScalingFactor
         self._gate.wrappedValue = LagunaMoEGate(config)
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
@@ -227,13 +343,39 @@ private class LagunaSparseMoeBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let (inds, weights) = gate(x)
-        var y = switchMLP(x, inds)
-        y = weightedExpertSum(y, weights.asType(y.dtype))
-        if routedScalingFactor != 1 {
-            y = y * routedScalingFactor
+        callAsFunction(x, residual: nil)
+    }
+
+    /// Sparse-layer entry point that folds the decoder's residual add into the
+    /// combine graph instead of paying a standalone kernel for it.
+    func callAsFunction(_ x: MLXArray, residual: MLXArray) -> MLXArray {
+        callAsFunction(x, residual: Optional(residual))
+    }
+
+    private func callAsFunction(_ x: MLXArray, residual: MLXArray?) -> MLXArray {
+        // When the fused tail is live the gate returns RAW top-k scores and the
+        // `weights / weights.sum(-1)` divide is folded into the combine, which
+        // drops one dispatch and one [B, L, topK] intermediate per sparse layer.
+        let (inds, weights) = gate(x, normalizeWeights: !usesFusedCombine)
+        let y = switchMLP(x, inds)
+        let shared = sharedExpert(x)
+        if usesFusedCombine {
+            if let residual {
+                return lagunaCompiledNormalizedExpertCombineWithResidual(
+                    y, weights, shared, residual)
+            }
+            return lagunaCompiledNormalizedExpertCombine(y, weights, shared)
         }
-        return y + sharedExpert(x)
+
+        var out = weightedExpertSum(y, weights.asType(y.dtype))
+        if routedScalingFactor != 1 {
+            out = out * routedScalingFactor
+        }
+        out = out + shared
+        if let residual {
+            return residual + out
+        }
+        return out
     }
 }
 
@@ -270,8 +412,13 @@ private class LagunaDecoderLayer: Module {
     ) -> MLXArray {
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
         let h = x + r
-        let r2 = mlp(postAttentionLayerNorm(h))
-        return h + r2
+        let mlpInput = postAttentionLayerNorm(h)
+        // 39 of 40 layers are sparse, and each of those absorbs this residual
+        // add into its compiled combine rather than dispatching it separately.
+        if let sparseMLP = mlp as? LagunaSparseMoeBlock {
+            return sparseMLP(mlpInput, residual: h)
+        }
+        return h + mlp(mlpInput)
     }
 }
 
