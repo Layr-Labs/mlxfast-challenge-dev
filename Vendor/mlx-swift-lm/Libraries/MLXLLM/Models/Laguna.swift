@@ -125,6 +125,24 @@ private let lagunaCompiledNormalizedExpertCombineWithResidual: @Sendable (
     return residual + moe
 }
 
+/// Group-32 affine INT8 for the attention projections.
+///
+/// This is the only re-quantization the track's frozen envelope admits on top
+/// of the reference NVFP4 weights, and it is LOSSY, so it ships behind a switch
+/// that defaults ON but can be turned off without a rebuild while bisecting a
+/// correctness failure: `LAGUNA_ATTENTION_INT8=0`.
+private let lagunaAttentionINT8Enabled: Bool = {
+    switch ProcessInfo.processInfo.environment["LAGUNA_ATTENTION_INT8"]?.lowercased() {
+    case "0", "false", "no", "off": return false
+    default: return true
+    }
+}()
+
+/// The envelope's exact ceiling: group 32, 8 bits. Making either value lossier
+/// would leave the accepted representation set.
+private let lagunaAttentionINT8GroupSize = 32
+private let lagunaAttentionINT8Bits = 8
+
 // MARK: - Attention
 
 private class LagunaAttention: Module {
@@ -190,9 +208,66 @@ private class LagunaAttention: Module {
         super.init()
     }
 
+    /// Re-represent the attention projections as group-32 affine INT8.
+    ///
+    /// Laguna XS ships `q/k/v/o/g_proj` in BF16 while only the expert banks are
+    /// NVFP4, so attention is roughly 2.9 GB of the ~4.3 GB a decode step must
+    /// stream — about two thirds of the traffic, and the largest single term in
+    /// the budget. Group-32 affine INT8 is 8 bits per weight plus one fp16 scale
+    /// and one fp16 bias per 32 weights, i.e. 9 bits against BF16's 16, which
+    /// removes ~1.25 GB per step.
+    ///
+    /// This is the one re-quantization the track's frozen quantization envelope
+    /// admits beyond the reference NVFP4 weights: "the attention Q/K/V, output,
+    /// and per-head gate (`g_proj`) projection weights may be re-represented as
+    /// group-32 affine INT8 derived at init from the loaded weights". Nothing
+    /// else is touched — the routed experts, shared expert, MoE router gate,
+    /// embeddings and `lm_head` all stay exactly as shipped.
+    ///
+    /// Unlike every other change on this path this one is LOSSY, so it is gated
+    /// on the exact-token correctness runs, not just on the timer.
+    ///
+    /// Runs on the first forward because the checkpoint's BF16 weights are
+    /// installed after construction. Every scored entry point warms the model
+    /// before its timed window opens, so the conversion itself is untimed.
+    private var projectionsRequantized = false
+
+    private func requantizeProjectionsIfNeeded() {
+        guard !projectionsRequantized else { return }
+        projectionsRequantized = true
+        guard lagunaAttentionINT8Enabled else { return }
+
+        var replacements: [(String, Module)] = []
+        for (key, linear) in [
+            ("q_proj", wq), ("k_proj", wk), ("v_proj", wv), ("o_proj", wo),
+        ] + (gProj.map { [("g_proj", $0)] } ?? []) {
+            // Only a plain BF16/FP16 `Linear` is eligible: anything already
+            // quantized must be left alone, and the group size has to divide the
+            // input dimension exactly.
+            guard type(of: linear) == Linear.self,
+                linear.weight.ndim == 2,
+                linear.weight.dtype == .bfloat16 || linear.weight.dtype == .float16,
+                linear.weight.dim(1) % lagunaAttentionINT8GroupSize == 0
+            else {
+                continue
+            }
+            let quantized = QuantizedLinear(
+                linear,
+                groupSize: lagunaAttentionINT8GroupSize,
+                bits: lagunaAttentionINT8Bits,
+                mode: .affine
+            )
+            eval(quantized.weight, quantized.scales)
+            replacements.append((key, quantized))
+        }
+        guard !replacements.isEmpty else { return }
+        update(modules: ModuleChildren.unflattened(replacements))
+    }
+
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
+        requantizeProjectionsIfNeeded()
         let (B, L) = (x.dim(0), x.dim(1))
 
         var queries = wq(x)
