@@ -1,8 +1,139 @@
 import Dispatch
 import Foundation
 import MLX
+import MLXFastCore
+import MLXLMCommon
 @testable import MLXFastRuntimeWorkerSupport
 import Testing
+
+// MARK: - Hybrid cache-position validation
+
+/// Synthetic stand-in for `Qwen35TextModel.newCache`: one cache per layer,
+/// `KVCacheSimple` on the 16 full-attention layers (index % 4 == 3) and
+/// `MambaCache` on the 48 gated-delta layers. Constructing these allocates no
+/// MLXArray and loads no model, so the hybrid contract is testable on any
+/// machine.
+private func syntheticQwenHybridCaches(
+    attentionOffset: Int,
+    recurrentOffset: Int = 0,
+    layerCount: Int = MLXFastConstants.numHiddenLayers,
+    homogeneous: Bool = false
+) -> [BaseKVCache] {
+    let interval = MLXFastConstants.fullAttentionInterval
+    return (0..<layerCount).map { index in
+        let isFullAttention = homogeneous || index % interval == interval - 1
+        let cache: BaseKVCache = isFullAttention ? KVCacheSimple() : MambaCache()
+        cache.offset = isFullAttention ? attentionOffset : recurrentOffset
+        return cache
+    }
+}
+
+/// REGRESSION (native box-3 `generate-golden`, branch tip 13ff24b):
+/// `verifyQwenCachePosition` was renamed from `verifyLagunaCachePosition`
+/// without changing its rule, so it still demanded that ALL 64 layer caches
+/// report the same offset. Laguna's stack is homogeneous KV; Qwen 3.6 is
+/// hybrid, and the gated-delta caches never advance past 0. The first prefill
+/// passed (everything at 0) and the very next forward died with
+/// "Qwen KV cache layer offsets are inconsistent".
+@Test
+func qwenHybridCachePositionAcceptsRecurrentCachesPinnedAtZero() throws {
+    // Fresh cache before the first forward.
+    try QwenRuntime.verifyQwenCachePosition(
+        positionOffset: 0,
+        cache: syntheticQwenHybridCaches(attentionOffset: 0)
+    )
+    // After a 512-token prefill: 16 KV caches at 512, 48 recurrent caches at 0.
+    // This is the exact shape that used to throw.
+    try QwenRuntime.verifyQwenCachePosition(
+        positionOffset: 512,
+        cache: syntheticQwenHybridCaches(attentionOffset: 512)
+    )
+    // And after each subsequent teacher-forced decode step.
+    for step in 1...4 {
+        try QwenRuntime.verifyQwenCachePosition(
+            positionOffset: 512 + step,
+            cache: syntheticQwenHybridCaches(attentionOffset: 512 + step)
+        )
+    }
+}
+
+@Test
+func qwenHybridCachePositionRejectsDivergentFullAttentionOffsets() {
+    var caches = syntheticQwenHybridCaches(attentionOffset: 512)
+    // Layer 7 is full attention; make it lag the rest of the KV stack.
+    caches[7].offset = 511
+    #expect(throws: MLXFastError.self) {
+        try QwenRuntime.verifyQwenCachePosition(positionOffset: 512, cache: caches)
+    }
+}
+
+@Test
+func qwenHybridCachePositionRejectsRecurrentCachesThatCountPositions() {
+    // A gated-delta cache that advanced means the stack is not the pinned
+    // hybrid tower; the offset it reports is not a position this check can
+    // reconcile with the caller's.
+    #expect(throws: MLXFastError.self) {
+        try QwenRuntime.verifyQwenCachePosition(
+            positionOffset: 512,
+            cache: syntheticQwenHybridCaches(attentionOffset: 512, recurrentOffset: 512)
+        )
+    }
+}
+
+@Test
+func qwenHybridCachePositionRejectsWrongTopologyOrLayerCount() {
+    // A homogeneous all-KV stack is lockstep-consistent and would have
+    // satisfied the old rule, but it is not this tower.
+    #expect(throws: MLXFastError.self) {
+        try QwenRuntime.verifyQwenCachePosition(
+            positionOffset: 512,
+            cache: syntheticQwenHybridCaches(attentionOffset: 512, homogeneous: true)
+        )
+    }
+    // Wrong layer count, right topology.
+    #expect(throws: MLXFastError.self) {
+        try QwenRuntime.verifyQwenCachePosition(
+            positionOffset: 512,
+            cache: syntheticQwenHybridCaches(attentionOffset: 512, layerCount: 40)
+        )
+    }
+    #expect(throws: MLXFastError.self) {
+        try QwenRuntime.verifyQwenCachePosition(positionOffset: 0, cache: [])
+    }
+}
+
+@Test
+func qwenHybridCachePositionStillRejectsAStaleOrReusedCache() {
+    // The fail-loudly contract the Laguna check existed for is preserved: the
+    // caller's position must equal what the KV stack actually holds.
+    #expect(throws: MLXFastError.self) {
+        try QwenRuntime.verifyQwenCachePosition(
+            positionOffset: 513,
+            cache: syntheticQwenHybridCaches(attentionOffset: 512)
+        )
+    }
+    #expect(throws: MLXFastError.self) {
+        try QwenRuntime.verifyQwenCachePosition(
+            positionOffset: -1,
+            cache: syntheticQwenHybridCaches(attentionOffset: 0)
+        )
+    }
+}
+
+/// The gate and the cache check must read the same schedule; a tower whose
+/// interval changed would otherwise pass one and fail the other.
+@Test
+func qwenFullAttentionIntervalMatchesThePinnedLayerSchedule() {
+    #expect(MLXFastConstants.fullAttentionInterval == 4)
+    #expect(MLXFastConstants.numHiddenLayers % MLXFastConstants.fullAttentionInterval == 0)
+    let fullAttentionLayers = (0..<MLXFastConstants.numHiddenLayers).filter {
+        $0 % MLXFastConstants.fullAttentionInterval
+            == MLXFastConstants.fullAttentionInterval - 1
+    }
+    #expect(fullAttentionLayers.count == 16)
+    #expect(fullAttentionLayers.first == 3)
+    #expect(fullAttentionLayers.last == 63)
+}
 
 @Test
 func lagunaCorrectnessSelectsGreedyTokenWhenRuntimeTestsAreEnabled() throws {

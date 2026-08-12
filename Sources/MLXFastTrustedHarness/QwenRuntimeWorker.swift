@@ -214,9 +214,31 @@ extension QwenRuntime {
         return model(inputIDs, cache: cache)
     }
 
-    /// Every layer cache must agree on one logical offset
-    /// (`StandardKVCache` and `RotatingKVCache` both count total positions
-    /// seen), and it must equal the caller's expected position.
+    /// Validate the caller's expected position against the HYBRID cache stack.
+    ///
+    /// `Qwen35TextModel.newCache` returns one cache per layer, but they are not
+    /// interchangeable: the 16 full-attention layers (index % 4 == 3) get a
+    /// `KVCacheSimple` whose `offset` counts every position written, while the
+    /// 48 gated-delta linear-attention layers get a `MambaCache` holding
+    /// recurrent state, whose inherited `offset` the vendored gated-delta
+    /// forward never advances -- it stays 0 for the life of the sequence,
+    /// because a recurrent state has no per-position addressing to validate.
+    ///
+    /// So "every layer cache agrees on one offset" -- true of Laguna's
+    /// homogeneous KV stack, and what this check asserted when it was renamed
+    /// from `verifyLagunaCachePosition` -- is false here from the SECOND
+    /// forward of every sequence onward: 48 caches read 0 while 16 read N.
+    /// The invariant the hybrid layout actually provides is:
+    ///
+    /// - one cache per layer, at the pinned 64-layer count;
+    /// - the full-attention caches move in lockstep and equal the caller's
+    ///   expected position;
+    /// - the recurrent caches stay pinned at 0.
+    ///
+    /// Deliberately NOT delegated to `MLXFastModel`'s equivalent
+    /// (`validateQwen35CachePosition`), which encodes the same rule: that
+    /// module is participant-editable, and this is the trusted parent's
+    /// fail-loudly check on a stale or reused cache.
     static func verifyQwenCachePosition(
         positionOffset: Int,
         cache: [KVCache]
@@ -224,11 +246,45 @@ extension QwenRuntime {
         guard positionOffset >= 0 else {
             throw MLXFastError.invalidInput("Qwen position offset must be non-negative")
         }
-        guard let cacheOffset = cache.first?.offset else {
-            throw MLXFastError.invalidInput("Qwen model returned no KV caches")
+        guard cache.count == MLXFastConstants.numHiddenLayers else {
+            throw MLXFastError.invalidInput(
+                "Qwen model returned \(cache.count) layer caches, expected one per layer "
+                    + "(\(MLXFastConstants.numHiddenLayers))"
+            )
         }
-        guard cache.allSatisfy({ $0.offset == cacheOffset }) else {
-            throw MLXFastError.invalidInput("Qwen KV cache layer offsets are inconsistent")
+
+        let interval = MLXFastConstants.fullAttentionInterval
+        var attentionOffset: Int?
+        for (layerIndex, layerCache) in cache.enumerated() {
+            guard layerIndex % interval == interval - 1 else {
+                // Gated-delta layer: recurrent state, no position notion.
+                guard !(layerCache is KVCacheSimple), layerCache.offset == 0 else {
+                    throw MLXFastError.invalidInput(
+                        "Qwen recurrent cache at layer \(layerIndex) reports offset "
+                            + "\(layerCache.offset); gated-delta layers carry recurrent state "
+                            + "and must not count positions"
+                    )
+                }
+                continue
+            }
+            guard layerCache is KVCacheSimple else {
+                throw MLXFastError.invalidInput(
+                    "Qwen full-attention layer \(layerIndex) must carry a KV cache"
+                )
+            }
+            guard let expected = attentionOffset else {
+                attentionOffset = layerCache.offset
+                continue
+            }
+            guard layerCache.offset == expected else {
+                throw MLXFastError.invalidInput(
+                    "Qwen KV cache layer offsets are inconsistent"
+                )
+            }
+        }
+
+        guard let cacheOffset = attentionOffset else {
+            throw MLXFastError.invalidInput("Qwen model returned no full-attention KV caches")
         }
         guard positionOffset == cacheOffset else {
             throw MLXFastError.invalidInput(
@@ -630,8 +686,9 @@ func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
         )
     }
 
+    let interval = MLXFastConstants.fullAttentionInterval
     let expectedLayerTypes = (0..<MLXFastConstants.numHiddenLayers).map {
-        $0 % 4 == 3 ? "full_attention" : "linear_attention"
+        $0 % interval == interval - 1 ? "full_attention" : "linear_attention"
     }
     guard decoded.modelType == "qwen3_5_text",
           decoded.vocabSize == MLXFastConstants.vocabSize,
@@ -646,7 +703,7 @@ func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
           decoded.linearValueHeadDim == 128,
           decoded.linearKeyHeadDim == 128,
           decoded.linearConvKernelDim == 4,
-          decoded.fullAttentionInterval == 4,
+          decoded.fullAttentionInterval == MLXFastConstants.fullAttentionInterval,
           decoded.layerTypes == expectedLayerTypes,
           decoded.rmsNormEps == 1e-6,
           decoded.hiddenActivation == "silu",

@@ -26,6 +26,13 @@ public enum MLXFastConstants {
     public static let intermediateSize = 17_408
     public static let numHiddenLayers = 64
     public static let attentionHeads = 24
+    /// `full_attention_interval`: the tower repeats every 4 layers and the
+    /// LAST layer of each group (index % 4 == 3) is full attention, so 16 of
+    /// the 64 layers carry a KV cache and the other 48 carry gated-delta
+    /// recurrent state. Trusted code that has to reason about the hybrid cache
+    /// stack -- the runtime worker's pinned-config gate and its cache-position
+    /// check -- reads the schedule from here instead of repeating the literal.
+    public static let fullAttentionInterval = 4
     public static let correctnessPromptTokens = 512
     // Keep the public gate long enough to catch broad decode regressions while
     // leaving budget for the hidden GPQA behavior checks in the official job.
