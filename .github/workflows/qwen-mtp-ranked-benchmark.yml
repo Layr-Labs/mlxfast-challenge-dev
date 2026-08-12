@@ -1287,8 +1287,8 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           # Private object keys scoped to this trusted download step only (never
           # job level), so untrusted bench phases never receive the object names.
-          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/hidden-correctness-golden-QWEN-MTP-PENDING-ORGANIZER.json
-          MLXFAST_GPQA_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/gpqa-reference-cases-QWEN-MTP-PENDING-ORGANIZER.json
+          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-hidden-correctness-golden-QWEN-MTP-PENDING-ORGANIZER.json
+          MLXFAST_GPQA_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-gpqa-reference-cases-QWEN-MTP-PENDING-ORGANIZER.json
         run: |
           set -euo pipefail
           for key in "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" "${MLXFAST_GPQA_R2_PATH}"; do
@@ -1675,7 +1675,7 @@ jobs:
           # QWEN-PENDING-ORGANIZER. The correctness golden key is fixed (it is an
           # untimed gate and is not what the lottery would target); the timed
           # golden key comes from the per-run pool selection.
-          MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen_mtp_correctness_golden_hidden-QWEN-MTP-PENDING-ORGANIZER.json
+          MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-mtp-correctness-golden-hidden-QWEN-MTP-PENDING-ORGANIZER.json
           MLXFAST_QWEN_MTP_BENCH_GOLDEN_R2_PATH: ${{ steps.select_qwen_mtp_target.outputs.r2_path }}
           MLXFAST_QWEN_MTP_BENCH_GOLDEN_SHA256_SELECTED: ${{ steps.select_qwen_mtp_target.outputs.sha256 }}
           MLXFAST_QWEN_MTP_BENCH_GOLDEN_BYTES_SELECTED: ${{ steps.select_qwen_mtp_target.outputs.bytes }}
