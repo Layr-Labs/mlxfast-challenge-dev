@@ -188,11 +188,13 @@ public enum SwiftTransform {
             totalTensorByteCount = nextTotal
         }
 
-        if modelFamily == .laguna {
-            // Fail before the multi-GB copy if the selected tensor set is
-            // structurally inconsistent with the quantization spec the
-            // emitted config.json declares (the runtime re-validates the
-            // full geometry against LagunaConfig at load).
+        // Fail before the multi-GB copy if the selected tensor set is
+        // structurally inconsistent with the quantization spec the emitted
+        // config.json declares (the runtime re-validates the full geometry
+        // against its own config type at load). Gemma 4 is the legacy
+        // synthetic-fixture family and has no hardcoded public inventory.
+        switch modelFamily {
+        case .laguna:
             try LagunaCheckpointValidation.validateSelectedTensors(
                 selectedKeys: textKeys,
                 index: index,
@@ -201,6 +203,17 @@ public enum SwiftTransform {
                     fromConfigRoot: sourceConfigRoot
                 )
             )
+        case .qwen35:
+            try Qwen35CheckpointValidation.validateSelectedTensors(
+                selectedKeys: textKeys,
+                index: index,
+                headers: validatedHeaders,
+                quantization: Qwen35CheckpointValidation.quantizationSpec(
+                    fromConfigRoot: sourceConfigRoot
+                )
+            )
+        case .gemma4:
+            break
         }
 
         let fileManager = FileManager.default
@@ -696,30 +709,18 @@ public enum SwiftTransform {
             // The pinned Qwen checkpoint publishes the SAME affine spec twice,
             // as `quantization` and `quantization_config`. Emitting one of two
             // conflicting specs would silently pick a quantization the shards
-            // were not written with, so require them to agree when both are
-            // present rather than preferring either.
-            let quantization = root["quantization"]
-            let quantizationConfig = root["quantization_config"]
-            if let quantization, let quantizationConfig {
-                let canonicalQuantization = try JSONSerialization.data(
-                    withJSONObject: quantization,
-                    options: [.sortedKeys]
-                )
-                let canonicalQuantizationConfig = try JSONSerialization.data(
-                    withJSONObject: quantizationConfig,
-                    options: [.sortedKeys]
-                )
-                guard canonicalQuantization == canonicalQuantizationConfig else {
-                    throw MLXFastError.invalidInput(
-                        "reference config quantization and quantization_config conflict"
-                    )
-                }
-                runtimeConfig["quantization"] = quantization
-            } else if let quantization {
-                runtimeConfig["quantization"] = quantization
-            } else if let quantizationConfig {
-                runtimeConfig["quantization"] = quantizationConfig
-            }
+            // were not written with, so the parse below requires them to agree
+            // when both are present rather than preferring either -- and pins
+            // the values to affine 4-bit group-64 while it is there.
+            let spec = try Qwen35CheckpointValidation.quantizationSpec(
+                fromConfigRoot: root
+            )
+            runtimeConfig.removeValue(forKey: "quantization_config")
+            runtimeConfig["quantization"] = [
+                "group_size": spec.groupSize,
+                "bits": spec.bits,
+                "mode": spec.mode,
+            ]
         case .laguna:
             _ = try LagunaCheckpointValidation.quantizationSpec(fromConfigRoot: root)
             runtimeConfig = root
