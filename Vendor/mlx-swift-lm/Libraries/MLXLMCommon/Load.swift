@@ -76,6 +76,49 @@ public struct AdditionalWeightSource: Sendable {
 /// directory. Same idiom, same lifetime discipline as `_qwen35MTPEnabled`.
 public nonisolated(unsafe) var _additionalWeightSources: [AdditionalWeightSource] = []
 
+/// Prefix stripped from the PRIMARY directory's tensor names by the next
+/// ``loadWeights`` call, before `sanitize`.
+///
+/// This exists for one specific, checked-in shape: a checkpoint whose tensors are named
+/// for a multimodal WRAPPER (`language_model.model.*`, `language_model.lm_head.weight`)
+/// while its `config.json` declares the bare TEXT model. Such a tree is internally
+/// consistent only if the loader strips the wrapper prefix — which is exactly what this
+/// repository's own eager loader (`RuntimeWeightNameTracker`) already does for the same
+/// tree, by the same rule.
+///
+/// DO NOT SET THIS FOR A WRAPPER MODEL. `Qwen35Model.sanitize` deliberately ADDS
+/// `language_model.` so the parameters address its `language_model` child; stripping it
+/// first would leave every tensor addressed to nothing. The caller decides from the
+/// config's declared `model_type`, which is the only place the answer is written down.
+public nonisolated(unsafe) var _primaryWeightKeyPrefixStrip: String?
+
+/// Drop `prefix` from every key that carries it.
+///
+/// Pure and model-free so the rename rule is testable without loading anything.
+/// A collision after the rename means the tree carried BOTH spellings of a
+/// tensor and one of them would silently win, so it throws instead — the same
+/// stance this repository's eager loader (`RuntimeWeightNameTracker`) takes on
+/// the identical rename.
+public func strippingWeightKeyPrefix(
+    _ prefix: String, from weights: [String: MLXArray]
+) throws -> [String: MLXArray] {
+    guard !prefix.isEmpty else { return weights }
+    var renamed = [String: MLXArray]()
+    renamed.reserveCapacity(weights.count)
+    for (key, value) in weights {
+        let name = key.hasPrefix(prefix)
+            ? String(key.dropFirst(prefix.count)) : key
+        guard renamed.updateValue(value, forKey: name) == nil else {
+            throw ModelFactoryError.configurationFileError(
+                "model.safetensors.index.json",
+                "weight names collide after stripping '\(prefix)': \(name)",
+                NSError(domain: "MLXLMCommon", code: 1)
+            )
+        }
+    }
+    return renamed
+}
+
 /// Load a directory's safetensors into one dictionary, without any model coupling.
 public func loadArrays(directory: URL) throws -> [String: MLXArray] {
     var urls: [URL] = []
@@ -184,6 +227,13 @@ public func loadWeights(
     // already establishes this exact idiom in this fork: a global set
     // immediately before the load, read during it. Callers must clear it after
     // the load; see `Qwen36MTPHeadAttachment` on the consumer side.
+    // Strip the wrapper prefix from the primary tree FIRST, so an additional
+    // source merged below lands in the same namespace the model addresses.
+    if let strip = _primaryWeightKeyPrefixStrip, !strip.isEmpty {
+        weights = try strippingWeightKeyPrefix(strip, from: weights)
+        mark("strip \(strip)*")
+    }
+
     for source in _additionalWeightSources {
         let extra = try loadArrays(directory: source.directory)
         for (key, value) in extra {

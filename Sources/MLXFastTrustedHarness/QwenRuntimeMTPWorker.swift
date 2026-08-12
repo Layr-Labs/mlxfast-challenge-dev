@@ -134,21 +134,43 @@ extension QwenRuntime {
 
         let targetURL = URL(fileURLWithPath: targetWeightsPath)
         let headURL = URL(fileURLWithPath: mtpHeadPath)
+        // The layout is read from the backbone's OWN config and decides both
+        // which class the factory builds and whether the transform's
+        // `language_model.` text-tower prefix has to be stripped from the
+        // primary tree. Both Qwen 3.6 classes are accepted, because
+        // `Qwen35Model` is a pure pass-through wrapper around the same
+        // `Qwen35TextModel` for every call this session makes -- see
+        // `Qwen36MTPTarget`. Accepting only one of them is what made this worker
+        // unloadable in both directions: the transformed tree builds the bare
+        // text model, and the raw pinned reference builds the wrapper.
+        var backboneLayout = Qwen36MTPHeadAttachment.BackboneLayout.textModel
         let context = try Qwen36MTPHeadAttachment.withHeadAttached(
+            backboneDirectory: targetURL,
             headDirectory: headURL
-        ) {
-            try waitForQwenMTPAsync {
+        ) { layout in
+            backboneLayout = layout
+            return try waitForQwenMTPAsync {
                 try await LLMModelFactory.shared.load(
                     from: targetURL,
                     using: #huggingFaceTokenizerLoader()
                 )
             }
         }
-        guard let model = context.model as? Qwen35TextModel else {
+        guard let model = context.model as? any Qwen36MTPTarget else {
             throw MLXFastError.invalidInput(
-                "the Qwen MTP target is not a Qwen35TextModel: "
-                    + "\(type(of: context.model))")
+                "the Qwen MTP backbone loaded as \(type(of: context.model)), "
+                    + "which is not an MTP-capable Qwen 3.6 model. This track "
+                    + "serves Qwen35TextModel (the transformed weights/ tree, "
+                    + "model_type qwen3_5_text) and Qwen35Model (the raw pinned "
+                    + "reference, model_type qwen3_5) and nothing else.")
         }
+        fputs(
+            "mlxfast-worker: qwen-mtp backbone layout=\(backboneLayout.rawValue) "
+                + "class=\(type(of: context.model)) "
+                + "key_prefix_strip="
+                + "\(backboneLayout.primaryKeyPrefixStrip ?? "<none>")\n",
+            stderr
+        )
         // Fail here rather than at the first draft. `_qwen35MTPEnabled` is set
         // and cleared around the load, and the head only attaches when the
         // configuration also declares `mtp_num_hidden_layers > 0`; a tree whose
@@ -232,7 +254,7 @@ extension QwenRuntime {
     static func handleQwenMTPWorkerRequest(
         _ request: RuntimeWorkerRequest,
         sessionNonce: String,
-        model: Qwen35TextModel,
+        model: any Qwen36MTPTarget,
         session: Qwen36MTPBlockSession,
         state: inout QwenMTPWorkerState
     ) throws -> RuntimeWorkerResponse {

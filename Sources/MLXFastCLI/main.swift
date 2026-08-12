@@ -1571,6 +1571,33 @@ private enum MLXFastCLI {
         return path
     }
 
+    /// Record, once per run, where the backbone and head actually came from.
+    ///
+    /// THE `MLXFAST_QWEN_MTP_TARGET_DIR` RECONCILIATION. The box-owned wrapper
+    /// exports that variable around every verb invocation, and nothing in
+    /// `Sources/` reads it — validation flagged it as dead. It is NOT wired up
+    /// here on purpose, and the reason is worth stating: the wrapper also passes
+    /// the load-bearing values as FLAGS (`--weights weights`, `--mtp-head <dir>`),
+    /// and those two things are not the same object. `--weights` is the
+    /// TRANSFORMED tree inside the phase workspace; `MLXFAST_QWEN_MTP_TARGET_DIR`
+    /// is the raw pinned HF snapshot the transform was derived FROM. Treating the
+    /// env var as a weights fallback would silently load the 16-file raw snapshot
+    /// instead of the 1,847-tensor transformed tree — a different model, scored
+    /// as if it were the candidate's. So it stays provenance only, it is logged
+    /// so an audit can see it, and `QwenMTPPayloadSchemaTests` pins that it never
+    /// becomes a load input.
+    private static func logQwenMTPProvenance(
+        verb: String, weightsPath: String, mtpHeadPath: String
+    ) {
+        let referenceDirectory = environmentValue(
+            "MLXFAST_QWEN_MTP_TARGET_DIR", fallback: "<unset>")
+        fputs(
+            "\(verb): weights=\(weightsPath) mtp_head=\(mtpHeadPath) "
+                + "pinned_reference=\(referenceDirectory)\n",
+            stderr
+        )
+    }
+
     private static func qwenMTPWeightsPath(_ options: ParsedOptions) -> String {
         options.value(
             for: "--weights",
@@ -1649,6 +1676,9 @@ private enum MLXFastCLI {
                 "mtp-verify requires the participant runtime worker"
             )
         }
+        logQwenMTPProvenance(
+            verb: "mtp-verify", weightsPath: weightsPath,
+            mtpHeadPath: mtpHeadPath)
         let report = try QwenRuntime.qwenMTPDecode(
             verb: "mtp-verify",
             options: QwenMTPOptions(
@@ -1697,6 +1727,9 @@ private enum MLXFastCLI {
                 "mtp-timed requires the participant runtime worker"
             )
         }
+        logQwenMTPProvenance(
+            verb: "mtp-timed", weightsPath: weightsPath,
+            mtpHeadPath: mtpHeadPath)
         let report = try QwenRuntime.qwenMTPDecode(
             verb: "mtp-timed",
             options: QwenMTPOptions(

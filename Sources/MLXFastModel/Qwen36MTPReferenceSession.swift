@@ -51,14 +51,14 @@ public struct Qwen36MTPReferenceAnswer {
 }
 
 public final class Qwen36MTPReferenceSession {
-    private let model: Qwen35TextModel
+    private let model: any Qwen36MTPTarget
     private var cache: [any KVCache] = []
     /// Absolute position of the token whose logits the frame currently holds,
     /// i.e. how many tokens have been fed. -1 before the seed prefill.
     private var fed = -1
     private var seedTokens: [Int] = []
 
-    public init(model: Qwen35TextModel) {
+    public init(model: any Qwen36MTPTarget) {
         self.model = model
     }
 

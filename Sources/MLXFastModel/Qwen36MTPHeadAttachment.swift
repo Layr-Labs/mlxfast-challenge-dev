@@ -64,31 +64,132 @@ public enum Qwen36MTPHeadAttachment {
     /// The key prefix the head's bare tensor names are merged under.
     public static let headKeyPrefix = "mtp."
 
-    /// Run `body` with the head tree registered as an additional weight source
-    /// and `_qwen35MTPEnabled` set, restoring both afterwards.
+    /// Which class the factory will build for a backbone tree, and therefore
+    /// which tensor-name namespace that tree's weights have to land in.
     ///
-    /// BOTH globals are restored on EVERY exit path. They are process-global and
-    /// read by the next load of any model; leaking either would silently change
+    /// The two trees this track can be pointed at disagree, and the disagreement
+    /// is the structural blocker the first migration hit:
+    ///
+    ///   * the TRANSFORMED tree (`weights/`, the primary — it is what the ranked
+    ///     flow provides and what `qwen-mtp-weights.sha256` pins) carries a
+    ///     `config.json` that is the reference's `text_config` verbatim, so it
+    ///     declares `qwen3_5_text` and the factory builds a bare
+    ///     `Qwen35TextModel`. But its 1,847 tensor names still carry the
+    ///     `language_model.` text-tower prefix the transform selects on
+    ///     (`SwiftTransform.textTowerPrefix`), because that name set is a pinned
+    ///     contract. A bare text model addresses `model.*` / `lm_head.weight`,
+    ///     so the prefix must be stripped at load — which is precisely what this
+    ///     repository's own eager loader (`RuntimeWeightNameTracker`) already
+    ///     does for the same tree, by the same rule, and which the serial track's
+    ///     natively byte-identical golden regeneration validated on box 3.
+    ///
+    ///   * the RAW pinned reference declares `qwen3_5` with a nested
+    ///     `text_config`, so the factory builds the multimodal `Qwen35Model`
+    ///     wrapper. That class's own `sanitize` ADDS `language_model.` so the
+    ///     parameters address its `language_model` child, so stripping the
+    ///     prefix first would leave every tensor addressed to nothing.
+    ///
+    /// Same prefix, opposite handling, and the ONLY place the answer is written
+    /// down is the config's `model_type`. Hence this enum rather than a guess.
+    public enum BackboneLayout: String, Sendable {
+        /// Flat text config (`qwen3_5_text`): factory builds `Qwen35TextModel`.
+        case textModel
+        /// Nested config (`qwen3_5` / `qwen3_6`): factory builds `Qwen35Model`.
+        case wrappedTextModel
+
+        /// The prefix to strip from the primary tree's tensor names, if any.
+        public var primaryKeyPrefixStrip: String? {
+            switch self {
+            case .textModel: return SwiftTransformTextTowerPrefix
+            case .wrappedTextModel: return nil
+            }
+        }
+    }
+
+    /// The text-tower prefix the transform selects on. Duplicated from
+    /// `SwiftTransform.textTowerPrefix` (which is `internal` to MLXFastTransform,
+    /// a target MLXFastModel does not depend on) and pinned equal to it by
+    /// `QwenMTPBackboneLayoutTests`.
+    public static let SwiftTransformTextTowerPrefix = "language_model."
+
+    /// Read the backbone's `config.json` and decide its layout.
+    ///
+    /// Refuses anything that is not a Qwen 3.5/3.6 family config LOUDLY: pointing
+    /// this track at some other checkpoint has to be a legible abort, not a
+    /// keyNotFound from three layers down inside the factory.
+    public static func backboneLayout(configData: Data) throws -> BackboneLayout {
+        guard let root = try? JSONSerialization.jsonObject(with: configData)
+            as? [String: Any],
+            let modelType = root["model_type"] as? String
+        else {
+            throw MLXFastError.invalidInput(
+                "the Qwen MTP backbone config.json declares no model_type")
+        }
+        guard modelType.hasPrefix("qwen3_5") || modelType.hasPrefix("qwen3_6")
+        else {
+            throw MLXFastError.invalidInput(
+                "the Qwen MTP backbone declares model_type \(modelType), which is "
+                    + "not a Qwen 3.5/3.6 family checkpoint")
+        }
+        // A nested `text_config` is what makes the factory build the wrapper. The
+        // model_type suffix agrees with it on every checkpoint this track pins,
+        // and where they could disagree the STRUCTURE is what the factory keys
+        // on, so the structure decides.
+        if root["text_config"] is [String: Any] {
+            return .wrappedTextModel
+        }
+        guard modelType.hasSuffix("_text") || root["num_hidden_layers"] != nil
+        else {
+            throw MLXFastError.invalidInput(
+                "the Qwen MTP backbone declares \(modelType) with neither a "
+                    + "text_config nor flat text-model fields; its layout cannot "
+                    + "be determined")
+        }
+        return .textModel
+    }
+
+    public static func backboneLayout(directory: URL) throws -> BackboneLayout {
+        let configURL = directory.appendingPathComponent("config.json")
+        guard let data = try? Data(contentsOf: configURL) else {
+            throw MLXFastError.invalidInput(
+                "the Qwen MTP backbone tree carries no config.json: "
+                    + directory.path)
+        }
+        return try backboneLayout(configData: data)
+    }
+
+    /// Run `body` with the head tree registered as an additional weight source,
+    /// the primary tree's key rewrite selected from its own config, and
+    /// `_qwen35MTPEnabled` set — restoring all three afterwards.
+    ///
+    /// ALL THREE globals are restored on EVERY exit path. They are process-global
+    /// and read by the next load of any model; leaking one would silently change
     /// how an unrelated later load behaves, which on a worker that serves a
     /// reference replay after the candidate is exactly the kind of cross-phase
     /// coupling this track cannot have.
+    @discardableResult
     public static func withHeadAttached<T>(
+        backboneDirectory: URL,
         headDirectory: URL,
-        _ body: () throws -> T
+        _ body: (BackboneLayout) throws -> T
     ) throws -> T {
+        let layout = try backboneLayout(directory: backboneDirectory)
         try verifyHeadTree(headDirectory)
         let previousSources = _additionalWeightSources
+        let previousStrip = _primaryWeightKeyPrefixStrip
         let previousEnabled = _qwen35MTPEnabled
         _additionalWeightSources = [
             AdditionalWeightSource(
                 directory: headDirectory, keyPrefix: headKeyPrefix)
         ]
+        _primaryWeightKeyPrefixStrip = layout.primaryKeyPrefixStrip
         _qwen35MTPEnabled = true
         defer {
             _additionalWeightSources = previousSources
+            _primaryWeightKeyPrefixStrip = previousStrip
             _qwen35MTPEnabled = previousEnabled
         }
-        return try body()
+        return try body(layout)
     }
 
     /// Structural checks that do not need MLX and are therefore unit-testable.
@@ -98,6 +199,18 @@ public enum Qwen36MTPHeadAttachment {
     /// `fixtures/qwen3_6_27b_mtp_head.sha256`, every run, before anything loads).
     /// Repeating it here would be a second, weaker copy of a stronger gate; what
     /// this adds is the shape the LOADER depends on.
+    ///
+    /// STAGING MUST EXCLUDE `.gitattributes`. The pinned head repo carries 8
+    /// files; the manifest pins 7, dropping `.gitattributes` exactly as the
+    /// backbone manifest drops it. `verify_cache` also runs a strict FLAT
+    /// INVENTORY check — any file present in the cache that the manifest does not
+    /// name is an error — so a stock `snapshot_download`, which brings
+    /// `.gitattributes` along, produces a head cache the ranked workflow rejects
+    /// wholesale. Box 3 hit exactly this. The installer and any manual staging
+    /// must drop it (`rm -f <head>/.gitattributes`, or download with an
+    /// allow-list); adding it to the manifest instead would diverge from the
+    /// backbone manifest's own convention and re-pin a git plumbing file as
+    /// model bytes.
     public static func verifyHeadTree(_ headDirectory: URL) throws {
         let fileManager = FileManager.default
         var isDirectory: ObjCBool = false

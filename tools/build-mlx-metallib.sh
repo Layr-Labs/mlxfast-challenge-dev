@@ -18,6 +18,25 @@ repository_path() {
   fi
 }
 
+# --all-build-roots: also publish next to the trusted CLI and into EVERY xctest
+# bundle under both build roots, in either configuration.
+#
+# WHY THIS FLAG EXISTS. Cmlx searches for `mlx.metallib` next to the RUNNING
+# executable. The default publish target is the participant worker's build root,
+# which is correct for a benchmark run and useless for `swift test`: the test
+# bundle is a third location, `swift test` builds debug while this script
+# defaults to release, and the pre-existing test-bundle publish below is gated on
+# the configuration being debug. So the documented sequence
+# "tools/build-mlx-metallib.sh && MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test"
+# left every MLX-gated test failing at its first MLXArray with "Failed to load
+# the default metallib" -- and a run WITHOUT the env var skips those tests and
+# exits 0, so the gap reads as green. `QwenMTPMetallibAvailabilityTests` turns
+# the missing file into one legible failure; this flag is the fix it names.
+# Parsed by the argument handler further down, alongside --print-fingerprint,
+# so that flag keeps working: it must be recognised BEFORE the fingerprint
+# early-exit's own "unknown argument" branch, not by a second loop above it.
+PUBLISH_ALL_BUILD_ROOTS=0
+
 BUILD_CONFIGURATION="${MLXFAST_SWIFT_CONFIGURATION:-release}"
 RUNTIME_WORKER_BIN="$(repository_path \
   "${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-.build-worker/${BUILD_CONFIGURATION}/mlxfast-runtime-worker}")"
@@ -74,10 +93,18 @@ if [[ "${1:-}" == "--print-fingerprint" ]]; then
   compute_vendored_metal_fingerprint
   exit 0
 fi
-if [[ "$#" -gt 0 ]]; then
-  echo "build-mlx-metallib.sh: unknown argument '$1' (supported: --print-fingerprint)" >&2
-  exit 2
-fi
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --all-build-roots)
+      PUBLISH_ALL_BUILD_ROOTS=1
+      shift
+      ;;
+    *)
+      echo "build-mlx-metallib.sh: unknown argument '$1' (supported: --print-fingerprint, --all-build-roots)" >&2
+      exit 2
+      ;;
+  esac
+done
 CMAKE_BUILD_DIR="$(repository_path "${MLXFAST_MLX_METAL_BUILD_DIR:-.build-worker/mlx-metal}")"
 BUILD_LOCK_DIR="$(repository_path \
   "${MLXFAST_MLX_METAL_BUILD_LOCK_DIR:-${CMAKE_BUILD_DIR}.mlxfast-build.lock}")"
@@ -734,10 +761,30 @@ publish_metallib "${METALLIB_PATH}" "${OUTPUT_PATH}"
 publish_fingerprint_record "${OUTPUT_PATH}.fingerprint"
 echo "build-mlx-metallib.sh: wrote ${OUTPUT_PATH}"
 
-if [[ "${BUILD_CONFIGURATION}" == "debug" ]]; then
-  while IFS= read -r test_binary_dir; do
-    publish_metallib "${METALLIB_PATH}" "${test_binary_dir}/mlx.metallib"
-    publish_fingerprint_record "${test_binary_dir}/mlx.metallib.fingerprint"
-    echo "build-mlx-metallib.sh: wrote ${test_binary_dir}/mlx.metallib"
-  done < <(find .build -path "*.xctest/Contents/MacOS" -type d)
+if [[ "${BUILD_CONFIGURATION}" == "debug" || "${PUBLISH_ALL_BUILD_ROOTS}" == "1" ]]; then
+  search_roots=(.build)
+  if [[ "${PUBLISH_ALL_BUILD_ROOTS}" == "1" ]]; then
+    search_roots=(.build .build-worker)
+  fi
+  for search_root in "${search_roots[@]}"; do
+    [[ -d "${search_root}" ]] || continue
+    while IFS= read -r test_binary_dir; do
+      publish_metallib "${METALLIB_PATH}" "${test_binary_dir}/mlx.metallib"
+      publish_fingerprint_record "${test_binary_dir}/mlx.metallib.fingerprint"
+      echo "build-mlx-metallib.sh: wrote ${test_binary_dir}/mlx.metallib"
+    done < <(find "${search_root}" -path "*.xctest/Contents/MacOS" -type d)
+  done
+fi
+
+# The trusted CLI links no MLX today, so it needs no metallib of its own; a
+# swift-testing bundle run directly from a build root does. Publish beside every
+# built product directory under both roots so no runner location is missing one.
+if [[ "${PUBLISH_ALL_BUILD_ROOTS}" == "1" ]]; then
+  for product_dir in .build/debug .build/release .build-worker/debug .build-worker/release; do
+    [[ -d "${product_dir}" ]] || continue
+    [[ "$(cd "${product_dir}" && pwd -P)" == "$(dirname "${OUTPUT_PATH}")" ]] && continue
+    publish_metallib "${METALLIB_PATH}" "${product_dir}/mlx.metallib"
+    publish_fingerprint_record "${product_dir}/mlx.metallib.fingerprint"
+    echo "build-mlx-metallib.sh: wrote ${product_dir}/mlx.metallib"
+  done
 fi

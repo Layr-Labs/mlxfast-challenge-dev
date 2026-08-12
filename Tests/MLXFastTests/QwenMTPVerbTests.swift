@@ -393,6 +393,36 @@ struct QwenMTPPayloadSchemaTests {
         }
     }
 
+    /// `MLXFAST_QWEN_MTP_TARGET_DIR` must never become a LOAD input.
+    ///
+    /// The box wrapper exports it around every verb invocation and nothing reads
+    /// it, which reads like a bug and is not one: it names the RAW pinned HF
+    /// snapshot, while `--weights` names the TRANSFORMED tree derived from it.
+    /// Wiring the env var into the weights resolution would silently load the
+    /// 16-file raw snapshot instead of the 1,847-tensor transformed tree — a
+    /// different model, scored as the candidate's. It is provenance, it is
+    /// logged, and this test keeps it that way.
+    @Test
+    func thePinnedReferenceDirectoryIsProvenanceNotAWeightsSource() throws {
+        let cli = try S.text(Self.cliPath)
+        let resolver = try #require(
+            cli.range(of: "private static func qwenMTPWeightsPath("))
+        let end = try #require(
+            cli.range(
+                of: "\n    }\n", range: resolver.upperBound ..< cli.endIndex))
+        let body = String(cli[resolver.upperBound ..< end.lowerBound])
+        #expect(
+            !body.contains("MLXFAST_QWEN_MTP_TARGET_DIR"),
+            """
+            the MTP weights resolver now falls back to             MLXFAST_QWEN_MTP_TARGET_DIR. That variable is the RAW pinned             snapshot, not the transformed tree; using it as --weights loads a             different model and scores it as the candidate's.
+            """
+        )
+        #expect(body.contains("MLXFAST_WEIGHTS_PATH"))
+        // It IS read for provenance, so an audit can see which pinned reference
+        // the run was staged from.
+        #expect(cli.contains("pinned_reference="))
+    }
+
     /// Both MTP verbs must be reachable from the CLI dispatch, because the ranked
     /// workflow and the local runner both assert their presence by grepping this
     /// exact shape.

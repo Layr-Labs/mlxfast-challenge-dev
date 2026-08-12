@@ -107,7 +107,7 @@ public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
 /// side through a different verb, which put any divergence between the two paths
 /// straight into the score.
 public final class Qwen36MTPBlockSession {
-    private let model: Qwen35TextModel
+    private let model: any Qwen36MTPTarget
     private let stopTokens: Set<Int>
     /// MTPLX default `base_hidden_variant == mtp_hidden_variant == "post_norm"`.
     private let postNorm: Bool
@@ -128,7 +128,7 @@ public final class Qwen36MTPBlockSession {
     public private(set) var reachedStopToken = false
 
     public init(
-        model: Qwen35TextModel,
+        model: any Qwen36MTPTarget,
         stopTokens: Set<Int>,
         postNorm: Bool = true
     ) throws {
