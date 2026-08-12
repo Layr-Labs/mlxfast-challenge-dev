@@ -1,13 +1,9 @@
 import Foundation
-#if !MLXFAST_TRUSTED_HARNESS
 import MLX
-#endif
 import MLXFastCore
-#if !MLXFAST_TRUSTED_HARNESS
 import MLXFastModel
-#endif
 
-extension LagunaRuntime {
+extension QwenRuntime {
     public static func localIterate(
         _ options: LocalIterateOptions,
         worker: RuntimeWorkerOptions? = nil
@@ -127,21 +123,15 @@ extension LagunaRuntime {
                     progress: progress
                 )
             } else {
-                #if !MLXFAST_TRUSTED_HARNESS
-                    timing = try runLocalIterateCheckedTiming(
-                        weightsPath: options.weightsPath,
-                        testCase: localCase,
-                        goldenHash: golden.sha256,
-                        decodeSteps: options.benchmarkDecodeSteps,
-                        timingRepeats: options.timingRepeats,
-                        modeName: modeName,
-                        progress: progress
-                    )
-                #else
-                    throw MLXFastError.invalidInput(
-                        "trusted local benchmark requires the participant worker"
-                    )
-                #endif
+                timing = try runLocalIterateCheckedTiming(
+                    weightsPath: options.weightsPath,
+                    testCase: localCase,
+                    goldenHash: golden.sha256,
+                    decodeSteps: options.benchmarkDecodeSteps,
+                    timingRepeats: options.timingRepeats,
+                    modeName: modeName,
+                    progress: progress
+                )
             }
             let timingWallSeconds = secondsSince(timingWallStart)
             timedSeconds = timing.prefillSecondsPerToken
@@ -431,7 +421,7 @@ extension LagunaRuntime {
     /// `metrics.error`).
     ///
     /// Local-only by construction: this file is never on the ranked path,
-    /// which routes to LagunaRuntime.benchmark and evaluates the hidden
+    /// which routes to QwenRuntime.benchmark and evaluates the hidden
     /// goldens. The M5 runner remains the fidelity authority.
     static let localGoldenDriftEnvironmentName = "MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT"
 
@@ -549,8 +539,7 @@ extension LagunaRuntime {
         progress?("local thermal gate complete phase=\(phase)")
     }
 
-    #if !MLXFAST_TRUSTED_HARNESS
-        static func runLocalIterateCheckedTiming(
+    static func runLocalIterateCheckedTiming(
         weightsPath: String,
         testCase: GoldenCase,
         goldenHash: String,
@@ -611,12 +600,12 @@ extension LagunaRuntime {
                 positionOffset: 0
             )
             eval(prefillLogits)
-            let prefillToken = try LagunaCorrectness.greedyToken(from: prefillLogits)
+            let prefillToken = try QwenCorrectness.greedyToken(from: prefillLogits)
             let prefillElapsed = secondsSince(prefillStart)
             prefillHeartbeat?.cancel()
             totalPrefillSeconds += prefillElapsed
             Memory.clearCache()
-            latestStats = LagunaRuntime.expertStats(from: weightCache)
+            latestStats = QwenRuntime.expertStats(from: weightCache)
             if failureStep == nil, prefillToken != expectedSeedToken {
                 failureStep = repeatIndex * checkedStepsPerPass
                 failureExpected = expectedSeedToken
@@ -654,8 +643,8 @@ extension LagunaRuntime {
                 cache: cache,
                 positionOffset: 0
             )
-            var actualToken = try LagunaCorrectness.greedyToken(from: logits)
-            latestStats = LagunaRuntime.expertStats(from: weightCache)
+            var actualToken = try QwenCorrectness.greedyToken(from: logits)
+            latestStats = QwenRuntime.expertStats(from: weightCache)
             if failureStep == nil, actualToken != expectedSeedToken {
                 failureStep = repeatIndex * checkedStepsPerPass + 1
                 failureExpected = expectedSeedToken
@@ -677,7 +666,7 @@ extension LagunaRuntime {
                     cache: cache,
                     positionOffset: testCase.promptTokens.count + decodedStep
                 )
-                actualToken = try LagunaCorrectness.greedyToken(from: logits)
+                actualToken = try QwenCorrectness.greedyToken(from: logits)
                 let expectedToken = expectedDecodeTokens[decodedStep]
                 if failureStep == nil, actualToken != expectedToken {
                     failureStep = repeatIndex * checkedStepsPerPass + decodedStep + 2
@@ -687,7 +676,7 @@ extension LagunaRuntime {
                 }
                 let stepElapsed = secondsSince(stepStart)
                 totalStepOnlySeconds += stepElapsed
-                latestStats = LagunaRuntime.expertStats(from: weightCache)
+                latestStats = QwenRuntime.expertStats(from: weightCache)
                 reportProgress(
                     step: repeatIndex * decodeSteps + decodedStep + 1,
                     total: totalDecodeSteps,
@@ -711,8 +700,8 @@ extension LagunaRuntime {
             totalDecodeSeconds += secondsSince(decodePhaseStart)
         }
 
-        let bandwidth = (gbPerToken: 0.0, source: LagunaRuntime.bandwidthSource)
-        latestStats = LagunaRuntime.expertStats(from: weightCache)
+        let bandwidth = (gbPerToken: 0.0, source: QwenRuntime.bandwidthSource)
+        latestStats = QwenRuntime.expertStats(from: weightCache)
         let correctness = localIterateCorrectnessReport(
             passed: failureStep == nil,
             checkedSteps: failureStep.map { $0 + 1 } ?? checkedStepsPerPass * timingRepeats,
@@ -736,8 +725,7 @@ extension LagunaRuntime {
             expertStats: latestStats,
             peakRamGB: Double(Memory.peakMemory) / Double(1 << 30)
         )
-        }
-    #endif
+    }
 
     static func runLocalIterateCheckedTimingWithWorker(
         weightsPath: String,
@@ -902,7 +890,7 @@ extension LagunaRuntime {
                 progress?("\(modeName) checked pass \(repeatIndex + 1)/\(timingRepeats) complete")
             }
         }
-        let bandwidth = (gbPerToken: 0.0, source: LagunaRuntime.bandwidthSource)
+        let bandwidth = (gbPerToken: 0.0, source: QwenRuntime.bandwidthSource)
         let correctness = localIterateCorrectnessReport(
             passed: failureStep == nil,
             checkedSteps: failureStep.map { $0 + 1 } ?? checkedStepsPerPass * timingRepeats,
@@ -973,7 +961,7 @@ extension LagunaRuntime {
     /// unmistakable; only the score becomes the same directional
     /// decode_speedup^0.75 * prefill_speedup^0.25 estimate that passing local
     /// runs publish. Official/ranked scoring is untouched: this is reached
-    /// exclusively from localIterate's failure path, and LagunaRuntime.benchmark
+    /// exclusively from localIterate's failure path, and QwenRuntime.benchmark
     /// keeps publishing score: null on failure (see
     /// rankedScoreSemanticsAreUnchangedByLocalEstimatedScore).
     static func localModeFailedPayloadWithEstimatedScore(
@@ -1039,7 +1027,7 @@ extension LagunaRuntime {
         // the payload as local-mode, submit never uploads local score files
         // (only editablePaths), the ranked pipeline never runs this code path
         // (benchmark.yml and measure-job.sh invoke --official, which routes to
-        // LagunaRuntime.benchmark), and the ranked artifact validator rejects
+        // QwenRuntime.benchmark), and the ranked artifact validator rejects
         // this shape (runtime must be "swift" with the hidden-gate fields
         // populated). The official score remains the paired-ratio overlay
         // computed by the trusted ranked workflow, exactly as before.

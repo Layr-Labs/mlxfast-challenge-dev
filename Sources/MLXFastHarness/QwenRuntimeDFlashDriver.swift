@@ -298,7 +298,7 @@ struct DFlashLiveReferenceOracle: DFlashReferenceOracle {
     }
 }
 
-extension LagunaRuntime {
+extension QwenRuntime {
     /// Run a validated, parent-timed DFlash block-decode measurement.
     ///
     /// Timing is parent-owned end to end: the clock starts after the seed
@@ -713,7 +713,7 @@ public struct DFlashReferenceGoldenResult {
     }
 }
 
-extension LagunaRuntime {
+extension QwenRuntime {
     /// Generate the DFlash reference golden (contract layer L1).
     ///
     /// The worker spawned here MUST be the one built from the pinned baseline

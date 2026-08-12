@@ -163,7 +163,7 @@ private enum MLXFastCLI {
                 fallback: defaultCorrectnessGoldenPath()
             )
         )
-        let report = try LagunaRuntime.runCorrectness(
+        let report = try QwenRuntime.runCorrectness(
             CorrectnessOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath
@@ -177,7 +177,7 @@ private enum MLXFastCLI {
         FileHandle.standardOutput.write(data)
         print("")
         if !report.passed, report.error.contains("token mismatch") {
-            fputs("mlxfast-swift: \(LagunaRuntime.nonM5GoldenMismatchCaveat)\n", stderr)
+            fputs("mlxfast-swift: \(QwenRuntime.nonM5GoldenMismatchCaveat)\n", stderr)
         }
         return report.passed ? 0 : 1
     }
@@ -207,7 +207,7 @@ private enum MLXFastCLI {
             throw MLXFastError.invalidInput("--top-k must be a positive integer")
         }
         let caseName = options.value(for: "--case", default: "")
-        let report = try LagunaRuntime.traceCorrectness(
+        let report = try QwenRuntime.traceCorrectness(
             CorrectnessTraceOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
@@ -254,7 +254,7 @@ private enum MLXFastCLI {
                 "preflight requires the participant runtime worker"
             )
         }
-        try LagunaRuntime.runPreflightWithWorker(
+        try QwenRuntime.runPreflightWithWorker(
             weightsPath: weightsPath,
             worker: worker
         )
@@ -310,7 +310,7 @@ private enum MLXFastCLI {
             let timingRepeats = localSubmit ? MLXFastConstants.localSubmitBenchmarkRepeats : 1
             let modeName = localSubmit ? "local-submit" : "local-iterate"
             let runtime = localSubmit ? "swift-local-submit" : "swift-local-iterate"
-            let payload = LagunaRuntime.localIterate(
+            let payload = QwenRuntime.localIterate(
                 LocalIterateOptions(
                     weightsPath: weightsPath,
                     goldenPath: goldenPath,
@@ -375,7 +375,7 @@ private enum MLXFastCLI {
         // passes CHECK_GATES=1 SKIP_TIMED=1 and is unaffected.
         let checkGates = environmentValue("MLXFAST_BENCHMARK_CHECK_GATES", fallback: "1") != "0"
         let skipTimedBenchmark = environmentValue("MLXFAST_BENCHMARK_SKIP_TIMED", fallback: "1") == "1"
-        let payload = LagunaRuntime.benchmark(
+        let payload = QwenRuntime.benchmark(
             BenchmarkOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
@@ -646,7 +646,7 @@ private enum MLXFastCLI {
                 + "(covers decode offsets \(promptTokens.count)..<\(promptTokens.count + steps))\n",
             stderr
         )
-        let expectedTokens = try LagunaRuntime.generateGreedyTokens(
+        let expectedTokens = try QwenRuntime.generateGreedyTokens(
             GreedyGenerationOptions(
                 weightsPath: weightsPath,
                 promptTokens: promptTokens,
@@ -756,7 +756,7 @@ private enum MLXFastCLI {
                 + "for case \(caseName) (prompt_tokens=\(promptTokens.count))\n",
             stderr
         )
-        let expectedTokens = try LagunaRuntime.generateGreedyTokens(
+        let expectedTokens = try QwenRuntime.generateGreedyTokens(
             GreedyGenerationOptions(
                 weightsPath: weightsPath,
                 promptTokens: promptTokens,
@@ -1002,7 +1002,7 @@ private enum MLXFastCLI {
                 continue
             }
 
-            let generated = try LagunaRuntime.generateGreedyTokens(
+            let generated = try QwenRuntime.generateGreedyTokens(
                 GreedyGenerationOptions(
                     weightsPath: weightsPath,
                     promptTokens: promptTokens,
@@ -1396,7 +1396,7 @@ private enum MLXFastCLI {
             )
         }
 
-        let report = try LagunaRuntime.experimentalDFlashBenchmark(
+        let report = try QwenRuntime.experimentalDFlashBenchmark(
             options: ExperimentalDFlashOptions(
                 targetWeightsPath: weightsPath,
                 drafterPath: drafterPath,
@@ -1594,7 +1594,7 @@ private enum MLXFastCLI {
             )
         }
 
-        let result = try LagunaRuntime.experimentalDFlashReferenceGolden(
+        let result = try QwenRuntime.experimentalDFlashReferenceGolden(
             plan: plan,
             chain: chain,
             targetWeightsPath: weightsPath,

@@ -10,10 +10,10 @@ func lagunaCorrectnessSelectsGreedyTokenWhenRuntimeTestsAreEnabled() throws {
         return
     }
 
-    #expect(try LagunaCorrectness.greedyToken(
+    #expect(try QwenCorrectness.greedyToken(
         from: MLXArray([Float(0.1), 2.0, 1.0], [3])
     ) == 1)
-    #expect(try LagunaCorrectness.greedyToken(
+    #expect(try QwenCorrectness.greedyToken(
         from: MLXArray([Float(1), 2, 3, 2], [2, 2])
     ) == 0)
 }
@@ -24,7 +24,7 @@ func lagunaCorrectnessSelectsGreedyTokenWhenRuntimeTestsAreEnabled() throws {
 @Test
 func runtimeWorkerOrphanReaperFiresOnceTheParentIsGone() {
     let fired = DispatchSemaphore(value: 0)
-    let thread = LagunaRuntime.startRuntimeWorkerOrphanReaper(
+    let thread = QwenRuntime.startRuntimeWorkerOrphanReaper(
         pollIntervalSeconds: 0.01,
         isOrphaned: { true },
         onOrphaned: { fired.signal() }
@@ -36,7 +36,7 @@ func runtimeWorkerOrphanReaperFiresOnceTheParentIsGone() {
 @Test
 func runtimeWorkerOrphanReaperStaysQuietWhileTheParentIsAlive() {
     let fired = DispatchSemaphore(value: 0)
-    let thread = LagunaRuntime.startRuntimeWorkerOrphanReaper(
+    let thread = QwenRuntime.startRuntimeWorkerOrphanReaper(
         pollIntervalSeconds: 0.01,
         isOrphaned: { false },
         onOrphaned: { fired.signal() }
@@ -55,9 +55,9 @@ func phaseStartAllocatorResetLeavesExactlyEmptyCacheWhenRuntimeTestsAreEnabled()
         let scratch = MLXArray(Array(repeating: Float(1), count: 1 << 20), [1024, 1024])
         eval(scratch + scratch)
     }
-    try LagunaRuntime.resetRuntimeWorkerAllocatorForPhaseStart()
+    try QwenRuntime.resetRuntimeWorkerAllocatorForPhaseStart()
     #expect(Memory.cacheMemory == 0)
-    #expect(Memory.cacheLimit == LagunaRuntime.trustedRuntimeWorkerPhaseStartCacheLimitBytes)
+    #expect(Memory.cacheLimit == QwenRuntime.trustedRuntimeWorkerPhaseStartCacheLimitBytes)
 }
 
 @Test
@@ -100,7 +100,7 @@ func traceProtocolCarriesRequestedTopKAndExpectedTokenDiagnostics() throws {
 
 @Test
 func workerComputesExpectedTokenDiagnosticsOutsideReturnedTopSubset() throws {
-    let diagnostics = try LagunaRuntime.correctnessLogitDiagnostics(
+    let diagnostics = try QwenRuntime.correctnessLogitDiagnostics(
         values: (0..<20).map { Double(20 - $0) },
         topK: 12,
         expectedToken: 19

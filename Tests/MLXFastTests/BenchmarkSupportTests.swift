@@ -21,10 +21,10 @@ func runtimeWorkerClientSkipsNonJSONStdoutLines() {
 @Test
 func commitIdentifierPrefersTrustedDispatchSHAOverGit() {
     let fullSHA = "5f95c4bdce07a0ef79ea350c91d9eb0d7476cf2f"
-    #expect(LagunaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": fullSHA]) == fullSHA)
+    #expect(QwenRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": fullSHA]) == fullSHA)
     // Short (rev-parse --short style) values and surrounding whitespace are fine.
-    #expect(LagunaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": "5f95c4bdce07"]) == "5f95c4bdce07")
-    #expect(LagunaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": " \(fullSHA)\n"]) == fullSHA)
+    #expect(QwenRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": "5f95c4bdce07"]) == "5f95c4bdce07")
+    #expect(QwenRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": " \(fullSHA)\n"]) == fullSHA)
 
     // Values that could not satisfy the trusted shell predicates fall back to
     // git instead of being stamped verbatim into the sealed score.
@@ -36,16 +36,16 @@ func commitIdentifierPrefersTrustedDispatchSHAOverGit() {
         "not-a-commit-sha",
         "5f95c4bdce07;rm -rf /",
     ] {
-        let fallback = LagunaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": invalid])
+        let fallback = QwenRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": invalid])
         #expect(fallback != invalid || invalid.isEmpty)
         #expect(!fallback.contains(";"))
     }
 
-    #expect(LagunaRuntime.isCommitSHAHex(fullSHA))
-    #expect(LagunaRuntime.isCommitSHAHex("abcdef0"))
-    #expect(!LagunaRuntime.isCommitSHAHex("abcdef"))
-    #expect(!LagunaRuntime.isCommitSHAHex(String(repeating: "a", count: 41)))
-    #expect(!LagunaRuntime.isCommitSHAHex("ABCDEF0"))
+    #expect(QwenRuntime.isCommitSHAHex(fullSHA))
+    #expect(QwenRuntime.isCommitSHAHex("abcdef0"))
+    #expect(!QwenRuntime.isCommitSHAHex("abcdef"))
+    #expect(!QwenRuntime.isCommitSHAHex(String(repeating: "a", count: 41)))
+    #expect(!QwenRuntime.isCommitSHAHex("ABCDEF0"))
 }
 
 @Test
@@ -621,9 +621,9 @@ func semanticBehaviorGateRequiresPromptAndReferenceAnswer() {
         semanticReferenceAnswer: "answer"
     )
 
-    #expect(!LagunaRuntime.behaviorUsesSemanticJudge(exactOnly))
-    #expect(!LagunaRuntime.behaviorUsesSemanticJudge(missingReference))
-    #expect(LagunaRuntime.behaviorUsesSemanticJudge(semantic))
+    #expect(!QwenRuntime.behaviorUsesSemanticJudge(exactOnly))
+    #expect(!QwenRuntime.behaviorUsesSemanticJudge(missingReference))
+    #expect(QwenRuntime.behaviorUsesSemanticJudge(semantic))
 }
 
 @Test
@@ -661,7 +661,7 @@ func failedScoreRedactsCorrectnessTokenMismatchByDefault() {
         error: "token mismatch"
     )
 
-    let payload = LagunaRuntime.failedScore(
+    let payload = QwenRuntime.failedScore(
         error: "token mismatch",
         correctness: report,
         passedCorrectness: false,
@@ -692,7 +692,7 @@ func failedScorePreservesExplicitPublicMismatchTokensAndRuntimeLabel() {
         error: "token mismatch"
     )
 
-    let payload = LagunaRuntime.failedScore(
+    let payload = QwenRuntime.failedScore(
         error: "token mismatch",
         correctness: report,
         passedCorrectness: false,
@@ -738,7 +738,7 @@ func decodeTimingPlanRejectsInvalidRanges() throws {
 
 // The former editable decode-delay knob (Gemma4SubmissionControls
 // .measuredDecodeDelayMilliseconds, read via
-// LagunaRuntime.submissionValidationDelayMilliseconds) was model code invoked by
+// QwenRuntime.submissionValidationDelayMilliseconds) was model code invoked by
 // trusted code ONLY on the scored decode path. Because submitted model code is
 // editable, being invoked only while timed was itself a phase oracle. The hook
 // is now removed entirely: the editable file is gone and no trusted harness
@@ -931,7 +931,7 @@ func nonWorkerBenchmarkRejectsBehaviorGatesBecauseTTFTRequiresWorker() throws {
     let fixture = try makePreflightFixture(goldenContents: validGoldenJSON(correctnessGates: behaviorGate))
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
-    let score = LagunaRuntime.benchmark(
+    let score = QwenRuntime.benchmark(
         BenchmarkOptions(
             weightsPath: fixture.weights.path,
             goldenPath: fixture.golden.path,
@@ -1384,24 +1384,24 @@ private func writeIndex(_ path: URL, tensors: [TensorFixture], shardName: String
 @Test
 func localDecodeProgressIntervalUsesExpectedCadence() {
     // Tiny synthetic runs get a running-number line on every token.
-    #expect(LagunaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 16, timingRepeats: 1) == 1)
-    #expect(LagunaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 32, timingRepeats: 1) == 1)
+    #expect(QwenRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 16, timingRepeats: 1) == 1)
+    #expect(QwenRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 32, timingRepeats: 1) == 1)
     // The 128-step local-iterate window and 1023-step local-submit window keep
     // the historical 8-step cadence.
-    #expect(LagunaRuntime.localIterateDecodeProgressInterval(
+    #expect(QwenRuntime.localIterateDecodeProgressInterval(
         totalDecodeSteps: MLXFastConstants.localIterateBenchmarkDecodeSteps,
         timingRepeats: 1
     ) == 8)
-    #expect(LagunaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 1023, timingRepeats: 1) == 8)
+    #expect(QwenRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 1023, timingRepeats: 1) == 8)
     // Multi-repeat runs keep the sparser 64-step cadence.
-    #expect(LagunaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 512, timingRepeats: 4) == 64)
+    #expect(QwenRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 512, timingRepeats: 4) == 64)
 }
 
 @Test
 func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
     // Mid-run: charged 20s so far (18s seed + 2s steps), 2 of 16 tokens done at
     // 1s/step mean -> project 14 more step-seconds on top of the charged 20.
-    let projected = LagunaRuntime.localIterateProjectedDecodeSecondsPerToken(
+    let projected = QwenRuntime.localIterateProjectedDecodeSecondsPerToken(
         chargedSecondsSoFar: 20,
         stepOnlySecondsSoFar: 2,
         decodedTokens: 2,
@@ -1410,7 +1410,7 @@ func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
     #expect(abs(projected - (20.0 + 14.0) / 16.0) < 1e-12)
 
     // Final token: exactly the charged mean the score payload will report.
-    let final = LagunaRuntime.localIterateProjectedDecodeSecondsPerToken(
+    let final = QwenRuntime.localIterateProjectedDecodeSecondsPerToken(
         chargedSecondsSoFar: 32,
         stepOnlySecondsSoFar: 14,
         decodedTokens: 16,
@@ -1420,7 +1420,7 @@ func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
 
     // Guards.
     #expect(
-        LagunaRuntime.localIterateProjectedDecodeSecondsPerToken(
+        QwenRuntime.localIterateProjectedDecodeSecondsPerToken(
             chargedSecondsSoFar: 1,
             stepOnlySecondsSoFar: 1,
             decodedTokens: 0,
@@ -1431,7 +1431,7 @@ func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
 
 @Test
 func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
-    let status = LagunaRuntime.localIterateLiveDecodeStatus(
+    let status = QwenRuntime.localIterateLiveDecodeStatus(
         lastStepSeconds: 0.9,
         chargedSecondsSoFar: 20,
         stepOnlySecondsSoFar: 2,
@@ -1451,7 +1451,7 @@ func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
     #expect(!status.contains("expert_hit_rate="))
 
     // The final step has no ETA.
-    let finalStep = LagunaRuntime.localIterateLiveDecodeStatus(
+    let finalStep = QwenRuntime.localIterateLiveDecodeStatus(
         lastStepSeconds: 1,
         chargedSecondsSoFar: 32,
         stepOnlySecondsSoFar: 14,
@@ -1462,7 +1462,7 @@ func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
     #expect(!finalStep.contains("decode_eta_seconds="))
 
     // Before prefill has a positive measurement there is no score estimate.
-    let withoutPrefill = LagunaRuntime.localIterateLiveDecodeStatus(
+    let withoutPrefill = QwenRuntime.localIterateLiveDecodeStatus(
         lastStepSeconds: 0.9,
         chargedSecondsSoFar: 20,
         stepOnlySecondsSoFar: 2,
@@ -1474,7 +1474,7 @@ func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
     #expect(!withoutPrefill.contains("projected_score="))
 
     #expect(
-        LagunaRuntime.localIterateLiveDecodeStatus(
+        QwenRuntime.localIterateLiveDecodeStatus(
             lastStepSeconds: 0,
             chargedSecondsSoFar: 0,
             stepOnlySecondsSoFar: 0,
@@ -1815,7 +1815,7 @@ func runtimeWorkerStartsTheOrphanReaperBeforeLoadingTheModel() throws {
     // model-loading work, or the load window (the exact window stdin-EOF
     // cannot cover) is left unprotected.
     let worker = try String(
-        contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeWorker.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeWorker.swift",
         encoding: .utf8
     )
     let reaperCall = try #require(worker.range(of: "startRuntimeWorkerOrphanReaper()"))
@@ -1828,7 +1828,7 @@ func runtimeWorkerStartsTheOrphanReaperBeforeLoadingTheModel() throws {
 
 @Test
 func localIteratePrefillStatusReportsPerTokenAndSpeedup() {
-    let status = LagunaRuntime.localIteratePrefillStatus(
+    let status = QwenRuntime.localIteratePrefillStatus(
         elapsedSeconds: 51.2,
         promptTokens: 512
     )
@@ -1839,15 +1839,15 @@ func localIteratePrefillStatusReportsPerTokenAndSpeedup() {
 
     // Zero-duration or zero-token inputs fall back to the plain seconds field.
     #expect(
-        LagunaRuntime.localIteratePrefillStatus(elapsedSeconds: 0, promptTokens: 512)
+        QwenRuntime.localIteratePrefillStatus(elapsedSeconds: 0, promptTokens: 512)
             == "seconds=0.0"
     )
 }
 
 @Test
 func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
-    let timing = LagunaRuntime.LocalIterateTimingResult(
-        correctness: LagunaRuntime.localIterateCorrectnessReport(
+    let timing = QwenRuntime.LocalIterateTimingResult(
+        correctness: QwenRuntime.localIterateCorrectnessReport(
             passed: true,
             checkedSteps: 18,
             caseCount: 1,
@@ -1860,7 +1860,7 @@ func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
             modeName: "local-iterate"
         ),
         prefillSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken / 2,
-        decode: LagunaRuntime.DecodeMeasurement(
+        decode: QwenRuntime.DecodeMeasurement(
             secondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken / 2,
             bandwidthGBPerToken: 0,
             bandwidthSource: "ram_resident_model"
@@ -1870,7 +1870,7 @@ func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
     )
 
     var lines: [String] = []
-    LagunaRuntime.emitLocalIterateSummary(
+    QwenRuntime.emitLocalIterateSummary(
         modeName: "local-iterate",
         timing: timing,
         progress: { lines.append($0) }
@@ -1896,7 +1896,7 @@ func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
 // summary prints) as a numeric, CLI-usable score.
 @Test
 func localIterateScorePublishesCLIUsableEstimatedScore() throws {
-    let payload = LagunaRuntime.localIterateScore(
+    let payload = QwenRuntime.localIterateScore(
         peakRamGB: 24.5,
         bandwidthGBPerToken: 0,
         decodeSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken / 2,
@@ -1905,7 +1905,7 @@ func localIterateScorePublishesCLIUsableEstimatedScore() throws {
         validationSeconds: 1,
         correctnessSeconds: 5,
         timedSeconds: 5,
-        correctness: LagunaRuntime.localIterateCorrectnessReport(
+        correctness: QwenRuntime.localIterateCorrectnessReport(
             passed: true,
             checkedSteps: 18,
             caseCount: 1,
@@ -1957,7 +1957,7 @@ func localIterateScorePublishesCLIUsableEstimatedScore() throws {
 /// would turn the escape hatch into a way to hide a real regression.
 @Test
 func localIterateScoreUnderGoldenDriftStaysUsableButRecordsTheDivergence() throws {
-    let payload = LagunaRuntime.localIterateScore(
+    let payload = QwenRuntime.localIterateScore(
         peakRamGB: 24.5,
         bandwidthGBPerToken: 0,
         decodeSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
@@ -1966,7 +1966,7 @@ func localIterateScoreUnderGoldenDriftStaysUsableButRecordsTheDivergence() throw
         validationSeconds: 1,
         correctnessSeconds: 5,
         timedSeconds: 5,
-        correctness: LagunaRuntime.localIterateCorrectnessReport(
+        correctness: QwenRuntime.localIterateCorrectnessReport(
             passed: false,
             checkedSteps: 7,
             caseCount: 1,
@@ -1993,7 +1993,7 @@ func localIterateScoreUnderGoldenDriftStaysUsableButRecordsTheDivergence() throw
     #expect(payload.metrics.firstFailingStep == 6)
     #expect(payload.metrics.expectedToken == 1234)
     #expect(payload.metrics.actualToken == 4321)
-    #expect(payload.metrics.error.contains(LagunaRuntime.localGoldenDriftEnvironmentName))
+    #expect(payload.metrics.error.contains(QwenRuntime.localGoldenDriftEnvironmentName))
     #expect(payload.metrics.error.contains("NOT verified"))
 }
 
@@ -2001,7 +2001,7 @@ func localIterateScoreUnderGoldenDriftStaysUsableButRecordsTheDivergence() throw
 func localIterateScoreFailsForUnusableTimings() {
     // Zero/invalid timings make the estimate non-finite. The payload must be a
     // failed run, not a passing result that merely omits its score.
-    let payload = LagunaRuntime.localIterateScore(
+    let payload = QwenRuntime.localIterateScore(
         peakRamGB: 0,
         bandwidthGBPerToken: 0,
         decodeSecondsPerToken: 0,
@@ -2010,7 +2010,7 @@ func localIterateScoreFailsForUnusableTimings() {
         validationSeconds: 0,
         correctnessSeconds: 0,
         timedSeconds: 0,
-        correctness: LagunaRuntime.localIterateCorrectnessReport(
+        correctness: QwenRuntime.localIterateCorrectnessReport(
             passed: true,
             checkedSteps: 18,
             caseCount: 1,
@@ -2036,7 +2036,7 @@ func localIterateScoreFailsForUnusableTimings() {
 
 @Test
 func localIterateScoreSanitizesNonfiniteFailureMetricsForJSON() throws {
-    let payload = LagunaRuntime.localIterateScore(
+    let payload = QwenRuntime.localIterateScore(
         peakRamGB: .nan,
         bandwidthGBPerToken: .infinity,
         decodeSecondsPerToken: .nan,
@@ -2045,7 +2045,7 @@ func localIterateScoreSanitizesNonfiniteFailureMetricsForJSON() throws {
         validationSeconds: .nan,
         correctnessSeconds: .infinity,
         timedSeconds: -1,
-        correctness: LagunaRuntime.localIterateCorrectnessReport(
+        correctness: QwenRuntime.localIterateCorrectnessReport(
             passed: true,
             checkedSteps: 18,
             caseCount: 1,
@@ -2106,7 +2106,7 @@ func localIterateScoreSanitizesNonfiniteFailureMetricsForJSON() throws {
 @Test
 func firstTokenMismatchReportIncludesNonM5GoldenCaveat() {
     var lines: [String] = []
-    LagunaRuntime.reportFirstTokenMismatch(
+    QwenRuntime.reportFirstTokenMismatch(
         { lines.append($0) },
         modeName: "local-iterate",
         checkedStep: 17
@@ -2140,7 +2140,7 @@ func localFailedRunWithMeasuredTimingsStillPublishesNumericEstimatedScore() thro
         goldenHash: "golden",
         error: "local-iterate teacher-forced token mismatch"
     )
-    let failed = LagunaRuntime.failedScore(
+    let failed = QwenRuntime.failedScore(
         error: "local-iterate teacher-forced token mismatch",
         correctness: report,
         passedCorrectness: false,
@@ -2152,7 +2152,7 @@ func localFailedRunWithMeasuredTimingsStillPublishesNumericEstimatedScore() thro
     )
 
     var lines: [String] = []
-    let payload = LagunaRuntime.localModeFailedPayloadWithEstimatedScore(
+    let payload = QwenRuntime.localModeFailedPayloadWithEstimatedScore(
         failed,
         modeName: "local-iterate",
         progress: { lines.append($0) }
@@ -2188,14 +2188,14 @@ func localFailedRunWithMeasuredTimingsStillPublishesNumericEstimatedScore() thro
 // payloads are never touched.
 @Test
 func localFailedPayloadWithoutTimingsKeepsNullScore() {
-    let noTimings = LagunaRuntime.failedScore(
+    let noTimings = QwenRuntime.failedScore(
         error: "local-iterate public golden must contain at least one case",
         correctness: nil,
         passedCorrectness: false,
         runtime: "swift-local-iterate"
     )
     var lines: [String] = []
-    let unchanged = LagunaRuntime.localModeFailedPayloadWithEstimatedScore(
+    let unchanged = QwenRuntime.localModeFailedPayloadWithEstimatedScore(
         noTimings,
         modeName: "local-iterate",
         progress: { lines.append($0) }
@@ -2205,7 +2205,7 @@ func localFailedPayloadWithoutTimingsKeepsNullScore() {
     #expect(lines.isEmpty)
 
     let passing = ScorePayload(score: 1.5, passed: true, metrics: noTimings.metrics)
-    let stillPassing = LagunaRuntime.localModeFailedPayloadWithEstimatedScore(
+    let stillPassing = QwenRuntime.localModeFailedPayloadWithEstimatedScore(
         passing,
         modeName: "local-iterate",
         progress: { lines.append($0) }
@@ -2231,7 +2231,7 @@ func rankedScoreSemanticsAreUnchangedByLocalEstimatedScore() {
         goldenHash: "hash",
         error: ""
     )
-    let passed = LagunaRuntime.passedScore(
+    let passed = QwenRuntime.passedScore(
         score: 1.25,
         peakRamGB: 20,
         bandwidthGBPerToken: 0,
@@ -2251,7 +2251,7 @@ func rankedScoreSemanticsAreUnchangedByLocalEstimatedScore() {
     #expect(passed.score == 1.25)
     #expect(passed.metrics.runtime == "swift")
 
-    let failed = LagunaRuntime.failedScore(
+    let failed = QwenRuntime.failedScore(
         error: "boom",
         correctness: nil,
         passedCorrectness: false,
@@ -2279,11 +2279,11 @@ func localIteratePhaseHeartbeatFiresWhileBlockedAndStopsAfterCancel() throws {
     }
 
     // No progress sink means no timer at all.
-    #expect(LagunaRuntime.startPhaseHeartbeat(label: "x", progress: nil) == nil)
+    #expect(QwenRuntime.startPhaseHeartbeat(label: "x", progress: nil) == nil)
 
     let box = MessageBox()
     let heartbeat = try #require(
-        LagunaRuntime.startPhaseHeartbeat(
+        QwenRuntime.startPhaseHeartbeat(
             label: "local-iterate prefill measured",
             intervalSeconds: 0.05,
             progress: { box.append($0) }

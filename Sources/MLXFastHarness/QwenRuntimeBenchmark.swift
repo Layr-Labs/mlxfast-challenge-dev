@@ -3,10 +3,10 @@ import MLX
 import MLXFastCore
 import MLXFastModel
 
-// LagunaRuntime is split across LagunaRuntime*.swift for auditability.
+// QwenRuntime is split across QwenRuntime*.swift for auditability.
 // Generated split; behavior identical to the original single file.
 
-extension LagunaRuntime {
+extension QwenRuntime {
     public static func benchmark(
         _ options: BenchmarkOptions,
         worker: RuntimeWorkerOptions? = nil
@@ -733,7 +733,7 @@ extension LagunaRuntime {
                 positionOffset: 0
             )
             eval(logits)
-            let token = try LagunaCorrectness.greedyToken(from: logits)
+            let token = try QwenCorrectness.greedyToken(from: logits)
             try requireBenchmarkMatch(
                 BenchmarkOutputValidator.comparePrefillToken(
                     expectedToken: expectedToken,
@@ -870,7 +870,7 @@ extension LagunaRuntime {
             cache: cache,
             positionOffset: 0
         )
-        var token = try LagunaCorrectness.greedyToken(from: logits)
+        var token = try QwenCorrectness.greedyToken(from: logits)
         try requireBenchmarkMatch(
             BenchmarkOutputValidator.compareDecodeSeedToken(
                 expectedToken: expectedSeedToken,
@@ -890,7 +890,7 @@ extension LagunaRuntime {
                 cache: cache,
                 positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
             )
-            token = try LagunaCorrectness.greedyToken(from: logits)
+            token = try QwenCorrectness.greedyToken(from: logits)
             actualTokens.append(token)
             let expectedToken = expectedTokens[decodedStep]
             if token != expectedToken {

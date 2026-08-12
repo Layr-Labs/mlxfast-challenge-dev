@@ -8,7 +8,7 @@ import Testing
 
 @Test
 func lagunaCorrectnessComparesExpectedTokenSequences() {
-    let pass = LagunaCorrectness.compareTokens(
+    let pass = QwenCorrectness.compareTokens(
         expected: [4, 5, 6],
         actual: [4, 5, 6],
         steps: 3
@@ -17,7 +17,7 @@ func lagunaCorrectnessComparesExpectedTokenSequences() {
     #expect(pass.checkedSteps == 3)
     #expect(pass.firstFailingStep == nil)
 
-    let fail = LagunaCorrectness.compareTokens(
+    let fail = QwenCorrectness.compareTokens(
         expected: [4, 5, 6],
         actual: [4, 9, 6],
         steps: 3
@@ -28,7 +28,7 @@ func lagunaCorrectnessComparesExpectedTokenSequences() {
     #expect(fail.expectedToken == 5)
     #expect(fail.actualToken == 9)
 
-    let short = LagunaCorrectness.compareTokens(
+    let short = QwenCorrectness.compareTokens(
         expected: [4, 5, 6],
         actual: [4],
         steps: 3
@@ -39,7 +39,7 @@ func lagunaCorrectnessComparesExpectedTokenSequences() {
     #expect(short.expectedToken == 5)
     #expect(short.actualToken == nil)
 
-    let expectedShort = LagunaCorrectness.compareTokens(
+    let expectedShort = QwenCorrectness.compareTokens(
         expected: [4],
         actual: [4, 5],
         steps: 2
@@ -50,7 +50,7 @@ func lagunaCorrectnessComparesExpectedTokenSequences() {
     #expect(expectedShort.expectedToken == nil)
     #expect(expectedShort.actualToken == 5)
 
-    let bothShort = LagunaCorrectness.compareTokens(
+    let bothShort = QwenCorrectness.compareTokens(
         expected: [4],
         actual: [4],
         steps: 2
@@ -65,7 +65,7 @@ func lagunaCorrectnessComparesExpectedTokenSequences() {
 @Test
 func lagunaCorrectnessGeneratesGreedyTokensWithGrowingContext() throws {
     var contexts: [[Int]] = []
-    let generated = try LagunaCorrectness.generateGreedyNoCache(
+    let generated = try QwenCorrectness.generateGreedyNoCache(
         promptTokens: [10, 11],
         steps: 3
     ) { context in
@@ -81,7 +81,7 @@ func lagunaCorrectnessGeneratesGreedyTokensWithGrowingContext() throws {
 func lagunaCorrectnessTeacherForcedUsesGoldenPrefix() throws {
     var contexts: [[Int]] = []
     let expected = [20, 21, 22]
-    let comparison = try LagunaCorrectness.compareTeacherForcedNoCache(
+    let comparison = try QwenCorrectness.compareTeacherForcedNoCache(
         promptTokens: [10, 11],
         expectedTokens: expected,
         steps: expected.count
@@ -144,7 +144,7 @@ func lagunaRuntimeCorrectnessReportsMissingArtifacts() throws {
     let directory = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
 
-    let report = try LagunaRuntime.runCorrectness(
+    let report = try QwenRuntime.runCorrectness(
         CorrectnessOptions(
             weightsPath: directory.appendingPathComponent("missing-weights").path,
             goldenPath: directory.appendingPathComponent("missing-golden.json").path
@@ -178,7 +178,7 @@ func lagunaRuntimeCorrectnessReportsGoldenMetadataWhenWeightsAreMissing() throws
     """
     try json.write(to: goldenPath, atomically: true, encoding: .utf8)
 
-    let report = try LagunaRuntime.runCorrectness(
+    let report = try QwenRuntime.runCorrectness(
         CorrectnessOptions(
             weightsPath: directory.appendingPathComponent("missing-weights").path,
             goldenPath: goldenPath.path

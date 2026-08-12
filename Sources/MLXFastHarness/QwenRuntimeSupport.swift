@@ -4,10 +4,10 @@ import MLX
 import MLXFastCore
 import Tokenizers
 
-// LagunaRuntime is split across LagunaRuntime*.swift for auditability.
+// QwenRuntime is split across QwenRuntime*.swift for auditability.
 // Generated split; behavior identical to the original single file.
 
-extension LagunaRuntime {
+extension QwenRuntime {
     static func currentResidentMemoryGB() -> Double {
         guard let info = processMemoryInfo() else {
             return 0

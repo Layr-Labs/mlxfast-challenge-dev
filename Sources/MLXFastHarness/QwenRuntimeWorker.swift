@@ -1,19 +1,14 @@
 import Darwin
 import Foundation
-#if !MLXFAST_TRUSTED_HARNESS
 import MLX
-#endif
 import MLXFastCore
-#if !MLXFAST_TRUSTED_HARNESS
 import MLXFastModel
 import MLXLMCommon
-#endif
 
-// LagunaRuntime is split across LagunaRuntime*.swift for auditability.
+// QwenRuntime is split across QwenRuntime*.swift for auditability.
 // Generated split; behavior identical to the original single file.
 
-#if !MLXFAST_TRUSTED_HARNESS
-extension LagunaRuntime {
+extension QwenRuntime {
     public static func runWorker(weightsPath: String) throws {
         // The worker holds the ~21.6 GB model for its whole lifetime, so it must
         // never outlive the harness parent that spawned it. Reading protocol
@@ -139,7 +134,7 @@ extension LagunaRuntime {
     /// the defaults.
     @discardableResult
     static func startRuntimeWorkerOrphanReaper(
-        pollIntervalSeconds: Double = LagunaRuntime.runtimeWorkerOrphanPollSeconds,
+        pollIntervalSeconds: Double = QwenRuntime.runtimeWorkerOrphanPollSeconds,
         isOrphaned: @escaping @Sendable () -> Bool = { getppid() == 1 },
         onOrphaned: @escaping @Sendable () -> Void = {
             fputs(
@@ -301,7 +296,7 @@ extension LagunaRuntime {
                 cache: cache,
                 positionOffset: 0
             )
-            let token = try LagunaCorrectness.greedyToken(from: logits)
+            let token = try QwenCorrectness.greedyToken(from: logits)
             let diagnostics = try correctnessLogitDiagnostics(
                 from: logits,
                 topK: request.topK
@@ -337,7 +332,7 @@ extension LagunaRuntime {
                 cache: cache,
                 positionOffset: state.correctnessPromptTokenCount + state.correctnessStep
             )
-            let token = try LagunaCorrectness.greedyToken(from: logits)
+            let token = try QwenCorrectness.greedyToken(from: logits)
             let diagnostics = try correctnessLogitDiagnostics(
                 from: logits,
                 topK: request.topK
@@ -372,7 +367,7 @@ extension LagunaRuntime {
                 positionOffset: 0
             )
             eval(logits)
-            let token = try LagunaCorrectness.greedyToken(from: logits)
+            let token = try QwenCorrectness.greedyToken(from: logits)
             return RuntimeWorkerResponse(
                 id: request.id,
                 nonce: sessionNonce,
@@ -408,7 +403,7 @@ extension LagunaRuntime {
                 cache: cache,
                 positionOffset: 0
             )
-            let token = try LagunaCorrectness.greedyToken(from: logits)
+            let token = try QwenCorrectness.greedyToken(from: logits)
             let seedToken = token
             materializeLagunaCacheState(cache)
             state.decodeCache = cache
@@ -444,7 +439,7 @@ extension LagunaRuntime {
                 cache: cache,
                 positionOffset: state.decodeSeedTokenCount + state.decodeStep
             )
-            let token = try LagunaCorrectness.greedyToken(from: logits)
+            let token = try QwenCorrectness.greedyToken(from: logits)
             state.decodeStep += 1
             return RuntimeWorkerResponse(
                 id: request.id,
@@ -477,7 +472,6 @@ extension LagunaRuntime {
     }
 
 }
-#endif
 
 private struct RuntimeWorkerPinnedConfiguration: Decodable {
     let modelType: String
@@ -988,16 +982,14 @@ private struct RuntimeWorkerWireCodingKey: CodingKey {
     }
 }
 
-#if !MLXFAST_TRUSTED_HARNESS
-    struct RuntimeWorkerState {
-        var correctnessCache: [KVCache]?
-        var correctnessPromptTokenCount = 0
-        var correctnessStep = 0
-        var decodeCache: [KVCache]?
-        var decodeSeedTokenCount = 0
-        var decodeStep = 0
-    }
-#endif
+struct RuntimeWorkerState {
+    var correctnessCache: [KVCache]?
+    var correctnessPromptTokenCount = 0
+    var correctnessStep = 0
+    var decodeCache: [KVCache]?
+    var decodeSeedTokenCount = 0
+    var decodeStep = 0
+}
 
 struct RuntimeWorkerPreflightResponse: Codable, Equatable {
     let ok: Bool
@@ -1883,56 +1875,7 @@ func stopRuntimeWorkerProcess(
     return !process.isRunning
 }
 
-/// Reassert the actual runtime-worker executable as the final Seatbelt exec
-/// rule. Operator-provided profiles can outlive a binary-layout change; a
-/// stale allow would otherwise make sandbox-exec die before the protocol hello.
-/// Strip every earlier exec exception, then append a deny plus one literal
-/// allow so the resulting profile admits exactly this worker.
-func runtimeWorkerSandboxProfile(
-    rebinding profilePath: String,
-    toExecutableAt executablePath: String
-) throws -> String {
-    let source = try String(contentsOfFile: profilePath, encoding: .utf8)
-    var retainedLines: [Substring] = []
-    for line in source.split(separator: "\n", omittingEmptySubsequences: false) {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        if trimmed.hasPrefix("(allow process-exec") {
-            guard trimmed.hasSuffix(")") else {
-                throw MLXFastError.invalidInput(
-                    "runtime worker sandbox profile has an unsupported multiline process-exec allow"
-                )
-            }
-            continue
-        }
-        retainedLines.append(line)
-    }
-    let sourceWithoutExecAllows = retainedLines.joined(separator: "\n")
-    let resolvedExecutablePath = URL(fileURLWithPath: executablePath)
-        .standardizedFileURL
-        .resolvingSymlinksInPath()
-        .path
-    let escapedExecutablePath = resolvedExecutablePath
-        .replacingOccurrences(of: "\\", with: "\\\\")
-        .replacingOccurrences(of: "\"", with: "\\\"")
-    let separator = sourceWithoutExecAllows.hasSuffix("\n") ? "" : "\n"
-    let rebound = sourceWithoutExecAllows + separator + """
-    ;; Trusted-harness executable binding (must remain the final exec rules).
-    (deny process-exec*)
-    (allow process-exec (literal "\(escapedExecutablePath)"))
-    """
-    let outputURL = FileManager.default.temporaryDirectory
-        .appendingPathComponent(
-            "mlxfast-runtime-worker-bound-\(UUID().uuidString).sb"
-        )
-    try rebound.write(to: outputURL, atomically: true, encoding: .utf8)
-    try FileManager.default.setAttributes(
-        [.posixPermissions: 0o400],
-        ofItemAtPath: outputURL.path
-    )
-    return outputURL.path
-}
-
-extension LagunaRuntime {
+extension QwenRuntime {
     public static func runPreflightWithWorker(
         weightsPath: String,
         worker options: RuntimeWorkerOptions
@@ -1957,11 +1900,7 @@ extension LagunaRuntime {
             "--weights",
             weightsPath,
         ]
-        if let configuredSandboxProfilePath = options.sandboxProfilePath {
-            let sandboxProfilePath = try runtimeWorkerSandboxProfile(
-                rebinding: configuredSandboxProfilePath,
-                toExecutableAt: options.executablePath
-            )
+        if let sandboxProfilePath = options.sandboxProfilePath {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
             process.arguments = [
                 "-f",
@@ -2094,11 +2033,7 @@ final class RuntimeWorkerClient {
                 weightsPath,
             ]
         }
-        if let configuredSandboxProfilePath = options.sandboxProfilePath {
-            let sandboxProfilePath = try runtimeWorkerSandboxProfile(
-                rebinding: configuredSandboxProfilePath,
-                toExecutableAt: options.executablePath
-            )
+        if let sandboxProfilePath = options.sandboxProfilePath {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
             process.arguments = [
                 "-f",

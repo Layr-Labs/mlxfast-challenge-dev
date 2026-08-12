@@ -7,10 +7,10 @@ import MLXFastCore
 import MLXFastModel
 #endif
 
-// LagunaRuntime is split across LagunaRuntime*.swift for auditability.
+// QwenRuntime is split across QwenRuntime*.swift for auditability.
 // Generated split; behavior identical to the original single file.
 
-extension LagunaRuntime {
+extension QwenRuntime {
     public static func traceCorrectness(
         _ options: CorrectnessTraceOptions,
         worker workerOptions: RuntimeWorkerOptions? = nil
@@ -503,7 +503,7 @@ extension LagunaRuntime {
             cache: cache,
             positionOffset: 0
         )
-        var actualToken = try LagunaCorrectness.greedyToken(from: logits)
+        var actualToken = try QwenCorrectness.greedyToken(from: logits)
 
         for step in 0..<steps {
             let expectedToken = testCase.expectedTokens[step]
@@ -537,7 +537,7 @@ extension LagunaRuntime {
                 cache: cache,
                 positionOffset: testCase.promptTokens.count + step
             )
-            actualToken = try LagunaCorrectness.greedyToken(from: logits)
+            actualToken = try QwenCorrectness.greedyToken(from: logits)
         }
 
         return CorrectnessTokenComparison(
@@ -561,7 +561,7 @@ extension LagunaRuntime {
             cache: cache,
             positionOffset: 0
         )
-        let actualToken = try LagunaCorrectness.greedyToken(from: logits)
+        let actualToken = try QwenCorrectness.greedyToken(from: logits)
         return compareAnchorToken(
             anchor: anchor,
             actualToken: actualToken,
@@ -598,7 +598,7 @@ extension LagunaRuntime {
                 cache: cache,
                 positionOffset: 0
             )
-            let actualToken = try LagunaCorrectness.greedyToken(from: logits)
+            let actualToken = try QwenCorrectness.greedyToken(from: logits)
             return compareBehaviorFirstToken(
                 testCase: testCase,
                 actualToken: actualToken,
@@ -887,7 +887,7 @@ extension LagunaRuntime {
             cache: cache,
             positionOffset: 0
         )
-        var token = try LagunaCorrectness.greedyToken(from: logits)
+        var token = try QwenCorrectness.greedyToken(from: logits)
         var generated: [Int] = []
         generated.reserveCapacity(step + 1)
 
@@ -910,7 +910,7 @@ extension LagunaRuntime {
                 cache: cache,
                 positionOffset: testCase.promptTokens.count + currentStep
             )
-            token = try LagunaCorrectness.greedyToken(from: logits)
+            token = try QwenCorrectness.greedyToken(from: logits)
         }
 
         throw MLXFastError.invalidInput("trace failed to reach step \(step)")
@@ -1006,7 +1006,7 @@ extension LagunaRuntime {
             cache: cache,
             positionOffset: 0
         )
-        var token = try LagunaCorrectness.greedyToken(from: logits)
+        var token = try QwenCorrectness.greedyToken(from: logits)
         var generated: [Int] = []
         generated.reserveCapacity(steps)
 
@@ -1027,7 +1027,7 @@ extension LagunaRuntime {
                 cache: cache,
                 positionOffset: promptTokens.count + step
             )
-            token = try LagunaCorrectness.greedyToken(from: logits)
+            token = try QwenCorrectness.greedyToken(from: logits)
         }
         return generated
         }

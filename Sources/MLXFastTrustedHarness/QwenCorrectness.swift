@@ -26,7 +26,7 @@ public struct CorrectnessTokenComparison: Equatable {
     }
 }
 
-public enum LagunaCorrectness {
+public enum QwenCorrectness {
     public static func generateGreedyNoCache(
         promptTokens: [Int],
         steps: Int = MLXFastConstants.correctnessSteps,

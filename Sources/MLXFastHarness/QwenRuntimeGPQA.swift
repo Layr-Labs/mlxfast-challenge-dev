@@ -2,10 +2,10 @@ import Foundation
 import MLXFastCore
 import Tokenizers
 
-// LagunaRuntime is split across LagunaRuntime*.swift for auditability.
+// QwenRuntime is split across QwenRuntime*.swift for auditability.
 // Generated split; behavior identical to the original single file.
 
-extension LagunaRuntime {
+extension QwenRuntime {
     struct SemanticGPQAAnswerDocument: Encodable {
         let version: Int
         let cases: [SemanticGPQAAnswerCase]

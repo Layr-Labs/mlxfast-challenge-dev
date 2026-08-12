@@ -869,7 +869,7 @@ func hashWeightsDirectoryRejectsHardlinks() throws {
         contentsOfFile: ".github/scripts/hash-weights-directory.sh",
         encoding: .utf8
     )
-    // Mirrors overlay-editable-paths.sh and LagunaRuntime.directoryDigest.
+    // Mirrors overlay-editable-paths.sh and QwenRuntime.directoryDigest.
     #expect(hashScript.contains("-links +1"))
     #expect(hashScript.contains("weights tree contains a hardlinked file"))
     // Reproducible digest recipe (path-order-stable, content-addressed).
@@ -877,7 +877,7 @@ func hashWeightsDirectoryRejectsHardlinks() throws {
     #expect(hashScript.contains("LC_ALL=C sort -z"))
 
     let preflight = try String(
-        contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimePreflight.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimePreflight.swift",
         encoding: .utf8
     )
     #expect(preflight.contains("func requireSingleHardLink("))
@@ -2304,7 +2304,7 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(!cli.contains("case \"measure-gpqa-ttft\""))
     #expect(cli.contains("AutoTokenizer.from(modelFolder: modelFolder, strict: false)"))
     #expect(cli.contains("acceptedReferenceTokenSequences"))
-    #expect(cli.contains("LagunaRuntime.generateGreedyTokens"))
+    #expect(cli.contains("QwenRuntime.generateGreedyTokens"))
     #expect(cli.contains("runtimeWorkerOptions(blockedGoldenPath: gpqaPath)"))
     #expect(!cli.contains("calibrated_reference_outputs"))
     #expect(cli.contains("SemanticGPQAAnswerDocument"))
@@ -2369,6 +2369,7 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
 func unsafePrivateCalibrationToolingStaysExcluded() {
     for path in [
         "Sources/MLXFastCore/PrivateArtifactCalibration.swift",
+        "Sources/MLXFastTrustedHarness/QwenRuntimePrivateCalibration.swift",
         "Sources/MLXFastTrustedHarness/LagunaRuntimePrivateCalibration.swift",
         "Tests/Fixtures/PrivateArtifactCalibration/synthetic-private-golden-template.json",
         "Tests/Fixtures/PrivateArtifactCalibration/synthetic-private-gpqa-template.json",
@@ -2626,7 +2627,7 @@ func decodeMeasurementRunsSingleUnmemoizableSeedForward() throws {
     // other from that memo, collapsing two decode-charged forwards into one and
     // inflating decode_speedup with no real speedup. Guard both decode paths.
     let worker = try String(
-        contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeWorker.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeWorker.swift",
         encoding: .utf8
     )
     let beginStart = try #require(worker.range(of: "case \"decode_begin\":"))
@@ -2639,7 +2640,7 @@ func decodeMeasurementRunsSingleUnmemoizableSeedForward() throws {
     #expect(decodeBegin.contains("with NO preceding"))
 
     let benchmark = try String(
-        contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeBenchmark.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeBenchmark.swift",
         encoding: .utf8
     )
     let decodeStart = try #require(benchmark.range(of: "static func measureDecode("))
@@ -2853,7 +2854,7 @@ func sealedStdoutScoreIsCoarsenedLikeTheWrittenFile() throws {
 @Test
 func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
     let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeWorker.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeWorker.swift",
         encoding: .utf8
     )
 
@@ -2877,7 +2878,7 @@ func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
 @Test
 func runtimeWorkerValidatesTransformedWeightsAtStartup() throws {
     let worker = try String(
-        contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeWorker.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeWorker.swift",
         encoding: .utf8
     )
     // The structural validation BenchmarkPreflight.check used to run in the
@@ -2916,11 +2917,11 @@ func benchmarkLocalIterateModeUsesPublicFixtureAndNonOfficialScore() throws {
         encoding: .utf8
     )
     let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeLocalIterate.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeLocalIterate.swift",
         encoding: .utf8
     )
     let options = try String(
-        contentsOfFile: "Sources/MLXFastHarness/LagunaRuntime.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntime.swift",
         encoding: .utf8
     )
 
@@ -2931,7 +2932,7 @@ func benchmarkLocalIterateModeUsesPublicFixtureAndNonOfficialScore() throws {
         "public static let localIterateBenchmarkDecodeSteps = benchmarkDecodeSteps"
     ))
     #expect(cli.contains("flagOptions: [\"--local-submit\", \"--local-iterate\"]"))
-    #expect(cli.contains("LagunaRuntime.localIterate("))
+    #expect(cli.contains("QwenRuntime.localIterate("))
     #expect(cli.contains("MLXFastConstants.defaultLocalIterateScorePath"))
     #expect(runtime.contains("runLocalIterateCheckedTimingWithWorker("))
     #expect(runtime.contains("includes_seed_prefill=true"))
@@ -3106,7 +3107,7 @@ func localIterateStreamsLiveNumbersDuringTheRun() throws {
     // score, heartbeats during long silent forwards, an immediate (redacted)
     // token-mismatch report, and a final summary block.
     let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeLocalIterate.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeLocalIterate.swift",
         encoding: .utf8
     )
 
@@ -3144,7 +3145,7 @@ func localIterateStreamsLiveNumbersDuringTheRun() throws {
 func localCorrectnessFailureSurfacesCarryNonM5GoldenCaveat() throws {
     let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
     let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeLocalIterate.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeLocalIterate.swift",
         encoding: .utf8
     )
     let cli = try String(
@@ -3173,7 +3174,7 @@ func localCorrectnessFailureSurfacesCarryNonM5GoldenCaveat() throws {
     // Standalone correctness command: same sentence on stderr for mismatch
     // failures, with the exit code unchanged.
     #expect(cli.contains("if !report.passed, report.error.contains(\"token mismatch\")"))
-    #expect(cli.contains("LagunaRuntime.nonM5GoldenMismatchCaveat"))
+    #expect(cli.contains("QwenRuntime.nonM5GoldenMismatchCaveat"))
     #expect(cli.contains("return report.passed ? 0 : 1"))
 
     // The caveat points at a README callout that actually exists.
@@ -3999,11 +4000,11 @@ func localModesForwardWorkerStderrLiveButOfficialRunsDoNot() throws {
         encoding: .utf8
     )
     let worker = try String(
-        contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeWorker.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeWorker.swift",
         encoding: .utf8
     )
     let options = try String(
-        contentsOfFile: "Sources/MLXFastHarness/LagunaRuntime.swift",
+        contentsOfFile: "Sources/MLXFastHarness/QwenRuntime.swift",
         encoding: .utf8
     )
 
@@ -4818,12 +4819,12 @@ func staticReviewFailsClosedOnSelfContradictoryPassedTrueWithHighSeverity() thro
     #expect(crossCheckBlock.contains("passed=\"false\""))
 }
 
-// LagunaRuntime was split across LagunaRuntime*.swift; concatenate them so
+// QwenRuntime was split across QwenRuntime*.swift; concatenate them so
 // source-level assertions stay agnostic to which split file the code lives in.
 private func harnessRuntimeSource() throws -> String {
     let directory = "Sources/MLXFastHarness"
     let files = try FileManager.default.contentsOfDirectory(atPath: directory)
-        .filter { $0.hasPrefix("LagunaRuntime") && $0.hasSuffix(".swift") }
+        .filter { $0.hasPrefix("QwenRuntime") && $0.hasSuffix(".swift") }
         .sorted()
     return try files
         .map { try String(contentsOfFile: "\(directory)/\($0)", encoding: .utf8) }

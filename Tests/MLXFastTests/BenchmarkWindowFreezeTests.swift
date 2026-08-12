@@ -100,7 +100,7 @@ func benchmarkWindowFreezeDocMatchesConstants() throws {
 
 @Test
 func timedDecodeChargesOneValidatedSeedForward() throws {
-    let worker = try packageFile("Sources/MLXFastHarness/LagunaRuntimeWorker.swift")
+    let worker = try packageFile("Sources/MLXFastHarness/QwenRuntimeWorker.swift")
     let decodeBegin = try slice(worker, from: "case \"decode_begin\":", to: "case \"decode_step\":")
     // Exactly one whole-prompt forward, and no warmup pass to memoize against it.
     #expect(decodeBegin.components(separatedBy: "lagunaLogits(").count - 1 == 1)
@@ -109,7 +109,7 @@ func timedDecodeChargesOneValidatedSeedForward() throws {
 
     // The decode phase is parent-timed and validated; worker-reported seconds
     // must not be the scored value, and both the seed and the steps are checked.
-    let benchmark = try packageFile("Sources/MLXFastHarness/LagunaRuntimeBenchmark.swift")
+    let benchmark = try packageFile("Sources/MLXFastHarness/QwenRuntimeBenchmark.swift")
     let measureWorkerDecode = try slice(
         benchmark,
         from: "static func measureWorkerDecode(",
@@ -140,7 +140,7 @@ func timedDecodeChargesOneValidatedSeedForward() throws {
 
 @Test
 func timedPrefillChargesOneValidatedColdForward() throws {
-    let benchmark = try packageFile("Sources/MLXFastHarness/LagunaRuntimeBenchmark.swift")
+    let benchmark = try packageFile("Sources/MLXFastHarness/QwenRuntimeBenchmark.swift")
     let measureWorkerPrefill = try slice(
         benchmark,
         from: "static func measureWorkerPrefillSecondsPerToken(",
@@ -156,7 +156,7 @@ func timedPrefillChargesOneValidatedColdForward() throws {
 
 @Test
 func workerPhaseStartsResetTrustedAllocatorBeforeForwardSetup() throws {
-    let worker = try packageFile("Sources/MLXFastHarness/LagunaRuntimeWorker.swift")
+    let worker = try packageFile("Sources/MLXFastHarness/QwenRuntimeWorker.swift")
     let resetCall = "try resetRuntimeWorkerAllocatorForPhaseStart()"
 
     // The phase-start value and reset live in the trusted harness, not in
@@ -237,7 +237,7 @@ func workerPhaseStartsResetTrustedAllocatorBeforeForwardSetup() throws {
 
 @Test
 func trustedParentStartsPhaseTimerBeforeWorkerResetRequest() throws {
-    let benchmark = try packageFile("Sources/MLXFastHarness/LagunaRuntimeBenchmark.swift")
+    let benchmark = try packageFile("Sources/MLXFastHarness/QwenRuntimeBenchmark.swift")
     let prefill = try slice(
         benchmark,
         from: "static func measureWorkerPrefillSecondsPerToken(",
@@ -278,7 +278,7 @@ func scoredBaselinesResolveFromGoldenWithConstantsFallback() throws {
     #expect(golden.contains("baselineDecodeSecondsPerToken ?? MLXFastConstants.officialBaselineDecodeSecondsPerToken"))
     #expect(golden.contains("must be provided together"))
 
-    let benchmark = try packageFile("Sources/MLXFastHarness/LagunaRuntimeBenchmark.swift")
+    let benchmark = try packageFile("Sources/MLXFastHarness/QwenRuntimeBenchmark.swift")
     let score = try packageFile("Sources/MLXFastCore/Score.swift")
     // Both benchmark paths adopt the golden's resolved baselines...
     #expect(benchmark.components(separatedBy: "benchmarkGolden.resolvedBaselinePrefillSecondsPerToken").count - 1 == 2)
@@ -315,9 +315,9 @@ func decodeMeasurementInvokesNoPhaseVaryingEditableHook() throws {
     #expect(!FileManager.default.fileExists(
         atPath: "Sources/MLXFastModel/Gemma4SubmissionControls.swift"
     ))
-    let worker = try packageFile("Sources/MLXFastHarness/LagunaRuntimeWorker.swift")
-    let benchmark = try packageFile("Sources/MLXFastHarness/LagunaRuntimeBenchmark.swift")
-    let localIterate = try packageFile("Sources/MLXFastHarness/LagunaRuntimeLocalIterate.swift")
+    let worker = try packageFile("Sources/MLXFastHarness/QwenRuntimeWorker.swift")
+    let benchmark = try packageFile("Sources/MLXFastHarness/QwenRuntimeBenchmark.swift")
+    let localIterate = try packageFile("Sources/MLXFastHarness/QwenRuntimeLocalIterate.swift")
     for source in [worker, benchmark, localIterate] {
         #expect(!source.contains("submissionValidationDelayMilliseconds"))
         #expect(!source.contains("measuredDecodeDelayMilliseconds"))

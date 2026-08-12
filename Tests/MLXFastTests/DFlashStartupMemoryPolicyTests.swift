@@ -6,7 +6,7 @@ import Testing
 // serial worker: the ~21.6 GB pinned target plus the separately-loaded drafter,
 // warmed across every legal block width at a seed past the sliding-window ring.
 // It reaches that residency through LLMModelFactory, so it never constructs
-// LagunaRuntimeWeightCache -- which was the documented low-memory startup
+// Qwen35RuntimeWeightCache -- which was the documented low-memory startup
 // policy's only call site. These tests pin the wiring that closed that gap.
 //
 // Scope note: no MLX device work, no weights, no hidden material. Two of the
@@ -14,13 +14,13 @@ import Testing
 // function directly.
 
 private let dflashWorkerTrustedPath =
-    "Sources/MLXFastTrustedHarness/LagunaRuntimeDFlashWorker.swift"
+    "Sources/MLXFastTrustedHarness/QwenRuntimeDFlashWorker.swift"
 private let dflashWorkerParticipantPath =
-    "Sources/MLXFastHarness/LagunaRuntimeDFlashWorker.swift"
+    "Sources/MLXFastHarness/QwenRuntimeDFlashWorker.swift"
 private let dflashDriverTrustedPath =
-    "Sources/MLXFastTrustedHarness/LagunaRuntimeDFlashDriver.swift"
+    "Sources/MLXFastTrustedHarness/QwenRuntimeDFlashDriver.swift"
 private let dflashDriverParticipantPath =
-    "Sources/MLXFastHarness/LagunaRuntimeDFlashDriver.swift"
+    "Sources/MLXFastHarness/QwenRuntimeDFlashDriver.swift"
 
 private let trustedHarnessGuardOpen = "#if !MLXFAST_TRUSTED_HARNESS\n"
 private let trustedHarnessGuardClose = "#endif\n"
@@ -248,8 +248,8 @@ func dflashResidentSetGetsTheDocumentedLowMemoryProfileBelow64GiB() {
 struct DFlashTrustedEditableCouplingTests {
     private static let policyPath = "Sources/MLXFastModel/RuntimeStartupMemoryPolicy.swift"
     private static let workerPaths = [
-        "Sources/MLXFastTrustedHarness/LagunaRuntimeDFlashWorker.swift",
-        "Sources/MLXFastHarness/LagunaRuntimeDFlashWorker.swift",
+        "Sources/MLXFastTrustedHarness/QwenRuntimeDFlashWorker.swift",
+        "Sources/MLXFastHarness/QwenRuntimeDFlashWorker.swift",
     ]
 
     @Test

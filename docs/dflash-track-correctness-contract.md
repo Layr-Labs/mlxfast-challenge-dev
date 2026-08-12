@@ -151,12 +151,12 @@ Hard requirements on it:
 -------------------------------------------
 Only ONE request kind reaches the candidate worker on every leg:
 decode_block. No verify/re-verify/attest opcode exists. This is deliberate:
-LagunaRuntimeWorker.swift's env allowlist already makes the environment
+QwenRuntimeWorker.swift's env allowlist already makes the environment
 byte-identical across legs to kill phase oracles, and a distinguishable
 re-verify opcode would reintroduce one in band, below that defense.
 
 Parent -> worker, per round r (extends ExperimentalDecodeBlockRequest at
-LagunaRuntimeWorker.swift:968):
+QwenRuntimeWorker.swift:968):
   { kind:"decode_block", id, token: <previous committed token>,
     max_block_size: K_r }
 K_r is chosen by the PARENT from a randomized schedule (see 6c). Nothing else
@@ -196,7 +196,7 @@ field is a hard protocol failure, never a warning):
                               descending, deduped, finite, in vocab range
                               (reuse validatedWorkerTopLogits' internal
                               consistency checks at
-                              LagunaRuntimeCorrectnessCompare.swift:429 —
+                              QwenRuntimeCorrectnessCompare.swift:429 —
                               but note those checks are necessary, never
                               sufficient; truth comes only from 3).
   g. accepted_count: Int      diagnostic only; the parent recomputes
@@ -492,7 +492,7 @@ width. Nothing in E requires or assumes any particular acceptance pattern.
     forgeable row equation (758-766) and the worker-reported
     exactPair*/serialVerificationRowCount fields as GATING inputs; retain
     only as diagnostics.
-  - LagunaRuntimeWorker.swift:968 ExperimentalDecodeBlockRequest and
+  - QwenRuntimeWorker.swift:968 ExperimentalDecodeBlockRequest and
     validateExperimentalDecodeBlockRequest: add the kv_checkpoint flag;
     forbid everything else as today.
   - New trusted module: reference-worker spawn + frame query + journal
@@ -3096,7 +3096,7 @@ holds the lock).
 
 The criterion the manifest has always named:
 `trusted-sequential-reverification-with-bounded-near-tie-budget`, exactly as
-implemented in `Sources/MLXFastTrustedHarness/LagunaRuntimeDFlash.swift` and
+implemented in `Sources/MLXFastTrustedHarness/QwenRuntimeDFlash.swift` and
 exercised by every accepted run to date. Per emitted token, first match wins:
 
 | outcome | predicate | bound |

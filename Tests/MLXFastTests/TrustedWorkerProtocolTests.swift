@@ -18,7 +18,7 @@ func trustedPreflightUsesOneShotWorkerProtocolAndPropagatesFailure() throws {
         """,
         to: successWorker
     )
-    try LagunaRuntime.runPreflightWithWorker(
+    try QwenRuntime.runPreflightWithWorker(
         weightsPath: "/tmp/weights",
         worker: RuntimeWorkerOptions(
             executablePath: successWorker.path,
@@ -41,7 +41,7 @@ func trustedPreflightUsesOneShotWorkerProtocolAndPropagatesFailure() throws {
         to: failingWorker
     )
     #expect(throws: MLXFastError.self) {
-        try LagunaRuntime.runPreflightWithWorker(
+        try QwenRuntime.runPreflightWithWorker(
             weightsPath: "/tmp/weights",
             worker: RuntimeWorkerOptions(
                 executablePath: failingWorker.path,
@@ -94,7 +94,7 @@ func trustedTracePreservesLargeTopKAndOutOfSubsetExpectedDiagnostics() throws {
     }
     """.write(to: golden, atomically: true, encoding: .utf8)
 
-    let report = try LagunaRuntime.traceCorrectness(
+    let report = try QwenRuntime.traceCorrectness(
         CorrectnessTraceOptions(
             weightsPath: "/tmp/weights",
             goldenPath: golden.path,

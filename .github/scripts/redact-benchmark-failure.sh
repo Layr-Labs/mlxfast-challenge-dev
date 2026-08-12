@@ -71,7 +71,7 @@ if [[ -s "${score_path}" ]]; then
     timed_benchmark_seconds="$(jq 'if (.metrics.timed_benchmark_seconds | type) == "number" then .metrics.timed_benchmark_seconds else null end' "${score_path}")"
 
     # Categories are matched ONLY against fixed prefixes that the trusted
-    # harness itself authors (LagunaRuntimeBenchmark). Anything else --
+    # harness itself authors (QwenRuntimeBenchmark). Anything else --
     # including error text that originated inside the sandboxed worker -- is
     # deliberately collapsed to an opaque category.
     if [[ "${error_text}" == "performance floor failed"* ]]; then

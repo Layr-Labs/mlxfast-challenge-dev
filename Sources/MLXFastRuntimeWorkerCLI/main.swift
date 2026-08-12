@@ -40,7 +40,7 @@ private enum ParticipantWorkerCLI {
                         "MLXFAST_WEIGHTS_PATH"
                     ] ?? MLXFastConstants.defaultWeightsPath
                 )
-                try LagunaRuntime.runWorker(weightsPath: weightsPath)
+                try QwenRuntime.runWorker(weightsPath: weightsPath)
 
             case "dflash-runtime-worker":
                 // DFlash block-decode track worker. Takes the organizer-pinned
@@ -67,7 +67,7 @@ private enum ParticipantWorkerCLI {
                             + "MLXFAST_DFLASH_DRAFTER_DIR)"
                     )
                 }
-                try LagunaRuntime.runExperimentalDFlashWorker(
+                try QwenRuntime.runExperimentalDFlashWorker(
                     targetWeightsPath: weightsPath,
                     drafterPath: drafterPath
                 )
@@ -82,7 +82,7 @@ private enum ParticipantWorkerCLI {
                         "MLXFAST_WEIGHTS_PATH"
                     ] ?? MLXFastConstants.defaultWeightsPath
                 )
-                try LagunaRuntime.runPreflightWorker(
+                try QwenRuntime.runPreflightWorker(
                     weightsPath: weightsPath
                 )
 

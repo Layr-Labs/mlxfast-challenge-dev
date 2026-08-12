@@ -16,7 +16,7 @@ struct BenchmarkSafetyTests {
         try Data("alpha\n".utf8).write(to: root.appendingPathComponent("a.txt"))
         try Data("ignored".utf8).write(to: root.appendingPathComponent(".gitkeep"))
 
-        let digest = try LagunaRuntime.directoryDigest(
+        let digest = try QwenRuntime.directoryDigest(
             rootPath: root.path,
             ignoredRelativePaths: [".gitkeep"]
         )
@@ -24,7 +24,7 @@ struct BenchmarkSafetyTests {
         // Golden from the pre-change recipe: sorted relative path + NUL +
         // raw per-file SHA-256 + NUL. The read strategy must not alter it.
         #expect(
-            digest == LagunaRuntime.DirectoryDigest(
+            digest == QwenRuntime.DirectoryDigest(
                 fileCount: 2,
                 byteCount: 11,
                 sha256: "bc1b1f56a33b786645d24771234b988228e7b97266ba74337fc2329ea7101134"
@@ -32,7 +32,7 @@ struct BenchmarkSafetyTests {
         )
 
         let source = try String(
-            contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimePreflight.swift",
+            contentsOfFile: "Sources/MLXFastHarness/QwenRuntimePreflight.swift",
             encoding: .utf8
         )
         let noCache = try #require(
@@ -67,8 +67,8 @@ struct BenchmarkSafetyTests {
             restoreEnvironment("MLXFAST_COOL_GATE_TEST_LOG", value: previousLog)
         }
 
-        try LagunaRuntime.runLocalPhaseCoolGate(phase: "prefill")
-        try LagunaRuntime.runLocalPhaseCoolGate(phase: "decode")
+        try QwenRuntime.runLocalPhaseCoolGate(phase: "prefill")
+        try QwenRuntime.runLocalPhaseCoolGate(phase: "decode")
 
         #expect(try String(contentsOf: log, encoding: .utf8) == "prefill\ndecode\n")
     }
@@ -1463,19 +1463,19 @@ struct BenchmarkSafetyTests {
     @Test
     func scoredWorkerResponsesExcludeDiagnostics() throws {
         let worker = try String(
-            contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeWorker.swift",
+            contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeWorker.swift",
             encoding: .utf8
         )
         let benchmark = try String(
-            contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeBenchmark.swift",
+            contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeBenchmark.swift",
             encoding: .utf8
         )
         let local = try String(
-            contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeLocalIterate.swift",
+            contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeLocalIterate.swift",
             encoding: .utf8
         )
         let support = try String(
-            contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeSupport.swift",
+            contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeSupport.swift",
             encoding: .utf8
         )
         let decodeStep = try sourceSlice(worker, from: "case \"decode_step\":", to: "case \"phase_diagnostics\":")
@@ -1530,11 +1530,11 @@ struct BenchmarkSafetyTests {
     @Test
     func semanticGPQACaptureIsWrittenOnlyAfterCorrectnessWorkerCloses() throws {
         let correctness = try String(
-            contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeCorrectness.swift",
+            contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeCorrectness.swift",
             encoding: .utf8
         )
         let benchmark = try String(
-            contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeBenchmark.swift",
+            contentsOfFile: "Sources/MLXFastHarness/QwenRuntimeBenchmark.swift",
             encoding: .utf8
         )
 

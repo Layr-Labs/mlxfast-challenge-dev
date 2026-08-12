@@ -1,14 +1,12 @@
 import Foundation
 import MLXFastCore
-#if !MLXFAST_TRUSTED_HARNESS
 import MLXFastModel
-#endif
 import Tokenizers
 
-// LagunaRuntime is split across LagunaRuntime*.swift for auditability.
+// QwenRuntime is split across QwenRuntime*.swift for auditability.
 // Generated split; behavior identical to the original single file.
 
-extension LagunaRuntime {
+extension QwenRuntime {
     public static func generateGreedyTokens(
         _ options: GreedyGenerationOptions,
         progress: ((Int, Int) -> Void)? = nil
@@ -38,27 +36,16 @@ extension LagunaRuntime {
             return tokens
         }
 
-        #if !MLXFAST_TRUSTED_HARNESS
-            let config = try LagunaConfig.load(from: options.weightsPath)
-            let loader = try LagunaWeightLoader(
-                weightsPath: options.weightsPath
-            )
-            let weightCache = LagunaRuntimeWeightCache(
-                loader: loader,
-                config: config
-            )
-            return try generateGreedyCached(
-                promptTokens: options.promptTokens,
-                steps: options.steps,
-                weightCache: weightCache,
-                progressIntervalSteps: 1,
-                progress: progress
-            )
-        #else
-            throw MLXFastError.invalidInput(
-                "trusted greedy generation requires the participant worker"
-            )
-        #endif
+        let config = try LagunaConfig.load(from: options.weightsPath)
+        let loader = try LagunaWeightLoader(weightsPath: options.weightsPath)
+        let weightCache = LagunaRuntimeWeightCache(loader: loader, config: config)
+        return try generateGreedyCached(
+            promptTokens: options.promptTokens,
+            steps: options.steps,
+            weightCache: weightCache,
+            progressIntervalSteps: 1,
+            progress: progress
+        )
     }
 
     public static func runCorrectness(
@@ -69,77 +56,34 @@ extension LagunaRuntime {
             return runCorrectnessWithWorker(options, worker: worker)
         }
 
-        #if !MLXFAST_TRUSTED_HARNESS
-            var loadedGolden: GoldenFixture?
-            var loader: LagunaWeightLoader?
-            do {
-                try requireFile(
-                    options.goldenPath,
-                    description: "correctness golden file"
-                )
-                let golden = try loadGoldenFixture(from: options.goldenPath)
-                loadedGolden = golden
-                _ = try BenchmarkPreflight.checkCorrectnessArtifacts(
-                    weightsPath: options.weightsPath,
-                    goldenPath: options.goldenPath
-                )
-                let config = try LagunaConfig.load(from: options.weightsPath)
-                let runtimeLoader = try LagunaWeightLoader(
-                    weightsPath: options.weightsPath
-                )
-                loader = runtimeLoader
-                let weightCache = LagunaRuntimeWeightCache(
-                    loader: runtimeLoader,
-                    config: config
-                )
-                return runLayeredCorrectness(
-                    golden: golden,
-                    weightCache: weightCache,
-                    steps: MLXFastConstants.correctnessSteps
-                )
-            } catch {
-                return failedCorrectnessReport(
-                    checkedSteps: 0,
-                    caseCount: loadedGolden?.totalCorrectnessCaseCount ?? 0,
-                    goldenHash: loadedGolden?.sha256 ?? "",
-                    expertStats: expertStats(from: loader),
-                    error: "\(error)"
-                )
-            }
-        #else
-            var loadedGolden: GoldenFixture?
-            do {
-                try requireFile(
-                    options.goldenPath,
-                    description: "correctness golden file"
-                )
-                let golden = try loadGoldenFixture(
-                    from: options.goldenPath
-                )
-                loadedGolden = golden
-                _ = try BenchmarkPreflight.checkCorrectnessArtifacts(
-                    weightsPath: options.weightsPath,
-                    goldenPath: options.goldenPath
-                )
-                return failedCorrectnessReport(
-                    checkedSteps: 0,
-                    caseCount: golden.totalCorrectnessCaseCount,
-                    goldenHash: golden.sha256,
-                    expertStats: .zero,
-                    error:
-                        "trusted correctness requires the participant worker"
-                )
-            } catch {
-                return failedCorrectnessReport(
-                    checkedSteps: 0,
-                    caseCount:
-                        loadedGolden?.totalCorrectnessCaseCount ?? 0,
-                    goldenHash: loadedGolden?.sha256 ?? "",
-                    expertStats: .zero,
-                    error: "\(error)"
-                )
-            }
-        #endif
+        var loadedGolden: GoldenFixture?
+        var loader: LagunaWeightLoader?
+        do {
+            try requireFile(options.goldenPath, description: "correctness golden file")
+            let golden = try loadGoldenFixture(from: options.goldenPath)
+            loadedGolden = golden
+            _ = try BenchmarkPreflight.checkCorrectnessArtifacts(
+                weightsPath: options.weightsPath,
+                goldenPath: options.goldenPath
+            )
+            let config = try LagunaConfig.load(from: options.weightsPath)
+            let runtimeLoader = try LagunaWeightLoader(weightsPath: options.weightsPath)
+            loader = runtimeLoader
+            let weightCache = LagunaRuntimeWeightCache(loader: runtimeLoader, config: config)
+            return runLayeredCorrectness(
+                golden: golden,
+                weightCache: weightCache,
+                steps: MLXFastConstants.correctnessSteps
+            )
+        } catch {
+            return failedCorrectnessReport(
+                checkedSteps: 0,
+                caseCount: loadedGolden?.totalCorrectnessCaseCount ?? 0,
+                goldenHash: loadedGolden?.sha256 ?? "",
+                expertStats: expertStats(from: loader),
+                error: "\(error)"
+            )
+        }
     }
 
     static func runCorrectnessWithWorker(
@@ -232,8 +176,7 @@ extension LagunaRuntime {
         }
     }
 
-    #if !MLXFAST_TRUSTED_HARNESS
-        static func runLayeredCorrectness(
+    static func runLayeredCorrectness(
         golden: GoldenFixture,
         weightCache: LagunaRuntimeWeightCache,
         steps: Int = MLXFastConstants.correctnessSteps,
@@ -396,8 +339,7 @@ extension LagunaRuntime {
             goldenHash: golden.sha256,
             error: ""
         )
-        }
-    #endif
+    }
 
     static func runLayeredCorrectnessWithWorker(
         golden: GoldenFixture,

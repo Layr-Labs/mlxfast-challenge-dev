@@ -276,7 +276,7 @@ re-derived.
 
 | clause | implementation | observed in run `30613617340` |
 |---|---|---|
-| **trusted** | verifier lives in `Sources/MLXFastTrustedHarness/LagunaRuntimeDFlash*.swift`; participant code cannot reach it (it links no MLX/model code) | gate ran inside the trusted parent, candidate confined to the bench sandbox |
+| **trusted** | verifier lives in `Sources/MLXFastTrustedHarness/QwenRuntimeDFlash*.swift`; participant code cannot reach it (it links no MLX/model code) | gate ran inside the trusted parent, candidate confined to the bench sandbox |
 | **sequential reverification** | `DFlashReferenceRow.sequentialArgmax` — "reference argmax in the K=1 sequential frame" — plus post-run replay | `reference_checked_row_total: 858`, `verify_block_replayed_round_count: 335` |
 | **bounded near-tie budget** | `nearTieBudget` / `residualBudget`, bound `experimentalDFlashNearTieAdmissionBudgetPerThousand = 40`, enforced by the `residualBudgetExhausted` violation | `admissible_near_tie_count: 6`, `residual_divergence_count: 0`, i.e. the budget was exercised and not exhausted |
 

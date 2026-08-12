@@ -91,7 +91,7 @@ func validateExperimentalDFlashBlockRequest(
     )
 }
 
-extension LagunaRuntime {
+extension QwenRuntime {
     /// Runtime worker for the DFlash block-decode track.
     ///
     /// Loads the organizer-pinned target and drafter, warms the block graph, and

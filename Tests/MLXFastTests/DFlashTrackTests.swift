@@ -2405,7 +2405,7 @@ struct DFlashReusedSerialGateTests {
         #expect(judge.contains(".github/scripts/run-semantic-gpqa-gate.sh"))
     }
 
-    // TASK 6. `LagunaRuntimeDFlashDriver` guards on
+    // TASK 6. `QwenRuntimeDFlashDriver` guards on
     // `options.totalTokenCount <= golden.rows.count`, and the pinned hidden
     // correctness golden (14683 bytes) cannot physically hold 512 rows under any
     // field population. Until the goldens are regenerated the gate must refuse

@@ -317,10 +317,10 @@ public struct RuntimeWorkerOptions: Equatable {
     }
 }
 
-// Implementation lives in the LagunaRuntime*.swift split files.
-public enum LagunaRuntime {}
+// Implementation lives in the QwenRuntime*.swift split files.
+public enum QwenRuntime {}
 
-extension LagunaRuntime {
+extension QwenRuntime {
     /// The Laguna runtime keeps every text-tower weight (including all 256
     /// routed experts) RAM-resident; there is no expert streaming machinery,
     /// so score/worker protocol fields stay zero.
