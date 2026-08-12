@@ -163,10 +163,18 @@ jobs:
       # failure instead of a silently smaller cache verification.
       MLXFAST_QWEN_MTP_TARGET_MANIFEST_RECORDS: "15"
       MLXFAST_QWEN_MTP_TARGET_MANIFEST_BYTES: "16081488494"
-      # QWEN-PENDING-ORGANIZER: the MTP head's byte manifest is a phase-2
-      # artifact (the head is byte-verified on box 3 but not yet checked in).
-      # The cache verification step does `test -s` on this path.
+      # LANDED (phase 2): the MTP head's byte manifest is checked in. It was
+      # built exactly like the target manifest -- LFS oids for the two LFS blobs
+      # (model.safetensors, tokenizer.json), direct content hashing for the rest.
       MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH: fixtures/qwen3_6_27b_mtp_head.sha256
+      # Whole-manifest shape pins for the head, recomputed from the checked-in
+      # file, for exactly the reason the target's exist: per-file hashing cannot
+      # see a manifest that LOST records -- it would verify fewer files and
+      # report success. 7 records, not 8: the head repo carries 8 files at the
+      # pinned revision and `.gitattributes` is excluded, the same exclusion the
+      # backbone manifest makes (16 repo files, 15 records).
+      MLXFAST_QWEN_MTP_HEAD_MANIFEST_RECORDS: "7"
+      MLXFAST_QWEN_MTP_HEAD_MANIFEST_BYTES: "258489240"
       # --- Decode / score contract ---------------------------------------
       # Depth 2. Provenance: the MTP session's measured envelope on M5 (exact
       # greedy vs serial, 12/12 runs to 512 tokens, all EOS branches) --
@@ -709,7 +717,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! -s "${MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH}" ]]; then
-            echo "::error::QWEN-MTP-PENDING-ORGANIZER: the MTP head byte manifest ${MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH} does not exist. The head (${MLXFAST_QWEN_MTP_HEAD_REPO} @ ${MLXFAST_QWEN_MTP_HEAD_REVISION}) is byte-verified on the staging box but its manifest is not checked in yet (phase 2). Land it before this track can run." >&2
+            echo "::error::the MTP head byte manifest ${MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH} is missing or empty. It pins ${MLXFAST_QWEN_MTP_HEAD_REPO} @ ${MLXFAST_QWEN_MTP_HEAD_REVISION} and this workflow refuses to load a head it cannot byte-verify." >&2
             exit 1
           fi
           verify_cache() {
@@ -765,6 +773,14 @@ jobs:
             exit 1
           fi
           echo "qwen-mtp-ranked-benchmark: target manifest shape verified (${manifest_records} records, ${manifest_bytes} bytes)"
+          head_records="$(awk '!/^#/ && NF { n++ } END { print n + 0 }' "${MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH}")"
+          head_bytes="$(awk '!/^#/ && NF { s += $2 } END { printf "%d\n", s }' "${MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH}")"
+          if [[ "${head_records}" != "${MLXFAST_QWEN_MTP_HEAD_MANIFEST_RECORDS}" \
+              || "${head_bytes}" != "${MLXFAST_QWEN_MTP_HEAD_MANIFEST_BYTES}" ]]; then
+            echo "::error::${MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH} carries ${head_records} records / ${head_bytes} bytes but the workflow pins ${MLXFAST_QWEN_MTP_HEAD_MANIFEST_RECORDS} records / ${MLXFAST_QWEN_MTP_HEAD_MANIFEST_BYTES} bytes." >&2
+            exit 1
+          fi
+          echo "qwen-mtp-ranked-benchmark: MTP head manifest shape verified (${head_records} records, ${head_bytes} bytes)"
           verify_cache "${MLXFAST_QWEN_MTP_TARGET_MANIFEST_PATH}" "${MLXFAST_QWEN_MTP_TARGET_DIR}" "Qwen target"
           verify_cache "${MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH}" "${MLXFAST_QWEN_MTP_HEAD_DIR}" "Qwen MTP head"
 
@@ -1828,7 +1844,7 @@ jobs:
                   --mtp-head "${MLXFAST_QWEN_MTP_HEAD_DIR}" \
                   --golden .qwen-mtp-ranked-src/qwen_mtp_correctness_golden.json \
                   --tokens "${MLXFAST_QWEN_MTP_CORRECTNESS_TOKENS}" \
-                  --depth "${MLXFAST_QWEN_MTP_DEPTH}"
+                  --mtp-depth "${MLXFAST_QWEN_MTP_DEPTH}"
               ' > "${raw_stdout}" 2> "${gates_log}" || status=$?
           if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" != "1" ]]; then
             cat "${gates_log}" || true
@@ -1837,22 +1853,51 @@ jobs:
             echo "::error::Qwen-MTP correctness gate did not emit a single valid report payload (exit=${status})" >&2
             exit 1
           fi
-          # POST-REBASE RECONCILIATION ITEM. Every conjunct below must be
-          # cross-checked against the keys mtp-verify's report payload actually
-          # emits once phase 3 lands it -- asserting a field the payload does not
-          # carry makes `jq -e` fail on EVERY run, which is exactly how the DFlash
-          # gate was dead before it ever gated anything (its jq required
-          # .experimental and .target_verification_mode; neither was emitted).
-          # The DFlash suite grew a general test for this class; extend it to this
-          # gate rather than eyeballing the field list.
+          # RECONCILED WITH THE PAYLOAD (phase 2). Every conjunct below is
+          # cross-checked against the keys `mtp-verify` actually emits by
+          # QwenMTPPayloadSchemaTests, which parses this step's jq and the CLI's
+          # payload literal and requires the first to be a subset of the second.
+          # Asserting a field the payload does not carry makes `jq -e` fail on
+          # EVERY run, which is exactly how the DFlash gate was dead before it
+          # ever gated anything (its jq required .experimental and
+          # .target_verification_mode; neither was emitted).
+          #
+          # TWO SPELLINGS OF ONE PREDICATE. `uses_pinned_mtp_head` is what this
+          # workflow and the local runner pinned; `uses_native_mtp_head` is what
+          # the box-owned measurement wrapper pinned. The wrapper is an installed,
+          # signed artifact this branch does not own, so the payload emits both
+          # and the schema test requires them to stay equal. Asserting BOTH here
+          # is what makes that equality load-bearing rather than decorative.
+          #
+          # The ledger conjuncts are not decoration either: bit-exact tokens with
+          # an unclosed row ledger would mean the tokens were not bound to the
+          # work the candidate declared, which is the whole point of Criterion E.
           jq -e \
             --arg track "${MLXFAST_QWEN_MTP_TRACK_ID}" \
             --argjson tokens "${MLXFAST_QWEN_MTP_CORRECTNESS_TOKENS}" \
+            --argjson depth "${MLXFAST_QWEN_MTP_DEPTH}" \
             '
             .track_id == $track
             and .uses_pinned_mtp_head == true
+            and .uses_native_mtp_head == true
+            and .uses_native_mtp_head == .uses_pinned_mtp_head
+            and .mtp_head_attached == true
+            and .mtp_depth == $depth
             and .decode_token_count == $tokens
+            and .emitted_token_total == $tokens
             and .all_tokens_matched == true
+            and .parity_all_ok == true
+            and .reference_checked_row_total == .declared_rows_total
+            and ((.accepted_draft_total + .rejected_draft_total
+                  + .target_tail_total) == .declared_rows_total)
+            and .target_cache_offset_final
+                == (.seed_token_count + .emitted_token_total)
+            and (.row_ledger | type == "array")
+            and (.row_ledger | length) == .declared_rows_total
+            and ([.row_ledger[]
+                  | select((.top2_logits | type != "array")
+                           or (.top2_logits | length) < 2)]
+                 | length) == 0
             and .official_score_produced == false
             and (has("score") | not)
             and (has("speedup") | not)
@@ -2096,8 +2141,8 @@ jobs:
           MEASURE_STATE_DIR="${MLXFAST_MEASURE_STATE_DIR}" \
           BASELINE_WS="${MLXFAST_QWEN_MTP_BASELINE_RESOLVED}" \
           BASELINE_CALIBRATION="${MLXFAST_QWEN_MTP_BASELINE_CALIBRATION}" \
-          QWEN_MTP_TARGET_DIR="${MLXFAST_QWEN_MTP_TARGET_DIR}" \
-          QWEN_MTP_HEAD_DIR="${MLXFAST_QWEN_MTP_HEAD_DIR}" \
+          QMTP_TARGET_DIR="${MLXFAST_QWEN_MTP_TARGET_DIR}" \
+          QMTP_HEAD_DIR="${MLXFAST_QWEN_MTP_HEAD_DIR}" \
           MACMON="${MLXFAST_MACMON}" \
           GPU_LOADED_UTIL=0.95 \
             "${MLXFAST_QWEN_MTP_MEASURE_JOB}" \
@@ -2106,7 +2151,7 @@ jobs:
               --golden "${MLXFAST_PRIVATE_DIR}/qwen_mtp_benchmark_golden.json" \
               --contract "${MLXFAST_JOB_WS}/${MLXFAST_QWEN_MTP_CONTRACT_PATH}" \
               --tokens "${MLXFAST_QWEN_MTP_DECODE_TOKENS}" \
-              --depth "${MLXFAST_QWEN_MTP_DEPTH}" \
+              --mtp-depth "${MLXFAST_QWEN_MTP_DEPTH}" \
               --min-pairs "${MLXFAST_QWEN_MTP_MIN_ACCEPTED_PAIRS}" \
               --target-pairs "${MLXFAST_QWEN_MTP_TARGET_PAIRS}" \
               --tag "qwen-mtp-ranked-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \

@@ -11,7 +11,7 @@
 #   2. GPU cool gate           `./benchmark.sh --local-cool-gate-only`, the base
 #                              local loop's own 40C gate, before EACH
 #                              model-resident leg.
-#   3. serial K=1 control      `mlxfast-swift mtp-timed --depth 1`  (denominator)
+#   3. serial K=1 control      `mlxfast-swift mtp-timed --mtp-depth 1`  (denominator)
 #   4. native-MTP decode       `mlxfast-swift mtp-timed`            (numerator)
 #
 # The reference rows both measured legs decode come from `mlxfast-swift
@@ -401,7 +401,7 @@ echo "benchmark-qwen-mtp.sh: generating the MTP reference rows (${token_count} r
   --mtp-head "${MLXFAST_QWEN_MTP_HEAD_DIR}" \
   --emitted "${plan_path}" \
   --generate "${token_count}" \
-  --depth "${depth}" \
+  --mtp-depth "${depth}" \
   --output "${golden_path}" \
   --plan-output "${run_dir}/generated-plan.json"
 
@@ -443,7 +443,7 @@ echo "benchmark-qwen-mtp.sh: measuring the serial K=1 control (${token_count} to
   --mtp-head "${MLXFAST_QWEN_MTP_HEAD_DIR}" \
   --golden "${golden_path}" \
   --tokens "${token_count}" \
-  --depth 1 > "${serial_report}"
+  --mtp-depth 1 > "${serial_report}"
 
 # --- 4. native-MTP decode (numerator) ----------------------------------------
 run_cool_gate "the native-MTP decode"
@@ -453,7 +453,7 @@ echo "benchmark-qwen-mtp.sh: measuring native-MTP decode (${token_count} tokens,
   --mtp-head "${MLXFAST_QWEN_MTP_HEAD_DIR}" \
   --golden "${golden_path}" \
   --tokens "${token_count}" \
-  --depth "${depth}" > "${mtp_report}"
+  --mtp-depth "${depth}" > "${mtp_report}"
 
 # --- 5. seal and validate both reports ---------------------------------------
 require_single_json_object "${serial_report}" "the serial K=1 control"
