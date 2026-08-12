@@ -87,6 +87,39 @@ struct QwenMTPTrackNamingTests {
         // "reference" directly after "mtp-" -- are all retired entries.
         ("untimed verify verb", "mtp-verify"),
         ("timed measurement verb", "mtp-timed"),
+        ("canonical depth flag", "--mtp-depth"),
+        ("head tree flag", "--mtp-head"),
+        // --- runtime-worker surface (phase 2) --------------------------------
+        // The worker subcommand and the five protocol kinds. Wire strings are
+        // surface names too: a retired substring in a request kind would survive
+        // in every transcript and every sandbox profile that names it.
+        ("runtime worker subcommand", "mtp-runtime-worker"),
+        ("worker warm kind", "mtp_decode_warm"),
+        ("worker begin kind", "mtp_decode_begin"),
+        ("worker round kind", "mtp_decode_round"),
+        ("worker reference prefill kind", "mtp_reference_prefill"),
+        ("worker reference rows kind", "mtp_reference_rows"),
+        ("head directory environment variable", "MLXFAST_QWEN_MTP_HEAD_DIR"),
+        // --- Swift sources this track adds -----------------------------------
+        ("worker hot-path source", "Qwen36MTPBlockSession.swift"),
+        ("head attachment source", "Qwen36MTPHeadAttachment.swift"),
+        ("serial reference source", "Qwen36MTPReferenceSession.swift"),
+        ("worker harness source", "QwenRuntimeMTPWorker.swift"),
+        ("trusted contract source", "QwenRuntimeMTP.swift"),
+        ("trusted driver source", "QwenRuntimeMTPDriver.swift"),
+        ("verb test suite source", "QwenMTPVerbTests.swift"),
+        ("rollback test suite source", "QwenMTPRollbackContractTests.swift"),
+        // --- payload fields ---------------------------------------------------
+        // The evidence payload's own key names, enumerated for the same reason:
+        // they are read by a box-owned wrapper and a workflow, so they are as
+        // hard to rename as a filename.
+        ("native head boolean", "uses_native_mtp_head"),
+        ("pinned head boolean", "uses_pinned_mtp_head"),
+        ("head attachment boolean", "mtp_head_attached"),
+        ("depth field", "mtp_depth"),
+        ("serial control depth field", "serial_control_depth"),
+        ("row ledger field", "row_ledger"),
+        ("parity gate field", "parity_all_ok"),
         // --- box-owned and per-track paths -----------------------------------
         ("measure wrapper filename", "measure-qwen-mtp-job.sh"),
         ("per-track state dir", "/opt/bench-runner/state/qwen3.6-27b-mtp-v1"),
@@ -139,7 +172,20 @@ struct QwenMTPTrackNamingTests {
         "benchmark-qwen-mtp.sh",
         "setup-qwen-mtp.sh",
         "benchmark.qwen-mtp.json",
+        "fixtures/qwen3_6_27b_mtp_head.sha256",
         "Tests/MLXFastTests/QwenMTPTrackNamingTests.swift",
+        // Phase 2: the runtime and verb sources. Scanned WHOLE, comments
+        // included -- these files talk ABOUT the retired surface (the DFlash
+        // rollback, the retired row equation) and must do so without ever
+        // spelling a retired name.
+        "Sources/MLXFastModel/Qwen36MTPBlockSession.swift",
+        "Sources/MLXFastModel/Qwen36MTPHeadAttachment.swift",
+        "Sources/MLXFastModel/Qwen36MTPReferenceSession.swift",
+        "Sources/MLXFastHarness/QwenRuntimeMTPWorker.swift",
+        "Sources/MLXFastTrustedHarness/QwenRuntimeMTP.swift",
+        "Sources/MLXFastTrustedHarness/QwenRuntimeMTPDriver.swift",
+        "Tests/MLXFastTests/QwenMTPVerbTests.swift",
+        "Tests/MLXFastTests/QwenMTPRollbackContractTests.swift",
     ]
 
     // MARK: - NEGATIVE: the guard still catches every retired name
@@ -273,6 +319,10 @@ struct QwenMTPTrackNamingTests {
         let benchmarkRunner = try S.text("benchmark-qwen-mtp.sh")
         let setupRunner = try S.text("setup-qwen-mtp.sh")
         let manifest = try S.text("benchmark.qwen-mtp.json")
+        let cli = try S.text("Sources/MLXFastCLI/main.swift")
+        let workerCLI = try S.text("Sources/MLXFastRuntimeWorkerCLI/main.swift")
+        let workerHarness = try S.text(
+            "Sources/MLXFastHarness/QwenRuntimeMTPWorker.swift")
 
         let expectations: [(needle: String, haystack: String, file: String)] = [
             ("qwen3.6-27b-mtp-v1", workflow, "the workflow"),
@@ -293,6 +343,21 @@ struct QwenMTPTrackNamingTests {
             ("qwen-mtp-ranked-benchmark.yml", benchmarkRunner, "the local benchmark runner"),
             ("setup-qwen-mtp.sh", benchmarkRunner, "the local benchmark runner"),
             ("fixtures/qwen3_6_27b_mtp_head.sha256", setupRunner, "the local setup runner"),
+            // Phase 2: the verbs, the worker subcommand and the canonical depth
+            // flag have to be the names the shipped code actually uses.
+            ("--mtp-depth", workflow, "the workflow"),
+            ("--mtp-depth", benchmarkRunner, "the local benchmark runner"),
+            ("--mtp-head", workflow, "the workflow"),
+            ("--mtp-head", benchmarkRunner, "the local benchmark runner"),
+            ("mtp-verify", cli, "the trusted CLI"),
+            ("mtp-timed", cli, "the trusted CLI"),
+            ("mtp-runtime-worker", workerCLI, "the runtime-worker CLI"),
+            ("mtp_decode_round", workerHarness, "the worker harness"),
+            ("mtp_reference_rows", workerHarness, "the worker harness"),
+            ("uses_native_mtp_head", cli, "the trusted CLI"),
+            ("uses_pinned_mtp_head", cli, "the trusted CLI"),
+            ("row_ledger", cli, "the trusted CLI"),
+            ("parity_all_ok", cli, "the trusted CLI"),
         ]
         for expectation in expectations {
             #expect(

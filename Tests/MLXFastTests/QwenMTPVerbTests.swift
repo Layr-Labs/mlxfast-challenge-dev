@@ -1,0 +1,544 @@
+import Foundation
+import MLXFastCore
+import MLXFastHarness
+import Testing
+
+// Unit-level guards for the Qwen 3.6 native-MTP verbs. NOTHING here loads a
+// model, opens a worker or touches a network: every assertion reads checked-in
+// text, runs pure arithmetic, or feeds a synthetic report through the same code
+// a real one goes through.
+//
+// The three classes of bug these exist for, in the order they have actually
+// happened on this repo's other speculative track:
+//
+//   1. A GATE THAT ASSERTS A FIELD THE PAYLOAD DOES NOT EMIT. `jq -e` then fails
+//      on every run and the gate is dead before it ever gates anything. The
+//      DFlash parity gate shipped that way (it required `.experimental` and
+//      `.target_verification_mode`); the general form of the check is what would
+//      have caught it, so it is applied here from day one.
+//   2. A LEDGER THAT CLOSES BY ARITHMETIC RATHER THAN BY AUDIT. The retired MTP
+//      track validated `2*pairs - rollbacks + serialRows == totalTokenCount`,
+//      which a worker that verified nothing passes.
+//   3. A FLAG OR FIELD RENAMED ON ONE SIDE OF A TWO-CONSUMER CONTRACT.
+
+@Suite
+struct QwenMTPPayloadSchemaTests {
+    private typealias S = DFlashGateTextSupport
+
+    private static let workflowPath =
+        ".github/workflows/qwen-mtp-ranked-benchmark.yml"
+    private static let cliPath = "Sources/MLXFastCLI/main.swift"
+
+    /// The keys `emitQwenMTPPayload` actually puts in its payload — the
+    /// authority for what any gate is allowed to assert on.
+    static func payloadKeys() throws -> Set<String> {
+        let cli = try S.text(cliPath)
+        let function = try #require(
+            cli.range(of: "private static func emitQwenMTPPayload("),
+            "emitQwenMTPPayload is gone from the CLI"
+        )
+        let tail = cli[function.upperBound...]
+        let literal = try #require(
+            tail.range(of: "var payload: [String: Any] = ["),
+            "emitQwenMTPPayload no longer builds a `payload` dictionary"
+        )
+        let serialize = try #require(
+            tail.range(
+                of: "JSONSerialization.data(",
+                range: literal.upperBound ..< tail.endIndex
+            ),
+            "could not find the end of the MTP payload construction"
+        )
+        let region = String(tail[literal.upperBound ..< serialize.lowerBound])
+        var keys = Set(S.captures(#""([a-z][a-z0-9_]*)":"#, in: region))
+        for key in S.captures(#"payload\["([a-z][a-z0-9_]*)"\]"#, in: region) {
+            keys.insert(key)
+        }
+        return keys
+    }
+
+    /// Anti-vacuity: the extractor must find the keys the payload demonstrably
+    /// has, so a parsing regression cannot make every check below pass silently.
+    @Test
+    func thePayloadKeyExtractorFindsRealKeys() throws {
+        let keys = try Self.payloadKeys()
+        for key in [
+            "track_id", "verb", "mtp_depth", "all_tokens_matched",
+            "parity_all_ok", "declared_rows_total",
+            "reference_checked_row_total", "uses_native_mtp_head",
+            "uses_pinned_mtp_head",
+        ] {
+            #expect(keys.contains(key), "payload is missing \(key): \(keys)")
+        }
+        #expect(
+            keys.count > 20,
+            "MTP payload key extraction looks broken: \(keys)"
+        )
+    }
+
+    /// THE CHECK THE DFLASH GATE NEEDED AND DID NOT HAVE. Every field the ranked
+    /// correctness gate's jq requires must be a field the payload emits.
+    @Test
+    func theRankedGateAssertsOnlyFieldsTheReportEmits() throws {
+        let workflow = try S.text(Self.workflowPath)
+        let step = try S.stepBody(
+            workflow, "Qwen-MTP correctness and parity gate (untimed)")
+        let asserted = S.jqAssertedFields(in: S.executable(step))
+        let emitted = try Self.payloadKeys()
+
+        #expect(
+            !asserted.required.isEmpty,
+            "the gate asserts nothing; either the step moved or the jq parser broke"
+        )
+        let missing = asserted.required.subtracting(emitted)
+        #expect(
+            missing.isEmpty,
+            """
+            the Qwen-MTP correctness gate requires \(missing.sorted()), which \
+            mtp-verify never emits. `jq -e` will fail on EVERY run and the gate \
+            will be dead before it gates anything. Either drop the conjunct or \
+            add the field -- do not leave them disagreeing.
+            """
+        )
+        // The absence assertions must stay absences: a payload that grew a
+        // `score` key would turn the untimed fidelity verb into a second,
+        // ungated scoring path.
+        let wronglyPresent = asserted.forbidden.intersection(emitted)
+        #expect(
+            wronglyPresent.isEmpty,
+            """
+            mtp-verify now emits \(wronglyPresent.sorted()), which the gate \
+            requires to be ABSENT. The untimed verb must not be able to publish \
+            a number.
+            """
+        )
+        #expect(asserted.forbidden.contains("score"))
+        #expect(asserted.forbidden.contains("speedup"))
+    }
+
+    /// The box wrapper is not in this repository, so its field list is mirrored
+    /// here BY NAME. Every field `measure-qwen-mtp-job.sh` reads out of a phase
+    /// report or an exactness probe has to exist in the payload, or a ranked run
+    /// rejects a valid measurement for a reason no local test would ever show.
+    @Test
+    func thePayloadCarriesEveryFieldTheBoxWrapperReads() throws {
+        let emitted = try Self.payloadKeys()
+        // Sourced from measure-qwen-mtp-job.sh: check_row_accounting's ledger
+        // projection, run_phase_once's expect_side / accept jq, the timing
+        // readout, run_exactness_probe's jq, and parity_all_ok_from_reports.
+        let wrapperFields = [
+            "track_id",
+            "all_tokens_matched",
+            "official_score_produced",
+            "parent_measured_seconds_per_token",
+            "uses_native_mtp_head",
+            "mtp_depth",
+            "decode_token_count",
+            "emitted_token_total",
+            "declared_rows_total",
+            "reference_checked_row_total",
+            "accepted_draft_total",
+            "rejected_draft_total",
+            "target_tail_total",
+            "round_count",
+            "seed_token_count",
+            "target_cache_offset_final",
+        ]
+        for field in wrapperFields {
+            #expect(
+                emitted.contains(field),
+                """
+                measure-qwen-mtp-job.sh reads `.\(field)` out of a phase report \
+                and the payload does not emit it. That wrapper is box-owned and \
+                is not editable from this branch; the payload has to satisfy it.
+                """
+            )
+        }
+    }
+
+    /// `rows_per_round` is duplicated across a Swift constant and a shell
+    /// function in a file this repository does not own. Pin the value so the two
+    /// cannot drift silently.
+    @Test
+    func rowsPerRoundMatchesTheWrapperEquation() throws {
+        // The wrapper's `rows_per_round() { echo $((depth + 1)); }`: the head
+        // proposes D draft rows and the target contributes one tail row.
+        for depth in 1 ... 8 {
+            #expect(
+                QwenMTPRowAccounting.rowsPerRound(depth: depth) == depth + 1,
+                """
+                rows_per_round(\(depth)) changed. measure-qwen-mtp-job.sh \
+                computes depth + 1 in shell and its comment names this constant \
+                as the ONE place to change; both have to move together.
+                """
+            )
+        }
+    }
+
+    /// The L3 equations, exercised on a synthetic ledger rather than trusted to
+    /// read correctly. Depth 2 over 4 rounds: 3 full accepts and 1 round that
+    /// accepted one draft and rejected one.
+    @Test
+    func theRowAccountingEquationsCloseOnAnHonestLedger() throws {
+        let rounds = 4
+        let depth = 2
+        let accepted = 3 * 2 + 1        // 7
+        let rejected = 1                // the one rejected draft
+        let tail = rounds               // one target row per round
+        let declared = accepted + rejected + tail   // 12 == (depth + 1) * rounds
+        let emitted = rounds + accepted             // 11
+        #expect(
+            QwenMTPRowAccounting.closes(
+                emittedTokenTotal: emitted,
+                configuredTokenTotal: emitted,
+                declaredRowTotal: declared,
+                referenceCheckedRowTotal: declared,
+                acceptedDraftTotal: accepted,
+                rejectedDraftTotal: rejected,
+                targetTailTotal: tail,
+                roundCount: rounds,
+                depth: depth,
+                seedTokenCount: 512,
+                targetCacheOffsetFinal: 512 + emitted
+            ))
+    }
+
+    /// The equality on `reference_checked_row_total` is the accounting hole the
+    /// rejected-tail replay closes, and the wrapper's header forbids relaxing it
+    /// back to `>= emitted`. Prove a ledger that leaves the tail unpriced FAILS.
+    @Test
+    func aLedgerThatLeavesTheRejectedTailUnpricedIsRejected() throws {
+        let rounds = 4
+        let depth = 2
+        let accepted = 7
+        let rejected = 1
+        let tail = rounds
+        let declared = accepted + rejected + tail
+        let emitted = rounds + accepted
+        #expect(
+            !QwenMTPRowAccounting.closes(
+                emittedTokenTotal: emitted,
+                configuredTokenTotal: emitted,
+                declaredRowTotal: declared,
+                // Everything but the rejected row was checked. Under the OLD
+                // `>= emitted` invariant this passed.
+                referenceCheckedRowTotal: declared - rejected,
+                acceptedDraftTotal: accepted,
+                rejectedDraftTotal: rejected,
+                targetTailTotal: tail,
+                roundCount: rounds,
+                depth: depth,
+                seedTokenCount: 512,
+                targetCacheOffsetFinal: 512 + emitted
+            ),
+            """
+            a ledger whose rejected tail was never reference-checked still \
+            closes. That is the exact hole measure-qwen-mtp-job.sh's EQUALITY on \
+            reference_checked_row_total exists to close, and its header says the \
+            fix for a rejection is to measure a tree that carries the readouts, \
+            never to weaken the comparison.
+            """
+        )
+    }
+
+    /// A ledger whose declared rows exceed what the depth could have produced is
+    /// rejected: a worker cannot declare work the round shape does not allow.
+    @Test
+    func aLedgerDeclaringMoreRowsThanTheDepthAllowsIsRejected() throws {
+        #expect(
+            !QwenMTPRowAccounting.closes(
+                emittedTokenTotal: 11,
+                configuredTokenTotal: 11,
+                declaredRowTotal: 13,
+                referenceCheckedRowTotal: 13,
+                acceptedDraftTotal: 8,
+                rejectedDraftTotal: 1,
+                targetTailTotal: 4,
+                roundCount: 4,
+                depth: 2,
+                seedTokenCount: 512,
+                targetCacheOffsetFinal: 523
+            ))
+    }
+
+    /// `parity_all_ok` must be an AND, not a copy of the exactness verdict: a run
+    /// whose ledger did not close has not proven its tokens were produced by the
+    /// work it declared, whatever the tokens happened to be.
+    @Test
+    func parityAllOKRequiresBothExactnessAndACloseLedger() throws {
+        func report(
+            matched: Bool,
+            referenceChecked: Int,
+            declared: Int
+        ) -> QwenMTPReport {
+            QwenMTPReport(
+                verb: "mtp-timed",
+                depth: 2,
+                seedTokenCount: 512,
+                decodeTokenCount: 11,
+                emittedTokenTotal: 11,
+                allTokensMatched: matched,
+                firstDivergenceIndex: matched ? nil : 3,
+                firstDivergenceReferenceMargin: nil,
+                roundCount: 4,
+                acceptedDraftTotal: 7,
+                rejectedDraftTotal: 1,
+                targetTailTotal: 4,
+                declaredRowTotal: declared,
+                referenceCheckedRowTotal: referenceChecked,
+                rejectedRowsReferenceChecked: 1,
+                verifyBlockReplayedRoundCount: 0,
+                residualDivergenceCount: 0,
+                maxRejectedTailLogitDelta: 0,
+                targetCacheOffsetFinal: 523,
+                decodeSeconds: 1,
+                maxRoundRequestSeconds: 0.1,
+                p50RoundRequestSeconds: 0.05
+            )
+        }
+        #expect(report(matched: true, referenceChecked: 12, declared: 12)
+            .parityAllOK)
+        #expect(!report(matched: false, referenceChecked: 12, declared: 12)
+            .parityAllOK)
+        #expect(!report(matched: true, referenceChecked: 11, declared: 12)
+            .parityAllOK)
+    }
+
+    /// The two boolean spellings of "the pinned native MTP head drafted this
+    /// run" must stay a single predicate. Two consumers pinned different names
+    /// before the payload existed; the payload emits both, so nothing may make
+    /// them diverge.
+    @Test
+    func theTwoHeadBooleansAreOnePredicate() throws {
+        let cli = try S.text(Self.cliPath)
+        #expect(
+            cli.contains(
+                #""uses_native_mtp_head": report.usesNativeMTPHead,"#))
+        #expect(
+            cli.contains(
+                #""uses_pinned_mtp_head": report.usesNativeMTPHead,"#),
+            """
+            uses_pinned_mtp_head is no longer derived from the same expression \
+            as uses_native_mtp_head. The box wrapper reads one and the ranked \
+            workflow reads the other; if they can disagree, one consumer can \
+            accept a run the other would reject.
+            """
+        )
+        // ... and the depth predicate itself: depth 1 is the serial control and
+        // must report FALSE, which is what the local runner's baseline leg jq
+        // requires. Asserted on the behaviour, not on the source text.
+        #expect(!Self.headBooleanReport(depth: 1).usesNativeMTPHead)
+        #expect(Self.headBooleanReport(depth: 2).usesNativeMTPHead)
+    }
+
+    /// A minimal report used only to exercise the depth-derived head predicate.
+    static func headBooleanReport(depth: Int) -> QwenMTPReport {
+        QwenMTPReport(
+            verb: "mtp-timed",
+            depth: depth,
+            seedTokenCount: 512,
+            decodeTokenCount: 1,
+            emittedTokenTotal: 1,
+            allTokensMatched: true,
+            firstDivergenceIndex: nil,
+            firstDivergenceReferenceMargin: nil,
+            roundCount: 1,
+            acceptedDraftTotal: 0,
+            rejectedDraftTotal: 0,
+            targetTailTotal: 1,
+            declaredRowTotal: 1,
+            referenceCheckedRowTotal: 1,
+            rejectedRowsReferenceChecked: 0,
+            verifyBlockReplayedRoundCount: 0,
+            residualDivergenceCount: 0,
+            maxRejectedTailLogitDelta: 0,
+            targetCacheOffsetFinal: 513,
+            decodeSeconds: 1,
+            maxRoundRequestSeconds: 1,
+            p50RoundRequestSeconds: 1
+        )
+    }
+
+    /// The depth flag has one canonical spelling and one accepted alias, and the
+    /// ambiguous case is refused rather than resolved.
+    @Test
+    func theDepthFlagHasACanonicalSpellingAndARefusedAmbiguity() throws {
+        let cli = try S.text(Self.cliPath)
+        #expect(cli.contains(#""--mtp-depth""#))
+        #expect(cli.contains(#""--depth""#))
+        #expect(
+            cli.contains("--depth is an alias of --mtp-depth, not a second knob"),
+            """
+            the CLI no longer refuses a --mtp-depth/--depth disagreement. Silently \
+            preferring one would let a caller believe it measured a depth the run \
+            did not use.
+            """
+        )
+        // Both in-repo callers use the canonical spelling; the box wrapper's is
+        // canonical by construction.
+        for path in [Self.workflowPath, "benchmark-qwen-mtp.sh"] {
+            let body = try S.text(path)
+            #expect(
+                body.contains("--mtp-depth"),
+                "\(path) does not pass --mtp-depth")
+            #expect(
+                !body.contains("--depth "),
+                """
+                \(path) still passes the alias --depth. The canonical spelling \
+                is --mtp-depth (the box wrapper's own CLI takes only that), and \
+                a caller left on the alias will keep working until the alias is \
+                removed and then fail on a ranked run.
+                """
+            )
+        }
+    }
+
+    /// Both MTP verbs must be reachable from the CLI dispatch, because the ranked
+    /// workflow and the local runner both assert their presence by grepping this
+    /// exact shape.
+    @Test
+    func bothVerbsAreDeclaredInTheShapeTheCallersGrepFor() throws {
+        let cli = try S.text(Self.cliPath)
+        for verb in ["mtp-verify", "mtp-timed"] {
+            #expect(
+                cli.contains("case \"\(verb)\":"),
+                """
+                the CLI no longer declares `case "\(verb)":`. Both \
+                benchmark-qwen-mtp.sh and the ranked workflow assert this literal \
+                shape and abort with QWEN-MTP-PENDING-PHASE3 without it.
+                """
+            )
+        }
+    }
+}
+
+// MARK: - the head manifest fixture
+
+@Suite
+struct QwenMTPHeadManifestTests {
+    private typealias S = DFlashGateTextSupport
+
+    private static let manifestPath = "fixtures/qwen3_6_27b_mtp_head.sha256"
+
+    struct Record {
+        let sha256: String
+        let bytes: Int
+        let path: String
+    }
+
+    static func records() throws -> [Record] {
+        try S.text(manifestPath).split(separator: "\n").compactMap { line in
+            guard !line.hasPrefix("#"), !line.isEmpty else { return nil }
+            let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard fields.count == 3, let bytes = Int(fields[1]) else {
+                return nil
+            }
+            return Record(
+                sha256: String(fields[0]),
+                bytes: bytes,
+                path: String(fields[2])
+            )
+        }
+    }
+
+    /// The manifest is well-formed in the same format the target manifest uses:
+    /// the workflow's `verify_cache` reads both with one `while read` loop.
+    @Test
+    func theHeadManifestIsWellFormed() throws {
+        let records = try Self.records()
+        #expect(records.count == 7, "expected 7 records, got \(records.count)")
+        for record in records {
+            #expect(
+                record.sha256.count == 64
+                    && record.sha256.allSatisfy {
+                        $0.isHexDigit && !$0.isUppercase
+                    },
+                "\(record.path) has a malformed digest: \(record.sha256)"
+            )
+            #expect(record.bytes > 0, "\(record.path) has no bytes")
+            #expect(
+                !record.path.contains("/"),
+                """
+                \(record.path) is nested. `verify_cache` compares each manifest \
+                entry against `basename` of a maxdepth-1 find, so a nested entry \
+                would verify a file the inventory check then reports as \
+                unexpected.
+                """
+            )
+        }
+        let paths = Set(records.map(\.path))
+        #expect(paths.count == records.count, "duplicate manifest entries")
+        for required in [
+            "config.json", "model.safetensors",
+            "model.safetensors.index.json", "tokenizer.json",
+            "tokenizer_config.json",
+        ] {
+            #expect(
+                paths.contains(required),
+                "the head manifest does not pin \(required)")
+        }
+        // `.gitattributes` is deliberately absent, exactly as it is absent from
+        // the backbone manifest (16 repo files, 15 records). The inventory half
+        // of `verify_cache` rejects any file in the cache that the manifest does
+        // not name, so pinning it here would only be correct if the staged tree
+        // carried it -- and the staged backbone tree demonstrably does not, or
+        // the target verification would already be failing.
+        #expect(!paths.contains(".gitattributes"))
+    }
+
+    /// The whole-manifest shape pins must equal what the file actually carries.
+    /// Per-file hashing cannot see a manifest that LOST records; it would verify
+    /// fewer files and report success.
+    @Test
+    func theWorkflowShapePinsMatchTheCheckedInManifest() throws {
+        let records = try Self.records()
+        let environment = try S.jobEnvironment(
+            try S.text(".github/workflows/qwen-mtp-ranked-benchmark.yml"))
+        #expect(
+            environment["MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH"]
+                == Self.manifestPath)
+        #expect(
+            environment["MLXFAST_QWEN_MTP_HEAD_MANIFEST_RECORDS"]
+                == String(records.count),
+            "the workflow pins a different head record count than the manifest has"
+        )
+        #expect(
+            environment["MLXFAST_QWEN_MTP_HEAD_MANIFEST_BYTES"]
+                == String(records.reduce(0) { $0 + $1.bytes }),
+            "the workflow pins a different head byte total than the manifest has"
+        )
+    }
+
+    /// The manifest header must name the artifact it pins, at the revision the
+    /// workflow pins. A manifest that pinned a different revision's bytes would
+    /// verify a head nobody agreed to.
+    @Test
+    func theHeadManifestNamesThePinnedRepositoryAndRevision() throws {
+        let body = try S.text(Self.manifestPath)
+        let environment = try S.jobEnvironment(
+            try S.text(".github/workflows/qwen-mtp-ranked-benchmark.yml"))
+        let repository = try #require(environment["MLXFAST_QWEN_MTP_HEAD_REPO"])
+        let revision = try #require(
+            environment["MLXFAST_QWEN_MTP_HEAD_REVISION"])
+        #expect(body.contains(repository))
+        #expect(body.contains(revision))
+        #expect(repository == "mlx-community/Qwen3.6-27B-MTP-4bit")
+        #expect(revision == "83795d546e9d328160e593fb0bf10b2bf2fe637e")
+    }
+
+    /// The tensor count the loader enforces and the count the payload reports are
+    /// one constant, and it is the count the pinned head's own index carries.
+    @Test
+    func theHeadTensorCountIsOneConstant() throws {
+        #expect(MLXFastConstants.qwenMTPHeadTensorCount == 31)
+        let cli = try S.text("Sources/MLXFastCLI/main.swift")
+        #expect(
+            cli.contains("MLXFastConstants.qwenMTPHeadTensorCount"),
+            """
+            the payload no longer reports the shared head tensor count. A second \
+            literal here would let the number the loader enforces and the number \
+            the evidence reports drift apart.
+            """
+        )
+    }
+}
