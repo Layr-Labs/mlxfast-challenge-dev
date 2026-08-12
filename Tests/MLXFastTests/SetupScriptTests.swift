@@ -503,7 +503,11 @@ func setupAcceptsLegacyReferenceDirectoryAsItsOwnCompatibilityPath() throws {
         environment: [
             "REPO_ROOT": FileManager.default.currentDirectoryPath,
             "TEST_ROOT": root.path,
-            "MLXFAST_REFERENCE_DIR": "reference_weights/laguna-xs-2.1-nvfp4-mlx",
+            // setup.sh's DEFAULT_REFERENCE_DIR (and therefore
+            // REFERENCE_COMPAT_LINK) is the Qwen 3.6 path on this branch;
+            // pointing MLXFAST_REFERENCE_DIR at it is what makes the
+            // reference directory its own compatibility path.
+            "MLXFAST_REFERENCE_DIR": "reference_weights/Qwen3.6-27B-4bit",
         ]
     )
 
@@ -1109,11 +1113,23 @@ func poolsideReferenceDownloadersUseSourceSpecificQueryHandling() throws {
     let requests = try String(contentsOf: curlLog, encoding: .utf8)
         .split(separator: "\n")
         .map(String.init)
+    // The behaviour under test is source-specific query handling: only
+    // huggingface.co URLs get "?download=true" appended. Two downloaders are
+    // exercised and they no longer share an identity on this branch --
+    // setup.sh resolves the Qwen 3.6 revision on Hugging Face directly (no
+    // mirror exists for it yet, so there is no R2 leg and no fallback), while
+    // .github/scripts/download-reference-cache-scope.sh still carries the
+    // Laguna R2-then-Hugging-Face pair. Re-aiming that script at Qwen is
+    // Phase 5 workflow work; the query-handling contract asserted here holds
+    // for both sources exactly as before.
+    let qwenHF =
+        "https://huggingface.co/mlx-community/Qwen3.6-27B-4bit/resolve/"
+        + "c000ac2c2057d94be3fa931000c31723aac53282/config.json?download=true"
     let r2 = "https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx/config.json"
     let hf =
         "https://huggingface.co/poolside/Laguna-XS-2.1-NVFP4-mlx/resolve/"
         + "841778bda563a36104dd521e37d99218e46f4f25/config.json?download=true"
-    #expect(requests == [r2, hf, r2, hf])
+    #expect(requests == [qwenHF, r2, hf])
     #expect(!requests.contains("\(r2)?download=true"))
 }
 
