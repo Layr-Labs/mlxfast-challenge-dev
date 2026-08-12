@@ -54,6 +54,48 @@ private final class ParallelShardState: @unchecked Sendable {
     }
 }
 
+/// A separately-pinned weight tree to merge into the next ``loadWeights`` call.
+///
+/// `keyPrefix` is prepended to every tensor name the tree carries, which is how a
+/// checkpoint published with BARE names (`fc.weight`, `layers.0.*`, `norm.weight`)
+/// becomes the `mtp.*` namespace the loading model expects.
+public struct AdditionalWeightSource: Sendable {
+    public let directory: URL
+    public let keyPrefix: String
+
+    public init(directory: URL, keyPrefix: String) {
+        self.directory = directory
+        self.keyPrefix = keyPrefix
+    }
+}
+
+/// Extra weight trees merged by the next ``loadWeights`` call, before `sanitize`.
+///
+/// Set immediately before a load and cleared immediately after; it exists because the
+/// model factory's `_load` is a fixed protocol requirement that cannot carry a second
+/// directory. Same idiom, same lifetime discipline as `_qwen35MTPEnabled`.
+public nonisolated(unsafe) var _additionalWeightSources: [AdditionalWeightSource] = []
+
+/// Load a directory's safetensors into one dictionary, without any model coupling.
+public func loadArrays(directory: URL) throws -> [String: MLXArray] {
+    var urls: [URL] = []
+    if let enumerator = FileManager.default.enumerator(
+        at: directory, includingPropertiesForKeys: nil)
+    {
+        for case let url as URL in enumerator where url.pathExtension == "safetensors" {
+            urls.append(url)
+        }
+    }
+    urls.sort { $0.lastPathComponent < $1.lastPathComponent }
+    var out = [String: MLXArray]()
+    for url in urls {
+        for (key, value) in try loadArrays(url: url) {
+            out[key] = value
+        }
+    }
+    return out
+}
+
 /// Load model weights.
 ///
 /// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
@@ -127,6 +169,28 @@ public func loadWeights(
         if i == 0 || metadata.isEmpty { metadata = m }
     }
     mark("read shards (parallel)")
+
+    // Merge any separately-pinned weight trees BEFORE sanitize and BEFORE the
+    // quantization wiring below. Both orderings are load-bearing: `sanitize` is
+    // where a model decides what an extra key MEANS, and `quantize(model:)`
+    // decides which submodules become quantized layers by asking whether
+    // `weights["<path>.scales"]` exists -- so a tree merged after that walk
+    // would arrive as quantized tensors addressed to unquantized layers and
+    // fail `update(parameters:verify:)`.
+    //
+    // WHY A GLOBAL. The factory's `_load` is a protocol requirement with a
+    // fixed signature, so an extra directory cannot be threaded through it
+    // without changing every conformance. `_qwen35MTPEnabled` (Qwen35MTP.swift)
+    // already establishes this exact idiom in this fork: a global set
+    // immediately before the load, read during it. Callers must clear it after
+    // the load; see `Qwen36MTPHeadAttachment` on the consumer side.
+    for source in _additionalWeightSources {
+        let extra = try loadArrays(directory: source.directory)
+        for (key, value) in extra {
+            weights[source.keyPrefix + key] = value
+        }
+        mark("merge \(source.keyPrefix)*")
+    }
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)

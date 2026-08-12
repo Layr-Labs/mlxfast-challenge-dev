@@ -1,0 +1,10 @@
+# SHA256 manifest for mlx-community/Qwen3.6-27B-MTP-4bit.
+# Revision: 83795d546e9d328160e593fb0bf10b2bf2fe637e
+# Format: <sha256> <byte_count> <relative_path>
+9447a082427fa6dc8284c45dacec4e40ce4b33af75e2e5c2175da29bb45eedf5 1892 README.md
+64c2cf173fc259540fa39f6f07ccfa51359a3d7be76c2d0e8b9fdecbe4446b0d 3779 config.json
+b9983c04801d7ad28e2f49cc7517ff3e8bfff9d2346255dcf7478f42165c0539 238934137 model.safetensors
+6233c1805e07b028f4eb34d50dac5bf22a676728eeaf2ea43c4f94523af7a4fc 1973 model.safetensors.index.json
+5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42 12807982 tokenizer.json
+5186f0defcd7f232382c7f0aebcd2252d073bb921ab240e407b7ae8745d2b29b 16718 tokenizer_config.json
+ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003 6722759 vocab.json
