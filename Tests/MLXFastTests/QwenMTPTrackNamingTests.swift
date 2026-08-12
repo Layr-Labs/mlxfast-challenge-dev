@@ -132,7 +132,7 @@ struct QwenMTPTrackNamingTests {
         ("per-track baseline dir", "/opt/bench-runner/baseline/qwen3.6-27b-mtp-v1/current"),
         ("per-track baseline calibration", "/opt/bench-runner/state/qwen3.6-27b-mtp-v1/baseline-calibration.json"),
         ("MTP head cache dir", "/opt/bench-runner/cache/qwen-mtp/qwen3.6-27b-mtp-v1/mtp-head"),
-        ("runner label", "m5-qwen-mtp"),
+        ("runner label", "m5-qwen3.6-27b-mtp"),
         ("bench job workspace", "/Users/Shared/bench-jobs/qwen-mtp-ranked-current"),
         // --- fixtures -------------------------------------------------------
         ("track contract fixture", "fixtures/qwen3_6_27b_mtp_track.json"),
@@ -339,7 +339,7 @@ struct QwenMTPTrackNamingTests {
             ("MLXFAST_QWEN_MTP_CALIBRATION_READY", workflow, "the workflow"),
             ("measure-qwen-mtp-job.sh", workflow, "the workflow"),
             ("/opt/bench-runner/state/qwen3.6-27b-mtp-v1", workflow, "the workflow"),
-            ("m5-qwen-mtp", workflow, "the workflow"),
+            ("m5-qwen3.6-27b-mtp", workflow, "the workflow"),
             ("mtp-verify", workflow, "the workflow"),
             ("mtp-timed", workflow, "the workflow"),
             ("mtp-verify", benchmarkRunner, "the local benchmark runner"),

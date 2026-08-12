@@ -90,12 +90,12 @@ concurrency:
 
 jobs:
   qwen-mtp-ranked:
-    name: "single-machine Qwen 3.6 MTP ranked benchmark (m5-qwen-mtp)"
+    name: "single-machine Qwen 3.6 MTP ranked benchmark (m5-qwen3.6-27b-mtp)"
     # DEDICATED label, deliberately NOT m5-bench and NOT m5-laguna-dflash.
     # An unserved dispatch QUEUES instead of running on a box provisioned for
     # another track, which is the safe failure for an inert track. Registering a
     # runner under this label is an operator action (target box: m5-max-128gb-3).
-    runs-on: [self-hosted, m5-qwen-mtp]
+    runs-on: [self-hosted, m5-qwen3.6-27b-mtp]
     # Budget: build (~15m) + transform of the 16.1 GB source (~10m) + artifact
     # hashing (~3m) + full-length parity pass (~15m) + cooldowns (up to 900s per
     # timed phase) + >=3 alternating timed pairs.

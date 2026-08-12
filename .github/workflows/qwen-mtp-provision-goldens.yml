@@ -97,10 +97,10 @@ concurrency:
 
 jobs:
   qwen-mtp-provision-goldens:
-    name: "freeze and upload the hidden Qwen-MTP goldens (m5-qwen-mtp)"
+    name: "freeze and upload the hidden Qwen-MTP goldens (m5-qwen3.6-27b-mtp)"
     # The Qwen-MTP box: it is where the pinned baseline tree, the target cache and
     # the MTP head cache live. The shared `m5-bench` pool has none of them.
-    runs-on: [self-hosted, m5-qwen-mtp]
+    runs-on: [self-hosted, m5-qwen3.6-27b-mtp]
     # Two full-length reference generations (512 rows each, one width-1 forward
     # per row plus the declared-frame replays) with the 16.1 GB target and the
     # ~247 MB MTP head resident, plus two uploads and two verification downloads.

@@ -99,7 +99,7 @@
   "reference_baseline": {
     "status": "measured_box3_phase5",
     "publication_allowed": false,
-    "required_rebaseline_hardware": "m5-qwen-mtp",
+    "required_rebaseline_hardware": "m5-qwen3.6-27b-mtp",
     "_note": "The paired depth-0 serial control, the per-prompt no-op references and the thermal/telemetry envelope were all measured on box 3 at tip 6a3bee9. publication_allowed stays false until the operator's go-live runbook: it gates ranked scoring together with official_scoring_enabled."
   },
   "proposed_scoring": {

@@ -49,7 +49,7 @@ concurrency:
   # It does NOT keep the probe away from a ranked run -- an earlier comment
   # here claimed it did, which was wrong: a DISTINCT concurrency group is
   # exactly what lets two workflows run at the same time. What actually
-  # serialises them is that both target the single m5-qwen-mtp runner,
+  # serialises them is that both target the single m5-qwen3.6-27b-mtp runner,
   # so GitHub queues one behind the other regardless of grouping. The probe
   # is read-only and ~1 minute, so queueing behind a ranked run costs
   # nothing; the point of naming this is that the protection comes from the
@@ -59,8 +59,8 @@ concurrency:
 
 jobs:
   probe:
-    name: probe R2 keys (m5-qwen-mtp)
-    runs-on: [self-hosted, m5-qwen-mtp]
+    name: probe R2 keys (m5-qwen3.6-27b-mtp)
+    runs-on: [self-hosted, m5-qwen3.6-27b-mtp]
     timeout-minutes: 15
     # MUST match qwen-mtp-ranked-benchmark.yml's binding, or the probe tests
     # different credentials than the ranked job uses and its answer is worthless.
