@@ -18,11 +18,12 @@ extension QwenRuntime {
     /// Run one native-MTP decode over the golden and audit it.
     ///
     /// - Parameters:
+    ///   - verb: the reporting verb name. It selects what is REPORTED, never
+    ///     what is run: both verbs execute this identical decode, and only
+    ///     `mtp-timed` treats the parent's wall clock as authoritative.
     ///   - retainLedger: `mtp-verify` keeps the per-row evidence; `mtp-timed`
-    ///     does not.
-    ///   - timed: whether the parent's clock is authoritative for this run. Both
-    ///     values run the SAME decode; `false` simply means the seconds reported
-    ///     are diagnostic.
+    ///     does not (a 512-token ledger of top-2 readouts would dominate a
+    ///     timing report).
     public static func qwenMTPDecode(
         verb: String,
         options: QwenMTPOptions,
