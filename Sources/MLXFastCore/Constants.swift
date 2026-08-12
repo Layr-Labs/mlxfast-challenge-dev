@@ -1,9 +1,12 @@
 public enum MLXFastConstants {
-    public static let referenceModelRepository = "poolside/Laguna-XS-2.1-NVFP4-mlx"
-    public static let referenceModelRevision = "841778bda563a36104dd521e37d99218e46f4f25"
-    public static let referenceModelName = "laguna-xs-2.1-nvfp4-mlx"
-    public static let defaultReferencePath = "reference_weights/laguna-xs-2.1-nvfp4-mlx"
-    public static let defaultReferenceCachePath = ".cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25"
+    // Qwen 3.6 native-MTP track identity (QWEN36-MTP-CHALLENGE-PLAN.md phase 1).
+    // The artifact is named Qwen3.6; its immutable internal architecture name
+    // is `qwen3_5_text`, which is why the runtime sources are Qwen35*-prefixed.
+    public static let referenceModelRepository = "mlx-community/Qwen3.6-27B-4bit"
+    public static let referenceModelRevision = "c000ac2c2057d94be3fa931000c31723aac53282"
+    public static let referenceModelName = "Qwen3.6-27B-4bit"
+    public static let defaultReferencePath = "reference_weights/Qwen3.6-27B-4bit"
+    public static let defaultReferenceCachePath = ".cache/huggingface/hub/models--mlx-community--Qwen3.6-27B-4bit/snapshots/c000ac2c2057d94be3fa931000c31723aac53282"
     public static let defaultWeightsPath = "weights"
     public static let defaultGoldenPath = "correctness_golden.json"
     public static let defaultPublicCorrectnessPromptPath = "correctness_prompts/public_longcopy_gate_english_512.txt"
@@ -12,20 +15,17 @@ public enum MLXFastConstants {
     public static let defaultScorePath = "score.json"
     public static let defaultLocalIterateScorePath = "score.local-iterate.json"
 
-    // Frozen text-tower geometry of the pinned Poolside Laguna XS 2.1 NVFP4
-    // target (poolside/Laguna-XS-2.1-NVFP4-mlx), mirrored from
-    // Sources/MLXFastModel/LagunaConfig.swift's LagunaConstants (MLXFastCore
-    // is trusted and cannot import the editable model target).
-    // `intermediateSize` is the dense MLP width used only by layer 0 -- the
-    // 39 sparse layers use the MoE widths pinned in the track contract.
-    // `attentionHeads` is the checkpoint's top-level `num_attention_heads`
-    // fallback (48); per-layer counts are 48 on full-attention layers
-    // (0, 4, 8, ..., 36) and 64 on the 30 sliding-window layers.
-    public static let vocabSize = 100_352
-    public static let hiddenSize = 2_048
-    public static let intermediateSize = 8_192
-    public static let numHiddenLayers = 40
-    public static let attentionHeads = 48
+    // Frozen text-tower geometry of the pinned mlx-community/Qwen3.6-27B-4bit
+    // target, mirrored from Sources/MLXFastModel/Qwen35Config.swift
+    // (MLXFastCore is trusted and cannot import the editable model target).
+    // The tower is 64 layers on a 4-layer repeat: every 4th layer (index % 4
+    // == 3) is full attention, the other three are gated-delta linear
+    // attention. `attentionHeads` is the full-attention query-head count.
+    public static let vocabSize = 248_320
+    public static let hiddenSize = 5_120
+    public static let intermediateSize = 17_408
+    public static let numHiddenLayers = 64
+    public static let attentionHeads = 24
     public static let correctnessPromptTokens = 512
     // Keep the public gate long enough to catch broad decode regressions while
     // leaving budget for the hidden GPQA behavior checks in the official job.

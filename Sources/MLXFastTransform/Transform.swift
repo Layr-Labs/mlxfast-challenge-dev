@@ -50,9 +50,15 @@ public struct TransformReport: Equatable {
 /// atomic install, revalidation, verifier) can be exercised end to end with
 /// small synthetic fixtures -- the Laguna family requires the exact pinned
 /// 912-tensor inventory with real shapes.
+/// The `.qwen35` family is the Qwen 3.6 native-MTP track target
+/// (`mlx-community/Qwen3.6-27B-4bit`, internal architecture name
+/// `qwen3_5_text`). It shares the legacy Gemma multimodal layout -- a nested
+/// `text_config` and `language_model.*` tensor names -- so it is distinguished
+/// from `.gemma4` by the `qwen3_5` model-type prefix inside `text_config`.
 enum TransformModelFamily: Equatable {
     case gemma4
     case laguna
+    case qwen35
 }
 
 /// Offline transform for the pinned reference checkpoint: selects ONLY the
@@ -81,6 +87,13 @@ enum TransformModelFamily: Equatable {
 ///   the flat source config minus the empty `vision_config`, carrying the
 ///   checkpoint's matching NVFP4 4-bit group-16 `quantization` and
 ///   `quantization_config` blocks.
+/// - Qwen 3.6 27B 4-bit (nested `text_config` whose `model_type` starts with
+///   `qwen3_5`): the Qwen native-MTP track target. The source index holds only
+///   `language_model.*` and `vision_tower.blocks.*`, so the text-tower prefix
+///   selects the tower and drops the vision blocks; the runtime config is the
+///   flattened `text_config` plus the checkpoint's affine `quantization` block,
+///   which must agree with its duplicate `quantization_config` when both are
+///   present. No metadata sidecars are emitted (untied `lm_head`).
 /// - Legacy Gemma 4 31B 4-bit (nested `text_config`): the archived dense
 ///   path, unchanged: flattened `text_config` runtime config plus the
 ///   projection/tied-head metadata sidecars.
@@ -253,7 +266,12 @@ public enum SwiftTransform {
                 selectedKeys: textKeys,
                 destinationDirectory: stagingDirectory
             )
-        case .laguna:
+        case .qwen35, .laguna:
+            // Qwen 3.6 has an untied `lm_head` and the runtime reads the
+            // checkpoint's own affine-quantized tensors directly, so neither
+            // the Gemma projection sidecar nor the tied-head packed13 sidecar
+            // means anything on this family -- emit nothing beyond the
+            // pass-through tensor set. For Laguna,
             // docs/laguna-weight-contract.md forbids derived layouts and
             // metadata sidecars in the Poolside v2 contract, and the runtime loads exactly the
             // indexed checkpoint tensors (its untied lm_head makes the
@@ -495,6 +513,13 @@ public enum SwiftTransform {
         switch family {
         case .gemma4:
             return isTextTowerKey(key)
+        case .qwen35:
+            // The pinned Qwen 3.6 index contains only `language_model.*` and
+            // `vision_tower.blocks.*`; the text-tower prefix selects the former
+            // and drops the latter. The MTP head (`*.mtp.*`) is not in the
+            // pinned backbone revision and is never selected here -- phase 2
+            // installs it as a separately pinned artifact.
+            return isTextTowerKey(key)
         case .laguna:
             guard key.hasPrefix("model.") || key.hasPrefix("lm_head.") else {
                 return false
@@ -543,7 +568,9 @@ public enum SwiftTransform {
             return false
         }
         switch url.pathExtension {
-        case "json", "model", "tiktoken", "txt":
+        // `jinja`: the pinned Qwen 3.6 checkpoint ships its chat template as
+        // `chat_template.jinja` rather than inside `tokenizer_config.json`.
+        case "jinja", "json", "model", "tiktoken", "txt":
             return true
         default:
             return name == "tokenizer" || name == "vocab"
@@ -588,10 +615,22 @@ public enum SwiftTransform {
         return root
     }
 
+    /// Model-type prefix of the Qwen 3.6 target's text tower. The pinned
+    /// checkpoint declares `qwen3_5_text`; the prefix is matched (rather than
+    /// the exact string) so a point revision of the same architecture family
+    /// is still routed to the Qwen path instead of silently falling through to
+    /// the legacy Gemma flattening.
+    static let qwen35TextModelTypePrefix = "qwen3_5"
+
     static func detectModelFamily(
         sourceConfigRoot root: [String: Any]
     ) throws -> TransformModelFamily {
-        if root["text_config"] is [String: Any] {
+        if let textConfig = root["text_config"] as? [String: Any] {
+            if let modelType = textConfig["model_type"] as? String,
+               modelType.hasPrefix(qwen35TextModelTypePrefix)
+            {
+                return .qwen35
+            }
             return .gemma4
         }
         if let modelType = root["model_type"] as? String, modelType == "laguna" {
@@ -639,6 +678,38 @@ public enum SwiftTransform {
             if let quantization = root["quantization"] {
                 runtimeConfig["quantization"] = quantization
             } else if let quantizationConfig = root["quantization_config"] {
+                runtimeConfig["quantization"] = quantizationConfig
+            }
+        case .qwen35:
+            guard let textConfig = root["text_config"] as? [String: Any] else {
+                throw MLXFastError.invalidInput("reference config.json is missing text_config")
+            }
+            runtimeConfig = textConfig
+            // The pinned Qwen checkpoint publishes the SAME affine spec twice,
+            // as `quantization` and `quantization_config`. Emitting one of two
+            // conflicting specs would silently pick a quantization the shards
+            // were not written with, so require them to agree when both are
+            // present rather than preferring either.
+            let quantization = root["quantization"]
+            let quantizationConfig = root["quantization_config"]
+            if let quantization, let quantizationConfig {
+                let canonicalQuantization = try JSONSerialization.data(
+                    withJSONObject: quantization,
+                    options: [.sortedKeys]
+                )
+                let canonicalQuantizationConfig = try JSONSerialization.data(
+                    withJSONObject: quantizationConfig,
+                    options: [.sortedKeys]
+                )
+                guard canonicalQuantization == canonicalQuantizationConfig else {
+                    throw MLXFastError.invalidInput(
+                        "reference config quantization and quantization_config conflict"
+                    )
+                }
+                runtimeConfig["quantization"] = quantization
+            } else if let quantization {
+                runtimeConfig["quantization"] = quantization
+            } else if let quantizationConfig {
                 runtimeConfig["quantization"] = quantizationConfig
             }
         case .laguna:
