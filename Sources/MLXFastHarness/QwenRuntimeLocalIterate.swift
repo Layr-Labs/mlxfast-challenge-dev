@@ -548,9 +548,9 @@ extension QwenRuntime {
         modeName: String,
         progress: ((String) -> Void)?
     ) throws -> LocalIterateTimingResult {
-        let config = try LagunaConfig.load(from: weightsPath)
-        let loader = try LagunaWeightLoader(weightsPath: weightsPath)
-        let weightCache = LagunaRuntimeWeightCache(loader: loader, config: config)
+        let config = try Qwen35Config.load(from: weightsPath)
+        let loader = try Qwen35WeightLoader(weightsPath: weightsPath)
+        let weightCache = Qwen35RuntimeWeightCache(loader: loader, config: config)
         let model = try weightCache.requireLibraryModel()
         guard !testCase.promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("\(modeName) prompt must not be empty")
@@ -593,7 +593,7 @@ extension QwenRuntime {
             }
             let prefillCache = model.newCache(parameters: nil)
             let prefillStart = DispatchTime.now().uptimeNanoseconds
-            let prefillLogits = try lagunaLogits(
+            let prefillLogits = try qwenLogits(
                 inputIDs: inputIDsArray(testCase.promptTokens),
                 model: model,
                 cache: prefillCache,
@@ -637,7 +637,7 @@ extension QwenRuntime {
                 seedHeartbeat?.cancel()
             }
             let cache = model.newCache(parameters: nil)
-            var logits = try lagunaLogits(
+            var logits = try qwenLogits(
                 inputIDs: inputIDsArray(testCase.promptTokens),
                 model: model,
                 cache: cache,
@@ -651,7 +651,7 @@ extension QwenRuntime {
                 failureActual = actualToken
                 reportFirstTokenMismatch(progress, modeName: modeName, checkedStep: failureStep! + 1)
             }
-            materializeLagunaCacheState(cache)
+            materializeQwenCacheState(cache)
             seedHeartbeat?.cancel()
             progress?(
                 "\(modeName) decode seed prefill complete "
@@ -660,7 +660,7 @@ extension QwenRuntime {
             for decodedStep in 0..<decodeSteps {
                 let previousToken = decodedStep == 0 ? expectedSeedToken : expectedDecodeTokens[decodedStep - 1]
                 let stepStart = DispatchTime.now().uptimeNanoseconds
-                logits = try lagunaLogits(
+                logits = try qwenLogits(
                     inputIDs: inputIDsArray([previousToken]),
                     model: model,
                     cache: cache,

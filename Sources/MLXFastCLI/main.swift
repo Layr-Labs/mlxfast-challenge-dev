@@ -2127,7 +2127,8 @@ private enum MLXFastCLI {
               mlxfast-swift dflash-probe --drafter PATH --golden PATH [--weights PATH] [--tokens N] [--schedule-seed N] [--output PATH]
               mlxfast-swift dflash-reference --drafter PATH --emitted PATH --output PATH [--weights PATH]
 
-            Swift-only Poolside Laguna XS 2.1 NVFP4 harness entrypoint.
+            Swift-only Qwen 3.6 27B 4-bit harness entrypoint (the DFlash
+            subcommands still drive the Laguna target and its pinned drafter).
             """
         )
     }

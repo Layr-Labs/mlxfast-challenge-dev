@@ -103,7 +103,7 @@ func timedDecodeChargesOneValidatedSeedForward() throws {
     let worker = try packageFile("Sources/MLXFastHarness/QwenRuntimeWorker.swift")
     let decodeBegin = try slice(worker, from: "case \"decode_begin\":", to: "case \"decode_step\":")
     // Exactly one whole-prompt forward, and no warmup pass to memoize against it.
-    #expect(decodeBegin.components(separatedBy: "lagunaLogits(").count - 1 == 1)
+    #expect(decodeBegin.components(separatedBy: "qwenLogits(").count - 1 == 1)
     #expect(!decodeBegin.contains("warmupCache"))
     #expect(!decodeBegin.contains("warmupLogits"))
 
@@ -335,6 +335,6 @@ func decodeMeasurementInvokesNoPhaseVaryingEditableHook() throws {
         )
     )
     let decodeStep = String(worker[decodeStepStart.upperBound..<decodeStepEnd.lowerBound])
-    #expect(decodeStep.contains("lagunaLogits("))
+    #expect(decodeStep.contains("qwenLogits("))
     #expect(!decodeStep.contains("Thread.sleep"))
 }

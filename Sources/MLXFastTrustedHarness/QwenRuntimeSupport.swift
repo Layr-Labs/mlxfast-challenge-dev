@@ -147,7 +147,7 @@ extension QwenRuntime {
             let values = try tokens.enumerated().map { index, token -> Int32 in
                 guard token >= 0, token < MLXFastConstants.vocabSize else {
                     throw MLXFastError.invalidInput(
-                        "input token[\(index)]=\(token) is outside Laguna vocab range 0..<\(MLXFastConstants.vocabSize)"
+                        "input token[\(index)]=\(token) is outside Qwen3.6 vocab range 0..<\(MLXFastConstants.vocabSize)"
                     )
                 }
                 return Int32(token)

@@ -22,9 +22,9 @@ extension QwenRuntime {
             selectedCase = first
         }
 
-        let config = try LagunaConfig.load(from: options.weightsPath)
-        let loader = try LagunaWeightLoader(weightsPath: options.weightsPath)
-        let weightCache = LagunaRuntimeWeightCache(loader: loader, config: config)
+        let config = try Qwen35Config.load(from: options.weightsPath)
+        let loader = try Qwen35WeightLoader(weightsPath: options.weightsPath)
+        let weightCache = Qwen35RuntimeWeightCache(loader: loader, config: config)
         return try traceGreedyCached(
             testCase: selectedCase,
             step: options.step,
@@ -324,7 +324,7 @@ extension QwenRuntime {
 
     static func compareTeacherForcedCached(
         testCase: GoldenCase,
-        weightCache: LagunaRuntimeWeightCache,
+        weightCache: Qwen35RuntimeWeightCache,
         steps: Int = MLXFastConstants.correctnessSteps,
         progressIntervalSteps: Int = 0,
         progress: ((Int, Int) -> Void)? = nil
@@ -340,7 +340,7 @@ extension QwenRuntime {
 
         let model = try weightCache.requireLibraryModel()
         let cache = model.newCache(parameters: nil)
-        var logits = try lagunaLogits(
+        var logits = try qwenLogits(
             inputIDs: inputIDsArray(testCase.promptTokens),
             model: model,
             cache: cache,
@@ -374,7 +374,7 @@ extension QwenRuntime {
                 break
             }
 
-            logits = try lagunaLogits(
+            logits = try qwenLogits(
                 inputIDs: inputIDsArray([expectedToken]),
                 model: model,
                 cache: cache,
@@ -394,11 +394,11 @@ extension QwenRuntime {
 
     static func compareAnchorCached(
         anchor: GoldenAnchorCase,
-        weightCache: LagunaRuntimeWeightCache
+        weightCache: Qwen35RuntimeWeightCache
     ) throws -> CorrectnessTokenComparison {
         let model = try weightCache.requireLibraryModel()
         let cache = model.newCache(parameters: nil)
-        let logits = try lagunaLogits(
+        let logits = try qwenLogits(
             inputIDs: inputIDsArray(anchor.contextTokens),
             model: model,
             cache: cache,
@@ -414,7 +414,7 @@ extension QwenRuntime {
 
     static func compareFreeRunCached(
         testCase: GoldenFreeRunCase,
-        weightCache: LagunaRuntimeWeightCache,
+        weightCache: Qwen35RuntimeWeightCache,
         progressIntervalSteps: Int = 0,
         progress: ((Int, Int) -> Void)? = nil
     ) throws -> CorrectnessTokenComparison {
@@ -430,12 +430,12 @@ extension QwenRuntime {
 
     static func compareBehaviorCached(
         testCase: GoldenBehaviorCase,
-        weightCache: LagunaRuntimeWeightCache
+        weightCache: Qwen35RuntimeWeightCache
     ) throws -> CorrectnessTokenComparison {
         if testCase.maxNewTokens == 1 {
             let model = try weightCache.requireLibraryModel()
             let cache = model.newCache(parameters: nil)
-            let logits = try lagunaLogits(
+            let logits = try qwenLogits(
                 inputIDs: inputIDsArray(testCase.promptTokens),
                 model: model,
                 cache: cache,
@@ -705,7 +705,7 @@ extension QwenRuntime {
         testCase: GoldenCase,
         step: Int,
         topK: Int,
-        weightCache: LagunaRuntimeWeightCache,
+        weightCache: Qwen35RuntimeWeightCache,
         goldenHash: String
     ) throws -> CorrectnessTraceReport {
         guard !testCase.promptTokens.isEmpty else {
@@ -722,7 +722,7 @@ extension QwenRuntime {
 
         let model = try weightCache.requireLibraryModel()
         let cache = model.newCache(parameters: nil)
-        var logits = try lagunaLogits(
+        var logits = try qwenLogits(
             inputIDs: inputIDsArray(testCase.promptTokens),
             model: model,
             cache: cache,
@@ -745,7 +745,7 @@ extension QwenRuntime {
                 )
             }
 
-            logits = try lagunaLogits(
+            logits = try qwenLogits(
                 inputIDs: inputIDsArray([token]),
                 model: model,
                 cache: cache,
@@ -828,7 +828,7 @@ extension QwenRuntime {
     static func generateGreedyCached(
         promptTokens: [Int],
         steps: Int,
-        weightCache: LagunaRuntimeWeightCache,
+        weightCache: Qwen35RuntimeWeightCache,
         progressIntervalSteps: Int = 0,
         progress: ((Int, Int) -> Void)? = nil
     ) throws -> [Int] {
@@ -841,7 +841,7 @@ extension QwenRuntime {
 
         let model = try weightCache.requireLibraryModel()
         let cache = model.newCache(parameters: nil)
-        var logits = try lagunaLogits(
+        var logits = try qwenLogits(
             inputIDs: inputIDsArray(promptTokens),
             model: model,
             cache: cache,
@@ -862,7 +862,7 @@ extension QwenRuntime {
             if step == steps - 1 {
                 break
             }
-            logits = try lagunaLogits(
+            logits = try qwenLogits(
                 inputIDs: inputIDsArray([token]),
                 model: model,
                 cache: cache,

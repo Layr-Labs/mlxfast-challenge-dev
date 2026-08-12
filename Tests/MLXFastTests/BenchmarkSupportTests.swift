@@ -91,7 +91,7 @@ private enum RuntimeWorkerDescriptorTestError: Error {
 }
 
 @Test
-func runtimeWorkerPinnedConfigurationAcceptsLagunaMoEArchitecture() throws {
+func runtimeWorkerPinnedConfigurationAcceptsQwen35Architecture() throws {
     let data = try JSONSerialization.data(
         withJSONObject: pinnedRuntimeWorkerConfigurationObject()
     )
@@ -99,7 +99,7 @@ func runtimeWorkerPinnedConfigurationAcceptsLagunaMoEArchitecture() throws {
 }
 
 @Test
-func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
+func runtimeWorkerPinnedConfigurationRejectsWrongQwen35Fields() throws {
     var cases: [(String, [String: Any])] = []
 
     func addCase(_ name: String, _ mutate: (inout [String: Any]) -> Void) {
@@ -108,157 +108,84 @@ func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
         cases.append((name, object))
     }
 
-    // A dense Gemma-4-shaped config (the previous pinned target) must be
-    // rejected wholesale, not merely on the model_type string.
-    addCase("model-type") { $0["model_type"] = "gemma4_text" }
-    addCase("hidden-size") { $0["hidden_size"] = 5_376 }
-    addCase("hidden-layers") { $0["num_hidden_layers"] = LagunaConstants.numHiddenLayers - 1 }
-    addCase("intermediate-size") { $0["intermediate_size"] = LagunaConstants.denseIntermediateSize - 1 }
-    addCase("attention-heads") { $0["num_attention_heads"] = 64 }
-    addCase("uniform-heads-per-layer") {
-        $0["num_attention_heads_per_layer"] =
-            [Int](repeating: 48, count: LagunaConstants.numHiddenLayers)
-    }
-    addCase("short-heads-per-layer") {
-        $0["num_attention_heads_per_layer"] =
-            [Int](repeating: 48, count: LagunaConstants.numHiddenLayers - 1)
-    }
-    addCase("missing-heads-per-layer") {
-        $0.removeValue(forKey: "num_attention_heads_per_layer")
-    }
-    addCase("kv-heads") { $0["num_key_value_heads"] = 16 }
-    addCase("head-dim") { $0["head_dim"] = 256 }
+    addCase("model-type") { $0["model_type"] = "other" }
+    addCase("vocab") { $0["vocab_size"] = MLXFastConstants.vocabSize - 1 }
+    addCase("hidden-size") { $0["hidden_size"] = MLXFastConstants.hiddenSize - 1 }
+    addCase("intermediate-size") { $0["intermediate_size"] = MLXFastConstants.intermediateSize - 1 }
+    addCase("hidden-layers") { $0["num_hidden_layers"] = MLXFastConstants.numHiddenLayers - 1 }
+    addCase("attention-heads") { $0["num_attention_heads"] = MLXFastConstants.attentionHeads - 1 }
+    addCase("kv-heads") { $0["num_key_value_heads"] = 8 }
+    addCase("head-dim") { $0["head_dim"] = 128 }
+    addCase("linear-value-heads") { $0["linear_num_value_heads"] = 24 }
+    addCase("linear-key-heads") { $0["linear_num_key_heads"] = 8 }
+    addCase("linear-value-head-dim") { $0["linear_value_head_dim"] = 64 }
+    addCase("linear-key-head-dim") { $0["linear_key_head_dim"] = 64 }
+    addCase("linear-conv-kernel") { $0["linear_conv_kernel_dim"] = 3 }
+    addCase("full-attention-interval") { $0["full_attention_interval"] = 8 }
     addCase("rms-norm") { $0["rms_norm_eps"] = 1e-5 }
-    addCase("vocab") { $0["vocab_size"] = 262_144 }
-    addCase("sliding-window") { $0["sliding_window"] = 1_024 }
+    addCase("hidden-activation") { $0["hidden_act"] = "gelu" }
     addCase("max-position") { $0["max_position_embeddings"] = 131_072 }
     addCase("attention-bias") { $0["attention_bias"] = true }
-    addCase("qkv-bias") { $0["qkv_bias"] = true }
     addCase("attention-dropout") { $0["attention_dropout"] = 0.1 }
-    addCase("per-element-gating") { $0["gating"] = "per-element" }
-    addCase("disabled-gating") { $0["gating"] = false }
-    addCase("per-layer-gating") {
-        var schedule = $0["gating_types"] as! [String]
-        schedule[7] = "per_element"
-        $0["gating_types"] = schedule
-    }
-    addCase("missing-per-layer-gating") {
-        $0.removeValue(forKey: "gating_types")
-    }
-    // Laguna's lm_head is untied; a tied-embedding config is a different
-    // (dense-era) checkpoint layout.
+    addCase("attention-output-gate") { $0["attn_output_gate"] = false }
+    addCase("output-gate-type") { $0["output_gate_type"] = "sigmoid" }
+    addCase("bos-token") { $0["bos_token_id"] = 1 }
+    addCase("eos-token") { $0["eos_token_id"] = 1 }
+    addCase("initializer-range") { $0["initializer_range"] = 0.01 }
+    addCase("pad-token") { $0["pad_token_id"] = 0 }
     addCase("tie-embeddings") { $0["tie_word_embeddings"] = true }
-    addCase("moe-disabled") { $0["num_experts"] = 0 }
-    addCase("experts") { $0["num_experts"] = 8 }
-    addCase("top-k-experts") { $0["num_experts_per_tok"] = 2 }
-    addCase("moe-intermediate") { $0["moe_intermediate_size"] = 1_024 }
-    addCase("shared-expert-intermediate") {
-        $0["shared_expert_intermediate_size"] = 1_024
-    }
-    addCase("routed-scaling") { $0["moe_routed_scaling_factor"] = 1.0 }
-    addCase("norm-topk") { $0["norm_topk_prob"] = false }
-    addCase("router-weight-on-input") {
-        $0["moe_apply_router_weight_on_input"] = true
-    }
-    addCase("router-softcap") { $0["moe_router_logit_softcapping"] = 30.0 }
-    addCase("router-aux-loss") { $0["router_aux_loss_coef"] = 0.1 }
+    addCase("mamba-dtype") { $0["mamba_ssm_dtype"] = "bfloat16" }
+    addCase("dtype") { $0["dtype"] = "float16" }
     addCase("use-cache") { $0["use_cache"] = false }
-    addCase("missing-layer-types") { $0.removeValue(forKey: "layer_types") }
+    addCase("top-level-partial-rotary") { $0["partial_rotary_factor"] = 0.5 }
     addCase("layer-pattern") {
-        // The dense Gemma 4 schedule (full attention every 6th layer) is
-        // not Laguna's every-4th-full schedule.
-        $0["layer_types"] = (0..<LagunaConstants.numHiddenLayers).map { index in
-            index % 6 == 5 ? "full_attention" : "sliding_attention"
-        }
+        var layerTypes = $0["layer_types"] as! [String]
+        layerTypes[0] = "full_attention"
+        $0["layer_types"] = layerTypes
     }
-    addCase("all-sparse-mlp") {
-        $0["mlp_layer_types"] =
-            [String](repeating: "sparse", count: LagunaConstants.numHiddenLayers)
+    addCase("layer-count") {
+        var layerTypes = $0["layer_types"] as! [String]
+        layerTypes.removeLast()
+        $0["layer_types"] = layerTypes
     }
-    addCase("mlp-only-layers") { $0["mlp_only_layers"] = [0, 1] }
-    addCase("decoder-sparse-step") { $0["decoder_sparse_step"] = 2 }
-    addCase("sliding-rope-theta") {
+    addCase("rope-theta") {
         var rope = $0["rope_parameters"] as! [String: Any]
-        var sliding = rope["sliding_attention"] as! [String: Any]
-        sliding["rope_theta"] = 20_000
-        rope["sliding_attention"] = sliding
+        rope["rope_theta"] = 1_000_000
         $0["rope_parameters"] = rope
     }
-    addCase("sliding-rope-type") {
+    addCase("rope-type") {
         var rope = $0["rope_parameters"] as! [String: Any]
-        var sliding = rope["sliding_attention"] as! [String: Any]
-        sliding["rope_type"] = "yarn"
-        rope["sliding_attention"] = sliding
+        rope["rope_type"] = "proportional"
         $0["rope_parameters"] = rope
     }
-    addCase("sliding-partial-rotary") {
+    addCase("rope-partial-rotary") {
         var rope = $0["rope_parameters"] as! [String: Any]
-        var sliding = rope["sliding_attention"] as! [String: Any]
-        sliding["partial_rotary_factor"] = 0.5
-        rope["sliding_attention"] = sliding
+        rope["partial_rotary_factor"] = 0.5
         $0["rope_parameters"] = rope
     }
-    addCase("full-rope-theta") {
+    addCase("mrope-interleaved") {
         var rope = $0["rope_parameters"] as! [String: Any]
-        var full = rope["full_attention"] as! [String: Any]
-        full["rope_theta"] = 10_000
-        rope["full_attention"] = full
+        rope["mrope_interleaved"] = false
         $0["rope_parameters"] = rope
     }
-    addCase("full-rope-type") {
+    addCase("mrope-section") {
         var rope = $0["rope_parameters"] as! [String: Any]
-        var full = rope["full_attention"] as! [String: Any]
-        full["rope_type"] = "default"
-        rope["full_attention"] = full
+        rope["mrope_section"] = [16, 16]
         $0["rope_parameters"] = rope
     }
-    addCase("full-partial-rotary") {
+    addCase("rope-library-type") {
         var rope = $0["rope_parameters"] as! [String: Any]
-        var full = rope["full_attention"] as! [String: Any]
-        full["partial_rotary_factor"] = 1.0
-        rope["full_attention"] = full
+        rope["type"] = "linear"
         $0["rope_parameters"] = rope
     }
-    addCase("yarn-factor") {
+    addCase("rope-library-factor") {
         var rope = $0["rope_parameters"] as! [String: Any]
-        var full = rope["full_attention"] as! [String: Any]
-        full["factor"] = 8.0
-        rope["full_attention"] = full
+        rope["factor"] = 2
         $0["rope_parameters"] = rope
     }
-    addCase("yarn-original-max-position") {
+    addCase("rope-unknown") {
         var rope = $0["rope_parameters"] as! [String: Any]
-        var full = rope["full_attention"] as! [String: Any]
-        full["original_max_position_embeddings"] = 4_096
-        rope["full_attention"] = full
-        $0["rope_parameters"] = rope
-    }
-    addCase("yarn-beta-fast") {
-        var rope = $0["rope_parameters"] as! [String: Any]
-        var full = rope["full_attention"] as! [String: Any]
-        full["beta_fast"] = 32.0
-        rope["full_attention"] = full
-        $0["rope_parameters"] = rope
-    }
-    addCase("yarn-beta-slow") {
-        var rope = $0["rope_parameters"] as! [String: Any]
-        var full = rope["full_attention"] as! [String: Any]
-        full["beta_slow"] = 2.0
-        rope["full_attention"] = full
-        $0["rope_parameters"] = rope
-    }
-    addCase("yarn-attention-factor") {
-        var rope = $0["rope_parameters"] as! [String: Any]
-        var full = rope["full_attention"] as! [String: Any]
-        full["attention_factor"] = 1.25
-        rope["full_attention"] = full
-        $0["rope_parameters"] = rope
-    }
-    addCase("missing-yarn-attention-factor") {
-        var rope = $0["rope_parameters"] as! [String: Any]
-        var full = rope["full_attention"] as! [String: Any]
-        full.removeValue(forKey: "attention_factor")
-        rope["full_attention"] = full
+        rope["unknown"] = true
         $0["rope_parameters"] = rope
     }
     addCase("quantization-bits") {
@@ -268,7 +195,7 @@ func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
     }
     addCase("quantization-group") {
         var quantization = $0["quantization"] as! [String: Any]
-        quantization["group_size"] = 64
+        quantization["group_size"] = 32
         $0["quantization"] = quantization
     }
     addCase("quantization-mode") {
@@ -276,21 +203,18 @@ func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
         quantization["mode"] = "symmetric"
         $0["quantization"] = quantization
     }
-    addCase("missing-quantization") { $0.removeValue(forKey: "quantization") }
-    addCase("missing-quantization-config") { $0.removeValue(forKey: "quantization_config") }
-    addCase("quantization-missing-mode") {
+    addCase("quantization-unknown") {
         var quantization = $0["quantization"] as! [String: Any]
-        quantization.removeValue(forKey: "mode")
+        quantization["unknown"] = true
         $0["quantization"] = quantization
     }
-    addCase("quantization-override") {
-        var quantization = $0["quantization"] as! [String: Any]
-        quantization["model.layers.1.mlp.switch_mlp.gate_proj"] = [
-            "group_size": 16,
-            "bits": 4,
-        ]
-        $0["quantization"] = quantization
-    }
+    addCase("mtp-layers") { $0["mtp_num_hidden_layers"] = 0 }
+    addCase("mtp-dedicated-embeddings") { $0["mtp_use_dedicated_embeddings"] = true }
+    addCase("mtp-enabled") { $0["mtp_enabled"] = true }
+    addCase("moe-experts") { $0["num_experts"] = 8 }
+    addCase("moe-intermediate") { $0["moe_intermediate_size"] = 1_024 }
+    addCase("moe-enable") { $0["enable_moe_block"] = true }
+    addCase("unknown-root") { $0["behavior_change"] = true }
 
     for (name, object) in cases {
         let data = try JSONSerialization.data(withJSONObject: object)
@@ -301,19 +225,84 @@ func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
 }
 
 @Test
-func runtimeWorkerPinnedConfigurationAcceptsNullableArtifactFields() throws {
-    // The immutable config omits these two fields. Explicit JSON null is the
-    // only equivalent representation; concrete false/zero values are rejected
-    // by the mutation table above.
-    var object = pinnedRuntimeWorkerConfigurationObject()
-    #expect(object["qkv_bias"] == nil)
-    #expect(object["moe_router_logit_softcapping"] == nil)
-    object["qkv_bias"] = NSNull()
-    object["moe_router_logit_softcapping"] = NSNull()
+func runtimeWorkerPinnedConfigurationRejectsMissingQwen35Fields() throws {
+    let requiredTopLevelFields = [
+        "model_type", "vocab_size", "hidden_size", "intermediate_size",
+        "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+        "head_dim", "linear_num_value_heads", "linear_num_key_heads",
+        "linear_value_head_dim", "linear_key_head_dim",
+        "linear_conv_kernel_dim", "full_attention_interval", "layer_types",
+        "rms_norm_eps", "hidden_act", "max_position_embeddings",
+        "attention_bias", "attention_dropout", "attn_output_gate",
+        "output_gate_type", "bos_token_id", "eos_token_id",
+        "initializer_range", "pad_token_id", "tie_word_embeddings", "mamba_ssm_dtype",
+        "dtype", "use_cache", "partial_rotary_factor", "rope_parameters",
+        "mtp_num_hidden_layers", "mtp_use_dedicated_embeddings",
+    ]
+    for field in requiredTopLevelFields {
+        var object = pinnedRuntimeWorkerConfigurationObject()
+        object.removeValue(forKey: field)
+        #expect(throws: MLXFastError.self, "missing \(field)") {
+            try validateRuntimeWorkerPinnedConfigurationData(
+                JSONSerialization.data(withJSONObject: object)
+            )
+        }
+    }
 
-    try validateRuntimeWorkerPinnedConfigurationData(
-        JSONSerialization.data(withJSONObject: object)
-    )
+    for field in [
+        "rope_theta", "rope_type", "partial_rotary_factor",
+        "mrope_interleaved", "mrope_section",
+    ] {
+        var object = pinnedRuntimeWorkerConfigurationObject()
+        var rope = object["rope_parameters"] as! [String: Any]
+        rope.removeValue(forKey: field)
+        object["rope_parameters"] = rope
+        #expect(throws: MLXFastError.self, "missing rope field \(field)") {
+            try validateRuntimeWorkerPinnedConfigurationData(
+                JSONSerialization.data(withJSONObject: object)
+            )
+        }
+    }
+
+    for field in ["group_size", "bits", "mode"] {
+        var object = pinnedRuntimeWorkerConfigurationObject()
+        var quantization = object["quantization"] as! [String: Any]
+        quantization.removeValue(forKey: field)
+        object["quantization"] = quantization
+        #expect(throws: MLXFastError.self, "missing quantization field \(field)") {
+            try validateRuntimeWorkerPinnedConfigurationData(
+                JSONSerialization.data(withJSONObject: object)
+            )
+        }
+    }
+
+    var noQuantization = pinnedRuntimeWorkerConfigurationObject()
+    noQuantization.removeValue(forKey: "quantization")
+    #expect(throws: MLXFastError.self) {
+        try validateRuntimeWorkerPinnedConfigurationData(
+            JSONSerialization.data(withJSONObject: noQuantization)
+        )
+    }
+}
+
+@Test
+func runtimeWorkerPinnedConfigurationRejectsAlternateQuantizationSchemas() throws {
+    var quantizationConfigOnly = pinnedRuntimeWorkerConfigurationObject()
+    quantizationConfigOnly["quantization_config"] =
+        quantizationConfigOnly.removeValue(forKey: "quantization")
+    #expect(throws: MLXFastError.self) {
+        try validateRuntimeWorkerPinnedConfigurationData(
+            JSONSerialization.data(withJSONObject: quantizationConfigOnly)
+        )
+    }
+
+    var matchingForms = pinnedRuntimeWorkerConfigurationObject()
+    matchingForms["quantization_config"] = matchingForms["quantization"]
+    #expect(throws: MLXFastError.self) {
+        try validateRuntimeWorkerPinnedConfigurationData(
+            JSONSerialization.data(withJSONObject: matchingForms)
+        )
+    }
 }
 
 @Test
@@ -951,8 +940,32 @@ func nonWorkerBenchmarkRejectsBehaviorGatesBecauseTTFTRequiresWorker() throws {
 }
 
 @Test
+func qwen35PreflightFixtureHasExactPinnedTensorInventory() {
+    let tensors = requiredQwen35DenseTensorFixtures()
+    let names = Set(tensors.map(\.name))
+
+    #expect(tensors.count == Qwen35WeightLoader.requiredTensorCount)
+    #expect(names.count == Qwen35WeightLoader.requiredTensorCount)
+    #expect(
+        names.filter { !$0.contains(".layers.") }.count
+            == Qwen35WeightLoader.requiredTopLevelTensorCount
+    )
+    for layerIndex in 0..<MLXFastConstants.numHiddenLayers {
+        let prefix = "language_model.model.layers.\(layerIndex)."
+        let layerCount = names.filter { $0.hasPrefix(prefix) }.count
+        let expected = layerIndex % 4 == 3
+            ? Qwen35WeightLoader.requiredFullAttentionLayerTensorCount
+            : Qwen35WeightLoader.requiredLinearLayerTensorCount
+        #expect(layerCount == expected, "layer \(layerIndex)")
+    }
+    #expect(names.contains(Qwen35WeightNames.lmHead))
+    #expect(names.contains("language_model.lm_head.scales"))
+    #expect(names.contains("language_model.lm_head.biases"))
+}
+
+@Test
 func benchmarkPreflightRejectsMissingSemanticTensor() throws {
-    let fixture = try makePreflightFixture(omitDenseTensorName: LagunaWeightNames.finalNorm)
+    let fixture = try makePreflightFixture(omitDenseTensorName: Qwen35WeightNames.finalNorm)
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
@@ -962,7 +975,7 @@ func benchmarkPreflightRejectsMissingSemanticTensor() throws {
 
 @Test
 func lagunaWeightLoaderRejectsUnexpectedTensorInventory() throws {
-    let fixture = try makePreflightFixture(
+    let fixture = try makeLagunaWeightsFixture(
         extraDenseTensor: TensorFixture(
             name: "model.unexpected.weight",
             dtype: "BF16",
@@ -1046,7 +1059,7 @@ func lagunaWeightLoaderExplicitlyRejectsNonMLXQuantizationSchemas() throws {
         "model.layers.1.self_attn.v_scale",
         "model.layers.1.mlp.switch_mlp.gate_proj.biases",
     ] {
-        let fixture = try makePreflightFixture(
+        let fixture = try makeLagunaWeightsFixture(
             extraDenseTensor: TensorFixture(
                 name: forbiddenName,
                 dtype: "U8",
@@ -1144,13 +1157,13 @@ private func makePreflightFixture(
     let weights = directory.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
 
-    try lagunaPreflightConfigJSON().write(
+    try qwenPreflightConfigJSON().write(
         to: weights.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
     )
 
-    var denseTensors = requiredLagunaDenseTensorFixtures()
+    var denseTensors = requiredQwen35DenseTensorFixtures()
     if let omitDenseTensorName {
         denseTensors.removeAll { $0.name == omitDenseTensorName }
     }
@@ -1171,8 +1184,8 @@ private func makePreflightFixture(
     return PreflightFixture(root: directory, weights: weights, golden: golden)
 }
 
-/// The pinned Poolside Laguna NVFP4 runtime config as the transform writes it.
-private func lagunaPreflightConfigJSON() throws -> String {
+/// The pinned Qwen 3.6 4-bit runtime config as the transform writes it.
+private func qwenPreflightConfigJSON() throws -> String {
     let root = pinnedRuntimeWorkerConfigurationObject()
     let data = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
     return String(decoding: data, as: UTF8.self)
@@ -1224,6 +1237,169 @@ private func correctnessOnlyGoldenJSON() -> String {
       ]
     }
     """
+}
+
+/// Every tensor `Qwen35WeightLoader.validateRequiredMetadata` requires for the
+/// frozen 64-layer hybrid tower: three linear-attention layers followed by one
+/// full-attention layer, repeated 16 times. Real byte contents do not matter
+/// for preflight, so the fixture writes sparse files with the checkpoint's
+/// exact BF16 and affine-4 U32 metadata.
+private func requiredQwen35DenseTensorFixtures() -> [TensorFixture] {
+    let hidden = MLXFastConstants.hiddenSize
+    let intermediate = MLXFastConstants.intermediateSize
+    let vocab = MLXFastConstants.vocabSize
+    let layers = MLXFastConstants.numHiddenLayers
+    let heads = MLXFastConstants.attentionHeads
+    let headDim = 256
+    let kvHeads = 4
+    let linearValueHeads = 48
+    let linearKeyHeads = 16
+    let linearValueHeadDim = 128
+    let linearKeyHeadDim = 128
+    let linearConvKernelDim = 4
+
+    func packedCols(_ inFeatures: Int) -> Int {
+        inFeatures / 8
+    }
+
+    func quantized(
+        _ name: String,
+        outFeatures: Int,
+        inFeatures: Int
+    ) -> [TensorFixture] {
+        let companionShape = [outFeatures, inFeatures / 64]
+        let baseName = String(name.dropLast(".weight".count))
+        return [
+            TensorFixture(
+                name: name,
+                dtype: "U32",
+                shape: [outFeatures, packedCols(inFeatures)]
+            ),
+            TensorFixture(
+                name: "\(baseName).scales",
+                dtype: "BF16",
+                shape: companionShape
+            ),
+            TensorFixture(
+                name: "\(baseName).biases",
+                dtype: "BF16",
+                shape: companionShape
+            ),
+        ]
+    }
+
+    let linearKeySize = linearKeyHeads * linearKeyHeadDim
+    let linearValueSize = linearValueHeads * linearValueHeadDim
+    let linearConvSize = linearKeySize * 2 + linearValueSize
+    let fullQuerySize = heads * headDim * 2
+    let fullKVSize = kvHeads * headDim
+    let fullOutputSize = heads * headDim
+
+    var tensors: [TensorFixture] = []
+    tensors += quantized(
+        Qwen35WeightNames.embedTokens,
+        outFeatures: vocab,
+        inFeatures: hidden
+    )
+    tensors.append(
+        TensorFixture(
+            name: Qwen35WeightNames.finalNorm,
+            dtype: "BF16",
+            shape: [hidden]
+        )
+    )
+    tensors += quantized(
+        Qwen35WeightNames.lmHead,
+        outFeatures: vocab,
+        inFeatures: hidden
+    )
+
+    for layerIndex in 0..<layers {
+        for suffix in [
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+        ] {
+            tensors.append(
+                TensorFixture(
+                    name: Qwen35WeightNames.layer(layerIndex, suffix),
+                    dtype: "BF16",
+                    shape: [hidden]
+                )
+            )
+        }
+
+        for (suffix, output, input) in [
+            ("gate_proj.weight", intermediate, hidden),
+            ("up_proj.weight", intermediate, hidden),
+            ("down_proj.weight", hidden, intermediate),
+        ] {
+            tensors += quantized(
+                Qwen35WeightNames.mlp(layerIndex, suffix),
+                outFeatures: output,
+                inFeatures: input
+            )
+        }
+
+        if layerIndex % 4 == 3 {
+            for suffix in ["q_norm.weight", "k_norm.weight"] {
+                tensors.append(
+                    TensorFixture(
+                        name: Qwen35WeightNames.fullAttention(
+                            layerIndex,
+                            suffix
+                        ),
+                        dtype: "BF16",
+                        shape: [headDim]
+                    )
+                )
+            }
+            for (suffix, output, input) in [
+                ("q_proj.weight", fullQuerySize, hidden),
+                ("k_proj.weight", fullKVSize, hidden),
+                ("v_proj.weight", fullKVSize, hidden),
+                ("o_proj.weight", hidden, fullOutputSize),
+            ] {
+                tensors += quantized(
+                    Qwen35WeightNames.fullAttention(layerIndex, suffix),
+                    outFeatures: output,
+                    inFeatures: input
+                )
+            }
+        } else {
+            for (suffix, shape) in [
+                ("conv1d.weight", [linearConvSize, linearConvKernelDim, 1]),
+                ("A_log", [linearValueHeads]),
+                ("dt_bias", [linearValueHeads]),
+                ("norm.weight", [linearValueHeadDim]),
+            ] {
+                tensors.append(
+                    TensorFixture(
+                        name: Qwen35WeightNames.linearAttention(
+                            layerIndex,
+                            suffix
+                        ),
+                        dtype: "BF16",
+                        shape: shape
+                    )
+                )
+            }
+            for (suffix, output, input) in [
+                ("in_proj_qkv.weight", linearConvSize, hidden),
+                ("in_proj_z.weight", linearValueSize, hidden),
+                ("in_proj_b.weight", linearValueHeads, hidden),
+                ("in_proj_a.weight", linearValueHeads, hidden),
+                ("out_proj.weight", hidden, linearValueSize),
+            ] {
+                tensors += quantized(
+                    Qwen35WeightNames.linearAttention(layerIndex, suffix),
+                    outFeatures: output,
+                    inFeatures: input
+                )
+            }
+        }
+    }
+
+    return tensors
 }
 
 /// Every tensor `LagunaWeightLoader.validateRequiredMetadata` requires for a
@@ -1368,6 +1544,46 @@ private func requiredLagunaDenseTensorFixtures() -> [TensorFixture] {
     }
 
     return tensors
+}
+
+/// Laguna-shaped weights directory for the tests that still exercise the
+/// Poolside artifact contract and the Laguna weight loader. The shared
+/// `makePreflightFixture` now writes the Qwen 3.6 artifact the harness drives,
+/// so those tests build their own tree here rather than reading a config that
+/// describes a different checkpoint.
+private func makeLagunaWeightsFixture(
+    omitDenseTensorName: String? = nil,
+    extraDenseTensor: TensorFixture? = nil
+) throws -> PreflightFixture {
+    let directory = try temporaryDirectory()
+    let weights = directory.appendingPathComponent("weights", isDirectory: true)
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+
+    let configData = try JSONSerialization.data(
+        withJSONObject: pinnedLagunaConfigObject(),
+        options: [.sortedKeys]
+    )
+    try configData.write(to: weights.appendingPathComponent("config.json"))
+
+    var denseTensors = requiredLagunaDenseTensorFixtures()
+    if let omitDenseTensorName {
+        denseTensors.removeAll { $0.name == omitDenseTensorName }
+    }
+    if let extraDenseTensor {
+        denseTensors.append(extraDenseTensor)
+    }
+    let denseShard = "model-00001.safetensors"
+    try writeSafetensors(weights.appendingPathComponent(denseShard), tensors: denseTensors)
+    try writeIndex(
+        weights.appendingPathComponent("model.safetensors.index.json"),
+        tensors: denseTensors,
+        shardName: denseShard
+    )
+
+    let golden = directory.appendingPathComponent("correctness_golden.json")
+    try validGoldenJSON().write(to: golden, atomically: true, encoding: .utf8)
+
+    return PreflightFixture(root: directory, weights: weights, golden: golden)
 }
 
 private func writeIndex(_ path: URL, tensors: [TensorFixture], shardName: String) throws {
@@ -1820,7 +2036,7 @@ func runtimeWorkerStartsTheOrphanReaperBeforeLoadingTheModel() throws {
     )
     let reaperCall = try #require(worker.range(of: "startRuntimeWorkerOrphanReaper()"))
     let protocolIO = try #require(worker.range(of: "RuntimeWorkerProtocolIO.isolatingStandardIO()"))
-    let weightCache = try #require(worker.range(of: "LagunaRuntimeWeightCache(loader:"))
+    let weightCache = try #require(worker.range(of: "Qwen35RuntimeWeightCache(loader:"))
     #expect(reaperCall.lowerBound < protocolIO.lowerBound)
     #expect(reaperCall.lowerBound < weightCache.lowerBound)
     #expect(worker.contains("getppid() == 1"))
@@ -2398,7 +2614,55 @@ private func makeRuntimeWorkerScript(_ contents: String) throws -> URL {
 /// and 256-expert top-8 MoE blocks with a 512-wide shared expert on the
 /// other 39 layers.
 private func pinnedRuntimeWorkerConfigurationObject() -> [String: Any] {
-    pinnedLagunaConfigObject()
+    [
+        "model_type": "qwen3_5_text",
+        "vocab_size": MLXFastConstants.vocabSize,
+        "hidden_size": MLXFastConstants.hiddenSize,
+        "intermediate_size": MLXFastConstants.intermediateSize,
+        "num_hidden_layers": MLXFastConstants.numHiddenLayers,
+        "num_attention_heads": MLXFastConstants.attentionHeads,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "linear_num_value_heads": 48,
+        "linear_num_key_heads": 16,
+        "linear_value_head_dim": 128,
+        "linear_key_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "full_attention_interval": 4,
+        "layer_types": (0..<MLXFastConstants.numHiddenLayers).map {
+            $0 % 4 == 3 ? "full_attention" : "linear_attention"
+        },
+        "rms_norm_eps": 1e-6,
+        "hidden_act": "silu",
+        "max_position_embeddings": 262_144,
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "attn_output_gate": true,
+        "output_gate_type": "swish",
+        "bos_token_id": 248_044,
+        "eos_token_id": 248_044,
+        "initializer_range": 0.02,
+        "pad_token_id": NSNull(),
+        "tie_word_embeddings": false,
+        "mamba_ssm_dtype": "float32",
+        "dtype": "bfloat16",
+        "use_cache": true,
+        "partial_rotary_factor": 0.25,
+        "rope_parameters": [
+            "rope_theta": 10_000_000.0,
+            "rope_type": "default",
+            "partial_rotary_factor": 0.25,
+            "mrope_interleaved": true,
+            "mrope_section": [11, 11, 10],
+        ],
+        "quantization": [
+            "group_size": 64,
+            "bits": 4,
+            "mode": "affine",
+        ],
+        "mtp_num_hidden_layers": 1,
+        "mtp_use_dedicated_embeddings": false,
+    ]
 }
 
 private func shortRuntimeWorkerOptions(executable: URL) -> RuntimeWorkerOptions {

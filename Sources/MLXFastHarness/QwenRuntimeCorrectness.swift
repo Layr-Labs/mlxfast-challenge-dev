@@ -36,9 +36,9 @@ extension QwenRuntime {
             return tokens
         }
 
-        let config = try LagunaConfig.load(from: options.weightsPath)
-        let loader = try LagunaWeightLoader(weightsPath: options.weightsPath)
-        let weightCache = LagunaRuntimeWeightCache(loader: loader, config: config)
+        let config = try Qwen35Config.load(from: options.weightsPath)
+        let loader = try Qwen35WeightLoader(weightsPath: options.weightsPath)
+        let weightCache = Qwen35RuntimeWeightCache(loader: loader, config: config)
         return try generateGreedyCached(
             promptTokens: options.promptTokens,
             steps: options.steps,
@@ -57,7 +57,7 @@ extension QwenRuntime {
         }
 
         var loadedGolden: GoldenFixture?
-        var loader: LagunaWeightLoader?
+        var loader: Qwen35WeightLoader?
         do {
             try requireFile(options.goldenPath, description: "correctness golden file")
             let golden = try loadGoldenFixture(from: options.goldenPath)
@@ -66,10 +66,10 @@ extension QwenRuntime {
                 weightsPath: options.weightsPath,
                 goldenPath: options.goldenPath
             )
-            let config = try LagunaConfig.load(from: options.weightsPath)
-            let runtimeLoader = try LagunaWeightLoader(weightsPath: options.weightsPath)
+            let config = try Qwen35Config.load(from: options.weightsPath)
+            let runtimeLoader = try Qwen35WeightLoader(weightsPath: options.weightsPath)
             loader = runtimeLoader
-            let weightCache = LagunaRuntimeWeightCache(loader: runtimeLoader, config: config)
+            let weightCache = Qwen35RuntimeWeightCache(loader: runtimeLoader, config: config)
             return runLayeredCorrectness(
                 golden: golden,
                 weightCache: weightCache,
@@ -178,7 +178,7 @@ extension QwenRuntime {
 
     static func runLayeredCorrectness(
         golden: GoldenFixture,
-        weightCache: LagunaRuntimeWeightCache,
+        weightCache: Qwen35RuntimeWeightCache,
         steps: Int = MLXFastConstants.correctnessSteps,
         progress: ((String) -> Void)? = nil
     ) -> CorrectnessReport {

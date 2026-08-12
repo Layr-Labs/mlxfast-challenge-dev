@@ -39,11 +39,11 @@ extension QwenRuntime {
         }
 
         #if !MLXFAST_TRUSTED_HARNESS
-            let config = try LagunaConfig.load(from: options.weightsPath)
-            let loader = try LagunaWeightLoader(
+            let config = try Qwen35Config.load(from: options.weightsPath)
+            let loader = try Qwen35WeightLoader(
                 weightsPath: options.weightsPath
             )
-            let weightCache = LagunaRuntimeWeightCache(
+            let weightCache = Qwen35RuntimeWeightCache(
                 loader: loader,
                 config: config
             )
@@ -71,7 +71,7 @@ extension QwenRuntime {
 
         #if !MLXFAST_TRUSTED_HARNESS
             var loadedGolden: GoldenFixture?
-            var loader: LagunaWeightLoader?
+            var loader: Qwen35WeightLoader?
             do {
                 try requireFile(
                     options.goldenPath,
@@ -83,12 +83,12 @@ extension QwenRuntime {
                     weightsPath: options.weightsPath,
                     goldenPath: options.goldenPath
                 )
-                let config = try LagunaConfig.load(from: options.weightsPath)
-                let runtimeLoader = try LagunaWeightLoader(
+                let config = try Qwen35Config.load(from: options.weightsPath)
+                let runtimeLoader = try Qwen35WeightLoader(
                     weightsPath: options.weightsPath
                 )
                 loader = runtimeLoader
-                let weightCache = LagunaRuntimeWeightCache(
+                let weightCache = Qwen35RuntimeWeightCache(
                     loader: runtimeLoader,
                     config: config
                 )
@@ -235,7 +235,7 @@ extension QwenRuntime {
     #if !MLXFAST_TRUSTED_HARNESS
         static func runLayeredCorrectness(
         golden: GoldenFixture,
-        weightCache: LagunaRuntimeWeightCache,
+        weightCache: Qwen35RuntimeWeightCache,
         steps: Int = MLXFastConstants.correctnessSteps,
         progress: ((String) -> Void)? = nil
     ) -> CorrectnessReport {

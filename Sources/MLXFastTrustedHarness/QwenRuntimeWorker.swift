@@ -6,6 +6,7 @@ import MLX
 import MLXFastCore
 #if !MLXFAST_TRUSTED_HARNESS
 import MLXFastModel
+import MLXLLM
 import MLXLMCommon
 #endif
 
@@ -28,11 +29,11 @@ extension QwenRuntime {
         // use standard I/O; none of that may be confused with protocol traffic.
         let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
         try validateRuntimeWorkerPinnedConfiguration(weightsPath: weightsPath)
-        let config = try LagunaConfig.load(from: weightsPath)
-        let loader = try LagunaWeightLoader(weightsPath: weightsPath)
+        let config = try Qwen35Config.load(from: weightsPath)
+        let loader = try Qwen35WeightLoader(weightsPath: weightsPath)
         // Validate transformed-weight structure HERE, inside the sandboxed worker,
         // rather than in the trusted parent. These checks execute editable
-        // MLXFastModel code (DenseTensorStore / LagunaWeightLoader); the parent
+        // MLXFastModel code (DenseTensorStore / Qwen35WeightLoader); the parent
         // used to run the equivalent via BenchmarkPreflight.check, which meant
         // submitted code ran in the unsandboxed process that authors score.json.
         // Failing here throws before the protocol hello below, so the parent's
@@ -41,10 +42,10 @@ extension QwenRuntime {
         // parent.
         try loader.denseStore.validateReadableByteRanges()
         try loader.validateRequiredMetadata(config: config)
-        // Constructing the weight cache loads the whole 4-bit Laguna text
+        // Constructing the weight cache loads the whole 4-bit Qwen 3.6 text
         // tower and runs its constructor-time kernel warmup, all before the
         // protocol hello -- outside every scored window.
-        let weightCache = LagunaRuntimeWeightCache(loader: loader, config: config)
+        let weightCache = Qwen35RuntimeWeightCache(loader: loader, config: config)
         _ = try weightCache.requireLibraryModel()
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
@@ -100,8 +101,8 @@ extension QwenRuntime {
         let response: RuntimeWorkerPreflightResponse
         do {
             try validateRuntimeWorkerPinnedConfiguration(weightsPath: weightsPath)
-            let config = try LagunaConfig.load(from: weightsPath)
-            let loader = try LagunaWeightLoader(weightsPath: weightsPath)
+            let config = try Qwen35Config.load(from: weightsPath)
+            let loader = try Qwen35WeightLoader(weightsPath: weightsPath)
             try loader.denseStore.validateReadableByteRanges()
             try loader.validateRequiredMetadata(config: config)
             response = RuntimeWorkerPreflightResponse(ok: true)
@@ -195,57 +196,57 @@ extension QwenRuntime {
         }
     }
 
-    /// One forward through the RAM-resident Laguna runtime model. Laguna is
-    /// an INSTANCE model whose per-layer `[KVCache]`
+    /// One forward through the RAM-resident Qwen 3.6 text tower. It is an
+    /// INSTANCE model whose per-layer `[KVCache]`
     /// stack both stores K/V and supplies RoPE positions, so the model
     /// takes no explicit offset. `positionOffset` is kept as the caller's
     /// statement of where the sequence should be and is validated against
     /// the cache offsets, preserving the old adapter's fail-loudly contract
     /// for a stale or reused cache. Returns `[1, 1, vocab]` LAST-token
-    /// logits (Laguna applies no final softcap and no embedding scaling).
-    static func lagunaLogits(
+    /// logits (Qwen applies no final softcap and no embedding scaling).
+    static func qwenLogits(
         inputIDs: MLXArray,
-        model: LagunaRuntimeModel,
+        model: Qwen35TextModel,
         cache: [KVCache],
         positionOffset: Int
     ) throws -> MLXArray {
-        try verifyLagunaCachePosition(positionOffset: positionOffset, cache: cache)
+        try verifyQwenCachePosition(positionOffset: positionOffset, cache: cache)
         return model(inputIDs, cache: cache)
     }
 
     /// Every layer cache must agree on one logical offset
     /// (`StandardKVCache` and `RotatingKVCache` both count total positions
     /// seen), and it must equal the caller's expected position.
-    static func verifyLagunaCachePosition(
+    static func verifyQwenCachePosition(
         positionOffset: Int,
         cache: [KVCache]
     ) throws {
         guard positionOffset >= 0 else {
-            throw MLXFastError.invalidInput("Laguna position offset must be non-negative")
+            throw MLXFastError.invalidInput("Qwen position offset must be non-negative")
         }
         guard let cacheOffset = cache.first?.offset else {
-            throw MLXFastError.invalidInput("Laguna model returned no KV caches")
+            throw MLXFastError.invalidInput("Qwen model returned no KV caches")
         }
         guard cache.allSatisfy({ $0.offset == cacheOffset }) else {
-            throw MLXFastError.invalidInput("Laguna KV cache layer offsets are inconsistent")
+            throw MLXFastError.invalidInput("Qwen KV cache layer offsets are inconsistent")
         }
         guard positionOffset == cacheOffset else {
             throw MLXFastError.invalidInput(
-                "Laguna position offset \(positionOffset) does not match KV cache offset \(cacheOffset)"
+                "Qwen position offset \(positionOffset) does not match KV cache offset \(cacheOffset)"
             )
         }
     }
 
     /// Force-evaluate the per-layer KV state so the seed prefill's cache
     /// writes are complete before decode steps are timed against it.
-    static func materializeLagunaCacheState(_ cache: [KVCache]) {
+    static func materializeQwenCacheState(_ cache: [KVCache]) {
         eval(cache)
     }
 
     static func handleWorkerRequest(
         _ request: RuntimeWorkerRequest,
         sessionNonce: String,
-        weightCache: LagunaRuntimeWeightCache,
+        weightCache: Qwen35RuntimeWeightCache,
         state: inout RuntimeWorkerState
     ) throws -> RuntimeWorkerResponse {
         let carriesTraceDiagnostics =
@@ -295,7 +296,7 @@ extension QwenRuntime {
             try resetRuntimeWorkerAllocatorForPhaseStart()
             let model = try weightCache.requireLibraryModel()
             let cache = model.newCache(parameters: nil)
-            let logits = try lagunaLogits(
+            let logits = try qwenLogits(
                 inputIDs: inputIDsArray(promptTokens),
                 model: model,
                 cache: cache,
@@ -331,7 +332,7 @@ extension QwenRuntime {
             guard let cache = state.correctnessCache else {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness step before begin")
             }
-            let logits = try lagunaLogits(
+            let logits = try qwenLogits(
                 inputIDs: inputIDsArray([previousToken]),
                 model: try weightCache.requireLibraryModel(),
                 cache: cache,
@@ -365,7 +366,7 @@ extension QwenRuntime {
             try resetRuntimeWorkerAllocatorForPhaseStart()
             let model = try weightCache.requireLibraryModel()
             let cache = model.newCache(parameters: nil)
-            let logits = try lagunaLogits(
+            let logits = try qwenLogits(
                 inputIDs: inputIDsArray(promptTokens),
                 model: model,
                 cache: cache,
@@ -402,7 +403,7 @@ extension QwenRuntime {
             // reset above separately removes allocator free-buffer state.
             let model = try weightCache.requireLibraryModel()
             let cache = model.newCache(parameters: nil)
-            let logits = try lagunaLogits(
+            let logits = try qwenLogits(
                 inputIDs: inputIDsArray(seedTokens),
                 model: model,
                 cache: cache,
@@ -410,7 +411,7 @@ extension QwenRuntime {
             )
             let token = try QwenCorrectness.greedyToken(from: logits)
             let seedToken = token
-            materializeLagunaCacheState(cache)
+            materializeQwenCacheState(cache)
             state.decodeCache = cache
             state.decodeSeedTokenCount = seedTokens.count
             state.decodeStep = 0
@@ -429,7 +430,7 @@ extension QwenRuntime {
                 throw MLXFastError.invalidInput("runtime worker decode_step before decode_begin")
             }
             // decode_step invokes only the same editable entry points the
-            // correctness path invokes (the Laguna model forward /
+            // correctness path invokes (the Qwen model forward /
             // greedyToken); it must never call an editable hook that is
             // unique to the scored decode path. The former editable
             // decode-delay knob (removed) was exactly such a phase oracle:
@@ -438,7 +439,7 @@ extension QwenRuntime {
             // "I am being scored now", which lets it serve a slow/correct
             // path while checked and a cheap path while timed. Keep
             // trusted->editable calls phase-agnostic.
-            let logits = try lagunaLogits(
+            let logits = try qwenLogits(
                 inputIDs: inputIDsArray([inputToken]),
                 model: try weightCache.requireLibraryModel(),
                 cache: cache,
@@ -481,141 +482,93 @@ extension QwenRuntime {
 
 private struct RuntimeWorkerPinnedConfiguration: Decodable {
     let modelType: String
+    let vocabSize: Int
     let hiddenSize: Int
-    let numHiddenLayers: Int
     let intermediateSize: Int
+    let numHiddenLayers: Int
     let numAttentionHeads: Int
-    let numAttentionHeadsPerLayer: [Int]
     let numKeyValueHeads: Int
     let headDim: Int
-    let rmsNormEps: Double
-    let vocabSize: Int
-    let slidingWindow: Int
-    let maxPositionEmbeddings: Int
-    let attentionBias: Bool?
-    let qkvBias: Bool?
-    let attentionDropout: Double?
-    let gating: String
-    let gatingTypes: [String]
-    let tieWordEmbeddings: Bool
-    let numExperts: Int
-    let numExpertsPerTok: Int
-    let moeIntermediateSize: Int
-    let sharedExpertIntermediateSize: Int
-    let moeRoutedScalingFactor: Double
-    let normTopkProb: Bool
-    let moeApplyRouterWeightOnInput: Bool
-    let moeRouterLogitSoftcapping: Double?
-    let routerAuxLossCoef: Double
-    let useCache: Bool
+    let linearNumValueHeads: Int
+    let linearNumKeyHeads: Int
+    let linearValueHeadDim: Int
+    let linearKeyHeadDim: Int
+    let linearConvKernelDim: Int
+    let fullAttentionInterval: Int
     let layerTypes: [String]
-    let mlpLayerTypes: [String]
-    let mlpOnlyLayers: [Int]
-    let decoderSparseStep: Int
+    let rmsNormEps: Double
+    let hiddenActivation: String
+    let maxPositionEmbeddings: Int
+    let attentionBias: Bool
+    let attentionDropout: Double
+    let attentionOutputGate: Bool
+    let outputGateType: String
+    let bosTokenID: Int
+    let eosTokenID: Int
+    let initializerRange: Double
+    let padTokenID: Int?
+    let tieWordEmbeddings: Bool
+    let mambaSSMDType: String
+    let dtype: String
+    let useCache: Bool
+    let partialRotaryFactor: Double
     let ropeParameters: RuntimeWorkerPinnedRopeParameters
-    let quantization: RuntimeWorkerPinnedQuantization?
-    let quantizationConfig: RuntimeWorkerPinnedQuantization?
+    let quantization: RuntimeWorkerPinnedQuantization
+    let mtpNumHiddenLayers: Int
+    let mtpUseDedicatedEmbeddings: Bool
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
+        case vocabSize = "vocab_size"
         case hiddenSize = "hidden_size"
-        case numHiddenLayers = "num_hidden_layers"
         case intermediateSize = "intermediate_size"
+        case numHiddenLayers = "num_hidden_layers"
         case numAttentionHeads = "num_attention_heads"
-        case numAttentionHeadsPerLayer = "num_attention_heads_per_layer"
         case numKeyValueHeads = "num_key_value_heads"
         case headDim = "head_dim"
+        case linearNumValueHeads = "linear_num_value_heads"
+        case linearNumKeyHeads = "linear_num_key_heads"
+        case linearValueHeadDim = "linear_value_head_dim"
+        case linearKeyHeadDim = "linear_key_head_dim"
+        case linearConvKernelDim = "linear_conv_kernel_dim"
+        case fullAttentionInterval = "full_attention_interval"
+        case layerTypes = "layer_types"
         case rmsNormEps = "rms_norm_eps"
-        case vocabSize = "vocab_size"
-        case slidingWindow = "sliding_window"
+        case hiddenActivation = "hidden_act"
         case maxPositionEmbeddings = "max_position_embeddings"
         case attentionBias = "attention_bias"
-        case qkvBias = "qkv_bias"
         case attentionDropout = "attention_dropout"
-        case gating
-        case gatingTypes = "gating_types"
+        case attentionOutputGate = "attn_output_gate"
+        case outputGateType = "output_gate_type"
+        case bosTokenID = "bos_token_id"
+        case eosTokenID = "eos_token_id"
+        case initializerRange = "initializer_range"
+        case padTokenID = "pad_token_id"
         case tieWordEmbeddings = "tie_word_embeddings"
-        case numExperts = "num_experts"
-        case numExpertsPerTok = "num_experts_per_tok"
-        case moeIntermediateSize = "moe_intermediate_size"
-        case sharedExpertIntermediateSize = "shared_expert_intermediate_size"
-        case moeRoutedScalingFactor = "moe_routed_scaling_factor"
-        case normTopkProb = "norm_topk_prob"
-        case moeApplyRouterWeightOnInput = "moe_apply_router_weight_on_input"
-        case moeRouterLogitSoftcapping = "moe_router_logit_softcapping"
-        case routerAuxLossCoef = "router_aux_loss_coef"
+        case mambaSSMDType = "mamba_ssm_dtype"
+        case dtype
         case useCache = "use_cache"
-        case layerTypes = "layer_types"
-        case mlpLayerTypes = "mlp_layer_types"
-        case mlpOnlyLayers = "mlp_only_layers"
-        case decoderSparseStep = "decoder_sparse_step"
+        case partialRotaryFactor = "partial_rotary_factor"
         case ropeParameters = "rope_parameters"
         case quantization
-        case quantizationConfig = "quantization_config"
+        case mtpNumHiddenLayers = "mtp_num_hidden_layers"
+        case mtpUseDedicatedEmbeddings = "mtp_use_dedicated_embeddings"
     }
 }
 
 private struct RuntimeWorkerPinnedRopeParameters: Decodable {
-    let slidingAttention: RuntimeWorkerPinnedRopeSpec
-    let fullAttention: RuntimeWorkerPinnedRopeSpec
-
-    enum CodingKeys: String, CodingKey {
-        case slidingAttention = "sliding_attention"
-        case fullAttention = "full_attention"
-    }
-}
-
-private struct RuntimeWorkerPinnedRopeSpec: Decodable {
     let ropeTheta: Double
     let ropeType: String
-    let partialRotaryFactor: Double?
-    let factor: Double?
-    let originalMaxPositionEmbeddings: Int?
-    let betaFast: Double?
-    let betaSlow: Double?
-    let attentionFactor: Double?
+    let partialRotaryFactor: Double
+    let mropeInterleaved: Bool
+    let mropeSection: [Int]
 
-    enum CodingKeys: String, CodingKey, CaseIterable {
+    enum CodingKeys: String, CodingKey {
         case ropeTheta = "rope_theta"
         case ropeType = "rope_type"
         case partialRotaryFactor = "partial_rotary_factor"
-        case factor
-        case originalMaxPositionEmbeddings = "original_max_position_embeddings"
-        case betaFast = "beta_fast"
-        case betaSlow = "beta_slow"
-        case attentionFactor = "attention_factor"
-    }
-
-    init(from decoder: Decoder) throws {
-        let wire = try decoder.container(keyedBy: RuntimeWorkerQuantizationKey.self)
-        let allowed = Set(CodingKeys.allCases.map(\.rawValue))
-        guard wire.allKeys.allSatisfy({ allowed.contains($0.stringValue) }) else {
-            throw DecodingError.dataCorrupted(
-                .init(
-                    codingPath: decoder.codingPath,
-                    debugDescription:
-                        "Poolside Laguna RoPE contains unsupported fields"
-                )
-            )
-        }
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        ropeTheta = try container.decode(Double.self, forKey: .ropeTheta)
-        ropeType = try container.decode(String.self, forKey: .ropeType)
-        partialRotaryFactor = try container.decodeIfPresent(
-            Double.self,
-            forKey: .partialRotaryFactor
-        )
-        factor = try container.decodeIfPresent(Double.self, forKey: .factor)
-        originalMaxPositionEmbeddings = try container.decodeIfPresent(
-            Int.self,
-            forKey: .originalMaxPositionEmbeddings
-        )
-        betaFast = try container.decodeIfPresent(Double.self, forKey: .betaFast)
-        betaSlow = try container.decodeIfPresent(Double.self, forKey: .betaSlow)
-        attentionFactor = try container.decodeIfPresent(
-            Double.self,
-            forKey: .attentionFactor
-        )
+        case mropeInterleaved = "mrope_interleaved"
+        case mropeSection = "mrope_section"
     }
 }
 
@@ -624,62 +577,11 @@ private struct RuntimeWorkerPinnedQuantization: Decodable, Equatable {
     let groupSize: Int
     let mode: String
 
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: RuntimeWorkerQuantizationKey.self)
-        let allowed = Set(["bits", "group_size", "mode"])
-        guard container.allKeys.allSatisfy({ allowed.contains($0.stringValue) }) else {
-            throw DecodingError.dataCorrupted(
-                .init(
-                    codingPath: decoder.codingPath,
-                    debugDescription:
-                        "Poolside Laguna NVFP4 does not permit per-tensor quantization overrides"
-                )
-            )
-        }
-        bits = try container.decode(Int.self, forKey: .init("bits"))
-        groupSize = try container.decode(Int.self, forKey: .init("group_size"))
-        mode = try container.decode(String.self, forKey: .init("mode"))
+    enum CodingKeys: String, CodingKey {
+        case bits
+        case groupSize = "group_size"
+        case mode
     }
-}
-
-private struct RuntimeWorkerQuantizationKey: CodingKey {
-    let stringValue: String
-    let intValue: Int? = nil
-
-    init(_ stringValue: String) {
-        self.stringValue = stringValue
-    }
-
-    init?(stringValue: String) {
-        self.init(stringValue)
-    }
-
-    init?(intValue: Int) {
-        return nil
-    }
-}
-
-/// Frozen geometry of the Poolside Laguna XS 2.1 NVFP4 checkpoint that this
-/// gate guards.
-///
-/// Anchored to Laguna's own literals rather than to `MLXFastConstants`: on the
-/// `qwen36-mtp-track` branch those constants carry the Qwen 3.6 target identity
-/// (64 layers, hidden 5120, vocab 248320), while this gate still validates the
-/// Laguna artifact. Reading them here made the gate demand a checkpoint that
-/// does not exist -- Laguna's `model_type` with Qwen's geometry -- so it
-/// rejected the very config it is meant to accept. Mirrored from
-/// `LagunaConstants` (Sources/MLXFastModel/LagunaConfig.swift); the trusted
-/// harness cannot import the editable model target. The anti-drift intent is
-/// unchanged: every field below is still pinned to an exact literal.
-private enum LagunaPinnedGeometry {
-    static let numHiddenLayers = 40
-    static let hiddenSize = 2_048
-    /// Dense MLP intermediate size (layer 0 only).
-    static let intermediateSize = 8_192
-    /// `num_attention_heads` in the source config (the full-attention query
-    /// head count; sliding-window layers carry 64, see the per-layer table).
-    static let attentionHeads = 48
-    static let vocabSize = 100_352
 }
 
 func validateRuntimeWorkerPinnedConfiguration(weightsPath: String) throws {
@@ -701,7 +603,24 @@ func validateRuntimeWorkerPinnedConfiguration(weightsPath: String) throws {
     try validateRuntimeWorkerPinnedConfigurationData(Data(contentsOf: path))
 }
 
+/// Accept exactly the transformed `mlx-community/Qwen3.6-27B-4bit` artifact.
+///
+/// The transform writes the source checkpoint's `text_config` verbatim plus the
+/// single checkpoint-wide `quantization` block, so this gate is a field-by-field
+/// restatement of the pinned `qwen3_5_text` tower: 64 layers on a 4-layer repeat
+/// (index % 4 == 3 is full attention, the other three gated-delta linear
+/// attention), hidden 5120, intermediate 17408, vocab 248320, untied `lm_head`,
+/// group-64 4-bit affine quantization, and partial rotary 0.25 of head_dim 256
+/// (64 rotary dims) at theta 1e7.
+///
+/// Geometry that MLXFastConstants already carries is read from there rather than
+/// duplicated -- on this branch those constants ARE the Qwen target identity, so
+/// the earlier Laguna/Qwen chimera the phase-1 repoint created (f05be0c) is
+/// resolved by moving the gate to the artifact the constants describe rather
+/// than by re-pinning the constants' geometry to a second checkpoint.
 func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
+    try validateRuntimeWorkerPinnedConfigurationSchema(data)
+
     let decoded: RuntimeWorkerPinnedConfiguration
     do {
         decoded = try JSONDecoder().decode(RuntimeWorkerPinnedConfiguration.self, from: data)
@@ -711,90 +630,169 @@ func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
         )
     }
 
-    // Laguna XS 2.1 layer schedule: one full-attention layer (48 query
-    // heads, YaRN partial RoPE) then three sliding-window layers (64 query
-    // heads, plain RoPE), repeating -- full at 0, 4, 8, ..., 36 -- with a
-    // dense MLP only at layer 0 and 256-expert top-8 MoE blocks elsewhere.
-    let expectedLayerTypes = (0..<LagunaPinnedGeometry.numHiddenLayers).map {
-        $0 % 4 == 0 ? "full_attention" : "sliding_attention"
+    let expectedLayerTypes = (0..<MLXFastConstants.numHiddenLayers).map {
+        $0 % 4 == 3 ? "full_attention" : "linear_attention"
     }
-    let expectedHeadsPerLayer = (0..<LagunaPinnedGeometry.numHiddenLayers).map {
-        $0 % 4 == 0 ? 48 : 64
-    }
-    let expectedMLPLayerTypes = (0..<LagunaPinnedGeometry.numHiddenLayers).map {
-        $0 == 0 ? "dense" : "sparse"
-    }
-    let expectedGatingTypes = [String](
-        repeating: "per_head",
-        count: LagunaPinnedGeometry.numHiddenLayers
-    )
-    guard let quantization = decoded.quantization,
-          let quantizationConfig = decoded.quantizationConfig,
-          quantization == quantizationConfig
-    else {
-        throw MLXFastError.invalidInput(
-            "runtime worker config.json requires matching quantization and quantization_config blocks"
-        )
-    }
-    // Match the immutable Poolside artifact's behavior-bearing fields exactly.
-    // qkv_bias and moe_router_logit_softcapping are absent in the source
-    // config (an explicit JSON null decodes equivalently); concrete false/zero
-    // substitutions are rejected rather than treated as a synthetic schema.
-    guard decoded.modelType == "laguna",
-          decoded.hiddenSize == LagunaPinnedGeometry.hiddenSize,
-          decoded.numHiddenLayers == LagunaPinnedGeometry.numHiddenLayers,
-          decoded.intermediateSize == LagunaPinnedGeometry.intermediateSize,
-          decoded.numAttentionHeads == LagunaPinnedGeometry.attentionHeads,
-          decoded.numAttentionHeadsPerLayer == expectedHeadsPerLayer,
-          decoded.numKeyValueHeads == 8,
-          decoded.headDim == 128,
+    guard decoded.modelType == "qwen3_5_text",
+          decoded.vocabSize == MLXFastConstants.vocabSize,
+          decoded.hiddenSize == MLXFastConstants.hiddenSize,
+          decoded.intermediateSize == MLXFastConstants.intermediateSize,
+          decoded.numHiddenLayers == MLXFastConstants.numHiddenLayers,
+          decoded.numAttentionHeads == MLXFastConstants.attentionHeads,
+          decoded.numKeyValueHeads == 4,
+          decoded.headDim == 256,
+          decoded.linearNumValueHeads == 48,
+          decoded.linearNumKeyHeads == 16,
+          decoded.linearValueHeadDim == 128,
+          decoded.linearKeyHeadDim == 128,
+          decoded.linearConvKernelDim == 4,
+          decoded.fullAttentionInterval == 4,
+          decoded.layerTypes == expectedLayerTypes,
           decoded.rmsNormEps == 1e-6,
-          decoded.vocabSize == LagunaPinnedGeometry.vocabSize,
-          decoded.slidingWindow == 512,
+          decoded.hiddenActivation == "silu",
           decoded.maxPositionEmbeddings == 262_144,
           decoded.attentionBias == false,
-          decoded.qkvBias == nil,
           decoded.attentionDropout == 0,
-          decoded.gating == "per-head",
-          decoded.gatingTypes == expectedGatingTypes,
-          !decoded.tieWordEmbeddings,
-          decoded.numExperts == 256,
-          decoded.numExpertsPerTok == 8,
-          decoded.moeIntermediateSize == 512,
-          decoded.sharedExpertIntermediateSize == 512,
-          decoded.moeRoutedScalingFactor == 2.5,
-          decoded.normTopkProb,
-          !decoded.moeApplyRouterWeightOnInput,
-          decoded.moeRouterLogitSoftcapping == nil,
-          decoded.routerAuxLossCoef == 0,
-          decoded.useCache == true,
-          decoded.layerTypes == expectedLayerTypes,
-          decoded.mlpLayerTypes == expectedMLPLayerTypes,
-          decoded.mlpOnlyLayers == [0],
-          decoded.decoderSparseStep == 1,
-          decoded.ropeParameters.slidingAttention.ropeTheta == 10_000,
-          decoded.ropeParameters.slidingAttention.ropeType == "default",
-          decoded.ropeParameters.slidingAttention.partialRotaryFactor == 1,
-          decoded.ropeParameters.slidingAttention.factor == nil,
-          decoded.ropeParameters.slidingAttention.originalMaxPositionEmbeddings == nil,
-          decoded.ropeParameters.slidingAttention.betaFast == nil,
-          decoded.ropeParameters.slidingAttention.betaSlow == nil,
-          decoded.ropeParameters.slidingAttention.attentionFactor == nil,
-          decoded.ropeParameters.fullAttention.ropeTheta == 500_000,
-          decoded.ropeParameters.fullAttention.ropeType == "yarn",
-          decoded.ropeParameters.fullAttention.partialRotaryFactor == 0.5,
-          decoded.ropeParameters.fullAttention.factor == 32,
-          decoded.ropeParameters.fullAttention.originalMaxPositionEmbeddings
-              == 8_192,
-          decoded.ropeParameters.fullAttention.betaFast == 64,
-          decoded.ropeParameters.fullAttention.betaSlow == 1,
-          decoded.ropeParameters.fullAttention.attentionFactor == 1,
-          quantization.bits == 4,
-          quantization.groupSize == 16,
-          quantization.mode == "nvfp4"
+          decoded.attentionOutputGate,
+          decoded.outputGateType == "swish",
+          decoded.bosTokenID == 248_044,
+          decoded.eosTokenID == 248_044,
+          decoded.initializerRange == 0.02,
+          decoded.padTokenID == nil,
+          decoded.tieWordEmbeddings == false,
+          decoded.mambaSSMDType == "float32",
+          decoded.dtype == "bfloat16",
+          decoded.useCache,
+          decoded.partialRotaryFactor == 0.25,
+          decoded.ropeParameters.ropeTheta == 10_000_000,
+          decoded.ropeParameters.ropeType == "default",
+          decoded.ropeParameters.partialRotaryFactor == 0.25,
+          decoded.ropeParameters.mropeInterleaved,
+          decoded.ropeParameters.mropeSection == [11, 11, 10],
+          decoded.quantization.bits == 4,
+          decoded.quantization.groupSize == 64,
+          decoded.quantization.mode == "affine",
+          decoded.mtpNumHiddenLayers == 1,
+          decoded.mtpUseDedicatedEmbeddings == false
     else {
         throw MLXFastError.invalidInput(
-            "runtime worker config.json does not match the pinned Laguna XS 2.1 MoE architecture"
+            "runtime worker config.json does not match the pinned Qwen3.6 qwen3_5_text architecture"
+        )
+    }
+}
+
+/// Exact-key schema check, run before decoding.
+///
+/// `Decodable` ignores unknown keys, so a config that carries the pinned values
+/// PLUS an extra behaviour-bearing field would decode cleanly. The transformed
+/// artifact's key set is fixed by the transform, so require it exactly -- at the
+/// root, inside `rope_parameters`, and inside `quantization`. This replaces the
+/// Laguna gate's per-container `allKeys` guards, which covered only the rope and
+/// quantization blocks.
+private func validateRuntimeWorkerPinnedConfigurationSchema(
+    _ data: Data
+) throws {
+    let json: Any
+    do {
+        json = try JSONSerialization.jsonObject(with: data)
+    } catch {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json must contain valid JSON"
+        )
+    }
+    guard let root = json as? [String: Any] else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json must be a JSON object"
+        )
+    }
+
+    try requireExactRuntimeWorkerKeys(
+        Set(root.keys),
+        expected: [
+            "attention_bias",
+            "attention_dropout",
+            "attn_output_gate",
+            "bos_token_id",
+            "dtype",
+            "eos_token_id",
+            "full_attention_interval",
+            "head_dim",
+            "hidden_act",
+            "hidden_size",
+            "initializer_range",
+            "intermediate_size",
+            "layer_types",
+            "linear_conv_kernel_dim",
+            "linear_key_head_dim",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "linear_value_head_dim",
+            "mamba_ssm_dtype",
+            "max_position_embeddings",
+            "model_type",
+            "mtp_num_hidden_layers",
+            "mtp_use_dedicated_embeddings",
+            "num_attention_heads",
+            "num_hidden_layers",
+            "num_key_value_heads",
+            "output_gate_type",
+            "pad_token_id",
+            "partial_rotary_factor",
+            "quantization",
+            "rms_norm_eps",
+            "rope_parameters",
+            "tie_word_embeddings",
+            "use_cache",
+            "vocab_size",
+        ],
+        field: "runtime worker config.json"
+    )
+
+    guard root["pad_token_id"] is NSNull else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json pad_token_id must be null"
+        )
+    }
+    guard let rope = root["rope_parameters"] as? [String: Any] else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json rope_parameters must be an object"
+        )
+    }
+    try requireExactRuntimeWorkerKeys(
+        Set(rope.keys),
+        expected: [
+            "mrope_interleaved",
+            "mrope_section",
+            "partial_rotary_factor",
+            "rope_theta",
+            "rope_type",
+        ],
+        field: "runtime worker config.json rope_parameters"
+    )
+
+    guard let quantization = root["quantization"] as? [String: Any] else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json quantization must be an object"
+        )
+    }
+    try requireExactRuntimeWorkerKeys(
+        Set(quantization.keys),
+        expected: ["bits", "group_size", "mode"],
+        field: "runtime worker config.json quantization"
+    )
+}
+
+private func requireExactRuntimeWorkerKeys(
+    _ actual: Set<String>,
+    expected: Set<String>,
+    field: String
+) throws {
+    let missing = expected.subtracting(actual).sorted()
+    let unexpected = actual.subtracting(expected).sorted()
+    guard missing.isEmpty, unexpected.isEmpty else {
+        throw MLXFastError.invalidInput(
+            "\(field) schema mismatch: missing=\(missing), "
+                + "unexpected=\(unexpected)"
         )
     }
 }

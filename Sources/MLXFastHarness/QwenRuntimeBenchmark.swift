@@ -112,10 +112,10 @@ extension QwenRuntime {
                         + "bytes=\(transformedWeightsDigest.byteCount)"
                 )
             }
-            let config = try LagunaConfig.load(from: options.weightsPath)
+            let config = try Qwen35Config.load(from: options.weightsPath)
             progress("correctness loader start")
-            let correctnessLoader = try LagunaWeightLoader(weightsPath: options.weightsPath)
-            let correctnessCache = LagunaRuntimeWeightCache(loader: correctnessLoader, config: config)
+            let correctnessLoader = try Qwen35WeightLoader(weightsPath: options.weightsPath)
+            let correctnessCache = Qwen35RuntimeWeightCache(loader: correctnessLoader, config: config)
             let correctnessStart = DispatchTime.now().uptimeNanoseconds
             progress("correctness start cases=\(golden.totalCorrectnessCaseCount)")
             let correctness = runLayeredCorrectness(
@@ -140,8 +140,8 @@ extension QwenRuntime {
                 )
             }
 
-            let runtimeBenchmarkLoader = try LagunaWeightLoader(weightsPath: options.weightsPath)
-            let benchmarkCache = LagunaRuntimeWeightCache(loader: runtimeBenchmarkLoader, config: config)
+            let runtimeBenchmarkLoader = try Qwen35WeightLoader(weightsPath: options.weightsPath)
+            let benchmarkCache = Qwen35RuntimeWeightCache(loader: runtimeBenchmarkLoader, config: config)
             guard let benchmarkGolden = golden.benchmark else {
                 throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
             }
@@ -390,8 +390,8 @@ extension QwenRuntime {
             progress("preflight start")
             let preflightStart = DispatchTime.now().uptimeNanoseconds
             // Model-free preflight: verify required artifacts exist WITHOUT loading
-            // config/tensors here. BenchmarkPreflight.check() calls LagunaConfig.load,
-            // DenseTensorStore, and LagunaWeightLoader (all EDITABLE MLXFastModel code),
+            // config/tensors here. BenchmarkPreflight.check() calls Qwen35Config.load,
+            // DenseTensorStore, and Qwen35WeightLoader (all EDITABLE MLXFastModel code),
             // which would execute submitted code in this trusted, unsandboxed parent. The
             // sandboxed runtime worker loads and validates config/dense/expert metadata
             // when it starts; malformed weights make it fail its protocol hello, surfacing
@@ -699,7 +699,7 @@ extension QwenRuntime {
     static func measurePrefillSecondsPerToken(
         promptTokens: [Int],
         expectedToken: Int,
-        weightCache: LagunaRuntimeWeightCache,
+        weightCache: Qwen35RuntimeWeightCache,
         progress: ((String) -> Void)? = nil
     ) throws -> Double {
         guard !promptTokens.isEmpty else {
@@ -726,7 +726,7 @@ extension QwenRuntime {
             )
             let cache = model.newCache(parameters: nil)
             let start = DispatchTime.now().uptimeNanoseconds
-            let logits = try lagunaLogits(
+            let logits = try qwenLogits(
                 inputIDs: inputIDsArray(promptTokens),
                 model: model,
                 cache: cache,
@@ -830,7 +830,7 @@ extension QwenRuntime {
         expectedSeedToken: Int,
         expectedTokens: [Int],
         decodeSteps: Int = MLXFastConstants.benchmarkDecodeSteps,
-        weightCache: LagunaRuntimeWeightCache,
+        weightCache: Qwen35RuntimeWeightCache,
         progress: ((String) -> Void)? = nil
     ) throws -> DecodeMeasurement {
         guard !seedTokens.isEmpty else {
@@ -864,7 +864,7 @@ extension QwenRuntime {
         progress?("decode seed prefill start seed_tokens=\(seedTokens.count)")
         let model = try weightCache.requireLibraryModel()
         let cache = model.newCache(parameters: nil)
-        var logits = try lagunaLogits(
+        var logits = try qwenLogits(
             inputIDs: inputIDsArray(seedTokens),
             model: model,
             cache: cache,
@@ -877,14 +877,14 @@ extension QwenRuntime {
                 actualToken: token
             )
         )
-        materializeLagunaCacheState(cache)
+        materializeQwenCacheState(cache)
         progress?("decode seed prefill complete")
 
         var actualTokens: [Int] = []
         actualTokens.reserveCapacity(timingPlan.decodeSteps)
         for decodedStep in 0..<timingPlan.decodeSteps {
             let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
-            logits = try lagunaLogits(
+            logits = try qwenLogits(
                 inputIDs: inputIDsArray([inputToken]),
                 model: model,
                 cache: cache,

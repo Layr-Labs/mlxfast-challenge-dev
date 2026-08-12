@@ -2636,7 +2636,7 @@ func decodeMeasurementRunsSingleUnmemoizableSeedForward() throws {
     // Exactly one whole-prompt forward, and no warmup pass preceding the seed.
     #expect(!decodeBegin.contains("warmupCache"))
     #expect(!decodeBegin.contains("warmupLogits"))
-    #expect(decodeBegin.components(separatedBy: "lagunaLogits(").count - 1 == 1)
+    #expect(decodeBegin.components(separatedBy: "qwenLogits(").count - 1 == 1)
     #expect(decodeBegin.contains("with NO preceding"))
 
     let benchmark = try String(
@@ -2864,7 +2864,7 @@ func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
     #expect(runtime.contains("response.nonce != sessionNonce"))
     #expect(runtime.contains("RuntimeWorkerProtocolIO.isolatingStandardIO()"))
     let protocolIsolation = try #require(runtime.range(of: "RuntimeWorkerProtocolIO.isolatingStandardIO()"))
-    let configLoad = try #require(runtime.range(of: "LagunaConfig.load(from: weightsPath)"))
+    let configLoad = try #require(runtime.range(of: "Qwen35Config.load(from: weightsPath)"))
     #expect(protocolIsolation.lowerBound < configLoad.lowerBound)
     #expect(runtime.contains("F_DUPFD_CLOEXEC"))
     #expect(runtime.contains("arc4random_buf(baseAddress, buffer.count)"))

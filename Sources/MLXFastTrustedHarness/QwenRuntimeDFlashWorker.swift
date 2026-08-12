@@ -108,14 +108,14 @@ extension QwenRuntime {
 
         // Select the startup memory profile BEFORE the target load and the
         // separate drafter load, mirroring the policy's only other call site
-        // (LagunaRuntimeWeightCache.init on the serial path). This adds no
+        // (Qwen35RuntimeWeightCache.init on the serial path). This adds no
         // policy and no threshold: the same 64 GiB boundary, the same
         // no-overwrite precedence for explicitly exported values, and the same
         // DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low|auto opt-out -- which does
         // reach here, because sanitizedRuntimeWorkerEnvironment forwards the
         // DARKBLOOM_ and MLX_ prefixes into this worker (MLXFAST_ is NOT
         // forwarded, so no MLXFAST_ spelling would ever arrive). It exists
-        // because the DFlash worker never constructs LagunaRuntimeWeightCache,
+        // because the DFlash worker never constructs Qwen35RuntimeWeightCache,
         // so it was the one startup path the policy never reached -- and it is
         // the path that needs it most: this worker holds the ~21.6 GB target
         // AND the separate drafter, and warms every legal block width at a
@@ -168,7 +168,7 @@ extension QwenRuntime {
 
         // Load the target through the vendored factory: `LagunaModel` is the
         // type that conforms to `DFlashTargetModel` (the scored serial model,
-        // LagunaRuntimeModel, deliberately does not), and this is the same load
+        // Qwen35TextModel, deliberately does not), and this is the same load
         // path the validated `mlx-bench dflash` run used.
         let targetURL = URL(fileURLWithPath: targetWeightsPath)
         let context = try waitForExperimentalDFlashAsync {

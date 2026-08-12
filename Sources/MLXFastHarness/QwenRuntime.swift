@@ -321,19 +321,19 @@ public struct RuntimeWorkerOptions: Equatable {
 public enum QwenRuntime {}
 
 extension QwenRuntime {
-    /// The Laguna runtime keeps every text-tower weight (including all 256
-    /// routed experts) RAM-resident; there is no expert streaming machinery,
-    /// so score/worker protocol fields stay zero.
+    /// The Qwen 3.6 tower is dense -- it has no routed experts at all -- and
+    /// every text-tower weight is RAM-resident, so there is no expert
+    /// streaming machinery and these score/worker protocol fields stay zero.
     /// Convention: call sites with a live weight cache/loader in scope go
     /// through these helpers; paths with no such handle (worker-backed
     /// benchmark phases and early failure payloads) inline
     /// `ExpertStreamingStats.zero` directly, which is identical by
     /// construction.
-    static func expertStats(from _: LagunaRuntimeWeightCache) -> ExpertStreamingStats {
+    static func expertStats(from _: Qwen35RuntimeWeightCache) -> ExpertStreamingStats {
         .zero
     }
 
-    static func expertStats(from _: LagunaWeightLoader?) -> ExpertStreamingStats {
+    static func expertStats(from _: Qwen35WeightLoader?) -> ExpertStreamingStats {
         .zero
     }
 }

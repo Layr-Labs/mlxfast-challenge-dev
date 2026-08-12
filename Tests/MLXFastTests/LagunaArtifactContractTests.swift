@@ -117,9 +117,23 @@ func poolsideLagunaPublicConfigFixturePinsExactArtifactSemantics() throws {
     #expect(parsed.useCache)
     #expect(parsed.fullRope.attentionFactor == 1)
 
-    try validateRuntimeWorkerPinnedConfigurationData(data)
+    // The runtime worker's pinned-config gate no longer accepts this artifact:
+    // it guards the Qwen 3.6 tower the harness now drives. Assert the negative
+    // rather than dropping the coverage -- a gate that accepted BOTH towers
+    // would be a gate that pins neither.
+    #expect(throws: MLXFastError.self) {
+        try validateRuntimeWorkerPinnedConfigurationData(data)
+    }
 }
 
+/// Behaviour-bearing mutations of the Poolside artifact must not parse as the
+/// pinned Laguna config.
+///
+/// This used to drive the runtime worker's pinned-config gate. That gate now
+/// guards the Qwen 3.6 artifact and rejects every Laguna config -- mutated or
+/// not -- so it can no longer tell these mutations apart from the unmutated
+/// baseline. `LagunaConfig`'s own frozen-invariant check is the instrument that
+/// still discriminates, so the loop drives that instead.
 @Test
 func poolsideLagunaConfigRejectsEveryBehaviorBearingMutation() throws {
     typealias Mutation = (String, (inout [String: Any]) -> Void)
@@ -251,9 +265,8 @@ func runtimeWorkerRejectsPublicContractFieldsPreviouslyIgnoredByDecoder() throws
     for (name, mutate) in mutations {
         var object = try poolsideLagunaConfigObject()
         mutate(&object)
-        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         #expect(throws: MLXFastError.self, "mutation: \(name)") {
-            try validateRuntimeWorkerPinnedConfigurationData(data)
+            _ = try loadPoolsideLagunaConfig(object)
         }
     }
 }

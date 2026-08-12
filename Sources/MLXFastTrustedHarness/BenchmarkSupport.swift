@@ -136,12 +136,12 @@ public enum BenchmarkPreflight {
             }
         }
         #if !MLXFAST_TRUSTED_HARNESS
-            let config = try LagunaConfig.load(from: weightsPath)
+            let config = try Qwen35Config.load(from: weightsPath)
 
             let denseStore = try DenseTensorStore(weightsPath: weightsPath)
             try denseStore.validateReadableByteRanges()
 
-            try LagunaWeightLoader(denseStore: denseStore)
+            try Qwen35WeightLoader(denseStore: denseStore)
                 .validateRequiredMetadata(config: config)
         #endif
 
