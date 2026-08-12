@@ -2052,8 +2052,15 @@ final class RuntimeWorkerClient {
     init(
         options: RuntimeWorkerOptions,
         weightsPath: String,
-        dflashDrafterPath: String? = nil
+        dflashDrafterPath: String? = nil,
+        mtpHeadPath: String? = nil
     ) throws {
+        guard dflashDrafterPath == nil || mtpHeadPath == nil else {
+            throw MLXFastError.invalidInput(
+                "a runtime worker serves one speculative track at a time; "
+                    + "--drafter and --mtp-head are mutually exclusive"
+            )
+        }
         guard options.helloTimeoutSeconds.isFinite,
               options.helloTimeoutSeconds > 0,
               options.requestTimeoutSeconds.isFinite,
@@ -2080,6 +2087,17 @@ final class RuntimeWorkerClient {
                 weightsPath,
                 "--drafter",
                 dflashDrafterPath,
+            ]
+        } else if let mtpHeadPath {
+            // A head path switches the worker to the native-MTP subcommand. That
+            // worker serves only mtp_* kinds, so a serial or DFlash request
+            // cannot be smuggled into an MTP session or vice versa.
+            workerArguments = [
+                "mtp-runtime-worker",
+                "--weights",
+                weightsPath,
+                "--mtp-head",
+                mtpHeadPath,
             ]
         } else {
             workerArguments = [
@@ -2245,6 +2263,53 @@ final class RuntimeWorkerClient {
             kind: "dflash_decode_block",
             token: previousCommittedToken,
             maxBlockSize: maxBlockSize
+        )
+    }
+
+    // MARK: - Qwen 3.6 native-MTP track
+
+    /// Untimed phase start: allocator clear plus the round-shape warm. Issued
+    /// before the parent's clock starts, because neither step sees the seed.
+    func warmMTPDecode() throws -> RuntimeWorkerResponse {
+        try send(kind: "mtp_decode_warm")
+    }
+
+    func beginMTPDecode(seedTokens: [Int]) throws -> RuntimeWorkerResponse {
+        try send(kind: "mtp_decode_begin", seedTokens: seedTokens)
+    }
+
+    /// One accept/verify/rollback round at the parent-chosen draft depth.
+    ///
+    /// No previous-token argument, unlike the DFlash block request: the next
+    /// primary is the argmax of a row the TARGET produced inside the session, so
+    /// there is no parent-side token to bind and supplying one would invite a
+    /// worker to decode from something other than its own logits.
+    func mtpDecodeRound(depth: Int) throws -> RuntimeWorkerResponse {
+        try send(kind: "mtp_decode_round", maxBlockSize: depth)
+    }
+
+    func mtpReferencePrefill(seedTokens: [Int]) throws -> RuntimeWorkerResponse {
+        try send(kind: "mtp_reference_prefill", seedTokens: seedTokens)
+    }
+
+    /// Reference-side row request. `verifyBlockTokens`, when supplied, is the
+    /// candidate's own verify input for one round (`[primary] + journalled
+    /// drafts`), replayed as a branch off the same continuous frame so the parent
+    /// can price the rejected tail -- the rows no serial golden can describe.
+    func mtpReferenceRows(
+        prefixTokens: [Int],
+        seedTokenCount: Int,
+        startOffset: Int,
+        rowCount: Int,
+        verifyBlockTokens: [Int]? = nil
+    ) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "mtp_reference_rows",
+            prefixTokens: prefixTokens,
+            startOffset: startOffset,
+            rowCount: rowCount,
+            seedTokenCount: seedTokenCount,
+            verifyBlockTokens: verifyBlockTokens
         )
     }
 

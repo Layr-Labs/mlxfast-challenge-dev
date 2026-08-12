@@ -55,11 +55,11 @@ import MLXLMCommon
 /// Loads and validates the separately pinned Qwen 3.6 MTP head alongside a
 /// backbone weights tree.
 public enum Qwen36MTPHeadAttachment {
-    /// Tensors the pinned head revision (83795d54) carries, counted from its own
-    /// `model.safetensors.index.json`: `fc.{weight,scales,biases}`, `norm.weight`,
-    /// `pre_fc_norm_embedding.weight`, `pre_fc_norm_hidden.weight` and the single
-    /// decoder layer's 25 entries.
-    public static let expectedHeadTensorCount = 31
+    /// Tensors the pinned head revision (83795d54) carries. Single source of
+    /// truth is `MLXFastConstants`, because the trusted CLI reports the same
+    /// number in the evidence payload and links no model code.
+    public static let expectedHeadTensorCount =
+        MLXFastConstants.qwenMTPHeadTensorCount
 
     /// The key prefix the head's bare tensor names are merged under.
     public static let headKeyPrefix = "mtp."

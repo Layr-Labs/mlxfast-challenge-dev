@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXFastCore
 import MLXLLM
 import MLXLMCommon
 
@@ -488,9 +489,7 @@ public final class Qwen36MTPBlockSession {
 
 /// Compiled bounds for the native-MTP track. Deliberately not env-overridable.
 public enum Qwen36MTPLimits {
-    /// Depth 1 is the serial control; the measured envelope makes depth 3 exact
-    /// but net-slower, and nothing above 4 has ever been measured on this
-    /// checkpoint. The ceiling exists so a request cannot ask the worker for an
-    /// unbounded verify width.
-    public static let maxDepth = 8
+    /// Single source of truth is `MLXFastConstants.qwenMTPMaxDepth`: the trusted
+    /// parent bounds the same quantity and links no model code.
+    public static let maxDepth = MLXFastConstants.qwenMTPMaxDepth
 }

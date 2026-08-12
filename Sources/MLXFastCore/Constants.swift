@@ -210,6 +210,26 @@ public enum MLXFastConstants {
     // able to wrap Laguna's 512-position sliding-window cache three times,
     // which is what makes the contract's wrap-seam leg (layer L4) reachable.
     public static let experimentalDFlashMaxConfiguredTotalTokens = 1_536
+
+    // MARK: - Qwen 3.6 native-MTP track (qwen3.6-27b-mtp-v1)
+
+    /// Tensors the pinned MTP head revision carries
+    /// (mlx-community/Qwen3.6-27B-MTP-4bit @ 83795d54), counted from its own
+    /// `model.safetensors.index.json`: `fc.{weight,scales,biases}`,
+    /// `norm.weight`, `pre_fc_norm_embedding.weight`,
+    /// `pre_fc_norm_hidden.weight`, and the single decoder layer's 25 entries.
+    ///
+    /// It lives HERE, in the no-MLX core, because both sides need it and they
+    /// cannot share a type: the worker enforces it at load
+    /// (`Qwen36MTPHeadAttachment`), and the trusted CLI reports it in the
+    /// evidence payload without linking any model code.
+    public static let qwenMTPHeadTensorCount = 31
+
+    /// Draft depth ceiling. Depth 1 is the serial control; the measured envelope
+    /// makes depth 3 exact but net-slower, and nothing above 4 has been measured
+    /// on this checkpoint. The ceiling exists so a request cannot ask the worker
+    /// for an unbounded verify width.
+    public static let qwenMTPMaxDepth = 8
     // Criterion E residual bucket: emitted tokens that match NEITHER the
     // reference K=1 argmax NOR the reference argmax in the candidate-declared
     // block frame are counted here and must additionally sit inside the

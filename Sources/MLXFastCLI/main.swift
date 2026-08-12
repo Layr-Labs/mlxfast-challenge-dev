@@ -61,6 +61,12 @@ private enum MLXFastCLI {
                 // Serial K=1 control: the denominator of the paired score.
                 try runDFlashBenchmark(options, serialControl: true)
                 return 0
+            case "mtp-verify":
+                try runQwenMTPVerify(options)
+                return 0
+            case "mtp-timed":
+                try runQwenMTPTimed(options)
+                return 0
             case "dflash-reference":
                 try runDFlashReference(options)
                 return 0
@@ -1509,6 +1515,366 @@ private enum MLXFastCLI {
         }
     }
 
+    // MARK: - Qwen 3.6 native-MTP track (qwen3.6-27b-mtp-v1)
+
+    /// Track identity. Duplicated nowhere else in this file: every payload below
+    /// reads it from here, so a rename cannot half-land.
+    private static let qwenMTPTrackID = "qwen3.6-27b-mtp-v1"
+
+    /// The value options both MTP verbs accept.
+    ///
+    /// `--mtp-depth` is CANONICAL and `--depth` is an accepted alias. The reason
+    /// is that the depth flag was pinned by two consumers before this payload
+    /// existed and they disagree: the box-owned measurement wrapper
+    /// (`deploy/qwen36-mtp/measure-qwen-mtp-job.sh`, `QMTP_FLAG_DEPTH`) spells it
+    /// `--mtp-depth`, while the in-repo ranked workflow and local runner spelled
+    /// it `--depth`. The wrapper is an installed, signed, box-owned artifact this
+    /// branch does not own; the two in-repo callers are ours and have been moved
+    /// to the canonical spelling. The alias stays so that a wrapper revision in
+    /// flight cannot silently fall back to a default depth -- and supplying BOTH
+    /// with different values is refused rather than resolved.
+    private static let qwenMTPValueOptions: Set<String> = [
+        "--weights", "--mtp-head", "--golden", "--tokens", "--mtp-depth",
+        "--depth", "--output",
+    ]
+
+    private static func qwenMTPDepth(_ options: ParsedOptions) throws -> Int {
+        let canonical = options.value(for: "--mtp-depth", default: "")
+        let alias = options.value(for: "--depth", default: "")
+        if !canonical.isEmpty, !alias.isEmpty, canonical != alias {
+            throw MLXFastError.invalidInput(
+                "--mtp-depth \(canonical) and --depth \(alias) disagree; "
+                    + "--depth is an alias of --mtp-depth, not a second knob"
+            )
+        }
+        let raw = canonical.isEmpty ? alias : canonical
+        guard !raw.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "the MTP verbs require --mtp-depth N (1 is the serial control)"
+            )
+        }
+        return try positiveInteger(raw, name: "--mtp-depth")
+    }
+
+    private static func qwenMTPHeadPath(_ options: ParsedOptions) throws -> String {
+        let path = options.value(
+            for: "--mtp-head",
+            default: environmentValue("MLXFAST_QWEN_MTP_HEAD_DIR", fallback: "")
+        )
+        guard !path.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "the MTP verbs require --mtp-head PATH (or "
+                    + "MLXFAST_QWEN_MTP_HEAD_DIR): the head is a SEPARATELY "
+                    + "pinned artifact merged onto the backbone at load"
+            )
+        }
+        return path
+    }
+
+    private static func qwenMTPWeightsPath(_ options: ParsedOptions) -> String {
+        options.value(
+            for: "--weights",
+            default: environmentValue(
+                "MLXFAST_WEIGHTS_PATH",
+                fallback: MLXFastConstants.defaultWeightsPath
+            )
+        )
+    }
+
+    /// `mtp-verify`: the UNTIMED fidelity verb.
+    ///
+    /// Two modes, mutually exclusive:
+    ///   * GATE mode (`--golden`): run one full native-MTP pass at `--mtp-depth`
+    ///     over the reference rows and emit the evidence payload -- the row
+    ///     ledger with per-row top-2 logit values, the exactness verdict against
+    ///     the serial trajectory, and `parity_all_ok`.
+    ///   * GENERATE mode (`--emitted` + `--generate`): produce those reference
+    ///     rows in the first place, by walking the serial width-1 frame.
+    ///
+    /// It emits NO score and NO speedup, and the ranked gate asserts their
+    /// absence: an untimed fidelity verb that could publish a number would be a
+    /// second, ungated scoring path.
+    private static func runQwenMTPVerify(_ options: ParsedOptions) throws {
+        try options.validate(
+            valueOptions: qwenMTPValueOptions
+                .union(["--emitted", "--generate", "--plan-output"])
+        )
+        let weightsPath = qwenMTPWeightsPath(options)
+        let mtpHeadPath = try qwenMTPHeadPath(options)
+        let goldenPath = options.value(for: "--golden", default: "")
+        let emittedPath = options.value(for: "--emitted", default: "")
+        let generateRaw = options.value(for: "--generate", default: "")
+
+        if !emittedPath.isEmpty || !generateRaw.isEmpty {
+            guard goldenPath.isEmpty else {
+                throw MLXFastError.invalidInput(
+                    "mtp-verify runs EITHER a gate pass (--golden) or reference "
+                        + "generation (--emitted/--generate), never both"
+                )
+            }
+            guard !emittedPath.isEmpty, !generateRaw.isEmpty else {
+                throw MLXFastError.invalidInput(
+                    "mtp-verify reference generation needs both --emitted PATH "
+                        + "and --generate N"
+                )
+            }
+            try runQwenMTPReferenceGeneration(
+                options,
+                weightsPath: weightsPath,
+                mtpHeadPath: mtpHeadPath,
+                emittedPath: emittedPath,
+                generateTokenCount: try positiveInteger(
+                    generateRaw, name: "--generate")
+            )
+            return
+        }
+
+        guard !goldenPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "mtp-verify requires --golden PATH (the reference rows)"
+            )
+        }
+        let depth = try qwenMTPDepth(options)
+        let tokens = try positiveInteger(
+            options.value(
+                for: "--tokens",
+                default: String(MLXFastConstants.experimentalDFlashMaxTotalTokens)
+            ),
+            name: "--tokens"
+        )
+        guard let workerOptions = try runtimeWorkerOptions(
+            blockedGoldenPath: goldenPath
+        ) else {
+            throw MLXFastError.invalidInput(
+                "mtp-verify requires the participant runtime worker"
+            )
+        }
+        let report = try QwenRuntime.qwenMTPDecode(
+            verb: "mtp-verify",
+            options: QwenMTPOptions(
+                targetWeightsPath: weightsPath,
+                mtpHeadPath: mtpHeadPath,
+                goldenPath: goldenPath,
+                depth: depth,
+                totalTokenCount: tokens
+            ),
+            workerOptions: workerOptions,
+            retainLedger: true
+        )
+        try emitQwenMTPPayload(report, options: options, timed: false)
+    }
+
+    /// `mtp-timed`: the parent-counted timed decode window.
+    ///
+    /// `--mtp-depth 1` is the SERIAL CONTROL and is the denominator of the paired
+    /// score: the same binary, the same worker, the same forward, speculation
+    /// switched off. It is not a second verb, for the reason the wrapper's header
+    /// records -- the retired Gemma track's separate serial verb meant numerator
+    /// and denominator went through different code paths and any divergence
+    /// between them landed straight in the score.
+    private static func runQwenMTPTimed(_ options: ParsedOptions) throws {
+        try options.validate(valueOptions: qwenMTPValueOptions)
+        let weightsPath = qwenMTPWeightsPath(options)
+        let mtpHeadPath = try qwenMTPHeadPath(options)
+        let goldenPath = options.value(for: "--golden", default: "")
+        guard !goldenPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "mtp-timed requires --golden PATH (the reference rows)"
+            )
+        }
+        let depth = try qwenMTPDepth(options)
+        let tokens = try positiveInteger(
+            options.value(
+                for: "--tokens",
+                default: String(MLXFastConstants.experimentalDFlashMaxTotalTokens)
+            ),
+            name: "--tokens"
+        )
+        guard let workerOptions = try runtimeWorkerOptions(
+            blockedGoldenPath: goldenPath
+        ) else {
+            throw MLXFastError.invalidInput(
+                "mtp-timed requires the participant runtime worker"
+            )
+        }
+        let report = try QwenRuntime.qwenMTPDecode(
+            verb: "mtp-timed",
+            options: QwenMTPOptions(
+                targetWeightsPath: weightsPath,
+                mtpHeadPath: mtpHeadPath,
+                goldenPath: goldenPath,
+                depth: depth,
+                totalTokenCount: tokens
+            ),
+            workerOptions: workerOptions,
+            retainLedger: false
+        )
+        try emitQwenMTPPayload(report, options: options, timed: true)
+    }
+
+    private static func runQwenMTPReferenceGeneration(
+        _ options: ParsedOptions,
+        weightsPath: String,
+        mtpHeadPath: String,
+        emittedPath: String,
+        generateTokenCount: Int
+    ) throws {
+        let outputPath = options.value(for: "--output", default: "")
+        guard !outputPath.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "mtp-verify reference generation requires --output PATH"
+            )
+        }
+        let planData = try Data(contentsOf: URL(fileURLWithPath: emittedPath))
+        let plan = try JSONDecoder().decode(
+            QwenMTPEmittedPlan.self, from: planData)
+        guard let workerOptions = try runtimeWorkerOptions(
+            blockedGoldenPath: outputPath
+        ) else {
+            throw MLXFastError.invalidInput(
+                "mtp-verify requires the participant runtime worker"
+            )
+        }
+        let planOutputPath = options.value(for: "--plan-output", default: "")
+        let result = try QwenRuntime.qwenMTPReferenceGolden(
+            plan: plan,
+            generateTokenCount: generateTokenCount,
+            targetWeightsPath: weightsPath,
+            mtpHeadPath: mtpHeadPath,
+            outputPath: outputPath,
+            planOutputPath: planOutputPath.isEmpty ? nil : planOutputPath,
+            workerOptions: workerOptions
+        )
+        fputs(
+            "mtp-verify: rows=\(result.rowCount) "
+                + "seed_tokens=\(result.seedTokenCount) "
+                + "reference_seed_token=\(result.referenceSeedToken) "
+                + "self_consistent=\(result.selfConsistent) "
+                + "(\(result.selfConsistencyDetail)) "
+                + "chain_contradictions=\(result.chainRowContradictionCount)\n",
+            stderr
+        )
+        guard result.selfConsistent else {
+            throw MLXFastError.invalidInput(
+                "the generated MTP reference is not self-consistent: "
+                    + result.selfConsistencyDetail
+            )
+        }
+    }
+
+    /// The evidence payload. Field names are the consumer contract; see
+    /// `deploy/qwen36-mtp/measure-qwen-mtp-job.sh`, the ranked workflow's gate jq
+    /// and `benchmark-qwen-mtp.sh`.
+    private static func emitQwenMTPPayload(
+        _ report: QwenMTPReport,
+        options: ParsedOptions,
+        timed: Bool
+    ) throws {
+        fputs(
+            "\(report.verb): tokens=\(report.decodeTokenCount) "
+                + "depth=\(report.depth) rounds=\(report.roundCount) "
+                + "accepted_draft_rate="
+                + "\(String(format: "%.4f", report.acceptedDraftRate)) "
+                + "all_tokens_matched=\(report.allTokensMatched) "
+                + "reference_checked_rows="
+                + "\(report.referenceCheckedRowTotal)/\(report.declaredRowTotal) "
+                + "seconds_per_token="
+                + "\(String(format: "%.6f", report.decodeSecondsPerToken))\n",
+            stderr
+        )
+
+        var payload: [String: Any] = [
+            "track_id": qwenMTPTrackID,
+            "verb": report.verb,
+            "official_score_produced": false,
+            "mtp_depth": report.depth,
+            // The serial control's depth, carried so a reader of one side's
+            // report can see what the other side was measured at.
+            "serial_control_depth": 1,
+            // TWO SPELLINGS, ONE PREDICATE ("the pinned native MTP head drafted
+            // this run", i.e. depth > 1). The box-owned wrapper asserts
+            // `uses_native_mtp_head`; the ranked workflow and the local runner
+            // assert `uses_pinned_mtp_head`. Both were pinned before this payload
+            // existed and the wrapper is not ours to change, so both are emitted
+            // and `QwenMTPPayloadSchemaTests` requires them to stay equal.
+            "uses_native_mtp_head": report.usesNativeMTPHead,
+            "uses_pinned_mtp_head": report.usesNativeMTPHead,
+            // Distinct from the two above and deliberately so: the head is loaded
+            // and resident on BOTH sides of the pair, so its residency cost is
+            // charged to the serial denominator too. Only the drafting differs.
+            "mtp_head_attached": true,
+            "mtp_head_tensor_count":
+                MLXFastConstants.qwenMTPHeadTensorCount,
+            "seed_token_count": report.seedTokenCount,
+            "decode_token_count": report.decodeTokenCount,
+            "all_tokens_matched": report.allTokensMatched,
+            "parity_all_ok": report.parityAllOK,
+            "accepted_draft_rate": report.acceptedDraftRate,
+            "residual_divergence_count": report.residualDivergenceCount,
+            // Criterion E L3 ledger.
+            "emitted_token_total": report.emittedTokenTotal,
+            "declared_rows_total": report.declaredRowTotal,
+            "reference_checked_row_total": report.referenceCheckedRowTotal,
+            "rejected_rows_reference_checked":
+                report.rejectedRowsReferenceChecked,
+            "verify_block_replayed_round_count":
+                report.verifyBlockReplayedRoundCount,
+            "max_rejected_tail_logit_delta": report.maxRejectedTailLogitDelta,
+            "accepted_draft_total": report.acceptedDraftTotal,
+            "rejected_draft_total": report.rejectedDraftTotal,
+            "target_tail_total": report.targetTailTotal,
+            "round_count": report.roundCount,
+            "target_cache_offset_final": report.targetCacheOffsetFinal,
+        ]
+        if let index = report.firstDivergenceIndex {
+            payload["first_divergence_index"] = index
+            if let margin = report.firstDivergenceReferenceMargin {
+                payload["first_divergence_reference_margin"] = margin
+            }
+        }
+        if timed {
+            // The trusted parent's own wall clock over its own configured token
+            // total. Worker-reported timing is never scored.
+            payload["parent_measured_seconds_per_token"] =
+                report.decodeSecondsPerToken
+            payload["decode_seconds"] = report.decodeSeconds
+            payload["max_block_request_seconds"] = report.maxRoundRequestSeconds
+            payload["p50_block_request_seconds"] = report.p50RoundRequestSeconds
+        }
+        if !report.ledger.isEmpty {
+            payload["row_ledger"] = report.ledger.map { row in
+                var entry: [String: Any] = [
+                    "row_index": row.rowIndex,
+                    "round": row.round,
+                    "kind": row.kind.rawValue,
+                    "accepted": row.accepted,
+                    "token": row.token,
+                    "top2_tokens": row.top2Tokens,
+                    "top2_logits": row.top2Logits,
+                    "reference_token": row.referenceToken,
+                    "reference_checked_by": row.referenceCheckedBy.rawValue,
+                    "reference_margin": row.referenceMargin.isFinite
+                        ? row.referenceMargin : -1,
+                ]
+                if let draftIndex = row.draftIndex {
+                    entry["draft_index"] = draftIndex
+                }
+                return entry
+            }
+        }
+
+        let data = try JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        FileHandle.standardOutput.write(data)
+        FileHandle.standardOutput.write(Data("\n".utf8))
+        let outputPath = options.value(for: "--output", default: "")
+        if !outputPath.isEmpty {
+            try data.write(to: URL(fileURLWithPath: outputPath))
+        }
+    }
+
     /// `dflash-reference`: generate the pinned-baseline reference golden
     /// (contract layer L1). Run this AFTER the timed phase, from the pinned
     /// baseline tree, over organizer-transformed weights.
@@ -2126,6 +2492,9 @@ private enum MLXFastCLI {
               mlxfast-swift dflash-benchmark --drafter PATH --golden PATH [--weights PATH] [--block-size N] [--tokens N] [--schedule-seed N] [--output PATH]
               mlxfast-swift dflash-probe --drafter PATH --golden PATH [--weights PATH] [--tokens N] [--schedule-seed N] [--output PATH]
               mlxfast-swift dflash-reference --drafter PATH --emitted PATH --output PATH [--weights PATH]
+              mlxfast-swift mtp-verify --mtp-head PATH --golden PATH --mtp-depth D [--weights PATH] [--tokens N] [--output PATH]
+              mlxfast-swift mtp-verify --mtp-head PATH --emitted PATH --generate N --output PATH [--weights PATH] [--plan-output PATH]
+              mlxfast-swift mtp-timed --mtp-head PATH --golden PATH --mtp-depth D [--weights PATH] [--tokens N] [--output PATH]
 
             Swift-only Qwen 3.6 27B 4-bit harness entrypoint (the DFlash
             subcommands still drive the Laguna target and its pinned drafter).

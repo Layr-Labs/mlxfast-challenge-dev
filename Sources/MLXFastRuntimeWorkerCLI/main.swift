@@ -72,6 +72,36 @@ private enum ParticipantWorkerCLI {
                     drafterPath: drafterPath
                 )
 
+            case "mtp-runtime-worker":
+                // Qwen 3.6 native-MTP track worker. Takes the organizer-pinned
+                // backbone and the SEPARATELY pinned MTP head (operator Q8:
+                // separate trees, merge at load); serves the mtp_* kinds only.
+                try options.requireOnly(
+                    values: ["--weights", "--mtp-head"]
+                )
+                let weightsPath = options.value(
+                    for: "--weights",
+                    default: ProcessInfo.processInfo.environment[
+                        "MLXFAST_WEIGHTS_PATH"
+                    ] ?? MLXFastConstants.defaultWeightsPath
+                )
+                let mtpHeadPath = options.value(
+                    for: "--mtp-head",
+                    default: ProcessInfo.processInfo.environment[
+                        "MLXFAST_QWEN_MTP_HEAD_DIR"
+                    ] ?? ""
+                )
+                guard !mtpHeadPath.isEmpty else {
+                    throw MLXFastError.invalidInput(
+                        "mtp-runtime-worker requires --mtp-head (or "
+                            + "MLXFAST_QWEN_MTP_HEAD_DIR)"
+                    )
+                }
+                try QwenRuntime.runQwenMTPWorker(
+                    targetWeightsPath: weightsPath,
+                    mtpHeadPath: mtpHeadPath
+                )
+
             case "preflight":
                 try options.requireOnly(
                     values: ["--weights"]
@@ -104,6 +134,7 @@ private enum ParticipantWorkerCLI {
             Usage:
               mlxfast-runtime-worker runtime-worker [--weights PATH]
               mlxfast-runtime-worker dflash-runtime-worker [--weights PATH] --drafter PATH
+              mlxfast-runtime-worker mtp-runtime-worker [--weights PATH] --mtp-head PATH
               mlxfast-runtime-worker preflight [--weights PATH]
 
             Participant-side MLX runtime worker for mlxfast-swift.
