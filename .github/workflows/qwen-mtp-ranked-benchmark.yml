@@ -190,23 +190,35 @@ jobs:
       MLXFAST_QWEN_MTP_MAX_RANKED_FAILURES: "5"
       # Provisional target identity for the timed decode prompt family.
       MLXFAST_QWEN_MTP_TIMED_TARGET_ID: lowsim-prose-qwen-v1
-      # --- Hidden artifact pins (ALL PENDING) -----------------------------
-      # None of these exist yet: the goldens, the GPQA reference and the timed
-      # prompt pool must be generated on box 3 against the Qwen tower and
-      # uploaded to R2 by the organizer. Every one carries the literal
-      # QWEN-MTP-PENDING-ORGANIZER, which:
-      #   1. "Enforce Qwen-MTP organizer pin completeness" rejects by name,
-      #      before any secret is used or any hidden byte is fetched;
-      #   2. fails the 64-hex / positive-integer shape checks in that same step;
-      #   3. would fail the download and the post-download digest comparison.
-      # Three independent refusals, so removing any one of them does not open a
-      # path to a silently-passing run.
+      # --- Hidden artifact pins (partially resolved) ----------------------
+      # RESOLVED (generated on box 3 against the Qwen 3.6 SERIAL tower and
+      # uploaded to R2 under this track's namespace):
+      #   * the RAW hidden correctness golden -- the reused serial gate's
+      #     teacher-forced base case (256) + free-run gate (128), regenerated
+      #     from the serial reseed prompt (detokenized under the Laguna
+      #     tokenizer with verified exact round-trip, re-tokenized under Qwen);
+      #   * the GPQA reference cases -- prompts/answer-keys/domains preserved
+      #     from the serial reseed, accepted-token-sequences re-tokenized under
+      #     the Qwen tokenizer (9 budget-valid cases, verified via
+      #     generate-gpqa-answers against the Qwen weights).
+      # Their digests + byte counts are pinned here and the matching R2 object
+      # keys (in "Prepare hidden correctness golden") embed the same digests.
+      #
+      # STILL PENDING (phase 2 -- the native-MTP head is byte-verified on box 3
+      # but not yet integrated into the ranked runtime, so no MTP-head golden
+      # and no measured no-op reference can be produced): the MTP-specific
+      # hidden correctness golden below and MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR
+      # (above) carry the literal QWEN-MTP-PENDING-ORGANIZER, which the
+      # pin-completeness gate rejects BY NAME (before any secret is used), fails
+      # the 64-hex / positive-integer shape checks, and would fail the download
+      # digest comparison -- three independent refusals keep the track
+      # fail-closed while ANY one of these remains a placeholder.
       MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_SHA256: QWEN-MTP-PENDING-ORGANIZER
       MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_BYTES: "QWEN-MTP-PENDING-ORGANIZER"
-      MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: QWEN-MTP-PENDING-ORGANIZER
-      MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "QWEN-MTP-PENDING-ORGANIZER"
-      MLXFAST_GPQA_REFERENCE_SHA256: QWEN-MTP-PENDING-ORGANIZER
-      MLXFAST_GPQA_REFERENCE_BYTES: "QWEN-MTP-PENDING-ORGANIZER"
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: eef3b817e390759275b7bc3570b10bb2846d2303000a0c9f1d627ad70f718c1e
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "21036"
+      MLXFAST_GPQA_REFERENCE_SHA256: d05e93e9694d86e0041e6b9c843642d4637de524e9a1b88a145caaa0da6235fe
+      MLXFAST_GPQA_REFERENCE_BYTES: "9886"
       # --- Reused serial gate contract ------------------------------------
       # The correctness/GPQA gate leg is the live serial gate stack re-hosted
       # here and pointed at this job's build, exactly as dflash-benchmark.yml
@@ -1275,11 +1287,14 @@ jobs:
       # worker the other's token oracle. The scrub step below is that bracket --
       # do not reorder these steps.
       #
-      # QWEN-PENDING-ORGANIZER: every object key below is a placeholder. The
-      # Qwen-derived hidden correctness golden and GPQA reference must be
-      # generated on the serving box against the Qwen tower and uploaded under
-      # this track's namespace. The keys are SHA-addressed by convention, so the
-      # final key embeds the digest that is also pinned in job env.
+      # RESOLVED: both object keys below are SHA-addressed by convention and
+      # embed the digest also pinned in job env. The Qwen-derived RAW hidden
+      # correctness golden and GPQA reference were generated on the serving box
+      # against the Qwen tower and uploaded under this track's namespace (no
+      # bucket segment: correctness_prompts/qwen3.6-27b-mtp-v1/...). The pending
+      # marker guard below now passes for these two; the phase-2 MTP-specific
+      # correctness golden key (in "Prepare MTP correctness golden") stays a
+      # placeholder and fails closed there.
       - name: Prepare hidden correctness golden
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -1287,8 +1302,8 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           # Private object keys scoped to this trusted download step only (never
           # job level), so untrusted bench phases never receive the object names.
-          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-hidden-correctness-golden-QWEN-MTP-PENDING-ORGANIZER.json
-          MLXFAST_GPQA_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-gpqa-reference-cases-QWEN-MTP-PENDING-ORGANIZER.json
+          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-hidden-correctness-golden-eef3b817e390759275b7bc3570b10bb2846d2303000a0c9f1d627ad70f718c1e.json
+          MLXFAST_GPQA_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-gpqa-reference-cases-d05e93e9694d86e0041e6b9c843642d4637de524e9a1b88a145caaa0da6235fe.json
         run: |
           set -euo pipefail
           for key in "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" "${MLXFAST_GPQA_R2_PATH}"; do

@@ -60,6 +60,18 @@ struct QwenMTPTrackNamingTests {
         ("ranked workflow filename", "qwen-mtp-ranked-benchmark.yml"),
         ("ranked workflow path", ".github/workflows/qwen-mtp-ranked-benchmark.yml"),
         ("ranked workflow name", "qwen-mtp-ranked-benchmark"),
+        // The provisioning + R2-key-probe workflows. The probe file dodges the
+        // retired names deliberately: putting the probe verb directly after
+        // "mtp-" would reproduce a retired substring (this file is scanned WHOLE,
+        // so the retired string is described, never spelled), so the verb is
+        // spelled "r2-key-probe" -- probe LAST -- and the file is
+        // qwen-mtp-r2-key-probe.yml.
+        ("provisioning workflow filename", "qwen-mtp-provision-goldens.yml"),
+        ("provisioning workflow path", ".github/workflows/qwen-mtp-provision-goldens.yml"),
+        ("provisioning workflow name", "qwen-mtp-provision-goldens"),
+        ("r2-key-probe workflow filename", "qwen-mtp-r2-key-probe.yml"),
+        ("r2-key-probe workflow path", ".github/workflows/qwen-mtp-r2-key-probe.yml"),
+        ("r2-key-probe workflow name", "qwen-mtp-r2-key-probe"),
         ("local benchmark runner", "benchmark-qwen-mtp.sh"),
         ("local setup runner", "setup-qwen-mtp.sh"),
         ("track manifest filename", "benchmark.qwen-mtp.json"),
@@ -122,6 +134,8 @@ struct QwenMTPTrackNamingTests {
     /// here, so the self-check costs nothing and closes the loop.
     static let newSurfaceFiles = [
         ".github/workflows/qwen-mtp-ranked-benchmark.yml",
+        ".github/workflows/qwen-mtp-provision-goldens.yml",
+        ".github/workflows/qwen-mtp-r2-key-probe.yml",
         "benchmark-qwen-mtp.sh",
         "setup-qwen-mtp.sh",
         "benchmark.qwen-mtp.json",
@@ -368,16 +382,17 @@ struct QwenMTPTrackNamingTests {
             )
         )
 
-        // 2. The hidden-artifact pins are still placeholders, and the marker is
-        //    spelled consistently so the pin-completeness gate can find them.
+        // 2. The PHASE-2 hidden-artifact pins are still placeholders -- the
+        //    MTP-head correctness golden and the measured decode floor, neither
+        //    producible until the native-MTP head is integrated into the ranked
+        //    runtime -- and the marker is spelled consistently so the
+        //    pin-completeness gate can find them. The RAW correctness golden and
+        //    the GPQA reference are now RESOLVED (generated on box 3 against the
+        //    Qwen serial tower) and are asserted as real values in step 3 below.
         let marker = "QWEN-MTP-PENDING-ORGANIZER"
         for pin in [
             "MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_SHA256",
             "MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_BYTES",
-            "MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256",
-            "MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES",
-            "MLXFAST_GPQA_REFERENCE_SHA256",
-            "MLXFAST_GPQA_REFERENCE_BYTES",
             "MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR",
         ] {
             let value = try #require(
@@ -397,6 +412,10 @@ struct QwenMTPTrackNamingTests {
 
         // 3. The pins that ARE computable from this branch are real, not
         //    placeholders -- the inert posture must not have swallowed them.
+        //    The last four are the box-3-generated model-derived pins (the RAW
+        //    hidden correctness golden and the GPQA reference); pinning them
+        //    here forces the R2 object key and the job-env digest to move
+        //    together, exactly as the DFlash goldens are mutation-tested.
         for (pin, expected) in [
             ("MLXFAST_EXPECTED_NUM_LAYERS", "64"),
             ("MLXFAST_QWEN_MTP_TARGET_MANIFEST_RECORDS", "15"),
@@ -407,6 +426,16 @@ struct QwenMTPTrackNamingTests {
                 "MLXFAST_QWEN_MTP_CHECKPOINT_REVISION",
                 "c000ac2c2057d94be3fa931000c31723aac53282"
             ),
+            (
+                "MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256",
+                "eef3b817e390759275b7bc3570b10bb2846d2303000a0c9f1d627ad70f718c1e"
+            ),
+            ("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES", "21036"),
+            (
+                "MLXFAST_GPQA_REFERENCE_SHA256",
+                "d05e93e9694d86e0041e6b9c843642d4637de524e9a1b88a145caaa0da6235fe"
+            ),
+            ("MLXFAST_GPQA_REFERENCE_BYTES", "9886"),
         ] {
             #expect(
                 environment[pin] == expected,
