@@ -39,13 +39,24 @@ extension QwenRuntime {
                     + "replay; this is an operator fault, not a submission fault"
             )
         }
+        // ONE ROW MORE THAN THE BUDGET, and the +1 is not slack. `rows[i]`
+        // describes the token emitted at index `i + 1` (index 0 is the seed
+        // argmax, which has no row and is pinned by `reference_seed_token`), so
+        // covering N emitted tokens needs N-1 rows. The LAST round's target tail
+        // row then predicts the token at index N -- one past the window -- and
+        // that row is declared, so it has to be reference-checked too. Requiring
+        // N+1 rows makes a short reference a legible abort here rather than a
+        // "row not reference-checked" failure 500 tokens into a gated run.
         guard options.totalTokenCount > 0,
-              options.totalTokenCount <= golden.rows.count + 1
+              golden.rows.count >= options.totalTokenCount + 1
         else {
             throw MLXFastError.invalidInput(
-                "the MTP reference carries \(golden.rows.count) rows (covering "
-                    + "\(golden.rows.count + 1) emitted tokens) but "
-                    + "\(options.totalTokenCount) tokens were requested"
+                "the MTP reference carries \(golden.rows.count) rows; a "
+                    + "\(options.totalTokenCount)-token window needs at least "
+                    + "\(options.totalTokenCount + 1) (one per emitted token "
+                    + "after the seed argmax, plus one for the final round's "
+                    + "target tail row). Regenerate with --generate "
+                    + "\(options.totalTokenCount + 1)."
             )
         }
         guard options.depth >= 1 else {
@@ -99,8 +110,25 @@ extension QwenRuntime {
         var latencies: [Double] = []
 
         while emitted.count < options.totalTokenCount {
+            // THE DEPTH CLAMP, and it lives HERE rather than in the worker. The
+            // validated driver computed `cycleDepth = min(depth, maxTokens -
+            // len(tokens))` AFTER appending the primary, so a round never drafted
+            // past the budget. The worker cannot do that: it is deliberately
+            // never told how much of the decode window remains, because a worker
+            // that knew could special-case the tail of a scored window. So the
+            // PARENT clamps by asking for a narrower round, which reproduces the
+            // driver's arithmetic exactly -- a round commits at most
+            // `1 + requestedDepth` tokens, so `remaining - 1` is the widest
+            // request that cannot overrun.
+            //
+            // The one case the clamp cannot cover is `remaining == 1`: the
+            // minimum legal depth is 1 and an accepted draft would then commit
+            // two tokens. That round is truncated below instead.
+            let remaining = options.totalTokenCount - emitted.count
+            let requestedDepth = Swift.max(
+                1, Swift.min(options.depth, remaining - 1))
             let roundStart = Date()
-            let response = try client.mtpDecodeRound(depth: options.depth)
+            let response = try client.mtpDecodeRound(depth: requestedDepth)
             let latency = Date().timeIntervalSince(roundStart)
             guard response.ok, let tokens = response.tokens, !tokens.isEmpty else {
                 throw MLXFastError.invalidInput(
@@ -109,7 +137,7 @@ extension QwenRuntime {
             }
             let round = QwenMTPObservedRound(
                 emittedBaseIndex: emitted.count,
-                requestedDepth: options.depth,
+                requestedDepth: requestedDepth,
                 tokens: tokens,
                 declaredRows: response.declaredRows ?? 0,
                 draftTokens: response.draftTokens ?? [],
@@ -120,12 +148,17 @@ extension QwenRuntime {
                 targetCacheOffset: response.targetCacheOffset ?? -1,
                 latencySeconds: latency
             )
-            try requireStructurallySound(round: round, depth: options.depth)
-            // A stop-token round declares one row and no drafts. Inside a scored
-            // window that means the trajectory ended before the configured token
-            // total, which is an OPERATOR fault (a timed prompt that terminates)
-            // and has to fail loudly rather than short a denominator.
-            if round.declaredRows == 1 && options.depth > 1 {
+            try requireStructurallySound(round: round, depth: requestedDepth)
+            // A stop-token round is the ONLY round that drafts nothing: every
+            // other round drafts at least one token, because the requested depth
+            // is clamped at 1 from below. Inside a scored window that means the
+            // trajectory ended before the configured token total, which is an
+            // OPERATOR fault (a timed prompt that terminates) and has to fail
+            // loudly rather than short a denominator. Checked at EVERY depth,
+            // including the serial control: a denominator measured over fewer
+            // tokens than the numerator is the worst possible silent failure on
+            // a paired track.
+            if round.draftTokens.isEmpty {
                 throw QwenMTPContractViolation(
                     kind: .stopTokenInsideWindow,
                     step: emitted.count,
@@ -140,10 +173,20 @@ extension QwenRuntime {
         }
         let decodeSeconds = Date().timeIntervalSince(started)
 
-        // The parent's own denominator: its configured token total, never a
-        // worker-reported count. A round may overrun the window; the ledger below
-        // scores the whole round it audited, and the TIMING divides by the
-        // configured total.
+        // TRUNCATE TO THE PARENT'S OWN DENOMINATOR. With the clamp above a round
+        // can overrun by at most one token (`remaining == 1` and the single draft
+        // accepted), and the scored window is the parent's configured total, not
+        // whatever the last round happened to commit. The extra token is simply
+        // outside the window: the round that produced it still declared its rows
+        // and those rows are still reference-checked, which is why
+        // `declared_rows_total >= emitted_token_total` is an inequality.
+        //
+        // Every offset reported below is PARENT-DERIVED from this truncated
+        // total, never read back from the worker -- the ledger the box wrapper
+        // audits must not be something the measured party can assert.
+        if emitted.count > options.totalTokenCount {
+            emitted = Array(emitted.prefix(options.totalTokenCount))
+        }
         let emittedTotal = emitted.count
 
         // --- exactness against the serial trajectory --------------------------
@@ -291,10 +334,11 @@ extension QwenRuntime {
         // row in is the frame the candidate produced it in.
         let context = golden.seedTokens + emitted
         let seedCount = golden.seedTokens.count
-        let needsReplay = rounds.contains {
-            $0.rejectedDraftCount > 1
-                || ($0.rejectedDraftCount == 1 && $0.draftTokens.count == 0)
-        }
+        // A round needs the replay exactly when it has rows past the FIRST
+        // rejection: `goldenBackedDrafts = min(accepted + 1, draftCount)`, so
+        // `draftCount > goldenBackedDrafts` reduces to `rejected > 1`. A run with
+        // no such round never opens a second worker at all.
+        let needsReplay = rounds.contains { $0.rejectedDraftCount > 1 }
 
         var referenceClient: RuntimeWorkerClient?
         defer { referenceClient?.close() }

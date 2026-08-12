@@ -400,7 +400,7 @@ echo "benchmark-qwen-mtp.sh: generating the MTP reference rows (${token_count} r
   --weights "${weights_path}" \
   --mtp-head "${MLXFAST_QWEN_MTP_HEAD_DIR}" \
   --emitted "${plan_path}" \
-  --generate "${token_count}" \
+  --generate "$(( token_count + 1 ))" \
   --mtp-depth "${depth}" \
   --output "${golden_path}" \
   --plan-output "${run_dir}/generated-plan.json"
@@ -419,7 +419,7 @@ if ! jq -e --argjson tokens "${token_count}" '
       and ($g.rows | type == "array") and $rows > 0
       and ($g.emitted_tokens | type == "array")
       and ($g.emitted_tokens | length) == $rows
-      and $rows >= $tokens
+      and $rows >= ($tokens + 1)
       and ([
             range(0; $rows)
             | select($g.emitted_tokens[.] != $g.rows[.].sequential_argmax)
@@ -428,7 +428,8 @@ if ! jq -e --argjson tokens "${token_count}" '
   echo "benchmark-qwen-mtp.sh: the MTP reference rows are not usable: they must report" >&2
   echo "benchmark-qwen-mtp.sh:   reference_self_consistent == true," >&2
   echo "benchmark-qwen-mtp.sh:   emitted_tokens[i] == rows[i].sequential_argmax for every row, and" >&2
-  echo "benchmark-qwen-mtp.sh:   at least ${token_count} rows" >&2
+  echo "benchmark-qwen-mtp.sh:   at least $(( token_count + 1 )) rows (one per emitted token after the" >&2
+  echo "benchmark-qwen-mtp.sh:   seed argmax, plus one for the final round's target tail row)" >&2
   exit 1
 fi
 
