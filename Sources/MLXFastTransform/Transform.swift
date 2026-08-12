@@ -625,6 +625,14 @@ public enum SwiftTransform {
     static func detectModelFamily(
         sourceConfigRoot root: [String: Any]
     ) throws -> TransformModelFamily {
+        // The pinned Qwen checkpoint declares `qwen3_5` at the top level and
+        // `qwen3_5_text` inside `text_config`; either is sufficient, and both
+        // are checked before the `text_config`-means-Gemma fallthrough below.
+        if let modelType = root["model_type"] as? String,
+           modelType.hasPrefix(qwen35TextModelTypePrefix)
+        {
+            return .qwen35
+        }
         if let textConfig = root["text_config"] as? [String: Any] {
             if let modelType = textConfig["model_type"] as? String,
                modelType.hasPrefix(qwen35TextModelTypePrefix)

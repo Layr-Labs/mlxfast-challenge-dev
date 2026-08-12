@@ -22,10 +22,16 @@ func pinnedLagunaConfigObject() -> [String: Any] {
           let root = try? JSONSerialization.jsonObject(with: data)
             as? [String: Any],
           let source = root["source"] as? [String: Any],
+          // Compared against the Laguna literals rather than
+          // MLXFastConstants: on the qwen36-mtp-track branch those constants
+          // carry the Qwen 3.6 track identity, while this fixture pins the
+          // Poolside Laguna config contract. The anti-drift intent is
+          // unchanged -- the fixture still cannot silently become synthetic --
+          // it is just anchored to the checkpoint it actually describes.
           source["repository"] as? String
-            == MLXFastConstants.referenceModelRepository,
+            == "poolside/Laguna-XS-2.1-NVFP4-mlx",
           source["revision"] as? String
-            == MLXFastConstants.referenceModelRevision,
+            == "841778bda563a36104dd521e37d99218e46f4f25",
           source["config_sha256"] as? String
             == "ef1eaf6709b38ab58b47480fdf8b2732163b34427d4a0ec334f77af27e1ce3b9",
           let config = root["config"] as? [String: Any]
