@@ -784,3 +784,51 @@ centres on the DFlash runtime under
 the forward pass dispatches. Local scripts are `setup-dflash.sh` and
 `benchmark-dflash.sh`; the retired Gemma-era MTP surface stays retired under
 its own names and must not be revived.
+
+## Qwen 3.6 MTP track (in progress — branch `qwen36-mtp-track`)
+
+**Status: phase 1 (target-runtime port) only. Not a ranked track, not
+go-live, and nothing in this section describes the currently ranked
+`laguna-xs-2.1-dflash-v1` pipeline above — that pipeline and its rules are
+unchanged.** See `QWEN36-MTP-CHALLENGE-PLAN.md` (operator working copy,
+outside this repo) for the phase plan.
+
+Pinned Qwen target identity, mirrored by `Sources/MLXFastCore/Constants.swift`
+(`referenceModelRepository` / `referenceModelRevision`), by `setup.sh`
+(`REFERENCE_MODEL_REPO` / `REFERENCE_REVISION` / `REFERENCE_MANIFEST_PATH`),
+and by the checked-in manifest `fixtures/reference_qwen3_6_27b_4bit.sha256`:
+
+```text
+repository  mlx-community/Qwen3.6-27B-4bit
+revision    c000ac2c2057d94be3fa931000c31723aac53282
+manifest    fixtures/reference_qwen3_6_27b_4bit.sha256
+```
+
+The MTP head is a separately pinned artifact
+(`mlx-community/Qwen3.6-27B-MTP-4bit` @ `83795d546e9d328160e593fb0bf10b2bf2fe637e`)
+and is NOT part of the phase-1 backbone port: the transform never selects
+`mtp.*` tensors, and the pinned backbone revision above contains none.
+
+What phase 1 landed on this branch:
+
+- `Sources/MLXFastModel/Qwen35*.swift` — the Qwen 3.6 text tower. The
+  artifact is named Qwen3.6; its immutable internal architecture name is
+  `qwen3_5_text`, which is why the sources carry a `Qwen35` prefix. 64
+  layers on a 4-layer repeat (every 4th layer full attention, the other
+  three gated-delta linear attention), vocab 248320, hidden 5120, untied
+  `lm_head`, affine 4-bit quantization.
+- `Sources/MLXFastTransform/Transform.swift` — a third
+  `TransformModelFamily` case, `.qwen35`, selected by the `qwen3_5`
+  model-type prefix inside the source `text_config`. The `laguna` and
+  `gemma4` families are untouched.
+- `Tests/MLXFastTests/Qwen35ReferenceParityTests.swift` — the re-aimed
+  streaming-schedule parity gate. It is opt-in and loads the real
+  checkpoint, so it is skipped unless
+  `MLXFAST_RUN_QWEN_REFERENCE_PARITY=1` and
+  `MLXFAST_QWEN_REFERENCE_WEIGHTS_PATH=<transformed-weights>` are both set.
+
+The Laguna/DFlash surface (`Laguna*.swift`, `benchmark-dflash.sh`,
+`setup-dflash.sh`, the DFlash track fixture and contract) is deliberately
+left in place and unmodified; the two targets coexist on this branch until
+the track identity is chosen. The retired Gemma-era MTP names stay retired —
+a Qwen track id must not substring-collide with them.

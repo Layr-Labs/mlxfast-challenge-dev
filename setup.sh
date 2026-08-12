@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Bootstrap system tools and build the Swift-only Laguna harness.
+# Bootstrap system tools and build the Swift-only Qwen3.6 harness.
 set -euo pipefail
 
-REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-poolside/Laguna-XS-2.1-NVFP4-mlx}"
-REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-841778bda563a36104dd521e37d99218e46f4f25}"
+REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/Qwen3.6-27B-4bit}"
+REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-c000ac2c2057d94be3fa931000c31723aac53282}"
 REFERENCE_CACHE_REPO_DIR="models--${REFERENCE_MODEL_REPO//\//--}"
 REFERENCE_CACHE_REVISION_DIR="${REFERENCE_REVISION//\//--}"
-# The organizer's public Darkbloom R2 mirror is primary. It serves the exact
-# Poolside NVFP4 revision pinned below; failed or stalled transfers fall back
-# to that same immutable Hugging Face revision. download_url_for_file appends
-# "?download=true" only for huggingface.co URLs.
-DEFAULT_REFERENCE_BASE_URL="https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx"
-DEFAULT_REFERENCE_FALLBACK_BASE_URL="https://huggingface.co/poolside/Laguna-XS-2.1-NVFP4-mlx/resolve/841778bda563a36104dd521e37d99218e46f4f25"
+# No organizer-hosted mirror exists for this checkpoint yet (the Darkbloom R2
+# mirror serves the retired Laguna target only). Resolve the immutable Hugging
+# Face revision directly and leave the fallback empty by default.
+# download_url_for_file appends "?download=true" only for huggingface.co URLs,
+# so that resolves to the raw LFS/Xet bytes.
+DEFAULT_REFERENCE_BASE_URL="https://huggingface.co/mlx-community/Qwen3.6-27B-4bit/resolve/${REFERENCE_REVISION}"
+DEFAULT_REFERENCE_FALLBACK_BASE_URL=""
 REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}"
 if [[ -n "${MLXFAST_REFERENCE_FALLBACK_BASE_URL+x}" ]]; then
   REFERENCE_FALLBACK_BASE_URL="${MLXFAST_REFERENCE_FALLBACK_BASE_URL}"
@@ -22,13 +23,12 @@ else
 fi
 REFERENCE_AUTH_HEADER="${MLXFAST_REFERENCE_AUTH_HEADER:-}"
 REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}"
-REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256}"
+REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_qwen3_6_27b_4bit.sha256}"
 REFERENCE_HASH_VERIFY="${MLXFAST_REFERENCE_HASH_VERIFY:-1}"
 REFERENCE_POST_DOWNLOAD_FULL_VERIFY="${MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY:-1}"
 REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-40}"
-# Default 3 parallel shard downloads: the R2 mirror sustains full throughput at
-# 3 streams, and higher fan-out mostly adds contention on home connections.
-# Override with MLXFAST_REFERENCE_DOWNLOAD_JOBS.
+# The pinned checkpoint has three safetensors shards; three jobs gives each
+# shard one download stream. Override with MLXFAST_REFERENCE_DOWNLOAD_JOBS.
 REFERENCE_DOWNLOAD_JOBS="${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-3}"
 REFERENCE_DOWNLOAD_PROGRESS_SECONDS="${MLXFAST_REFERENCE_DOWNLOAD_PROGRESS_SECONDS:-15}"
 REFERENCE_DOWNLOAD_STALL_SECONDS="${MLXFAST_REFERENCE_DOWNLOAD_STALL_SECONDS:-120}"
@@ -51,7 +51,7 @@ SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 # next to the worker binary, where Cmlx searches first.
 RUNTIME_WORKER_BIN="${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-.build-worker/release/mlxfast-runtime-worker}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${RUNTIME_WORKER_BIN}")/mlx.metallib}"
-DEFAULT_REFERENCE_DIR="reference_weights/laguna-xs-2.1-nvfp4-mlx"
+DEFAULT_REFERENCE_DIR="reference_weights/Qwen3.6-27B-4bit"
 DEFAULT_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}"
 DEFAULT_HF_HUB_CACHE="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${DEFAULT_HF_HOME}/hub}}"
 REFERENCE_CACHE_DIR="${MLXFAST_REFERENCE_CACHE_DIR:-${DEFAULT_HF_HUB_CACHE}/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}}"
