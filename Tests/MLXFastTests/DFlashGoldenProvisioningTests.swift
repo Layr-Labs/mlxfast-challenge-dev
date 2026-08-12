@@ -639,11 +639,17 @@ struct DFlashGoldenProvisioningTests {
         #expect(varied.output.contains("ACCEPTED"))
 
         let real = try Self.publicProseTokens()
+        // 277 distinct in 512 (was 276 under the Laguna tokenizer). The PROSE
+        // is byte-identical -- only the tokenizer changed with the Qwen 3.6
+        // target repoint -- and the seed-variety ratio moved 0.5391 -> 0.5410,
+        // still far above the guard script's 0.40 floor, so the floor itself
+        // needs no re-derivation. If this pin ever moves because the prose
+        // changed, re-derive the constant in \(Self.guardScript) instead.
         #expect(
-            Set(real).count == 276 && real.count == 512,
+            Set(real).count == 277 && real.count == 512,
             """
             \(Self.publicProseFixture) no longer carries the 512-token / \
-            276-distinct English prose sample the seed-variety threshold was \
+            277-distinct English prose sample the seed-variety threshold was \
             derived against. Re-derive the constant in \(Self.guardScript) \
             rather than adjusting this expectation.
             """
@@ -656,7 +662,7 @@ struct DFlashGoldenProvisioningTests {
             """
             the guard rejected a seed that IS the tokenization of the English \
             prose checked into this repository (\(Self.publicProseFixture), \
-            cases[0].prompt_tokens: 276 distinct in 512). The 0.40 seed-variety \
+            cases[0].prompt_tokens: 277 distinct in 512). The 0.40 seed-variety \
             floor is above real prose and must be re-derived. Output:
             \(checkedIn.output)
             """

@@ -14,13 +14,17 @@ func checkedInPublicCorrectnessGoldenIsValid() throws {
     #expect(promptDigest == "98f6a5c49523c891300978437074279c97bb8aa7af18cbf2645983cfbf15e781")
     #expect(promptData.count == 2_735)
 
+    // Fixture digests regenerated on m5-max-128gb-3 with the Qwen 3.6 runtime
+    // (QWEN36-MTP-CHALLENGE-PLAN.md phase 5). The prompt digest and byte count
+    // above are deliberately UNCHANGED: the prompt text was not touched, only
+    // the model that continued it.
     let path = MLXFastConstants.defaultPublicCorrectnessGoldenPath
     let data = try Data(contentsOf: URL(fileURLWithPath: path))
     let digest = SHA256.hash(data: data)
         .map { String(format: "%02x", $0) }
         .joined()
 
-    #expect(digest == "b9509697c08a2cf3c2943a85f0b76e39c485c441794690fa76835b40a58d7a63")
+    #expect(digest == "80b3a722632036fd568b6b48d4fe01b54e0f4eb57a163e7ab1de0b1d2edf59ce")
 
     let fixture = try loadGoldenFixture(from: path)
     #expect(fixture.sha256 == digest)
@@ -38,7 +42,7 @@ func checkedInPublicCorrectnessGoldenIsValid() throws {
         .map { String(format: "%02x", $0) }
         .joined()
 
-    #expect(localSubmitDigest == "f49e4c2cbc0d3ceee90195a3a12e1ff082636f8c031587485a9a2c10702b03d2")
+    #expect(localSubmitDigest == "7a6c4c2c1c6242f9bdd8ba83ec342c296e3a0604839cd0e7055928f1f694c6f7")
 
     let localSubmitFixture = try loadGoldenFixture(
         from: localSubmitPath,
