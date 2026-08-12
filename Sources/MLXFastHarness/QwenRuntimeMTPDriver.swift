@@ -245,6 +245,9 @@ extension QwenRuntime {
                 }
         }
 
+        // Whole-window summaries use the SAME lower-median rule as the
+        // after-first p50, so the payload carries exactly one definition of
+        // "p50" rather than two that differ on even-length windows.
         let sortedLatencies = latencies.sorted()
         return QwenMTPReport(
             verb: verb,
@@ -268,10 +271,9 @@ extension QwenRuntime {
             maxRejectedTailLogitDelta: audit.maxRejectedTailLogitDelta,
             targetCacheOffsetFinal: golden.seedTokens.count + emittedTotal,
             decodeSeconds: decodeSeconds,
+            roundRequestSeconds: latencies,
             maxRoundRequestSeconds: sortedLatencies.last ?? 0,
-            p50RoundRequestSeconds: sortedLatencies.isEmpty
-                ? 0
-                : sortedLatencies[sortedLatencies.count / 2],
+            p50RoundRequestSeconds: QwenMTPReport.lowerMedian(latencies),
             ledger: retainLedger ? audit.rows : []
         )
     }

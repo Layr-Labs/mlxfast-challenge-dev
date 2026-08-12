@@ -1885,6 +1885,34 @@ private enum MLXFastCLI {
             payload["parent_measured_seconds_per_token"] =
                 report.decodeSecondsPerToken
             payload["decode_seconds"] = report.decodeSeconds
+            // THE STALL GUARDRAIL'S INPUT. The box wrapper's
+            // check_stall_guardrail FAILS CLOSED unless a timed report carries
+            // either the full per-block array or the after-first trio, and it
+            // deliberately refuses to fall back to whole-window max/p50: the
+            // first block is a measured one-time post-prefill warmup (flat
+            // across a 64x window sweep), and folding it back into the ratio is
+            // the false rejection the exclusion exists to stop.
+            //
+            // BOTH ROUTES ARE EMITTED, and that is not redundancy. The array is
+            // preferred and is what the wrapper uses whenever it holds at least
+            // two entries -- the wrapper then does its own slice, max and median,
+            // so the guard's arithmetic is not something the measured side gets
+            // to assert. The trio covers the one case the array route declines,
+            // a window of a single round, which would otherwise land in the
+            // wrapper's "absent" branch and reject a valid measurement. They
+            // cannot disagree: the trio is DERIVED from the same array using the
+            // wrapper's exact lower-median rule, and a test pins that.
+            //
+            // Size: one double per round, so 512 rounds at the ranked window is
+            // ~17 KB of JSON -- two orders of magnitude below the mtp-verify row
+            // ledger this same code path already emits.
+            payload["block_request_seconds"] = report.roundRequestSeconds
+            payload["first_block_seconds"] = report.firstBlockSeconds
+            payload["max_block_request_seconds_after_first"] =
+                report.maxRoundRequestSecondsAfterFirst
+            payload["p50_block_request_seconds_after_first"] =
+                report.p50RoundRequestSecondsAfterFirst
+            // Whole-window, RETAINED FOR AUDIT ONLY -- no guard reads these now.
             payload["max_block_request_seconds"] = report.maxRoundRequestSeconds
             payload["p50_block_request_seconds"] = report.p50RoundRequestSeconds
         }

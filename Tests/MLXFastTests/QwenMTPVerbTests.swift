@@ -143,6 +143,12 @@ struct QwenMTPPayloadSchemaTests {
             "round_count",
             "seed_token_count",
             "target_cache_offset_final",
+            // check_stall_guardrail, which FAILS CLOSED without one of the two
+            // routes and will not fall back to whole-window max/p50.
+            "block_request_seconds",
+            "first_block_seconds",
+            "max_block_request_seconds_after_first",
+            "p50_block_request_seconds_after_first",
         ]
         for field in wrapperFields {
             #expect(
@@ -228,6 +234,126 @@ struct QwenMTPPayloadSchemaTests {
             """
         )
         #expect(runner.contains(".is_serial_control == true"))
+    }
+
+    /// THE STALL GUARDRAIL CONTRACT. The wrapper fails CLOSED unless a timed
+    /// report offers one of two routes, and the payload must satisfy at least
+    /// one of them or every ranked run rejects on the report contract.
+    @Test
+    func theTimedPayloadSatisfiesBothStallGuardrailRoutes() throws {
+        let cli = try S.text(Self.cliPath)
+        // Route 1: the full per-block array (preferred -- the wrapper slices and
+        // reduces it itself, so the guard's arithmetic is not asserted by the
+        // measured side).
+        #expect(cli.contains(#"payload["block_request_seconds"] = report.roundRequestSeconds"#))
+        // Route 2: the after-first trio, for a window the array route declines.
+        #expect(cli.contains(#"payload["first_block_seconds"]"#))
+        #expect(cli.contains(#"payload["max_block_request_seconds_after_first"]"#))
+        #expect(cli.contains(#"payload["p50_block_request_seconds_after_first"]"#))
+        // Whole-window fields survive for audit; the guard no longer reads them.
+        #expect(cli.contains(#"payload["max_block_request_seconds"]"#))
+        #expect(cli.contains(#"payload["p50_block_request_seconds"]"#))
+    }
+
+    /// The array and the trio must agree BIT FOR BIT, because the wrapper picks
+    /// a route by array length and a report offering two different answers would
+    /// pass or fail depending on which branch it happened to take.
+    ///
+    /// The p50 rule is the wrapper's own: `sorted[floor((n - 1) / 2)]`, the LOWER
+    /// median. Swift's natural `sorted[count / 2]` is the UPPER median and
+    /// differs on every even-length window -- which a 512-token run very often
+    /// is.
+    @Test
+    func theArrayAndTheTrioAgreeIncludingOnEvenLengthWindows() throws {
+        // Even post-first population (5 rounds -> 4 after the first), where the
+        // upper and lower medians differ.
+        let evenReport = Self.timedReport(blocks: [0.26, 0.05, 0.01, 0.04, 0.02])
+        #expect(evenReport.firstBlockSeconds == 0.26)
+        #expect(evenReport.maxRoundRequestSecondsAfterFirst == 0.05)
+        // sorted post-first = [0.01, 0.02, 0.04, 0.05]; floor((4-1)/2) = 1.
+        #expect(evenReport.p50RoundRequestSecondsAfterFirst == 0.02)
+
+        // Odd post-first population.
+        let oddReport = Self.timedReport(blocks: [0.26, 0.05, 0.01, 0.04])
+        #expect(oddReport.p50RoundRequestSecondsAfterFirst == 0.04)
+
+        // The whole-window p50 uses the SAME rule, so the payload carries one
+        // definition of "p50" rather than two.
+        #expect(
+            QwenMTPReport.lowerMedian([0.26, 0.05, 0.01, 0.04]) == 0.04,
+            "the whole-window p50 rule drifted from the after-first rule")
+
+        // Degenerate cases must not trap: the wrapper treats a non-positive p50
+        // as "no usable post-first population" and skips the ratio.
+        #expect(Self.timedReport(blocks: [0.26]).p50RoundRequestSecondsAfterFirst == 0)
+        #expect(Self.timedReport(blocks: []).firstBlockSeconds == 0)
+    }
+
+    /// The array is a per-ROUND journal, so its length is the round count. A
+    /// short array would silently shrink the population the guard reduces over.
+    @Test
+    func theBlockArrayLengthIsTheRoundCount() throws {
+        let report = Self.timedReport(blocks: [0.26, 0.05, 0.01, 0.04, 0.02])
+        #expect(report.roundRequestSeconds.count == report.roundCount)
+        #expect(report.firstBlockSeconds == report.roundRequestSeconds[0])
+    }
+
+    /// The first block is EXCLUDED FROM THE RATIO, NOT FROM THE REPORT. Box 3
+    /// measured a depth-1 phase at max_block 0.261 s against p50 0.0389 s --
+    /// 6.71x, tripping a factor-4 guard -- and the shape was a one-time
+    /// post-prefill warmup. Prove the exclusion is what rescues that run, and
+    /// that a genuine stall in the post-first population is still caught.
+    @Test
+    func excludingTheFirstBlockRescuesAWarmupAndStillCatchesAStall() throws {
+        func ratio(_ blocks: [Double]) -> Double {
+            let report = Self.timedReport(blocks: blocks)
+            let p50 = report.p50RoundRequestSecondsAfterFirst
+            guard p50 > 0 else { return 0 }
+            return report.maxRoundRequestSecondsAfterFirst / p50
+        }
+        // The measured box-3 shape: one 0.261 s first block over a ~0.039 s body.
+        let warmup = [0.261] + Array(repeating: 0.0389, count: 300)
+        #expect(
+            ratio(warmup) < 4,
+            """
+            the measured box-3 warmup shape still trips a factor-4 guard after \
+            the first block is excluded.
+            """
+        )
+        // A real stall mid-window is still a rejection.
+        var stalled = Array(repeating: 0.0389, count: 300)
+        stalled[150] = 0.5
+        #expect(ratio([0.261] + stalled) > 4)
+    }
+
+    /// A minimal timed report carrying a given per-round journal.
+    static func timedReport(blocks: [Double]) -> QwenMTPReport {
+        let sorted = blocks.sorted()
+        return QwenMTPReport(
+            verb: "mtp-timed",
+            depth: 2,
+            seedTokenCount: 512,
+            decodeTokenCount: blocks.count,
+            emittedTokenTotal: blocks.count,
+            allTokensMatched: true,
+            firstDivergenceIndex: nil,
+            firstDivergenceReferenceMargin: nil,
+            roundCount: blocks.count,
+            acceptedDraftTotal: 0,
+            rejectedDraftTotal: 0,
+            targetTailTotal: blocks.count,
+            declaredRowTotal: blocks.count,
+            referenceCheckedRowTotal: blocks.count,
+            rejectedRowsReferenceChecked: 0,
+            verifyBlockReplayedRoundCount: 0,
+            residualDivergenceCount: 0,
+            maxRejectedTailLogitDelta: 0,
+            targetCacheOffsetFinal: 512 + blocks.count,
+            decodeSeconds: blocks.reduce(0, +),
+            roundRequestSeconds: blocks,
+            maxRoundRequestSeconds: sorted.last ?? 0,
+            p50RoundRequestSeconds: QwenMTPReport.lowerMedian(blocks)
+        )
     }
 
     /// `rows_per_round` is duplicated across a Swift constant and a shell

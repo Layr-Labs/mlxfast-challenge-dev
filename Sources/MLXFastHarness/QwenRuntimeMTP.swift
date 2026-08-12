@@ -281,8 +281,47 @@ public struct QwenMTPReport: Equatable {
     public let maxRejectedTailLogitDelta: Double
     public let targetCacheOffsetFinal: Int
     public let decodeSeconds: Double
+    /// Per-round wall time, one entry per round, in emission order.
+    ///
+    /// THE STALL GUARDRAIL'S PRIMARY INPUT. The box wrapper's
+    /// `check_stall_guardrail` fails CLOSED unless a timed report carries either
+    /// this array or the after-first trio, and it will not fall back to a
+    /// whole-window max/p50 -- because the first block is a measured, one-time
+    /// post-prefill warmup (flat across a 64x window sweep) and folding it back
+    /// into the ratio is exactly the false rejection the exclusion exists to
+    /// stop. Emitting the raw array is preferred over emitting summaries: the
+    /// wrapper then does its own slice, max and median, so the guard's arithmetic
+    /// is not something the measured side gets to assert.
+    public let roundRequestSeconds: [Double]
+    /// Whole-window max/p50, RETAINED FOR AUDIT ONLY. No guard reads these any
+    /// more; they exist so a human comparing an old report to a new one is not
+    /// looking at two different quantities.
     public let maxRoundRequestSeconds: Double
     public let p50RoundRequestSeconds: Double
+
+    /// The excluded first block, reported rather than hidden.
+    public var firstBlockSeconds: Double { roundRequestSeconds.first ?? 0 }
+
+    /// Max over rounds AFTER the first -- the wrapper's array route, computed
+    /// here so the two accepted routes cannot disagree.
+    public var maxRoundRequestSecondsAfterFirst: Double {
+        roundRequestSeconds.dropFirst().max() ?? 0
+    }
+
+    /// p50 over rounds AFTER the first, using the wrapper's EXACT rule:
+    /// `sorted[floor((n - 1) / 2)]`, i.e. the LOWER median. Matching the jq
+    /// bit-for-bit is the point -- a report that offered both routes with two
+    /// different median conventions would hand the guard two different answers
+    /// depending on which branch it happened to take.
+    public var p50RoundRequestSecondsAfterFirst: Double {
+        Self.lowerMedian(Array(roundRequestSeconds.dropFirst()))
+    }
+
+    public static func lowerMedian(_ values: [Double]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        return sorted[(sorted.count - 1) / 2]
+    }
     /// Retained ledger rows. `mtp-verify` carries the whole ledger as the
     /// fidelity evidence; `mtp-timed` carries none (the timed report is a timing
     /// artifact, and a 512-token ledger of top-2 readouts would dominate it).
@@ -344,6 +383,7 @@ public struct QwenMTPReport: Equatable {
         maxRejectedTailLogitDelta: Double,
         targetCacheOffsetFinal: Int,
         decodeSeconds: Double,
+        roundRequestSeconds: [Double] = [],
         maxRoundRequestSeconds: Double,
         p50RoundRequestSeconds: Double,
         ledger: [QwenMTPLedgerRow] = []
@@ -368,6 +408,7 @@ public struct QwenMTPReport: Equatable {
         self.maxRejectedTailLogitDelta = maxRejectedTailLogitDelta
         self.targetCacheOffsetFinal = targetCacheOffsetFinal
         self.decodeSeconds = decodeSeconds
+        self.roundRequestSeconds = roundRequestSeconds
         self.maxRoundRequestSeconds = maxRoundRequestSeconds
         self.p50RoundRequestSeconds = p50RoundRequestSeconds
         self.ledger = ledger
