@@ -782,7 +782,12 @@ fi
 if [[ "${PUBLISH_ALL_BUILD_ROOTS}" == "1" ]]; then
   for product_dir in .build/debug .build/release .build-worker/debug .build-worker/release; do
     [[ -d "${product_dir}" ]] || continue
-    [[ "$(cd "${product_dir}" && pwd -P)" == "$(dirname "${OUTPUT_PATH}")" ]] && continue
+    # `cond && continue` would abort the whole script under `set -e` whenever the
+    # condition is FALSE, because the compound then returns 1 as a standalone
+    # statement. Use an if.
+    if [[ "$(cd "${product_dir}" && pwd -P)" == "$(dirname "${OUTPUT_PATH}")" ]]; then
+      continue
+    fi
     publish_metallib "${METALLIB_PATH}" "${product_dir}/mlx.metallib"
     publish_fingerprint_record "${product_dir}/mlx.metallib.fingerprint"
     echo "build-mlx-metallib.sh: wrote ${product_dir}/mlx.metallib"
