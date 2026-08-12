@@ -14,7 +14,9 @@ let qwen36Revision = "c000ac2c2057d94be3fa931000c31723aac53282"
 let qwen36ConfigSHA256 =
     "ede24666ac51e6d5ab948a8a1e6c72fc6effd941ba3aabb6dd942eb517c78043"
 
+// Tests/MLXFastTests/Model/<this file> -> repository root is four levels up.
 private let qwen36ArtifactRepositoryRoot = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
     .deletingLastPathComponent()
     .deletingLastPathComponent()
     .deletingLastPathComponent()

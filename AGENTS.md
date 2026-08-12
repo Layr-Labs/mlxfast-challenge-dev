@@ -821,7 +821,7 @@ What phase 1 landed on this branch:
   `TransformModelFamily` case, `.qwen35`, selected by the `qwen3_5`
   model-type prefix inside the source `text_config`. The `laguna` and
   `gemma4` families are untouched.
-- `Tests/MLXFastTests/Qwen35ReferenceParityTests.swift` — the re-aimed
+- `Tests/MLXFastTests/Model/Qwen35ReferenceParityTests.swift` — the re-aimed
   streaming-schedule parity gate. It is opt-in and loads the real
   checkpoint, so it is skipped unless
   `MLXFAST_RUN_QWEN_REFERENCE_PARITY=1` and

@@ -34,7 +34,7 @@ fixtures/qwen3_6_27b_tensor_inventory.json
 the Laguna fixtures carry (`poolside_laguna_xs_2_1_nvfp4`): mlx-community is
 the *distributor* of an Alibaba model, not its author, so a `mlx_community_`
 prefix would name the wrong party for the artifact being described. The two
-filenames are consumed by `Tests/MLXFastTests/Qwen35ArtifactFixtureSupport.swift`.
+filenames are consumed by `Tests/MLXFastTests/Model/Qwen35ArtifactFixtureSupport.swift`.
 
 The config fixture is the complete public `config.json`, normalized only for
 JSON formatting. The inventory fixture was extracted by reading only the three

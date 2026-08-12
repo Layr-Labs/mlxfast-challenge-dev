@@ -7,7 +7,9 @@ import MLXFastCore
 let poolsideLagunaRepository = "poolside/Laguna-XS-2.1-NVFP4-mlx"
 let poolsideLagunaRevision = "841778bda563a36104dd521e37d99218e46f4f25"
 
+// Tests/MLXFastTests/Model/<this file> -> repository root is four levels up.
 private let lagunaArtifactRepositoryRoot = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
     .deletingLastPathComponent()
     .deletingLastPathComponent()
     .deletingLastPathComponent()
