@@ -1550,10 +1550,18 @@ private enum MLXFastCLI {
         let raw = canonical.isEmpty ? alias : canonical
         guard !raw.isEmpty else {
             throw MLXFastError.invalidInput(
-                "the MTP verbs require --mtp-depth N (1 is the serial control)"
+                "the MTP verbs require --mtp-depth N (0 is the true serial "
+                + "control: MTP off. 1 is a speculative-depth-1 diagnostic, "
+                + "NOT the control)"
             )
         }
-        return try positiveInteger(raw, name: "--mtp-depth")
+        // NOT `positiveInteger`: 0 is the true serial control (MTP off) and is
+        // the depth the paired score divides by.
+        guard let depth = Int(raw), depth >= 0 else {
+            throw MLXFastError.invalidInput(
+                "--mtp-depth must be a non-negative integer, got '\(raw)'")
+        }
+        return depth
     }
 
     private static func qwenMTPHeadPath(_ options: ParsedOptions) throws -> String {
@@ -1822,8 +1830,14 @@ private enum MLXFastCLI {
             "official_score_produced": false,
             "mtp_depth": report.depth,
             // The serial control's depth, carried so a reader of one side's
-            // report can see what the other side was measured at.
-            "serial_control_depth": 1,
+            // report can see what the other side was measured at. It is 0 --
+            // MTP OFF -- not 1: depth 1 still drafts and accepts, so dividing by
+            // it measures depth 2 against one-deep speculation rather than
+            // against serial decode.
+            "serial_control_depth": MLXFastConstants.qwenMTPSerialControlDepth,
+            // The one bit that separates a denominator from a numerator, stated
+            // rather than inferred from `mtp_depth` by every consumer.
+            "is_serial_control": report.isSerialControl,
             // TWO SPELLINGS, ONE PREDICATE ("the pinned native MTP head drafted
             // this run", i.e. depth > 1). The box-owned wrapper asserts
             // `uses_native_mtp_head`; the ranked workflow and the local runner

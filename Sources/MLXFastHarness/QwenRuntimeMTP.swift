@@ -288,7 +288,23 @@ public struct QwenMTPReport: Equatable {
     /// artifact, and a 512-token ledger of top-2 readouts would dominate it).
     public let ledger: [QwenMTPLedgerRow]
 
-    public var usesNativeMTPHead: Bool { depth > 1 }
+    /// True when the pinned native MTP head DRAFTED for this run.
+    ///
+    /// The predicate is `depth >= 1`, not `depth > 1`: at depth 1 the head really
+    /// does draft, verify and accept — box 3 measured a 0.699 accept rate over
+    /// 302 rounds at 512 tokens — so calling it "not using the head" was the
+    /// mislabel that let a one-deep speculative decoder serve as the serial
+    /// denominator. The true control is depth 0, where nothing on the hot path
+    /// reads the head at all (it stays attached and resident so its cost is
+    /// charged to both sides of the pair).
+    public var usesNativeMTPHead: Bool {
+        depth > MLXFastConstants.qwenMTPSerialControlDepth
+    }
+
+    /// True only for the depth this track divides by.
+    public var isSerialControl: Bool {
+        depth == MLXFastConstants.qwenMTPSerialControlDepth
+    }
     public var decodeSecondsPerToken: Double {
         decodeSeconds / Double(Swift.max(decodeTokenCount, 1))
     }

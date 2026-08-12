@@ -230,6 +230,21 @@ public enum MLXFastConstants {
     /// on this checkpoint. The ceiling exists so a request cannot ask the worker
     /// for an unbounded verify width.
     public static let qwenMTPMaxDepth = 8
+
+    /// The depth of the TRUE SERIAL CONTROL: 0, meaning MTP OFF.
+    ///
+    /// Operator design, and it is not a naming choice. Depth 1 is NOT serial: it
+    /// is a one-deep speculative decoder that still drafts, still verifies and
+    /// still accepts — measured on box 3 at 512 tokens it ran 302 rounds with a
+    /// 0.699 accept rate, i.e. an ALREADY-ACCELERATED baseline. Dividing by it
+    /// measures depth-2 against one-deep speculation, not against serial decode,
+    /// and that is how a 0.875x "speedup" came out of a method the authors
+    /// measured at 1.34x @ 128 against true serial.
+    ///
+    /// Depth 0 therefore drafts nothing and consults the head not at all: one
+    /// token per target forward. Depth 1 remains available as a labelled
+    /// speculative-depth-1 diagnostic and is never the denominator.
+    public static let qwenMTPSerialControlDepth = 0
     // Criterion E residual bucket: emitted tokens that match NEITHER the
     // reference K=1 argmax NOR the reference argmax in the candidate-declared
     // block frame are counted here and must additionally sit inside the

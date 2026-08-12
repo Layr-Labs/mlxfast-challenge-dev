@@ -156,6 +156,80 @@ struct QwenMTPPayloadSchemaTests {
         }
     }
 
+    /// THE SERIAL CONTROL IS DEPTH 0, AND THE LEDGER CLOSES THERE.
+    ///
+    /// Box 3 measured the old depth-1 "control" running 512 tokens in 302 rounds
+    /// at a 0.699 accept rate — an already-accelerated baseline — which is why
+    /// the paired ratio came out at 0.875x for a method the authors measured at
+    /// 1.34x @ 128 against true serial. Depth 0 emits exactly one token per
+    /// round, so rounds == tokens and every declared row is the round's own
+    /// target tail row.
+    @Test
+    func theSerialControlIsDepthZeroAndItsLedgerCloses() throws {
+        #expect(MLXFastConstants.qwenMTPSerialControlDepth == 0)
+        // `rows_per_round(0) == 1` — the box wrapper's shell arithmetic
+        // (`depth + 1`) needs no special case for the control.
+        #expect(QwenMTPRowAccounting.rowsPerRound(depth: 0) == 1)
+
+        let tokens = 512
+        #expect(
+            QwenMTPRowAccounting.closes(
+                emittedTokenTotal: tokens,
+                configuredTokenTotal: tokens,
+                declaredRowTotal: tokens,
+                referenceCheckedRowTotal: tokens,
+                acceptedDraftTotal: 0,
+                rejectedDraftTotal: 0,
+                targetTailTotal: tokens,
+                roundCount: tokens,
+                depth: 0,
+                seedTokenCount: 512,
+                targetCacheOffsetFinal: 512 + tokens
+            ))
+        // A "serial" run that drafted anything must NOT close at depth 0: that is
+        // the one-deep speculative decoder this depth exists to exclude.
+        #expect(
+            !QwenMTPRowAccounting.closes(
+                emittedTokenTotal: tokens,
+                configuredTokenTotal: tokens,
+                declaredRowTotal: tokens + 40,
+                referenceCheckedRowTotal: tokens + 40,
+                acceptedDraftTotal: 40,
+                rejectedDraftTotal: 0,
+                targetTailTotal: tokens,
+                roundCount: 302,
+                depth: 0,
+                seedTokenCount: 512,
+                targetCacheOffsetFinal: 512 + tokens
+            ),
+            """
+            a depth-0 ledger with accepted drafts still closes. Depth 0 must \
+            draft nothing; a control that speculates is an accelerated \
+            denominator and every score divided by it is understated.
+            """
+        )
+    }
+
+    /// The control depth is one constant, shared by the payload, the local
+    /// runner and the box wrapper's QMTP_SERIAL_DEPTH.
+    @Test
+    func theControlDepthIsOneConstantAcrossEveryConsumer() throws {
+        let cli = try S.text(Self.cliPath)
+        #expect(
+            cli.contains(
+                "\"serial_control_depth\": MLXFastConstants.qwenMTPSerialControlDepth"),
+            "the payload hard-codes a control depth instead of sharing the constant")
+        let runner = try S.text("benchmark-qwen-mtp.sh")
+        #expect(
+            runner.contains("--mtp-depth 0 > \"${serial_report}\""),
+            """
+            the local runner's baseline leg is not at depth 0. Depth 1 still \
+            drafts and accepts, so it is not a serial control.
+            """
+        )
+        #expect(runner.contains(".is_serial_control == true"))
+    }
+
     /// `rows_per_round` is duplicated across a Swift constant and a shell
     /// function in a file this repository does not own. Pin the value so the two
     /// cannot drift silently.
@@ -324,11 +398,19 @@ struct QwenMTPPayloadSchemaTests {
             accept a run the other would reject.
             """
         )
-        // ... and the depth predicate itself: depth 1 is the serial control and
+        // ... and the depth predicate itself. DEPTH 0 is the serial control and
         // must report FALSE, which is what the local runner's baseline leg jq
-        // requires. Asserted on the behaviour, not on the source text.
-        #expect(!Self.headBooleanReport(depth: 1).usesNativeMTPHead)
+        // requires. DEPTH 1 must report TRUE: the head really does draft there
+        // (box 3 measured a 0.699 accept rate over 302 rounds at 512 tokens), and
+        // calling that "not using the head" is what let a one-deep speculative
+        // decoder serve as the serial denominator. Asserted on the behaviour, not
+        // on the source text.
+        #expect(!Self.headBooleanReport(depth: 0).usesNativeMTPHead)
+        #expect(Self.headBooleanReport(depth: 0).isSerialControl)
+        #expect(Self.headBooleanReport(depth: 1).usesNativeMTPHead)
+        #expect(!Self.headBooleanReport(depth: 1).isSerialControl)
         #expect(Self.headBooleanReport(depth: 2).usesNativeMTPHead)
+        #expect(!Self.headBooleanReport(depth: 2).isSerialControl)
     }
 
     /// A minimal report used only to exercise the depth-derived head predicate.

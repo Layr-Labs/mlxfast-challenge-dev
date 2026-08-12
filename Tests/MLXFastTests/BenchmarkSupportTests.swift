@@ -1854,6 +1854,18 @@ func runtimeWorkerWatchdogAtomicCancellationDisarmsTimer() {
 
 @Test
 func runtimeWorkerClientCancelsSuccessfulRequestWatchdogs() throws {
+    // TIMING-SENSITIVE BY CONSTRUCTION, so give the fake worker room. This test
+    // asserts that a SUCCEEDED request cancels its watchdog, which it proves by
+    // sleeping 0.25s -- 2.5x the 0.1s request timeout -- between two requests and
+    // requiring the second to still be served. Under full-suite parallelism the
+    // 2s hello timeout was the part that lost the race (observed: 12.1s wall,
+    // versus 0.41s isolated), because a `/bin/sh` spawn competing with the rest
+    // of the suite can take longer than that to produce its first line.
+    //
+    // Only the HELLO budget is widened. The request timeout, the sleep and the
+    // ordering are untouched, so what the test asserts is unchanged: a stale
+    // watchdog would still fire during the sleep and fail the second request no
+    // matter how long the handshake took.
     let executable = try makeRuntimeWorkerScript("""
     #!/bin/sh
     printf '%s\\n' '{"id":0,"nonce":"test-nonce","ok":true}'
@@ -1867,7 +1879,7 @@ func runtimeWorkerClientCancelsSuccessfulRequestWatchdogs() throws {
     let client = try RuntimeWorkerClient(
         options: RuntimeWorkerOptions(
             executablePath: executable.path,
-            helloTimeoutSeconds: 2,
+            helloTimeoutSeconds: 30,
             requestTimeoutSeconds: 0.1,
             shutdownTimeoutSeconds: 0.1,
             terminationGraceSeconds: 0.05

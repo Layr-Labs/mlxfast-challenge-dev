@@ -58,9 +58,11 @@ func validateQwenMTPRoundRequest(
           request.seedTokenCount == nil,
           request.verifyBlockTokens == nil,
           let depth = request.maxBlockSize,
-          // 1 is legal: it is the serial control the paired score divides by,
-          // served by the same worker, the same protocol and the same forward.
-          depth >= 1,
+          // 0 is legal and is the TRUE SERIAL CONTROL the paired score divides
+          // by -- MTP off, one token per target forward -- served by the same
+          // worker, the same protocol and the same forward. 1 is also legal and
+          // is a labelled speculative-depth-1 diagnostic, never a denominator.
+          depth >= Qwen36MTPLimits.serialControlDepth,
           depth <= Qwen36MTPLimits.maxDepth
     else {
         throw MLXFastError.invalidInput(
@@ -70,8 +72,10 @@ func validateQwenMTPRoundRequest(
         throw MLXFastError.invalidInput(
             "MTP worker has a negative committed token count")
     }
+    // Depth 0 commits exactly one token per round; every other depth commits at
+    // most `depth + 1`.
     let (requestedTotal, overflow) =
-        decodedTokenCount.addingReportingOverflow(depth + 1)
+        decodedTokenCount.addingReportingOverflow(Swift.max(depth + 1, 1))
     guard !overflow,
           requestedTotal
               <= MLXFastConstants.experimentalDFlashMaxConfiguredTotalTokens
@@ -349,6 +353,14 @@ extension QwenRuntime {
                       // it was produced at rather than a round later.
                       result.acceptedDraftCount + result.rejectedDraftCount
                           + 1 == result.declaredRows,
+                      // Depth 0 must commit exactly one token and declare exactly
+                      // one row: a serial control that drafted anything would be
+                      // an accelerated denominator, which is the specific defect
+                      // this depth exists to remove.
+                      round.depth != Qwen36MTPLimits.serialControlDepth
+                          || (result.tokens.count == 1
+                              && result.declaredRows == 1
+                              && result.draftTokens.isEmpty),
                       result.perRowTop2Tokens.count == result.declaredRows,
                       result.perRowTop2Logits.count == result.declaredRows
                 else {

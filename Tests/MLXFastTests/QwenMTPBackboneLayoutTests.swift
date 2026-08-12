@@ -366,20 +366,44 @@ struct QwenMTPMetallibAvailabilityTests {
     @Test(.enabled(if: ProcessInfo.processInfo
         .environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1"))
     func theMetallibIsBesideTheTestBundleWhenGatedTestsAreRequested() throws {
-        let executable = URL(
-            fileURLWithPath: ProcessInfo.processInfo.arguments[0])
-        let beside = executable.deletingLastPathComponent()
-            .appendingPathComponent("mlx.metallib")
+        // DERIVED FROM THE BUNDLE, NOT FROM argv[0]. Under SwiftPM the running
+        // executable is the toolchain's `xctest` helper, which lives in the
+        // toolchain and never carries a metallib -- so an argv[0]-derived check
+        // failed on EVERY gated run even when placement was correct. Box 3 hit
+        // exactly that: the gated MLX tests genuinely ran for 5s+ while this
+        // check reported the metallib missing.
+        //
+        // The bundle's own directory is where the loaded test code lives and
+        // where `--all-build-roots` publishes, so that is what to look at.
+        var candidates: [URL] = []
+        for bundle in Bundle.allBundles
+        where bundle.bundleURL.pathExtension == "xctest" {
+            candidates.append(bundle.bundleURL
+                .appendingPathComponent("Contents/MacOS"))
+            candidates.append(bundle.bundleURL.deletingLastPathComponent())
+        }
+        candidates.append(Bundle.main.bundleURL)
+        candidates.append(Bundle.main.bundleURL.deletingLastPathComponent())
+
+        // Not being able to identify a bundle is not evidence of a missing
+        // metallib, and a check that cannot tell the difference is worse than no
+        // check: it is the false failure this test was just fixed for.
+        guard !candidates.isEmpty else { return }
+        let found = candidates.contains {
+            FileManager.default.fileExists(
+                atPath: $0.appendingPathComponent("mlx.metallib").path)
+        }
         #expect(
-            FileManager.default.fileExists(atPath: beside.path),
+            found,
             """
-            MLXFAST_RUN_MLX_RUNTIME_TESTS=1 is set but there is no mlx.metallib \
-            at \(beside.path). Cmlx searches next to the RUNNING executable, and \
-            tools/build-mlx-metallib.sh writes it next to the worker binary only. \
-            Run `tools/build-mlx-metallib.sh --all-build-roots`, which places it \
-            beside the trusted CLI and every xctest bundle as well. Without it \
-            every MLX-gated test in this repository fails at its first MLXArray, \
-            and a run that SKIPS them exits 0 having proven nothing.
+            MLXFAST_RUN_MLX_RUNTIME_TESTS=1 is set but no mlx.metallib was found \
+            beside the loaded test bundle. Searched: \
+            \(candidates.map(\.path).joined(separator: ", ")). \
+            tools/build-mlx-metallib.sh publishes next to the WORKER binary only \
+            and its test-bundle publish is gated on a debug configuration it does \
+            not default to. Run `tools/build-mlx-metallib.sh --all-build-roots`. \
+            Without it every MLX-gated test fails at its first MLXArray, and a \
+            run that SKIPS them exits 0 having proven nothing.
             """
         )
     }

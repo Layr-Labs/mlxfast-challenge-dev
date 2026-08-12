@@ -11,7 +11,7 @@
 #   2. GPU cool gate           `./benchmark.sh --local-cool-gate-only`, the base
 #                              local loop's own 40C gate, before EACH
 #                              model-resident leg.
-#   3. serial K=1 control      `mlxfast-swift mtp-timed --mtp-depth 1`  (denominator)
+#   3. TRUE serial control     `mlxfast-swift mtp-timed --mtp-depth 0`  (denominator)
 #   4. native-MTP decode       `mlxfast-swift mtp-timed`            (numerator)
 #
 # The reference rows both measured legs decode come from `mlxfast-swift
@@ -433,18 +433,24 @@ if ! jq -e --argjson tokens "${token_count}" '
   exit 1
 fi
 
-# --- 3. serial K=1 control (denominator) -------------------------------------
-# Depth 1 is the same worker, the same protocol and the same forward with the
-# speculative width pinned to 1, head loaded and never used. That is what makes
-# the ratio like-for-like.
-run_cool_gate "the serial K=1 control"
-echo "benchmark-qwen-mtp.sh: measuring the serial K=1 control (${token_count} tokens)" >&2
+# --- 3. TRUE serial control, MTP OFF (denominator) ---------------------------
+# Depth 0 is the same binary, the same worker, the same protocol and the same
+# target forward with speculation switched OFF: one token per forward, no
+# drafting, no head consultation on the hot path. The head stays LOADED so its
+# residency is charged to both sides; only the drafting differs.
+#
+# NOT depth 1. Depth 1 still drafts, verifies and accepts -- box 3 measured 302
+# rounds at a 0.699 accept rate over a 512-token window -- so it is an
+# already-accelerated baseline, and dividing by it measures depth 2 against
+# one-deep speculation instead of against serial decode.
+run_cool_gate "the true serial control"
+echo "benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (${token_count} tokens)" >&2
 "${swift_bin}" "${TIMED_VERB}" \
   --weights "${weights_path}" \
   --mtp-head "${MLXFAST_QWEN_MTP_HEAD_DIR}" \
   --golden "${golden_path}" \
   --tokens "${token_count}" \
-  --mtp-depth 1 > "${serial_report}"
+  --mtp-depth 0 > "${serial_report}"
 
 # --- 4. native-MTP decode (numerator) ----------------------------------------
 run_cool_gate "the native-MTP decode"
@@ -462,7 +468,8 @@ jq -e --arg track "${TRACK_ID}" --argjson tokens "${token_count}" '
   .track_id == $track
   and .official_score_produced == false
   and .uses_pinned_mtp_head == false
-  and .mtp_depth == 1
+  and .is_serial_control == true
+  and .mtp_depth == 0
   and .decode_token_count == $tokens
   and .all_tokens_matched == true
   and (.parent_measured_seconds_per_token | type == "number" and . > 0)
@@ -473,6 +480,7 @@ jq -e --arg track "${TRACK_ID}" --argjson tokens "${token_count}" '
   .track_id == $track
   and .official_score_produced == false
   and .uses_pinned_mtp_head == true
+  and .is_serial_control == false
   and .mtp_depth > 1
   and .decode_token_count == $tokens
   and .all_tokens_matched == true

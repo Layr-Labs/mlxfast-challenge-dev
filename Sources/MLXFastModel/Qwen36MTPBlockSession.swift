@@ -146,6 +146,10 @@ public final class Qwen36MTPBlockSession {
     /// every legal width `1 ... maxDepth + 1`, and the head's single-token draft
     /// step — on throwaway cache state. Nothing here sees a seed.
     public func warmAllDepths(maxDepth: Int) throws {
+        // Warms every legal verify width from 1 (the serial control's
+        // single-token forward) up to maxDepth + 1, plus the head's draft step.
+        // The head warm runs even for a serial-only session: the head is resident
+        // on both sides, so warming it on both keeps the load shape identical.
         guard maxDepth >= 1, maxDepth <= Qwen36MTPLimits.maxDepth else {
             throw Qwen36MTPSessionError.invalidDepth(maxDepth)
         }
@@ -213,7 +217,9 @@ public final class Qwen36MTPBlockSession {
     public func generateRound(depth: Int) throws -> Qwen36MTPRoundResult {
         guard began, let logitsRow = pendingLogitsRow, let hidden = pendingHidden
         else { throw Qwen36MTPSessionError.notBegun }
-        guard depth >= 1, depth <= Qwen36MTPLimits.maxDepth else {
+        guard depth >= Qwen36MTPLimits.serialControlDepth,
+              depth <= Qwen36MTPLimits.maxDepth
+        else {
             throw Qwen36MTPSessionError.invalidDepth(depth)
         }
         roundCount += 1
@@ -253,6 +259,45 @@ public final class Qwen36MTPBlockSession {
                 perRowTop2Logits: [tailLogits],
                 targetCacheOffset: seedTokenCount + committedTokenCount,
                 reachedStopToken: true
+            )
+        }
+
+        // DEPTH 0 = THE TRUE SERIAL CONTROL. One token per target forward: no
+        // draft, no head cache, no head forward, no verify window and therefore
+        // no rollback. The head stays ATTACHED and resident -- the paired
+        // contract charges its residency to both sides, so the denominator must
+        // carry the same memory and the same load shape -- but nothing on this
+        // path reads it. That is the difference between "MTP off" and "MTP depth
+        // 1", and it is the whole reason this branch exists.
+        //
+        // The single row this forward produces IS the round's target tail row:
+        // its argmax becomes the next primary, exactly as the bonus row does on
+        // the speculative path. So the ledger closes with declaredRows = 1,
+        // accepted = rejected = 0, tail = 1 -- and `rows_per_round(0) = 1` in the
+        // box wrapper agrees without any special case there.
+        if depth == Qwen36MTPLimits.serialControlDepth {
+            let (serialLogits, serialHidden) = model.callWithHidden(
+                input: LMInput.Text(
+                    tokens: MLXArray([primary]).reshaped([1, 1])),
+                cache: cache, nConfirmed: 0)
+            pendingLogitsRow = serialLogits[
+                0..., (serialLogits.dim(1) - 1) ..< serialLogits.dim(1), 0...]
+            // Still produced, still post-norm: keeping the hidden chain identical
+            // means switching depth is the ONLY difference between the two sides.
+            pendingHidden = hiddenRow(serialHidden, serialHidden.dim(1) - 1)
+            eval(cache.flatMap { $0.state })
+            if let row = pendingLogitsRow, let h = pendingHidden { eval(row, h) }
+            let (tailTokens, tailLogits) = Self.topTwo(of: lastRow(serialLogits))
+            return Qwen36MTPRoundResult(
+                tokens: committed,
+                declaredRows: 1,
+                draftTokens: [],
+                acceptedDraftCount: 0,
+                rejectedDraftCount: 0,
+                perRowTop2Tokens: [tailTokens],
+                perRowTop2Logits: [tailLogits],
+                targetCacheOffset: seedTokenCount + committedTokenCount,
+                reachedStopToken: false
             )
         }
 
@@ -492,4 +537,9 @@ public enum Qwen36MTPLimits {
     /// Single source of truth is `MLXFastConstants.qwenMTPMaxDepth`: the trusted
     /// parent bounds the same quantity and links no model code.
     public static let maxDepth = MLXFastConstants.qwenMTPMaxDepth
+
+    /// Depth 0: MTP off, one token per target forward. See
+    /// `MLXFastConstants.qwenMTPSerialControlDepth` for why this is 0 and not 1.
+    public static let serialControlDepth =
+        MLXFastConstants.qwenMTPSerialControlDepth
 }

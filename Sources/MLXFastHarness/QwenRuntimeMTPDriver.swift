@@ -60,8 +60,11 @@ extension QwenRuntime {
                     + "\(options.totalTokenCount + 1)."
             )
         }
-        guard options.depth >= 1 else {
-            throw MLXFastError.invalidInput("--mtp-depth must be at least 1")
+        guard options.depth >= MLXFastConstants.qwenMTPSerialControlDepth else {
+            throw MLXFastError.invalidInput(
+                "--mtp-depth must be at least "
+                    + "\(MLXFastConstants.qwenMTPSerialControlDepth) "
+                    + "(0 is the true serial control: MTP off)")
         }
 
         let client = try RuntimeWorkerClient(
@@ -125,9 +128,15 @@ extension QwenRuntime {
             // The one case the clamp cannot cover is `remaining == 1`: the
             // minimum legal depth is 1 and an accepted draft would then commit
             // two tokens. That round is truncated below instead.
+            //
+            // The serial control is exempt: depth 0 commits exactly one token per
+            // round, so it can never overrun, and clamping it to 1 would silently
+            // turn the denominator back into a one-deep speculative decoder.
             let remaining = options.totalTokenCount - emitted.count
-            let requestedDepth = Swift.max(
-                1, Swift.min(options.depth, remaining - 1))
+            let requestedDepth =
+                options.depth == MLXFastConstants.qwenMTPSerialControlDepth
+                ? MLXFastConstants.qwenMTPSerialControlDepth
+                : Swift.max(1, Swift.min(options.depth, remaining - 1))
             let roundStart = Date()
             let response = try client.mtpDecodeRound(depth: requestedDepth)
             let latency = Date().timeIntervalSince(roundStart)
@@ -159,7 +168,8 @@ extension QwenRuntime {
             // including the serial control: a denominator measured over fewer
             // tokens than the numerator is the worst possible silent failure on
             // a paired track.
-            if round.draftTokens.isEmpty {
+            if round.draftTokens.isEmpty
+                && options.depth != MLXFastConstants.qwenMTPSerialControlDepth {
                 throw QwenMTPContractViolation(
                     kind: .stopTokenInsideWindow,
                     step: emitted.count,
