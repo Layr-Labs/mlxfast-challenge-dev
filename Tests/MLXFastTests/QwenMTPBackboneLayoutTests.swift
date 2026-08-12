@@ -366,29 +366,34 @@ struct QwenMTPMetallibAvailabilityTests {
     @Test(.enabled(if: ProcessInfo.processInfo
         .environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1"))
     func theMetallibIsBesideTheTestBundleWhenGatedTestsAreRequested() throws {
-        // DERIVED FROM THE BUNDLE, NOT FROM argv[0]. Under SwiftPM the running
-        // executable is the toolchain's `xctest` helper, which lives in the
-        // toolchain and never carries a metallib -- so an argv[0]-derived check
-        // failed on EVERY gated run even when placement was correct. Box 3 hit
-        // exactly that: the gated MLX tests genuinely ran for 5s+ while this
-        // check reported the metallib missing.
+        // ANCHORED ON A TYPE IN THIS MODULE, not on argv[0] and not on
+        // `Bundle.allBundles`. Two false-failure modes had to be ruled out, and
+        // box 3 hit BOTH while the gated MLX tests were demonstrably running
+        // (9s+ of real MLXArray work) and this check reported "missing":
         //
-        // The bundle's own directory is where the loaded test code lives and
-        // where `--all-build-roots` publishes, so that is what to look at.
-        var candidates: [URL] = []
+        //   * argv[0] under SwiftPM is the toolchain's `xctest` helper, which
+        //     lives in the toolchain and never carries a metallib;
+        //   * `Bundle.allBundles` does not list the .xctest bundle under
+        //     swift-testing, so the loop contributed nothing -- and because
+        //     `Bundle.main` still appended two toolchain paths, `candidates` was
+        //     never empty and the "cannot identify a bundle" guard never fired.
+        //
+        // `Bundle(for:)` on a type defined in THIS module returns the bundle
+        // that actually contains the loaded test code, which is what
+        // `--all-build-roots` publishes into. That is the question being asked,
+        // so ask it directly.
+        let testBundle = Bundle(for: MetallibProbe.self)
+        var candidates: [URL] = [
+            testBundle.bundleURL.appendingPathComponent("Contents/MacOS"),
+            testBundle.bundleURL.appendingPathComponent("Contents/Resources"),
+            testBundle.bundleURL.deletingLastPathComponent(),
+        ]
         for bundle in Bundle.allBundles
         where bundle.bundleURL.pathExtension == "xctest" {
             candidates.append(bundle.bundleURL
                 .appendingPathComponent("Contents/MacOS"))
             candidates.append(bundle.bundleURL.deletingLastPathComponent())
         }
-        candidates.append(Bundle.main.bundleURL)
-        candidates.append(Bundle.main.bundleURL.deletingLastPathComponent())
-
-        // Not being able to identify a bundle is not evidence of a missing
-        // metallib, and a check that cannot tell the difference is worse than no
-        // check: it is the false failure this test was just fixed for.
-        guard !candidates.isEmpty else { return }
         let found = candidates.contains {
             FileManager.default.fileExists(
                 atPath: $0.appendingPathComponent("mlx.metallib").path)
@@ -408,3 +413,12 @@ struct QwenMTPMetallibAvailabilityTests {
         )
     }
 }
+
+/// Anchor for `Bundle(for:)` in `QwenMTPMetallibAvailabilityTests`.
+///
+/// A class, and in this module, for the only reason that matters: `Bundle(for:)`
+/// takes an AnyClass and resolves to the bundle containing that class's binary.
+/// swift-testing suites are structs, so without this there is no type here to
+/// hand it, which is how the check ended up asking `Bundle.allBundles` a
+/// question it does not answer.
+private final class MetallibProbe {}
