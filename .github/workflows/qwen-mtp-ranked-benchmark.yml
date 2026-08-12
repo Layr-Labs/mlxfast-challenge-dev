@@ -144,12 +144,14 @@ jobs:
       # --- Track contract ------------------------------------------------
       MLXFAST_QWEN_MTP_TRACK_ID: qwen3.6-27b-mtp-v1
       MLXFAST_QWEN_MTP_TRACK_NAME: mlxfast-challenge-dev-qwen-mtp
-      # QWEN-PENDING-ORGANIZER: the track contract fixture does not exist yet.
-      # It is the phase-5 artifact carrying official_scoring_enabled,
-      # reference_baseline.publication_allowed, the timed_prompt_pool and each
-      # pool entry's pinned no-op reference. "Enforce Qwen-MTP track enablement"
-      # does `test -s` on this path, so every dispatch fails closed until the
-      # operator authors and lands it.
+      # The phase-5 track contract fixture, now AUTHORED: it carries
+      # official_scoring_enabled, reference_baseline.publication_allowed, the
+      # 8-entry timed_prompt_pool and each pool entry's MEASURED no-op
+      # reference. "Enforce Qwen-MTP track enablement" does `test -s` on this
+      # path, and then refuses a RANKED dispatch while either
+      # official_scoring_enabled or reference_baseline.publication_allowed is
+      # false -- both are still false, so ranked runs stay refused and only
+      # run_benchmark=false gates-only dry runs proceed.
       MLXFAST_QWEN_MTP_CONTRACT_PATH: fixtures/qwen3_6_27b_mtp_track.json
       # The BENCHMARK MANIFEST (editablePaths / scoring), distinct from the track
       # contract fixture above. Passed as CONTRACT_PATH to BOTH
@@ -185,12 +187,15 @@ jobs:
       MLXFAST_QWEN_MTP_DEPTH: "2"
       MLXFAST_QWEN_MTP_DECODE_TOKENS: "512"
       MLXFAST_QWEN_MTP_CORRECTNESS_TOKENS: "512"
-      # QWEN-PENDING-ORGANIZER. The normalised floor is a MEASURED quantity
-      # derived from the pool's own no-op references, not a value that can be
-      # guessed from the DFlash track (different method, different acceptance
-      # rate, different verify-row cost). It stays a placeholder so no dispatch
-      # can be scored against an invented threshold.
-      MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR: "QWEN-MTP-PENDING-ORGANIZER"
+      # RESOLVED (phase 5, box 3 at tip 6a3bee9). The floor is NORMALISED, so
+      # its value is method-independent: each pool entry's own MEASURED
+      # noop_decode_speedup normalises to 1.0 and the floor is the 0.95 margin
+      # below that, matching the DFlash convention. The measurement that makes
+      # this legitimate is the per-entry noop_decode_speedup in
+      # fixtures/qwen3_6_27b_mtp_track.json -- raw ratios spanning 0.756 to
+      # 1.0915 across the 8 prompts, which is precisely why the RAW ratio could
+      # never carry a fixed floor.
+      MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR: "0.95"
       MLXFAST_QWEN_MTP_MIN_ACCEPTED_PAIRS: "3"
       MLXFAST_QWEN_MTP_TARGET_PAIRS: "4"
       # Attributable ranked failures allowed per submission branch (contract
@@ -212,17 +217,22 @@ jobs:
       # Their digests + byte counts are pinned here and the matching R2 object
       # keys (in "Prepare hidden correctness golden") embed the same digests.
       #
-      # STILL PENDING (phase 2 -- the native-MTP head is byte-verified on box 3
-      # but not yet integrated into the ranked runtime, so no MTP-head golden
-      # and no measured no-op reference can be produced): the MTP-specific
-      # hidden correctness golden below and MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR
-      # (above) carry the literal QWEN-MTP-PENDING-ORGANIZER, which the
-      # pin-completeness gate rejects BY NAME (before any secret is used), fails
-      # the 64-hex / positive-integer shape checks, and would fail the download
-      # digest comparison -- three independent refusals keep the track
-      # fail-closed while ANY one of these remains a placeholder.
-      MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_SHA256: QWEN-MTP-PENDING-ORGANIZER
-      MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_BYTES: "QWEN-MTP-PENDING-ORGANIZER"
+      # RESOLVED (phase 5 -- the native-MTP head is now integrated into the
+      # ranked runtime, so the MTP-head golden and the measured no-op references
+      # both exist). Generated on box 3 at tip 6a3bee9 against the Qwen 3.6
+      # tower with the pinned MTP head, from the hidden correctness prompt's own
+      # 512 seed tokens: `mtp-verify --emitted <plan> --generate 513`
+      # (reference_self_consistent=true, 513 rows), then re-verified by a
+      # `mtp-verify --tokens 512 --mtp-depth 2` pass that returned
+      # all_tokens_matched=true, parity_all_ok=true and a CLOSED row ledger
+      # (767/767 reference-checked).
+      #
+      # NOTE the object itself is NOT yet uploaded to R2; the key below embeds
+      # this digest and the download step will fail until the operator uploads
+      # it. That is the intended fail-closed ordering -- digest first, upload
+      # second -- and it is why official_scoring_enabled stays false.
+      MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_SHA256: 0c1dcdabd85e7655f5df03e5a1265a5fde1a43ef223283021463f7af80481add
+      MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_BYTES: "110168"
       MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: eef3b817e390759275b7bc3570b10bb2846d2303000a0c9f1d627ad70f718c1e
       MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "21036"
       MLXFAST_GPQA_REFERENCE_SHA256: d05e93e9694d86e0041e6b9c843642d4637de524e9a1b88a145caaa0da6235fe
@@ -1703,10 +1713,14 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          # QWEN-PENDING-ORGANIZER. The correctness golden key is fixed (it is an
+          # RESOLVED (phase 5). The correctness golden key is fixed (it is an
           # untimed gate and is not what the lottery would target); the timed
-          # golden key comes from the per-run pool selection.
-          MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-mtp-correctness-golden-hidden-QWEN-MTP-PENDING-ORGANIZER.json
+          # golden key comes from the per-run pool selection. Per this track's
+          # convention the key embeds the object's own SHA-256, so the key and
+          # MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_SHA256 cannot drift apart
+          # silently -- a digest edit that misses the key produces a 404, not a
+          # mismatched gate.
+          MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-mtp-correctness-golden-hidden-0c1dcdabd85e7655f5df03e5a1265a5fde1a43ef223283021463f7af80481add.json
           MLXFAST_QWEN_MTP_BENCH_GOLDEN_R2_PATH: ${{ steps.select_qwen_mtp_target.outputs.r2_path }}
           MLXFAST_QWEN_MTP_BENCH_GOLDEN_SHA256_SELECTED: ${{ steps.select_qwen_mtp_target.outputs.sha256 }}
           MLXFAST_QWEN_MTP_BENCH_GOLDEN_BYTES_SELECTED: ${{ steps.select_qwen_mtp_target.outputs.bytes }}

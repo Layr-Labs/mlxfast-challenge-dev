@@ -454,14 +454,59 @@ struct QwenMTPTrackNamingTests {
             )
         )
 
-        // 2. The PHASE-2 hidden-artifact pins are still placeholders -- the
-        //    MTP-head correctness golden and the measured decode floor, neither
-        //    producible until the native-MTP head is integrated into the ranked
-        //    runtime -- and the marker is spelled consistently so the
-        //    pin-completeness gate can find them. The RAW correctness golden and
-        //    the GPQA reference are now RESOLVED (generated on box 3 against the
-        //    Qwen serial tower) and are asserted as real values in step 3 below.
+        // 2. INERTNESS NO LONGER RESTS ON PLACEHOLDER PINS.
+        //
+        //    It used to: the phase-2 MTP-head correctness golden and the
+        //    measured decode floor were unproducible until the native-MTP head
+        //    was integrated into the ranked runtime, so the fail-closed posture
+        //    was spelled as "these pins still contain the marker". Phase 5
+        //    integrated the head, measured the pool on box 3 and RESOLVED all
+        //    three (they are asserted as real values in step 3 below).
+        //
+        //    So the posture moves to where it now actually lives -- the trusted
+        //    contract fixture. "Enforce Qwen-MTP track enablement" refuses a
+        //    RANKED dispatch while EITHER of these is false, and a gates-only
+        //    dry run publishes no score. Both must stay false until the operator
+        //    completes the go-live runbook, which is also when the R2 objects
+        //    these pins name actually get uploaded.
+        let contract = try S.json("fixtures/qwen3_6_27b_mtp_track.json")
+        #expect(
+            contract["official_scoring_enabled"] as? Bool == false,
+            "official_scoring_enabled must stay false until go-live"
+        )
+        let baseline = contract["reference_baseline"] as? [String: Any]
+        #expect(
+            baseline?["publication_allowed"] as? Bool == false,
+            "reference_baseline.publication_allowed must stay false until go-live"
+        )
+        #expect(
+            contract["track_id"] as? String == "qwen3.6-27b-mtp-v1",
+            "the contract track_id must match the workflow's track"
+        )
+        // The pool the normalised floor divides by: 8 entries, all distinct.
+        let pool = contract["timed_prompt_pool"] as? [[String: Any]]
+        #expect(pool?.count == 8, "the timed prompt pool must carry 8 entries")
+        #expect(
+            Set((pool ?? []).compactMap { $0["sha256"] as? String }).count == 8,
+            "the timed prompt pool must name 8 DISTINCT targets"
+        )
+        #expect(
+            (pool ?? []).allSatisfy {
+                ($0["noop_decode_speedup"] as? Double).map { $0 > 0 } ?? false
+            },
+            "every pool entry needs a positive measured no-op reference"
+        )
+
+        //    The marker itself must remain spelled consistently in the workflow,
+        //    because the pin-completeness gate still greps for it: resolving the
+        //    values must not have deleted the guard that catches a REGRESSION
+        //    back to a placeholder.
         let marker = "QWEN-MTP-PENDING-ORGANIZER"
+        #expect(
+            workflow.contains("PENDING_MARKER: \(marker)"),
+            "the pin-completeness gate lost its marker definition"
+        )
+        // And no pin may quietly become a placeholder again.
         for pin in [
             "MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_SHA256",
             "MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_BYTES",
@@ -472,13 +517,8 @@ struct QwenMTPTrackNamingTests {
                 "the workflow declares no \(pin)"
             )
             #expect(
-                value.contains(marker),
-                """
-                \(pin) is '\(value)', not a placeholder. If the organizer \
-                artifact has landed, this test is the reminder to move the \
-                matching R2 object key, the manifest's scoring block and this \
-                assertion in the SAME commit.
-                """
+                !value.contains(marker),
+                "\(pin) regressed to a placeholder ('\(value)')"
             )
         }
 
@@ -508,6 +548,20 @@ struct QwenMTPTrackNamingTests {
                 "d05e93e9694d86e0041e6b9c843642d4637de524e9a1b88a145caaa0da6235fe"
             ),
             ("MLXFAST_GPQA_REFERENCE_BYTES", "9886"),
+            // Phase 5, generated on box 3 against the Qwen tower with the
+            // pinned MTP head. Pinned here for the same reason as the four
+            // above: the digest, the byte count and the R2 object key that
+            // embeds the digest must move in ONE commit or the download gate
+            // fails on a key/digest mismatch.
+            (
+                "MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_SHA256",
+                "0c1dcdabd85e7655f5df03e5a1265a5fde1a43ef223283021463f7af80481add"
+            ),
+            ("MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_BYTES", "110168"),
+            // NORMALISED floor: every pool entry's own measured
+            // noop_decode_speedup normalises to 1.0, so 0.95 is the margin, not
+            // a raw ratio. Measured raw ratios span 0.756-1.0915.
+            ("MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR", "0.95"),
         ] {
             #expect(
                 environment[pin] == expected,

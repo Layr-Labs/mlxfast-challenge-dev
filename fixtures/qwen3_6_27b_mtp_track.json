@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "track_id": "qwen3.6-27b-mtp-v1",
+  "official_scoring_enabled": false,
+  "official_scoring_enabled_note": "NOT ENABLED. Phase 5 authoring only. The track stays fail-closed until the operator completes the go-live runbook and flips BOTH this field and reference_baseline.publication_allowed on the trusted ref. Everything this fixture pins has been measured on box 3 against the real Qwen 3.6 27B tower with the pinned native MTP head (tip 6a3bee9): the 8-entry timed_prompt_pool below carries per-entry digests and MEASURED no-op references, and token_fidelity_gate_status is implemented. What is NOT yet satisfied, and why this stays false: the pool objects and the hidden MTP correctness golden exist only on box 3 and have not been uploaded to R2, so every r2_path here is unresolvable until the operator uploads them. Flipping this to true before that upload would let a ranked dispatch reach the download step and fail there instead of at the enablement gate.",
+  "mlx_swift_lm_revision": "6a3bee95eadaef0445b8201304f3417ec431f0f0",
+  "timed_prompt_pool": [
+    {
+      "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-beagle.json",
+      "sha256": "18372ce49d8bd7109e74468e35f8f0b03220d120711408e0d071ee72675ec518",
+      "bytes": 110237,
+      "noop_decode_speedup": 0.9177
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-botany.json",
+      "sha256": "3c4c6f16a8cf1889653a1dbd2d294eb84ff8ce38a764656e1052ba4a39032e84",
+      "bytes": 110059,
+      "noop_decode_speedup": 0.7848
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-drama.json",
+      "sha256": "20abc6f8c815ae676b79204e09ae05ff478684b1bef9062fb3a6a671ad99ebc6",
+      "bytes": 109671,
+      "noop_decode_speedup": 0.756
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-essays.json",
+      "sha256": "249f11ce6be26fce5d8a1507d3592748b60811301fb56d4c4fb5e83b0a716f5f",
+      "bytes": 109933,
+      "noop_decode_speedup": 1.0699
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-medicine.json",
+      "sha256": "31552c33c0e633eff35ec37fd7dc7b4ec4a1e773cb819641f0031192a4c1d48b",
+      "bytes": 109863,
+      "noop_decode_speedup": 1.0915
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-plutarch.json",
+      "sha256": "faae02408d7e50f7ad372b0a42f03e16d6f05b910a3d8ecfa8afc3b41f72b5f0",
+      "bytes": 110000,
+      "noop_decode_speedup": 0.8502
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-republic.json",
+      "sha256": "7933fd2df8bb2b4bea4f68115c8893829b32f630a683ced1bc5ddd27a3e137f7",
+      "bytes": 110274,
+      "noop_decode_speedup": 0.9621
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-travel.json",
+      "sha256": "7c3b4643da1082ad1219cced981deb606f7e0b22a6e8ef8ef869999a67b42a91",
+      "bytes": 110321,
+      "noop_decode_speedup": 0.9444
+    }
+  ],
+  "timed_prompt_pool_note": "Contract layer L6 (anti-lottery). Each entry IS a timed MTP reference-rows golden (the object the ranked job downloads and passes to mtp-timed --golden), NOT the prose prompt it was seeded from. Each was generated on box 3 with `mtp-verify --emitted <plan> --generate 513` over the transformed weights tree plus the pinned MTP head, from a DIFFERENT 512-token prose seed (8 distinct domains), and each returned reference_self_consistent=true with 513 rows.",
+  "noop_decode_speedup_note": "MEASURED on box 3 at tip 6a3bee9, one paired run per entry: raw_ratio = (depth-0 parent_measured_seconds_per_token) / (depth-2 parent_measured_seconds_per_token) over the same 512-token window and the same rows golden. Depth 0 is the TRUE serial control (MTP off, head resident but never consulted, 512 rounds, accepted=rejected=0). The spread across the pool is LARGE -- 0.756 to 1.0915, a 1.44x span -- because acceptance is prompt-dependent (0.344 to 0.585 measured). That spread is exactly what the normalised score exists to remove: an unnormalised raw ratio would hand a candidate drawn on `medicine` a 1.44x advantage over one drawn on `drama` for identical code. Every entry normalises to 1.0 by construction.",
+  "target": {
+    "upstream_model_id": "mlx-community/Qwen3.6-27B-4bit",
+    "upstream_revision": "c000ac2c2057d94be3fa931000c31723aac53282",
+    "manifest_path": "fixtures/reference_qwen3_6_27b_4bit.sha256",
+    "manifest_sha256": "af856a4402594ad6301237b71523c1a77d6ffdadd779e96ca32d5130c8b38740",
+    "manifest_sha256_note": "SHA-256 of the checked-in manifest file itself, so a tampered manifest is caught before any weight byte is read.",
+    "expected_source_bytes": 16081488494,
+    "expected_source_bytes_note": "Sum of the pinned entries in fixtures/reference_qwen3_6_27b_4bit.sha256.",
+    "model_type": "qwen3_5_text",
+    "model_type_note": "The TRANSFORMED runtime tree declares qwen3_5_text and loads as Qwen35TextModel with the `language_model.` text-tower prefix stripped; the raw pinned reference declares qwen3_5 and loads as the Qwen35Model wrapper. Both are MTP-capable and both are accepted by the worker (verified on box 3 at this tip: layout=textModel and layout=wrappedTextModel both reach the protocol hello).",
+    "num_hidden_layers": 64,
+    "full_attention_interval": 4,
+    "vocab_size": 248320,
+    "quantization": {
+      "mode": "affine",
+      "group_size": 64,
+      "bits": 4
+    }
+  },
+  "mtp_head": {
+    "upstream_model_id": "mlx-community/Qwen3.6-27B-MTP-4bit",
+    "upstream_revision": "83795d546e9d328160e593fb0bf10b2bf2fe637e",
+    "manifest_path": "fixtures/qwen3_6_27b_mtp_head.sha256",
+    "manifest_sha256": "d25144825d85382d2d2ce12f4678f550cde939bf1043fa882b983569de05deac",
+    "expected_total_bytes": 258489240,
+    "tensor_count": 31,
+    "tensor_count_note": "Pinned in MLXFastConstants.qwenMTPHeadTensorCount and asserted at load: a head tree that lost or gained a tensor fails the load instead of drafting from a partly-uninitialised head.",
+    "merge_note": "The head is a SEPARATELY PINNED tree, merged at load under the `mtp.` key prefix before sanitize and before the quantization walk. It is resident on BOTH sides of the pair, so its residency cost is charged to the serial denominator too; only the drafting differs.",
+    "residency_verified": "Byte-verified on box 3 against fixtures/qwen3_6_27b_mtp_head.sha256: 7/7 files match sha256 and byte count, and the staging directory contains exactly those 7 files."
+  },
+  "protocol": {
+    "name": "trusted_qwen_mtp_block_v1",
+    "serial_control_depth": 0,
+    "serial_control_depth_note": "0 means MTP OFF: one token per target forward, no draft, no head cache, no head forward, no verify window, no rollback. It is NOT 1. Depth 1 still drafts one token and accepts ~70% of those drafts (measured 0.699 on box 3), so dividing by depth 1 measures depth 2 against one-deep speculation rather than against serial decode, and understates the gain. The depth-0 leg is asserted structurally, not assumed: round_count == decode tokens, accepted == rejected == 0, declared == target_tail == decode tokens, is_serial_control true, uses_native_mtp_head false.",
+    "candidate_depth": 2,
+    "maximum_depth": 8,
+    "decode_tokens": 512,
+    "parent_oracle_required": true,
+    "worker_timing_is_authoritative": false
+  },
+  "reference_baseline": {
+    "status": "measured_box3_phase5",
+    "publication_allowed": false,
+    "required_rebaseline_hardware": "m5-qwen-mtp",
+    "_note": "The paired depth-0 serial control, the per-prompt no-op references and the thermal/telemetry envelope were all measured on box 3 at tip 6a3bee9. publication_allowed stays false until the operator's go-live runbook: it gates ranked scoring together with official_scoring_enabled."
+  },
+  "proposed_scoring": {
+    "status": "proposed_phase5_awaiting_operator_signoff",
+    "score": "qwen_mtp_decode_speedup = (paired_serial_decode_sec_per_token at --mtp-depth 0) / (candidate decode_sec_per_token at --mtp-depth 2), over the same rows golden and the same parent-counted 512-token window",
+    "ranked_decode_window_tokens": 512,
+    "aggregation": "ratio_of_means: mean(serial seconds/token across accepted pairs) / mean(candidate seconds/token across accepted pairs)",
+    "denominator_authority": "trusted parent wall time divided by the parent-configured decode token count; worker-reported timing is never scored",
+    "component_floor": "NORMALISED aggregate qwen_mtp_decode_speedup >= 0.95",
+    "normalized_scoring": {
+      "status": "proposed_phase5",
+      "rationale": "The anti-lottery sampler draws one pool prompt uniformly at random per run, and the measured no-op reference spans 0.756 to 1.0915 across the pool. Without normalisation the draw would dominate the score.",
+      "reference_source": "timed_prompt_pool[].noop_decode_speedup, keyed by sha256. Each entry's own measured no-op normalises to 1.0.",
+      "published_score": "score = normalised ratio-of-means; metrics carry BOTH the raw ratio and the normalised value"
+    },
+    "token_fidelity_gate": "Every emitted token must equal the serial trajectory: mtp-verify at the candidate depth must return all_tokens_matched=true AND parity_all_ok=true, with the row ledger CLOSED (reference_checked_row_total == declared_rows_total, and accepted + rejected + target_tail == declared_rows_total). Verified on box 3 across all 8 pool prompts and the hidden correctness golden.",
+    "token_fidelity_gate_status": "implemented",
+    "stall_guardrail": "a run whose max block latency exceeds 4x its p50 block latency is rejected. CALIBRATION NOTE: as measured, max_block_request_seconds is the FIRST block after the seed prefill and is a one-time warmup, not a stall -- it is flat to within 1% across 8/32/128/512-round windows (serial ~0.19s, depth-2 ~0.267s). At the 512 window the serial leg therefore trips 4x (measured 5.72-5.90x) while the depth-2 leg does not (3.30-3.36x). The guardrail should exclude the first block before this track is enabled.",
+    "prefill_component": "none; seed prefill is charged inside the decode measurement, identically on both legs",
+    "leaderboard": "separate qwen3.6-27b-mtp-v1 namespace, never mixed with the serial or DFlash tracks",
+    "measurement_protocol": "minimum three accepted thermal-gated pairs per session (target four), alternating order"
+  },
+  "license": {
+    "spdx": "Apache-2.0",
+    "url": "https://huggingface.co/Qwen/Qwen3.6-27B",
+    "TODO_OPERATOR": "Confirm the license tag against mlx-community/Qwen3.6-27B-4bit, mlx-community/Qwen3.6-27B-MTP-4bit and the upstream Qwen repo before go-live."
+  }
+}
