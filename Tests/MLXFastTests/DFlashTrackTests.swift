@@ -1698,6 +1698,21 @@ struct DFlashGoLiveRunbookTests {
 enum DFlashGateTextSupport {
     static let dflashWorkflowPath = ".github/workflows/dflash-benchmark.yml"
     static let dflashManifestPath = "benchmark.json"
+    /// The Qwen 3.6 native-MTP ranked workflow. It carries the pins that were
+    /// repointed to Qwen (layer count, public fixture digests) while
+    /// dflash-benchmark.yml keeps Laguna's, so several tests below assert the
+    /// SAME pin against BOTH workflows with different expected values.
+    static let qwenMTPWorkflowPath = ".github/workflows/qwen-mtp-ranked-benchmark.yml"
+    static let qwenMTPManifestPath = "benchmark.qwen-mtp.json"
+    /// Laguna's values, still pinned by the DFlash workflow. Spelled as
+    /// literals on purpose: after the Qwen identity repoint they can no longer
+    /// be derived from Constants or from the checked-in fixtures, and the point
+    /// of keeping them is that an edit to the DFlash track's pins must be
+    /// deliberate rather than silent.
+    static let lagunaNumHiddenLayers = "40"
+    static let lagunaPublicGoldenSHA256 =
+        "b9509697c08a2cf3c2943a85f0b76e39c485c441794690fa76835b40a58d7a63"
+    static let lagunaPublicGoldenBytes = "10686"
     static let dflashFixturePath = "fixtures/laguna_xs_2_1_dflash_track.json"
     static let cliPath = "Sources/MLXFastCLI/main.swift"
 
@@ -2321,33 +2336,60 @@ struct DFlashReusedSerialGateTests {
         )
 
         // The public fixture the behavior gate teacher-forces really is the
-        // pinned bytes, in both workflows.
+        // pinned bytes -- in whichever workflow owns the CURRENT fixture.
+        //
+        // The public fixtures were regenerated with the Qwen 3.6 runtime, so
+        // exactly one ranked workflow mirrors them: the Qwen-MTP one. This used
+        // to be a withKnownIssue against dflash-benchmark.yml because no Qwen
+        // workflow existed; now that one does, the assertion is HARD and aimed
+        // at it. The check that matters is unchanged and still recomputes from
+        // the checked-in bytes, so regenerating a fixture forces the pin to move.
         let fixturePath = try #require(dflash["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH"])
         let fixtureData = try Data(contentsOf: URL(fileURLWithPath: fixturePath))
         let digest = SHA256.hash(data: fixtureData)
             .map { String(format: "%02x", $0) }
             .joined()
-        // QWEN-MTP-PHASE5-TODO: the public fixture was regenerated with the
-        // Qwen 3.6 runtime on m5-max-128gb-3, so its digest and byte count
-        // moved. The workflow mirroring them is the protected, still-Laguna
-        // .github/workflows/dflash-benchmark.yml, and the Qwen-MTP workflow
-        // that would carry the new pins is Phase 5 work
-        // (QWEN36-MTP-CHALLENGE-PLAN.md). Both assertions are kept and still
-        // recompute from the checked-in bytes; withKnownIssue fails once the
-        // workflow pin matches again, which is the signal to remove the guard.
-        withKnownIssue(
+        let qwen = try S.jobEnvironment(try S.text(S.qwenMTPWorkflowPath))
+        #expect(qwen["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH"] == fixturePath)
+        #expect(
+            qwen["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256"] == digest,
             """
-            QWEN-MTP-PHASE5-TODO: dflash-benchmark.yml still pins the pre-Qwen \
-            public fixture digest/bytes. Remove this guard when the Qwen-MTP \
-            workflow pins the regenerated fixture.
+            the Qwen-MTP workflow pins \
+            \(qwen["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256"] ?? "nothing") for \
+            \(fixturePath), but the checked-in bytes hash to \(digest)
             """
-        ) {
-            #expect(dflash["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256"] == digest)
-            #expect(
-                dflash["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES"]
-                    == String(fixtureData.count)
-            )
-        }
+        )
+        #expect(
+            qwen["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES"]
+                == String(fixtureData.count)
+        )
+
+        // DFLASH-SIDE COVERAGE, DELIBERATELY KEPT. The DFlash track still gates
+        // on the PRE-Qwen fixture bytes, so its pins cannot be derived from the
+        // checked-in file any more -- but dropping the assertion would leave the
+        // live ranked track's public-gate pins unguarded, which is the opposite
+        // of what retargeting is for. Assert Laguna's literals instead, so an
+        // edit to them is deliberate. When the DFlash track is repointed or
+        // retired, this expectation fails and must be updated in that commit.
+        #expect(
+            dflash["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256"]
+                == S.lagunaPublicGoldenSHA256,
+            """
+            the DFlash workflow's public-gate digest changed. It pins the \
+            pre-Qwen fixture on purpose; if the DFlash track has been repointed \
+            at the regenerated fixture, update this literal in the same commit.
+            """
+        )
+        #expect(
+            dflash["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES"]
+                == S.lagunaPublicGoldenBytes
+        )
+        // The two tracks' pins must not silently converge either: if they ever
+        // match, one of the two workflows was edited without its test.
+        #expect(
+            dflash["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256"]
+                != qwen["MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256"]
+        )
         #expect(fixturePath == MLXFastConstants.defaultPublicCorrectnessGoldenPath)
         #expect(dflash["MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH"]
             == MLXFastConstants.defaultPublicCorrectnessPromptPath)

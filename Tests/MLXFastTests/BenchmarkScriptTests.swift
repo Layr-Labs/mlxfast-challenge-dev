@@ -934,24 +934,51 @@ func benchmarkWorkflowPinsTrustedLayerCountForFinalValidation() throws {
 
     // The model shape is a trusted, literal workflow contract. A dispatch or
     // participant-controlled expression must never choose the accepted count.
+    //
+    // TWO WORKFLOWS, TWO MODELS, ONE RULE. Constants now describe Qwen 3.6
+    // (64 layers), so the workflow that must mirror them is the Qwen-MTP one;
+    // dflash-benchmark.yml pins Laguna's 40 and keeps doing so while that track
+    // is the live ranked one. This was a withKnownIssue only because no Qwen
+    // workflow existed to carry the repointed pin. Both sides are now asserted
+    // HARD, and both keep the negative assertions -- the "never an expression,
+    // never a dispatch input" property is what stops a submitter choosing the
+    // accepted shape, and it has to hold on every ranked workflow, not just the
+    // one whose number currently matches Constants.
+    let qwenWorkflow = try String(
+        contentsOfFile: ".github/workflows/qwen-mtp-ranked-benchmark.yml",
+        encoding: .utf8
+    )
+    let qwenSteps = try #require(qwenWorkflow.range(of: "\n    steps:"))
+    let qwenJobHeader = String(qwenWorkflow[..<qwenSteps.lowerBound])
+    let qwenDispatch = try #require(qwenWorkflow.range(of: "  workflow_dispatch:"))
+    let qwenPermissions = try #require(
+        qwenWorkflow.range(of: "\npermissions:", range: qwenDispatch.upperBound..<qwenWorkflow.endIndex)
+    )
+    let qwenDispatchInputs = String(qwenWorkflow[qwenDispatch.lowerBound..<qwenPermissions.lowerBound])
+
     let assignment = "MLXFAST_EXPECTED_NUM_LAYERS: \"\(MLXFastConstants.numHiddenLayers)\""
-    // QWEN-MTP-PHASE5-TODO: the only ranked workflow on this branch is the
-    // DFlash one, which pins Laguna's 40 layers, and .github/workflows/** is
-    // protected surface that the Qwen target repoint deliberately did not
-    // touch. The Qwen-MTP workflow that would carry
-    // MLXFAST_EXPECTED_NUM_LAYERS: "64" does not exist yet -- authoring it is
-    // Phase 5 (QWEN36-MTP-CHALLENGE-PLAN.md). The assertion is kept, not
-    // deleted: withKnownIssue fails loudly once the pin does line up, which is
-    // exactly when this guard must come off.
-    withKnownIssue(
+    #expect(
+        qwenJobHeader.components(separatedBy: assignment).count - 1 == 1,
         """
-        QWEN-MTP-PHASE5-TODO: no Qwen-MTP ranked workflow exists on \
-        qwen36-mtp-track, so no workflow pins MLXFastConstants.numHiddenLayers \
-        (64). Remove this guard when the Qwen workflow lands.
+        the Qwen-MTP ranked workflow must pin MLXFAST_EXPECTED_NUM_LAYERS to \
+        MLXFastConstants.numHiddenLayers (\(MLXFastConstants.numHiddenLayers)) \
+        exactly once
         """
-    ) {
-        #expect(jobHeader.components(separatedBy: assignment).count - 1 == 1)
-    }
+    )
+    #expect(!qwenDispatchInputs.contains("MLXFAST_EXPECTED_NUM_LAYERS"))
+    #expect(!qwenJobHeader.contains("MLXFAST_EXPECTED_NUM_LAYERS: ${{"))
+
+    // DFLASH-SIDE COVERAGE, DELIBERATELY KEPT: Laguna's literal, because after
+    // the Qwen repoint it can no longer be derived from Constants. Dropping it
+    // would leave the live ranked track's shape contract unguarded.
+    let lagunaAssignment = "MLXFAST_EXPECTED_NUM_LAYERS: \"40\""
+    #expect(
+        jobHeader.components(separatedBy: lagunaAssignment).count - 1 == 1,
+        """
+        the DFlash workflow must still pin Laguna's 40 layers exactly once; if \
+        that track has been repointed, update this literal in the same commit
+        """
+    )
     #expect(!dispatchInputs.contains("MLXFAST_EXPECTED_NUM_LAYERS"))
     #expect(!jobHeader.contains("MLXFAST_EXPECTED_NUM_LAYERS: ${{"))
 
@@ -2166,39 +2193,72 @@ func rankedJobRunsPublicBehaviorGateBeforeHiddenGates() throws {
 
     // The pinned hash must match the actual checked-in fixture, so regenerating
     // the fixture forces the workflow pin to move too.
+    //
+    // The public fixtures were regenerated with the Qwen 3.6 runtime, so the
+    // workflow that mirrors the CURRENT bytes is the Qwen-MTP one; this was a
+    // withKnownIssue only for as long as that workflow did not exist. It is now
+    // a HARD assertion aimed at it, still derived from the checked-in bytes.
     let fixtureData = try Data(
         contentsOf: URL(fileURLWithPath: "correctness_prompts/public_longcopy_gate_english_512_256.json")
     )
     let fixtureHash = SHA256.hash(data: fixtureData).map { String(format: "%02x", $0) }.joined()
-    // QWEN-MTP-PHASE5-TODO: the public fixture was regenerated with the Qwen
-    // 3.6 runtime on m5-max-128gb-3, so its digest and byte count moved. The
-    // workflow that mirrors them is .github/workflows/dflash-benchmark.yml --
-    // protected surface belonging to the still-Laguna DFlash track -- and the
-    // Qwen-MTP workflow that would carry the new pins does not exist yet
-    // (QWEN36-MTP-CHALLENGE-PLAN.md phase 5). Both assertions are kept and
-    // still recompute from the checked-in bytes; withKnownIssue fails once the
-    // workflow pin matches again, which is the signal to remove this guard.
-    withKnownIssue(
-        """
-        QWEN-MTP-PHASE5-TODO: dflash-benchmark.yml still pins the pre-Qwen \
-        public fixture digest/bytes. Remove this guard when the Qwen-MTP \
-        workflow pins the regenerated fixture.
-        """
-    ) {
-        #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: \(fixtureHash)"))
-        // Same for the byte count: the correctness-only validation hard-checks
-        // bytes after the SHA, so a stale byte pin fails the correctness-only
-        // run even when the hash matches. Deriving it from the fixture forces
-        // the pin to move when the fixture is regenerated, instead of silently
-        // drifting.
-        #expect(
-            workflow.contains(
-                "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"\(fixtureData.count)\""
-            )
+    let qwenWorkflow = try String(
+        contentsOfFile: ".github/workflows/qwen-mtp-ranked-benchmark.yml",
+        encoding: .utf8
+    )
+    #expect(
+        qwenWorkflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: \(fixtureHash)"),
+        "the Qwen-MTP workflow does not pin the checked-in 256-step fixture digest \(fixtureHash)"
+    )
+    // Same for the byte count: the correctness-only validation hard-checks
+    // bytes after the SHA, so a stale byte pin fails the correctness-only run
+    // even when the hash matches. Deriving it from the fixture forces the pin to
+    // move when the fixture is regenerated, instead of silently drifting.
+    #expect(
+        qwenWorkflow.contains(
+            "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"\(fixtureData.count)\""
         )
-    }
-    // The gate re-hashes the fixture at run time against the pinned value.
+    )
+    // The 1024-step variant is the pre-submit fixture and the 256-step golden is
+    // a strict greedy prefix of it. The Qwen workflow pins both so the pair
+    // cannot drift apart; derive that pin from its own bytes too.
+    let longFixtureData = try Data(
+        contentsOf: URL(fileURLWithPath: "correctness_prompts/public_longcopy_gate_english_512_1024.json")
+    )
+    let longFixtureHash = SHA256.hash(data: longFixtureData)
+        .map { String(format: "%02x", $0) }.joined()
+    #expect(
+        qwenWorkflow.contains(
+            "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_1024_SHA256: \(longFixtureHash)"
+        )
+    )
+    #expect(
+        qwenWorkflow.contains(
+            "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_1024_BYTES: \"\(longFixtureData.count)\""
+        )
+    )
+
+    // DFLASH-SIDE COVERAGE, DELIBERATELY KEPT. This test's subject is the DFlash
+    // job's public gate, and that job still pins the PRE-Qwen fixture -- a pin no
+    // longer derivable from any checked-in file. Assert Laguna's literal rather
+    // than dropping the check, so the live ranked track's public-gate pin cannot
+    // be edited silently.
+    #expect(
+        workflow.contains(
+            "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: b9509697c08a2cf3c2943a85f0b76e39c485c441794690fa76835b40a58d7a63"
+        ),
+        """
+        the DFlash workflow's public-gate digest changed. It pins the pre-Qwen \
+        fixture on purpose; if that track has been repointed at the regenerated \
+        fixture, update this literal in the same commit.
+        """
+    )
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"10686\""))
+    // The gate re-hashes the fixture at run time against the pinned value --
+    // required in BOTH workflows, since that is what turns a stale pin into a
+    // failed run rather than a silently different oracle.
     #expect(gateBody.contains("public correctness golden hash mismatch"))
+    #expect(qwenWorkflow.contains("public correctness golden hash mismatch"))
 }
 
 // The 64-step teacher-forced base case only exercises single-token forwards at
