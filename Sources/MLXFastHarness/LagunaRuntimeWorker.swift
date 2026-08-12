@@ -653,6 +653,29 @@ private struct RuntimeWorkerQuantizationKey: CodingKey {
     }
 }
 
+/// Frozen geometry of the Poolside Laguna XS 2.1 NVFP4 checkpoint that this
+/// gate guards.
+///
+/// Anchored to Laguna's own literals rather than to `MLXFastConstants`: on the
+/// `qwen36-mtp-track` branch those constants carry the Qwen 3.6 target identity
+/// (64 layers, hidden 5120, vocab 248320), while this gate still validates the
+/// Laguna artifact. Reading them here made the gate demand a checkpoint that
+/// does not exist -- Laguna's `model_type` with Qwen's geometry -- so it
+/// rejected the very config it is meant to accept. Mirrored from
+/// `LagunaConstants` (Sources/MLXFastModel/LagunaConfig.swift); the trusted
+/// harness cannot import the editable model target. The anti-drift intent is
+/// unchanged: every field below is still pinned to an exact literal.
+private enum LagunaPinnedGeometry {
+    static let numHiddenLayers = 40
+    static let hiddenSize = 2_048
+    /// Dense MLP intermediate size (layer 0 only).
+    static let intermediateSize = 8_192
+    /// `num_attention_heads` in the source config (the full-attention query
+    /// head count; sliding-window layers carry 64, see the per-layer table).
+    static let attentionHeads = 48
+    static let vocabSize = 100_352
+}
+
 func validateRuntimeWorkerPinnedConfiguration(weightsPath: String) throws {
     let path = URL(fileURLWithPath: weightsPath).appendingPathComponent("config.json")
     let values = try path.resourceValues(
@@ -686,18 +709,18 @@ func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
     // heads, YaRN partial RoPE) then three sliding-window layers (64 query
     // heads, plain RoPE), repeating -- full at 0, 4, 8, ..., 36 -- with a
     // dense MLP only at layer 0 and 256-expert top-8 MoE blocks elsewhere.
-    let expectedLayerTypes = (0..<MLXFastConstants.numHiddenLayers).map {
+    let expectedLayerTypes = (0..<LagunaPinnedGeometry.numHiddenLayers).map {
         $0 % 4 == 0 ? "full_attention" : "sliding_attention"
     }
-    let expectedHeadsPerLayer = (0..<MLXFastConstants.numHiddenLayers).map {
+    let expectedHeadsPerLayer = (0..<LagunaPinnedGeometry.numHiddenLayers).map {
         $0 % 4 == 0 ? 48 : 64
     }
-    let expectedMLPLayerTypes = (0..<MLXFastConstants.numHiddenLayers).map {
+    let expectedMLPLayerTypes = (0..<LagunaPinnedGeometry.numHiddenLayers).map {
         $0 == 0 ? "dense" : "sparse"
     }
     let expectedGatingTypes = [String](
         repeating: "per_head",
-        count: MLXFastConstants.numHiddenLayers
+        count: LagunaPinnedGeometry.numHiddenLayers
     )
     guard let quantization = decoded.quantization,
           let quantizationConfig = decoded.quantizationConfig,
@@ -712,15 +735,15 @@ func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
     // config (an explicit JSON null decodes equivalently); concrete false/zero
     // substitutions are rejected rather than treated as a synthetic schema.
     guard decoded.modelType == "laguna",
-          decoded.hiddenSize == MLXFastConstants.hiddenSize,
-          decoded.numHiddenLayers == MLXFastConstants.numHiddenLayers,
-          decoded.intermediateSize == MLXFastConstants.intermediateSize,
-          decoded.numAttentionHeads == MLXFastConstants.attentionHeads,
+          decoded.hiddenSize == LagunaPinnedGeometry.hiddenSize,
+          decoded.numHiddenLayers == LagunaPinnedGeometry.numHiddenLayers,
+          decoded.intermediateSize == LagunaPinnedGeometry.intermediateSize,
+          decoded.numAttentionHeads == LagunaPinnedGeometry.attentionHeads,
           decoded.numAttentionHeadsPerLayer == expectedHeadsPerLayer,
           decoded.numKeyValueHeads == 8,
           decoded.headDim == 128,
           decoded.rmsNormEps == 1e-6,
-          decoded.vocabSize == MLXFastConstants.vocabSize,
+          decoded.vocabSize == LagunaPinnedGeometry.vocabSize,
           decoded.slidingWindow == 512,
           decoded.maxPositionEmbeddings == 262_144,
           decoded.attentionBias == false,

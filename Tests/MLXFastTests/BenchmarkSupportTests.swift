@@ -112,16 +112,16 @@ func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
     // rejected wholesale, not merely on the model_type string.
     addCase("model-type") { $0["model_type"] = "gemma4_text" }
     addCase("hidden-size") { $0["hidden_size"] = 5_376 }
-    addCase("hidden-layers") { $0["num_hidden_layers"] = MLXFastConstants.numHiddenLayers - 1 }
-    addCase("intermediate-size") { $0["intermediate_size"] = MLXFastConstants.intermediateSize - 1 }
+    addCase("hidden-layers") { $0["num_hidden_layers"] = LagunaConstants.numHiddenLayers - 1 }
+    addCase("intermediate-size") { $0["intermediate_size"] = LagunaConstants.denseIntermediateSize - 1 }
     addCase("attention-heads") { $0["num_attention_heads"] = 64 }
     addCase("uniform-heads-per-layer") {
         $0["num_attention_heads_per_layer"] =
-            [Int](repeating: 48, count: MLXFastConstants.numHiddenLayers)
+            [Int](repeating: 48, count: LagunaConstants.numHiddenLayers)
     }
     addCase("short-heads-per-layer") {
         $0["num_attention_heads_per_layer"] =
-            [Int](repeating: 48, count: MLXFastConstants.numHiddenLayers - 1)
+            [Int](repeating: 48, count: LagunaConstants.numHiddenLayers - 1)
     }
     addCase("missing-heads-per-layer") {
         $0.removeValue(forKey: "num_attention_heads_per_layer")
@@ -167,13 +167,13 @@ func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
     addCase("layer-pattern") {
         // The dense Gemma 4 schedule (full attention every 6th layer) is
         // not Laguna's every-4th-full schedule.
-        $0["layer_types"] = (0..<MLXFastConstants.numHiddenLayers).map { index in
+        $0["layer_types"] = (0..<LagunaConstants.numHiddenLayers).map { index in
             index % 6 == 5 ? "full_attention" : "sliding_attention"
         }
     }
     addCase("all-sparse-mlp") {
         $0["mlp_layer_types"] =
-            [String](repeating: "sparse", count: MLXFastConstants.numHiddenLayers)
+            [String](repeating: "sparse", count: LagunaConstants.numHiddenLayers)
     }
     addCase("mlp-only-layers") { $0["mlp_only_layers"] = [0, 1] }
     addCase("decoder-sparse-step") { $0["decoder_sparse_step"] = 2 }
@@ -1003,8 +1003,15 @@ func lagunaWeightContractPinsExactXSHeaderInventory() throws {
         .joined()
 
     #expect(contract.schemaVersion == 1)
-    #expect(contract.source.repository == MLXFastConstants.referenceModelRepository)
-    #expect(contract.source.revision == MLXFastConstants.referenceModelRevision)
+    // Pinned to the Laguna literals rather than MLXFastConstants: this
+    // contract describes the Poolside checkpoint, while on the
+    // qwen36-mtp-track branch those constants name the Qwen 3.6 target.
+    // Same anti-drift intent, anchored to the checkpoint it documents
+    // (matches pinnedLagunaConfigObject in LagunaConfigTests).
+    #expect(contract.source.repository == "poolside/Laguna-XS-2.1-NVFP4-mlx")
+    #expect(
+        contract.source.revision == "841778bda563a36104dd521e37d99218e46f4f25"
+    )
     #expect(contract.canonicalRecordFormat.contains("name<TAB>dtype<TAB>"))
     #expect(tensors.count == contract.tensorCount)
     #expect(contract.tensorCount == LagunaConstants.tensorCount)
@@ -1228,10 +1235,16 @@ private func correctnessOnlyGoldenJSON() -> String {
 /// sparse: only routed/shared expert projections use Poolside's packed U32
 /// NVFP4 layout with U8 group-16 scales; all other matrices are BF16.
 private func requiredLagunaDenseTensorFixtures() -> [TensorFixture] {
-    let hidden = MLXFastConstants.hiddenSize
-    let denseIntermediate = MLXFastConstants.intermediateSize
-    let vocab = MLXFastConstants.vocabSize
-    let layers = MLXFastConstants.numHiddenLayers
+    // Laguna's own frozen geometry, not MLXFastConstants: on the
+    // qwen36-mtp-track branch those constants carry the Qwen 3.6 target
+    // identity (64 layers, hidden 5120, vocab 248320), and building a
+    // "Laguna" inventory from them produced a checkpoint that exists
+    // nowhere -- 1,464 tensors at Qwen shapes -- which no Laguna contract
+    // or preflight byte budget can describe.
+    let hidden = LagunaConstants.hiddenSize
+    let denseIntermediate = LagunaConstants.denseIntermediateSize
+    let vocab = LagunaConstants.vocabSize
+    let layers = LagunaConstants.numHiddenLayers
     let kvHeads = 8
     let headDim = 128
     let experts = 256
