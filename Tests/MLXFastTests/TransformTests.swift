@@ -128,6 +128,48 @@ func transformDetectsModelFamilyFromSourceConfig() throws {
     )
     #expect(try SwiftTransform.detectModelFamily(sourceConfigRoot: gemma) == .gemma4)
 
+    // Qwen 3.6 carries a `text_config` exactly like the legacy Gemma 4
+    // multimodal layout, so detection must discriminate on the `qwen3_5`
+    // model-type prefix BEFORE the text_config-means-Gemma fallthrough --
+    // otherwise the real checkpoint routes to the Gemma flattening.
+    let qwen = try #require(
+        try JSONSerialization.jsonObject(
+            with: Data(contentsOf: qwen36ConfigFixtureURL)
+        ) as? [String: Any]
+    )
+    #expect(try SwiftTransform.detectModelFamily(sourceConfigRoot: qwen) == .qwen35)
+    #expect(qwen["text_config"] != nil)
+
+    // Either level declaring the prefix is sufficient: the top level alone,
+    #expect(
+        try SwiftTransform.detectModelFamily(
+            sourceConfigRoot: ["model_type": "qwen3_5"]
+        ) == .qwen35
+    )
+    // and the nested text tower alone (a language-model-only republish that
+    // drops the multimodal wrapper's own model_type).
+    #expect(
+        try SwiftTransform.detectModelFamily(
+            sourceConfigRoot: ["text_config": ["model_type": "qwen3_5_text"]]
+        ) == .qwen35
+    )
+    // A point revision of the same family still routes to .qwen35 rather than
+    // falling through to Gemma: the prefix is matched, not the exact string.
+    #expect(
+        try SwiftTransform.detectModelFamily(
+            sourceConfigRoot: [
+                "model_type": "qwen3_5_omni",
+                "text_config": ["model_type": "qwen3_5_text"],
+            ]
+        ) == .qwen35
+    )
+    // But a text_config that is NOT qwen3_5 keeps the legacy Gemma route.
+    #expect(
+        try SwiftTransform.detectModelFamily(
+            sourceConfigRoot: ["text_config": ["model_type": "gemma4_text"]]
+        ) == .gemma4
+    )
+
     #expect(throws: MLXFastError.self) {
         _ = try SwiftTransform.detectModelFamily(sourceConfigRoot: ["model_type": "qwen3"])
     }
