@@ -590,9 +590,15 @@ struct QwenMTPTrackNamingTests {
             ("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES", "36183"),
             (
                 "MLXFAST_GPQA_REFERENCE_SHA256",
-                "d05e93e9694d86e0041e6b9c843642d4637de524e9a1b88a145caaa0da6235fe"
+                // c8bce79c = d05e93e9 with the previously empty
+                // accepted_responses filled from the reference model's own
+                // captures (its own note called for exactly that fill).
+                // Prompts, answer_keys, domains and accepted_token_sequences
+                // are byte-identical. Self-match restored: an unmodified
+                // candidate scores 9/9.
+                "c8bce79c0258f2b67882cb3a609937066a27eb7d8f6170e0fd6db8cbac8ce0d7"
             ),
-            ("MLXFAST_GPQA_REFERENCE_BYTES", "9886"),
+            ("MLXFAST_GPQA_REFERENCE_BYTES", "11125"),
             // Phase 5, generated on box 3 against the Qwen tower with the
             // pinned MTP head. Pinned here for the same reason as the four
             // above: the digest, the byte count and the R2 object key that

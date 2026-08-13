@@ -247,8 +247,24 @@ jobs:
       # eef3b817 object stays in R2 as a content-addressed sibling.
       MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: faf1a679e993a3ea2ffb263213c66a526ba9cea591954898f8851bae42c9d5c5
       MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "36183"
-      MLXFAST_GPQA_REFERENCE_SHA256: d05e93e9694d86e0041e6b9c843642d4637de524e9a1b88a145caaa0da6235fe
-      MLXFAST_GPQA_REFERENCE_BYTES: "9886"
+      # c8bce79c supersedes d05e93e9: identical prompts, answer_keys, domains
+      # and accepted_token_sequences (proven by key-level diff), with the
+      # previously EMPTY accepted_responses filled from the reference model's
+      # own captures. d05e93e9's own note instructed the operator to fill that
+      # field before upload and it never happened, so the semantic judge was
+      # scoring candidates against the ground-truth answer key instead of
+      # against the reference implementation. With it filled, an unmodified
+      # candidate self-matches 9/9 and min_pass 7 regains its calibrated
+      # two-case error budget. d05e93e9 stays in R2 as a sibling.
+      #
+      # KNOWN LIMITATION (documented operator-side, referred to the organizer):
+      # every answer_key in this fixture is "A" and the reference model is
+      # position-biased toward option A, so this gate measures fidelity to the
+      # reference, not question-answering accuracy, and cannot reject a
+      # constant-"A" answerer. Shuffling option order is organizer material and
+      # is deliberately not done here.
+      MLXFAST_GPQA_REFERENCE_SHA256: c8bce79c0258f2b67882cb3a609937066a27eb7d8f6170e0fd6db8cbac8ce0d7
+      MLXFAST_GPQA_REFERENCE_BYTES: "11125"
       # --- Reused serial gate contract ------------------------------------
       # The correctness/GPQA gate leg is the live serial gate stack re-hosted
       # here and pointed at this job's build, exactly as dflash-benchmark.yml
@@ -1348,7 +1364,7 @@ jobs:
           # Private object keys scoped to this trusted download step only (never
           # job level), so untrusted bench phases never receive the object names.
           MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-hidden-correctness-golden-faf1a679e993a3ea2ffb263213c66a526ba9cea591954898f8851bae42c9d5c5.json
-          MLXFAST_GPQA_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-gpqa-reference-cases-d05e93e9694d86e0041e6b9c843642d4637de524e9a1b88a145caaa0da6235fe.json
+          MLXFAST_GPQA_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-gpqa-reference-cases-c8bce79c0258f2b67882cb3a609937066a27eb7d8f6170e0fd6db8cbac8ce0d7.json
         run: |
           set -euo pipefail
           for key in "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" "${MLXFAST_GPQA_R2_PATH}"; do
