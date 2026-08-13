@@ -1,16 +1,35 @@
 {
+  "_headerComment": [
+    "QWEN 3.6 NATIVE-MTP TRACK MANIFEST (track id qwen3.6-27b-mtp-v1).",
+    "THIS FILE BECOMES benchmark.json AT THE REPO SPLIT. It is kept under a",
+    "track-qualified name only while the Qwen-MTP track shares a repository with",
+    "the live laguna-xs-2.1-dflash-v1 track, whose manifest IS benchmark.json.",
+    "Renaming it at the split is the whole migration: the Yukon CLI, the",
+    "modifiable-surface enforcement and the editable-path overlay all read",
+    "benchmark.json by default, and the ranked workflow passes this path",
+    "explicitly (MLXFAST_QWEN_MTP_EDITABLE_SURFACE_CONTRACT) precisely because it",
+    "cannot rely on that default while two manifests coexist.",
+    "JSON carries no comment syntax, so this note is a data field. It is inert:",
+    "nothing reads it, and every consumer reads the keys below by name.",
+    "LIVE 2026-08-13. The operator completed go-live on the qwen36-mtp-track ref",
+    "(the merge to main is deferred): the contract fixture named by contractPath",
+    "carries official_scoring_enabled=true and reference_baseline.publication_allowed",
+    "=true, the workflow ships with MLXFAST_QWEN_MTP_CALIBRATION_READY=1, and every",
+    "hidden-artifact pin resolves to a real uploaded R2 object verified by digest on",
+    "download. See docs/qwen-mtp-go-live-runbook.md."
+  ],
   "schemaVersion": 1,
-  "name": "mlxfast-challenge-dev-dflash",
-  "trackId": "laguna-xs-2.1-dflash-v1",
-  "description": "Poolside Laguna XS 2.1 DFlash track: optimize target-verified block decode driven by the organizer-provisioned DFlash draft model (a separate ~924 MB EAGLE-style speculator: 5 sliding-window layers, block size 16, conditioned on target hidden states, borrowing the target embedding and lm_head). The drafter and target weights are fixed; the editable surface is the drafting/verification runtime -- block dispatch, multi-row verification kernels, KV rollback, and cache handling. Decode-only paired scoring against the trusted serial K=1 target oracle, with parent-owned token fidelity verification.",
+  "name": "mlxfast-challenge-dev-qwen-mtp",
+  "trackId": "qwen3.6-27b-mtp-v1",
+  "description": "Qwen 3.6 27B native-MTP speculative-decode track: optimize speculative decode driven by the checkpoint's own multi-token-prediction head (mlx-community/Qwen3.6-27B-MTP-4bit, ~247 MB, organizer-pinned by revision and byte manifest). Unlike an EAGLE-style track there is no separately trained drafter artifact: the speculator ships with the model, so the anti-substitution rules bind the head's pinned revision. The target and head weights are fixed; the editable surface is the Qwen 3.6 text tower, the offline transform, and the speculative decode runtime -- draft dispatch, multi-row verification, KV rollback and cache handling -- on top of the vendored MLX kernel families the forward pass dispatches. Decode-only paired scoring against the trusted serial K=1 target oracle, with parent-owned token fidelity verification. Native MTP decode is measured exact-greedy against serial on this checkpoint (12/12 runs to 512 tokens, all EOS branches), so the fidelity gate requires exact token match rather than a near-tie budget.",
   "category": "swift",
   "direction": "+",
   "editablePaths": [
     "Sources/MLXFastModel",
     "Sources/MLXFastTransform",
-    "Vendor/mlx-swift-lm/Libraries/MLXLLM/DFlashTarget.swift",
-    "Vendor/mlx-swift-lm/Libraries/MLXLLM/DFlashVerifyLinear.swift",
-    "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Laguna.swift",
+    "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35.swift",
+    "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35MTP.swift",
+    "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35MoE.swift",
     "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/AttentionUtils.swift",
     "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/BaseConfiguration.swift",
     "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/BatchKVCache.swift",
@@ -25,14 +44,6 @@
     "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/RoPEApplication.swift",
     "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/RoPEUtils.swift",
     "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift",
-    "Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlashBatchedEngine.swift",
-    "Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlashBatchedTokenGenerator.swift",
-    "Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlashConfiguration.swift",
-    "Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlashDraftModel.swift",
-    "Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlashError.swift",
-    "Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlashGenerate.swift",
-    "Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlashGreedyRound.swift",
-    "Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlashTokenIterator.swift",
     "Vendor/mlx-swift/Source/Cmlx/mlx-generated/binary.cpp",
     "Vendor/mlx-swift/Source/Cmlx/mlx-generated/binary_ops.cpp",
     "Vendor/mlx-swift/Source/Cmlx/mlx-generated/copy.cpp",
@@ -102,44 +113,51 @@
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/unary.metal",
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/unary_ops.h"
   ],
-  "contractPath": "fixtures/laguna_xs_2_1_dflash_track.json",
+  "contractPath": "fixtures/qwen3_6_27b_mtp_track.json",
   "setupCommand": [
     "bash",
     "-c",
-    "./setup.sh && ./setup-dflash.sh"
+    "./setup.sh && ./setup-qwen-mtp.sh"
   ],
   "preSubmitCommand": [
     "bash",
     "-c",
-    "./benchmark-dflash.sh --local-submit"
+    "./benchmark-qwen-mtp.sh --local-submit"
   ],
   "benchmarkCommand": [
     "bash",
     "-c",
-    "MLXFAST_SCORE_PATH=score.json ./benchmark-dflash.sh --local-iterate"
+    "MLXFAST_SCORE_PATH=score.json ./benchmark-qwen-mtp.sh --local-iterate"
   ],
   "runner": {
     "provider": "github-actions",
-    "workflow": "dflash-benchmark.yml"
+    "workflow": "qwen-mtp-ranked-benchmark.yml"
   },
   "scoreArtifact": "benchmark-results-<run_id>/score.json",
   "scorePath": "score.json",
   "scoring": {
-    "mode": "dflash-paired-decode-only",
+    "mode": "qwen-mtp-paired-decode-only",
     "decodeTokens": 512,
-    "aggregation": "ratio_of_means",
-    "scoreNormalization": "per-prompt no-op reference: the ratio-of-means aggregate is divided by the sampled prompt's pinned noop_decode_speedup (fixtures/laguna_xs_2_1_dflash_track.json timed_prompt_pool[]) before the floor is applied and the score published. See proposed_scoring.normalized_scoring and Amendment 32.",
+    "mtpDepth": 2,
+    "mtpDepthNote": "Provenance: measured envelope on M5 (exact-greedy vs serial) -- 1.74x at 32 tokens, 1.34x at 128, ~1.0x at 512; depth 3 is exact but net-slower. MUST be re-derived across the whole timed pool once the pool exists: a depth tuned to one prompt is the same trap as a floor tuned to one prompt.",
+    "aggregation": "median_of_per_prompt_normalized_ratio_of_means",
+    "aggregationNote": "OPERATOR-RATIFIED 2026-08-13, superseding single-sampled-prompt scoring. A ranked run draws one prompt per COLLECTION; each of the 8 contractPath timed_prompt_pool collections is a singleton today, so all 8 are timed. Each prompt gets its own ratio-of-means (mean serial seconds/token over that prompt's accepted pairs divided by mean candidate seconds/token over the same pairs), normalised by that prompt's own pinned noop_decode_speedup; the published score is the MEDIAN of those 8 normalised ratios.",
+    "medianRule": "even_n_mean_of_two_central_order_statistics",
+    "medianRuleNote": "8 is EVEN, so this is load-bearing: the score is the mean of the two central order statistics, NOT the lower-median rule the per-pair mtp_decode_speedup_median diagnostic uses.",
+    "scoreNormalization": "per-prompt no-op reference: each prompt's ratio-of-means is divided by that prompt's pinned noop_decode_speedup (contractPath timed_prompt_pool[], joined on the golden object's own sha256) before the median is taken, the floor applied and the score published.",
+    "antiLotteryNote": "Normalisation alone is not enough. It cancels the BASELINE's prompt-dependence -- every entry's measured no-op maps to 1.0 by construction -- but not the CANDIDATE's prompt-dependent improvement profile, so a single draw remained a lottery over which prompt a submission happened to be good at. Median-of-8 removes that by construction and additionally blunts any residual error in one prompt's pinned reference.",
     "decodeSpeedupFloor": 0.95,
-    "decodeSpeedupFloorNote": "NORMALISED floor (adopted 2026-08-01, Amendment 32): >= 0.95 on the per-prompt-normalised aggregate == within 5% of the sampled prompt's own no-op. Supersedes the raw 0.83 (worst pool no-op 0.8726 x 0.952), which was correct only for the worst prompt. Pinned equal to the fixture component_floor and the workflow MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR by test; the box MIN_ACCEPTED_SPEEDUP is a separate LOOSE RAW sanity floor (0.50, decoupled and APPLIED on the box 2026-08-01), not this value.",
-    "minAcceptedPairs": 3,
-    "targetPairs": 4,
-    "tokenFidelityGate": "trusted-sequential-reverification-with-bounded-near-tie-budget",
+    "decodeSpeedupFloorNote": "RESOLVED at go-live 2026-08-13 and pinned EQUAL to MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR in the ranked workflow, which is the enforcing site; this field is documentation and is not itself enforced. The floor is applied to the NORMALISED MEDIAN, which is what makes 0.95 method-independent: each pool entry's own MEASURED noop_decode_speedup (contractPath timed_prompt_pool[]) normalises to 1.0 by construction, so an unmodified candidate medians to 1.0 and the floor is the 0.95 margin below parity, matching the DFlash convention. It could never have been carried over as a RAW ratio -- the pool's raw no-ops span 0.756 to 1.0915, a 1.44x lottery that normalisation exists to remove.",
+    "pairsPerPrompt": 1,
+    "minPairsPerPrompt": 1,
+    "pairsPerPromptNote": "PER PROMPT, not per run: a ranked run is 8 prompts x 1 pair = 8 pairs / 16 timed phases. Supersedes the run-level minAcceptedPairs 3 / targetPairs 4, which bought pair-averaging on a single prompt; the median over 8 prompts does that job and also cancels the prompt lottery. Raisable via the measurement wrapper's --pairs-per-prompt when calibration data asks for it.",
+    "tokenFidelityGate": "trusted-sequential-reverification-exact-token-match",
     "tokenFidelityGateStatus": "implemented",
     "stallGuardrail": "max block latency > 4x p50 rejects the run (one gated retry)"
   },
   "leaderboard": {
-    "namespace": "laguna-xs-2.1-dflash-v1",
-    "separateFromSerialTrack": true
+    "namespace": "qwen3.6-27b-mtp-v1",
+    "separateFromDFlashTrack": true
   },
-  "staticReviewTrackId": "laguna-xs-2.1-dflash-v1"
+  "staticReviewTrackId": "qwen3.6-27b-mtp-v1"
 }
