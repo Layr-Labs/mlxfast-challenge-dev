@@ -126,7 +126,7 @@ jobs:
       MLXFAST_QWEN_MTP_TARGET_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--Qwen3.6-27B-4bit/snapshots/c000ac2c2057d94be3fa931000c31723aac53282
       # This track's speculator is the checkpoint's own multi-token-prediction
       # head, NOT a separately trained drafter artifact.
-      MLXFAST_QWEN_MTP_HEAD_DIR: /opt/bench-runner/cache/qwen-mtp/qwen3.6-27b-mtp-v1/mtp-head
+      MLXFAST_QWEN_MTP_HEAD_DIR: /opt/bench-runner/cache/qwen36/qwen3.6-27b-mtp-v1/mtp-head
       # Distinct stable path from BOTH the retired serial track's ranked-current
       # and the Qwen-MTP ranked job's qwen-mtp-ranked-current, inside the same
       # /Users/Shared/bench-jobs confinement bench-exec.sh enforces.

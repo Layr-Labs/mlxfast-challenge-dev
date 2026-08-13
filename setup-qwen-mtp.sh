@@ -43,7 +43,7 @@ CACHE_ROOT="${MLXFAST_QWEN_MTP_CACHE_ROOT:-${DEFAULT_CACHE_ROOT}}"
 # MLXFAST_QWEN_MTP_HEAD_DIR is the name both the Swift CLI (--mtp-head default)
 # and the ranked workflow read for this directory. The leaf stays `mtp-head` so
 # the local default mirrors the runner layout
-# (/opt/bench-runner/cache/qwen-mtp/qwen3.6-27b-mtp-v1/mtp-head).
+# (/opt/bench-runner/cache/qwen36/qwen3.6-27b-mtp-v1/mtp-head).
 MTP_HEAD_DIR="${MLXFAST_QWEN_MTP_HEAD_DIR:-${CACHE_ROOT}/mtp-head}"
 
 DEFAULT_MTP_HEAD_BASE_URL="https://huggingface.co/${MTP_HEAD_MODEL_ID}/resolve/${MTP_HEAD_REVISION}"

@@ -128,7 +128,7 @@ jobs:
       # The MTP head is a SEPARATELY pinned artifact and is NOT part of the
       # backbone manifest (the pinned backbone revision contains no mtp.* tensors
       # and the transform never selects them).
-      MLXFAST_QWEN_MTP_HEAD_DIR: /opt/bench-runner/cache/qwen-mtp/qwen3.6-27b-mtp-v1/mtp-head
+      MLXFAST_QWEN_MTP_HEAD_DIR: /opt/bench-runner/cache/qwen36/qwen3.6-27b-mtp-v1/mtp-head
       MLXFAST_QWEN_MTP_HEAD_REPO: mlx-community/Qwen3.6-27B-MTP-4bit
       MLXFAST_QWEN_MTP_HEAD_REVISION: 83795d546e9d328160e593fb0bf10b2bf2fe637e
       # Bench workspace: distinct stable path per track, same

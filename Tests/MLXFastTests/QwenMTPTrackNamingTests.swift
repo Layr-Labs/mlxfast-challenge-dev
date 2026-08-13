@@ -131,7 +131,7 @@ struct QwenMTPTrackNamingTests {
         ("per-track state dir leaf", "qwen3.6-27b-mtp-v1"),
         ("per-track baseline dir", "/opt/bench-runner/baseline/qwen3.6-27b-mtp-v1/current"),
         ("per-track baseline calibration", "/opt/bench-runner/state/qwen3.6-27b-mtp-v1/baseline-calibration.json"),
-        ("MTP head cache dir", "/opt/bench-runner/cache/qwen-mtp/qwen3.6-27b-mtp-v1/mtp-head"),
+        ("MTP head cache dir", "/opt/bench-runner/cache/qwen36/qwen3.6-27b-mtp-v1/mtp-head"),
         ("runner label", "m5-qwen3.6-27b-mtp"),
         ("bench job workspace", "/Users/Shared/bench-jobs/qwen-mtp-ranked-current"),
         // --- fixtures -------------------------------------------------------
