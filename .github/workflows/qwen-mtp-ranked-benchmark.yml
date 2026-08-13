@@ -1,0 +1,2504 @@
+name: qwen-mtp-ranked-benchmark
+
+# QWEN 3.6 NATIVE-MTP SPECULATIVE-DECODE TRACK (track id qwen3.6-27b-mtp-v1).
+#
+# STATUS: DRAFT / NOT LIVE / NOT RANKED. This workflow is authored ahead of the
+# operator go-live so every pin that is computable from the checked-in tree is
+# frozen now and every pin that depends on organizer-provisioned hidden material
+# is present, NAMED, and FAILS CLOSED. Nothing here enables anything: the track
+# ships inert (MLXFAST_QWEN_MTP_CALIBRATION_READY: "0"), the contract fixture it
+# reads does not exist yet, and the hidden-artifact pins carry the literal
+# QWEN-MTP-PENDING-ORGANIZER, which the pin-completeness gate below rejects.
+#
+# NAMING. The obvious filename for this workflow would append "-benchmark"
+# directly after "mtp-", which reproduces one of the retired Gemma/Laguna MTP
+# surface names (DFlashTrackTests.retiredMTPNames) as a substring -- and the
+# naming law forbids any of those strings anywhere in the repository. The name
+# is therefore qwen-mtp-ranked-benchmark(.yml), with "ranked" breaking the
+# adjacency; every artifact name this job publishes follows the same rule.
+# QwenMTPTrackNamingTests enumerates every new surface name this track
+# introduces and proves the property mechanically, so a future rename cannot
+# silently reintroduce a retired string. The suffix rule is the whole trick:
+# prefixing a retired name with "qwen-" does NOT make it new.
+#
+# RELATIONSHIP TO THE LIVE TRACK. The ranked track on main is
+# laguna-xs-2.1-dflash-v1 (.github/workflows/dflash-benchmark.yml,
+# benchmark.json). This workflow is modeled structurally on that one -- same
+# step order, same trusted-shell sealing, same single-occupancy hidden-golden
+# bracket, same TOCTOU harness pins -- and it CHANGES NOTHING about it. Both may
+# coexist on this branch; only one may ever be the ranked entrypoint, and the
+# switch is a repo-split action, not a change here.
+#
+# METHOD. The speculative mechanism is the CHECKPOINT'S OWN multi-token-
+# prediction head (mlx-community/Qwen3.6-27B-MTP-4bit, ~247 MB), not a separately
+# trained EAGLE-style drafter. That is the one structural difference from the
+# DFlash template: there is no third-party drafter artifact to substitute, so
+# the anti-substitution rules bind the MTP head's pinned revision instead.
+# Measured envelope on M5 (depth 2, exact-greedy vs serial, 12/12 runs to 512
+# tokens): 1.74x @ 32 tokens, 1.34x @ 128, ~1.0x @ 512. Depth 3 is exact but
+# net-slower. Depth is pinned at 2 below and MUST be re-derived across the whole
+# timed pool once the pool exists, exactly as DFlash re-derived K three times.
+#
+# SCORING (provisional, mirrors the DFlash mechanics):
+#   raw   = mean(serial K=1 seconds/token) / mean(MTP seconds/token)
+#           [ratio-of-means over accepted thermally-gated pairs]
+#   score = raw / noop_reference[sampled prompt]   [per-prompt normalised]
+# The floor is deliberately NOT chosen here: it is a measured quantity derived
+# from the pool's own no-op references (DFlash's floor moved three times for
+# exactly this reason), so it carries QWEN-PENDING and fails closed.
+#
+# HOST CONTRACT (operator-provisioned, janitor-audited; consumed, never
+# installed, by this workflow):
+#   MLXFAST_QWEN_MTP_TARGET_DIR   read-only runner-owned cache holding exactly
+#                                 the 15 files pinned by
+#                                 fixtures/reference_qwen3_6_27b_4bit.sha256.
+#   MLXFAST_QWEN_MTP_HEAD_DIR     read-only cache holding the pinned MTP head
+#                                 (its byte manifest is PENDING -- phase 2).
+#   MLXFAST_QWEN_MTP_BASELINE_WS  pinned prebuilt tree with weights already
+#                                 transformed; the serial denominator runs from
+#                                 here, never from the candidate workspace.
+#   MLXFAST_QWEN_MTP_BASELINE_CALIBRATION
+#                                 operator calibration with sanity bands.
+#   MLXFAST_QWEN_MTP_MEASURE_JOB  box-owned timing wrapper measure-qwen-mtp-job.sh
+#                                 (fixed 40C thermal contract, 2 Hz macmon
+#                                 telemetry, throttle/stall rejection, per-track
+#                                 state isolation, lib-only hook).
+#
+# Dispatch-only, same self-hosted safety rules as the DFlash pipeline: no
+# PR/push triggers, refs restricted to main, submissions/*, baseline/*, and
+# yukon/baseline/*.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_track_enabled:
+        description: "ARMING interlock. Defaults TRUE so Yukon (which omits custom inputs) can dispatch; the load-bearing gates are the trusted contract fields, the calibration-ready interlock, and the organizer pin-completeness gate, none of which this flag can satisfy. An explicit false is still refused."
+        required: false
+        default: true
+        type: boolean
+      run_benchmark:
+        description: "Run the timed paired MTP measurement after the correctness/parity gate. false = correctness/parity only (the migration-window shape: gates work while ranked timing stays refused)."
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mlxfast-qwen-mtp-ranked-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  qwen-mtp-ranked:
+    name: "single-machine Qwen 3.6 MTP ranked benchmark (m5-qwen3.6-27b-mtp)"
+    # DEDICATED label, deliberately NOT m5-bench and NOT m5-laguna-dflash.
+    # An unserved dispatch QUEUES instead of running on a box provisioned for
+    # another track, which is the safe failure for an inert track. Registering a
+    # runner under this label is an operator action (target box: m5-max-128gb-3).
+    runs-on: [self-hosted, m5-qwen3.6-27b-mtp]
+    # Budget: build (~15m) + transform of the 16.1 GB source (~10m) + artifact
+    # hashing (~3m) + full-length parity pass (~15m) + cooldowns (up to 900s per
+    # timed phase) + >=3 alternating timed pairs.
+    timeout-minutes: 360
+    # MUST match the environment the other ranked jobs bind: the SAME secret
+    # NAMES resolve per environment, so a different binding silently hands this
+    # job different credentials and a different endpoint for the same objects.
+    environment: benchmark-private-prompts-v2
+    env:
+      # --- Host contract -------------------------------------------------
+      MLXFAST_BENCH_EXEC: /opt/bench/bench-exec.sh
+      MLXFAST_JANITOR: /opt/bench/janitor.sh
+      MLXFAST_QUARANTINE_FLAG: /opt/bench/quarantine.flag
+      MLXFAST_MACMON: /opt/bench-runner/bin/macmon
+      MLXFAST_QWEN_MTP_MEASURE_JOB: /opt/bench-runner/measure-qwen-mtp-job.sh
+      # Per-track paths. The calibration file MUST stay inside the per-track
+      # state dir: the bare /opt/bench-runner/state is the retired serial
+      # track's, and banding this track's runs against those numbers would
+      # cross-write another track's oracle cache.
+      MLXFAST_QWEN_MTP_BASELINE_WS: /opt/bench-runner/baseline/qwen3.6-27b-mtp-v1/current
+      MLXFAST_QWEN_MTP_BASELINE_CALIBRATION: /opt/bench-runner/state/qwen3.6-27b-mtp-v1/baseline-calibration.json
+      MLXFAST_MEASURE_STATE_DIR: /opt/bench-runner/state/qwen3.6-27b-mtp-v1
+      # Pinned checkpoint snapshot. Repo + revision are mirrored by
+      # Sources/MLXFastCore/Constants.swift (referenceModelRepository /
+      # referenceModelRevision) and by setup.sh; the snapshot leaf below IS the
+      # revision, so a repin moves all three together.
+      MLXFAST_QWEN_MTP_TARGET_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--Qwen3.6-27B-4bit/snapshots/c000ac2c2057d94be3fa931000c31723aac53282
+      MLXFAST_QWEN_MTP_CHECKPOINT_REPO: mlx-community/Qwen3.6-27B-4bit
+      MLXFAST_QWEN_MTP_CHECKPOINT_REVISION: c000ac2c2057d94be3fa931000c31723aac53282
+      # The MTP head is a SEPARATELY pinned artifact and is NOT part of the
+      # backbone manifest (the pinned backbone revision contains no mtp.* tensors
+      # and the transform never selects them).
+      MLXFAST_QWEN_MTP_HEAD_DIR: /opt/bench-runner/cache/qwen36/qwen3.6-27b-mtp-v1/mtp-head
+      MLXFAST_QWEN_MTP_HEAD_REPO: mlx-community/Qwen3.6-27B-MTP-4bit
+      MLXFAST_QWEN_MTP_HEAD_REVISION: 83795d546e9d328160e593fb0bf10b2bf2fe637e
+      # Bench workspace: distinct stable path per track, same
+      # /Users/Shared/bench-jobs confinement contract. Stable across runs on
+      # purpose (llbuild caches absolute paths); never per-run.
+      MLXFAST_JOB_WS: /Users/Shared/bench-jobs/qwen-mtp-ranked-current
+      # --- Runner-only private material (0700 runner) --------------------
+      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-qwen-mtp-private-${{ github.run_id }}-${{ github.run_attempt }}
+      # Satisfies stage-benchmark-artifacts.sh's /tmp/mlxfast-artifacts- prefix
+      # contract with a track-distinct run component.
+      MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-qwen-mtp-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_MEASURE_OUT: /tmp/mlxfast-qwen-mtp-measure-${{ github.run_id }}-${{ github.run_attempt }}
+      # --- Track contract ------------------------------------------------
+      MLXFAST_QWEN_MTP_TRACK_ID: qwen3.6-27b-mtp-v1
+      MLXFAST_QWEN_MTP_TRACK_NAME: mlxfast-challenge-dev-qwen-mtp
+      # The phase-5 track contract fixture, now AUTHORED: it carries
+      # official_scoring_enabled, reference_baseline.publication_allowed, the
+      # 8-entry timed_prompt_pool and each pool entry's MEASURED no-op
+      # reference. "Enforce Qwen-MTP track enablement" does `test -s` on this
+      # path, and then refuses a RANKED dispatch while either
+      # official_scoring_enabled or reference_baseline.publication_allowed is
+      # false -- both are still false, so ranked runs stay refused and only
+      # run_benchmark=false gates-only dry runs proceed.
+      MLXFAST_QWEN_MTP_CONTRACT_PATH: fixtures/qwen3_6_27b_mtp_track.json
+      # The BENCHMARK MANIFEST (editablePaths / scoring), distinct from the track
+      # contract fixture above. Passed as CONTRACT_PATH to BOTH
+      # enforce-modifiable-surface.sh and overlay-editable-paths.sh so a
+      # submission is judged and overlaid against the SAME surface; naming a
+      # different file in one of the two silently drops files the other accepted.
+      MLXFAST_QWEN_MTP_EDITABLE_SURFACE_CONTRACT: benchmark.qwen-mtp.json
+      MLXFAST_QWEN_MTP_TARGET_MANIFEST_PATH: fixtures/reference_qwen3_6_27b_4bit.sha256
+      # Whole-manifest shape pins, recomputed from the checked-in manifest on
+      # this branch. They make a truncated or extended manifest a first-minute
+      # failure instead of a silently smaller cache verification.
+      MLXFAST_QWEN_MTP_TARGET_MANIFEST_RECORDS: "15"
+      MLXFAST_QWEN_MTP_TARGET_MANIFEST_BYTES: "16081488494"
+      # LANDED (phase 2): the MTP head's byte manifest is checked in. It was
+      # built exactly like the target manifest -- LFS oids for the two LFS blobs
+      # (model.safetensors, tokenizer.json), direct content hashing for the rest.
+      MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH: fixtures/qwen3_6_27b_mtp_head.sha256
+      # Whole-manifest shape pins for the head, recomputed from the checked-in
+      # file, for exactly the reason the target's exist: per-file hashing cannot
+      # see a manifest that LOST records -- it would verify fewer files and
+      # report success. 7 records, not 8: the head repo carries 8 files at the
+      # pinned revision and `.gitattributes` is excluded, the same exclusion the
+      # backbone manifest makes (16 repo files, 15 records).
+      MLXFAST_QWEN_MTP_HEAD_MANIFEST_RECORDS: "7"
+      MLXFAST_QWEN_MTP_HEAD_MANIFEST_BYTES: "258489240"
+      # --- Decode / score contract ---------------------------------------
+      # Depth 2. Provenance: the MTP session's measured envelope on M5 (exact
+      # greedy vs serial, 12/12 runs to 512 tokens, all EOS branches) --
+      # 1.74x @ 32, 1.34x @ 128, ~1.0x @ 512; depth 3 is exact but net-slower.
+      # MUST be re-derived across the WHOLE timed pool once the pool exists: a
+      # depth tuned to one prompt is the same trap as a floor tuned to one
+      # prompt (DFlash re-derived K three times for exactly this reason).
+      MLXFAST_QWEN_MTP_DEPTH: "2"
+      MLXFAST_QWEN_MTP_DECODE_TOKENS: "512"
+      MLXFAST_QWEN_MTP_CORRECTNESS_TOKENS: "512"
+      # RESOLVED (phase 5, box 3 at tip 6a3bee9). The floor is NORMALISED, so
+      # its value is method-independent: each pool entry's own MEASURED
+      # noop_decode_speedup normalises to 1.0 and the floor is the 0.95 margin
+      # below that, matching the DFlash convention. The measurement that makes
+      # this legitimate is the per-entry noop_decode_speedup in
+      # fixtures/qwen3_6_27b_mtp_track.json -- raw ratios spanning 0.756 to
+      # 1.0915 across the 8 prompts, which is precisely why the RAW ratio could
+      # never carry a fixed floor.
+      MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR: "0.95"
+      MLXFAST_QWEN_MTP_MIN_ACCEPTED_PAIRS: "3"
+      MLXFAST_QWEN_MTP_TARGET_PAIRS: "4"
+      # Attributable ranked failures allowed per submission branch (contract
+      # layer L6, second half). Same sizing argument as the DFlash track.
+      MLXFAST_QWEN_MTP_MAX_RANKED_FAILURES: "5"
+      # Provisional target identity for the timed decode prompt family.
+      MLXFAST_QWEN_MTP_TIMED_TARGET_ID: lowsim-prose-qwen-v1
+      # --- Hidden artifact pins (partially resolved) ----------------------
+      # RESOLVED (generated on box 3 against the Qwen 3.6 SERIAL tower and
+      # uploaded to R2 under this track's namespace):
+      #   * the RAW hidden correctness golden -- the reused serial gate's
+      #     teacher-forced base case (256) + free-run gate (128), regenerated
+      #     from the serial reseed prompt (detokenized under the Laguna
+      #     tokenizer with verified exact round-trip, re-tokenized under Qwen);
+      #   * the GPQA reference cases -- prompts/answer-keys/domains preserved
+      #     from the serial reseed, accepted-token-sequences re-tokenized under
+      #     the Qwen tokenizer (9 budget-valid cases, verified via
+      #     generate-gpqa-answers against the Qwen weights).
+      # Their digests + byte counts are pinned here and the matching R2 object
+      # keys (in "Prepare hidden correctness golden") embed the same digests.
+      #
+      # RESOLVED (phase 5 -- the native-MTP head is now integrated into the
+      # ranked runtime, so the MTP-head golden and the measured no-op references
+      # both exist). Generated on box 3 at tip 6a3bee9 against the Qwen 3.6
+      # tower with the pinned MTP head, from the hidden correctness prompt's own
+      # 512 seed tokens: `mtp-verify --emitted <plan> --generate 513`
+      # (reference_self_consistent=true, 513 rows), then re-verified by a
+      # `mtp-verify --tokens 512 --mtp-depth 2` pass that returned
+      # all_tokens_matched=true, parity_all_ok=true and a CLOSED row ledger
+      # (767/767 reference-checked).
+      #
+      # NOTE the object itself is NOT yet uploaded to R2; the key below embeds
+      # this digest and the download step will fail until the operator uploads
+      # it. That is the intended fail-closed ordering -- digest first, upload
+      # second -- and it is why official_scoring_enabled stays false.
+      MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_SHA256: 0c1dcdabd85e7655f5df03e5a1265a5fde1a43ef223283021463f7af80481add
+      MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_BYTES: "110168"
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: eef3b817e390759275b7bc3570b10bb2846d2303000a0c9f1d627ad70f718c1e
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "21036"
+      MLXFAST_GPQA_REFERENCE_SHA256: d05e93e9694d86e0041e6b9c843642d4637de524e9a1b88a145caaa0da6235fe
+      MLXFAST_GPQA_REFERENCE_BYTES: "9886"
+      # --- Reused serial gate contract ------------------------------------
+      # The correctness/GPQA gate leg is the live serial gate stack re-hosted
+      # here and pointed at this job's build, exactly as dflash-benchmark.yml
+      # re-hosts it: a submitter on this track edits the same vendored model and
+      # kernel surface and this job builds the same two binaries, so those gates
+      # already prove the model is still sound. NOTHING BELOW IS RETUNED.
+      #
+      # The ONE renamed input: the serial gate steps read MLXFAST_REFERENCE_DIR,
+      # while this workflow calls the same directory MLXFAST_QWEN_MTP_TARGET_DIR.
+      # Job-level env cannot read the env context, so the path is spelled twice
+      # and "Qwen-MTP host preflight" asserts the two strings are equal.
+      MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--Qwen3.6-27B-4bit/snapshots/c000ac2c2057d94be3fa931000c31723aac53282
+      # Trusted final-artifact shape contract; equals
+      # MLXFastConstants.numHiddenLayers on this branch (Qwen 3.6 27B: 64 layers
+      # on a 4-layer repeat -- every 4th layer full attention, the other three
+      # gated-delta linear attention).
+      MLXFAST_EXPECTED_NUM_LAYERS: "64"
+      # The transform already ran and was hashed, so the gates pass does not
+      # re-verify it.
+      MLXFAST_VERIFY_TRANSFORM: "0"
+      MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}
+      MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-qwen-mtp-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
+      MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-qwen-mtp-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json
+      MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
+      MLXFAST_BENCHMARK_CORRECTNESS_STEPS: "64"
+      MLXFAST_GPQA_CASE_COUNT: "9"
+      MLXFAST_GPQA_MAX_NEW_TOKENS: "128"
+      MLXFAST_GPQA_TTFT_CASE_COUNT: "9"
+      MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "9"
+      MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: "128"
+      # Carried over from the calibrated serial value. It is a MEASURED number
+      # on a different model, so it is re-derivable per NEW-MODEL-BRINGUP 7.4
+      # (min(observed) - 1 over >= 4 baseline-equivalent ranked runs) once this
+      # track has ranked history. Left at the conservative inherited value
+      # rather than invented downward.
+      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "7"
+      MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
+      MLXFAST_SEMANTIC_GPQA_MODEL: claude-opus-4-8
+      # --- Public drift tripwire (REAL PINS, recomputed on this branch) ----
+      # The checked-in public fixtures were regenerated against the Qwen 3.6
+      # tower on m5-max-128gb-3 (commit 8fbe338: the 256-step golden is a strict
+      # greedy prefix of the 1024-step one; prompt text and its sha are
+      # unchanged). Both digests and byte counts below were recomputed from the
+      # committed bytes on this branch, not copied from any prior workflow.
+      MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 80b3a722632036fd568b6b48d4fe01b54e0f4eb57a163e7ab1de0b1d2edf59ce
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: "10787"
+      # The 1024-step variant is the pre-submit fixture the local runner uses.
+      # Pinned here so the two never drift apart unnoticed.
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_1024_PATH: correctness_prompts/public_longcopy_gate_english_512_1024.json
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_1024_SHA256: 7a6c4c2c1c6242f9bdd8ba83ec342c296e3a0604839cd0e7055928f1f694c6f7
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_1024_BYTES: "21313"
+      # --- Benchmark plumbing ---------------------------------------------
+      MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+      MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
+      MLXFAST_RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
+      MLXFAST_CANDIDATE_SHA: ${{ github.sha }}
+      MLXFAST_IS_SUBMISSION_BRANCH: ${{ startsWith(github.ref, 'refs/heads/submissions/') && '1' || '0' }}
+      # Operator-pinned Metal toolchain, identical to the ranked DFlash build.
+      MLXFAST_METAL_TOOLCHAIN_IDENTIFIER: com.apple.dt.toolchain.Metal.32023.883
+      # THE CALIBRATION-READY INTERLOCK (NEW-MODEL-BRINGUP 7.5). A single
+      # boolean, hard-pinned in trusted workflow source -- never an expression,
+      # never a dispatch input -- attesting that the model-derived private
+      # fixtures AND the final-SHA on-box baseline + calibration for THIS model
+      # are installed and calibrated. It gates only TIMED runs, so
+      # run_benchmark=false correctness dispatches keep working while it is
+      # closed, which is the migration shape. "0" until the operator completes
+      # the go-live runbook on m5-max-128gb-3.
+      MLXFAST_QWEN_MTP_CALIBRATION_READY: "0"
+      # Trusted workflow identity, asserted by "Enforce trusted workflow
+      # context" below.
+      MLXFAST_QWEN_MTP_TRUSTED_REPOSITORY: Layr-Labs/mlxfast-challenge-dev
+      MLXFAST_QWEN_MTP_WORKFLOW_PATH: .github/workflows/qwen-mtp-ranked-benchmark.yml
+    steps:
+      # Fail fast if the box is quarantined or the isolation stack is missing,
+      # before any checkout or secret use. Track-specific host paths are only
+      # asserted after the enablement gate (they do not exist until go-live).
+      - name: Host preflight
+        run: |
+          set -euo pipefail
+          echo "host=$(hostname) chip=$(sysctl -n machdep.cpu.brand_string) user=$(id -un) uid=$(id -u)"
+          if [[ -e "${MLXFAST_QUARANTINE_FLAG}" ]]; then
+            echo "::error::box is quarantined (${MLXFAST_QUARANTINE_FLAG}); janitor detected drift -- see RUNBOOK" >&2
+            exit 1
+          fi
+          test -e "${MLXFAST_BENCH_EXEC}" || { echo "::error::bench-exec bridge missing" >&2; exit 1; }
+          test -e "${MLXFAST_JANITOR}" || { echo "::error::janitor missing" >&2; exit 1; }
+          # THE CALIBRATION-READY INTERLOCK, enforced in the first step, before
+          # checkout and before any secret use (NEW-MODEL-BRINGUP 7.5). It
+          # refuses TIMED runs only: a correctness-only dispatch is exactly the
+          # migration workflow and must keep working while the flag is closed.
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" && "${MLXFAST_QWEN_MTP_CALIBRATION_READY}" != "1" ]]; then
+            echo "::error::Qwen 3.6 MTP model-derived fixtures and final-SHA baseline are not calibrated" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          # Submission branches contribute editable paths only; trusted main is
+          # the harness/workflow/contract base. Main, baseline/*, and
+          # yukon/baseline/* run their exact SHA.
+          ref: ${{ startsWith(github.ref, 'refs/heads/submissions/') && 'main' || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Inlined rather than delegated to a .github/scripts/ helper. The DFlash
+      # track has enforce-trusted-dflash-benchmark-workflow.sh; the equivalent
+      # enforce-trusted-qwen-mtp-workflow.sh is a follow-up that belongs with the
+      # rest of the .github/scripts work, and this draft deliberately touches no
+      # file another phase owns. The logic below is that script's logic, with
+      # WORKFLOW_PATH read from job env instead of hardcoded.
+      - name: Enforce trusted workflow context
+        env:
+          GH_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
+          : "${GITHUB_REF:?GITHUB_REF is required}"
+          : "${GH_WORKFLOW_REF:?workflow ref is required}"
+          : "${GITHUB_EVENT_NAME:?GITHUB_EVENT_NAME is required}"
+          if [[ "${GITHUB_REPOSITORY}" != "${MLXFAST_QWEN_MTP_TRUSTED_REPOSITORY}" ]]; then
+            echo "::error::private benchmark workflow must run in ${MLXFAST_QWEN_MTP_TRUSTED_REPOSITORY}, not ${GITHUB_REPOSITORY}" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
+            echo "::error::private benchmark workflow only supports workflow_dispatch" >&2
+            exit 1
+          fi
+          case "${GITHUB_REF}" in
+            refs/heads/main|refs/heads/submissions/*|refs/heads/baseline/*|refs/heads/yukon/baseline/*)
+              ;;
+            # TEMPORARY (2026-08-13): pre-merge migration window -- qwen36-mtp-track
+            # is signature-protected (verified-committer branch rule); REMOVE this
+            # arm at the go-live merge (grep 'TEMPORARY (2026-08-13)' -- the
+            # enforce-trusted-qwen-mtp-* guard scripts carry matching entries).
+            refs/heads/qwen36-mtp-track)
+              echo "::warning::TEMPORARY REF IN USE: refs/heads/qwen36-mtp-track must be removed from this allowlist at the go-live merge." >&2
+              ;;
+            *)
+              echo "::error::private benchmark workflow ref is not allowed: ${GITHUB_REF}" >&2
+              echo "::error::allowed branches are main, submissions/*, baseline/*, and yukon/baseline/*, and (TEMPORARY, until go-live) qwen36-mtp-track" >&2
+              exit 1
+              ;;
+          esac
+          expected_workflow_ref="${MLXFAST_QWEN_MTP_TRUSTED_REPOSITORY}/${MLXFAST_QWEN_MTP_WORKFLOW_PATH}@${GITHUB_REF}"
+          if [[ "${GH_WORKFLOW_REF}" != "${expected_workflow_ref}" ]]; then
+            echo "::error::unexpected workflow ref ${GH_WORKFLOW_REF}" >&2
+            echo "::error::expected ${expected_workflow_ref}" >&2
+            exit 1
+          fi
+          echo "qwen-mtp-ranked-benchmark: trusted workflow verified ${GH_WORKFLOW_REF}"
+
+      # Standing fail-closed gate, before any secret use, submitted-code
+      # handling, or bench execution. Enablement is TWO questions:
+      #   may this job RUN?      confirm_track_enabled, a matching track_id, and
+      #                          non-empty golden pins.
+      #   may it PUBLISH?        official_scoring_enabled AND
+      #                          reference_baseline.publication_allowed.
+      # Requiring the PUBLISH answer in order to RUN would make the pipeline
+      # untestable before the switch it gates was already thrown -- the mistake
+      # the DFlash track had to split apart after the fact. A gates-only
+      # dispatch produces NO ranked score and is allowed against a not-yet-
+      # enabled track.
+      #
+      # TODAY THIS STEP FAILS ON ITS FIRST LINE: the contract fixture does not
+      # exist. That is the intended state of an inert track.
+      - name: Enforce Qwen-MTP track enablement
+        env:
+          CONFIRM_TRACK_ENABLED: ${{ inputs.confirm_track_enabled && '1' || '0' }}
+          RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          if [[ ! -s "${MLXFAST_QWEN_MTP_CONTRACT_PATH}" ]]; then
+            echo "::error::QWEN-MTP-PENDING-ORGANIZER: the track contract fixture ${MLXFAST_QWEN_MTP_CONTRACT_PATH} does not exist. It carries official_scoring_enabled, reference_baseline.publication_allowed, the timed_prompt_pool and each pool entry's pinned no-op reference. Author it (QWEN36-MTP-CHALLENGE-PLAN.md phase 5) before any dispatch of this workflow can proceed." >&2
+            exit 1
+          fi
+          track_id="$(jq -r '.track_id' "${MLXFAST_QWEN_MTP_CONTRACT_PATH}")"
+          if [[ "${track_id}" != "${MLXFAST_QWEN_MTP_TRACK_ID}" ]]; then
+            echo "::error::contract track_id ${track_id} does not match workflow track ${MLXFAST_QWEN_MTP_TRACK_ID}" >&2
+            exit 1
+          fi
+          scoring_enabled="$(jq -r '.official_scoring_enabled' "${MLXFAST_QWEN_MTP_CONTRACT_PATH}")"
+          publication_allowed="$(jq -r '.reference_baseline.publication_allowed' "${MLXFAST_QWEN_MTP_CONTRACT_PATH}")"
+          if [[ "${scoring_enabled}" != "true" || "${publication_allowed}" != "true" ]]; then
+            if [[ "${RUN_BENCHMARK}" == "1" ]]; then
+              echo "::error::Qwen-MTP track ${MLXFAST_QWEN_MTP_TRACK_ID} is NOT enabled (official_scoring_enabled=${scoring_enabled}, reference_baseline.publication_allowed=${publication_allowed}). A RANKED run is deliberately refused until the operator completes the go-live runbook and flips both trusted-contract fields on the trusted ref. Dispatch with run_benchmark=false to validate the gates without producing a score." >&2
+              exit 1
+            fi
+            echo "::notice::Qwen-MTP track ${MLXFAST_QWEN_MTP_TRACK_ID} is not enabled for ranked scoring (official_scoring_enabled=${scoring_enabled}, reference_baseline.publication_allowed=${publication_allowed}); proceeding as a GATES-ONLY dry run, which publishes no score."
+            echo "MLXFAST_QWEN_MTP_DRY_RUN_UNENABLED=1" >> "${GITHUB_ENV}"
+          fi
+          for pin_name in \
+            MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_SHA256 \
+            MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_BYTES \
+            MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256 \
+            MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES \
+            MLXFAST_GPQA_REFERENCE_SHA256 \
+            MLXFAST_GPQA_REFERENCE_BYTES; do
+            if [[ -z "${!pin_name}" ]]; then
+              echo "::error::hidden Qwen-MTP golden pin ${pin_name} is empty; freeze the goldens on the serving box and pin them here before enabling the track" >&2
+              exit 1
+            fi
+          done
+          if [[ "${CONFIRM_TRACK_ENABLED}" != "1" ]]; then
+            echo "::error::Qwen-MTP track enablement interlock is disabled; dispatch requires confirm_track_enabled=true" >&2
+            exit 1
+          fi
+          if [[ "${RUN_BENCHMARK}" == "1" ]]; then
+            echo "qwen-mtp-ranked-benchmark: track ${MLXFAST_QWEN_MTP_TRACK_ID} enablement verified (RANKED: scoring enabled and publication allowed)"
+          else
+            echo "qwen-mtp-ranked-benchmark: track ${MLXFAST_QWEN_MTP_TRACK_ID} enablement verified (GATES-ONLY dry run: no ranked score is produced)"
+          fi
+
+      # THE PENDING-PIN GATE. Non-emptiness (checked above) is not enough while
+      # the organizer artifacts do not exist: a placeholder string is non-empty.
+      # This step rejects the literal marker BY NAME and independently enforces
+      # the SHAPE every pin must have, so neither a leftover placeholder nor a
+      # typo'd digest can reach a download, a comparison, or a score.
+      #
+      # Scoping mirrors the dispatch kind: the untimed set is required by every
+      # dispatch, the timed set only by a ranked one, so the gates-only path
+      # stays usable the moment the untimed artifacts land -- without ever
+      # relaxing the ranked requirements.
+      - name: Enforce Qwen-MTP organizer pin completeness
+        env:
+          PENDING_MARKER: QWEN-MTP-PENDING-ORGANIZER
+        run: |
+          set -euo pipefail
+          pending=()
+          malformed=()
+          check_hex() {
+            local name="$1" value="${!1-}"
+            if [[ "${value}" == *"${PENDING_MARKER}"* ]]; then
+              pending+=("${name}")
+              return
+            fi
+            if [[ ! "${value}" =~ ^[0-9a-f]{64}$ ]]; then
+              malformed+=("${name} (not a 64-character lowercase hex digest)")
+            fi
+          }
+          check_positive_int() {
+            local name="$1" value="${!1-}"
+            if [[ "${value}" == *"${PENDING_MARKER}"* ]]; then
+              pending+=("${name}")
+              return
+            fi
+            if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+              malformed+=("${name} (not a positive integer)")
+            fi
+          }
+          check_number() {
+            local name="$1" value="${!1-}"
+            if [[ "${value}" == *"${PENDING_MARKER}"* ]]; then
+              pending+=("${name}")
+              return
+            fi
+            if [[ ! "${value}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+              malformed+=("${name} (not a non-negative decimal number)")
+            fi
+          }
+          # Required by EVERY dispatch, gates-only included.
+          check_hex MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_SHA256
+          check_positive_int MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_BYTES
+          check_hex MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256
+          check_positive_int MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES
+          check_hex MLXFAST_GPQA_REFERENCE_SHA256
+          check_positive_int MLXFAST_GPQA_REFERENCE_BYTES
+          # Required only by a run that can publish a score.
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
+            check_number MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR
+          fi
+          # The public pins are NOT in either list on purpose: they are computed
+          # from bytes checked into this repository and are already frozen. Assert
+          # that here, so a future edit cannot quietly turn a real pin into a
+          # placeholder without this step noticing.
+          for frozen in \
+            MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256 \
+            MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_1024_SHA256; do
+            if [[ "${!frozen}" == *"${PENDING_MARKER}"* ]]; then
+              malformed+=("${frozen} (a public fixture pin must never be a placeholder: recompute it from the checked-in fixture)")
+            fi
+          done
+          if ((${#pending[@]})); then
+            for name in "${pending[@]}"; do
+              echo "::error::${PENDING_MARKER}: ${name} is still a placeholder. The hidden Qwen-MTP artifacts (correctness golden, GPQA reference, timed prompt pool, normalised floor) must be generated on the serving box, uploaded to R2, and pinned here before this track can run." >&2
+            done
+          fi
+          if ((${#malformed[@]})); then
+            for problem in "${malformed[@]}"; do
+              echo "::error::Qwen-MTP pin is malformed: ${problem}" >&2
+            done
+          fi
+          if ((${#pending[@]} + ${#malformed[@]})); then
+            exit 1
+          fi
+          echo "qwen-mtp-ranked-benchmark: organizer pin completeness verified"
+
+      # Track-specific host contract, asserted only once enablement passed.
+      - name: Qwen-MTP host preflight
+        run: |
+          set -euo pipefail
+          test -x "${MLXFAST_QWEN_MTP_MEASURE_JOB}" || { echo "::error::measure-qwen-mtp-job missing" >&2; exit 1; }
+          test -x "${MLXFAST_MACMON}" || { echo "::error::macmon missing" >&2; exit 1; }
+          test -f "${MLXFAST_QWEN_MTP_TARGET_DIR}/config.json" || { echo "::error::Qwen target cache missing" >&2; exit 1; }
+          test -f "${MLXFAST_QWEN_MTP_HEAD_DIR}/config.json" || { echo "::error::Qwen MTP head cache missing" >&2; exit 1; }
+          # The snapshot leaf must BE the pinned revision. Spelled twice (path and
+          # revision) because job-level env cannot compose, so assert them equal.
+          case "${MLXFAST_QWEN_MTP_TARGET_DIR}" in
+            */snapshots/"${MLXFAST_QWEN_MTP_CHECKPOINT_REVISION}")
+              ;;
+            *)
+              echo "::error::MLXFAST_QWEN_MTP_TARGET_DIR (${MLXFAST_QWEN_MTP_TARGET_DIR}) does not end in the pinned revision ${MLXFAST_QWEN_MTP_CHECKPOINT_REVISION}; the cache path and the checkpoint pin have drifted apart" >&2
+              exit 1
+              ;;
+          esac
+          # The reused serial gate steps read MLXFAST_REFERENCE_DIR; this
+          # workflow calls the same directory MLXFAST_QWEN_MTP_TARGET_DIR. Assert
+          # the two spellings are the same string so the duplication can never rot
+          # into "the serial gates checked a different checkpoint".
+          if [[ "${MLXFAST_REFERENCE_DIR}" != "${MLXFAST_QWEN_MTP_TARGET_DIR}" ]]; then
+            echo "::error::MLXFAST_REFERENCE_DIR (${MLXFAST_REFERENCE_DIR}) must be the same path as MLXFAST_QWEN_MTP_TARGET_DIR (${MLXFAST_QWEN_MTP_TARGET_DIR}); the reused serial correctness/GPQA gates and the MTP target must be the same pinned checkpoint" >&2
+            exit 1
+          fi
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
+            test -d "${MLXFAST_QWEN_MTP_BASELINE_WS}" || { echo "::error::pinned Qwen-MTP baseline workspace missing" >&2; exit 1; }
+            test -s "${MLXFAST_QWEN_MTP_BASELINE_CALIBRATION}" || { echo "::error::Qwen-MTP baseline calibration missing" >&2; exit 1; }
+          fi
+
+      - name: Capture candidate commit
+        id: candidate_context
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${CANDIDATE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::candidate SHA must be an exact 40-character lowercase commit SHA" >&2
+            exit 1
+          fi
+          trusted_main_sha="$(git rev-parse HEAD)"
+          printf '%s\n' "${CANDIDATE_SHA}" > candidate.sha
+          printf 'trusted_main_sha=%s\n' "${trusted_main_sha}" >> "${GITHUB_OUTPUT}"
+
+      # Contract layer L6, second half (the timed pool is the first half).
+      # Sampling a timed target per run makes a tuned threshold a 1/N gamble;
+      # rate limiting is what stops the gamble being repeated for free. Only
+      # participant-attributable failures count -- see the recorder step near the
+      # end.
+      - name: Enforce Qwen-MTP ranked-failure rate limit
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        run: |
+          set -euo pipefail
+          limit="${MLXFAST_QWEN_MTP_MAX_RANKED_FAILURES}"
+          counts_dir="${MLXFAST_MEASURE_STATE_DIR}/failure-counts"
+          mkdir -p "${counts_dir}"
+          # Branch names are attacker-influenced, so derive the filename from a
+          # digest rather than from the ref text itself.
+          branch_key="$(printf '%s' "${GITHUB_REF}" | shasum -a 256 | awk '{print $1}')"
+          counter="${counts_dir}/${branch_key}.count"
+          used=0
+          if [[ -s "${counter}" ]]; then
+            used="$(tr -dc '0-9' < "${counter}")"
+            used="${used:-0}"
+          fi
+          if [[ "${used}" -ge "${limit}" ]]; then
+            echo "::error::this submission branch has used ${used} of ${limit} attributable ranked Qwen-MTP attempts; further attempts are rate limited" >&2
+            exit 1
+          fi
+          echo "qwen-mtp-ranked-benchmark: attributable ranked failures for this branch: ${used}/${limit}"
+
+      - name: Checkout submitted editable paths
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          path: .mlxfast-submission-src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify submitted commit and modifiable surface
+        id: verify_submission
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        env:
+          SUBMISSION_REF: ${{ github.sha }}
+          TRUSTED_MAIN_SHA: ${{ steps.candidate_context.outputs.trusted_main_sha }}
+        run: |
+          set -euo pipefail
+          hardened_git="${GITHUB_WORKSPACE}/.github/scripts/hardened-git.sh"
+          actual_sha="$("${hardened_git}" -C .mlxfast-submission-src rev-parse HEAD)"
+          if [[ "${actual_sha}" != "${SUBMISSION_REF}" ]]; then
+            echo "::error::submitted checkout resolved to ${actual_sha}, expected ${SUBMISSION_REF}" >&2
+            exit 1
+          fi
+          if ! "${hardened_git}" -C .mlxfast-submission-src cat-file -e "${TRUSTED_MAIN_SHA}^{commit}"; then
+            echo "::error::submitted checkout cannot resolve trusted main commit ${TRUSTED_MAIN_SHA}" >&2
+            exit 1
+          fi
+          base_sha="$("${hardened_git}" -C .mlxfast-submission-src merge-base "${TRUSTED_MAIN_SHA}" "${actual_sha}")"
+          if [[ "${base_sha}" != "${TRUSTED_MAIN_SHA}" ]]; then
+            echo "::error::submission must be based on current trusted main ${TRUSTED_MAIN_SHA}; merge-base is ${base_sha}" >&2
+            exit 1
+          fi
+          # CONTRACT_PATH is load-bearing, not cosmetic: without it the script
+          # defaults to benchmark.json (the DFlash manifest on this branch) and a
+          # Qwen-MTP submitter's edits are judged against the wrong editable
+          # surface -- while the overlay below, reading the same default, silently
+          # does not overlay them. Both invocations must name this track's
+          # manifest.
+          (
+            cd .mlxfast-submission-src
+            BASE_SHA="${base_sha}" HEAD_SHA="${actual_sha}" \
+              CONTRACT_PATH="${MLXFAST_QWEN_MTP_EDITABLE_SURFACE_CONTRACT}" \
+              "${GITHUB_WORKSPACE}/.github/scripts/enforce-modifiable-surface.sh"
+          )
+          if ! "${hardened_git}" cat-file -e "${actual_sha}^{commit}"; then
+            "${hardened_git}" fetch --no-tags .mlxfast-submission-src "${actual_sha}"
+          fi
+          "${hardened_git}" cat-file -e "${actual_sha}^{commit}"
+          printf 'base_sha=%s\n' "${base_sha}" >> "${GITHUB_OUTPUT}"
+          echo "qwen-mtp-ranked-benchmark: verified submitted commit ${actual_sha} against base ${base_sha}"
+
+      # Static review with THIS track's policy: native-MTP, target-verified
+      # speculation is permitted; prompt lookup, head substitution, unverified
+      # drafts, timing forgery, and cross-request future state remain
+      # fail-worthy.
+      #
+      # POST-REBASE RECONCILIATION ITEM. run-submission-static-review.sh's policy
+      # allowlist accepts only `serial` and `dflash|laguna-xs-2.1-dflash-v1` and
+      # fails closed on anything else, so this step refuses today. Authoring the
+      # native-MTP policy arm is a change to .github/scripts/, which this draft
+      # deliberately does not touch. Failing closed is the correct interim
+      # behaviour: an unknown track must never be reviewed under another track's
+      # speculative-decode policy, and the two policies are OPPOSITE.
+      - name: Review submitted code for benchmark bypasses (Qwen-MTP policy)
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
+          HEAD_SHA: ${{ github.sha }}
+          REVIEW_BASE_SHA: ${{ steps.verify_submission.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          (
+            cd .mlxfast-submission-src
+            MLXFAST_SUBMISSION_TRACK_ID="${MLXFAST_QWEN_MTP_TRACK_ID}" \
+            MLXFAST_SUBMISSION_REVIEW_BASE_SHA="${REVIEW_BASE_SHA}" \
+              "${GITHUB_WORKSPACE}/.github/scripts/run-submission-static-review.sh"
+          )
+
+      - name: Overlay submitted editable paths
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        env:
+          SUBMISSION_WORKTREE: .mlxfast-submission-src
+          # Must match the CONTRACT_PATH the surface enforcement above used, or
+          # the overlay silently drops files the enforcement just accepted.
+          CONTRACT_PATH: ${{ env.MLXFAST_QWEN_MTP_EDITABLE_SURFACE_CONTRACT }}
+        run: .github/scripts/overlay-editable-paths.sh
+
+      - name: Remove submitted checkout
+        if: ${{ always() && startsWith(github.ref, 'refs/heads/submissions/') }}
+        run: |
+          set -euo pipefail
+          rm -rf .mlxfast-submission-src
+          test ! -e .mlxfast-submission-src
+
+      # Same Seatbelt-semantics probe as the other pipelines: this host's
+      # sandbox-exec must still deny golden reads, private-dir reads,
+      # non-workspace writes, network, and fork/exec under a worker profile.
+      - name: Probe runtime worker sandbox
+        run: .github/scripts/probe-runtime-worker-sandbox.sh
+
+      - name: Check private material present
+        run: |
+          set -euo pipefail
+          if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
+            echo "::error::hidden Qwen-MTP goldens require private R2 secrets" >&2
+            exit 1
+          fi
+          # The reused semantic GPQA gate is REQUIRED, so an unreachable judge
+          # must fail the run -- and must fail HERE, before ~25 minutes of build
+          # and transform, not after them.
+          if [[ "${MLXFAST_ANTHROPIC_PRESENT}" != "1" ]]; then
+            echo "::error::semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
+            exit 1
+          fi
+
+      # Full content hash of every target and MTP-head cache file against the
+      # checked-in manifests, every run, plus a strict flat-inventory check -- a
+      # corrupted or swapped cache can never feed the transform or the head load.
+      #
+      # The target manifest additionally carries WHOLE-MANIFEST pins (record
+      # count and total byte count, both recomputed from the committed file).
+      # Per-file hashing alone cannot detect a manifest that lost records: it
+      # would verify fewer files and report success.
+      - name: Verify Qwen target and MTP head caches against pinned manifests
+        run: |
+          set -euo pipefail
+          if [[ ! -s "${MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH}" ]]; then
+            echo "::error::the MTP head byte manifest ${MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH} is missing or empty. It pins ${MLXFAST_QWEN_MTP_HEAD_REPO} @ ${MLXFAST_QWEN_MTP_HEAD_REVISION} and this workflow refuses to load a head it cannot byte-verify." >&2
+            exit 1
+          fi
+          verify_cache() {
+            local manifest="$1" root="$2" label="$3"
+            test -s "${manifest}"
+            local failures=0 checked=0
+            local expected_names=()
+            while read -r want_hash want_bytes rel_path; do
+              [[ -z "${want_hash}" || "${want_hash}" == \#* ]] && continue
+              expected_names+=("${rel_path}")
+              local path="${root}/${rel_path}"
+              if [[ ! -f "${path}" || -L "${path}" ]]; then
+                echo "::error::${label} file missing or not a regular file: ${rel_path}" >&2
+                failures=$((failures + 1))
+                continue
+              fi
+              local actual_bytes actual_hash
+              actual_bytes="$(wc -c < "${path}" | tr -d ' ')"
+              actual_hash="$(shasum -a 256 "${path}" | awk '{print $1}')"
+              if [[ "${actual_bytes}" != "${want_bytes}" || "${actual_hash}" != "${want_hash}" ]]; then
+                echo "::error::${label} file mismatch: ${rel_path}" >&2
+                failures=$((failures + 1))
+              fi
+              checked=$((checked + 1))
+            done < "${manifest}"
+            while IFS= read -r existing; do
+              local name found expected
+              name="$(basename "${existing}")"
+              found=0
+              for expected in "${expected_names[@]}"; do
+                if [[ "${name}" == "${expected}" ]]; then
+                  found=1
+                  break
+                fi
+              done
+              if [[ "${found}" != "1" ]]; then
+                echo "::error::unexpected file in ${label} cache: ${existing}" >&2
+                failures=$((failures + 1))
+              fi
+            done < <(find "${root}" -mindepth 1 -maxdepth 1 -print)
+            if [[ "${failures}" -ne 0 || "${checked}" -eq 0 ]]; then
+              echo "::error::${label} cache failed manifest verification (checked=${checked} failures=${failures})" >&2
+              exit 1
+            fi
+            echo "qwen-mtp-ranked-benchmark: ${label} cache verified against pinned manifest (${checked} files)"
+          }
+          # Whole-manifest shape, asserted BEFORE the per-file loop consumes it.
+          manifest_records="$(awk '!/^#/ && NF { n++ } END { print n + 0 }' "${MLXFAST_QWEN_MTP_TARGET_MANIFEST_PATH}")"
+          manifest_bytes="$(awk '!/^#/ && NF { s += $2 } END { printf "%d\n", s }' "${MLXFAST_QWEN_MTP_TARGET_MANIFEST_PATH}")"
+          if [[ "${manifest_records}" != "${MLXFAST_QWEN_MTP_TARGET_MANIFEST_RECORDS}" \
+              || "${manifest_bytes}" != "${MLXFAST_QWEN_MTP_TARGET_MANIFEST_BYTES}" ]]; then
+            echo "::error::${MLXFAST_QWEN_MTP_TARGET_MANIFEST_PATH} carries ${manifest_records} records / ${manifest_bytes} bytes but the workflow pins ${MLXFAST_QWEN_MTP_TARGET_MANIFEST_RECORDS} records / ${MLXFAST_QWEN_MTP_TARGET_MANIFEST_BYTES} bytes. Per-file hashing cannot see a manifest that LOST records -- it would verify fewer files and report success -- so this pin moves with the manifest deliberately." >&2
+            exit 1
+          fi
+          echo "qwen-mtp-ranked-benchmark: target manifest shape verified (${manifest_records} records, ${manifest_bytes} bytes)"
+          head_records="$(awk '!/^#/ && NF { n++ } END { print n + 0 }' "${MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH}")"
+          head_bytes="$(awk '!/^#/ && NF { s += $2 } END { printf "%d\n", s }' "${MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH}")"
+          if [[ "${head_records}" != "${MLXFAST_QWEN_MTP_HEAD_MANIFEST_RECORDS}" \
+              || "${head_bytes}" != "${MLXFAST_QWEN_MTP_HEAD_MANIFEST_BYTES}" ]]; then
+            echo "::error::${MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH} carries ${head_records} records / ${head_bytes} bytes but the workflow pins ${MLXFAST_QWEN_MTP_HEAD_MANIFEST_RECORDS} records / ${MLXFAST_QWEN_MTP_HEAD_MANIFEST_BYTES} bytes." >&2
+            exit 1
+          fi
+          echo "qwen-mtp-ranked-benchmark: MTP head manifest shape verified (${head_records} records, ${head_bytes} bytes)"
+          verify_cache "${MLXFAST_QWEN_MTP_TARGET_MANIFEST_PATH}" "${MLXFAST_QWEN_MTP_TARGET_DIR}" "Qwen target"
+          verify_cache "${MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH}" "${MLXFAST_QWEN_MTP_HEAD_DIR}" "Qwen MTP head"
+
+      # Trusted caches are RESTORE-ONLY here: this workflow never saves into a
+      # trusted cache namespace (the same anti-poisoning posture the DFlash
+      # pipeline holds).
+      - name: Restore trusted SwiftPM dependency cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+            .build-worker/checkouts
+            .build-worker/repositories
+            .build-worker/artifacts
+            .build-worker/workspace-state.json
+          key: swiftpm-trusted-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+
+      - name: Compute MLX Metal library cache fingerprint
+        id: mlx_metallib_fingerprint
+        run: |
+          set -euo pipefail
+          cmake_bin="$(command -v cmake 2>/dev/null || true)"
+          if [[ -z "${cmake_bin}" ]]; then
+            for candidate in /opt/homebrew/bin/cmake /usr/local/bin/cmake; do
+              if [[ -x "${candidate}" ]]; then
+                cmake_bin="${candidate}"
+                break
+              fi
+            done
+          fi
+          test -x "${cmake_bin}"
+          metal_toolchain_identifier="$(
+            xcodebuild -showComponent MetalToolchain 2>/dev/null \
+              | awk -F': ' '/Toolchain Identifier/ { print $2; exit }' \
+              || true
+          )"
+          if [[ -n "${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" \
+              && "${metal_toolchain_identifier}" != "${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" ]]; then
+            echo "::error::installed Metal toolchain (${metal_toolchain_identifier:-none}) does not match the ranked pin (${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}); update the pin or the box deliberately" >&2
+            exit 1
+          fi
+          # Two-fingerprint scheme: the vendored kernel sources of THIS
+          # (overlaid) work tree key the metallib cache so a cached mlx.metallib
+          # can never mask participant kernel edits; the base fingerprint keys
+          # the build-products caches.
+          vendored_metal_fingerprint="$(tools/build-mlx-metallib.sh --print-fingerprint)"
+          test "${#vendored_metal_fingerprint}" -eq 64
+          base_fingerprint="$({
+            printf '%s\n' mlx-metallib-m5-max-v2
+            uname -m
+            sysctl -n machdep.cpu.brand_string
+            sw_vers -buildVersion
+            xcodebuild -version
+            printf 'METAL_TOOLCHAIN_IDENTIFIER=%s\n' "${metal_toolchain_identifier}"
+            xcrun --sdk macosx --show-sdk-build-version
+            if [[ -n "${metal_toolchain_identifier}" ]]; then
+              TOOLCHAINS="${metal_toolchain_identifier}" xcrun -sdk macosx metal -v 2>&1
+            else
+              xcrun -sdk macosx metal -v 2>&1
+            fi
+            "${cmake_bin}" --version
+            shasum -a 256 Package.swift Package.resolved tools/build-mlx-metallib.sh
+          } | shasum -a 256 | awk '{print $1}')"
+          test "${#base_fingerprint}" -eq 64
+          fingerprint="$({
+            printf 'BASE_FINGERPRINT=%s\n' "${base_fingerprint}"
+            printf 'VENDORED_METAL_FINGERPRINT=%s\n' "${vendored_metal_fingerprint}"
+          } | shasum -a 256 | awk '{print $1}')"
+          test "${#fingerprint}" -eq 64
+          printf 'sha256=%s\n' "${fingerprint}" >> "${GITHUB_OUTPUT}"
+          printf 'base_sha256=%s\n' "${base_fingerprint}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore trusted MLX Metal library cache
+        id: restore_mlx_metallib_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .mlxfast-cache/mlx.metallib
+            .mlxfast-cache/mlx.metallib.fingerprint
+          key: mlx-metallib-m5-max-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
+
+      - name: Verify restored MLX Metal library
+        env:
+          CACHE_HIT: ${{ steps.restore_mlx_metallib_cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [[ "${CACHE_HIT}" == "true" ]]; then
+            test -s .mlxfast-cache/mlx.metallib
+            test -s .mlxfast-cache/mlx.metallib.fingerprint
+            expected_record="mlxfast-metallib-fingerprint-v1 $(tools/build-mlx-metallib.sh --print-fingerprint)"
+            restored_record="$(cat .mlxfast-cache/mlx.metallib.fingerprint)"
+            if [[ "${restored_record}" != "${expected_record}" ]]; then
+              echo "::warning::restored mlx.metallib does not match the vendored Metal sources in this work tree; discarding it so the bench build recompiles"
+              /bin/rm -f .mlxfast-cache/mlx.metallib .mlxfast-cache/mlx.metallib.fingerprint
+            fi
+          else
+            /bin/rm -f .mlxfast-cache/mlx.metallib .mlxfast-cache/mlx.metallib.fingerprint
+          fi
+
+      - name: Reset staged trusted build products
+        run: /bin/rm -rf .mlxfast-cache/trusted-build .mlxfast-cache/worker-build
+
+      - name: Restore trusted build products cache
+        id: restore_build_products_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .mlxfast-cache/trusted-build
+          key: bench-trusted-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}
+
+      - name: Restore worker build products cache
+        id: restore_worker_build_products_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .mlxfast-cache/worker-build
+          key: bench-worker-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}
+
+      - name: Verify restored build products
+        env:
+          TRUSTED_CACHE_HIT: ${{ steps.restore_build_products_cache.outputs.cache-hit }}
+          WORKER_CACHE_HIT: ${{ steps.restore_worker_build_products_cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [[ "${TRUSTED_CACHE_HIT}" == "true" ]]; then
+            test -d .mlxfast-cache/trusted-build/release
+          else
+            /bin/rm -rf .mlxfast-cache/trusted-build
+          fi
+          if [[ "${WORKER_CACHE_HIT}" == "true" ]]; then
+            test -d .mlxfast-cache/worker-build/release
+          else
+            /bin/rm -rf .mlxfast-cache/worker-build
+          fi
+
+      # Proven-fresh stable path, trusted resolve while networked, bench ACL
+      # grant, then explicit bench-deny of every trusted surface (including
+      # fixtures/, which carries this track's contract and manifests) and a
+      # runner-owned bench-NON-writable staging dir for the predictable-name
+      # hidden goldens.
+      - name: Prepare bench workspace
+        run: |
+          set -euo pipefail
+          rm -rf "${MLXFAST_JOB_WS}" || true
+          if [[ -e "${MLXFAST_JOB_WS}" || -L "${MLXFAST_JOB_WS}" ]]; then
+            echo "::error::stale bench workspace at ${MLXFAST_JOB_WS} could not be fully removed; run the janitor and retry" >&2
+            exit 1
+          fi
+          cp -c -R "${GITHUB_WORKSPACE}" "${MLXFAST_JOB_WS}" 2>/dev/null \
+            || { rm -rf "${MLXFAST_JOB_WS}"; cp -R "${GITHUB_WORKSPACE}" "${MLXFAST_JOB_WS}"; }
+          .github/scripts/hardened-git.sh -C "${MLXFAST_JOB_WS}" cat-file -e "${MLXFAST_CANDIDATE_SHA}^{commit}"
+          .github/scripts/hardened-git.sh -C "${MLXFAST_JOB_WS}" update-ref --no-deref HEAD "${MLXFAST_CANDIDATE_SHA}"
+          if [[ -d "${MLXFAST_JOB_WS}/.mlxfast-cache/trusted-build/release" ]]; then
+            rm -rf "${MLXFAST_JOB_WS}/.build"
+            mv "${MLXFAST_JOB_WS}/.mlxfast-cache/trusted-build" "${MLXFAST_JOB_WS}/.build"
+            echo "qwen-mtp-ranked-benchmark: seeded trusted build products into bench workspace"
+          fi
+          if [[ -d "${MLXFAST_JOB_WS}/.mlxfast-cache/worker-build/release" ]]; then
+            rm -rf "${MLXFAST_JOB_WS}/.build-worker"
+            mv "${MLXFAST_JOB_WS}/.mlxfast-cache/worker-build" "${MLXFAST_JOB_WS}/.build-worker"
+            echo "qwen-mtp-ranked-benchmark: seeded worker build products into bench workspace"
+          fi
+          mkdir -p "${MLXFAST_PRIVATE_DIR}"
+          chmod 700 "${MLXFAST_PRIVATE_DIR}"
+          # Private audit record of the rate-limit branch key, written HERE (the
+          # rate-limit step runs long before this directory exists) and
+          # unconditionally fatal on failure, so a broken write is visible
+          # instead of swallowed.
+          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
+            printf '%s\n' "$(printf '%s' "${GITHUB_REF}" | shasum -a 256 | awk '{print $1}')" \
+              > "${MLXFAST_PRIVATE_DIR}/qwen_mtp_branch_key"
+          fi
+          mkdir -p "${MLXFAST_JOB_WS}/private"
+          mkdir -p "${MLXFAST_JOB_WS}/.qwen-mtp-ranked-src"
+          # Staging dir for the REUSED serial hidden inputs. Deliberately named
+          # .ranked-src -- the serial name -- so the copied "Attach GPQA gates"
+          # step stays identical to the live one instead of being retargeted (a
+          # retargeted copy is how workflows drift).
+          mkdir -p "${MLXFAST_JOB_WS}/.ranked-src"
+          # Resolve dependencies for both SwiftPM roots while still trusted and
+          # networked (the bench uid has a PF egress block).
+          (cd "${MLXFAST_JOB_WS}" && swift package resolve --force-resolved-versions)
+          (cd "${MLXFAST_JOB_WS}" && swift package resolve --force-resolved-versions --scratch-path .build-worker)
+          /bin/chmod -R +a "user:bench allow list,search,readattr,readextattr,read,execute,add_file,add_subdirectory,delete_child,write,append,writeattr,writeextattr,file_inherit,directory_inherit" "${MLXFAST_JOB_WS}"
+          /bin/chmod -R +a "user:bench deny write,append,writeattr,writeextattr,delete,delete_child,add_file,add_subdirectory,chown,file_inherit,directory_inherit" \
+            "${MLXFAST_JOB_WS}/.github" \
+            "${MLXFAST_JOB_WS}/tools" \
+            "${MLXFAST_JOB_WS}/Sources" \
+            "${MLXFAST_JOB_WS}/correctness_prompts" \
+            "${MLXFAST_JOB_WS}/fixtures" \
+            "${MLXFAST_JOB_WS}/.qwen-mtp-ranked-src" \
+            "${MLXFAST_JOB_WS}/.ranked-src"
+          /bin/chmod +a "user:bench deny write,append,writeattr,writeextattr,delete,chown" \
+            "${MLXFAST_JOB_WS}/benchmark.sh" \
+            "${MLXFAST_JOB_WS}/benchmark.qwen-mtp.json" \
+            "${MLXFAST_JOB_WS}/benchmark-qwen-mtp.sh" \
+            "${MLXFAST_JOB_WS}/setup-qwen-mtp.sh" \
+            "${MLXFAST_JOB_WS}/setup.sh" \
+            "${MLXFAST_JOB_WS}/Package.swift" \
+            "${MLXFAST_JOB_WS}/Package.resolved"
+          echo "qwen-mtp-ranked-benchmark: bench workspace ready at ${MLXFAST_JOB_WS} (trusted harness surfaces ACL-locked against bench writes)"
+
+      - name: Verify trusted source scope
+        run: .github/scripts/verify-trusted-source-scope.sh "${GITHUB_WORKSPACE}" "${MLXFAST_JOB_WS}"
+
+      - name: Assert bench network egress lockdown
+        run: |
+          set -euo pipefail
+          probe="$(cat <<'PROBE'
+            set -u
+            [ -x /usr/bin/curl ] || exit 2
+            rc=1
+            for target in https://1.1.1.1 https://8.8.8.8; do
+              if /usr/bin/curl --silent --show-error --max-time 5 --output /dev/null "${target}" 2>/dev/null; then
+                echo "bench egress reached ${target}"
+                rc=0
+                break
+              fi
+            done
+            exit "${rc}"
+          PROBE
+          )"
+          runner_egress=0
+          for target in https://1.1.1.1 https://8.8.8.8; do
+            if /usr/bin/curl --silent --max-time 5 --output /dev/null "${target}" 2>/dev/null; then
+              runner_egress=1
+              break
+            fi
+          done
+          if [[ "${runner_egress}" -ne 1 ]]; then
+            echo "::warning::bench egress preflight cannot assess PF lockdown (trusted-uid egress probe failed; box appears offline); continuing -- trusted network steps will fail closed if the box is truly offline"
+            exit 0
+          fi
+          bench_rc=0
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" /bin/bash -c "${probe}" || bench_rc=$?
+          if [[ "${bench_rc}" -eq 1 ]]; then
+            echo "qwen-mtp-ranked-benchmark: bench network egress lockdown verified (bench-uid egress blocked)"
+            exit 0
+          fi
+          if [[ "${bench_rc}" -ne 0 ]]; then
+            echo "::warning::bench egress preflight cannot assess PF lockdown (bench probe exited ${bench_rc}: curl unavailable or bridge error); continuing without a verdict"
+            exit 0
+          fi
+          pf_provisioned=0
+          if grep -Eisq 'mlxfast|darkbloom|bench[-_.]?egress|egress[-_.]?bench|uid[-_.]?560|user[[:space:]]+bench|user[[:space:]]+560([^0-9]|$)' /etc/pf.conf /etc/pf.anchors/* 2>/dev/null; then
+            pf_provisioned=1
+          fi
+          if [[ "${MLXFAST_REQUIRE_BENCH_EGRESS_LOCKDOWN:-0}" == "1" ]]; then
+            pf_provisioned=1
+          fi
+          if [[ "${pf_provisioned}" -eq 1 ]]; then
+            echo "::error::bench network egress is NOT locked down (a bench-uid outbound connection succeeded) although the PF bench-egress lockdown is provisioned on this box; refusing to run submitted code" >&2
+            exit 1
+          fi
+          echo "::warning::PF bench-egress lockdown not yet active on this box; egress preflight is dormant (bench-uid egress currently open). It will enforce automatically once the operator ships the PF lockdown."
+
+      # Two-root build discipline: the trusted CLI builds in .build and the
+      # participant worker (which compiles the participant-editable vendored MLX
+      # forks) in its own .build-worker scratch root, as two separate bench-exec
+      # invocations.
+      - name: Build trusted CLI in bench sandbox
+        env:
+          BENCH_JOB_ID: qwen-mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-build
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+              GIT_CONFIG_COUNT=2 \
+              GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="${MLXFAST_JOB_WS}" \
+              GIT_CONFIG_KEY_1=safe.directory GIT_CONFIG_VALUE_1="${MLXFAST_JOB_WS}/*" \
+              MLXFAST_METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" /bin/bash -c '
+              set -euo pipefail
+              cd "${MJOB_WS}"
+              /usr/bin/swift build -c release --force-resolved-versions --product mlxfast-swift
+            '
+          test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-swift"
+          # Pin the trusted timer/gates/score artifacts BEFORE the participant
+          # worker build runs: worker-build-time code execution must not be able
+          # to alter the trusted binary between its build and its pin.
+          .github/scripts/pin-trusted-harness.sh write \
+            "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+
+      # QWEN-MTP-PENDING-PHASE3. The two MTP subcommands this workflow drives do
+      # not exist on the CLI yet (Sources/MLXFastCLI declares transform,
+      # verify-transform, correctness, correctness-trace, preflight, benchmark,
+      # attach-gpqa-gates, attach-free-run-gate, generate-golden,
+      # analyze-ngram-similarity, generate-gpqa-answers, checkpoint-shards, and
+      # the three dflash-* verbs). Asserting their presence HERE turns a
+      # ~25-minute-late "unknown subcommand" abort into a second-30 diagnostic
+      # that names the missing work, and keeps the failure attributable to the
+      # harness rather than to a submission.
+      #
+      # VERB NAMES ARE DELIBERATE: mtp-verify / mtp-timed. The natural spellings
+      # -- appending "probe", "benchmark" or "reference" directly after "mtp-" --
+      # are all literal entries in DFlashTrackTests.retiredMTPNames, and
+      # prefixing one of those with "qwen-" does NOT clear it: the retired string
+      # survives as a substring. Only a different word after "mtp-" does.
+      - name: Assert Qwen-MTP CLI verbs exist
+        run: |
+          set -euo pipefail
+          missing=()
+          for verb in mtp-verify mtp-timed; do
+            if ! grep -qF "case \"${verb}\":" Sources/MLXFastCLI/main.swift; then
+              missing+=("${verb}")
+            fi
+          done
+          if ((${#missing[@]})); then
+            echo "::error::QWEN-MTP-PENDING-PHASE3: the trusted CLI does not declare ${missing[*]}. The native-MTP verify and timed subcommands are phase-3 work (harness conversion, QWEN36-MTP-CHALLENGE-PLAN.md); this workflow drives them and cannot run until they land." >&2
+            exit 1
+          fi
+          echo "qwen-mtp-ranked-benchmark: CLI declares mtp-verify and mtp-timed"
+
+      - name: Build participant worker in bench sandbox
+        env:
+          BENCH_JOB_ID: qwen-mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-buildworker
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+              GIT_CONFIG_COUNT=2 \
+              GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="${MLXFAST_JOB_WS}" \
+              GIT_CONFIG_KEY_1=safe.directory GIT_CONFIG_VALUE_1="${MLXFAST_JOB_WS}/*" \
+              MLXFAST_METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" /bin/bash -c '
+              set -euo pipefail
+              cd "${MJOB_WS}"
+              /usr/bin/swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker
+              if [[ -s .mlxfast-cache/mlx.metallib && -s .mlxfast-cache/mlx.metallib.fingerprint ]]; then
+                /bin/cp .mlxfast-cache/mlx.metallib .build-worker/release/mlx.metallib
+                /bin/cp .mlxfast-cache/mlx.metallib.fingerprint .build-worker/release/mlx.metallib.fingerprint
+                echo "qwen-mtp-ranked-benchmark: restored trusted MLX Metal library"
+              else
+                tools/build-mlx-metallib.sh
+              fi
+              /bin/chmod 0644 .build-worker/release/mlx.metallib .build-worker/release/mlx.metallib.fingerprint
+            '
+          test -x "${MLXFAST_JOB_WS}/.build-worker/release/mlxfast-runtime-worker"
+          test -s "${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib"
+          test -s "${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib.fingerprint"
+          # Separate participant-worker attestation (TOCTOU defense): every
+          # scored phase must execute exactly the worker binary and metallib
+          # built from the reviewed source tree; the worker stays OUT of the
+          # trusted pin.
+          .github/scripts/pin-trusted-harness.sh write \
+            "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
+
+      # Transform the pinned Qwen 3.6 target source into the candidate's runtime
+      # weights. The transform selects the .qwen35 family from the source
+      # text_config's qwen3_5 model-type prefix (the artifact is named Qwen3.6;
+      # its immutable internal architecture name is qwen3_5_text). The MTP head
+      # is NOT transformed here: it is a separate pinned artifact and the
+      # transform never selects mtp.* tensors.
+      - name: Transform Qwen target in bench sandbox
+        env:
+          BENCH_JOB_ID: qwen-mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-transform
+        run: |
+          set -euo pipefail
+          status=0
+          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
+            echo "qwen-mtp-ranked-benchmark: running submitted transform with private process logs suppressed"
+            # shellcheck disable=SC2024  # trusted shell owns the capture files
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" MLXFAST_QWEN_MTP_TARGET_DIR="${MLXFAST_QWEN_MTP_TARGET_DIR}" \
+                MLXFAST_SANDBOX_PARENT_TOOLS=1 /bin/bash -c '
+                set -euo pipefail
+                cd "${MJOB_WS}"
+                mkdir -p weights
+                exec .build/release/mlxfast-swift transform \
+                  --reference "${MLXFAST_QWEN_MTP_TARGET_DIR}" \
+                  --output weights
+              ' > "${MLXFAST_PRIVATE_DIR}/transform-private.log" 2>&1 || status=$?
+          else
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" MLXFAST_QWEN_MTP_TARGET_DIR="${MLXFAST_QWEN_MTP_TARGET_DIR}" \
+                MLXFAST_SANDBOX_PARENT_TOOLS=1 /bin/bash -c '
+                set -euo pipefail
+                cd "${MJOB_WS}"
+                mkdir -p weights
+                exec .build/release/mlxfast-swift transform \
+                  --reference "${MLXFAST_QWEN_MTP_TARGET_DIR}" \
+                  --output weights
+              ' || status=$?
+          fi
+          test "${status}" -eq 0
+          test -f "${MLXFAST_JOB_WS}/weights/config.json"
+
+      - name: Hash transformed Qwen weights for ranked audit
+        run: .github/scripts/hash-weights-directory.sh "${MLXFAST_JOB_WS}/weights" qwen-mtp-weights.sha256
+
+      # TOCTOU guard: the submitted transform just ran with workspace write
+      # access. Re-verify the trusted driver + binary and the participant worker
+      # + metallib against their post-build pins before executing them as bench
+      # again.
+      - name: Verify trusted harness before public gate
+        run: |
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
+
+      # Public drift tripwire: one independent 64-step teacher-forced check
+      # against the checked-in public fixture, ordered BEFORE any hidden byte
+      # enters the workspace, so the worker running this public case cannot read
+      # a hidden oracle. A tripwire for accidental behavior change, NOT a
+      # security boundary.
+      #
+      # The fixture is the Qwen-regenerated one on this branch and both its
+      # digest and its byte count are pinned in job env; the step re-hashes it at
+      # run time so a swapped fixture fails before the model is loaded.
+      - name: Public behavior gate
+        env:
+          BENCH_JOB_ID: qwen-mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-publicgate
+          # Harness parity: the worker Seatbelt profile denies the golden under
+          # check by literal path. env_keep carries this through sudo.
+          BENCH_GOLDEN_PATH: ${{ env.MLXFAST_JOB_WS }}/correctness_prompts/public_longcopy_gate_english_512_256.json
+        run: |
+          set -euo pipefail
+          actual_hash="$(shasum -a 256 "${MLXFAST_JOB_WS}/${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" | awk '{print $1}')"
+          actual_bytes="$(wc -c < "${MLXFAST_JOB_WS}/${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" | tr -d ' ')"
+          if [[ "${actual_hash}" != "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256}" ]]; then
+            echo "::error::public correctness golden hash mismatch (${actual_hash})" >&2
+            exit 1
+          fi
+          if [[ "${actual_bytes}" != "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES}" ]]; then
+            echo "::error::public correctness golden byte-count mismatch (${actual_bytes})" >&2
+            exit 1
+          fi
+          # The 1024-step variant is not decoded here, but it is the pre-submit
+          # fixture and the 256-step golden is a strict greedy prefix of it. Pin
+          # it in the same step so the pair can never drift apart silently.
+          long_hash="$(shasum -a 256 "${MLXFAST_JOB_WS}/${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_1024_PATH}" | awk '{print $1}')"
+          long_bytes="$(wc -c < "${MLXFAST_JOB_WS}/${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_1024_PATH}" | tr -d ' ')"
+          if [[ "${long_hash}" != "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_1024_SHA256}" \
+              || "${long_bytes}" != "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_1024_BYTES}" ]]; then
+            echo "::error::public 1024-step correctness golden pin mismatch (${long_hash} bytes=${long_bytes})" >&2
+            exit 1
+          fi
+          status=0
+          started="${SECONDS}"
+          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
+            echo "qwen-mtp-ranked-benchmark: running public behavior gate with process logs suppressed"
+            # shellcheck disable=SC2024  # trusted shell owns the capture files
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+                MLXFAST_PUBLIC_GOLDEN="${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" /bin/bash -c '
+                set -u
+                cd "${MJOB_WS}" || exit 97
+                exec .build/release/mlxfast-swift correctness \
+                  --weights weights \
+                  --golden "${MLXFAST_PUBLIC_GOLDEN}"
+              ' > public-gate-report.json \
+                2> "${MLXFAST_PRIVATE_DIR}/public-gate-private.log" || status=$?
+          else
+            # shellcheck disable=SC2024  # trusted shell owns the capture files
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+                MLXFAST_PUBLIC_GOLDEN="${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" /bin/bash -c '
+                set -u
+                cd "${MJOB_WS}" || exit 97
+                exec .build/release/mlxfast-swift correctness \
+                  --weights weights \
+                  --golden "${MLXFAST_PUBLIC_GOLDEN}"
+              ' > public-gate-report.json || status=$?
+          fi
+          # The report only ever references the checked-in public fixture, so
+          # surfacing the mismatch position and tokens leaks nothing hidden.
+          jq -r '"qwen-mtp-ranked-benchmark: public gate passed=\(.passed) checked_steps=\(.checked_steps) first_failing_step=\(.first_failing_step) expected_token=\(.expected_token) actual_token=\(.actual_token)"' \
+            public-gate-report.json || true
+          echo "qwen-mtp-ranked-benchmark: public behavior gate finished in $((SECONDS - started))s"
+          exit "${status}"
+
+      # Reap stragglers from the unsandboxed build/transform BEFORE hidden
+      # material enters the workspace.
+      - name: Reap lingering bench processes before hidden material
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /bin/bash "${MLXFAST_JOB_WS}/.github/scripts/reap-bench-processes.sh"
+
+      # Record every file in the bench workspace BEFORE any hidden material
+      # enters it, for the allowlist scrub before timing.
+      - name: Snapshot post-transform workspace
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" /bin/bash -c '
+              set -u
+              if [ -d "${MJOB_WS}/tmp" ]; then
+                find "${MJOB_WS}/tmp" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+              fi
+            '
+          manifest="${MLXFAST_PRIVATE_DIR}/post-transform-manifest.nul"
+          find_err="${MLXFAST_PRIVATE_DIR}/post-transform-find.err"
+          set +e
+          ( cd "${MLXFAST_JOB_WS}" && find . -mindepth 1 \( -type f -o -type l \) -print0 2> "${find_err}" ) \
+            | LC_ALL=C sort -z > "${manifest}"
+          set -e
+          if [[ -s "${find_err}" ]]; then
+            if grep -vq 'Permission denied' "${find_err}"; then
+              echo "::error::workspace snapshot hit unexpected find errors (only bench-private Permission denied subtrees are tolerated):" >&2
+              cat "${find_err}" >&2
+              exit 1
+            fi
+            skipped="$(grep -c 'Permission denied' "${find_err}" | tr -d ' ')"
+            echo "qwen-mtp-ranked-benchmark: snapshot skipped ${skipped} bench-private (0700) subtrees the runner cannot read; the scrub is equally blind there and end-of-job cleanup wipes them"
+          fi
+          test -s "${manifest}"
+          count="$(tr -cd '\0' < "${manifest}" | wc -c | tr -d ' ')"
+          echo "qwen-mtp-ranked-benchmark: snapshotted ${count} pre-hidden workspace files for the allowlist scrub"
+
+      # ---- REUSED SERIAL GATE LEG: hidden correctness + GPQA ---------------
+      # These steps are the live serial gate steps re-hosted here and pointed at
+      # THIS job's build. There is deliberately no second GPQA implementation and
+      # no MTP-specific correctness path: GPQA proves the MODEL is sound, and
+      # asking the question through the normal decode path is exactly what that
+      # requires.
+      #
+      # ORDERING IS A SECURITY PROPERTY. BENCH_GOLDEN_PATH denies exactly ONE
+      # literal path in the worker Seatbelt profile, and this job handles two
+      # hidden goldens. The serial augmented golden must be fully scrubbed before
+      # the MTP golden is installed; overlapping residency would hand each leg's
+      # worker the other's token oracle. The scrub step below is that bracket --
+      # do not reorder these steps.
+      #
+      # RESOLVED: both object keys below are SHA-addressed by convention and
+      # embed the digest also pinned in job env. The Qwen-derived RAW hidden
+      # correctness golden and GPQA reference were generated on the serving box
+      # against the Qwen tower and uploaded under this track's namespace (no
+      # bucket segment: correctness_prompts/qwen3.6-27b-mtp-v1/...). The pending
+      # marker guard below now passes for these two; the phase-2 MTP-specific
+      # correctness golden key (in "Prepare MTP correctness golden") stays a
+      # placeholder and fails closed there.
+      - name: Prepare hidden correctness golden
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          # Private object keys scoped to this trusted download step only (never
+          # job level), so untrusted bench phases never receive the object names.
+          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-hidden-correctness-golden-eef3b817e390759275b7bc3570b10bb2846d2303000a0c9f1d627ad70f718c1e.json
+          MLXFAST_GPQA_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-gpqa-reference-cases-d05e93e9694d86e0041e6b9c843642d4637de524e9a1b88a145caaa0da6235fe.json
+        run: |
+          set -euo pipefail
+          for key in "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" "${MLXFAST_GPQA_R2_PATH}"; do
+            if [[ "${key}" == *"QWEN-MTP-PENDING-ORGANIZER"* ]]; then
+              echo "::error::QWEN-MTP-PENDING-ORGANIZER: the R2 object key '${key}' is a placeholder. Generate the Qwen-derived hidden correctness golden and GPQA reference on the serving box, upload them under this track's namespace, and replace the key AND the matching digest/byte pins together." >&2
+              exit 1
+            fi
+          done
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" \
+            "${MLXFAST_PRIVATE_DIR}/raw_golden.json"
+          raw_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/raw_golden.json" | awk '{print $1}')"
+          raw_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/raw_golden.json" | tr -d ' ')"
+          if [[ "${raw_hash}" != "${MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256}" || "${raw_bytes}" != "${MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES}" ]]; then
+            echo "::error::raw hidden correctness golden pin mismatch" >&2
+            exit 1
+          fi
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_GPQA_R2_PATH}" \
+            "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json"
+          gpqa_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" | awk '{print $1}')"
+          gpqa_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" | tr -d ' ')"
+          if [[ "${gpqa_hash}" != "${MLXFAST_GPQA_REFERENCE_SHA256}" || "${gpqa_bytes}" != "${MLXFAST_GPQA_REFERENCE_BYTES}" ]]; then
+            echo "::error::private GPQA reference pin mismatch" >&2
+            exit 1
+          fi
+          echo "qwen-mtp-ranked-benchmark: raw hidden golden verified ${raw_hash} bytes=${raw_bytes}; GPQA reference verified ${gpqa_hash} bytes=${gpqa_bytes}"
+
+      # PARITY CONTRACT: attach-gpqa-gates augments the raw golden with GPQA
+      # behavior gates but MUST NOT mutate its .cases -- enforced below by
+      # re-pinning the augmented golden's .cases against the raw hash-pinned
+      # golden. It loads the tokenizer, i.e. runs code from the submitted build,
+      # so it executes through bench-exec like every other untrusted invocation.
+      - name: Attach GPQA gates and verify augmented golden
+        env:
+          BENCH_JOB_ID: qwen-mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-attach
+        run: |
+          set -euo pipefail
+          # Symlink-safe placement of the predictable-name hidden inputs into the
+          # runner-owned, bench-NON-writable staging dir, so the submitted
+          # transform cannot pre-plant a symlink at these names and redirect the
+          # trusted copy.
+          golden_src="${MLXFAST_JOB_WS}/.ranked-src/golden.json"
+          gpqa_src="${MLXFAST_JOB_WS}/.ranked-src/gpqa.json"
+          for hidden_target in "${golden_src}" "${gpqa_src}"; do
+            if [[ -e "${hidden_target}" || -L "${hidden_target}" ]]; then
+              echo "::error::refusing to place hidden input over pre-existing path ${hidden_target}" >&2
+              exit 1
+            fi
+          done
+          install -m 0444 "${MLXFAST_PRIVATE_DIR}/raw_golden.json" "${golden_src}"
+          install -m 0444 "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" "${gpqa_src}"
+          status=0
+          # shellcheck disable=SC2024  # trusted shell owns the capture files
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+              MLXFAST_GPQA_CASE_COUNT="${MLXFAST_GPQA_CASE_COUNT}" \
+              MLXFAST_GPQA_MAX_NEW_TOKENS="${MLXFAST_GPQA_MAX_NEW_TOKENS}" \
+              MLXFAST_SANDBOX_PARENT_TOOLS=1 /bin/bash -c '
+              set -u
+              cd "${MJOB_WS}" || exit 97
+              exec .build/release/mlxfast-swift attach-gpqa-gates \
+                --golden .ranked-src/golden.json \
+                --gpqa .ranked-src/gpqa.json \
+                --tokenizer weights \
+                --output correctness_golden_ranked.json \
+                --case-count "${MLXFAST_GPQA_CASE_COUNT}" \
+                --max-new-tokens "${MLXFAST_GPQA_MAX_NEW_TOKENS}"
+            ' > "${MLXFAST_PRIVATE_DIR}/attach-gpqa.log" 2>&1 || status=$?
+          rm -rf "${MLXFAST_JOB_WS}/.ranked-src"
+          test "${status}" -eq 0 || { echo "::error::attach-gpqa-gates failed" >&2; exit 1; }
+          test -s "${MLXFAST_JOB_WS}/correctness_golden_ranked.json"
+          cp "${MLXFAST_JOB_WS}/correctness_golden_ranked.json" "${MLXFAST_CORRECTNESS_GOLDEN_PATH}"
+          # Defense in depth: attach-gpqa-gates executes the SUBMITTED build, so
+          # never trust its output to preserve the base case.
+          raw_cases_hash="$(jq -S '.cases' "${MLXFAST_PRIVATE_DIR}/raw_golden.json" | shasum -a 256 | awk '{print $1}')"
+          augmented_cases_hash="$(jq -S '.cases' "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | shasum -a 256 | awk '{print $1}')"
+          if [[ "${augmented_cases_hash}" != "${raw_cases_hash}" ]]; then
+            echo "::error::attach-gpqa-gates mutated the pinned base .cases (augmented ${augmented_cases_hash} != raw ${raw_cases_hash})" >&2
+            exit 1
+          fi
+          echo "qwen-mtp-ranked-benchmark: augmented golden base cases re-pinned to raw pinned golden (cases sha256 ${raw_cases_hash})"
+          actual_hash="$(shasum -a 256 "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | awk '{print $1}')"
+          actual_bytes="$(wc -c < "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | tr -d ' ')"
+          export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256="${actual_hash}"
+          export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES="${actual_bytes}"
+          {
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"
+          } >> "${GITHUB_ENV}"
+          .github/scripts/verify-correctness-golden.sh
+          ws_hash="$(shasum -a 256 "${MLXFAST_JOB_WS}/correctness_golden_ranked.json" | awk '{print $1}')"
+          test "${ws_hash}" == "${actual_hash}"
+          echo "qwen-mtp-ranked-benchmark: using private GPQA-augmented correctness golden ${actual_hash} bytes=${actual_bytes}"
+
+      # TOCTOU guard before the first --official invocation.
+      - name: Verify trusted harness before gates
+        run: |
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
+
+      # The single gates+base pass: ONE benchmark invocation (via benchmark.sh
+      # --official) that teacher-forces the FULL hidden base case AND runs the
+      # anchor/free-run/behavior/GPQA gates, GPQA TTFT, and the semantic-answer
+      # capture, while SKIPPING the timed benchmark. This is the SERIAL decode
+      # path on purpose: it is what proves the model is still sound. The MTP
+      # parity gate below is a separate, additional check, and the timed MTP
+      # measurement runs LAST behind the measure wrapper's thermal gate.
+      - name: Correctness and gates (full base case + hidden gates, no timing)
+        id: gates_run
+        env:
+          BENCH_JOB_ID: qwen-mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-gates
+          BENCH_GOLDEN_PATH: ${{ env.MLXFAST_JOB_WS }}/correctness_golden_ranked.json
+          MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ env.MLXFAST_CANDIDATE_SHA }} mode=single-machine-gates"
+        run: |
+          set -euo pipefail
+          raw_stdout="${MLXFAST_PRIVATE_DIR}/gates-stdout.raw"
+          gates_log="${MLXFAST_PRIVATE_DIR}/gates-private.log"
+          started="${SECONDS}"
+          status=0
+          # shellcheck disable=SC2024  # trusted shell owns the capture files
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env \
+              MJOB_WS="${MLXFAST_JOB_WS}" \
+              MLXFAST_OFFICIAL_BENCHMARK_RUN=1 \
+              MLXFAST_SKIP_TRANSFORM=1 \
+              MLXFAST_VERIFY_TRANSFORM="${MLXFAST_VERIFY_TRANSFORM}" \
+              MLXFAST_REFERENCE_DIR="${MLXFAST_REFERENCE_DIR}" \
+              MLXFAST_WEIGHTS_PATH=weights \
+              MLXFAST_CORRECTNESS_GOLDEN_PATH=correctness_golden_ranked.json \
+              MLXFAST_BENCHMARK_CORRECTNESS_STEPS="${MLXFAST_EXPECTED_CORRECTNESS_STEPS}" \
+              MLXFAST_BENCHMARK_CHECK_GATES=1 \
+              MLXFAST_BENCHMARK_SKIP_TIMED=1 \
+              MLXFAST_PRIVATE_DIR="${MLXFAST_JOB_WS}/private" \
+              MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH="${MLXFAST_JOB_WS}/private/semantic_gpqa_answers.json" \
+              MLXFAST_SEMANTIC_GPQA_CASE_COUNT="${MLXFAST_SEMANTIC_GPQA_CASE_COUNT}" \
+              MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS="${MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS}" \
+              MLXFAST_SCORE_PATH=score.gates.json \
+              MLXFAST_INTEGRITY_PATH=benchmark-integrity.gates.json \
+              MLXFAST_NOTE="${MLXFAST_NOTE}" \
+              MLXFAST_COMMIT_SHA="${MLXFAST_CANDIDATE_SHA}" \
+              GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0=safe.directory \
+              GIT_CONFIG_VALUE_0='*' \
+              /bin/bash -c '
+                set -u
+                cd "${MJOB_WS}" || exit 97
+                ./benchmark.sh --official 1>&2
+                status=$?
+                if [ -s "${MLXFAST_SCORE_PATH}" ]; then
+                  cat "${MLXFAST_SCORE_PATH}"
+                fi
+                exit "${status}"
+              ' > "${raw_stdout}" 2> "${gates_log}" &
+          pid="$!"
+          # ps -p, not kill -0: the backgrounded pid is a setuid sudo process, so
+          # the runner user cannot signal it but can still see it.
+          while ps -p "${pid}" >/dev/null 2>&1; do
+            sleep 60
+            if ps -p "${pid}" >/dev/null 2>&1; then
+              echo "qwen-mtp-ranked-benchmark: correctness+gates still running elapsed=$((SECONDS - started))s"
+            fi
+          done
+          wait "${pid}" || status=$?
+          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" != "1" ]]; then
+            cat "${gates_log}" || true
+          fi
+          # SCORE SEALING: the payload is taken from the exec'd process's stdout,
+          # captured in THIS trusted shell. On-disk workspace files are untrusted
+          # after bench ran.
+          if [[ "$(jq -s 'length' "${raw_stdout}" 2>/dev/null)" != "1" ]] \
+              || ! jq -e '(.passed | type == "boolean") and has("score") and (.metrics | type == "object")' \
+                  "${raw_stdout}" >/dev/null 2>&1; then
+            echo "::error::correctness+gates run did not emit a single valid score payload (exit=${status})" >&2
+            exit 1
+          fi
+          # Sealed as gates-score.json, NOT score.json: the timed scoring step
+          # owns score.json, and sealing both there would let one overwrite the
+          # other and publish a score whose correctness fields were never
+          # validated.
+          cp "${raw_stdout}" gates-score.json
+          cp "${MLXFAST_JOB_WS}/benchmark-integrity.gates.json" benchmark-integrity.gates.json
+          sealed_hash="$(shasum -a 256 gates-score.json | awk '{print $1}')"
+          integrity_hash="$(jq -r '.score_sha256 // empty' benchmark-integrity.gates.json)"
+          if [[ "${sealed_hash}" != "${integrity_hash}" ]]; then
+            echo "::error::sealed gates score hash does not match harness integrity record (possible in-workspace tamper)" >&2
+            exit 1
+          fi
+          trusted_weights_hash="$(tr -d '[:space:]' < qwen-mtp-weights.sha256)"
+          gates_weights_hash="$(jq -r '.metrics.weights_hash // empty' gates-score.json)"
+          integrity_weights_hash="$(jq -r '.weights_sha256 // empty' benchmark-integrity.gates.json)"
+          if [[ "${gates_weights_hash}" != "${trusted_weights_hash}" \
+              || "${integrity_weights_hash}" != "${trusted_weights_hash}" ]]; then
+            echo "::error::transformed weights changed between trusted hashing and the gates run" >&2
+            exit 1
+          fi
+          echo "qwen-mtp-ranked-benchmark: correctness+gates finished exit=${status} seconds=$((SECONDS - started))"
+          exit "${status}"
+
+      # On a real gates failure the score's error/token fields can carry hidden
+      # values, so nothing downstream may consume an unvalidated score.
+      - name: Validate sealed gates score
+        run: |
+          set -euo pipefail
+          test -s gates-score.json
+          jq -e '
+            .passed == true
+            and (.metrics.error == "")
+            and (.metrics.first_failing_case == null)
+            and (.metrics.first_failing_layer == null)
+            and (.metrics.first_failing_step == null)
+            and (.metrics.expected_token == null)
+            and (.metrics.actual_token == null)
+            and (.metrics.passed_correctness == true)
+          ' gates-score.json >/dev/null
+
+      # Semantic GPQA judge (Anthropic), trusted step: consumes the bench-written
+      # answer capture, patches the sealed score's semantic fields and overall
+      # verdict, and re-anchors the integrity hash. The API key never crosses the
+      # bridge. This is the ONLY GPQA judge in the repository.
+      - name: Semantic GPQA gate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
+          MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: ${{ env.MLXFAST_JOB_WS }}/private/semantic_gpqa_answers.json
+          MLXFAST_SCORE_PATH: gates-score.json
+          MLXFAST_INTEGRITY_PATH: benchmark-integrity.gates.json
+        run: |
+          set -euo pipefail
+          if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+            echo "::error::semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
+            exit 1
+          fi
+          .github/scripts/run-semantic-gpqa-gate.sh
+
+      # SINGLE-OCCUPANCY BRACKET for hidden goldens. Remove the serial hidden
+      # material (and the semantic-answer capture, which embeds hidden reference
+      # answers) BEFORE the MTP golden is installed.
+      - name: Scrub serial hidden material before the MTP gate
+        run: |
+          set -euo pipefail
+          rm -f "${MLXFAST_JOB_WS}/correctness_golden_ranked.json"
+          rm -rf "${MLXFAST_JOB_WS}/private"
+          mkdir -p "${MLXFAST_JOB_WS}/private"
+          chmod 700 "${MLXFAST_JOB_WS}/private"
+          if [[ -e "${MLXFAST_JOB_WS}/correctness_golden_ranked.json" ]]; then
+            echo "::error::could not remove the serial augmented hidden golden before the MTP gate; refusing to run two hidden goldens in one workspace" >&2
+            exit 1
+          fi
+          leftovers="$(find "${MLXFAST_JOB_WS}" -maxdepth 2 -name '*golden*' ! -path "*/correctness_prompts/*" | grep -v '^$' || true)"
+          if [[ -n "${leftovers}" ]]; then
+            echo "::error::serial hidden-material scrub left candidates behind: ${leftovers}" >&2
+            exit 1
+          fi
+          echo "qwen-mtp-ranked-benchmark: serial hidden material scrubbed; workspace holds no hidden golden before the MTP golden is installed"
+
+      # CONTRACT LAYER L6 (anti-lottery). A single frozen hidden prompt makes a
+      # failed ranked run free to retry, which degrades every output-side gate
+      # into "must be correct often enough" and lets a threshold be tuned by
+      # submit-until-green. The defense is to sample the timed target from a
+      # POOL, uniformly at random per run, from entropy the participant cannot
+      # see or influence. The floor counts DISTINCT targets (distinct sha256 AND
+      # distinct r2_path), not pool LENGTH: one golden listed eight times has
+      # length 8 and anti-lottery value zero.
+      #
+      # RANKED-ONLY. A dry run times nothing, so it needs no timed target, and
+      # guarding this step is what lets the gates-only dispatch reach the MTP
+      # parity gate below before the operator has provisioned any pool objects.
+      - name: Select hidden Qwen-MTP timed target from the pool
+        id: select_qwen_mtp_target
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          contract="${MLXFAST_QWEN_MTP_CONTRACT_PATH}"
+          test -s "${contract}"
+          pool_type="$(jq -r '(.timed_prompt_pool // []) | type' "${contract}")"
+          if [[ "${pool_type}" != "array" ]]; then
+            echo "::error::Qwen-MTP timed prompt pool in ${contract} is a ${pool_type}, not an array; every check below indexes it positionally" >&2
+            exit 1
+          fi
+          pool_size="$(jq '(.timed_prompt_pool // []) | length' "${contract}")"
+          if [[ "${pool_size}" -lt 1 ]]; then
+            echo "::error::QWEN-MTP-PENDING-ORGANIZER: the timed prompt pool is empty in ${contract}; generate the timed prompts on the serving box, upload the pool objects to R2 and pin them before enabling this track" >&2
+            exit 1
+          fi
+          # PER-ENTRY COMPLETENESS, for EVERY entry, BEFORE sampling. Validating
+          # only the sampled entry gives one-in-N coverage of the pool, which
+          # makes a malformed entry look exactly like a flake ~25 minutes into a
+          # ranked job.
+          malformed="$(jq -r '
+            .timed_prompt_pool
+            | to_entries
+            | map(
+                .key as $i
+                | .value as $e
+                | if ($e | type) != "object" then
+                    ["entry \($i) is a \($e | type), not an object"]
+                  else
+                    [ (if (($e.r2_path? // null) | type) != "string" then
+                         "entry \($i): r2_path is missing or not a string"
+                       elif ($e.r2_path == "") then
+                         "entry \($i): r2_path is empty"
+                       else empty end),
+                      (if (($e.sha256? // null) | type) != "string" then
+                         "entry \($i): sha256 is missing or not a string"
+                       elif ($e.sha256 | test("^[0-9a-f]{64}$") | not) then
+                         "entry \($i): sha256 is not a 64-character lowercase hex digest"
+                       else empty end),
+                      (if (($e.bytes? // null) | type) != "number" then
+                         "entry \($i): bytes is missing or not a number"
+                       elif ($e.bytes <= 0) or ($e.bytes != ($e.bytes | floor)) then
+                         "entry \($i): bytes is not a positive integer"
+                       else empty end),
+                      (if (($e.noop_decode_speedup? // null) | type) != "number" then
+                         "entry \($i): noop_decode_speedup is missing or not a number"
+                       elif ($e.noop_decode_speedup <= 0) then
+                         "entry \($i): noop_decode_speedup is not positive"
+                       else empty end) ]
+                  end
+              )
+            | add // []
+            | .[]' "${contract}")"
+          if [[ -n "${malformed}" ]]; then
+            while IFS= read -r problem; do
+              echo "::error::Qwen-MTP timed prompt pool is malformed in ${contract}: ${problem}" >&2
+            done <<<"${malformed}"
+            exit 1
+          fi
+          required_distinct=8
+          distinct_sha="$(jq '[.timed_prompt_pool[].sha256] | unique | length' "${contract}")"
+          distinct_path="$(jq '[.timed_prompt_pool[].r2_path] | unique | length' "${contract}")"
+          if [[ "${MLXFAST_RUN_BENCHMARK:-0}" == "1" ]]; then
+            shortfall=""
+            if [[ "${distinct_sha}" -lt "${required_distinct}" ]]; then
+              shortfall="${shortfall} ${distinct_sha} distinct sha256 digest(s), short by $(( required_distinct - distinct_sha ));"
+            fi
+            if [[ "${distinct_path}" -lt "${required_distinct}" ]]; then
+              shortfall="${shortfall} ${distinct_path} distinct r2_path key(s), short by $(( required_distinct - distinct_path ));"
+            fi
+            if [[ -n "${shortfall}" ]]; then
+              echo "::error::Qwen-MTP timed prompt pool has length ${pool_size} but a RANKED run requires at least ${required_distinct} DISTINCT varied targets:${shortfall%;}. Listing one golden N times has length N and anti-lottery value zero. Dispatch with run_benchmark=false to validate the pipeline against a smaller pool." >&2
+              exit 1
+            fi
+          fi
+          # Uniform selection over [0,pool_size) from kernel entropy, rejecting
+          # the biased tail of the RNG range rather than using a plain modulo.
+          limit=$(( (65536 / pool_size) * pool_size ))
+          while :; do
+            draw=$(( $(od -An -N2 -tu2 < /dev/urandom | tr -d ' ') ))
+            if [[ "${draw}" -lt "${limit}" ]]; then break; fi
+          done
+          index=$(( draw % pool_size ))
+          entry="$(jq -c --argjson i "${index}" '.timed_prompt_pool[$i]' "${contract}")"
+          r2_path="$(jq -r '.r2_path' <<<"${entry}")"
+          sha256="$(jq -r '.sha256' <<<"${entry}")"
+          bytes="$(jq -r '.bytes' <<<"${entry}")"
+          # Redundant with the whole-pool check above, deliberately: this guards
+          # the three values that actually LEAVE the step, so a future edit to
+          # the extraction still fails closed rather than exporting an empty pin.
+          for field in "${r2_path}" "${sha256}" "${bytes}"; do
+            if [[ -z "${field}" || "${field}" == "null" ]]; then
+              echo "::error::Qwen-MTP timed prompt pool entry ${index} is incomplete" >&2
+              exit 1
+            fi
+          done
+          # Private audit record; never printed to the job log. Echoing the index
+          # would hand back the sampling.
+          jq -n --argjson i "${index}" --argjson n "${pool_size}" \
+            --argjson ds "${distinct_sha}" --argjson dp "${distinct_path}" \
+            --arg p "${r2_path}" \
+            '{selected_index:$i, pool_size:$n, distinct_sha256:$ds, distinct_r2_path:$dp, r2_path:$p}' \
+            > "${MLXFAST_PRIVATE_DIR}/qwen_mtp_timed_target_selection.json"
+          {
+            echo "r2_path=${r2_path}"
+            echo "sha256=${sha256}"
+            echo "bytes=${bytes}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "qwen-mtp-ranked-benchmark: timed target sampled from a pool of ${pool_size} entries / ${distinct_sha} distinct targets (selection recorded privately)"
+
+      - name: Prepare hidden Qwen-MTP goldens
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          # RESOLVED (phase 5). The correctness golden key is fixed (it is an
+          # untimed gate and is not what the lottery would target); the timed
+          # golden key comes from the per-run pool selection. Per this track's
+          # convention the key embeds the object's own SHA-256, so the key and
+          # MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_SHA256 cannot drift apart
+          # silently -- a digest edit that misses the key produces a 404, not a
+          # mismatched gate.
+          MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-mtp-correctness-golden-hidden-0c1dcdabd85e7655f5df03e5a1265a5fde1a43ef223283021463f7af80481add.json
+          MLXFAST_QWEN_MTP_BENCH_GOLDEN_R2_PATH: ${{ steps.select_qwen_mtp_target.outputs.r2_path }}
+          MLXFAST_QWEN_MTP_BENCH_GOLDEN_SHA256_SELECTED: ${{ steps.select_qwen_mtp_target.outputs.sha256 }}
+          MLXFAST_QWEN_MTP_BENCH_GOLDEN_BYTES_SELECTED: ${{ steps.select_qwen_mtp_target.outputs.bytes }}
+        run: |
+          set -euo pipefail
+          if [[ "${MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_R2_PATH}" == *"QWEN-MTP-PENDING-ORGANIZER"* ]]; then
+            echo "::error::QWEN-MTP-PENDING-ORGANIZER: the hidden MTP correctness golden R2 key is a placeholder. Generate it on the serving box against the Qwen tower with the pinned MTP head, upload it, and replace the key together with MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_SHA256/BYTES." >&2
+            exit 1
+          fi
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_R2_PATH}" \
+            "${MLXFAST_PRIVATE_DIR}/qwen_mtp_correctness_golden.json"
+          correctness_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/qwen_mtp_correctness_golden.json" | awk '{print $1}')"
+          correctness_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/qwen_mtp_correctness_golden.json" | tr -d ' ')"
+          if [[ "${correctness_hash}" != "${MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_SHA256}" || "${correctness_bytes}" != "${MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_BYTES}" ]]; then
+            echo "::error::hidden Qwen-MTP correctness golden pin mismatch" >&2
+            exit 1
+          fi
+          bench_hash="not downloaded (gates-only dispatch)"
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
+            # FAIL CLOSED if the ranked path reaches here without a selection. A
+            # SKIPPED step yields EMPTY outputs, not an error, so widening the
+            # guard on the selection step by mistake would silently produce a
+            # ranked run with no sampled target -- and losing per-run sampling is
+            # losing contract layer L6 itself.
+            for selected in \
+              "${MLXFAST_QWEN_MTP_BENCH_GOLDEN_R2_PATH}" \
+              "${MLXFAST_QWEN_MTP_BENCH_GOLDEN_SHA256_SELECTED}" \
+              "${MLXFAST_QWEN_MTP_BENCH_GOLDEN_BYTES_SELECTED}"; do
+              if [[ -z "${selected}" ]]; then
+                echo "::error::ranked Qwen-MTP dispatch reached the golden download with no timed-target selection; the selection step did not run or produced no outputs" >&2
+                exit 1
+              fi
+            done
+            .github/scripts/download-r2-object.sh \
+              "${MLXFAST_QWEN_MTP_BENCH_GOLDEN_R2_PATH}" \
+              "${MLXFAST_PRIVATE_DIR}/qwen_mtp_benchmark_golden.json"
+            bench_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/qwen_mtp_benchmark_golden.json" | awk '{print $1}')"
+            bench_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/qwen_mtp_benchmark_golden.json" | tr -d ' ')"
+            # Verified against the PER-RUN pool selection, not a fixed pin, so a
+            # swapped or truncated object fails closed even though the object key
+            # differs from run to run.
+            if [[ "${bench_hash}" != "${MLXFAST_QWEN_MTP_BENCH_GOLDEN_SHA256_SELECTED}" || "${bench_bytes}" != "${MLXFAST_QWEN_MTP_BENCH_GOLDEN_BYTES_SELECTED}" ]]; then
+              echo "::error::hidden Qwen-MTP timed golden pin mismatch for the sampled pool entry" >&2
+              exit 1
+            fi
+          else
+            echo "qwen-mtp-ranked-benchmark: gates-only dispatch; the timed golden is not downloaded and no timed target is sampled"
+          fi
+          # FAIL-CLOSED ROW-COUNT PRECONDITION on the gate's input, run on the
+          # runner-private copies before either golden is installed. This is NOT
+          # a new gate and NOT a threshold: it is the driver's own inequality
+          # (totalTokenCount <= golden.rows.count) asserted early against the same
+          # two numbers, so a short golden is a second-30 diagnostic instead of an
+          # argument error ~25 minutes in. It MUST stay a hard error -- never a
+          # clamp of the requested token count, because silently lowering it would
+          # shorten the correctness and scored decode windows without anyone
+          # deciding to.
+          check_golden_rows() {
+            local path="$1" wanted="$2" label="$3" rows
+            rows="$(jq -r 'if (.rows | type) == "array" then (.rows | length) else "" end' "${path}")"
+            if [[ ! "${rows}" =~ ^[0-9]+$ || "${rows}" -eq 0 ]]; then
+              echo "::error::hidden Qwen-MTP ${label} golden has no usable .rows array (read '${rows}'); regenerate the golden" >&2
+              exit 1
+            fi
+            if [[ "${rows}" -lt "${wanted}" ]]; then
+              echo "::error::hidden Qwen-MTP golden carries ${rows} rows but ${wanted} tokens are requested; regenerate the golden or lower the token count" >&2
+              exit 1
+            fi
+            echo "qwen-mtp-ranked-benchmark: ${label} golden carries ${rows} reference rows for ${wanted} requested tokens"
+          }
+          check_golden_rows \
+            "${MLXFAST_PRIVATE_DIR}/qwen_mtp_correctness_golden.json" \
+            "${MLXFAST_QWEN_MTP_CORRECTNESS_TOKENS}" correctness
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
+            check_golden_rows \
+              "${MLXFAST_PRIVATE_DIR}/qwen_mtp_benchmark_golden.json" \
+              "${MLXFAST_QWEN_MTP_DECODE_TOKENS}" benchmark
+          fi
+          golden_dst="${MLXFAST_JOB_WS}/.qwen-mtp-ranked-src/qwen_mtp_correctness_golden.json"
+          if [[ -e "${golden_dst}" || -L "${golden_dst}" ]]; then
+            echo "::error::refusing to place hidden input over pre-existing path ${golden_dst}" >&2
+            exit 1
+          fi
+          install -m 0444 "${MLXFAST_PRIVATE_DIR}/qwen_mtp_correctness_golden.json" "${golden_dst}"
+          echo "qwen-mtp-ranked-benchmark: hidden goldens verified (correctness ${correctness_hash}, benchmark ${bench_hash})"
+
+      - name: Verify trusted harness before Qwen-MTP correctness gate
+        run: |
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
+
+      # The untimed MTP correctness/parity gate: one full-length native-MTP
+      # speculative pass over the hidden correctness golden. The trusted parent
+      # checks every returned token against the serial oracle, enforces the
+      # speculative protocol, and re-validates the target and the MTP head before
+      # and after load. Stdout (the diagnostic report JSON) is sealed in this
+      # trusted shell; on-disk files are never trusted. Ordered BEFORE the timed
+      # phase so a broken submission never burns gated thermal time.
+      #
+      # NOTE ON THE FIDELITY CONTRACT. Native MTP decode on this checkpoint is
+      # measured EXACT-GREEDY against serial (12/12 runs to 512 tokens, all EOS
+      # branches, MTPLX-corroborated), which is a STRONGER property than the
+      # DFlash track can assert -- DFlash needed a bounded near-tie budget
+      # because its target's own block-shaped forward diverges from its
+      # sequential forward. This gate therefore requires all_tokens_matched
+      # outright. If a near-tie divergence is ever observed on the serving box,
+      # the correct response is a documented near-tie budget (DFlash's contract
+      # is the template), NOT relaxing this assertion in place.
+      - name: Qwen-MTP correctness and parity gate (untimed)
+        env:
+          BENCH_JOB_ID: qwen-mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-mtpgates
+          # Worker Seatbelt literal deny for the hidden correctness golden: only
+          # the harness parent may read it.
+          BENCH_GOLDEN_PATH: ${{ env.MLXFAST_JOB_WS }}/.qwen-mtp-ranked-src/qwen_mtp_correctness_golden.json
+        run: |
+          set -euo pipefail
+          raw_stdout="${MLXFAST_PRIVATE_DIR}/qwen-mtp-gates-stdout.raw"
+          gates_log="${MLXFAST_PRIVATE_DIR}/qwen-mtp-gates-private.log"
+          started="${SECONDS}"
+          status=0
+          # shellcheck disable=SC2024  # trusted shell owns the capture files
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env \
+              MJOB_WS="${MLXFAST_JOB_WS}" \
+              MLXFAST_QWEN_MTP_TARGET_DIR="${MLXFAST_QWEN_MTP_TARGET_DIR}" \
+              MLXFAST_QWEN_MTP_HEAD_DIR="${MLXFAST_QWEN_MTP_HEAD_DIR}" \
+              MLXFAST_QWEN_MTP_DEPTH="${MLXFAST_QWEN_MTP_DEPTH}" \
+              MLXFAST_QWEN_MTP_CORRECTNESS_TOKENS="${MLXFAST_QWEN_MTP_CORRECTNESS_TOKENS}" \
+              /bin/bash -c '
+                set -u
+                cd "${MJOB_WS}" || exit 97
+                exec .build/release/mlxfast-swift mtp-verify \
+                  --weights weights \
+                  --mtp-head "${MLXFAST_QWEN_MTP_HEAD_DIR}" \
+                  --golden .qwen-mtp-ranked-src/qwen_mtp_correctness_golden.json \
+                  --tokens "${MLXFAST_QWEN_MTP_CORRECTNESS_TOKENS}" \
+                  --mtp-depth "${MLXFAST_QWEN_MTP_DEPTH}"
+              ' > "${raw_stdout}" 2> "${gates_log}" || status=$?
+          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" != "1" ]]; then
+            cat "${gates_log}" || true
+          fi
+          if [[ "$(jq -s 'length' "${raw_stdout}" 2>/dev/null)" != "1" ]]; then
+            echo "::error::Qwen-MTP correctness gate did not emit a single valid report payload (exit=${status})" >&2
+            exit 1
+          fi
+          # RECONCILED WITH THE PAYLOAD (phase 2). Every conjunct below is
+          # cross-checked against the keys `mtp-verify` actually emits by
+          # QwenMTPPayloadSchemaTests, which parses this step's jq and the CLI's
+          # payload literal and requires the first to be a subset of the second.
+          # Asserting a field the payload does not carry makes `jq -e` fail on
+          # EVERY run, which is exactly how the DFlash gate was dead before it
+          # ever gated anything (its jq required .experimental and
+          # .target_verification_mode; neither was emitted).
+          #
+          # TWO SPELLINGS OF ONE PREDICATE. `uses_pinned_mtp_head` is what this
+          # workflow and the local runner pinned; `uses_native_mtp_head` is what
+          # the box-owned measurement wrapper pinned. The wrapper is an installed,
+          # signed artifact this branch does not own, so the payload emits both
+          # and the schema test requires them to stay equal. Asserting BOTH here
+          # is what makes that equality load-bearing rather than decorative.
+          #
+          # The ledger conjuncts are not decoration either: bit-exact tokens with
+          # an unclosed row ledger would mean the tokens were not bound to the
+          # work the candidate declared, which is the whole point of Criterion E.
+          jq -e \
+            --arg track "${MLXFAST_QWEN_MTP_TRACK_ID}" \
+            --argjson tokens "${MLXFAST_QWEN_MTP_CORRECTNESS_TOKENS}" \
+            --argjson depth "${MLXFAST_QWEN_MTP_DEPTH}" \
+            '
+            .track_id == $track
+            and .uses_pinned_mtp_head == true
+            and .uses_native_mtp_head == true
+            and .uses_native_mtp_head == .uses_pinned_mtp_head
+            and .mtp_head_attached == true
+            and .mtp_depth == $depth
+            and .decode_token_count == $tokens
+            and .emitted_token_total == $tokens
+            and .all_tokens_matched == true
+            and .parity_all_ok == true
+            and .reference_checked_row_total == .declared_rows_total
+            and ((.accepted_draft_total + .rejected_draft_total
+                  + .target_tail_total) == .declared_rows_total)
+            and .target_cache_offset_final
+                == (.seed_token_count + .emitted_token_total)
+            and (.row_ledger | type == "array")
+            and (.row_ledger | length) == .declared_rows_total
+            and ([.row_ledger[]
+                  | select((.top2_logits | type != "array")
+                           or (.top2_logits | length) < 2)]
+                 | length) == 0
+            and .official_score_produced == false
+            and (has("score") | not)
+            and (has("speedup") | not)
+            ' "${raw_stdout}" >/dev/null || {
+              echo "::error::Qwen-MTP correctness gate report failed validation (exit=${status})" >&2
+              exit 1
+            }
+          cp "${raw_stdout}" qwen-mtp-gates-report.json
+          echo "qwen-mtp-ranked-benchmark: correctness/parity gate passed in $((SECONDS - started))s (exit=${status})"
+          exit "${status}"
+
+      # ---- correctness-only (run_benchmark=false) artifact path ------------
+      - name: Stage Qwen-MTP correctness artifacts
+        id: stage_qwen_mtp_correctness_artifacts
+        # always() so a gates-only run that FAILS still publishes its
+        # diagnostics; the !run_benchmark half is not a convenience -- on a
+        # ranked run these artifacts are withheld because they are derived from
+        # hidden material.
+        if: ${{ always() && !inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f candidate.sha ]]; then
+            echo "::error::candidate.sha is missing; refusing to stage artifacts for an unidentified workspace" >&2
+            exit 1
+          fi
+          test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"
+          # PRESENT-ONLY STAGING. An aborted run has not produced every artifact,
+          # and requiring all of them made the staging step fail too -- costing
+          # evidence in exactly the case it is wanted. Every name is still passed
+          # through deny-private-artifacts.sh, so tolerating absence does not
+          # widen what may be published.
+          present=()
+          missing=()
+          suspicious=()
+          for name in \
+            candidate.sha \
+            public-gate-report.json \
+            gates-score.json \
+            qwen-mtp-gates-report.json \
+            qwen-mtp-weights.sha256; do
+            if [[ -L "${name}" ]]; then
+              # A SYMLINK IS NOT AN ABSENCE: a symlink where an artifact belongs
+              # is a candidate reaching outside the workspace, which is the thing
+              # artifact staging exists to prevent.
+              suspicious+=("${name}")
+            elif [[ -f "${name}" ]]; then
+              present+=("${name}")
+            else
+              missing+=("${name}")
+            fi
+          done
+          if ((${#suspicious[@]})); then
+            echo "::error::artifact source is a symlink, not a regular file: ${suspicious[*]}" >&2
+            exit 1
+          fi
+          if ((${#missing[@]})); then
+            echo "::notice::Qwen-MTP correctness staging: not produced by this run: ${missing[*]}"
+          fi
+          # CONTENT GATE. deny-private-artifacts.sh is NAME- and SIZE-based; it
+          # cannot see hidden values INSIDE a permitted filename. This step is
+          # always(), so it runs precisely when "Validate sealed gates score" did
+          # NOT -- and a failed gates run writes a score whose .metrics can carry
+          # first_failing_step / expected_token / actual_token, values derived
+          # FROM THE HIDDEN GOLDEN. Because a gates-only failure charges no
+          # attributable-failure budget, repeating it would return one hidden
+          # token per run: an iterated oracle. So re-assert the sealed-score
+          # predicate inline and DROP the file from the upload if it fails.
+          keep=()
+          for name in "${present[@]}"; do
+            case "${name}" in
+              gates-score.json)
+                if jq -e '
+                  .passed == true
+                  and (.metrics.error == "")
+                  and (.metrics.first_failing_case == null)
+                  and (.metrics.first_failing_layer == null)
+                  and (.metrics.first_failing_step == null)
+                  and (.metrics.expected_token == null)
+                  and (.metrics.actual_token == null)
+                  and (.metrics.expected_token_logit == null)
+                  and (.metrics.expected_token_rank == null)
+                  and (.metrics.passed_correctness == true)
+                ' "${name}" >/dev/null 2>&1; then
+                  keep+=("${name}")
+                else
+                  echo "::notice::withholding ${name}: it did not pass the sealed-score predicate, so it may carry hidden-golden token fields"
+                fi
+                ;;
+              public-gate-report.json)
+                # Its .error can embed sandboxed-worker stderr, i.e. text the
+                # SUBMITTED code controls.
+                if [[ "${MLXFAST_IS_SUBMISSION_BRANCH:-0}" != "1" ]] \
+                  || jq -e '(.error // "") == ""' "${name}" >/dev/null 2>&1; then
+                  keep+=("${name}")
+                else
+                  echo "::notice::withholding ${name}: non-empty .error on a submission branch may carry submitted-code output"
+                fi
+                ;;
+              *)
+                keep+=("${name}")
+                ;;
+            esac
+          done
+          present=("${keep[@]}")
+          .github/scripts/deny-private-artifacts.sh "${present[@]}"
+          staged=()
+          for name in "${present[@]}"; do staged+=("${name}=${name}"); done
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/qwen-mtp-correctness-results" \
+            "${staged[@]}"
+
+      - name: Upload Qwen-MTP correctness artifacts
+        if: always() && steps.stage_qwen_mtp_correctness_artifacts.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: qwen-mtp-correctness-results-${{ github.run_id }}
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/qwen-mtp-correctness-results
+          if-no-files-found: error
+          overwrite: true
+
+      # ---- ranked path (run_benchmark=true) --------------------------------
+      # Restore the workspace to its pre-hidden snapshot BEFORE the timed phase:
+      # remove the hidden correctness golden, purge bench scratch through the
+      # bridge, allowlist-delete every gates-phase file, and re-verify weights
+      # against its pinned hash.
+      - name: Scrub hidden material from bench workspace
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          rm -f "${MLXFAST_JOB_WS}/.qwen-mtp-ranked-src/qwen_mtp_correctness_golden.json"
+          rm -f "${MLXFAST_JOB_WS}/correctness_golden_ranked.json"
+          rm -rf "${MLXFAST_JOB_WS}/private"
+          mkdir -p "${MLXFAST_JOB_WS}/private"
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" /bin/bash -c '
+              set -u
+              if [ -d "${MJOB_WS}/tmp" ]; then
+                find "${MJOB_WS}/tmp" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+              fi
+            '
+          manifest="${MLXFAST_PRIVATE_DIR}/post-transform-manifest.nul"
+          test -s "${manifest}"
+          scrub_failed=0
+          while IFS= read -r -d '' rel; do
+            case "${rel}" in
+              ./weights/*|./.build/*|./.build-worker/*|./correctness_prompts/*) continue ;;
+              ./private/*) continue ;;
+            esac
+            if grep -zqxF -- "${rel}" "${manifest}"; then
+              continue
+            fi
+            target="${MLXFAST_JOB_WS}/${rel#./}"
+            rm -f -- "${target}" 2>/dev/null || true
+            if [[ -e "${target}" || -L "${target}" ]]; then
+              echo "::error::allowlist scrub could not remove gates-phase workspace file: ${rel}" >&2
+              scrub_failed=1
+            fi
+          done < <(cd "${MLXFAST_JOB_WS}" && find . -mindepth 1 \( -type f -o -type l \) -print0 | LC_ALL=C sort -z)
+          if [[ "${scrub_failed}" -ne 0 ]]; then
+            echo "::error::allowlist scrub left gates-phase workspace files it could not delete" >&2
+            exit 1
+          fi
+          test -s qwen-mtp-weights.sha256
+          scrub_weights_hash="$(.github/scripts/hash-weights-directory.sh "${MLXFAST_JOB_WS}/weights")"
+          trusted_weights_hash="$(tr -d '[:space:]' < qwen-mtp-weights.sha256)"
+          if [[ "${scrub_weights_hash}" != "${trusted_weights_hash}" ]]; then
+            echo "::error::transformed Qwen weights changed before timing (hash ${scrub_weights_hash} != ${trusted_weights_hash})" >&2
+            exit 1
+          fi
+          leftovers="$(find "${MLXFAST_JOB_WS}" -maxdepth 2 -name '*golden*' ! -path "*/correctness_prompts/*" | grep -v '^$' || true)"
+          if [[ -n "${leftovers}" ]]; then
+            echo "::error::hidden-material scrub left candidates behind: ${leftovers}" >&2
+            exit 1
+          fi
+          echo "qwen-mtp-ranked-benchmark: bench workspace restored to pre-hidden snapshot before timing"
+
+      - name: Reap lingering bench processes before timing
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /bin/bash "${MLXFAST_JOB_WS}/.github/scripts/reap-bench-processes.sh"
+
+      - name: Wait for quiescence before timing
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          waited=0
+          while :; do
+            load="$(sysctl -n vm.loadavg | awk '{print $2}')"
+            util="$("${MLXFAST_MACMON}" pipe -s1 2>/dev/null | jq -r '.gpu_usage[1] // 1' || true)"
+            [[ -n "${util}" ]] || util=1
+            if [[ "$(echo "${load} < 2.0" | bc -l)" == "1" && "$(echo "${util} < 0.10" | bc -l)" == "1" ]]; then
+              break
+            fi
+            sleep 15
+            waited=$((waited + 15))
+            if [[ "${waited}" -ge 900 ]]; then
+              echo "::error::machine did not reach quiescence within 900s (load=${load} gpu_util=${util})" >&2
+              exit 1
+            fi
+          done
+          temp="$("${MLXFAST_MACMON}" pipe -s1 2>/dev/null | jq -r '.temp.gpu_temp_avg // "?"')"
+          echo "qwen-mtp-ranked-benchmark: quiescent after ${waited}s (load=${load} gpu_util=${util} gpu_temp=${temp}C); thermal gate is enforced inside measure-qwen-mtp-job"
+
+      - name: Verify trusted harness before timing
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
+
+      # THE TIMED MTP MEASUREMENT -- LAST, via the box-owned wrapper with the
+      # fixed thermal contract. Per accepted pair, alternating order:
+      #   baseline:  pinned baseline tree, serial K=1 target decode over the
+      #              hidden benchmark golden;
+      #   candidate: this workspace, native-MTP speculative decode over the SAME
+      #              golden, same --tokens denominator.
+      # The wrapper enforces per-phase quiescence + the 40C gate + 2 Hz telemetry
+      # acceptance, requires all_tokens_matched=true from every run, checks the
+      # baseline calibration band, and seals results.json. Worker-reported timing
+      # has no authority anywhere; the parent divides its own wall time by its own
+      # configured token total.
+      - name: Timed paired Qwen-MTP benchmark (measure-qwen-mtp-job)
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          # RESOLVE the baseline symlink before handing it to the wrapper: the
+          # wrapper clones the baseline with `cp -c -R`, and on a symlink source
+          # that copies the SYMLINK, so the clone under /Users/Shared/bench-jobs
+          # becomes a link back into /opt/bench-runner and bench-exec.sh correctly
+          # refuses it. Passing the resolved path keeps `current` as the
+          # operator's indirection while giving the wrapper a real directory.
+          MLXFAST_QWEN_MTP_BASELINE_RESOLVED="$(readlink -f "${MLXFAST_QWEN_MTP_BASELINE_WS}")"
+          test -d "${MLXFAST_QWEN_MTP_BASELINE_RESOLVED}/.build/release" \
+            || { echo "::error::resolved baseline is not a built workspace: ${MLXFAST_QWEN_MTP_BASELINE_RESOLVED}" >&2; exit 1; }
+          # --contract points at the candidate workspace's OWN fixture copy,
+          # ABSOLUTE. The wrapper runs as the bench/runner uid and only
+          # MLXFAST_JOB_WS carries the bench read ACL, so a bare relative path
+          # would resolve against GITHUB_WORKSPACE (no such ACL) and the wrapper
+          # would see nothing.
+          # GPU_LOADED_UTIL recalibrated from the section 7 sessions
+          # 2026-08-13: the serial (depth-0) leg is a ~0.79-util workload, so
+          # the old 0.95 starves MIN_LOADED_SAMPLES on box 3 -- 6-8 loaded
+          # samples (as few as 3 steady) against 102-104 at 0.70, i.e. one
+          # hiccup from a false rejection. 0.70 matches the wrapper's own
+          # recalibrated default.
+          MEASURE_STATE_DIR="${MLXFAST_MEASURE_STATE_DIR}" \
+          BASELINE_WS="${MLXFAST_QWEN_MTP_BASELINE_RESOLVED}" \
+          BASELINE_CALIBRATION="${MLXFAST_QWEN_MTP_BASELINE_CALIBRATION}" \
+          QMTP_TARGET_DIR="${MLXFAST_QWEN_MTP_TARGET_DIR}" \
+          QMTP_HEAD_DIR="${MLXFAST_QWEN_MTP_HEAD_DIR}" \
+          MACMON="${MLXFAST_MACMON}" \
+          GPU_LOADED_UTIL=0.70 \
+            "${MLXFAST_QWEN_MTP_MEASURE_JOB}" \
+              --candidate "${MLXFAST_JOB_WS}" \
+              --baseline "${MLXFAST_QWEN_MTP_BASELINE_RESOLVED}" \
+              --golden "${MLXFAST_PRIVATE_DIR}/qwen_mtp_benchmark_golden.json" \
+              --contract "${MLXFAST_JOB_WS}/${MLXFAST_QWEN_MTP_CONTRACT_PATH}" \
+              --tokens "${MLXFAST_QWEN_MTP_DECODE_TOKENS}" \
+              --mtp-depth "${MLXFAST_QWEN_MTP_DEPTH}" \
+              --min-pairs "${MLXFAST_QWEN_MTP_MIN_ACCEPTED_PAIRS}" \
+              --target-pairs "${MLXFAST_QWEN_MTP_TARGET_PAIRS}" \
+              --tag "qwen-mtp-ranked-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+              --out "${MLXFAST_MEASURE_OUT}"
+          test -s "${MLXFAST_MEASURE_OUT}/results.json"
+          jq -c '{mode, accepted_pair_count, parity_all_ok}' "${MLXFAST_MEASURE_OUT}/results.json"
+
+      # Decode-only score contract applied in the trusted shell from the sealed
+      # paired results: hard token-fidelity gate, minimum accepted pairs,
+      # RATIO-OF-MEANS aggregation computed HERE from the sealed per-side
+      # seconds/token means (never trusted from a pre-aggregated field),
+      # per-prompt normalisation against the sampled prompt's own pinned no-op
+      # reference, and the floor on that aggregate.
+      - name: Compute Qwen-MTP score and enforce floor
+        if: ${{ inputs.run_benchmark }}
+        env:
+          # The sampled pool entry's sha256, from the trusted per-run selection.
+          # Consumed only inside this trusted step and never echoed, preserving
+          # the "selection recorded only in the private audit dir" posture.
+          MLXFAST_QWEN_MTP_SELECTED_SHA256: ${{ steps.select_qwen_mtp_target.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          # SECOND, INDEPENDENT check of the PUBLISH question, at the step that
+          # actually produces the ranked score rather than fifty steps earlier. A
+          # guard fifty steps upstream of the thing it protects is a guard whose
+          # coverage depends on step order.
+          scoring_enabled="$(jq -r '.official_scoring_enabled' "${MLXFAST_QWEN_MTP_CONTRACT_PATH}")"
+          publication_allowed="$(jq -r '.reference_baseline.publication_allowed' "${MLXFAST_QWEN_MTP_CONTRACT_PATH}")"
+          if [[ "${scoring_enabled}" != "true" || "${publication_allowed}" != "true" ]]; then
+            echo "::error::refusing to compute a ranked Qwen-MTP score for a track that is not enabled (official_scoring_enabled=${scoring_enabled}, reference_baseline.publication_allowed=${publication_allowed})" >&2
+            exit 1
+          fi
+          if [[ "${MLXFAST_QWEN_MTP_DRY_RUN_UNENABLED:-0}" == "1" ]]; then
+            echo "::error::a gates-only dry run reached the ranked scoring step; this step must never run for a dispatch that was admitted as unenabled" >&2
+            exit 1
+          fi
+          # THIRD, INDEPENDENT refusal of a placeholder floor. The pin-completeness
+          # gate already rejected it at the top of the job; repeating it here means
+          # no reordering, no widened guard and no future edit can arrive at a
+          # numeric comparison against a non-numeric threshold.
+          if [[ ! "${MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::QWEN-MTP-PENDING-ORGANIZER: MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR is '${MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR}', not a number. The normalised floor must be DERIVED from the pool's own measured no-op references before any score is published." >&2
+            exit 1
+          fi
+          results="${MLXFAST_MEASURE_OUT}/results.json"
+          test -s "${results}"
+          jq -e \
+            --arg track "${MLXFAST_QWEN_MTP_TRACK_ID}" \
+            --argjson min_pairs "${MLXFAST_QWEN_MTP_MIN_ACCEPTED_PAIRS}" \
+            '
+            .track_id == $track
+            and .parity_all_ok == true
+            and (.accepted_pair_count >= $min_pairs)
+            and ((.pairs | type) == "array")
+            and ((.pairs | length) == .accepted_pair_count)
+            and (.aggregate.baseline_serial_seconds_per_token_mean | type == "number" and . > 0)
+            and (.aggregate.candidate_mtp_seconds_per_token_mean | type == "number" and . > 0)
+            and (.aggregate.mtp_decode_speedup_median | type == "number")
+            and (.aggregate.mtp_decode_speedup_min | type == "number")
+            ' "${results}" >/dev/null || {
+              echo "::error::paired Qwen-MTP results failed validation (token-fidelity gate, pair count, or schema)" >&2
+              exit 1
+            }
+          # Ratio-of-means (RAW): mean serial s/tok over accepted pairs divided by
+          # mean MTP s/tok over the same pairs.
+          speedup_raw="$(jq -r '.aggregate.baseline_serial_seconds_per_token_mean / .aggregate.candidate_mtp_seconds_per_token_mean' "${results}")"
+          # PER-PROMPT NORMALISATION. Divide the raw ratio-of-means by the sampled
+          # prompt's OWN pinned no-op reference so every pool prompt's no-op maps
+          # to 1.0 and the ranked score does not depend on which prompt the
+          # anti-lottery sampler drew. The reference is read from the TRUSTED
+          # contract checkout under GITHUB_WORKSPACE, NOT the candidate-writable
+          # job workspace copy.
+          if [[ ! "${MLXFAST_QWEN_MTP_SELECTED_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::the per-run timed-target selection did not provide a sha256; cannot normalise the score" >&2
+            exit 1
+          fi
+          noop_ref="$(jq -r --arg s "${MLXFAST_QWEN_MTP_SELECTED_SHA256}" '[.timed_prompt_pool[] | select(.sha256 == $s) | .noop_decode_speedup] | if length == 1 then (.[0] | tostring) else "MISSING" end' "${MLXFAST_QWEN_MTP_CONTRACT_PATH}")"
+          if [[ "${noop_ref}" == "MISSING" || "${noop_ref}" == "null" || -z "${noop_ref}" ]]; then
+            echo "::error::no single pinned no-op reference (noop_decode_speedup) for the sampled timed prompt in ${MLXFAST_QWEN_MTP_CONTRACT_PATH}; the pool and its per-prompt references must be re-pinned together" >&2
+            exit 1
+          fi
+          if [[ "$(echo "${noop_ref} > 0" | bc -l)" != "1" ]]; then
+            echo "::error::pinned no-op reference ${noop_ref} for the sampled timed prompt is not a positive number" >&2
+            exit 1
+          fi
+          # score = raw / reference (full precision via jq, not bc scale).
+          speedup="$(jq -rn --argjson raw "${speedup_raw}" --argjson ref "${noop_ref}" '$raw / $ref')"
+          floor_ok="$(echo "${speedup} >= ${MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR}" | bc -l)"
+          if [[ "${floor_ok}" != "1" ]]; then
+            echo "::error::normalised mtp_decode_speedup ${speedup} (raw ${speedup_raw} / no-op reference ${noop_ref}) is below the ${MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR} floor" >&2
+            exit 1
+          fi
+          jq -n \
+            --arg track "${MLXFAST_QWEN_MTP_TRACK_ID}" \
+            --arg commit "${MLXFAST_CANDIDATE_SHA}" \
+            --arg weights_hash "$(tr -d '[:space:]' < qwen-mtp-weights.sha256)" \
+            --argjson score "${speedup}" \
+            --argjson raw "${speedup_raw}" \
+            --argjson noop_ref "${noop_ref}" \
+            --argjson floor "${MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR}" \
+            --argjson decode_tokens "${MLXFAST_QWEN_MTP_DECODE_TOKENS}" \
+            --argjson depth "${MLXFAST_QWEN_MTP_DEPTH}" \
+            --argjson target_pairs "${MLXFAST_QWEN_MTP_TARGET_PAIRS}" \
+            --slurpfile results "${results}" \
+            '
+            {
+              score: $score,
+              passed: true,
+              track_id: $track,
+              metrics: {
+                mode: "qwen-mtp-paired-decode-only",
+                aggregation: "ratio_of_means",
+                scoring_normalized: true,
+                commit: $commit,
+                decode_tokens: $decode_tokens,
+                mtp_depth: $depth,
+                decode_speedup_floor: $floor,
+                accepted_pair_count: $results[0].accepted_pair_count,
+                target_pair_count: $target_pairs,
+                parity_all_ok: $results[0].parity_all_ok,
+                mtp_decode_speedup_normalized: $score,
+                noop_reference_decode_speedup: $noop_ref,
+                mtp_decode_speedup_ratio_of_means: $raw,
+                mtp_decode_speedup_median: $results[0].aggregate.mtp_decode_speedup_median,
+                mtp_decode_speedup_min: $results[0].aggregate.mtp_decode_speedup_min,
+                baseline_serial_seconds_per_token_mean: $results[0].aggregate.baseline_serial_seconds_per_token_mean,
+                candidate_mtp_seconds_per_token_mean: $results[0].aggregate.candidate_mtp_seconds_per_token_mean,
+                qwen_mtp_weights_hash: $weights_hash
+              }
+            }
+            ' > score.json
+          shasum -a 256 score.json | awk '{print $1}' > score.json.sha256
+          jq -c '{track_id, score, passed}' score.json
+
+      - name: Check Qwen-MTP benchmark artifact paths
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"
+          .github/scripts/deny-private-artifacts.sh \
+            candidate.sha \
+            score.json \
+            score.json.sha256 \
+            public-gate-report.json \
+            gates-score.json \
+            qwen-mtp-gates-report.json \
+            qwen-mtp-weights.sha256
+
+      - name: Stage Qwen-MTP benchmark artifacts
+        id: stage_qwen_mtp_benchmark_artifacts
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/benchmark-results" \
+            candidate.sha=candidate.sha \
+            score.json=score.json \
+            score.sha256=score.json.sha256 \
+            public-gate-report.json=public-gate-report.json \
+            gates-score.json=gates-score.json \
+            qwen-mtp-gates-report.json=qwen-mtp-gates-report.json \
+            qwen-mtp-weights.sha256=qwen-mtp-weights.sha256
+
+      - name: Upload Qwen-MTP benchmark artifacts
+        if: ${{ inputs.run_benchmark && steps.stage_qwen_mtp_benchmark_artifacts.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results
+          if-no-files-found: error
+          overwrite: true
+
+      # Timing provenance for audit/disputes: sealed paired results (paths,
+      # commit ids, timings, telemetry aggregates only) and the measure verdict.
+      - name: Stage Qwen-MTP audit artifacts
+        id: stage_qwen_mtp_audit_artifacts
+        if: ${{ always() && inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          staged=()
+          if [[ -s "${MLXFAST_MEASURE_OUT}/results.json" ]]; then
+            cp "${MLXFAST_MEASURE_OUT}/results.json" qwen-mtp-paired-results.json
+            staged+=(qwen-mtp-paired-results.json=qwen-mtp-paired-results.json)
+          fi
+          if [[ -s "${MLXFAST_MEASURE_OUT}/verdict.txt" ]]; then
+            cp "${MLXFAST_MEASURE_OUT}/verdict.txt" qwen-mtp-measure-verdict.txt
+            staged+=(qwen-mtp-measure-verdict.txt=qwen-mtp-measure-verdict.txt)
+          fi
+          if [[ -s qwen-mtp-weights.sha256 ]]; then
+            staged+=(qwen-mtp-weights.sha256=qwen-mtp-weights.sha256)
+          fi
+          if [[ "${#staged[@]}" -eq 0 ]]; then
+            echo "qwen-mtp-ranked-benchmark: no audit artifacts to stage"
+            exit 0
+          fi
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/qwen-mtp-ranked-audit" \
+            "${staged[@]}"
+
+      - name: Upload Qwen-MTP audit artifacts
+        if: ${{ always() && inputs.run_benchmark && steps.stage_qwen_mtp_audit_artifacts.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: qwen-mtp-ranked-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/qwen-mtp-ranked-audit
+          if-no-files-found: ignore
+          retention-days: 90
+
+      # Failure reporting must never echo reference material: a validator that
+      # surfaced golden tokens would be a query oracle on the hidden prompt. The
+      # redactor maps the failure KIND to an opaque category and drops the detail
+      # text.
+      - name: Redact Qwen-MTP benchmark failure
+        id: redact_qwen_mtp_failure
+        if: ${{ failure() && inputs.run_benchmark }}
+        env:
+          MLXFAST_BENCHMARK_MODE: qwen-mtp-paired
+        run: |
+          set -euo pipefail
+          # Give the redactor a score file it can categorise from: it derives
+          # every category from a score's .metrics.error, and score.json does not
+          # exist until AFTER timing -- so on any earlier failure it would be
+          # handed nothing and collapse every cause into "no_score". Prefer the
+          # timed score when it exists, otherwise the sealed, already
+          # leak-validated gates score.
+          redact_score="gates-score.json"
+          if [[ -s score.json ]]; then
+            redact_score="score.json"
+          fi
+          .github/scripts/redact-benchmark-failure.sh \
+            benchmark-failure.json \
+            "${redact_score}" \
+            public-gate-report.json
+          .github/scripts/deny-private-artifacts.sh benchmark-failure.json
+
+      # Charge the branch's rate-limit budget ONLY for failures the participant
+      # is responsible for. Infra categories (a judge API outage, a thermal
+      # reject, a nondeterministic reference) are operator faults and must be
+      # re-dispatchable at no cost, otherwise the rate limit becomes a
+      # denial-of-service against honest submitters.
+      #
+      # POST-REBASE RECONCILIATION ITEM: redact-benchmark-failure.sh's category
+      # vocabulary is DFlash/serial-shaped. The qwen_mtp_* arm below only becomes
+      # live once the redactor emits those categories; until then an MTP-specific
+      # failure lands in one of the shared categories and is charged (or not) by
+      # the arms that already exist. Verify the vocabulary when phase 3 lands.
+      - name: Record attributable Qwen-MTP ranked failure
+        if: ${{ failure() && steps.redact_qwen_mtp_failure.outcome == 'success' && startsWith(github.ref, 'refs/heads/submissions/') }}
+        run: |
+          set -euo pipefail
+          test -s benchmark-failure.json || exit 0
+          # redact-benchmark-failure.sh emits `failure_category`, never
+          # `category`. Reading the wrong key would make this rate limiter INERT.
+          category="$(jq -r '.failure_category // ""' benchmark-failure.json)"
+          case "${category}" in
+            qwen_mtp_*|floor_failed|correctness_failed|prefill_token_mismatch|decode_seed_token_mismatch|decode_token_mismatch)
+              ;;
+            *)
+              echo "qwen-mtp-ranked-benchmark: category '${category}' is not participant-attributable; rate-limit budget untouched"
+              exit 0
+              ;;
+          esac
+          counts_dir="${MLXFAST_MEASURE_STATE_DIR}/failure-counts"
+          mkdir -p "${counts_dir}"
+          branch_key="$(printf '%s' "${GITHUB_REF}" | shasum -a 256 | awk '{print $1}')"
+          counter="${counts_dir}/${branch_key}.count"
+          used=0
+          if [[ -s "${counter}" ]]; then
+            used="$(tr -dc '0-9' < "${counter}")"
+            used="${used:-0}"
+          fi
+          printf '%s\n' "$((used + 1))" > "${counter}.tmp"
+          mv "${counter}.tmp" "${counter}"
+          echo "qwen-mtp-ranked-benchmark: recorded attributable failure ($((used + 1))/${MLXFAST_QWEN_MTP_MAX_RANKED_FAILURES}) for category ${category}"
+
+      - name: Upload redacted Qwen-MTP failure
+        if: ${{ failure() && steps.redact_qwen_mtp_failure.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: qwen-mtp-ranked-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: benchmark-failure.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Cleanup bench workspace
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -d "${MLXFAST_JOB_WS}" ]]; then
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /bin/sh -c 'find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null; true' || true
+            rm -rf "${MLXFAST_JOB_WS}" || true
+            if [[ -d "${MLXFAST_JOB_WS}" ]]; then
+              echo "::warning::bench workspace residue left at ${MLXFAST_JOB_WS}"
+            fi
+          fi
+          private_cleanup_failed=0
+          for private_path in \
+            "${MLXFAST_PRIVATE_DIR}" \
+            "${MLXFAST_MEASURE_OUT}" \
+            "${MLXFAST_ARTIFACT_ROOT}"; do
+            if ! rm -rf -- "${private_path}"; then
+              echo "::error::could not remove runner-private artifact path: ${private_path}" >&2
+              private_cleanup_failed=1
+              continue
+            fi
+            if [[ -e "${private_path}" || -L "${private_path}" ]]; then
+              echo "::error::runner-private artifact cleanup failed: ${private_path}" >&2
+              private_cleanup_failed=1
+            fi
+          done
+          exit "${private_cleanup_failed}"
+
+      - name: Janitor reset and integrity audit
+        if: always()
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_JANITOR}"
+          if [[ -e "${MLXFAST_QUARANTINE_FLAG}" ]]; then
+            echo "::error::janitor quarantined the box after this run" >&2
+            exit 1
+          fi
+          echo "qwen-mtp-ranked-benchmark: janitor reset + integrity audit clean"
