@@ -51,8 +51,8 @@ name: qwen-mtp-provision-goldens
 # Tests/MLXFastTests/QwenMTPGoldenProvisioningTests.swift:
 #   * publish a score -- it runs no measure job, computes no speedup, writes no
 #     score.json, and touches no ranked timing state;
-#   * run from a branch a participant can create -- refs/heads/main plus, for
-#     the pre-merge migration window only, refs/heads/qwen36-mtp-track, enforced
+#   * run from a branch a participant can create -- refs/heads/qwen36-mtp-track
+#     (this track's permanent base branch) plus refs/heads/main, enforced
 #     by .github/scripts/enforce-trusted-qwen-mtp-provision-workflow.sh;
 #   * edit the pins in qwen-mtp-ranked-benchmark.yml -- it PRINTS the four values
 #     and stops. Applying them is a reviewed commit, deliberately.
@@ -170,11 +170,12 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      # main, workflow_dispatch-only, this repository only. Stricter than
-      # the ranked job's allowlist on purpose: this job holds R2 WRITE
-      # credentials. The guard additionally allowlists refs/heads/qwen36-mtp-track
-      # for the pre-merge migration window ONLY -- see the TEMPORARY (2026-08-13)
-      # banner in the script, which must be removed at the go-live merge.
+      # Track base or main, workflow_dispatch-only, this repository only.
+      # Stricter than the ranked job's allowlist on purpose: this job holds R2
+      # WRITE credentials. The guard allowlists refs/heads/qwen36-mtp-track,
+      # this track's permanent base branch and the ref operators provision
+      # from -- see the PERMANENT BY DESIGN (2026-08-13) banner in the script.
+      # It is not a migration ref and is not scheduled for removal.
       - name: Enforce trusted workflow context
         run: .github/scripts/enforce-trusted-qwen-mtp-provision-workflow.sh
 

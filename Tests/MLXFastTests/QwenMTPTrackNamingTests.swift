@@ -475,7 +475,8 @@ struct QwenMTPTrackNamingTests {
     }
 
     /// The track is LIVE (operator go-live 2026-08-13, on the qwen36-mtp-track
-    /// ref; the merge to main is deferred). This suite used to pin the INERT
+    /// ref, which is this track's permanent base branch -- the track is
+    /// branch-targeted and no merge to main is planned). This suite used to pin the INERT
     /// posture; it now pins the ARMED one, which is the same discipline pointed
     /// the other way. Each of these is still a one-character edit away from
     /// flipping, so taking the track back OFFLINE means editing this test in the

@@ -17,12 +17,15 @@ import Testing
 // caught it. Reading workflow text is reserved here for the one thing that has
 // no runtime -- which script path each workflow's `run:` line names.
 //
-// THE TEMPORARY REF. Both guards allowlist refs/heads/qwen36-mtp-track in
-// addition to refs/heads/main, for the pre-merge migration window only. That is
-// the single deliberate difference from the DFlash guards, and
-// `theTemporaryMigrationRefIsFlaggedForRemoval` below pins BOTH halves of its
-// removal contract: the dated marker stays greppable in the script, and a
-// dispatch that actually uses the ref says so in the log.
+// THE TRACK-BASE REF. Both guards allowlist refs/heads/qwen36-mtp-track in
+// addition to refs/heads/main. That is the single deliberate difference from
+// the DFlash guards, and it is PERMANENT: the Qwen-MTP track is branch-targeted
+// (operator design decision 2026-08-13), so qwen36-mtp-track is its base branch
+// and the ref operators actually dispatch these credentialled jobs from, while
+// main is the DFlash track's base. `theTrackBaseRefIsPermanentByDesign` below
+// pins both halves of that: the dated design marker stays greppable in the
+// script, and a dispatch from the track base is admitted SILENTLY -- exactly as
+// a dispatch from main is -- so neither trusted ref is annotated as anomalous.
 @Suite("Qwen-MTP trusted-context guards")
 struct QwenMTPTrustedContextGuardTests {
     private typealias S = DFlashGateTextSupport
@@ -37,9 +40,9 @@ struct QwenMTPTrustedContextGuardTests {
     private static let probeWorkflow =
         ".github/workflows/qwen-mtp-r2-key-probe.yml"
 
-    /// The dated removal marker. Spelled once, asserted in both scripts.
-    private static let temporaryMarker = "TEMPORARY (2026-08-13)"
-    private static let migrationRef = "refs/heads/qwen36-mtp-track"
+    /// The dated design marker. Spelled once, asserted in both scripts.
+    private static let permanentMarker = "PERMANENT BY DESIGN (2026-08-13)"
+    private static let trackBaseRef = "refs/heads/qwen36-mtp-track"
 
     /// Each guard paired with the workflow it is pinned to.
     private static let guards: [(guardScript: String, workflow: String)] = [
@@ -95,17 +98,17 @@ struct QwenMTPTrustedContextGuardTests {
 
     // MARK: - What each guard admits
 
-    /// The allowlist, executed: refs/heads/main and the temporary migration ref
+    /// The allowlist, executed: refs/heads/main and this track's base branch
     /// pass; nothing else does. The ranked job admits `submissions/*`,
     /// `baseline/*` and `yukon/baseline/*` because a submission must run
-    /// against trusted main's harness. These two jobs hold R2 credentials and
-    /// choose, from the dispatched ref, the code that touches hidden material,
-    /// so copying that allowlist would hand every participant-creatable branch
-    /// namespace a hidden golden.
+    /// against the trusted harness on the track's base branch. These two jobs
+    /// hold R2 credentials and choose, from the dispatched ref, the code that
+    /// touches hidden material, so copying that allowlist would hand every
+    /// participant-creatable branch namespace a hidden golden.
     @Test
     func onlyTheAllowlistedRefsMayDispatch() throws {
         for (guardScript, workflow) in Self.guards {
-            for ref in ["refs/heads/main", Self.migrationRef] {
+            for ref in ["refs/heads/main", Self.trackBaseRef] {
                 let run = try Self.runGuard(
                     guardScript, ref: ref, event: "workflow_dispatch", workflow: workflow
                 )
@@ -236,71 +239,73 @@ struct QwenMTPTrustedContextGuardTests {
         }
     }
 
-    // MARK: - The temporary ref announces itself
+    // MARK: - The track-base ref is permanent, and ordinary
 
-    /// THE REMOVAL CONTRACT for the pre-merge migration allowlist entry, pinned
-    /// at both ends so it cannot outlive the window quietly:
+    /// THE PERMANENCE CONTRACT for the track-base allowlist entry, pinned at
+    /// both ends. This test replaces an earlier removal contract: the entry was
+    /// authored as a pre-merge migration window, and the operator's 2026-08-13
+    /// design decision made the Qwen-MTP track branch-targeted permanently, so
+    /// there is no merge at which to remove it. What is pinned now:
     ///
-    ///   IN THE FILE  the dated `TEMPORARY (2026-08-13)` marker and the branch
-    ///                name stay greppable, so the go-live merge can find every
-    ///                site by one search.
-    ///   IN THE LOG   a dispatch that actually uses the ref emits a `::warning::`
-    ///                naming it. A dispatch from main emits none, so the warning
-    ///                means what it says.
-    ///
-    /// When the ref is removed at go-live, this test is removed with it and
-    /// `onlyTheAllowlistedRefsMayDispatch` moves the branch into its refusal
-    /// list.
+    ///   IN THE FILE  the dated `PERMANENT BY DESIGN (2026-08-13)` marker and
+    ///                the branch name stay greppable, so a future reader who
+    ///                greps for the old removal marker finds this instead of a
+    ///                silent, unexplained extra ref.
+    ///   IN THE LOG   NEITHER trusted ref is annotated. The guard used to
+    ///                `::warning::` on every track-base dispatch, which is now
+    ///                the operator's normal path (calibration and provisioning
+    ///                are dispatched from the base branch) -- a warning on the
+    ///                normal path trains readers to ignore warnings. main and
+    ///                the track base are both admitted silently; a refusal is
+    ///                still loud, and `onlyTheAllowlistedRefsMayDispatch` proves
+    ///                every other ref is refused.
     @Test
-    func theTemporaryMigrationRefIsFlaggedForRemoval() throws {
+    func theTrackBaseRefIsPermanentByDesign() throws {
         for (guardScript, workflow) in Self.guards {
             let text = try S.text(guardScript)
             #expect(
-                text.contains(Self.temporaryMarker),
+                text.contains(Self.permanentMarker),
                 """
                 \(guardScript) allowlists an extra ref with no dated \
-                '\(Self.temporaryMarker)' marker. The marker is how the go-live \
-                merge finds it.
+                '\(Self.permanentMarker)' marker. The marker is what tells the \
+                next reader the entry is deliberate and permanent rather than a \
+                migration leftover.
                 """
             )
             #expect(
-                text.contains(Self.migrationRef),
-                "\(guardScript) no longer names \(Self.migrationRef)"
+                text.contains(Self.trackBaseRef),
+                "\(guardScript) no longer names \(Self.trackBaseRef)"
             )
             #expect(
-                text.contains("REMOVE this ref at"),
-                "\(guardScript) lost the removal instruction next to the marker"
+                text.contains("KEEP this ref"),
+                "\(guardScript) lost the keep instruction next to the marker"
             )
-
-            let temporary = try Self.runGuard(
-                guardScript,
-                ref: Self.migrationRef,
-                event: "workflow_dispatch",
-                workflow: workflow
-            )
-            #expect(temporary.status == 0)
             #expect(
-                temporary.output.contains("::warning::")
-                    && temporary.output.contains(Self.migrationRef),
+                !text.contains("TEMPORARY (2026-08-13)"),
                 """
-                a dispatch from \(Self.migrationRef) produced no warning naming \
-                the temporary ref. Output was: \(temporary.output)
+                \(guardScript) still carries the retired TEMPORARY (2026-08-13) \
+                removal marker. The track is branch-targeted permanently; a \
+                stale removal instruction invites deleting a load-bearing ref.
                 """
             )
 
-            let main = try Self.runGuard(
-                guardScript,
-                ref: "refs/heads/main",
-                event: "workflow_dispatch",
-                workflow: workflow
-            )
-            #expect(
-                !main.output.contains("::warning::"),
-                """
-                a dispatch from main warned about the temporary ref, which \
-                makes the warning meaningless: \(main.output)
-                """
-            )
+            // Both trusted refs are admitted, and both are admitted QUIETLY.
+            for ref in [Self.trackBaseRef, "refs/heads/main"] {
+                let run = try Self.runGuard(
+                    guardScript, ref: ref, event: "workflow_dispatch", workflow: workflow
+                )
+                #expect(run.status == 0, "\(guardScript) refused \(ref): \(run.output)")
+                #expect(
+                    !run.output.contains("::warning::")
+                        && !run.output.contains("::error::"),
+                    """
+                    \(guardScript) annotated an ordinary dispatch from \(ref). \
+                    Both trusted refs are normal operations and must be silent, \
+                    or the annotation stops meaning anything. Output was: \
+                    \(run.output)
+                    """
+                )
+            }
         }
     }
 

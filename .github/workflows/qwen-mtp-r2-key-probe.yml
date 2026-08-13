@@ -15,8 +15,8 @@
 # THE DISPATCHED REF with the real R2 credentials, so whoever chooses the ref
 # chooses the code that touches a hidden golden; "it only prints a byte count" is
 # a property of the trusted copy of that script, not of the workflow. The
-# allowlist is refs/heads/main plus -- for the pre-merge migration window only --
-# refs/heads/qwen36-mtp-track. See
+# allowlist is refs/heads/qwen36-mtp-track -- this track's permanent base branch
+# and the ref operators actually probe from -- plus refs/heads/main. See
 # .github/scripts/enforce-trusted-qwen-mtp-r2-probe-workflow.sh.
 #
 # The control key is probed FIRST: a known-good key that proves the credentials
@@ -119,9 +119,10 @@ jobs:
       # This must stay the first step after checkout: everything below it either
       # uses the credentials or runs a script from the dispatched ref.
       #
-      # The guard additionally allowlists refs/heads/qwen36-mtp-track for the
-      # pre-merge migration window ONLY -- see the TEMPORARY (2026-08-13) banner
-      # in the script, which must be removed at the go-live merge.
+      # The guard additionally allowlists refs/heads/qwen36-mtp-track, this
+      # track's permanent base branch -- see the PERMANENT BY DESIGN
+      # (2026-08-13) banner in the script. It is not a migration ref and is not
+      # scheduled for removal.
       - name: Enforce trusted workflow context
         run: .github/scripts/enforce-trusted-qwen-mtp-r2-probe-workflow.sh
 

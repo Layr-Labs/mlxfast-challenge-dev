@@ -17,7 +17,9 @@
 #
 # WHY THE BRANCH SET IS NARROW, and not the ranked allowlist. The ranked job
 # admits submissions/*, baseline/* and yukon/baseline/* because a submission has
-# to be able to run against trusted main's harness; those namespaces carry
+# to be able to run against the trusted harness on this track's base branch
+# (qwen36-mtp-track -- this track is branch-targeted, so its base is not main);
+# those namespaces carry
 # participant-authored content by design. This job has no such need -- it
 # resolves object keys and prints a status, a byte count and a sha256 -- and it
 # reads raw hidden material while doing it. Copying the ranked allowlist here
@@ -43,22 +45,28 @@ readonly WORKFLOW_PATH=".github/workflows/qwen-mtp-r2-key-probe.yml"
 
 ##############################################################################
 ##                                                                          ##
-##   TEMPORARY REF ALLOWLIST ENTRY -- READ THIS BEFORE GO-LIVE              ##
+##   TRACK-BASE REF ALLOWLIST ENTRY -- PERMANENT BY DESIGN                  ##
 ##                                                                          ##
 ##   This guard allows refs/heads/qwen36-mtp-track IN ADDITION to           ##
 ##   refs/heads/main. The DFlash twin is main-only; this extra ref is the   ##
-##   one deliberate difference and it is scheduled for REMOVAL.             ##
+##   one deliberate difference, and it is NOT scheduled for removal.        ##
+##   The Qwen-MTP track is branch-targeted permanently (operator design     ##
+##   decision 2026-08-13): qwen36-mtp-track is the track's base branch,     ##
+##   main is the DFlash track's, and no merge between them is planned.      ##
+##   Operators dispatch this probe from the track base, so that ref is the  ##
+##   NORMAL one here and main is the vestigial one.                         ##
 ##                                                                          ##
-##   Grep this file for "TEMPORARY (2026-08-13)": three marked sites -- the ##
-##   constant below, the refusal message, and the runtime ::warning:: this  ##
-##   guard prints on every dispatch that actually uses the extra ref.       ##
+##   Grep this file for "PERMANENT BY DESIGN (2026-08-13)": two marked      ##
+##   sites -- the constant below and the refusal message. A dispatch from   ##
+##   the track base emits no annotation, exactly as a dispatch from main    ##
+##   emits none: both are ordinary trusted operations.                      ##
 ##                                                                          ##
 ##############################################################################
 
-# TEMPORARY (2026-08-13): pre-merge migration window -- qwen36-mtp-track is
-# signature-protected (verified-committer branch rule); REMOVE this ref at
-# go-live merge
-readonly MIGRATION_REF="refs/heads/qwen36-mtp-track"
+# PERMANENT BY DESIGN (2026-08-13): qwen36-mtp-track is this track's base branch
+# and is signature-protected (verified-committer branch rule), the same property
+# that makes main trustworthy here. KEEP this ref; it has no removal date.
+readonly TRACK_BASE_REF="refs/heads/qwen36-mtp-track"
 
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 : "${GITHUB_REF:?GITHUB_REF is required}"
@@ -75,20 +83,12 @@ if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
   exit 1
 fi
 
-if [[ "${GITHUB_REF}" != "refs/heads/main" && "${GITHUB_REF}" != "${MIGRATION_REF}" ]]; then
+if [[ "${GITHUB_REF}" != "refs/heads/main" && "${GITHUB_REF}" != "${TRACK_BASE_REF}" ]]; then
   echo "::error::Qwen-MTP R2 key probe ref is not allowed: ${GITHUB_REF}" >&2
-  echo "::error::this job holds R2 credentials and downloads hidden competition material with scripts taken from the dispatched ref; only refs/heads/main and ${MIGRATION_REF} may dispatch it" >&2
-  # TEMPORARY (2026-08-13): pre-merge migration window -- qwen36-mtp-track is
-  # signature-protected (verified-committer branch rule); REMOVE this ref at
-  # go-live merge
+  # PERMANENT BY DESIGN (2026-08-13): ${TRACK_BASE_REF} is this track's base
+  # branch, not a migration ref. KEEP it in this allowlist.
+  echo "::error::this job holds R2 credentials and downloads hidden competition material with scripts taken from the dispatched ref; only refs/heads/main and ${TRACK_BASE_REF} (this track's base branch) may dispatch it" >&2
   exit 1
-fi
-
-if [[ "${GITHUB_REF}" == "${MIGRATION_REF}" ]]; then
-  # TEMPORARY (2026-08-13): pre-merge migration window -- qwen36-mtp-track is
-  # signature-protected (verified-committer branch rule); REMOVE this ref at
-  # go-live merge
-  echo "::warning::TEMPORARY REF IN USE: this dispatch came from ${MIGRATION_REF}, not refs/heads/main. The extra ref exists only for the pre-merge migration window and must be removed from this guard at the go-live merge."
 fi
 
 expected_workflow_ref="${TRUSTED_REPOSITORY}/${WORKFLOW_PATH}@${GITHUB_REF}"

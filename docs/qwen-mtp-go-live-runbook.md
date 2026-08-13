@@ -16,12 +16,26 @@ anti-cheat is sound enough to rank on.
 > `tokenFidelityGateStatus: "implemented"`,
 > `MLXFAST_QWEN_MTP_CALIBRATION_READY: "1"`, normalised decode floor `0.95`.
 >
-> **The merge to `main` is DEFERRED.** Everything landed on the
-> `qwen36-mtp-track` ref, so the ranked workflow's TEMPORARY `qwen36-mtp-track`
-> allowlist arm (grep `TEMPORARY (2026-08-13)`) is still load-bearing and must
-> be removed at the merge, together with the matching entries in the two
-> `enforce-trusted-qwen-mtp-*` guard scripts. Pre-go-live "pending / false /
-> inert" phrasing elsewhere in the tree is HISTORY.
+> **THIS TRACK IS BRANCH-TARGETED, PERMANENTLY** (operator design decision
+> 2026-08-13). `qwen36-mtp-track` is the track's **base branch**, not a
+> migration vehicle: there is no planned merge into `main`, `main` stays the
+> DFlash track's base with `benchmark.json` as its manifest, and public
+> submissions for this track build against **this branch's** harness. The
+> ranked workflow's `qwen36-mtp-track` allowlist arm and the matching entries in
+> the two `enforce-trusted-qwen-mtp-*` guard scripts are therefore **permanent**
+> (grep `PERMANENT BY DESIGN (2026-08-13)`); do not remove them. Pre-go-live
+> "pending / false / inert" phrasing elsewhere in the tree is HISTORY, and so is
+> any "at the go-live merge" instruction.
+>
+> **What that means operationally.** A `submissions/*` dispatch checks its
+> trusted harness out of `qwen36-mtp-track` (not `main`), so Yukon must import
+> this benchmark with `sourceBranch = qwen36-mtp-track` and base every
+> submission branch on that ref — a submission branched from `main` is refused
+> by the merge-base check in "Verify submitted commit and modifiable surface".
+> `main` keeps fail-closed copies of the three `qwen-mtp-*.yml` workflows as
+> **registration stubs** (a `workflow_dispatch` workflow is only dispatchable if
+> it exists on the default branch); they are frozen at the inert pre-go-live
+> draft and must be neither updated to match this branch nor deleted.
 
 ## 0. What is already done and verified (do not redo)
 

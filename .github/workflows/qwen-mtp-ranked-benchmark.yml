@@ -2,10 +2,16 @@ name: qwen-mtp-ranked-benchmark
 
 # QWEN 3.6 NATIVE-MTP SPECULATIVE-DECODE TRACK (track id qwen3.6-27b-mtp-v1).
 #
-# STATUS: LIVE / RANKED on the qwen36-mtp-track ref since 2026-08-13. The merge
-# to main is DEFERRED, so the TEMPORARY qwen36-mtp-track arm of the ref
-# allowlist below is still load-bearing and must be removed at that merge.
-# The track is armed: MLXFAST_QWEN_MTP_CALIBRATION_READY is "1", the contract
+# STATUS: LIVE / RANKED on the qwen36-mtp-track ref since 2026-08-13.
+#
+# THIS TRACK IS BRANCH-TARGETED, PERMANENTLY (operator design decision
+# 2026-08-13). `qwen36-mtp-track` is the track's BASE BRANCH, not a migration
+# vehicle staged for a merge into main: main stays the DFlash track's base and
+# its manifest stays benchmark.json. There is no scheduled go-live merge, so
+# the qwen36-mtp-track arm of the ref allowlist below is PERMANENT BY DESIGN,
+# and a submission dispatched on submissions/* checks its trusted harness out
+# of THIS branch (see the checkout step). The track is armed:
+# MLXFAST_QWEN_MTP_CALIBRATION_READY is "1", the contract
 # fixture carries official_scoring_enabled=true and
 # reference_baseline.publication_allowed=true, and every hidden-artifact pin
 # resolves to a real uploaded R2 object. The QWEN-MTP-PENDING-ORGANIZER marker
@@ -24,13 +30,26 @@ name: qwen-mtp-ranked-benchmark
 # silently reintroduce a retired string. The suffix rule is the whole trick:
 # prefixing a retired name with "qwen-" does NOT make it new.
 #
-# RELATIONSHIP TO THE LIVE TRACK. The ranked track on main is
+# RELATIONSHIP TO THE DFLASH TRACK. The ranked track based on main is
 # laguna-xs-2.1-dflash-v1 (.github/workflows/dflash-benchmark.yml,
 # benchmark.json). This workflow is modeled structurally on that one -- same
 # step order, same trusted-shell sealing, same single-occupancy hidden-golden
-# bracket, same TOCTOU harness pins -- and it CHANGES NOTHING about it. Both may
-# coexist on this branch; only one may ever be the ranked entrypoint, and the
-# switch is a repo-split action, not a change here.
+# bracket, same TOCTOU harness pins -- and it CHANGES NOTHING about it. The two
+# tracks are ranked SIMULTANEOUSLY off DIFFERENT base branches: DFlash off main,
+# Qwen-MTP off qwen36-mtp-track. Neither has to displace the other, and no
+# repo-split or merge is pending on either side.
+#
+# THE COPIES ON MAIN ARE REGISTRATION STUBS, AND THEY STAY. main carries its own
+# copies of the three qwen-mtp-*.yml workflows (this one,
+# qwen-mtp-provision-goldens.yml, qwen-mtp-r2-key-probe.yml), frozen at the
+# pre-go-live inert draft: CALIBRATION_READY "0", a contract fixture that does
+# not exist on main, QWEN-MTP-PENDING-ORGANIZER pins. They exist ONLY so GitHub
+# registers the workflow names on the repository default branch, which is what
+# makes `gh workflow run <name> --ref qwen36-mtp-track` resolvable at all; every
+# one of them FAILS CLOSED if actually dispatched from main, which is the
+# intended behaviour. Do not "fix" them to match this file and do not delete
+# them: the live definition is the one on qwen36-mtp-track, and a dispatch
+# always executes the dispatched ref's own copy.
 #
 # METHOD. The speculative mechanism is the CHECKPOINT'S OWN multi-token-
 # prediction head (mlx-community/Qwen3.6-27B-MTP-4bit, ~247 MB), not a separately
@@ -76,8 +95,9 @@ name: qwen-mtp-ranked-benchmark
 #                                 state isolation, lib-only hook).
 #
 # Dispatch-only, same self-hosted safety rules as the DFlash pipeline: no
-# PR/push triggers, refs restricted to main, submissions/*, baseline/*, and
-# yukon/baseline/*.
+# PR/push triggers, refs restricted to qwen36-mtp-track (this track's base,
+# where operators dispatch calibration from), main, submissions/*, baseline/*,
+# and yukon/baseline/*.
 on:
   workflow_dispatch:
     inputs:
@@ -409,10 +429,23 @@ jobs:
 
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          # Submission branches contribute editable paths only; trusted main is
-          # the harness/workflow/contract base. Main, baseline/*, and
-          # yukon/baseline/* run their exact SHA.
-          ref: ${{ startsWith(github.ref, 'refs/heads/submissions/') && 'main' || github.sha }}
+          # Submission branches contribute editable paths only; the TRUSTED
+          # HARNESS BASE FOR THIS TRACK IS refs/heads/qwen36-mtp-track, not
+          # main. This track is branch-targeted permanently (operator design
+          # decision 2026-08-13, see the header): main is the DFlash track's
+          # base and carries neither this track's benchmark manifest
+          # (benchmark.qwen-mtp.json), nor its contract fixture, nor its runners
+          # -- a submission checked out over main would fail closed at "Verify
+          # submitted commit and modifiable surface" with "cannot read
+          # benchmark.qwen-mtp.json from base commit", which is the fail-closed
+          # symptom this mapping fixes. The branch is trusted for the same
+          # reason main is: it is signature-protected under the
+          # verified-committer branch rule, so its tip is operator-authored.
+          # Everything downstream keys off this checkout -- the harness, the
+          # workflow's own scripts under .github/scripts/, the gates, the
+          # editable-surface allowlist, and the fixtures. qwen36-mtp-track,
+          # main, baseline/*, and yukon/baseline/* run their exact SHA.
+          ref: ${{ startsWith(github.ref, 'refs/heads/submissions/') && 'qwen36-mtp-track' || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -442,16 +475,20 @@ jobs:
           case "${GITHUB_REF}" in
             refs/heads/main|refs/heads/submissions/*|refs/heads/baseline/*|refs/heads/yukon/baseline/*)
               ;;
-            # TEMPORARY (2026-08-13): pre-merge migration window -- qwen36-mtp-track
-            # is signature-protected (verified-committer branch rule); REMOVE this
-            # arm at the go-live merge (grep 'TEMPORARY (2026-08-13)' -- the
-            # enforce-trusted-qwen-mtp-* guard scripts carry matching entries).
+            # PERMANENT BY DESIGN (2026-08-13): qwen36-mtp-track is THIS TRACK'S
+            # BASE BRANCH -- the ref operators dispatch calibration and
+            # verification runs from, and the ref submissions/* checks its
+            # trusted harness out of. It is not a migration arm and has no
+            # removal date. It is trusted on the same footing as main: both are
+            # signature-protected under the verified-committer branch rule. A
+            # dispatch from it is a NORMAL operation and is admitted silently,
+            # exactly like main. (grep 'PERMANENT BY DESIGN (2026-08-13)' -- the
+            # enforce-trusted-qwen-mtp-* guard scripts carry matching entries.)
             refs/heads/qwen36-mtp-track)
-              echo "::warning::TEMPORARY REF IN USE: refs/heads/qwen36-mtp-track must be removed from this allowlist at the go-live merge." >&2
               ;;
             *)
               echo "::error::private benchmark workflow ref is not allowed: ${GITHUB_REF}" >&2
-              echo "::error::allowed branches are main, submissions/*, baseline/*, and yukon/baseline/*, and (TEMPORARY, until go-live) qwen36-mtp-track" >&2
+              echo "::error::allowed branches are qwen36-mtp-track (this track's base), main, submissions/*, baseline/*, and yukon/baseline/*" >&2
               exit 1
               ;;
           esac
@@ -649,9 +686,13 @@ jobs:
             echo "::error::candidate SHA must be an exact 40-character lowercase commit SHA" >&2
             exit 1
           fi
-          trusted_main_sha="$(git rev-parse HEAD)"
+          # The tip of the TRUSTED BASE this run's harness was checked out at.
+          # On a submissions/* dispatch that is refs/heads/qwen36-mtp-track (see
+          # the checkout step), NOT main -- this track is branch-targeted. On
+          # every other allowlisted ref it is that ref's own dispatched SHA.
+          trusted_base_sha="$(git rev-parse HEAD)"
           printf '%s\n' "${CANDIDATE_SHA}" > candidate.sha
-          printf 'trusted_main_sha=%s\n' "${trusted_main_sha}" >> "${GITHUB_OUTPUT}"
+          printf 'trusted_base_sha=%s\n' "${trusted_base_sha}" >> "${GITHUB_OUTPUT}"
 
       # Contract layer L6, second half (the timed pool is the first half).
       # Sampling a timed target per run makes a tuned threshold a 1/N gamble;
@@ -694,7 +735,7 @@ jobs:
         if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
         env:
           SUBMISSION_REF: ${{ github.sha }}
-          TRUSTED_MAIN_SHA: ${{ steps.candidate_context.outputs.trusted_main_sha }}
+          TRUSTED_BASE_SHA: ${{ steps.candidate_context.outputs.trusted_base_sha }}
         run: |
           set -euo pipefail
           hardened_git="${GITHUB_WORKSPACE}/.github/scripts/hardened-git.sh"
@@ -703,13 +744,13 @@ jobs:
             echo "::error::submitted checkout resolved to ${actual_sha}, expected ${SUBMISSION_REF}" >&2
             exit 1
           fi
-          if ! "${hardened_git}" -C .mlxfast-submission-src cat-file -e "${TRUSTED_MAIN_SHA}^{commit}"; then
-            echo "::error::submitted checkout cannot resolve trusted main commit ${TRUSTED_MAIN_SHA}" >&2
+          if ! "${hardened_git}" -C .mlxfast-submission-src cat-file -e "${TRUSTED_BASE_SHA}^{commit}"; then
+            echo "::error::submitted checkout cannot resolve the trusted qwen36-mtp-track base commit ${TRUSTED_BASE_SHA}" >&2
             exit 1
           fi
-          base_sha="$("${hardened_git}" -C .mlxfast-submission-src merge-base "${TRUSTED_MAIN_SHA}" "${actual_sha}")"
-          if [[ "${base_sha}" != "${TRUSTED_MAIN_SHA}" ]]; then
-            echo "::error::submission must be based on current trusted main ${TRUSTED_MAIN_SHA}; merge-base is ${base_sha}" >&2
+          base_sha="$("${hardened_git}" -C .mlxfast-submission-src merge-base "${TRUSTED_BASE_SHA}" "${actual_sha}")"
+          if [[ "${base_sha}" != "${TRUSTED_BASE_SHA}" ]]; then
+            echo "::error::submission must be based on the current trusted qwen36-mtp-track tip ${TRUSTED_BASE_SHA} (this track is branch-targeted; submissions are NOT based on main); merge-base is ${base_sha}" >&2
             exit 1
           fi
           # CONTRACT_PATH is load-bearing, not cosmetic: without it the script
@@ -718,6 +759,16 @@ jobs:
           # surface -- while the overlay below, reading the same default, silently
           # does not overlay them. Both invocations must name this track's
           # manifest.
+          #
+          # WHERE THE ALLOWLIST COMES FROM. enforce-modifiable-surface.sh reads
+          # editablePaths with `git show ${BASE_SHA}:${CONTRACT_PATH}` -- from
+          # the BASE COMMIT's git object, never from the submission work tree --
+          # and BASE_SHA is pinned equal to TRUSTED_BASE_SHA two lines up. So the
+          # surface in force is benchmark.qwen-mtp.json AS OF THE
+          # qwen36-mtp-track TIP, and a submission cannot widen its own surface
+          # by editing the manifest. This is exactly why the checkout above had
+          # to move off main: main carries no benchmark.qwen-mtp.json, so this
+          # gate failed closed there and no Qwen-MTP submission could run at all.
           (
             cd .mlxfast-submission-src
             BASE_SHA="${base_sha}" HEAD_SHA="${actual_sha}" \
