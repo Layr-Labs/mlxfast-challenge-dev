@@ -240,26 +240,38 @@ struct QwenMTPBackboneLayoutTests {
         }
     }
 
-    /// The staged head tree must not carry `.gitattributes`.
+    /// The staged head tree DOES carry `.gitattributes`, and the manifest pins it.
     ///
-    /// The ranked workflow's `verify_cache` does a strict FLAT INVENTORY check —
-    /// any file in the cache the manifest does not name is an error — and the
-    /// manifest excludes `.gitattributes` exactly as the backbone manifest does.
-    /// A stock `snapshot_download` brings it along, so staging has to drop it.
-    /// Box 3 hit precisely this.
+    /// The ranked workflow's `verify_cache` does a strict FLAT INVENTORY check in
+    /// both directions — a record with no file is an error, a file with no record
+    /// is an error — so the manifest's record set and the staged tree must agree
+    /// file-for-file. A stock `snapshot_download` brings `.gitattributes` along
+    /// because it is a genuine file of the pinned revision, so the manifest pins
+    /// it rather than staging deleting it. Box 3 hit precisely this, from the
+    /// other side: the earlier "drop it" posture is what failed the run.
     @Test
-    func theHeadStagingExclusionIsDocumentedWhereItIsActionable() throws {
+    func theHeadStagingInclusionIsDocumentedWhereItIsActionable() throws {
         let attachment = try DFlashGateTextSupport.text(
             "Sources/MLXFastModel/Qwen36MTPHeadAttachment.swift")
         #expect(
             attachment.contains(".gitattributes"),
             """
-            the head-attachment docs no longer mention the .gitattributes \
-            staging exclusion. A stock HF snapshot carries that file, the \
-            manifest deliberately does not pin it, and the workflow's flat \
-            inventory check then rejects the whole head cache.
+            the head-attachment docs no longer mention .gitattributes staging. \
+            A stock HF snapshot carries that file, the manifest pins it, and \
+            the workflow's flat inventory check rejects the whole head cache if \
+            the staged tree and the record set disagree either way.
             """
         )
+        #expect(
+            attachment.contains("STAGING MUST INCLUDE `.gitattributes`"),
+            """
+            the head-attachment docs must state the CURRENT staging posture. \
+            The retired posture told operators to `rm -f` the file, which is \
+            exactly what broke run 31665285024.
+            """
+        )
+        // The retired instruction must not survive anywhere in the doc block.
+        #expect(!attachment.contains("rm -f <head>/.gitattributes"))
     }
 }
 

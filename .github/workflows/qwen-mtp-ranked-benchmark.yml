@@ -163,8 +163,8 @@ jobs:
       # Whole-manifest shape pins, recomputed from the checked-in manifest on
       # this branch. They make a truncated or extended manifest a first-minute
       # failure instead of a silently smaller cache verification.
-      MLXFAST_QWEN_MTP_TARGET_MANIFEST_RECORDS: "15"
-      MLXFAST_QWEN_MTP_TARGET_MANIFEST_BYTES: "16081488494"
+      MLXFAST_QWEN_MTP_TARGET_MANIFEST_RECORDS: "16"
+      MLXFAST_QWEN_MTP_TARGET_MANIFEST_BYTES: "16081490064"
       # LANDED (phase 2): the MTP head's byte manifest is checked in. It was
       # built exactly like the target manifest -- LFS oids for the two LFS blobs
       # (model.safetensors, tokenizer.json), direct content hashing for the rest.
@@ -172,11 +172,14 @@ jobs:
       # Whole-manifest shape pins for the head, recomputed from the checked-in
       # file, for exactly the reason the target's exist: per-file hashing cannot
       # see a manifest that LOST records -- it would verify fewer files and
-      # report success. 7 records, not 8: the head repo carries 8 files at the
-      # pinned revision and `.gitattributes` is excluded, the same exclusion the
-      # backbone manifest makes (16 repo files, 15 records).
-      MLXFAST_QWEN_MTP_HEAD_MANIFEST_RECORDS: "7"
-      MLXFAST_QWEN_MTP_HEAD_MANIFEST_BYTES: "258489240"
+      # report success. 8 records: the head repo carries 8 files at the pinned
+      # revision and ALL of them are pinned, including `.gitattributes`. The
+      # earlier 7-record shape excluded it, which made `verify_cache`'s flat
+      # inventory check reject the staged head wholesale the moment the file was
+      # present on disk; the backbone manifest carries the same fix (16 repo
+      # files, 16 records). Pinning is the fix, not deleting from the cache.
+      MLXFAST_QWEN_MTP_HEAD_MANIFEST_RECORDS: "8"
+      MLXFAST_QWEN_MTP_HEAD_MANIFEST_BYTES: "258490810"
       # --- Decode / score contract ---------------------------------------
       # Depth 2. Provenance: the MTP session's measured envelope on M5 (exact
       # greedy vs serial, 12/12 runs to 512 tokens, all EOS branches) --

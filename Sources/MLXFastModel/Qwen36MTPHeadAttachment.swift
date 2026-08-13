@@ -200,17 +200,18 @@ public enum Qwen36MTPHeadAttachment {
     /// Repeating it here would be a second, weaker copy of a stronger gate; what
     /// this adds is the shape the LOADER depends on.
     ///
-    /// STAGING MUST EXCLUDE `.gitattributes`. The pinned head repo carries 8
-    /// files; the manifest pins 7, dropping `.gitattributes` exactly as the
-    /// backbone manifest drops it. `verify_cache` also runs a strict FLAT
-    /// INVENTORY check — any file present in the cache that the manifest does not
-    /// name is an error — so a stock `snapshot_download`, which brings
-    /// `.gitattributes` along, produces a head cache the ranked workflow rejects
-    /// wholesale. Box 3 hit exactly this. The installer and any manual staging
-    /// must drop it (`rm -f <head>/.gitattributes`, or download with an
-    /// allow-list); adding it to the manifest instead would diverge from the
-    /// backbone manifest's own convention and re-pin a git plumbing file as
-    /// model bytes.
+    /// STAGING MUST INCLUDE `.gitattributes`. The pinned head repo carries 8
+    /// files and the manifest pins all 8, `.gitattributes` among them, exactly as
+    /// the backbone manifest now pins all 16 of its revision's files.
+    /// `verify_cache` runs a strict FLAT INVENTORY check in BOTH directions — a
+    /// manifest record with no file on disk is an error, and a file on disk the
+    /// manifest does not name is an error — so the two sets have to agree
+    /// exactly. The earlier posture here was the opposite (pin 7, delete the
+    /// file from the cache), and it was wrong in the direction that fails
+    /// closed: `.gitattributes` is a genuine file of the pinned upstream
+    /// revision, a stock `snapshot_download` brings it along, and the inventory
+    /// half then rejected the whole head cache. Box 3 hit exactly this. Pinning
+    /// the file is the fix; staging must NOT drop it.
     public static func verifyHeadTree(_ headDirectory: URL) throws {
         let fileManager = FileManager.default
         var isDirectory: ObjCBool = false

@@ -684,7 +684,7 @@ struct QwenMTPHeadManifestTests {
     @Test
     func theHeadManifestIsWellFormed() throws {
         let records = try Self.records()
-        #expect(records.count == 7, "expected 7 records, got \(records.count)")
+        #expect(records.count == 8, "expected 8 records, got \(records.count)")
         for record in records {
             #expect(
                 record.sha256.count == 64
@@ -715,13 +715,15 @@ struct QwenMTPHeadManifestTests {
                 paths.contains(required),
                 "the head manifest does not pin \(required)")
         }
-        // `.gitattributes` is deliberately absent, exactly as it is absent from
-        // the backbone manifest (16 repo files, 15 records). The inventory half
-        // of `verify_cache` rejects any file in the cache that the manifest does
-        // not name, so pinning it here would only be correct if the staged tree
-        // carried it -- and the staged backbone tree demonstrably does not, or
-        // the target verification would already be failing.
-        #expect(!paths.contains(".gitattributes"))
+        // `.gitattributes` IS pinned, exactly as it is now pinned in the backbone
+        // manifest (16 repo files, 16 records). The inventory half of
+        // `verify_cache` rejects any file in the cache that the manifest does not
+        // name, and the file is a genuine member of the pinned upstream revision
+        // that a stock `snapshot_download` stages -- so omitting the record does
+        // not keep a git plumbing file out of the pins, it just fails the run
+        // (run 31665285024 died on the target side of exactly this). The record
+        // set and the staged tree must agree file-for-file.
+        #expect(paths.contains(".gitattributes"))
     }
 
     /// The whole-manifest shape pins must equal what the file actually carries.

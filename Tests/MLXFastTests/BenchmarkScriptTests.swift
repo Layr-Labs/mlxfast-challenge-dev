@@ -134,10 +134,14 @@ func poolsideNVFP4DistributionIdentityIsPinned() throws {
     #expect(manifest.contains("# Revision: \(revision)"))
 
     // The mlx-community distribution ships three safetensors shards plus the
-    // processor/tokenizer metadata; it carries no .gitattributes or
+    // processor/tokenizer metadata and `.gitattributes`; it carries no
     // LICENSE.md, and adds the vision-side preprocessor configs the text-only
-    // transform never loads.
+    // transform never loads. Every file of the pinned revision is pinned: the
+    // ranked workflow's `verify_cache` rejects any cache file the manifest does
+    // not name, so an omitted record fails the run even though the bytes are
+    // genuine (run 31665285024 died on exactly this).
     let expectedPaths: Set<String> = [
+        ".gitattributes",
         "README.md",
         "chat_template.jinja",
         "config.json",
@@ -176,9 +180,9 @@ func poolsideNVFP4DistributionIdentityIsPinned() throws {
         }
     }
 
-    #expect(records.count == 15)
+    #expect(records.count == 16)
     #expect(paths == expectedPaths)
-    #expect(byteCount == 16_081_488_494)
+    #expect(byteCount == 16_081_490_064)
     #expect(
         shardHashes == [
             "model-00001-of-00003.safetensors":

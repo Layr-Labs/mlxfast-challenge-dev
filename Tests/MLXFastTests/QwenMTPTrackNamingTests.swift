@@ -570,8 +570,8 @@ struct QwenMTPTrackNamingTests {
         //    together, exactly as the DFlash goldens are mutation-tested.
         for (pin, expected) in [
             ("MLXFAST_EXPECTED_NUM_LAYERS", "64"),
-            ("MLXFAST_QWEN_MTP_TARGET_MANIFEST_RECORDS", "15"),
-            ("MLXFAST_QWEN_MTP_TARGET_MANIFEST_BYTES", "16081488494"),
+            ("MLXFAST_QWEN_MTP_TARGET_MANIFEST_RECORDS", "16"),
+            ("MLXFAST_QWEN_MTP_TARGET_MANIFEST_BYTES", "16081490064"),
             ("MLXFAST_METAL_TOOLCHAIN_IDENTIFIER", "com.apple.dt.toolchain.Metal.32023.883"),
             ("MLXFAST_QWEN_MTP_CHECKPOINT_REPO", "mlx-community/Qwen3.6-27B-4bit"),
             (
