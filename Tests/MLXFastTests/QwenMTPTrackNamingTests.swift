@@ -72,6 +72,21 @@ struct QwenMTPTrackNamingTests {
         ("r2-key-probe workflow filename", "qwen-mtp-r2-key-probe.yml"),
         ("r2-key-probe workflow path", ".github/workflows/qwen-mtp-r2-key-probe.yml"),
         ("r2-key-probe workflow name", "qwen-mtp-r2-key-probe"),
+        // The trusted-context guards the two credentialled workflows invoke BY
+        // PATH. A script path is as hard to rename as a workflow filename --
+        // the `run:` line names it literally and a rename that misses one end
+        // fails the job with exit 127 -- so both are enumerated here, and the
+        // probe guard's own verb placement matters for the same reason the
+        // probe workflow's does: the verb is spelled "r2-probe", never directly
+        // after "mtp-".
+        (
+            "provisioning trusted-context guard",
+            ".github/scripts/enforce-trusted-qwen-mtp-provision-workflow.sh"
+        ),
+        (
+            "r2-key-probe trusted-context guard",
+            ".github/scripts/enforce-trusted-qwen-mtp-r2-probe-workflow.sh"
+        ),
         ("local benchmark runner", "benchmark-qwen-mtp.sh"),
         ("local setup runner", "setup-qwen-mtp.sh"),
         ("track manifest filename", "benchmark.qwen-mtp.json"),
@@ -114,6 +129,7 @@ struct QwenMTPTrackNamingTests {
         ("trusted driver source", "QwenRuntimeMTPDriver.swift"),
         ("verb test suite source", "QwenMTPVerbTests.swift"),
         ("rollback test suite source", "QwenMTPRollbackContractTests.swift"),
+        ("trusted-context guard test suite source", "QwenMTPTrustedContextGuardTests.swift"),
         // --- payload fields ---------------------------------------------------
         // The evidence payload's own key names, enumerated for the same reason:
         // they are read by a box-owned wrapper and a workflow, so they are as
@@ -174,6 +190,12 @@ struct QwenMTPTrackNamingTests {
         ".github/workflows/qwen-mtp-ranked-benchmark.yml",
         ".github/workflows/qwen-mtp-provision-goldens.yml",
         ".github/workflows/qwen-mtp-r2-key-probe.yml",
+        // The two trusted-context guards. Scanned WHOLE like everything else
+        // here: their headers explain themselves at length by comparison with
+        // the DFlash twins, which is exactly the kind of prose that reaches for
+        // a dead name.
+        ".github/scripts/enforce-trusted-qwen-mtp-provision-workflow.sh",
+        ".github/scripts/enforce-trusted-qwen-mtp-r2-probe-workflow.sh",
         "benchmark-qwen-mtp.sh",
         "setup-qwen-mtp.sh",
         "benchmark.qwen-mtp.json",
@@ -193,6 +215,7 @@ struct QwenMTPTrackNamingTests {
         "Sources/MLXFastTrustedHarness/QwenRuntimeMTPDriver.swift",
         "Tests/MLXFastTests/QwenMTPVerbTests.swift",
         "Tests/MLXFastTests/QwenMTPRollbackContractTests.swift",
+        "Tests/MLXFastTests/QwenMTPTrustedContextGuardTests.swift",
     ]
 
     // MARK: - NEGATIVE: the guard still catches every retired name
@@ -323,6 +346,9 @@ struct QwenMTPTrackNamingTests {
     @Test
     func theEnumeratedNamesAreTheOnesTheFilesUse() throws {
         let workflow = try S.text(".github/workflows/qwen-mtp-ranked-benchmark.yml")
+        let provisionWorkflow = try S.text(
+            ".github/workflows/qwen-mtp-provision-goldens.yml")
+        let probeWorkflow = try S.text(".github/workflows/qwen-mtp-r2-key-probe.yml")
         let benchmarkRunner = try S.text("benchmark-qwen-mtp.sh")
         let setupRunner = try S.text("setup-qwen-mtp.sh")
         let manifest = try S.text("benchmark.qwen-mtp.json")
@@ -365,6 +391,20 @@ struct QwenMTPTrackNamingTests {
             ("uses_pinned_mtp_head", cli, "the trusted CLI"),
             ("row_ledger", cli, "the trusted CLI"),
             ("parity_all_ok", cli, "the trusted CLI"),
+            // The trusted-context guards: each credentialled workflow must name
+            // its own guard by path. A rename that misses the `run:` line fails
+            // the job with exit 127, which is how both of these shipped before
+            // the scripts existed at all.
+            (
+                ".github/scripts/enforce-trusted-qwen-mtp-provision-workflow.sh",
+                provisionWorkflow,
+                "the provisioning workflow"
+            ),
+            (
+                ".github/scripts/enforce-trusted-qwen-mtp-r2-probe-workflow.sh",
+                probeWorkflow,
+                "the r2-key-probe workflow"
+            ),
         ]
         for expectation in expectations {
             #expect(
