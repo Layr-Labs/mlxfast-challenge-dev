@@ -301,6 +301,21 @@ public final class Qwen36MTPBlockSession {
             )
         }
 
+        // OPERATOR K-TEST VARIANT, k = 1. The parent asks for `depth` drafts per
+        // round; a candidate may propose FEWER. The trusted driver bounds only
+        // `draftTokens.count <= depth` and derives every ledger quantity from
+        // the drafts actually proposed (`requireStructurallySound`), so a
+        // narrower round is a legal submission, not a contract break.
+        //
+        // This variant drafts ONE token per round at any requested width. It is
+        // the ONLY thing that changes: the verify block is still
+        // `[primary] + drafts`, acceptance is still the longest common prefix
+        // over the target's own argmaxes, and the snapshot / rollback /
+        // re-forward repair is untouched. The emitted stream is therefore the
+        // same greedy target chain at any k, which is what keeps every depth
+        // bit-exact.
+        let effectiveDepth = Swift.min(depth, 1)
+
         // 1. DRAFT. One fresh head cache per round, shared across the sub-steps;
         //    each sub-step chains the head's OWN post-`mtp.norm` hidden, never
         //    the trunk hidden again — re-feeding the trunk hidden would draft
@@ -309,7 +324,7 @@ public final class Qwen36MTPBlockSession {
         var drafts: [Int] = []
         var draftHidden = hidden
         var nextToken = primary
-        for _ in 0 ..< depth {
+        for _ in 0 ..< effectiveDepth {
             let (draftLogits, chained) = model.mtpForwardWithHidden(
                 hidden: draftHidden,
                 nextTokenIds: MLXArray([nextToken]).reshaped([1, 1]),
@@ -345,9 +360,9 @@ public final class Qwen36MTPBlockSession {
 
         var perRowTop2Tokens: [[Int]] = []
         var perRowTop2Logits: [[Double]] = []
-        perRowTop2Tokens.reserveCapacity(depth + 1)
-        perRowTop2Logits.reserveCapacity(depth + 1)
-        for index in 0 ..< depth {
+        perRowTop2Tokens.reserveCapacity(effectiveDepth + 1)
+        perRowTop2Logits.reserveCapacity(effectiveDepth + 1)
+        for index in 0 ..< effectiveDepth {
             let (ids, values) = Self.topTwo(of: verifyLogits[0, index])
             perRowTop2Tokens.append(ids)
             perRowTop2Logits.append(values)
@@ -407,7 +422,7 @@ public final class Qwen36MTPBlockSession {
 
         return Qwen36MTPRoundResult(
             tokens: committed,
-            declaredRows: depth + 1,
+            declaredRows: effectiveDepth + 1,
             draftTokens: drafts,
             acceptedDraftCount: acceptedCount,
             rejectedDraftCount: drafts.count - acceptedCount,
