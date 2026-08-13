@@ -218,7 +218,14 @@ jobs:
       # MUST be re-derived across the WHOLE timed pool once the pool exists: a
       # depth tuned to one prompt is the same trap as a floor tuned to one
       # prompt (DFlash re-derived K three times for exactly this reason).
-      MLXFAST_QWEN_MTP_DEPTH: "2"
+      # OPERATOR K-TEST BRANCH baseline/ktest-k3-5a50339: 3, NOT the ranked 2.
+      # This is the deep-slower arm of the k=0..3 test matrix and it is the only
+      # arm that cannot be expressed on the editable surface -- the trusted
+      # driver caps a candidate's drafts at the depth the parent requested
+      # (QwenRuntimeMTPDriver.requireStructurallySound, draftTokens.count <=
+      # depth), so depth 3 has to be ASKED for here. Do not merge this line
+      # anywhere: the ranked depth is 2.
+      MLXFAST_QWEN_MTP_DEPTH: "3"
       MLXFAST_QWEN_MTP_DECODE_TOKENS: "512"
       MLXFAST_QWEN_MTP_CORRECTNESS_TOKENS: "512"
       # RESOLVED (phase 5, box 3 at tip 6a3bee9). The floor is NORMALISED, so
