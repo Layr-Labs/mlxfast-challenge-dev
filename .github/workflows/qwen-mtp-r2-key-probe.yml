@@ -19,13 +19,18 @@
 # refs/heads/qwen36-mtp-track. See
 # .github/scripts/enforce-trusted-qwen-mtp-r2-probe-workflow.sh.
 #
-# The control key is probed FIRST. For the DFlash track this was a known-good
-# serial key that proved the credentials and the bucket in one shot; the
-# Qwen-MTP hidden correctness golden is NOT uploaded yet, so the control below is
-# a clearly-marked PLACEHOLDER (QWEN-MTP-PENDING-ORGANIZER) and WILL report
-# missing until the organizer provisions it and this control is replaced with the
-# real uploaded key. Until that replacement, a 'missing' control does NOT by
-# itself prove the credentials or the bucket are wrong.
+# The control key is probed FIRST: a known-good key that proves the credentials
+# and the bucket in one shot. It is no longer a QWEN-MTP-PENDING-ORGANIZER
+# placeholder -- the Qwen-MTP hidden correctness goldens ARE uploaded, and run
+# 31665216255 (2026-08-13T03:52Z) probed 11 of 11 supplied keys FOUND at ref
+# 43fec75, including the then-current control (eef3b817, 21036b).
+#
+# The control below was advanced to the faf1a679 key when c070938 re-pinned the
+# raw correctness golden. No PROBE has run against it since, but the object is
+# known present: gates-only dispatch 31692337492 (2026-08-13T10:49Z) downloaded
+# and digest-verified it (36183 bytes). So a 'missing' control here means the
+# credentials or the bucket are wrong, and every candidate result below it is
+# meaningless.
 name: qwen-mtp-r2-key-probe
 
 on:
@@ -240,7 +245,7 @@ jobs:
             rm -f "${out}"
           }
 
-          echo "=== control: the Qwen-MTP correctness golden key (PLACEHOLDER, PENDING ORGANIZER) ==="
+          echo "=== control: the Qwen-MTP correctness golden key (real key; unprobed since the faf1a679 re-pin) ==="
           probe "${control}" control
 
           echo
@@ -298,14 +303,13 @@ jobs:
           fi
 
           echo
-          echo "Read the control line first. NOTE: the control is currently a"
-          echo "PENDING placeholder key that does not exist in R2 yet, so it will"
-          echo "report 'missing' until the organizer provisions the Qwen-MTP"
-          echo "correctness golden and this workflow's control is updated to the"
-          echo "real key; until then a missing control does NOT by itself prove"
-          echo "the credentials or the bucket are wrong. Once the real control is"
-          echo "in place, a 'missing' control means the credentials or the bucket"
-          echo "are wrong and every candidate result below it is meaningless."
+          echo "Read the control line first. The control is a real uploaded key,"
+          echo "no longer a PENDING placeholder: the Qwen-MTP hidden artifacts are"
+          echo "provisioned (probe run 31665216255 found 11 of 11 supplied keys,"
+          echo "and gates dispatch 31692337492 downloaded and digest-verified the"
+          echo "two later re-pinned objects). So a 'missing' control means the"
+          echo "credentials or the bucket are wrong, and every candidate result"
+          echo "below it is meaningless."
 
       # Backstop for the Probe step's own trap. This runs when that step fails
       # and when GitHub cancels the job -- neither of which reliably runs a trap

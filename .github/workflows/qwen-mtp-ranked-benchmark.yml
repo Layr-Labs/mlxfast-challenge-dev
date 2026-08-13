@@ -233,10 +233,12 @@ jobs:
       # all_tokens_matched=true, parity_all_ok=true and a CLOSED row ledger
       # (767/767 reference-checked).
       #
-      # NOTE the object itself is NOT yet uploaded to R2; the key below embeds
-      # this digest and the download step will fail until the operator uploads
-      # it. That is the intended fail-closed ordering -- digest first, upload
-      # second -- and it is why official_scoring_enabled stays false.
+      # This object IS uploaded. Confirmed by qwen-mtp-r2-key-probe run
+      # 31665216255 (2026-08-13T03:52Z): FOUND, 110168 bytes, served sha256
+      # 0c1dcdab..., matching the key that embeds it and the pins below.
+      # The digest-first / upload-second ordering the pin was authored under is
+      # complete for this artifact, and the track went live on 4d8bb04
+      # (official_scoring_enabled=true, CALIBRATION_READY="1").
       MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_SHA256: 0c1dcdabd85e7655f5df03e5a1265a5fde1a43ef223283021463f7af80481add
       MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_BYTES: "110168"
       # faf1a679 supersedes eef3b817: same base case, free-run gate and
@@ -248,6 +250,13 @@ jobs:
       # case by attach-benchmark-oracle (the change is additive: only
       # `.benchmark` is added), matching the DFlash golden 94239d59. The
       # eef3b817 object stays in R2 as a content-addressed sibling.
+      #
+      # UPLOAD STATE: uploaded and verified end to end. Gates-only dispatch
+      # 31692337492 (2026-08-13T10:49Z, ref 7b68828) downloaded this object from
+      # R2 and logged "raw hidden golden verified faf1a679... bytes=36183".
+      # Note the r2-key-probe (run 31665216255) predates the re-pin and probed
+      # only the superseded eef3b817 sibling, so the probe is NOT the evidence
+      # for this pin -- the gates dispatch is.
       MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: faf1a679e993a3ea2ffb263213c66a526ba9cea591954898f8851bae42c9d5c5
       MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "36183"
       # c8bce79c supersedes d05e93e9: identical prompts, answer_keys, domains
@@ -266,6 +275,11 @@ jobs:
       # reference, not question-answering accuracy, and cannot reject a
       # constant-"A" answerer. Shuffling option order is organizer material and
       # is deliberately not done here.
+      #
+      # UPLOAD STATE: uploaded and verified end to end by the same gates-only
+      # dispatch 31692337492 -- "GPQA reference verified c8bce79c... bytes=11125".
+      # As above, the r2-key-probe predates this re-pin and probed only the
+      # superseded d05e93e9 sibling (9886b).
       MLXFAST_GPQA_REFERENCE_SHA256: c8bce79c0258f2b67882cb3a609937066a27eb7d8f6170e0fd6db8cbac8ce0d7
       MLXFAST_GPQA_REFERENCE_BYTES: "11125"
       # --- Reused serial gate contract ------------------------------------
@@ -1119,15 +1133,13 @@ jobs:
           .github/scripts/pin-trusted-harness.sh write \
             "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
 
-      # QWEN-MTP-PENDING-PHASE3. The two MTP subcommands this workflow drives do
-      # not exist on the CLI yet (Sources/MLXFastCLI declares transform,
-      # verify-transform, correctness, correctness-trace, preflight, benchmark,
-      # attach-gpqa-gates, attach-free-run-gate, generate-golden,
-      # analyze-ngram-similarity, generate-gpqa-answers, checkpoint-shards, and
-      # the three dflash-* verbs). Asserting their presence HERE turns a
-      # ~25-minute-late "unknown subcommand" abort into a second-30 diagnostic
-      # that names the missing work, and keeps the failure attributable to the
-      # harness rather than to a submission.
+      # The two MTP subcommands this workflow drives -- mtp-verify and mtp-timed --
+      # ARE declared on the trusted CLI (Sources/MLXFastCLI/main.swift). This step
+      # is the standing tripwire that keeps them that way: asserting their presence
+      # HERE turns a ~25-minute-late "unknown subcommand" abort into a second-30
+      # diagnostic that names the missing verb, and keeps the failure attributable
+      # to the harness rather than to a submission. A failure now means a
+      # regression or a bad checkout, not unfinished phase-3 work.
       #
       # VERB NAMES ARE DELIBERATE: mtp-verify / mtp-timed. The natural spellings
       # -- appending "probe", "benchmark" or "reference" directly after "mtp-" --
@@ -1144,7 +1156,7 @@ jobs:
             fi
           done
           if ((${#missing[@]})); then
-            echo "::error::QWEN-MTP-PENDING-PHASE3: the trusted CLI does not declare ${missing[*]}. The native-MTP verify and timed subcommands are phase-3 work (harness conversion, QWEN36-MTP-CHALLENGE-PLAN.md); this workflow drives them and cannot run until they land." >&2
+            echo "::error::QWEN-MTP-PENDING-PHASE3: the trusted CLI does not declare ${missing[*]}. These verbs landed with the native-MTP harness conversion and this workflow drives them, so their absence is a regression or a bad checkout -- not pending work. Check Sources/MLXFastCLI/main.swift on the checked-out ref." >&2
             exit 1
           fi
           echo "qwen-mtp-ranked-benchmark: CLI declares mtp-verify and mtp-timed"

@@ -79,10 +79,19 @@ the realized gain toward 1.0x. Treat the per-order and optimistic rates as
 diagnostics and reject a target with a conspicuous repeated run even if the
 aggregate narrowly passes.
 
-For comparison, the checked-in longcopy fixture currently scores 37 hits in
-129 positions (`0.2868`) under the same aggregate metric. The new threshold is
-therefore almost an order of magnitude lower than the repetitive workload it
+For comparison, the checked-in longcopy fixture currently scores 59 hits in
+129 positions (`0.45736`) under the same aggregate metric. The new threshold is
+therefore more than an order of magnitude lower than the repetitive workload it
 replaces.
+
+This figure is **tokenizer-dependent** — it is a property of how the fixture's
+text tokenizes, not of the text alone, so it moves when the target tokenizer
+changes. `0.45736` is the value measured on this branch under the Qwen 3.6
+tokenizer (`analyze-ngram-similarity --orders 1,2,3` over
+`correctness_prompts/public_longcopy_gate_english_512_{256,1024}.json`, which
+agree). The previously documented `37/129` (`0.2868`) was the serial-era
+tokenizer's value for the same fixture; re-measure rather than carrying either
+number forward to a new target.
 
 ## Correctness separation
 

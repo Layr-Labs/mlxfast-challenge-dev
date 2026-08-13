@@ -373,9 +373,9 @@ jobs:
             # array -- no eval, and nothing between the assertion and the exec
             # that could reintroduce a flag the assertion just cleared.
             #
-            # QWEN-MTP-PENDING-PHASE3: mtp-verify is the phase-3 native-MTP
-            # reference verb (harness conversion, not yet landed); this job fails
-            # closed until it exists.
+            # mtp-verify is the native-MTP reference verb from the harness
+            # conversion. It IS declared on the trusted CLI; this job still fails
+            # closed if it ever stops being.
             local -a cmd=(
               .build/release/mlxfast-swift mtp-verify
               --weights weights
@@ -396,9 +396,9 @@ jobs:
             done
 
             echo "qwen-mtp-provision-goldens: generating ${side} golden (${tokens} tokens) from the pinned baseline"
-            # QWEN-MTP-PENDING-PHASE3: mtp-verify is the phase-3 native-MTP
-            # reference verb (harness conversion, not yet landed); this job fails
-            # closed until it exists.
+            # mtp-verify is the native-MTP reference verb from the harness
+            # conversion. It IS declared on the trusted CLI; this job still fails
+            # closed if it ever stops being.
             sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
               /usr/bin/env \
                 MJOB_WS="${MLXFAST_JOB_WS}" \
