@@ -578,11 +578,16 @@ struct QwenMTPTrackNamingTests {
                 "MLXFAST_QWEN_MTP_CHECKPOINT_REVISION",
                 "c000ac2c2057d94be3fa931000c31723aac53282"
             ),
+            // faf1a679 = eef3b817 (generate-golden + attach-free-run-gate)
+            // plus the derived `.benchmark` oracle the ranked gates phase
+            // requires, attached by attach-benchmark-oracle. Additive only:
+            // .cases, .correctness_gates, .model_provenance and .version are
+            // byte-identical to eef3b817's.
             (
                 "MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256",
-                "eef3b817e390759275b7bc3570b10bb2846d2303000a0c9f1d627ad70f718c1e"
+                "faf1a679e993a3ea2ffb263213c66a526ba9cea591954898f8851bae42c9d5c5"
             ),
-            ("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES", "21036"),
+            ("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES", "36183"),
             (
                 "MLXFAST_GPQA_REFERENCE_SHA256",
                 "d05e93e9694d86e0041e6b9c843642d4637de524e9a1b88a145caaa0da6235fe"

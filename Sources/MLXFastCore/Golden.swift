@@ -624,6 +624,71 @@ private func validateBenchmarkGoldenBaselines(_ benchmark: BenchmarkGolden) thro
     }
 }
 
+// Derive the timed-benchmark oracle a ranked golden must carry from the
+// golden's OWN hidden base case, and return the document with it attached.
+//
+// WHY THIS EXISTS. QwenRuntime.benchmark requires `.benchmark` unconditionally
+// -- including on the gates-only phase (checkGates=1, skipTimedBenchmark=1),
+// where the oracle supplies only the baseline seconds-per-token placeholders.
+// `generate-golden` writes `benchmark: nil` and both attach verbs pass the
+// section through unchanged, so before this function existed no in-repo tool
+// could author a golden the ranked gates phase would accept.
+//
+// WHY IT DERIVES RATHER THAN MEASURES. The shape is not invented here: it is
+// read off the serial-era hidden golden that the DFlash ranked pipeline has
+// been consuming (correctness_prompts/laguna-xs-2.1-serial-v2/...94239d59),
+// whose oracle satisfies exactly the five identities below against its own
+// cases[0]. So the oracle restates tokens the golden already carries -- it
+// introduces no token the reference model did not produce for this prompt,
+// and it needs no model, no weights, and no timing run to author.
+//
+// Deliberately NO baseline_*_seconds_per_token: those two fields are the
+// per-prompt pool-rotation baselines (see BenchmarkGolden), and a hidden
+// correctness golden is not a pool golden. The precedent carries neither, and
+// on the gates-only path they are inert anyway -- the placeholder branch sets
+// measured := baseline, so both speedups are exactly 1.0 whatever they hold,
+// and overlay-paired-timing.sh overwrites them with the measured pair.
+public func goldenDocumentAttachingDerivedBenchmarkOracle(
+    _ golden: GoldenDocument
+) throws -> GoldenDocument {
+    // Never silently rewrite an oracle a golden already carries: the existing
+    // one may have been measured rather than derived, and the caller's
+    // --output defaults to the input path.
+    guard golden.benchmark == nil else {
+        throw MLXFastError.invalidInput(
+            "golden already contains a benchmark oracle; refusing to overwrite it"
+        )
+    }
+    guard let baseCase = golden.cases.first else {
+        throw MLXFastError.invalidInput(
+            "golden contains no base cases to derive a benchmark oracle from"
+        )
+    }
+    guard let firstExpectedToken = baseCase.expectedTokens.first else {
+        throw MLXFastError.invalidInput(
+            "golden base case \(baseCase.name) has no expected tokens to derive a benchmark oracle from"
+        )
+    }
+    let oracle = BenchmarkGolden(
+        prefillPromptTokens: baseCase.promptTokens,
+        expectedPrefillToken: firstExpectedToken,
+        decodeSeedTokens: baseCase.promptTokens,
+        expectedDecodeSeedToken: firstExpectedToken,
+        expectedDecodeTokens: Array(baseCase.expectedTokens.dropFirst())
+    )
+    // Fail here, before anything is written, on a base case too short to cover
+    // the timed decode window (expected_tokens must be >= benchmarkDecodeSteps
+    // + 1, the seed next-token plus the checked decode tokens).
+    try validateBenchmarkGolden(oracle)
+    return GoldenDocument(
+        version: golden.version ?? 1,
+        modelProvenance: golden.modelProvenance,
+        cases: golden.cases,
+        correctnessGates: golden.correctnessGates,
+        benchmark: oracle
+    )
+}
+
 private func validateGoldenFixtureKeys(_ data: Data) throws {
     let json = try JSONSerialization.jsonObject(with: data)
     guard let root = json as? [String: Any] else {

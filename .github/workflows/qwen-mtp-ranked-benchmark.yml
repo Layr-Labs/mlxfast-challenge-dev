@@ -236,8 +236,17 @@ jobs:
       # second -- and it is why official_scoring_enabled stays false.
       MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_SHA256: 0c1dcdabd85e7655f5df03e5a1265a5fde1a43ef223283021463f7af80481add
       MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_BYTES: "110168"
-      MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: eef3b817e390759275b7bc3570b10bb2846d2303000a0c9f1d627ad70f718c1e
-      MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "21036"
+      # faf1a679 supersedes eef3b817: same base case, free-run gate and
+      # provenance, plus the `.benchmark` oracle the ranked gates phase
+      # requires. eef3b817 was authored by generate-golden +
+      # attach-free-run-gate, neither of which can emit that section, so the
+      # gates run failed closed with "benchmark golden file must contain a
+      # benchmark oracle". The oracle is derived from the golden's own base
+      # case by attach-benchmark-oracle (the change is additive: only
+      # `.benchmark` is added), matching the DFlash golden 94239d59. The
+      # eef3b817 object stays in R2 as a content-addressed sibling.
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: faf1a679e993a3ea2ffb263213c66a526ba9cea591954898f8851bae42c9d5c5
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "36183"
       MLXFAST_GPQA_REFERENCE_SHA256: d05e93e9694d86e0041e6b9c843642d4637de524e9a1b88a145caaa0da6235fe
       MLXFAST_GPQA_REFERENCE_BYTES: "9886"
       # --- Reused serial gate contract ------------------------------------
@@ -1338,7 +1347,7 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           # Private object keys scoped to this trusted download step only (never
           # job level), so untrusted bench phases never receive the object names.
-          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-hidden-correctness-golden-eef3b817e390759275b7bc3570b10bb2846d2303000a0c9f1d627ad70f718c1e.json
+          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-hidden-correctness-golden-faf1a679e993a3ea2ffb263213c66a526ba9cea591954898f8851bae42c9d5c5.json
           MLXFAST_GPQA_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-gpqa-reference-cases-d05e93e9694d86e0041e6b9c843642d4637de524e9a1b88a145caaa0da6235fe.json
         run: |
           set -euo pipefail

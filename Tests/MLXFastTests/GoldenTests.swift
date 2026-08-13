@@ -937,6 +937,222 @@ func loadGoldenCasesRejectsNonPositiveRequiredPromptTokens() throws {
     }
 }
 
+// MARK: - attach-benchmark-oracle (goldenDocumentAttachingDerivedBenchmarkOracle)
+
+// A base case long enough for the derived oracle to cover the timed decode
+// window: expected_tokens must be >= benchmarkDecodeSteps + 1 (the decode seed
+// next-token plus the 128 checked decode tokens). The real hidden goldens
+// carry 256.
+private func oracleSourceExpectedTokens(
+    count: Int = MLXFastConstants.benchmarkDecodeSteps * 2
+) -> [Int] {
+    (0..<count).map { 900 + $0 }
+}
+
+private func oracleSourceDocument(
+    expectedTokens: [Int]? = nil,
+    cases: [GoldenCase]? = nil,
+    gates: GoldenCorrectnessGates? = nil,
+    benchmark: BenchmarkGolden? = nil
+) -> GoldenDocument {
+    GoldenDocument(
+        version: 1,
+        modelProvenance: GoldenModelProvenance(
+            repository: MLXFastConstants.referenceModelRepository,
+            revision: MLXFastConstants.referenceModelRevision
+        ),
+        cases: cases
+            ?? [
+                GoldenCase(
+                    name: "hidden-base",
+                    promptTokens: correctnessPrompt(11),
+                    expectedTokens: expectedTokens ?? oracleSourceExpectedTokens()
+                )
+            ],
+        correctnessGates: gates
+            ?? GoldenCorrectnessGates(
+                freeRun: [
+                    GoldenFreeRunCase(
+                        name: "free-run-decode-offset-coverage",
+                        promptTokens: correctnessPrompt(11),
+                        expectedTokens: Array(repeating: 5, count: MLXFastConstants.benchmarkDecodeSteps)
+                    )
+                ]
+            ),
+        benchmark: benchmark
+    )
+}
+
+@Test
+func attachDerivedBenchmarkOracleReproducesTheSerialEraPrecedentRule() throws {
+    let source = oracleSourceDocument()
+    let baseCase = source.cases[0]
+
+    let merged = try goldenDocumentAttachingDerivedBenchmarkOracle(source)
+
+    let oracle = try #require(merged.benchmark)
+    // The five identities read off the DFlash ranked golden (94239d59): the
+    // oracle restates the golden's own base case, introducing no new token.
+    #expect(oracle.prefillPromptTokens == baseCase.promptTokens)
+    #expect(oracle.decodeSeedTokens == baseCase.promptTokens)
+    #expect(oracle.expectedPrefillToken == baseCase.expectedTokens[0])
+    #expect(oracle.expectedDecodeSeedToken == baseCase.expectedTokens[0])
+    #expect(oracle.expectedDecodeTokens == Array(baseCase.expectedTokens.dropFirst()))
+    // Precedent shape: 512 / 512 / (expected - 1).
+    #expect(oracle.prefillPromptTokens.count == MLXFastConstants.benchmarkPrefillPromptTokens)
+    #expect(oracle.decodeSeedTokens.count == MLXFastConstants.benchmarkDecodeSeedTokens)
+    #expect(oracle.expectedDecodeTokens.count == baseCase.expectedTokens.count - 1)
+}
+
+@Test
+func attachDerivedBenchmarkOracleCarriesNoPerPromptBaselines() throws {
+    let merged = try goldenDocumentAttachingDerivedBenchmarkOracle(oracleSourceDocument())
+
+    let oracle = try #require(merged.benchmark)
+    // A hidden correctness golden is not a prompt-pool golden, so it must not
+    // carry pool-rotation baselines; scoring resolves to the calibrated
+    // constants exactly as the DFlash precedent does.
+    #expect(oracle.baselinePrefillSecondsPerToken == nil)
+    #expect(oracle.baselineDecodeSecondsPerToken == nil)
+    #expect(
+        oracle.resolvedBaselinePrefillSecondsPerToken
+            == MLXFastConstants.officialBaselinePrefillSecondsPerToken
+    )
+    #expect(
+        oracle.resolvedBaselineDecodeSecondsPerToken
+            == MLXFastConstants.officialBaselineDecodeSecondsPerToken
+    )
+}
+
+@Test
+func attachDerivedBenchmarkOracleLeavesEveryOtherSectionUntouched() throws {
+    let anchors = [
+        GoldenAnchorCase(name: "anchor-0", contextTokens: correctnessPrompt(3), expectedToken: 42)
+    ]
+    let behavior = [
+        GoldenBehaviorCase(
+            name: "gpqa-0",
+            promptTokens: correctnessPrompt(4),
+            acceptedTokenSequences: [[7, 8]],
+            maxNewTokens: 16
+        )
+    ]
+    let freeRun = [
+        GoldenFreeRunCase(
+            name: "free-run-decode-offset-coverage",
+            promptTokens: correctnessPrompt(11),
+            expectedTokens: Array(repeating: 5, count: MLXFastConstants.benchmarkDecodeSteps),
+            exactPrefixTokens: 8
+        )
+    ]
+    let source = oracleSourceDocument(
+        gates: GoldenCorrectnessGates(anchors: anchors, freeRun: freeRun, behavior: behavior)
+    )
+
+    let merged = try goldenDocumentAttachingDerivedBenchmarkOracle(source)
+
+    // ADDITIVE ONLY: `.benchmark` appears, nothing else moves.
+    #expect(merged.cases == source.cases)
+    #expect(merged.correctnessGates == source.correctnessGates)
+    #expect(merged.correctnessGates?.anchors == anchors)
+    #expect(merged.correctnessGates?.freeRun == freeRun)
+    #expect(merged.correctnessGates?.behavior == behavior)
+    #expect(merged.modelProvenance == source.modelProvenance)
+    #expect(merged.version == source.version)
+    #expect(source.benchmark == nil)
+    #expect(merged.benchmark != nil)
+}
+
+@Test
+func attachDerivedBenchmarkOracleRefusesToOverwriteAnExistingOracle() throws {
+    // A golden that already carries an oracle may have had it MEASURED rather
+    // than derived; silently replacing it would discard that provenance.
+    let existing = BenchmarkGolden(
+        prefillPromptTokens: Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens),
+        expectedPrefillToken: 4,
+        decodeSeedTokens: Array(repeating: 2, count: MLXFastConstants.benchmarkDecodeSeedTokens),
+        expectedDecodeSeedToken: 5,
+        expectedDecodeTokens: Array(repeating: 3, count: MLXFastConstants.benchmarkDecodeSteps)
+    )
+    let source = oracleSourceDocument(benchmark: existing)
+
+    do {
+        _ = try goldenDocumentAttachingDerivedBenchmarkOracle(source)
+        Issue.record("expected an existing benchmark oracle to be refused")
+    } catch let MLXFastError.invalidInput(message) {
+        #expect(message.contains("already contains a benchmark oracle"))
+    } catch {
+        Issue.record("expected MLXFastError.invalidInput, got \(error)")
+    }
+}
+
+@Test
+func attachDerivedBenchmarkOracleRejectsABaseCaseShorterThanTheTimedDecodeWindow() throws {
+    // benchmarkDecodeSteps expected tokens derive only benchmarkDecodeSteps-1
+    // decode tokens, one short of covering the timed window: the validator
+    // must reject it rather than write a golden that fails later on the box.
+    let source = oracleSourceDocument(
+        expectedTokens: oracleSourceExpectedTokens(count: MLXFastConstants.benchmarkDecodeSteps)
+    )
+
+    do {
+        _ = try goldenDocumentAttachingDerivedBenchmarkOracle(source)
+        Issue.record("expected a short base case to be rejected")
+    } catch let MLXFastError.invalidInput(message) {
+        #expect(message.contains("expected_decode_tokens"))
+    } catch {
+        Issue.record("expected MLXFastError.invalidInput, got \(error)")
+    }
+}
+
+@Test
+func attachDerivedBenchmarkOracleAcceptsTheExactTimedWindowBoundary() throws {
+    // One more expected token than the case above is exactly enough.
+    let source = oracleSourceDocument(
+        expectedTokens: oracleSourceExpectedTokens(count: MLXFastConstants.benchmarkDecodeSteps + 1)
+    )
+
+    let merged = try goldenDocumentAttachingDerivedBenchmarkOracle(source)
+
+    #expect(merged.benchmark?.expectedDecodeTokens.count == MLXFastConstants.benchmarkDecodeSteps)
+}
+
+@Test
+func attachDerivedBenchmarkOracleRejectsAGoldenWithNoBaseCases() throws {
+    let source = oracleSourceDocument(cases: [])
+
+    do {
+        _ = try goldenDocumentAttachingDerivedBenchmarkOracle(source)
+        Issue.record("expected a golden with no base cases to be rejected")
+    } catch let MLXFastError.invalidInput(message) {
+        #expect(message.contains("no base cases"))
+    } catch {
+        Issue.record("expected MLXFastError.invalidInput, got \(error)")
+    }
+}
+
+@Test
+func attachDerivedBenchmarkOracleOutputLoadsThroughTheStrictFixtureLoader() throws {
+    // End-to-end shape check: what the verb writes must be exactly what the
+    // ranked gates phase loads, oracle present, so the run gets past the
+    // "benchmark golden file must contain a benchmark oracle" guard.
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let merged = try goldenDocumentAttachingDerivedBenchmarkOracle(oracleSourceDocument())
+
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+    try encoder.encode(merged).write(to: path)
+
+    let fixture = try loadGoldenFixture(from: path.path)
+
+    #expect(fixture.benchmark != nil)
+    #expect(fixture.cases == merged.cases)
+    #expect(fixture.correctnessGates == merged.correctnessGates)
+    #expect(fixture.benchmark?.prefillPromptTokens == fixture.cases[0].promptTokens)
+    #expect(fixture.benchmark?.decodeSeedTokens == fixture.cases[0].promptTokens)
+}
+
 private func temporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent(
         UUID().uuidString,

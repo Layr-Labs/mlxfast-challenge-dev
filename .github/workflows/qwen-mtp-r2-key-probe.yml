@@ -195,14 +195,19 @@ jobs:
 
           # The control. This is the Qwen RAW hidden correctness golden key
           # under correctness_prompts/qwen3.6-27b-mtp-v1/ -- the SHA-addressed key
-          # for the golden generated on box 3 (digest eef3b817..., also pinned by
+          # for the golden generated on box 3 (digest faf1a679..., also pinned by
           # qwen-mtp-ranked-benchmark.yml as MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256
-          # and MLXFAST_CORRECTNESS_GOLDEN_R2_PATH). Unlike the DFlash probe --
-          # which used a serial key a ranked job already fetches successfully --
-          # this object is not uploaded to R2 YET, so the control will report
-          # missing until the operator runs qwen-mtp-provision-goldens.yml; once
-          # uploaded it is a genuine known-good control (matching digest).
-          control='correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-hidden-correctness-golden-eef3b817e390759275b7bc3570b10bb2846d2303000a0c9f1d627ad70f718c1e.json'
+          # and MLXFAST_CORRECTNESS_GOLDEN_R2_PATH). This object IS uploaded, so
+          # like the DFlash probe's serial key it is a genuine known-good
+          # control: the probe must report it present with a matching digest,
+          # and a missing/mismatched control means the probe itself is wrong,
+          # not that provisioning is outstanding.
+          #
+          # faf1a679 superseded eef3b817 (the box-3 golden before the
+          # `.benchmark` oracle was attached; see the ranked workflow's pin
+          # comment). eef3b817 remains in R2 as a content-addressed sibling but
+          # is no longer the control -- probe the digest the ranked job fetches.
+          control='correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-hidden-correctness-golden-faf1a679e993a3ea2ffb263213c66a526ba9cea591954898f8851bae42c9d5c5.json'
 
           probe() {
             local key="$1" label="$2" out="${work}/probe.bin"

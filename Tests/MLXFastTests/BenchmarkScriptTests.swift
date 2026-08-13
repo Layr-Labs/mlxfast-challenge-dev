@@ -2303,6 +2303,55 @@ func cliSupportsFreeRunGateAttachmentCoveringTimedDecodeOffsets() throws {
     #expect(cli.contains("attach-free-run-gate ["))
 }
 
+// QwenRuntime.benchmark refuses a golden with no `.benchmark` oracle even on
+// the gates-only phase (CHECK_GATES=1 + SKIP_TIMED=1, where the oracle only
+// supplies the baseline placeholders), but generate-golden writes
+// `benchmark: nil` and both attach verbs pass the section through -- so
+// without attach-benchmark-oracle no in-repo tool could author a hidden
+// golden the ranked "Correctness and gates" step accepts.
+@Test
+func cliSupportsBenchmarkOracleAttachmentForRankedGoldens() throws {
+    let cli = try String(
+        contentsOfFile: "Sources/MLXFastCLI/main.swift",
+        encoding: .utf8
+    )
+
+    #expect(cli.contains("case \"attach-benchmark-oracle\""))
+    #expect(cli.contains("func runAttachBenchmarkOracle"))
+    #expect(cli.contains("attach-benchmark-oracle ["))
+    // The derivation itself lives in MLXFastCore so it is unit-testable and
+    // so the CLI cannot drift from the precedent rule.
+    #expect(cli.contains("goldenDocumentAttachingDerivedBenchmarkOracle(golden)"))
+    // Pure file I/O: unlike the other attach verbs this one needs no weights,
+    // no tokenizer and no runtime worker, because it only restates tokens the
+    // golden already carries.
+    #expect(cli.contains("try options.validate(valueOptions: [\"--golden\", \"--output\"])"))
+    // The INPUT golden is strict-validated before any write -- --output
+    // defaults to the input path, so a malformed input must fail before it
+    // could be replaced on disk.
+    #expect(cli.contains("_ = try loadGoldenFixture(from: goldenPath)"))
+    // Same staged write-and-revalidate path as the other golden writers.
+    #expect(cli.contains("func writeValidatedGoldenDocument"))
+
+    let core = try String(
+        contentsOfFile: "Sources/MLXFastCore/Golden.swift",
+        encoding: .utf8
+    )
+
+    #expect(core.contains("func goldenDocumentAttachingDerivedBenchmarkOracle"))
+    // No silent overwrite of an oracle that may have been measured.
+    #expect(core.contains("already contains a benchmark oracle; refusing to overwrite it"))
+    // Derived strictly from the golden's own base case.
+    #expect(core.contains("prefillPromptTokens: baseCase.promptTokens"))
+    #expect(core.contains("decodeSeedTokens: baseCase.promptTokens"))
+    #expect(core.contains("expectedDecodeTokens: Array(baseCase.expectedTokens.dropFirst())"))
+    // Validated before it can be written.
+    #expect(core.contains("try validateBenchmarkGolden(oracle)"))
+    // A hidden correctness golden is NOT a prompt-pool golden: it must not
+    // carry per-prompt pool-rotation baselines.
+    #expect(!core.contains("baselinePrefillSecondsPerToken: MLXFastConstants"))
+}
+
 // The public fixtures under correctness_prompts/ are BASE golden cases (the
 // version-1 cases[] shape), not free-run gates, so the operator needs a
 // generation path that writes that shape directly from a prompt text file.

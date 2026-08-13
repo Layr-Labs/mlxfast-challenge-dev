@@ -42,6 +42,9 @@ private enum MLXFastCLI {
             case "attach-free-run-gate":
                 try runAttachFreeRunGate(options)
                 return 0
+            case "attach-benchmark-oracle":
+                try runAttachBenchmarkOracle(options)
+                return 0
             case "generate-golden":
                 try runGenerateGolden(options)
                 return 0
@@ -688,6 +691,56 @@ private enum MLXFastCLI {
             "attached free-run gate name=\(caseName) steps=\(steps) "
                 + "decode_offsets=\(promptTokens.count)..<\(promptTokens.count + steps) "
                 + "exact_prefix=\(exactPrefixTokens.map(String.init) ?? "full") "
+                + "output=\(outputPath)"
+        )
+    }
+
+    // Operator tool: attach the timed-benchmark oracle a ranked golden must
+    // carry, derived from the golden's own hidden base case.
+    //
+    // QwenRuntime.benchmark refuses a golden with no `.benchmark` section even
+    // on the gates-only phase (MLXFAST_BENCHMARK_CHECK_GATES=1 +
+    // MLXFAST_BENCHMARK_SKIP_TIMED=1), so a hidden golden authored by
+    // generate-golden + attach-free-run-gate alone -- neither of which can
+    // emit an oracle -- fails the ranked "Correctness and gates" step. This
+    // closes that provisioning gap. The derivation and the deliberate absence
+    // of per-prompt baselines are specified in
+    // goldenDocumentAttachingDerivedBenchmarkOracle; it needs no weights and
+    // no model, so unlike the other attach verbs this one is pure file I/O.
+    // Run it offline against the raw golden, then upload the result through
+    // the organizer process (docs/private-benchmark-security.md).
+    private static func runAttachBenchmarkOracle(_ options: ParsedOptions) throws {
+        try options.validate(valueOptions: ["--golden", "--output"])
+        let goldenPath = options.value(
+            for: "--golden",
+            default: environmentValue(
+                "MLXFAST_CORRECTNESS_GOLDEN_PATH",
+                fallback: MLXFastConstants.defaultGoldenPath
+            )
+        )
+        let outputPath = options.value(for: "--output", default: goldenPath)
+
+        try requireFile(goldenPath, description: "correctness golden file")
+        // Strict-validate the INPUT before any write. --output defaults to the
+        // input path, so a malformed input must fail here -- never after the
+        // original has been replaced on disk.
+        _ = try loadGoldenFixture(from: goldenPath)
+        let goldenData = try Data(contentsOf: URL(fileURLWithPath: goldenPath))
+        let golden = try JSONDecoder().decode(GoldenDocument.self, from: goldenData)
+
+        let merged = try goldenDocumentAttachingDerivedBenchmarkOracle(golden)
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        try writeValidatedGoldenDocument(encoder.encode(merged), to: outputPath)
+        guard let oracle = merged.benchmark else {
+            throw MLXFastError.invalidInput("attach-benchmark-oracle produced no benchmark oracle")
+        }
+        print(
+            "attached benchmark oracle prefill_tokens=\(oracle.prefillPromptTokens.count) "
+                + "decode_seed_tokens=\(oracle.decodeSeedTokens.count) "
+                + "expected_decode_tokens=\(oracle.expectedDecodeTokens.count) "
+                + "baselines=none "
                 + "output=\(outputPath)"
         )
     }
@@ -2560,6 +2613,7 @@ private enum MLXFastCLI {
               mlxfast-swift benchmark [--local-submit|--local-iterate] [--weights PATH] [--golden PATH] [--score-path PATH]
               mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
               mlxfast-swift attach-free-run-gate [--golden PATH] [--weights PATH] [--output PATH] [--name NAME] [--steps N] [--allow-partial] [--case NAME | --prompt-file PATH [--tokenizer PATH]] [--exact-prefix N]
+              mlxfast-swift attach-benchmark-oracle [--golden PATH] [--output PATH]
               mlxfast-swift generate-golden --prompt-file PATH [--weights PATH] [--tokenizer PATH] --output PATH --name NAME --steps N
               mlxfast-swift analyze-ngram-similarity --golden PATH [--case NAME] [--orders 1,2,3] [--max-hit-rate RATE]
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
