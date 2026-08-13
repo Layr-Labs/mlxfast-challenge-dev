@@ -9,53 +9,69 @@
       "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-beagle.json",
       "sha256": "18372ce49d8bd7109e74468e35f8f0b03220d120711408e0d071ee72675ec518",
       "bytes": 110237,
-      "noop_decode_speedup": 0.9177
+      "noop_decode_speedup": 0.9206,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.144
     },
     {
       "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-botany.json",
       "sha256": "3c4c6f16a8cf1889653a1dbd2d294eb84ff8ce38a764656e1052ba4a39032e84",
       "bytes": 110059,
-      "noop_decode_speedup": 0.7848
+      "noop_decode_speedup": 0.797,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.331
     },
     {
       "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-drama.json",
       "sha256": "20abc6f8c815ae676b79204e09ae05ff478684b1bef9062fb3a6a671ad99ebc6",
       "bytes": 109671,
-      "noop_decode_speedup": 0.756
+      "noop_decode_speedup": 0.7623,
+      "noop_decode_speedup_pairs": 3,
+      "noop_decode_speedup_spread_pct": 0.219
     },
     {
       "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-essays.json",
       "sha256": "249f11ce6be26fce5d8a1507d3592748b60811301fb56d4c4fb5e83b0a716f5f",
       "bytes": 109933,
-      "noop_decode_speedup": 1.0699
+      "noop_decode_speedup": 1.0648,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.155
     },
     {
       "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-medicine.json",
       "sha256": "31552c33c0e633eff35ec37fd7dc7b4ec4a1e773cb819641f0031192a4c1d48b",
       "bytes": 109863,
-      "noop_decode_speedup": 1.0915
+      "noop_decode_speedup": 1.0845,
+      "noop_decode_speedup_pairs": 8,
+      "noop_decode_speedup_spread_pct": 0.207
     },
     {
       "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-plutarch.json",
       "sha256": "faae02408d7e50f7ad372b0a42f03e16d6f05b910a3d8ecfa8afc3b41f72b5f0",
       "bytes": 110000,
-      "noop_decode_speedup": 0.8502
+      "noop_decode_speedup": 0.8621,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.437
     },
     {
       "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-republic.json",
       "sha256": "7933fd2df8bb2b4bea4f68115c8893829b32f630a683ced1bc5ddd27a3e137f7",
       "bytes": 110274,
-      "noop_decode_speedup": 0.9621
+      "noop_decode_speedup": 0.9671,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.269
     },
     {
       "r2_path": "correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-pool-travel.json",
       "sha256": "7c3b4643da1082ad1219cced981deb606f7e0b22a6e8ef8ef869999a67b42a91",
       "bytes": 110321,
-      "noop_decode_speedup": 0.9444
+      "noop_decode_speedup": 0.9497,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.167
     }
   ],
   "timed_prompt_pool_note": "Contract layer L6 (anti-lottery). Each entry IS a timed MTP reference-rows golden (the object the ranked job downloads and passes to mtp-timed --golden), NOT the prose prompt it was seeded from. Each was generated on box 3 with `mtp-verify --emitted <plan> --generate 513` over the transformed weights tree plus the pinned MTP head, from a DIFFERENT 512-token prose seed (8 distinct domains), and each returned reference_self_consistent=true with 513 rows.",
-  "noop_decode_speedup_note": "MEASURED on box 3 at tip 6a3bee9, one paired run per entry: raw_ratio = (depth-0 parent_measured_seconds_per_token) / (depth-2 parent_measured_seconds_per_token) over the same 512-token window and the same rows golden. Depth 0 is the TRUE serial control (MTP off, head resident but never consulted, 512 rounds, accepted=rejected=0). The spread across the pool is LARGE -- 0.756 to 1.0915, a 1.44x span -- because acceptance is prompt-dependent (0.344 to 0.585 measured). That spread is exactly what the normalised score exists to remove: an unnormalised raw ratio would hand a candidate drawn on `medicine` a 1.44x advantage over one drawn on `drama` for identical code. Every entry normalises to 1.0 by construction.",
+  "noop_decode_speedup_note": "RE-MEASURED 2026-08-13 on box 3 as N-PAIR MEANS; supersedes the single-shot values measured at tip 6a3bee9. Per entry: raw_ratio = mean(depth-0 serial parent_measured_seconds_per_token over accepted pairs) / mean(depth-2 parent measured_seconds_per_token over the same pairs) -- ratio-of-means, matching how the ranked job aggregates -- over the same 512-token window and the same rows golden, candidate = a clone of the pinned baseline tree (baseline-equivalent, so each entry's honest value IS its no-op reference). noop_decode_speedup_pairs records the accepted pairs behind each mean and noop_decode_speedup_spread_pct the measured spread, so the tolerance provenance is data rather than folklore. SPREAD METHOD: conservative propagation sqrt(CV_serial^2 + CV_mtp^2) of the two legs' per-phase CVs, applied identically to every entry. It OVER-states true paired spread by roughly 1.4-1.9x because the two legs of a pair share a thermal session and are positively correlated; where exact pair-level ratios were available (beagle, botany, drama) they were 0.104%, 0.281% and 0.116%. WHY THE RE-MEASUREMENT WAS NEEDED: the 6a3bee9-era references were each ONE pair (one depth-0 run, one depth-2 run, no averaging), and they were taken in a measurably different thermal/frequency regime -- their depth-0 serial legs cluster at 0.035653 s/tok while the current regime, and the pinned on-box serial calibration 0.037994794617407023, both sit at ~0.03800 s/tok, a +6.58% delta. That delta very nearly cancels in a ratio, but not exactly and not equally per prompt, so the old references and the pinned calibration were never mutually consistent. These means put both on the same footing for the first time. OBSERVED SHIFT: predominantly upward but NOT coherent -- 6 of 8 entries moved up, essays -0.475% and medicine -0.642% moved down; mean +0.32%, range -0.64% to +1.55%. A uniform shift would pass straight through the median-of-8 statistic, so the non-uniformity is the reason per-entry re-measurement was required rather than a single global correction. REJECTION-RATE FINDING (operator-ratified 2026-08-13): timing tolerance on this track is derived from measured per-prompt spread, never inherited from the serial era, because speculative decode is structurally prompt-sensitive -- rejection-heavy prompts do more rollback and re-forward work. In THIS data the correlation between acceptance rate and CURRENT spread is weak (r = -0.26, n=8, not significant); the strong relationship is between acceptance rate and the ERROR IN THE OLD SINGLE-SHOT REFERENCE (r = -0.75): the lowest-acceptance prompts are exactly where one-pair references were least reliable (botany 0.383 -> +1.55%, plutarch 0.434 -> +1.40%, against medicine 0.585 -> -0.64% and essays 0.563 -> -0.48%). Pair-averaging has already absorbed it: current spreads are 0.14-0.44% across the pool with no acceptance ordering. TOKEN EXACTNESS IS UNAFFECTED by anything in this note -- these are timing/score tolerances only. One anomaly is on record: medicine's first 4-pair session contained a single depth-0 serial reading of 0.039470826 s/tok, a >10 sigma excursion against the 31 other accepted serial observations (the depth-0 leg does prompt-independent work, so all serial readings are interchangeable and sit at ~0.03800). Rather than discard an accepted measurement, medicine was re-run at 8 pairs: the outlier did not recur, serial CV fell 1.632% -> 0.144%, and the mean landed at 1.0845 (pooling all 12 pairs minus the outlier gives 1.0844). The 8-pair value is the one pinned here.",
   "target": {
     "upstream_model_id": "mlx-community/Qwen3.6-27B-4bit",
     "upstream_revision": "c000ac2c2057d94be3fa931000c31723aac53282",

@@ -611,7 +611,8 @@ struct QwenMTPTrackNamingTests {
             ("MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_BYTES", "110168"),
             // NORMALISED floor: every pool entry's own measured
             // noop_decode_speedup normalises to 1.0, so 0.95 is the margin, not
-            // a raw ratio. Measured raw ratios span 0.756-1.0915.
+            // a raw ratio. Measured raw ratios span 0.7623-1.0845 (re-measured
+            // 2026-08-13 as N-pair means).
             ("MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR", "0.95"),
         ] {
             #expect(
@@ -686,6 +687,64 @@ struct QwenMTPTrackNamingTests {
     }
 }
 
+/// The no-op references were re-measured 2026-08-13 as N-pair means after the
+/// single-shot 6a3bee9-era values were found to carry both single-pair noise and
+/// a +6.58% thermal-regime delta. Timing tolerance on this track is DERIVED from
+/// measured per-prompt spread, never inherited, so every entry must carry the
+/// provenance that makes the derivation auditable rather than folklore.
+@Suite
+struct QwenMTPNoopReferenceProvenanceTests {
+    private typealias S = DFlashGateTextSupport
+
+    @Test
+    func everyPoolEntryCarriesItsMeasuredSpreadAndPairCount() throws {
+        let contract = try S.json("fixtures/qwen3_6_27b_mtp_track.json")
+        let pool = try #require(contract["timed_prompt_pool"] as? [[String: Any]])
+        #expect(pool.count == 8)
+        for e in pool {
+            let path = (e["r2_path"] as? String) ?? "<unknown>"
+            let pairs = try #require(
+                e["noop_decode_speedup_pairs"] as? Int,
+                "\(path) has no noop_decode_speedup_pairs"
+            )
+            #expect(
+                pairs >= 3,
+                "\(path) was averaged over \(pairs) pairs; the wrapper's min-pairs floor is 3"
+            )
+            let spread = try #require(
+                e["noop_decode_speedup_spread_pct"] as? Double,
+                "\(path) has no noop_decode_speedup_spread_pct"
+            )
+            #expect(
+                spread > 0 && spread < 1.0,
+                """
+                \(path) spread \(spread)% is outside the measured envelope \
+                (0.14-0.44% across the pool). A spread at or above 1% means the \
+                mean is not trustworthy -- add pairs before pinning it, as \
+                medicine required.
+                """
+            )
+        }
+    }
+
+    /// The note must record WHY the values moved, because a future reader
+    /// comparing them against the 6a3bee9-era numbers will otherwise read the
+    /// difference as a regression.
+    @Test
+    func theNoteRecordsTheRegimeDeltaAndTheRejectionRateFinding() throws {
+        let contract = try S.json("fixtures/qwen3_6_27b_mtp_track.json")
+        let note = try #require(contract["noop_decode_speedup_note"] as? String)
+        #expect(note.contains("6.58%"), "the thermal-regime delta is not recorded")
+        #expect(note.contains("0.037994794617407023"),
+                "the note must tie the regime to the pinned serial calibration")
+        // Token exactness is explicitly out of scope for these tolerances.
+        #expect(note.lowercased().contains("token exactness"))
+        // The honest version of the rejection-rate finding: the strong
+        // correlation is with OLD reference error, not with current spread.
+        #expect(note.contains("-0.75") && note.contains("-0.26"))
+    }
+}
+
 // MARK: - The go-live runbook the workflows point at
 
 /// `.github/workflows/qwen-mtp-provision-goldens.yml` refers operators to a
@@ -720,8 +779,14 @@ struct QwenMTPGoLiveRunbookTests {
     func runbookRecordsTheLimitsBeingAcceptedAtGoLive() throws {
         let runbook = try String(contentsOfFile: Self.path, encoding: .utf8)
         // The pool's raw no-op spread -- the reason the score is normalised.
-        #expect(runbook.contains("0.756"))
-        #expect(runbook.contains("1.0915"))
+        // Re-measured 2026-08-13 as N-pair means; the single-shot 6a3bee9-era
+        // span (0.756-1.0915) is superseded.
+        #expect(runbook.contains("0.7623"))
+        #expect(runbook.contains("1.0845"))
+        // The calibration acceptance window must be DERIVED and shown, not
+        // inherited from the serial era.
+        #expect(runbook.contains("0.992"))
+        #expect(runbook.lowercased().contains("common-mode"))
         // Prefill is measured but UNSCORED on this decode-only track.
         #expect(runbook.contains("prefill_component"))
         // The GPQA floor's honest limitation: a constant-"A" answerer scores

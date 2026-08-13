@@ -60,9 +60,9 @@ condemns, and the provisioning job refuses argv containing the flag.
 ### Why the pool exists, and why it must be varied
 
 Acceptance is strongly prompt-dependent (measured 0.344–0.585 across the pool),
-so the raw paired ratio spans **0.756** (drama) to **1.0915** (medicine) — a
-1.44x span for *identical code*. Sampling one prompt per run and publishing the
-raw ratio would hand a candidate drawn on `medicine` a 1.44x advantage over one
+so the raw paired ratio spans **0.7623** (drama) to **1.0845** (medicine) — a
+1.42x span for *identical code*. Sampling one prompt per run and publishing the
+raw ratio would hand a candidate drawn on `medicine` a 1.42x advantage over one
 drawn on `drama`. That is precisely what the normalised score removes: each
 entry's own measured `noop_decode_speedup` is pinned in the fixture, the raw
 ratio-of-means is divided by it, and every entry normalises to 1.0 by
@@ -198,6 +198,56 @@ it participates in scoring will mis-tune the track.
 step A). An unmodified candidate medians to 1.0 by construction, so 0.95 remains
 the same 5% margin below parity it always was — the number did not move when the
 aggregation did.
+
+### The CALIBRATION acceptance window (derived 2026-08-13, not inherited)
+
+This is the operator's own accept/reject band for **calibration dispatches** —
+runs of a known baseline-equivalent candidate, where the published median should
+land at parity. It is **not** a submission-facing gate: the 0.95 normalised
+floor, the `[0.95,1.05]` serial band and `MAX_PLAUSIBLE_SPEEDUP` are untouched by
+anything in this section.
+
+The inherited serial-era ±1% was never derived for this track and is wrong for
+it in both directions. The window below is derived from measured variance.
+
+**Inputs.** Three prompts have two *independent sessions* each (a ranked dispatch
+and a re-measurement session): beagle +0.228%, drama −0.261%, medicine +0.023%.
+The sd of a single session estimate is
+`sqrt(mean(d²)/2)` = **0.142%**.
+
+**Decomposition.** Typical within-run per-pair ratio sd is 0.150%, so a 4-pair
+mean carries 0.075% from pair noise alone. The residual
+`sqrt(0.142² − 0.075²)` = **0.120%** is *session-level* — thermal and frequency
+state that every prompt in a run shares. It does not average down with more
+pairs, which is why `pairs_per_prompt` beyond about 2 buys very little.
+
+**Propagating to the median of 8.** The session term is **common-mode**: a ranked
+run times all 8 prompts in one thermal session, so it shifts every prompt
+together and passes straight through the median. Only the independent per-prompt
+term is reduced (≈0.443× for the even-n mean-of-two-central rule at n=8). At the
+ranked `pairs_per_prompt: 1`:
+
+```
+sd(median) = sqrt( 0.120²  +  (0.443 × 0.150)² )  =  0.135%
+```
+
+Monte Carlo over 200k trials with the same inputs agrees: **0.135%**. Raising k
+to 4 only reaches 0.124% — confirming the common-mode term dominates.
+
+**The window.** ±3σ on the point estimate is [0.9959, 1.0041]. That estimate
+rests on only three paired comparisons, so σ is inflated by 1.8× (roughly the
+upper 95% χ² bound at ~3 df) before rounding outward:
+
+> **Calibration acceptance window: 0.992 – 1.008** (parity ±0.8%).
+
+A calibration run landing outside it is a stop-and-investigate, not a retry.
+**Re-derive it** once more paired sessions exist — the 1.8× inflation is
+compensating for a thin sample and should shrink, not persist.
+
+For contrast, the same inputs give a *single-draw* window of ±0.58%, and that is
+before per-prompt reference error, which is what the old single-shot references
+contributed and what made a 1.1% miss look normal. Median-of-8 is both tighter
+and robust to one bad reference.
 
 ## Step D — flip the two trusted-contract fields
 
