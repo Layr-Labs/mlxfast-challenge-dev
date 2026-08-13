@@ -42,13 +42,21 @@ name: qwen-mtp-ranked-benchmark
 # net-slower. Depth is pinned at 2 below and MUST be re-derived across the whole
 # timed pool once the pool exists, exactly as DFlash re-derived K three times.
 #
-# SCORING (provisional, mirrors the DFlash mechanics):
-#   raw   = mean(serial K=1 seconds/token) / mean(MTP seconds/token)
-#           [ratio-of-means over accepted thermally-gated pairs]
-#   score = raw / noop_reference[sampled prompt]   [per-prompt normalised]
-# The floor is deliberately NOT chosen here: it is a measured quantity derived
-# from the pool's own no-op references (DFlash's floor moved three times for
-# exactly this reason), so it carries QWEN-PENDING and fails closed.
+# SCORING (operator-ratified 2026-08-13 -- MEDIAN OF 8, no longer a single
+# sampled prompt; see docs/qwen-mtp-go-live-runbook.md and the contract
+# fixture's scoring_semantics block):
+#   per prompt p, over that prompt's accepted thermally-gated pairs:
+#     raw_p  = mean(serial depth-0 seconds/token) / mean(MTP seconds/token)
+#     norm_p = raw_p / noop_reference[p]          [per-prompt normalised]
+#   score    = median(norm_p over ALL 8 pool prompts)
+# The median rule is the mean of the two central order statistics -- 8 is even,
+# so the tie-break is load-bearing and is NOT the lower-median rule used by the
+# per-pair diagnostics. Per-prompt normalisation cancels the BASELINE's
+# prompt-dependence; the median cancels the CANDIDATE's, which normalisation
+# alone cannot reach.
+# The floor is a measured quantity derived from the pool's own no-op references
+# (DFlash's floor moved three times for exactly this reason); it is 0.95 against
+# the normalised median, which an unmodified candidate hits at exactly 1.0.
 #
 # HOST CONTRACT (operator-provisioned, janitor-audited; consumed, never
 # installed, by this workflow):
@@ -202,8 +210,21 @@ jobs:
       # 1.0915 across the 8 prompts, which is precisely why the RAW ratio could
       # never carry a fixed floor.
       MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR: "0.95"
-      MLXFAST_QWEN_MTP_MIN_ACCEPTED_PAIRS: "3"
-      MLXFAST_QWEN_MTP_TARGET_PAIRS: "4"
+      # PAIR BUDGET IS PER PROMPT (scoring semantics 2026-08-13). A ranked run
+      # times all 8 pool prompts, so the run-level budget is
+      # 8 x MLXFAST_QWEN_MTP_PAIRS_PER_PROMPT pairs = 16 timed phases at k=1.
+      #
+      # WHY k=1 AND NOT THE OLD 3/4. Those numbers bought pair-averaging on a
+      # SINGLE prompt, where averaging was the only defence against pair noise.
+      # The median over 8 prompts now does that job and more: it also cancels
+      # the prompt lottery, which no amount of pair-averaging on one prompt
+      # could. At the measured 0.77% pair noise, k=1 lands the score's own
+      # dispersion near 0.34% -- better than the old 4-pair single-prompt shape
+      # while timing 16 phases instead of 8. Raising this to 2 doubles the
+      # timed work for a ~0.1pp improvement, so it is left at 1 and the flag is
+      # there when calibration data says otherwise.
+      MLXFAST_QWEN_MTP_PAIRS_PER_PROMPT: "1"
+      MLXFAST_QWEN_MTP_MIN_PAIRS_PER_PROMPT: "1"
       # Attributable ranked failures allowed per submission branch (contract
       # layer L6, second half). Same sizing argument as the DFlash track.
       MLXFAST_QWEN_MTP_MAX_RANKED_FAILURES: "5"
@@ -1645,16 +1666,28 @@ jobs:
       # CONTRACT LAYER L6 (anti-lottery). A single frozen hidden prompt makes a
       # failed ranked run free to retry, which degrades every output-side gate
       # into "must be correct often enough" and lets a threshold be tuned by
-      # submit-until-green. The defense is to sample the timed target from a
-      # POOL, uniformly at random per run, from entropy the participant cannot
-      # see or influence. The floor counts DISTINCT targets (distinct sha256 AND
-      # distinct r2_path), not pool LENGTH: one golden listed eight times has
-      # length 8 and anti-lottery value zero.
+      # submit-until-green. The original defense sampled the timed target from a
+      # POOL uniformly at random per run; as of 2026-08-13 the stronger defense
+      # is in force -- the run times the WHOLE pool and scores the median, so
+      # there is no draw to get lucky on and a retry buys nothing. The floor
+      # still counts DISTINCT targets (distinct sha256 AND distinct r2_path),
+      # not pool LENGTH: one golden listed eight times has length 8, and a
+      # median over it is a median over one prompt.
       #
       # RANKED-ONLY. A dry run times nothing, so it needs no timed target, and
       # guarding this step is what lets the gates-only dispatch reach the MTP
       # parity gate below before the operator has provisioned any pool objects.
-      - name: Select hidden Qwen-MTP timed target from the pool
+      # SCORING SEMANTICS 2026-08-13: this step no longer SAMPLES. A ranked run
+      # times the WHOLE pool and publishes the median of the per-prompt
+      # normalised ratios, so there is nothing to draw and nothing to keep
+      # secret about the draw. Formally the run takes one prompt per COLLECTION;
+      # each of the 8 collections is a singleton today, so all 8 run.
+      #
+      # Every pool VALIDATION below is retained verbatim -- the per-entry
+      # completeness sweep and the >= 8 DISTINCT floor are what make the median
+      # a median over eight real prompts rather than over one prompt listed
+      # eight times. Only the uniform draw at the end is gone.
+      - name: Resolve the hidden Qwen-MTP timed prompt set
         id: select_qwen_mtp_target
         if: ${{ inputs.run_benchmark }}
         run: |
@@ -1730,40 +1763,31 @@ jobs:
               exit 1
             fi
           fi
-          # Uniform selection over [0,pool_size) from kernel entropy, rejecting
-          # the biased tail of the RNG range rather than using a plain modulo.
-          limit=$(( (65536 / pool_size) * pool_size ))
-          while :; do
-            draw=$(( $(od -An -N2 -tu2 < /dev/urandom | tr -d ' ') ))
-            if [[ "${draw}" -lt "${limit}" ]]; then break; fi
-          done
-          index=$(( draw % pool_size ))
-          entry="$(jq -c --argjson i "${index}" '.timed_prompt_pool[$i]' "${contract}")"
-          r2_path="$(jq -r '.r2_path' <<<"${entry}")"
-          sha256="$(jq -r '.sha256' <<<"${entry}")"
-          bytes="$(jq -r '.bytes' <<<"${entry}")"
-          # Redundant with the whole-pool check above, deliberately: this guards
-          # the three values that actually LEAVE the step, so a future edit to
-          # the extraction still fails closed rather than exporting an empty pin.
-          for field in "${r2_path}" "${sha256}" "${bytes}"; do
-            if [[ -z "${field}" || "${field}" == "null" ]]; then
-              echo "::error::Qwen-MTP timed prompt pool entry ${index} is incomplete" >&2
-              exit 1
-            fi
-          done
-          # Private audit record; never printed to the job log. Echoing the index
-          # would hand back the sampling.
-          jq -n --argjson i "${index}" --argjson n "${pool_size}" \
-            --argjson ds "${distinct_sha}" --argjson dp "${distinct_path}" \
-            --arg p "${r2_path}" \
-            '{selected_index:$i, pool_size:$n, distinct_sha256:$ds, distinct_r2_path:$dp, r2_path:$p}' \
-            > "${MLXFAST_PRIVATE_DIR}/qwen_mtp_timed_target_selection.json"
-          {
-            echo "r2_path=${r2_path}"
-            echo "sha256=${sha256}"
-            echo "bytes=${bytes}"
-          } >> "${GITHUB_OUTPUT}"
-          echo "qwen-mtp-ranked-benchmark: timed target sampled from a pool of ${pool_size} entries / ${distinct_sha} distinct targets (selection recorded privately)"
+          # THE WHOLE SET, in fixture order. No draw. The manifest is written to
+          # the runner-private dir and is the single source the download and
+          # timing steps iterate, so those steps cannot disagree with this one
+          # about which objects the run is scored on.
+          jq -c '[.timed_prompt_pool[] | {r2_path, sha256, bytes, noop_decode_speedup}]' \
+            "${contract}" > "${MLXFAST_PRIVATE_DIR}/qwen_mtp_timed_prompt_set.json"
+          # Redundant with the whole-pool sweep above, deliberately: this guards
+          # the values that actually LEAVE the step, so a future edit to the
+          # extraction still fails closed rather than exporting empty pins.
+          resolved="$(jq 'length' "${MLXFAST_PRIVATE_DIR}/qwen_mtp_timed_prompt_set.json")"
+          if [[ "${resolved}" -ne "${pool_size}" ]]; then
+            echo "::error::the resolved timed prompt set has ${resolved} entries but the pool has ${pool_size}" >&2
+            exit 1
+          fi
+          if ! jq -e 'all(.[];
+                (.r2_path | type == "string" and length > 0)
+                and (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+                and (.bytes | type == "number" and . > 0)
+                and (.noop_decode_speedup | type == "number" and . > 0))' \
+               "${MLXFAST_PRIVATE_DIR}/qwen_mtp_timed_prompt_set.json" >/dev/null; then
+            echo "::error::the resolved Qwen-MTP timed prompt set carries an incomplete entry" >&2
+            exit 1
+          fi
+          echo "pool_size=${pool_size}" >> "${GITHUB_OUTPUT}"
+          echo "qwen-mtp-ranked-benchmark: timed prompt set resolved -- ALL ${pool_size} pool entries / ${distinct_sha} distinct targets will be timed, and the published score is the median of their normalised ratios"
 
       - name: Prepare hidden Qwen-MTP goldens
         env:
@@ -1778,9 +1802,10 @@ jobs:
           # silently -- a digest edit that misses the key produces a 404, not a
           # mismatched gate.
           MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/qwen3.6-27b-mtp-v1/qwen3.6-27b-mtp-correctness-golden-hidden-0c1dcdabd85e7655f5df03e5a1265a5fde1a43ef223283021463f7af80481add.json
-          MLXFAST_QWEN_MTP_BENCH_GOLDEN_R2_PATH: ${{ steps.select_qwen_mtp_target.outputs.r2_path }}
-          MLXFAST_QWEN_MTP_BENCH_GOLDEN_SHA256_SELECTED: ${{ steps.select_qwen_mtp_target.outputs.sha256 }}
-          MLXFAST_QWEN_MTP_BENCH_GOLDEN_BYTES_SELECTED: ${{ steps.select_qwen_mtp_target.outputs.bytes }}
+          # The timed goldens are no longer a single sampled pin: the whole set
+          # comes from the resolved manifest and every object is verified in the
+          # loop below, per object, exactly as the single-golden path did.
+          MLXFAST_QWEN_MTP_POOL_SIZE: ${{ steps.select_qwen_mtp_target.outputs.pool_size }}
         run: |
           set -euo pipefail
           if [[ "${MLXFAST_QWEN_MTP_CORRECTNESS_GOLDEN_R2_PATH}" == *"QWEN-MTP-PENDING-ORGANIZER"* ]]; then
@@ -1798,34 +1823,43 @@ jobs:
           fi
           bench_hash="not downloaded (gates-only dispatch)"
           if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
-            # FAIL CLOSED if the ranked path reaches here without a selection. A
-            # SKIPPED step yields EMPTY outputs, not an error, so widening the
-            # guard on the selection step by mistake would silently produce a
-            # ranked run with no sampled target -- and losing per-run sampling is
-            # losing contract layer L6 itself.
-            for selected in \
-              "${MLXFAST_QWEN_MTP_BENCH_GOLDEN_R2_PATH}" \
-              "${MLXFAST_QWEN_MTP_BENCH_GOLDEN_SHA256_SELECTED}" \
-              "${MLXFAST_QWEN_MTP_BENCH_GOLDEN_BYTES_SELECTED}"; do
-              if [[ -z "${selected}" ]]; then
-                echo "::error::ranked Qwen-MTP dispatch reached the golden download with no timed-target selection; the selection step did not run or produced no outputs" >&2
-                exit 1
-              fi
-            done
-            .github/scripts/download-r2-object.sh \
-              "${MLXFAST_QWEN_MTP_BENCH_GOLDEN_R2_PATH}" \
-              "${MLXFAST_PRIVATE_DIR}/qwen_mtp_benchmark_golden.json"
-            bench_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/qwen_mtp_benchmark_golden.json" | awk '{print $1}')"
-            bench_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/qwen_mtp_benchmark_golden.json" | tr -d ' ')"
-            # Verified against the PER-RUN pool selection, not a fixed pin, so a
-            # swapped or truncated object fails closed even though the object key
-            # differs from run to run.
-            if [[ "${bench_hash}" != "${MLXFAST_QWEN_MTP_BENCH_GOLDEN_SHA256_SELECTED}" || "${bench_bytes}" != "${MLXFAST_QWEN_MTP_BENCH_GOLDEN_BYTES_SELECTED}" ]]; then
-              echo "::error::hidden Qwen-MTP timed golden pin mismatch for the sampled pool entry" >&2
+            # FAIL CLOSED if the ranked path reaches here without a resolved
+            # set. A SKIPPED step yields EMPTY outputs, not an error, so
+            # widening the guard on the resolve step by mistake would otherwise
+            # silently produce a ranked run with no timed prompts at all.
+            manifest="${MLXFAST_PRIVATE_DIR}/qwen_mtp_timed_prompt_set.json"
+            if [[ ! -s "${manifest}" || -z "${MLXFAST_QWEN_MTP_POOL_SIZE}" ]]; then
+              echo "::error::ranked Qwen-MTP dispatch reached the golden download with no resolved timed prompt set; the resolve step did not run or produced no output" >&2
               exit 1
             fi
+            set_size="$(jq 'length' "${manifest}")"
+            if [[ "${set_size}" != "${MLXFAST_QWEN_MTP_POOL_SIZE}" ]]; then
+              echo "::error::the resolved timed prompt set has ${set_size} entries but the resolve step reported ${MLXFAST_QWEN_MTP_POOL_SIZE}" >&2
+              exit 1
+            fi
+            # PER OBJECT, for EVERY object: download, then verify BOTH the digest
+            # and the byte count against that entry's own pin. This is the
+            # single-golden path's verification run in a loop -- nothing is
+            # weakened by there being eight of them, and one bad object fails the
+            # whole run rather than being quietly dropped from the median.
+            bench_hash=""
+            for index in $(seq 0 $(( set_size - 1 ))); do
+              entry="$(jq -c --argjson i "${index}" '.[$i]' "${manifest}")"
+              key="$(jq -r '.r2_path' <<<"${entry}")"
+              want_sha="$(jq -r '.sha256' <<<"${entry}")"
+              want_bytes="$(jq -r '.bytes' <<<"${entry}")"
+              dst="${MLXFAST_PRIVATE_DIR}/qwen_mtp_benchmark_golden_${index}.json"
+              .github/scripts/download-r2-object.sh "${key}" "${dst}"
+              got_sha="$(shasum -a 256 "${dst}" | awk '{print $1}')"
+              got_bytes="$(wc -c < "${dst}" | tr -d ' ')"
+              if [[ "${got_sha}" != "${want_sha}" || "${got_bytes}" != "${want_bytes}" ]]; then
+                echo "::error::hidden Qwen-MTP timed golden pin mismatch for pool entry ${index}" >&2
+                exit 1
+              fi
+              bench_hash="${bench_hash}${bench_hash:+ }${got_sha:0:8}"
+            done
           else
-            echo "qwen-mtp-ranked-benchmark: gates-only dispatch; the timed golden is not downloaded and no timed target is sampled"
+            echo "qwen-mtp-ranked-benchmark: gates-only dispatch; no timed goldens are downloaded"
           fi
           # FAIL-CLOSED ROW-COUNT PRECONDITION on the gate's input, run on the
           # runner-private copies before either golden is installed. This is NOT
@@ -1853,9 +1887,14 @@ jobs:
             "${MLXFAST_PRIVATE_DIR}/qwen_mtp_correctness_golden.json" \
             "${MLXFAST_QWEN_MTP_CORRECTNESS_TOKENS}" correctness
           if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
-            check_golden_rows \
-              "${MLXFAST_PRIVATE_DIR}/qwen_mtp_benchmark_golden.json" \
-              "${MLXFAST_QWEN_MTP_DECODE_TOKENS}" benchmark
+            # EVERY timed golden, not just one: a short golden anywhere in the
+            # set would abort the timing run partway through, after the earlier
+            # prompts had already been paid for in gated box time.
+            for index in $(seq 0 $(( $(jq 'length' "${MLXFAST_PRIVATE_DIR}/qwen_mtp_timed_prompt_set.json") - 1 ))); do
+              check_golden_rows \
+                "${MLXFAST_PRIVATE_DIR}/qwen_mtp_benchmark_golden_${index}.json" \
+                "${MLXFAST_QWEN_MTP_DECODE_TOKENS}" "benchmark[${index}]"
+            done
           fi
           golden_dst="${MLXFAST_JOB_WS}/.qwen-mtp-ranked-src/qwen_mtp_correctness_golden.json"
           if [[ -e "${golden_dst}" || -L "${golden_dst}" ]]; then
@@ -2215,6 +2254,27 @@ jobs:
           # samples (as few as 3 steady) against 102-104 at 0.70, i.e. one
           # hiccup from a false rejection. 0.70 matches the wrapper's own
           # recalibrated default.
+          # THE WHOLE TIMED SET, one --golden per pool entry, in manifest order.
+          # The wrapper resolves each one's normalising no-op reference from the
+          # contract by the object's OWN digest, so argv order carries no
+          # scoring meaning and a golden that is not a pinned pool member fails
+          # closed before the first thermal gate.
+          golden_args=()
+          set_size="$(jq 'length' "${MLXFAST_PRIVATE_DIR}/qwen_mtp_timed_prompt_set.json")"
+          for index in $(seq 0 $(( set_size - 1 ))); do
+            dst="${MLXFAST_PRIVATE_DIR}/qwen_mtp_benchmark_golden_${index}.json"
+            test -s "${dst}" \
+              || { echo "::error::timed golden ${index} is missing at timing time" >&2; exit 1; }
+            golden_args+=(--golden "${dst}")
+          done
+          if [[ "${#golden_args[@]}" -ne $(( set_size * 2 )) ]]; then
+            echo "::error::built ${#golden_args[@]} golden arguments for ${set_size} prompts" >&2
+            exit 1
+          fi
+          # --min-pairs / --target-pairs are PER PROMPT (scoring semantics
+          # 2026-08-13). At the ranked k=1 that is 8 prompts x 1 pair = 8 pairs
+          # / 16 timed phases; the wrapper pools those 8 serial pairs for the
+          # denominator band, which is a stronger check than the 4 it replaces.
           MEASURE_STATE_DIR="${MLXFAST_MEASURE_STATE_DIR}" \
           BASELINE_WS="${MLXFAST_QWEN_MTP_BASELINE_RESOLVED}" \
           BASELINE_CALIBRATION="${MLXFAST_QWEN_MTP_BASELINE_CALIBRATION}" \
@@ -2225,30 +2285,32 @@ jobs:
             "${MLXFAST_QWEN_MTP_MEASURE_JOB}" \
               --candidate "${MLXFAST_JOB_WS}" \
               --baseline "${MLXFAST_QWEN_MTP_BASELINE_RESOLVED}" \
-              --golden "${MLXFAST_PRIVATE_DIR}/qwen_mtp_benchmark_golden.json" \
+              "${golden_args[@]}" \
               --contract "${MLXFAST_JOB_WS}/${MLXFAST_QWEN_MTP_CONTRACT_PATH}" \
               --tokens "${MLXFAST_QWEN_MTP_DECODE_TOKENS}" \
               --mtp-depth "${MLXFAST_QWEN_MTP_DEPTH}" \
-              --min-pairs "${MLXFAST_QWEN_MTP_MIN_ACCEPTED_PAIRS}" \
-              --target-pairs "${MLXFAST_QWEN_MTP_TARGET_PAIRS}" \
+              --min-pairs-per-prompt "${MLXFAST_QWEN_MTP_MIN_PAIRS_PER_PROMPT}" \
+              --pairs-per-prompt "${MLXFAST_QWEN_MTP_PAIRS_PER_PROMPT}" \
               --tag "qwen-mtp-ranked-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
               --out "${MLXFAST_MEASURE_OUT}"
           test -s "${MLXFAST_MEASURE_OUT}/results.json"
-          jq -c '{mode, accepted_pair_count, parity_all_ok}' "${MLXFAST_MEASURE_OUT}/results.json"
+          jq -c '{mode, prompt_count, pairs_per_prompt, accepted_pair_count, parity_all_ok}' \
+            "${MLXFAST_MEASURE_OUT}/results.json"
 
       # Decode-only score contract applied in the trusted shell from the sealed
-      # paired results: hard token-fidelity gate, minimum accepted pairs,
-      # RATIO-OF-MEANS aggregation computed HERE from the sealed per-side
-      # seconds/token means (never trusted from a pre-aggregated field),
-      # per-prompt normalisation against the sampled prompt's own pinned no-op
-      # reference, and the floor on that aggregate.
+      # paired results: hard token-fidelity gate, minimum accepted pairs, and
+      # the MEDIAN OF THE PER-PROMPT NORMALISED RATIOS recomputed HERE from the
+      # sealed per-prompt seconds/token means and the TRUSTED contract's own
+      # no-op references -- never trusted from a pre-aggregated field.
+      #
+      # The wrapper computes the same number and seals it. This step recomputes
+      # it independently and then requires the two to agree, so a wrapper whose
+      # aggregation drifted (or was tampered with inside a bench-writable tree)
+      # is caught rather than believed.
       - name: Compute Qwen-MTP score and enforce floor
         if: ${{ inputs.run_benchmark }}
         env:
-          # The sampled pool entry's sha256, from the trusted per-run selection.
-          # Consumed only inside this trusted step and never echoed, preserving
-          # the "selection recorded only in the private audit dir" posture.
-          MLXFAST_QWEN_MTP_SELECTED_SHA256: ${{ steps.select_qwen_mtp_target.outputs.sha256 }}
+          MLXFAST_QWEN_MTP_POOL_SIZE: ${{ steps.select_qwen_mtp_target.outputs.pool_size }}
         run: |
           set -euo pipefail
           # SECOND, INDEPENDENT check of the PUBLISH question, at the step that
@@ -2275,9 +2337,16 @@ jobs:
           fi
           results="${MLXFAST_MEASURE_OUT}/results.json"
           test -s "${results}"
+          expected_pairs=$(( MLXFAST_QWEN_MTP_POOL_SIZE * MLXFAST_QWEN_MTP_MIN_PAIRS_PER_PROMPT ))
+          # THE BREAKDOWN SHAPE IS PART OF THE GATE. A results.json carrying
+          # fewer per_prompt entries than the pool has is a run that quietly
+          # scored a subset -- which is the prompt lottery reappearing as a
+          # missing-data bug rather than as a draw.
           jq -e \
             --arg track "${MLXFAST_QWEN_MTP_TRACK_ID}" \
-            --argjson min_pairs "${MLXFAST_QWEN_MTP_MIN_ACCEPTED_PAIRS}" \
+            --argjson min_pairs "${expected_pairs}" \
+            --argjson pool_size "${MLXFAST_QWEN_MTP_POOL_SIZE}" \
+            --argjson min_per_prompt "${MLXFAST_QWEN_MTP_MIN_PAIRS_PER_PROMPT}" \
             '
             .track_id == $track
             and .parity_all_ok == true
@@ -2288,37 +2357,68 @@ jobs:
             and (.aggregate.candidate_mtp_seconds_per_token_mean | type == "number" and . > 0)
             and (.aggregate.mtp_decode_speedup_median | type == "number")
             and (.aggregate.mtp_decode_speedup_min | type == "number")
+            # --- per-prompt breakdown: one entry per pool prompt, all clean ---
+            and ((.per_prompt | type) == "array")
+            and ((.per_prompt | length) == $pool_size)
+            and (.prompt_count == $pool_size)
+            and all(.per_prompt[];
+                  (.prompt_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+              and (.parity_ok == true)
+              and (.accepted_pair_count >= $min_per_prompt)
+              and (.serial_seconds_per_token_mean | type == "number" and . > 0)
+              and (.mtp_seconds_per_token_mean | type == "number" and . > 0)
+              and (.noop_reference_decode_speedup | type == "number" and . > 0)
+              and (.normalized_ratio | type == "number" and . > 0))
+            # every prompt distinct -- eight copies of one prompt is not a median
+            and (([.per_prompt[].prompt_sha256] | unique | length) == $pool_size)
+            and (.aggregate.normalized_decode_speedup_median | type == "number")
             ' "${results}" >/dev/null || {
-              echo "::error::paired Qwen-MTP results failed validation (token-fidelity gate, pair count, or schema)" >&2
+              echo "::error::paired Qwen-MTP results failed validation (token-fidelity gate, pair count, or per-prompt breakdown shape)" >&2
               exit 1
             }
-          # Ratio-of-means (RAW): mean serial s/tok over accepted pairs divided by
-          # mean MTP s/tok over the same pairs.
+          # Pooled RAW ratio-of-means, kept as a reported diagnostic. It is NOT
+          # the score: an unnormalised pooled ratio still carries the pool's
+          # 1.44x no-op spread.
           speedup_raw="$(jq -r '.aggregate.baseline_serial_seconds_per_token_mean / .aggregate.candidate_mtp_seconds_per_token_mean' "${results}")"
-          # PER-PROMPT NORMALISATION. Divide the raw ratio-of-means by the sampled
-          # prompt's OWN pinned no-op reference so every pool prompt's no-op maps
-          # to 1.0 and the ranked score does not depend on which prompt the
-          # anti-lottery sampler drew. The reference is read from the TRUSTED
-          # contract checkout under GITHUB_WORKSPACE, NOT the candidate-writable
-          # job workspace copy.
-          if [[ ! "${MLXFAST_QWEN_MTP_SELECTED_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::error::the per-run timed-target selection did not provide a sha256; cannot normalise the score" >&2
+          # THE SCORE, RECOMPUTED HERE. For each prompt: its own ratio-of-means
+          # divided by its own pinned no-op reference, then the median over all
+          # of them. The reference is joined on the prompt's sha256 against the
+          # TRUSTED contract checkout under GITHUB_WORKSPACE -- never the
+          # candidate-writable job workspace copy, and never the value the
+          # wrapper happened to seal.
+          speedup="$(jq -r --slurpfile contract "${MLXFAST_QWEN_MTP_CONTRACT_PATH}" '
+              ($contract[0].timed_prompt_pool // []) as $pool
+            | [ .per_prompt[]
+                | . as $p
+                | ([$pool[] | select(.sha256 == $p.prompt_sha256) | .noop_decode_speedup]) as $refs
+                | if ($refs | length) != 1 then
+                    error("prompt \($p.prompt_sha256) does not resolve to exactly one pinned no-op reference")
+                  elif ($refs[0] | type) != "number" or $refs[0] <= 0 then
+                    error("prompt \($p.prompt_sha256) has a non-positive pinned no-op reference")
+                  else
+                    ($p.serial_seconds_per_token_mean / $p.mtp_seconds_per_token_mean) / $refs[0]
+                  end ]
+            | sort
+            | if length == 0 then error("empty per-prompt breakdown")
+              elif (length % 2) == 1 then .[(length - 1) / 2]
+              else ((.[length/2 - 1] + .[length/2]) / 2)
+              end
+            ' "${results}")" || {
+              echo "::error::could not recompute the normalised median from the per-prompt breakdown and the trusted contract references" >&2
+              exit 1
+            }
+          # Independent-recompute cross-check. Same rule, two implementations
+          # (the wrapper's awk/sort and this jq); a disagreement beyond float
+          # noise means one of them is not doing what it says.
+          sealed="$(jq -r '.aggregate.normalized_decode_speedup_median' "${results}")"
+          if [[ "$(jq -rn --argjson a "${speedup}" --argjson b "${sealed}" \
+                    '(($a - $b) | fabs) < 0.0000001')" != "true" ]]; then
+            echo "::error::the recomputed normalised median ${speedup} disagrees with the wrapper's sealed ${sealed}" >&2
             exit 1
           fi
-          noop_ref="$(jq -r --arg s "${MLXFAST_QWEN_MTP_SELECTED_SHA256}" '[.timed_prompt_pool[] | select(.sha256 == $s) | .noop_decode_speedup] | if length == 1 then (.[0] | tostring) else "MISSING" end' "${MLXFAST_QWEN_MTP_CONTRACT_PATH}")"
-          if [[ "${noop_ref}" == "MISSING" || "${noop_ref}" == "null" || -z "${noop_ref}" ]]; then
-            echo "::error::no single pinned no-op reference (noop_decode_speedup) for the sampled timed prompt in ${MLXFAST_QWEN_MTP_CONTRACT_PATH}; the pool and its per-prompt references must be re-pinned together" >&2
-            exit 1
-          fi
-          if [[ "$(echo "${noop_ref} > 0" | bc -l)" != "1" ]]; then
-            echo "::error::pinned no-op reference ${noop_ref} for the sampled timed prompt is not a positive number" >&2
-            exit 1
-          fi
-          # score = raw / reference (full precision via jq, not bc scale).
-          speedup="$(jq -rn --argjson raw "${speedup_raw}" --argjson ref "${noop_ref}" '$raw / $ref')"
           floor_ok="$(echo "${speedup} >= ${MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR}" | bc -l)"
           if [[ "${floor_ok}" != "1" ]]; then
-            echo "::error::normalised mtp_decode_speedup ${speedup} (raw ${speedup_raw} / no-op reference ${noop_ref}) is below the ${MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR} floor" >&2
+            echo "::error::normalised mtp_decode_speedup median ${speedup} (pooled raw ${speedup_raw}) is below the ${MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR} floor" >&2
             exit 1
           fi
           jq -n \
@@ -2327,11 +2427,10 @@ jobs:
             --arg weights_hash "$(tr -d '[:space:]' < qwen-mtp-weights.sha256)" \
             --argjson score "${speedup}" \
             --argjson raw "${speedup_raw}" \
-            --argjson noop_ref "${noop_ref}" \
             --argjson floor "${MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR}" \
             --argjson decode_tokens "${MLXFAST_QWEN_MTP_DECODE_TOKENS}" \
             --argjson depth "${MLXFAST_QWEN_MTP_DEPTH}" \
-            --argjson target_pairs "${MLXFAST_QWEN_MTP_TARGET_PAIRS}" \
+            --argjson pairs_per_prompt "${MLXFAST_QWEN_MTP_PAIRS_PER_PROMPT}" \
             --slurpfile results "${results}" \
             '
             {
@@ -2340,22 +2439,38 @@ jobs:
               track_id: $track,
               metrics: {
                 mode: "qwen-mtp-paired-decode-only",
-                aggregation: "ratio_of_means",
+                aggregation: "median_of_per_prompt_normalized_ratio_of_means",
+                median_rule: "even_n_mean_of_two_central_order_statistics",
                 scoring_normalized: true,
                 commit: $commit,
                 decode_tokens: $decode_tokens,
                 mtp_depth: $depth,
                 decode_speedup_floor: $floor,
+                prompt_count: $results[0].prompt_count,
+                pairs_per_prompt: $pairs_per_prompt,
                 accepted_pair_count: $results[0].accepted_pair_count,
-                target_pair_count: $target_pairs,
                 parity_all_ok: $results[0].parity_all_ok,
-                mtp_decode_speedup_normalized: $score,
-                noop_reference_decode_speedup: $noop_ref,
-                mtp_decode_speedup_ratio_of_means: $raw,
+                mtp_decode_speedup_normalized_median: $score,
+                # Pooled and unnormalised: a diagnostic, never the score.
+                mtp_decode_speedup_pooled_ratio_of_means: $raw,
                 mtp_decode_speedup_median: $results[0].aggregate.mtp_decode_speedup_median,
                 mtp_decode_speedup_min: $results[0].aggregate.mtp_decode_speedup_min,
                 baseline_serial_seconds_per_token_mean: $results[0].aggregate.baseline_serial_seconds_per_token_mean,
                 candidate_mtp_seconds_per_token_mean: $results[0].aggregate.candidate_mtp_seconds_per_token_mean,
+                # The full breakdown the score is the median of. Every field
+                # here is already public (the pool digests and their no-op
+                # references are pinned in the checked-in contract), and
+                # publishing it is what lets a submitter see WHICH prompts their
+                # change helped instead of only the summary.
+                per_prompt: [
+                  $results[0].per_prompt[]
+                  | { prompt_sha256, accepted_pair_count,
+                      serial_seconds_per_token_mean,
+                      mtp_seconds_per_token_mean,
+                      raw_ratio_of_means,
+                      noop_reference_decode_speedup,
+                      normalized_ratio, parity_ok }
+                ],
                 qwen_mtp_weights_hash: $weights_hash
               }
             }

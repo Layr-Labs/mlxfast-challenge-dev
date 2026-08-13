@@ -68,6 +68,87 @@ entry's own measured `noop_decode_speedup` is pinned in the fixture, the raw
 ratio-of-means is divided by it, and every entry normalises to 1.0 by
 construction.
 
+### Scoring semantics: median of 8 (operator-ratified 2026-08-13)
+
+A ranked run **times the whole pool**, not one sampled prompt. Formally it draws
+one prompt per *collection*; each of the 8 collections is a singleton today, so
+all 8 run.
+
+```
+per prompt p:  raw_p  = mean(serial s/tok over p's pairs)
+                      / mean(mtp    s/tok over p's pairs)
+               norm_p = raw_p / p.noop_decode_speedup
+published:     score  = median(norm_1 .. norm_8)
+```
+
+**Why normalisation was not enough on its own.** Per-prompt normalisation
+cancels the *baseline's* prompt-dependence — every entry's own no-op maps to 1.0
+by construction. It cannot cancel the *candidate's* prompt-dependent improvement
+profile: a change that helps `medicine` and not `drama` still scored differently
+depending on the draw. Single-draw scoring was therefore a lottery over which
+prompt a submission happened to be good at. The median cancels that by
+construction, and being a median rather than a mean it also blunts any residual
+error in a single prompt's pinned reference.
+
+**The median rule is load-bearing because 8 is even:** the score is the mean of
+the two central order statistics, *not* the lower-median rule used by the
+per-pair `mtp_decode_speedup_median` diagnostic and by the CLI's own p50 fields.
+`results.json` and `score.json` both name the rule they used.
+
+**Pair budget is per prompt.** The ranked default is k=1 — 8 prompts × 1 pair =
+8 pairs / 16 timed phases, roughly 45 min of timed work. The old run-level 3/4
+budget bought pair-averaging on a single prompt; the median over 8 prompts does
+that job and also cancels the lottery. At the measured 0.77% pair noise, k=1
+puts the score's dispersion near 0.34%. Raise it with the wrapper's
+`--pairs-per-prompt` if calibration data asks.
+
+**The serial denominator band is pooled across prompts.** The serial control is
+depth 0 — 512 plain forwards — and is prompt-invariant by construction, since
+the measured pool spread lives entirely in the acceptance rate, which only the
+numerator sees. The band therefore checks the mean of *all* serial pairs of
+*all* prompts against the one top-level calibration: at 8+ pooled pairs that is
+a strictly stronger test than the 4-pair band it replaces, and no re-authoring
+of the installed calibration is required. Per-prompt serial means stay in the
+sealed breakdown, so a denominator that began to move with the prompt would be
+visible.
+
+### Why each prompt-window still pays its own process
+
+Batching all 8 prompts into one model residency per leg would be faster. It is
+**not available**, and the reasons are worth recording because they also define
+what taking that path would cost:
+
+- the worker builds exactly one `Qwen36MTPBlockSession` before the protocol
+  hello and guards `mtp_decode_begin` with `!state.began`; there is no reset
+  request kind anywhere in the tree (`QwenRuntimeMTPWorker.swift`);
+- the parent driver takes one golden per call and spawns a **second** worker
+  afterwards for the post-window reference replay
+  (`QwenRuntimeMTPDriver.swift`), so a batched leg would have to batch the audit
+  replay too;
+- the CLI's option parser rejects a repeated `--golden` outright ("duplicate
+  option") — the batched argv shape is a hard error, not last-wins;
+- **decisively**, the serial leg executes the *pinned baseline tree's* own
+  prebuilt `mlxfast-swift` and its sibling worker, so no repo-side protocol
+  change reaches it. Batching needs a new baseline build, a new signed §9d
+  manifest and a full re-calibration;
+- and it would change the measured quantity anyway: only the first
+  prompt-window of a batched leg carries the cold working set, while the
+  installed band was authored against per-window process start + allocator
+  clear + warm + a seed prefill charged *inside* the clock.
+
+**One consequence for the stall guard**, recorded because it constrains that
+future path: under batching the post-prefill warmup belongs to the *leg*, not to
+each window, so `STALL_EXCLUDE_FIRST_BLOCK` would have to become leg-aware —
+exclude `block[0]` of window 1 only. Excluding `block[0]` of every window opens
+8 blind spots at exactly the window boundaries where a stall is most likely;
+including `block[0]` of window 1 reinstates the 5.72–5.90x false rejection the
+calibration removed. Either way the CLI report would have to declare its
+position within the leg. On the per-invocation shape kept here the question does
+not arise: every window *is* a leg, and the guard is unchanged.
+
+Batched legs remain a documented future path. Taking it is a measurement-
+architecture change, not a scoring change.
+
 ## Step B — freeze and pin the hidden goldens (DONE)
 
 Three classes of hidden object, all content-addressed, all pinned by digest AND
@@ -112,6 +193,11 @@ window, identically on both legs; and the measurement wrapper seals
 `prefill_component: "none"` in its `results.json`. A prefill figure is recorded
 for historical tracking only. A reader who finds the prefill constant and assumes
 it participates in scoring will mis-tune the track.
+
+**The floor applies to the normalised MEDIAN** (see "Scoring semantics" under
+step A). An unmodified candidate medians to 1.0 by construction, so 0.95 remains
+the same 5% margin below parity it always was — the number did not move when the
+aggregation did.
 
 ## Step D — flip the two trusted-contract fields
 

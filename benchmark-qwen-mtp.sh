@@ -21,8 +21,10 @@
 #   * the reference rows are produced by the CANDIDATE's own build, not by the
 #     pinned baseline, so it checks MTP/serial parity and speed direction -- not
 #     target fidelity;
-#   * the ranked run samples a hidden pool prompt and scores per-prompt
-#     normalised, none of which this local loop can reproduce;
+#   * the ranked run times ALL 8 hidden pool prompts, normalises each against
+#     that prompt's own pinned no-op reference and publishes the MEDIAN of the 8
+#     -- none of which this local loop can reproduce (it has one prompt, no
+#     pinned references and no median to take);
 #   * .github/workflows/qwen-mtp-ranked-benchmark.yml measures against
 #     organizer-pinned hidden goldens on the ranked box and is the only authority
 #     for both fidelity and score.

@@ -732,4 +732,282 @@ struct QwenMTPGoLiveRunbookTests {
         #expect(runbook.lowercased().contains("fail-closed")
             || runbook.lowercased().contains("fails closed"))
     }
+
+    /// The runbook must describe the scoring the track actually performs. It
+    /// documented single-sampled-prompt scoring for as long as that was true;
+    /// leaving that text in place after the semantics changed would make the
+    /// operator-facing record the most authoritative-looking wrong answer in
+    /// the tree.
+    @Test
+    func runbookDescribesMedianOfEightScoring() throws {
+        let runbook = try String(contentsOfFile: Self.path, encoding: .utf8)
+        #expect(runbook.contains("median"))
+        // The rule, not just the word: 8 is even, so which median matters.
+        #expect(
+            runbook.contains("two central order statistics"),
+            "the runbook must state the even-n median rule the score uses"
+        )
+        // Pair budget is per prompt now, and the runbook is where an operator
+        // reads the wall-clock consequence.
+        #expect(runbook.contains("pairs-per-prompt") || runbook.contains("per prompt"))
+        // Pooled denominator banding -- the property that lets the INSTALLED
+        // calibration keep working across this change.
+        #expect(runbook.lowercased().contains("pooled"))
+        // And the recorded reason the per-invocation shape was kept.
+        #expect(runbook.contains("mtp_decode_begin"))
+    }
+}
+
+// MARK: - Scoring semantics: median of 8
+
+/// The operator-ratified scoring change of 2026-08-13: a ranked run times ALL
+/// eight pool prompts, normalises each against that prompt's own pinned no-op
+/// reference, and publishes the MEDIAN of the eight normalised ratios.
+///
+/// Everything here reads checked-in text or runs pure arithmetic. The point of
+/// the suite is that the rule is stated identically in the four places that
+/// have to agree -- the contract fixture, the track manifest, the ranked
+/// workflow and the operator runbook -- because the previous single-sample rule
+/// was also stated in all four, and a change that updates three of them leaves
+/// the fourth as a confident lie.
+@Suite
+struct QwenMTPScoringSemanticsTests {
+    private typealias S = DFlashGateTextSupport
+
+    private static let workflowPath =
+        ".github/workflows/qwen-mtp-ranked-benchmark.yml"
+    private static let fixturePath = "fixtures/qwen3_6_27b_mtp_track.json"
+    private static let manifestPath = "benchmark.qwen-mtp.json"
+    private static let aggregation =
+        "median_of_per_prompt_normalized_ratio_of_means"
+    private static let medianRule =
+        "even_n_mean_of_two_central_order_statistics"
+
+    /// THE RULE ITSELF, executed. 8 is even, so "the median" is ambiguous until
+    /// the tie-break is named, and the two candidate rules disagree on every
+    /// even-length population. The wrapper and the workflow both implement the
+    /// mean-of-two-central rule; this pins what that means so a future
+    /// "simplification" onto the lower-median rule used by the per-pair
+    /// diagnostic is a red test rather than a quiet score shift.
+    @Test
+    func theEvenMedianRuleIsTheMeanOfTheTwoCentralValues() throws {
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            let n = sorted.count
+            return n % 2 == 1
+                ? sorted[(n - 1) / 2]
+                : (sorted[n / 2 - 1] + sorted[n / 2]) / 2
+        }
+        func lowerMedian(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[(sorted.count - 1) / 2]
+        }
+
+        let eight = [1.10, 0.90, 1.00, 1.02, 0.98, 1.05, 0.95, 1.01]
+        #expect(median(eight) == 1.005)
+        // The two rules genuinely differ on this population -- otherwise the
+        // assertion above would be pinning nothing.
+        #expect(lowerMedian(eight) == 1.00)
+        #expect(median(eight) != lowerMedian(eight))
+        // Odd n is unambiguous and both rules agree.
+        #expect(median([3, 1, 2]) == 2)
+
+        // The anti-lottery property, as arithmetic: an unmodified candidate
+        // normalises to 1.0 on every prompt regardless of the 1.44x no-op
+        // spread, so it medians to exactly 1.0 and clears the 0.95 floor.
+        let fixture = try S.json(Self.fixturePath)
+        let pool = try #require(fixture["timed_prompt_pool"] as? [[String: Any]])
+        let noops = pool.compactMap { $0["noop_decode_speedup"] as? Double }
+        #expect(noops.count == 8)
+        let unmodified = noops.map { $0 / $0 }
+        #expect(median(unmodified) == 1.0)
+        // ... and a candidate that only helps ONE prompt does not score as if
+        // it helped all of them. A mean would read 1.05 here; the median does
+        // not move at all. This is the number the whole change buys.
+        var oneWin = Array(repeating: 1.0, count: 8)
+        oneWin[0] = 1.40
+        #expect(median(oneWin) == 1.0)
+        #expect(oneWin.reduce(0, +) / 8 > 1.04)
+    }
+
+    /// The contract fixture carries the machine-readable rule, in its own
+    /// coordinate-free block. It must NOT have disturbed the measured pool: the
+    /// eight entries and their pinned no-op references are a separate concern
+    /// with a separate owner, and this change adds keys beside them rather than
+    /// editing them.
+    @Test
+    func theFixtureDeclaresTheScoringSemanticsWithoutDisturbingThePool() throws {
+        let fixture = try S.json(Self.fixturePath)
+        let semantics = try #require(
+            fixture["scoring_semantics"] as? [String: Any],
+            "the contract fixture must carry a machine-readable scoring_semantics block"
+        )
+        #expect(semantics["aggregation"] as? String == Self.aggregation)
+        #expect(semantics["median_rule"] as? String == Self.medianRule)
+        #expect(semantics["pairs_per_prompt"] as? Int == 1)
+        // The reference is joined on the golden object's own digest, not on
+        // argv order or a filename. That is what makes an unpinned golden fail
+        // closed instead of borrowing its neighbour's normalisation.
+        let key = try #require(semantics["reference_key"] as? String)
+        #expect(key.contains("sha256"))
+        // Pooled denominator banding has to be stated, because it is the reason
+        // the installed calibration survives the change unmodified.
+        let banding = try #require(semantics["serial_denominator_banding"] as? String)
+        #expect(banding.lowercased().contains("pooled"))
+
+        // The pool itself is untouched: 8 distinct entries, each with a
+        // positive measured reference.
+        let pool = try #require(fixture["timed_prompt_pool"] as? [[String: Any]])
+        #expect(pool.count == 8)
+        #expect(Set(pool.compactMap { $0["sha256"] as? String }).count == 8)
+        #expect(
+            pool.allSatisfy { ($0["noop_decode_speedup"] as? Double).map { $0 > 0 } ?? false }
+        )
+    }
+
+    /// The manifest and the fixture must state the SAME rule. These are the two
+    /// documents a participant and an operator respectively read first.
+    @Test
+    func theManifestAndFixtureAgreeOnTheAggregationRule() throws {
+        let manifest = try S.json(Self.manifestPath)
+        let scoring = try #require(manifest["scoring"] as? [String: Any])
+        #expect(scoring["aggregation"] as? String == Self.aggregation)
+        #expect(scoring["medianRule"] as? String == Self.medianRule)
+        #expect(scoring["pairsPerPrompt"] as? Int == 1)
+        #expect(scoring["minPairsPerPrompt"] as? Int == 1)
+
+        let fixture = try S.json(Self.fixturePath)
+        let semantics = try #require(fixture["scoring_semantics"] as? [String: Any])
+        #expect(
+            scoring["aggregation"] as? String == semantics["aggregation"] as? String,
+            "the manifest and the contract fixture disagree about how the score is aggregated"
+        )
+        #expect(
+            scoring["medianRule"] as? String == semantics["median_rule"] as? String,
+            "the manifest and the contract fixture disagree about the median rule"
+        )
+        #expect(
+            (scoring["pairsPerPrompt"] as? Int) == (semantics["pairs_per_prompt"] as? Int),
+            "the manifest and the contract fixture disagree about the per-prompt pair budget"
+        )
+
+        // The manifest must also say WHY normalisation alone was not enough,
+        // since that is the question a reader asks when they see two mechanisms
+        // stacked on one score.
+        let anti = try #require(scoring["antiLotteryNote"] as? String)
+        #expect(anti.lowercased().contains("normalisation alone is not enough"))
+    }
+
+    /// The workflow's per-prompt pair budget must equal the one both documents
+    /// declare. The workflow is the only enforcing site; the other two are
+    /// documentation, exactly as with the decode floor.
+    @Test
+    func theWorkflowPinsThePairBudgetTheDocumentsDeclare() throws {
+        let environment = try S.jobEnvironment(try S.text(Self.workflowPath))
+        let pairs = try #require(environment["MLXFAST_QWEN_MTP_PAIRS_PER_PROMPT"])
+        let minPairs = try #require(environment["MLXFAST_QWEN_MTP_MIN_PAIRS_PER_PROMPT"])
+        #expect(pairs == "1")
+        #expect(minPairs == "1")
+
+        let manifest = try S.json(Self.manifestPath)
+        let scoring = try #require(manifest["scoring"] as? [String: Any])
+        #expect(Int(pairs) == scoring["pairsPerPrompt"] as? Int)
+        #expect(Int(minPairs) == scoring["minPairsPerPrompt"] as? Int)
+
+        // The run-level budget the per-prompt one replaced must be GONE, not
+        // left beside it: two pair budgets in one workflow is an invitation to
+        // wire the wrong one into the wrapper.
+        let workflow = try S.text(Self.workflowPath)
+        #expect(!workflow.contains("MLXFAST_QWEN_MTP_MIN_ACCEPTED_PAIRS"))
+        #expect(!workflow.contains("MLXFAST_QWEN_MTP_TARGET_PAIRS"))
+    }
+
+    /// The ranked workflow must TIME the whole pool. Scanned on the
+    /// comment-stripped view so the historical explanation in the comments
+    /// cannot satisfy an assertion about what the job does.
+    @Test
+    func theRankedWorkflowTimesEveryPoolPromptAndDrawsNothing() throws {
+        let workflow = try S.text(Self.workflowPath)
+        let executable = S.executable(workflow)
+
+        // 1. NO DRAW. The uniform sampler is the thing that was removed; if it
+        //    comes back, the median is a median over one prompt again.
+        #expect(
+            !executable.contains("/dev/urandom"),
+            "the Qwen-MTP workflow still draws a random timed target"
+        )
+        #expect(!executable.contains("selected_index"))
+
+        // 2. The resolve step publishes the whole set, and the download step
+        //    verifies EVERY object rather than one sampled pin.
+        let resolve = try S.stepBody(workflow, "Resolve the hidden Qwen-MTP timed prompt set")
+        #expect(resolve.contains("qwen_mtp_timed_prompt_set.json"))
+        #expect(resolve.contains("pool_size="))
+        // The pool validation that predates this change must survive it: the
+        // per-entry sweep and the >= 8 DISTINCT floor are what make the median
+        // a median over eight real prompts.
+        #expect(resolve.contains("required_distinct=8"))
+        #expect(resolve.contains("noop_decode_speedup"))
+
+        let prepare = try S.stepBody(workflow, "Prepare hidden Qwen-MTP goldens")
+        #expect(prepare.contains("qwen_mtp_benchmark_golden_${index}.json"))
+        #expect(
+            prepare.contains("hidden Qwen-MTP timed golden pin mismatch for pool entry"),
+            "each downloaded pool object must be verified against its own pin"
+        )
+
+        // 3. The timing step passes the whole set to the wrapper, per prompt.
+        let timed = try S.stepBody(
+            workflow, "Timed paired Qwen-MTP benchmark (measure-qwen-mtp-job)")
+        #expect(timed.contains("golden_args+=(--golden"))
+        #expect(timed.contains("--pairs-per-prompt"))
+        #expect(timed.contains("--min-pairs-per-prompt"))
+        #expect(
+            !timed.contains("--golden \"${MLXFAST_PRIVATE_DIR}/qwen_mtp_benchmark_golden.json\""),
+            "the timing step still passes a single sampled golden"
+        )
+    }
+
+    /// The scoring step must RECOMPUTE the median from the sealed per-prompt
+    /// breakdown and the TRUSTED contract's references, and must assert the
+    /// breakdown's shape. A results.json carrying fewer per-prompt entries than
+    /// the pool has is the prompt lottery returning as a missing-data bug, so
+    /// the shape is part of the gate rather than a diagnostic.
+    @Test
+    func theScoringStepRecomputesTheMedianAndGatesTheBreakdownShape() throws {
+        let workflow = try S.text(Self.workflowPath)
+        let score = try S.stepBody(workflow, "Compute Qwen-MTP score and enforce floor")
+
+        // Recomputed here, from per-prompt means -- never read out of a
+        // pre-aggregated field the wrapper supplied.
+        #expect(score.contains("serial_seconds_per_token_mean / $p.mtp_seconds_per_token_mean"))
+        #expect(score.contains("timed_prompt_pool"))
+        #expect(
+            score.contains("MLXFAST_QWEN_MTP_CONTRACT_PATH"),
+            "the no-op references must come from the trusted contract checkout"
+        )
+        // The even-n rule, spelled in the jq as well as in the docs.
+        #expect(score.contains("(.[length/2 - 1] + .[length/2]) / 2"))
+
+        // Breakdown shape is gated: one entry per pool prompt, each parity-clean
+        // and distinct.
+        #expect(score.contains("(.per_prompt | length) == $pool_size"))
+        #expect(score.contains(".parity_ok == true"))
+        #expect(score.contains("unique | length) == $pool_size"))
+
+        // Cross-check against the wrapper's own sealed value: same rule, two
+        // implementations, and a disagreement is an error rather than a
+        // preference for one of them.
+        #expect(score.contains("normalized_decode_speedup_median"))
+        #expect(score.contains("disagrees with the wrapper's sealed"))
+
+        // The floor still applies, and still to the normalised figure.
+        #expect(score.contains("MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR"))
+
+        // The published payload carries the median AND the breakdown, so a
+        // submitter can see which prompts their change helped.
+        #expect(score.contains("mtp_decode_speedup_normalized_median"))
+        #expect(score.contains("per_prompt: ["))
+        #expect(score.contains("aggregation: \"\(Self.aggregation)\""))
+    }
 }

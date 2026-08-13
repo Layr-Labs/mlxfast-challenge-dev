@@ -102,18 +102,34 @@
     "required_rebaseline_hardware": "m5-qwen3.6-27b-mtp",
     "_note": "The paired depth-0 serial control, the per-prompt no-op references and the thermal/telemetry envelope were all measured on box 3 at tip 6a3bee9. publication_allowed was flipped to true on 2026-08-13 by the operator's go-live runbook (docs/qwen-mtp-go-live-runbook.md step D); it gates ranked scoring together with official_scoring_enabled, and both are now true. The installed and calibrated on-box baseline tree is e86655528c2abe534aa2e61a454565237801aa2d, pinned by path (/opt/bench-runner/baseline/qwen3.6-27b-mtp-v1/current) and by the signed section-9d manifest rather than by any workflow commit variable."
   },
+  "scoring_semantics": {
+    "status": "operator_ratified_2026-08-13",
+    "aggregation": "median_of_per_prompt_normalized_ratio_of_means",
+    "prompt_selection": "one prompt per collection; each of the 8 timed_prompt_pool collections is a singleton today, so a ranked run times ALL 8. There is no per-run draw.",
+    "per_prompt_score": "raw_p = mean(serial seconds/token over p's accepted pairs) / mean(candidate seconds/token over p's accepted pairs); norm_p = raw_p / p.noop_decode_speedup",
+    "published_score": "median(norm_p over all timed prompts)",
+    "median_rule": "even_n_mean_of_two_central_order_statistics",
+    "median_rule_note": "8 is EVEN, so the rule matters: the score is the mean of the two central order statistics, NOT the lower-median rule used by the per-pair mtp_decode_speedup_median diagnostic and by the CLI's own p50 fields. results.json names both.",
+    "reference_key": "timed_prompt_pool[].sha256, matched against the SHA-256 of the golden object itself. Keying on the bytes rather than on argv order or a filename means an unpinned golden, or a pool re-pinned without its objects, fails closed instead of scoring against the wrong reference.",
+    "pairs_per_prompt": 1,
+    "pairs_per_prompt_note": "PER PROMPT, not per run: a ranked run is 8 prompts x 1 pair = 8 pairs / 16 timed phases. k=1 is the ranked default and is raisable via the wrapper's --pairs-per-prompt. The old 3/4 budget bought pair-averaging on a SINGLE prompt; the median over 8 prompts does that job and also cancels the prompt lottery, which pair-averaging on one prompt never could.",
+    "serial_denominator_banding": "POOLED across prompts: the band check runs on the mean of every accepted serial pair of every prompt against the one top-level calibration. The serial control is depth 0 -- 512 plain forwards -- and is prompt-invariant by construction, since the measured pool spread lives entirely in the acceptance rate, which only the numerator sees. Pooling 8+ pairs is a stronger test than the 4-pair band it replaces; per-prompt serial means stay in the sealed breakdown so a denominator that began to move with the prompt would be visible.",
+    "rationale": "Per-prompt normalisation cancels the BASELINE's prompt-dependence -- each entry's own measured no-op maps to 1.0 by construction -- but it cannot cancel the CANDIDATE's prompt-dependent improvement profile: a change that helps `medicine` and not `drama` still scores differently depending on which prompt was drawn. Single-draw scoring is therefore a prompt lottery even after normalisation. Median-of-8 cancels it by construction, and being a median rather than a mean it also de-fangs any residual error in a single prompt's pinned reference.",
+    "token_exactness": "unchanged: every timed phase must return all_tokens_matched=true, parity_all_ok is the AND over every accepted pair of every prompt, and the per-prompt breakdown carries its own parity_ok so a failure names the prompt.",
+    "supersedes": "the single-sampled-prompt scoring described in proposed_scoring.normalized_scoring below, which drew one pool prompt uniformly at random per run."
+  },
   "proposed_scoring": {
     "status": "proposed_phase5_awaiting_operator_signoff",
     "score": "qwen_mtp_decode_speedup = (paired_serial_decode_sec_per_token at --mtp-depth 0) / (candidate decode_sec_per_token at --mtp-depth 2), over the same rows golden and the same parent-counted 512-token window",
     "ranked_decode_window_tokens": 512,
-    "aggregation": "ratio_of_means: mean(serial seconds/token across accepted pairs) / mean(candidate seconds/token across accepted pairs)",
+    "aggregation": "ratio_of_means WITHIN a prompt: mean(serial seconds/token across that prompt's accepted pairs) / mean(candidate seconds/token across the same pairs). The RUN's published score is the median of the per-prompt normalised values -- see the scoring_semantics block above, which is the authority.",
     "denominator_authority": "trusted parent wall time divided by the parent-configured decode token count; worker-reported timing is never scored",
     "component_floor": "NORMALISED aggregate qwen_mtp_decode_speedup >= 0.95",
     "normalized_scoring": {
-      "status": "proposed_phase5",
-      "rationale": "The anti-lottery sampler draws one pool prompt uniformly at random per run, and the measured no-op reference spans 0.756 to 1.0915 across the pool. Without normalisation the draw would dominate the score.",
+      "status": "SUPERSEDED_2026-08-13 by the top-level scoring_semantics block; retained as the record of why normalisation exists",
+      "rationale": "The measured no-op reference spans 0.756 to 1.0915 across the pool. Under the ORIGINAL single-draw design one pool prompt was drawn uniformly at random per run, and without normalisation that draw would have dominated the score. Normalisation is still applied per prompt for exactly this reason; what changed is that a run now times ALL 8 prompts and publishes the median, because normalisation alone cannot cancel a candidate's own prompt-dependent improvement profile.",
       "reference_source": "timed_prompt_pool[].noop_decode_speedup, keyed by sha256. Each entry's own measured no-op normalises to 1.0.",
-      "published_score": "score = normalised ratio-of-means; metrics carry BOTH the raw ratio and the normalised value"
+      "published_score": "score = median over prompts of the per-prompt normalised ratio-of-means; metrics carry the pooled raw ratio, the per-prompt breakdown and the median"
     },
     "token_fidelity_gate": "Every emitted token must equal the serial trajectory: mtp-verify at the candidate depth must return all_tokens_matched=true AND parity_all_ok=true, with the row ledger CLOSED (reference_checked_row_total == declared_rows_total, and accepted + rejected + target_tail == declared_rows_total). Verified on box 3 across all 8 pool prompts and the hidden correctness golden.",
     "token_fidelity_gate_status": "implemented",
