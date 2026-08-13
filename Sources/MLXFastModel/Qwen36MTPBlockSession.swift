@@ -301,6 +301,14 @@ public final class Qwen36MTPBlockSession {
             )
         }
 
+        // OPERATOR K-TEST VARIANT, k = 2: the REFERENCE arm of the matrix. The
+        // draft loop below is untouched, so this branch drafts exactly the depth
+        // the parent requested -- the unmodified schedule the pinned no-op
+        // references were measured from. It carries this comment and nothing
+        // else, on purpose: it is a real submission-shaped diff on the editable
+        // surface whose expected normalised median is 1.000, which is what makes
+        // it the control the k=0/1/3 arms are read against.
+        //
         // 1. DRAFT. One fresh head cache per round, shared across the sub-steps;
         //    each sub-step chains the head's OWN post-`mtp.norm` hidden, never
         //    the trunk hidden again — re-feeding the trunk hidden would draft
