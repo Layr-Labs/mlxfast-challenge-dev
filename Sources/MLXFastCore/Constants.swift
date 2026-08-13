@@ -245,6 +245,91 @@ public enum MLXFastConstants {
     /// token per target forward. Depth 1 remains available as a labelled
     /// speculative-depth-1 diagnostic and is never the denominator.
     public static let qwenMTPSerialControlDepth = 0
+
+    /// SCORED. The serial denominator of this track's paired ratio: mean
+    /// depth-0 seconds/token of the pinned baseline at the ranked 512-token
+    /// window.
+    ///
+    /// Provenance: gated calibration sessions on m5-max-128gb-3, 2026-08-13,
+    /// authored via `measure-qwen-mtp-job.sh --calibration-bootstrap` and
+    /// installed as the on-box band in
+    /// `/opt/bench-runner/state/qwen3.6-27b-mtp-v1/baseline-calibration.json`.
+    /// Reproduced by every ranked run since: the pooled serial means of the
+    /// four go-live calibration dispatches
+    /// (31712368539, 31715555814, 31718615518, 31721547429) band against this
+    /// value at ratios 1.001674 / 1.001795 / 1.000355 / 1.001264 — every one
+    /// inside `[0.95, 1.05]`, and all four within 0.18% of the pinned mean,
+    /// which is the evidence that this constant still describes the box.
+    ///
+    /// It is TRACK-SCOPED on purpose. The unprefixed
+    /// `officialBaselineDecodeSecondsPerToken` above is the Poolside/Laguna
+    /// serial calibration that the live DFlash track compiles against; this
+    /// value is 2.74x larger and overwriting the shared constant with it would
+    /// silently retune another live track's acceptance-band reference.
+    ///
+    /// The depth-0 leg does prompt-INDEPENDENT work (512 plain forwards), which
+    /// is why one pooled denominator serves all 8 timed prompts: the measured
+    /// pool spread lives entirely in the acceptance rate, which only the
+    /// numerator sees.
+    public static let qwenMTPOfficialBaselineDecodeSecondsPerToken = 0.037994794617407023
+
+    /// UNSCORED — informational / historical tracking only.
+    ///
+    /// This track's score has NO PREFILL COMPONENT. `mtp_decode_speedup` is a
+    /// decode-only ratio-of-means; the seed prefill is charged *inside* the
+    /// decode measurement window, identically on both legs of every pair; and
+    /// `measure-qwen-mtp-job.sh` seals `prefill_component: "none"` in the
+    /// `results.json` it signs. Nothing reads this constant to compute a score,
+    /// and a future reader who assumes it participates will mis-tune the track.
+    ///
+    /// Provenance: RUNBOOK section 3.4, measured in the same gated sessions and
+    /// the same thermal/fan regime as the decode figure above, over the same
+    /// 512-token prefill window the ranked workflow pins
+    /// (`benchmarkPrefillPromptTokens`). 3 observations, spread 0.17%.
+    ///
+    /// It is deliberately NOT wired into the local-mode estimate. The Qwen-MTP
+    /// local path (`benchmark-qwen-mtp.sh`, `mtp-timed`) consumes no pinned
+    /// baseline constant at all: it reports a same-session paired ratio, timing
+    /// both legs in the run. There is therefore no seam to redirect, and
+    /// introducing one would replace a self-normalising measurement with a
+    /// hardware-absolute one — changing what the local number MEANS rather than
+    /// improving it.
+    public static let qwenMTPOfficialBaselinePrefillSecondsPerToken = 0.00115714
+
+    /// Semantic GPQA min-pass for THIS track, derived per NEW-MODEL-BRINGUP 7.4
+    /// as `min(observed) - 1` over the four baseline-equivalent ranked
+    /// calibration dispatches of 2026-08-13 (31712368539, 31715555814,
+    /// 31718615518, 31721547429). Every one of them judged 9/9, so
+    /// `min(observed) = 9` and the floor is 8 — one case of error budget for
+    /// judge nondeterminism, which is the whole point of the -1.
+    ///
+    /// TRACK-SCOPED deliberately. The unprefixed `semanticGPQAMinPassCount = 7`
+    /// above is the LIVE DFlash track's calibrated floor, tied to the DFlash
+    /// workflow env by `reusedGateCalibrationInTheDFlashWorkflowMatchesConstants`;
+    /// raising the shared constant would retune a live track that has not been
+    /// re-derived. Mirrored into MLXFAST_SEMANTIC_GPQA_MIN_PASS in the Qwen
+    /// workflow ONLY, and pinned to it by
+    /// `theQwenWorkflowMirrorsTheTrackScopedGPQAFloor`. The shared
+    /// `run-semantic-gpqa-gate.sh` default stays 7: it serves both tracks, and
+    /// the value that binds is the workflow env, not the script default.
+    ///
+    /// KNOWN LIMITATION — this floor cannot reject a constant-"A" answerer, and
+    /// raising it to 9 would not fix that. Every `answer_key` in the hidden
+    /// fixture is "A" while each prompt offers four options, and the reference
+    /// model is measurably position-biased toward A (it tracks the correct
+    /// option only ~2/9 when option order is rotated). Since
+    /// `accepted_responses` was filled from the reference model's own captures,
+    /// the gate measures FIDELITY TO THE REFERENCE, not question-answering
+    /// accuracy: 8 of the 9 reference captures are "A", so a constant-"A"
+    /// answerer scores exactly 8 — precisely this floor. Going to 9 would only
+    /// delete the judge-nondeterminism budget while still admitting it. The
+    /// real fix is shuffling option order, which is organizer material and is
+    /// tracked operator-side, deliberately not done in this repo.
+    /// (Do NOT restate the older "the reference selects a spread of letters"
+    /// rationale attached to the shared constant above — it is false for this
+    /// fixture and this floor does not rest on it.)
+    public static let qwenMTPSemanticGPQAMinPassCount = 8
+
     // Criterion E residual bucket: emitted tokens that match NEITHER the
     // reference K=1 argmax NOR the reference argmax in the candidate-declared
     // block frame are counted here and must additionally sit inside the

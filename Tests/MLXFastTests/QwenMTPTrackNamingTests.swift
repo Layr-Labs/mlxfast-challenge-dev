@@ -1,6 +1,9 @@
 import Foundation
 import Testing
 
+// The track-scoped constants pinned by QwenMTPTrackScopedConstantsTests.
+import MLXFastCore
+
 // NAMING LAW FOR THE QWEN 3.6 NATIVE-MTP TRACK (qwen3.6-27b-mtp-v1).
 //
 // The organizer's rule is that no retired Gemma/Laguna MTP surface name may
@@ -685,6 +688,78 @@ struct QwenMTPTrackNamingTests {
                 """
             )
         }
+    }
+}
+
+/// The Qwen-MTP track carries its own calibrated constants rather than reusing
+/// the unprefixed ones, which belong to the Poolside/Laguna serial calibration
+/// that the LIVE DFlash track compiles against. That separation is only
+/// trustworthy if it cannot silently collapse, in either direction: a future
+/// edit that "tidies up" by pointing the Qwen workflow at the shared constant,
+/// or that raises the shared constant to match Qwen, would retune a live track
+/// that has not been re-derived. Both directions are pinned here.
+@Suite
+struct QwenMTPTrackScopedConstantsTests {
+    private typealias S = DFlashGateTextSupport
+
+    @Test
+    func theQwenWorkflowMirrorsTheTrackScopedGPQAFloor() throws {
+        let environment = try S.jobEnvironment(
+            try S.text(".github/workflows/qwen-mtp-ranked-benchmark.yml"))
+        #expect(
+            environment["MLXFAST_SEMANTIC_GPQA_MIN_PASS"]
+                == String(MLXFastConstants.qwenMTPSemanticGPQAMinPassCount),
+            """
+            the Qwen workflow's semantic GPQA floor must mirror \
+            qwenMTPSemanticGPQAMinPassCount \
+            (\(MLXFastConstants.qwenMTPSemanticGPQAMinPassCount)), not the \
+            shared DFlash-calibrated semanticGPQAMinPassCount \
+            (\(MLXFastConstants.semanticGPQAMinPassCount))
+            """
+        )
+    }
+
+    /// The two floors are ALLOWED to differ — that is the point — but the
+    /// shared one must not drift onto the Qwen value by accident.
+    @Test
+    func theSharedGPQAFloorStaysAtTheDFlashCalibration() throws {
+        #expect(
+            MLXFastConstants.semanticGPQAMinPassCount == 7,
+            """
+            the shared semanticGPQAMinPassCount moved. It is the LIVE DFlash \
+            track's calibrated floor and is tied to the DFlash workflow env by \
+            reusedGateCalibrationInTheDFlashWorkflowMatchesConstants. Re-derive \
+            that track before changing it; the Qwen track has its own constant.
+            """
+        )
+        let dflash = try S.jobEnvironment(try S.text(S.dflashWorkflowPath))
+        #expect(dflash["MLXFAST_SEMANTIC_GPQA_MIN_PASS"] == "7",
+                "the DFlash workflow floor must not follow the Qwen re-derivation")
+        // The shared gate script serves both tracks, so its default must stay
+        // the conservative inherited value; the binding value is the job env.
+        let gate = try S.text(".github/scripts/run-semantic-gpqa-gate.sh")
+        #expect(gate.contains("MLXFAST_SEMANTIC_GPQA_MIN_PASS:-7}"),
+                "the shared gate script default must stay 7")
+    }
+
+    /// The scored decode denominator must not be confused with the shared
+    /// Poolside value, and the prefill figure must stay marked unscored.
+    @Test
+    func theTrackScopedBaselineConstantsAreDistinctAndDocumented() throws {
+        #expect(
+            MLXFastConstants.qwenMTPOfficialBaselineDecodeSecondsPerToken
+                != MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+            "the Qwen decode denominator must not collapse onto the Poolside one"
+        )
+        #expect(MLXFastConstants.qwenMTPOfficialBaselineDecodeSecondsPerToken > 0)
+        #expect(MLXFastConstants.qwenMTPOfficialBaselinePrefillSecondsPerToken > 0)
+
+        let constants = try S.text("Sources/MLXFastCore/Constants.swift")
+        // Prefill is UNSCORED on this decode-only track; the prose must say so
+        // wherever the constant is quoted (RUNBOOK 3.6).
+        #expect(constants.contains("prefill_component: \"none\""),
+                "the prefill constant's provenance must state the sealed contract")
+        #expect(constants.lowercased().contains("unscored"))
     }
 }
 

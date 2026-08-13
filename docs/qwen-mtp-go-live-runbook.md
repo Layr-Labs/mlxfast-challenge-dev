@@ -213,6 +213,39 @@ step A). An unmodified candidate medians to 1.0 by construction, so 0.95 remains
 the same 5% margin below parity it always was — the number did not move when the
 aggregation did.
 
+### The constants landed at go-live
+
+Both are **track-scoped** (`qwenMTP…`-prefixed, in the Qwen section of
+`Sources/MLXFastCore/Constants.swift`). The unprefixed `officialBaseline*`
+constants are the Poolside/Laguna serial calibration that the **live DFlash
+track** compiles against; the decode figure here is 2.74x larger, so overwriting
+the shared constant would silently retune another live track's acceptance-band
+reference. They are quoted here character-for-character:
+
+- `qwenMTPOfficialBaselineDecodeSecondsPerToken = 0.037994794617407023`
+- `qwenMTPOfficialBaselinePrefillSecondsPerToken = 0.00115714`
+- `qwenMTPSemanticGPQAMinPassCount = 8`
+
+**Decode is SCORED** — it is the serial denominator of the paired ratio, and the
+same value the on-box band checks against. **Prefill is UNSCORED**: this track's
+score has no prefill component at all. `mtp_decode_speedup` is a decode-only
+ratio-of-means, the seed prefill is charged *inside* the decode window
+identically on both legs, and the wrapper seals `prefill_component: "none"` in
+the `results.json` it signs. The prefill figure is retained for historical
+tracking only.
+
+Prefill is also deliberately **not** wired into the local-mode estimate. The
+Qwen-MTP local path consumes no pinned baseline constant: it times both legs in
+the same session and reports that ratio. There is no seam to redirect, and
+adding one would replace a self-normalising measurement with a
+hardware-absolute one — changing what the local number means rather than
+improving it.
+
+The GPQA floor is `min(observed) − 1` over the four go-live calibration
+dispatches, each of which judged 9/9. Its honest limitation is recorded under
+"Known limits" below and in the constant's own doc comment: it cannot reject a
+constant-"A" answerer, and raising it to 9 would not fix that.
+
 ### The CALIBRATION acceptance window (derived 2026-08-13, not inherited)
 
 This is the operator's own accept/reject band for **calibration dispatches** —
@@ -262,6 +295,34 @@ For contrast, the same inputs give a *single-draw* window of ±0.58%, and that i
 before per-prompt reference error, which is what the old single-shot references
 contributed and what made a 1.1% miss look normal. Median-of-8 is both tighter
 and robust to one bad reference.
+
+**CONFIRMED against the four go-live calibration dispatches** (31712368539,
+31715555814, 31718615518, 31721547429), which published medians of
+1.0012383415613857, 1.0004179605801127, 0.9990292566514924 and
+1.001237773084561:
+
+| quantity | value |
+|---|---|
+| mean of the four medians | 1.00048 |
+| observed `sd(median)` | **0.104%** |
+| worst single deviation from parity | 0.124% |
+| declared window in observed sigmas | ±7.7σ |
+
+The a-priori model predicted 0.135–0.188%; the measured 0.104% is slightly
+*tighter*, so the derivation was sound and conservative rather than optimistic.
+An empirical ±3σ would be [0.99687, 1.00313], or [0.99437, 1.00563] keeping the
+1.8× inflation.
+
+**Recommendation, not applied here:** on this evidence the window could tighten
+to roughly **0.994 – 1.006** and still sit at ~5.8σ. It is deliberately left at
+0.992–1.008 for now — four medians is three degrees of freedom, and the value of
+a calibration band is that it does not move every time new data arrives. Revisit
+after the next four ranked runs.
+
+One caveat worth carrying: the four dispatches ran back-to-back inside a single
+afternoon on one box. They therefore sample *within-day* thermal variation well
+and *across-day* drift not at all. The window should be re-checked, not assumed,
+after the first ranked runs on a different day.
 
 ## Step D — flip the two trusted-contract fields
 

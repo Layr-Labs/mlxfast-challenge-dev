@@ -226,8 +226,8 @@ jobs:
       # noop_decode_speedup normalises to 1.0 and the floor is the 0.95 margin
       # below that, matching the DFlash convention. The measurement that makes
       # this legitimate is the per-entry noop_decode_speedup in
-      # fixtures/qwen3_6_27b_mtp_track.json -- raw ratios spanning 0.756 to
-      # 1.0915 across the 8 prompts, which is precisely why the RAW ratio could
+      # fixtures/qwen3_6_27b_mtp_track.json -- raw ratios spanning 0.7623 to
+      # 1.0845 across the 8 prompts, which is precisely why the RAW ratio could
       # never carry a fixed floor.
       MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR: "0.95"
       # PAIR BUDGET IS PER PROMPT (scoring semantics 2026-08-13). A ranked run
@@ -356,9 +356,19 @@ jobs:
       # Carried over from the calibrated serial value. It is a MEASURED number
       # on a different model, so it is re-derivable per NEW-MODEL-BRINGUP 7.4
       # (min(observed) - 1 over >= 4 baseline-equivalent ranked runs) once this
-      # track has ranked history. Left at the conservative inherited value
-      # rather than invented downward.
-      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "7"
+      # track has ranked history. DERIVED 2026-08-13: the four go-live
+      # calibration dispatches (31712368539, 31715555814, 31718615518,
+      # 31721547429) each judged 9/9, so min(observed)=9 and the floor is 8 --
+      # one case of budget for judge nondeterminism.
+      #
+      # This is the TRACK-SCOPED value. It mirrors
+      # MLXFastConstants.qwenMTPSemanticGPQAMinPassCount, NOT the unprefixed
+      # semanticGPQAMinPassCount=7, which is the live DFlash track's own
+      # calibration and is deliberately left alone; the shared
+      # run-semantic-gpqa-gate.sh default likewise stays 7 because it serves
+      # both tracks and the binding value is this env var. See the constant's
+      # doc comment for the constant-"A" limitation this floor does NOT close.
+      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "8"
       MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
       MLXFAST_SEMANTIC_GPQA_MODEL: claude-opus-4-8
       # --- Public drift tripwire (REAL PINS, recomputed on this branch) ----
