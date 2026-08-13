@@ -2,13 +2,16 @@ name: qwen-mtp-ranked-benchmark
 
 # QWEN 3.6 NATIVE-MTP SPECULATIVE-DECODE TRACK (track id qwen3.6-27b-mtp-v1).
 #
-# STATUS: DRAFT / NOT LIVE / NOT RANKED. This workflow is authored ahead of the
-# operator go-live so every pin that is computable from the checked-in tree is
-# frozen now and every pin that depends on organizer-provisioned hidden material
-# is present, NAMED, and FAILS CLOSED. Nothing here enables anything: the track
-# ships inert (MLXFAST_QWEN_MTP_CALIBRATION_READY: "0"), the contract fixture it
-# reads does not exist yet, and the hidden-artifact pins carry the literal
-# QWEN-MTP-PENDING-ORGANIZER, which the pin-completeness gate below rejects.
+# STATUS: LIVE / RANKED on the qwen36-mtp-track ref since 2026-08-13. The merge
+# to main is DEFERRED, so the TEMPORARY qwen36-mtp-track arm of the ref
+# allowlist below is still load-bearing and must be removed at that merge.
+# The track is armed: MLXFAST_QWEN_MTP_CALIBRATION_READY is "1", the contract
+# fixture carries official_scoring_enabled=true and
+# reference_baseline.publication_allowed=true, and every hidden-artifact pin
+# resolves to a real uploaded R2 object. The QWEN-MTP-PENDING-ORGANIZER marker
+# and its pin-completeness gate are RETAINED deliberately: they no longer block
+# anything, but they still catch a regression back to a placeholder.
+# See docs/qwen-mtp-go-live-runbook.md.
 #
 # NAMING. The obvious filename for this workflow would append "-benchmark"
 # directly after "mtp-", which reproduces one of the retired Gemma/Laguna MTP
@@ -332,9 +335,16 @@ jobs:
       # fixtures AND the final-SHA on-box baseline + calibration for THIS model
       # are installed and calibrated. It gates only TIMED runs, so
       # run_benchmark=false correctness dispatches keep working while it is
-      # closed, which is the migration shape. "0" until the operator completes
-      # the go-live runbook on m5-max-128gb-3.
-      MLXFAST_QWEN_MTP_CALIBRATION_READY: "0"
+      # closed, which is the migration shape. FLIPPED TO "1" at go-live
+      # 2026-08-13: the baseline tree
+      # e86655528c2abe534aa2e61a454565237801aa2d is installed at
+      # /opt/bench-runner/baseline/qwen3.6-27b-mtp-v1/current, its paired
+      # serial-denominator calibration is authored at the ranked 512-token
+      # window in /opt/bench-runner/state/qwen3.6-27b-mtp-v1, and the box is
+      # signed with a clean janitor audit. See docs/qwen-mtp-go-live-runbook.md
+      # step D; taking the track offline flips this back in the same commit as
+      # the contract fixture and QwenMTPTrackNamingTests.
+      MLXFAST_QWEN_MTP_CALIBRATION_READY: "1"
       # Trusted workflow identity, asserted by "Enforce trusted workflow
       # context" below.
       MLXFAST_QWEN_MTP_TRUSTED_REPOSITORY: Layr-Labs/mlxfast-challenge-dev

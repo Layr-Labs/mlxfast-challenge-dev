@@ -11,10 +11,12 @@
     "cannot rely on that default while two manifests coexist.",
     "JSON carries no comment syntax, so this note is a data field. It is inert:",
     "nothing reads it, and every consumer reads the keys below by name.",
-    "NOT LIVE. The track is inert until the operator completes go-live: the",
-    "contract fixture named by contractPath does not exist yet, the workflow ships",
-    "with MLXFAST_QWEN_MTP_CALIBRATION_READY=0, and the hidden-artifact pins are",
-    "placeholders that fail closed. See QWEN36-MTP-CHALLENGE-PLAN.md phase 5."
+    "LIVE 2026-08-13. The operator completed go-live on the qwen36-mtp-track ref",
+    "(the merge to main is deferred): the contract fixture named by contractPath",
+    "carries official_scoring_enabled=true and reference_baseline.publication_allowed",
+    "=true, the workflow ships with MLXFAST_QWEN_MTP_CALIBRATION_READY=1, and every",
+    "hidden-artifact pin resolves to a real uploaded R2 object verified by digest on",
+    "download. See docs/qwen-mtp-go-live-runbook.md."
   ],
   "schemaVersion": 1,
   "name": "mlxfast-challenge-dev-qwen-mtp",
@@ -140,12 +142,12 @@
     "mtpDepthNote": "Provenance: measured envelope on M5 (exact-greedy vs serial) -- 1.74x at 32 tokens, 1.34x at 128, ~1.0x at 512; depth 3 is exact but net-slower. MUST be re-derived across the whole timed pool once the pool exists: a depth tuned to one prompt is the same trap as a floor tuned to one prompt.",
     "aggregation": "ratio_of_means",
     "scoreNormalization": "per-prompt no-op reference: the ratio-of-means aggregate is divided by the sampled prompt's pinned noop_decode_speedup (contractPath timed_prompt_pool[]) before the floor is applied and the score published.",
-    "decodeSpeedupFloor": null,
-    "decodeSpeedupFloorNote": "QWEN-MTP-PENDING-ORGANIZER. Deliberately null, not a number: the normalised floor is a MEASURED quantity derived from the timed pool's own no-op references and cannot be carried over from another track (different method, different acceptance rate, different verify-row cost). The enforcing site is MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR in the ranked workflow, which is itself a placeholder refused by two independent gates; this field must be pinned equal to it in the same commit.",
+    "decodeSpeedupFloor": 0.95,
+    "decodeSpeedupFloorNote": "RESOLVED at go-live 2026-08-13 and pinned EQUAL to MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR in the ranked workflow, which is the enforcing site; this field is documentation and is not itself enforced. The floor is applied to the NORMALISED aggregate, which is what makes 0.95 method-independent: each pool entry's own MEASURED noop_decode_speedup (contractPath timed_prompt_pool[]) normalises to 1.0 by construction, so the floor is the 0.95 margin below parity, matching the DFlash convention. It could never have been carried over as a RAW ratio -- the pool's raw no-ops span 0.756 to 1.0915, a 1.44x lottery that normalisation exists to remove.",
     "minAcceptedPairs": 3,
     "targetPairs": 4,
     "tokenFidelityGate": "trusted-sequential-reverification-exact-token-match",
-    "tokenFidelityGateStatus": "pending",
+    "tokenFidelityGateStatus": "implemented",
     "stallGuardrail": "max block latency > 4x p50 rejects the run (one gated retry)"
   },
   "leaderboard": {

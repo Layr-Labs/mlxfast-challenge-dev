@@ -474,17 +474,23 @@ struct QwenMTPTrackNamingTests {
         )
     }
 
-    /// The track ships INERT. These three are the fail-closed posture the draft
-    /// is required to hold, and each is a one-character edit away from being
-    /// armed, so pin them rather than trusting a reviewer to notice.
+    /// The track is LIVE (operator go-live 2026-08-13, on the qwen36-mtp-track
+    /// ref; the merge to main is deferred). This suite used to pin the INERT
+    /// posture; it now pins the ARMED one, which is the same discipline pointed
+    /// the other way. Each of these is still a one-character edit away from
+    /// flipping, so taking the track back OFFLINE means editing this test in the
+    /// same commit as the flags -- that friction is deliberate and runs in both
+    /// directions (NEW-MODEL-BRINGUP 7.5, docs/qwen-mtp-go-live-runbook.md).
     @Test
-    func theQwenMTPTrackShipsInert() throws {
+    func theQwenMTPTrackIsLive() throws {
         let workflow = try S.text(".github/workflows/qwen-mtp-ranked-benchmark.yml")
         let environment = try S.jobEnvironment(workflow)
 
-        // 1. The calibration-ready interlock is a hard-pinned literal "0" --
-        //    never an expression, never a dispatch input.
-        #expect(environment["MLXFAST_QWEN_MTP_CALIBRATION_READY"] == "0")
+        // 1. The calibration-ready interlock is a hard-pinned literal "1" --
+        //    never an expression, never a dispatch input. It attests that the
+        //    model-derived private fixtures and the final-SHA on-box baseline +
+        //    calibration are installed on m5-max-128gb-3.
+        #expect(environment["MLXFAST_QWEN_MTP_CALIBRATION_READY"] == "1")
         #expect(!workflow.contains("MLXFAST_QWEN_MTP_CALIBRATION_READY: ${{"))
         // ... and the runbook-shaped refusal message exists, scanned on the
         // comment-stripped view so a mention in prose cannot satisfy it.
@@ -494,30 +500,23 @@ struct QwenMTPTrackNamingTests {
             )
         )
 
-        // 2. INERTNESS NO LONGER RESTS ON PLACEHOLDER PINS.
+        // 2. THE TRUSTED CONTRACT IS ARMED.
         //
-        //    It used to: the phase-2 MTP-head correctness golden and the
-        //    measured decode floor were unproducible until the native-MTP head
-        //    was integrated into the ranked runtime, so the fail-closed posture
-        //    was spelled as "these pins still contain the marker". Phase 5
-        //    integrated the head, measured the pool on box 3 and RESOLVED all
-        //    three (they are asserted as real values in step 3 below).
-        //
-        //    So the posture moves to where it now actually lives -- the trusted
-        //    contract fixture. "Enforce Qwen-MTP track enablement" refuses a
-        //    RANKED dispatch while EITHER of these is false, and a gates-only
-        //    dry run publishes no score. Both must stay false until the operator
-        //    completes the go-live runbook, which is also when the R2 objects
-        //    these pins name actually get uploaded.
+        //    "Enforce Qwen-MTP track enablement" refuses a RANKED dispatch while
+        //    EITHER of these is false, and a gates-only dry run publishes no
+        //    score. Both were flipped to true at go-live on 2026-08-13, once the
+        //    R2 objects these pins name were uploaded and re-verified by digest
+        //    on download. Flipping either back to false takes the track offline
+        //    and MUST edit this test in the same commit.
         let contract = try S.json("fixtures/qwen3_6_27b_mtp_track.json")
         #expect(
-            contract["official_scoring_enabled"] as? Bool == false,
-            "official_scoring_enabled must stay false until go-live"
+            contract["official_scoring_enabled"] as? Bool == true,
+            "official_scoring_enabled must be true while the track is live"
         )
         let baseline = contract["reference_baseline"] as? [String: Any]
         #expect(
-            baseline?["publication_allowed"] as? Bool == false,
-            "reference_baseline.publication_allowed must stay false until go-live"
+            baseline?["publication_allowed"] as? Bool == true,
+            "reference_baseline.publication_allowed must be true while the track is live"
         )
         #expect(
             contract["track_id"] as? String == "qwen3.6-27b-mtp-v1",
@@ -562,8 +561,9 @@ struct QwenMTPTrackNamingTests {
             )
         }
 
-        // 3. The pins that ARE computable from this branch are real, not
-        //    placeholders -- the inert posture must not have swallowed them.
+        // 3. Every pin is a real value, not a placeholder. These are what the
+        //    armed track actually ranks against, so a regression here is a
+        //    scoring bug rather than a missing-work marker.
         //    The last four are the box-3-generated model-derived pins (the RAW
         //    hidden correctness golden and the GPQA reference); pinning them
         //    here forces the R2 object key and the job-env digest to move
@@ -619,5 +619,117 @@ struct QwenMTPTrackNamingTests {
                 "\(pin) is \(environment[pin] ?? "unset"), expected \(expected)"
             )
         }
+    }
+
+    /// `benchmark.qwen-mtp.json`'s own `decodeSpeedupFloorNote` says the field
+    /// "must be pinned equal to" the workflow env, and that the workflow is the
+    /// enforcing site. Nothing checked it, and the manifest sat at `null` while
+    /// the workflow had already resolved to 0.95. Modelled on the DFlash
+    /// equivalent, which exists because the same gap opened there.
+    @Test
+    func theManifestDeclaresTheDecodeFloorTheWorkflowEnforces() throws {
+        let environment = try S.jobEnvironment(
+            try S.text(".github/workflows/qwen-mtp-ranked-benchmark.yml"))
+        let raw = try #require(
+            environment["MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR"],
+            "the Qwen-MTP workflow must declare the floor it enforces"
+        )
+        let enforced = try #require(
+            Double(raw),
+            "MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR is not a number: \(raw)"
+        )
+
+        let manifest = try S.json("benchmark.qwen-mtp.json")
+        let scoring = try #require(manifest["scoring"] as? [String: Any])
+        let declared = try #require(
+            scoring["decodeSpeedupFloor"] as? Double,
+            "benchmark.qwen-mtp.json declares no numeric decodeSpeedupFloor"
+        )
+        #expect(
+            enforced == declared,
+            """
+            MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR=\(raw) is the only value the \
+            workflow actually rejects on, while benchmark.qwen-mtp.json \
+            declares \(declared).
+            """
+        )
+    }
+
+    /// A track cannot be ranking submissions while its own manifest says the
+    /// token-fidelity gate is unimplemented. The DFlash suite pins exactly this
+    /// invariant for its manifest; the Qwen manifest shipped "pending" against a
+    /// fixture that already said "implemented", which go-live had to reconcile.
+    @Test
+    func anEnabledTrackDeclaresAnImplementedTokenFidelityGate() throws {
+        let manifest = try S.json("benchmark.qwen-mtp.json")
+        let scoring = try #require(manifest["scoring"] as? [String: Any])
+        let gateStatus = try #require(scoring["tokenFidelityGateStatus"] as? String)
+
+        let contract = try S.json("fixtures/qwen3_6_27b_mtp_track.json")
+        let proposed = try #require(contract["proposed_scoring"] as? [String: Any])
+        #expect(
+            proposed["token_fidelity_gate_status"] as? String == gateStatus,
+            "fixture token_fidelity_gate_status disagrees with the manifest"
+        )
+
+        if contract["official_scoring_enabled"] as? Bool == true {
+            #expect(
+                gateStatus == "implemented",
+                """
+                Qwen-MTP official scoring is enabled while \
+                tokenFidelityGateStatus is '\(gateStatus)'. Ranked scoring \
+                without a proven fidelity gate is exactly the state the \
+                enablement interlock exists to prevent.
+                """
+            )
+        }
+    }
+}
+
+// MARK: - The go-live runbook the workflows point at
+
+/// `.github/workflows/qwen-mtp-provision-goldens.yml` refers operators to a
+/// "Qwen-MTP go-live runbook" from four places, including the "step A" and
+/// "step B" cited in error messages an operator only ever sees when a dispatch
+/// fails closed. That reference dangled at a file that did not exist until
+/// go-live on 2026-08-13. This pins its existence and the sections the workflow
+/// names, so the pointer cannot rot again -- the same guard the DFlash track
+/// grew after its runbook reference dangled for a week.
+@Suite
+struct QwenMTPGoLiveRunbookTests {
+    private static let path = "docs/qwen-mtp-go-live-runbook.md"
+
+    @Test
+    func runbookExistsAndCoversTheStepsTheWorkflowsCite() throws {
+        let runbook = try String(contentsOfFile: Self.path, encoding: .utf8)
+        // Steps named in the provisioning workflow's own error text.
+        #expect(runbook.contains("Step A"))
+        #expect(runbook.contains("Step B"))
+        // The two trusted-contract fields the enablement guard requires.
+        #expect(runbook.contains("official_scoring_enabled"))
+        #expect(runbook.contains("publication_allowed"))
+        // The blocking prerequisite the pool-selection step fails closed on.
+        #expect(runbook.contains("timed_prompt_pool"))
+        // The interlock this track's go-live actually turns.
+        #expect(runbook.contains("MLXFAST_QWEN_MTP_CALIBRATION_READY"))
+    }
+
+    /// The runbook must carry the measured facts and the known limits an
+    /// operator accepts by flipping the switch, not just the mechanical steps.
+    @Test
+    func runbookRecordsTheLimitsBeingAcceptedAtGoLive() throws {
+        let runbook = try String(contentsOfFile: Self.path, encoding: .utf8)
+        // The pool's raw no-op spread -- the reason the score is normalised.
+        #expect(runbook.contains("0.756"))
+        #expect(runbook.contains("1.0915"))
+        // Prefill is measured but UNSCORED on this decode-only track.
+        #expect(runbook.contains("prefill_component"))
+        // The GPQA floor's honest limitation: a constant-"A" answerer scores
+        // exactly the floor, so the floor does not reject it.
+        #expect(runbook.lowercased().contains("constant-\"a\"")
+            || runbook.lowercased().contains("constant-a"))
+        // The guard fails closed before the flags are flipped.
+        #expect(runbook.lowercased().contains("fail-closed")
+            || runbook.lowercased().contains("fails closed"))
     }
 }
