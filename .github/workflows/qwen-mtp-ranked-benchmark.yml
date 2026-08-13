@@ -2152,13 +2152,19 @@ jobs:
           # MLXFAST_JOB_WS carries the bench read ACL, so a bare relative path
           # would resolve against GITHUB_WORKSPACE (no such ACL) and the wrapper
           # would see nothing.
+          # GPU_LOADED_UTIL recalibrated from the section 7 sessions
+          # 2026-08-13: the serial (depth-0) leg is a ~0.79-util workload, so
+          # the old 0.95 starves MIN_LOADED_SAMPLES on box 3 -- 6-8 loaded
+          # samples (as few as 3 steady) against 102-104 at 0.70, i.e. one
+          # hiccup from a false rejection. 0.70 matches the wrapper's own
+          # recalibrated default.
           MEASURE_STATE_DIR="${MLXFAST_MEASURE_STATE_DIR}" \
           BASELINE_WS="${MLXFAST_QWEN_MTP_BASELINE_RESOLVED}" \
           BASELINE_CALIBRATION="${MLXFAST_QWEN_MTP_BASELINE_CALIBRATION}" \
           QMTP_TARGET_DIR="${MLXFAST_QWEN_MTP_TARGET_DIR}" \
           QMTP_HEAD_DIR="${MLXFAST_QWEN_MTP_HEAD_DIR}" \
           MACMON="${MLXFAST_MACMON}" \
-          GPU_LOADED_UTIL=0.95 \
+          GPU_LOADED_UTIL=0.70 \
             "${MLXFAST_QWEN_MTP_MEASURE_JOB}" \
               --candidate "${MLXFAST_JOB_WS}" \
               --baseline "${MLXFAST_QWEN_MTP_BASELINE_RESOLVED}" \
