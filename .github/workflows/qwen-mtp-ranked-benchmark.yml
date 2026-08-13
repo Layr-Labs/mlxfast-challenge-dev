@@ -369,9 +369,16 @@ jobs:
           case "${GITHUB_REF}" in
             refs/heads/main|refs/heads/submissions/*|refs/heads/baseline/*|refs/heads/yukon/baseline/*)
               ;;
+            # TEMPORARY (2026-08-13): pre-merge migration window -- qwen36-mtp-track
+            # is signature-protected (verified-committer branch rule); REMOVE this
+            # arm at the go-live merge (grep 'TEMPORARY (2026-08-13)' -- the
+            # enforce-trusted-qwen-mtp-* guard scripts carry matching entries).
+            refs/heads/qwen36-mtp-track)
+              echo "::warning::TEMPORARY REF IN USE: refs/heads/qwen36-mtp-track must be removed from this allowlist at the go-live merge." >&2
+              ;;
             *)
               echo "::error::private benchmark workflow ref is not allowed: ${GITHUB_REF}" >&2
-              echo "::error::allowed branches are main, submissions/*, baseline/*, and yukon/baseline/*" >&2
+              echo "::error::allowed branches are main, submissions/*, baseline/*, and yukon/baseline/*, and (TEMPORARY, until go-live) qwen36-mtp-track" >&2
               exit 1
               ;;
           esac
