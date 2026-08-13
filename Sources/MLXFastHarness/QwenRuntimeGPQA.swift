@@ -46,7 +46,16 @@ extension QwenRuntime {
         else {
             return nil
         }
-        let candidateTokens = Array(generatedTokens.prefix(maxNewTokens))
+        // Truncate at the first end-of-turn BEFORE decoding. The behavior loop
+        // is fixed-length by contract (checked_steps is predicted statically
+        // from the golden and cross-checked against the run), so it keeps
+        // generating after the model has ended its turn; past `<|im_end|>` that
+        // tail measured as degenerate repetition, and skipSpecialTokens would
+        // splice it onto an otherwise correct answer for the judge to read.
+        let candidateTokens = QwenChatTemplate.truncatedAtFirstEndOfTurn(
+            Array(generatedTokens.prefix(maxNewTokens)),
+            eosTokenId: tokenizer.eosTokenId
+        )
         guard !candidateTokens.isEmpty else {
             throw MLXFastError.invalidInput("\(behavior.name) semantic GPQA candidate token list is empty")
         }

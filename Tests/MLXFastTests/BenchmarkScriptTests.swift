@@ -2303,6 +2303,48 @@ func cliSupportsFreeRunGateAttachmentCoveringTimedDecodeOffsets() throws {
     #expect(cli.contains("attach-free-run-gate ["))
 }
 
+// Both GPQA capture entry points must frame the hidden question as a ChatML
+// turn with thinking pre-closed. Un-framed, the checkpoint (no bos_token, chat
+// template shipped as a sidecar so addSpecialTokens adds nothing) received a
+// bare question and never answered -- measured 0/9 commitments at a 512-token
+// budget with degenerate looping, which is what scored the semantic gate 1/9.
+// generate-gpqa-answers exists to reproduce the in-run capture offline, so the
+// two framings must not drift apart.
+@Test
+func gpqaCapturePathsFrameHiddenPromptsAsChatMLTurns() throws {
+    let cli = try String(
+        contentsOfFile: "Sources/MLXFastCLI/main.swift",
+        encoding: .utf8
+    )
+
+    // Both entry points wrap, and neither encodes the bare prompt any more.
+    let wrapped = "QwenChatTemplate.userTurnDisablingThinking(testCase.prompt)"
+    #expect(cli.components(separatedBy: wrapped).count - 1 == 2)
+    #expect(!cli.contains("tokenizer.encode(text: testCase.prompt, addSpecialTokens: true)"))
+    // The offline verb truncates the finished-turn tail before decoding.
+    #expect(cli.contains("QwenChatTemplate.truncatedAtFirstEndOfTurn("))
+    #expect(cli.contains("candidateTokens: answerTokens"))
+
+    // The in-run capture truncates too -- in BOTH harness copies.
+    for path in [
+        "Sources/MLXFastTrustedHarness/QwenRuntimeGPQA.swift",
+        "Sources/MLXFastHarness/QwenRuntimeGPQA.swift",
+    ] {
+        let harness = try String(contentsOfFile: path, encoding: .utf8)
+        #expect(harness.contains("QwenChatTemplate.truncatedAtFirstEndOfTurn("))
+        #expect(harness.contains("eosTokenId: tokenizer.eosTokenId"))
+    }
+
+    // The fixed-length behavior loop must NOT learn to stop early: its step
+    // count is predicted statically from the golden and cross-checked against
+    // the reported checked_steps.
+    let compare = try String(
+        contentsOfFile: "Sources/MLXFastTrustedHarness/QwenRuntimeCorrectnessCompare.swift",
+        encoding: .utf8
+    )
+    #expect(compare.contains("while generated.count < testCase.maxNewTokens {"))
+}
+
 // QwenRuntime.benchmark refuses a golden with no `.benchmark` oracle even on
 // the gates-only phase (CHECK_GATES=1 + SKIP_TIMED=1, where the oracle only
 // supplies the baseline placeholders), but generate-golden writes

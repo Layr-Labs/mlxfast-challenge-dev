@@ -1052,7 +1052,13 @@ private enum MLXFastCLI {
             guard answers.count < caseCount else {
                 break
             }
-            let promptTokens = tokenizer.encode(text: testCase.prompt, addSpecialTokens: true)
+            // Must match buildGPQABehaviorCaseIfWithinPromptBudget exactly:
+            // this verb exists to reproduce the in-run capture offline, so any
+            // divergence in framing makes the two incomparable.
+            let promptTokens = tokenizer.encode(
+                text: QwenChatTemplate.userTurnDisablingThinking(testCase.prompt),
+                addSpecialTokens: true
+            )
             guard !promptTokens.isEmpty else {
                 throw MLXFastError.invalidInput("\(testCase.identifier).prompt tokenized to zero tokens")
             }
@@ -1069,7 +1075,11 @@ private enum MLXFastCLI {
                 ),
                 worker: worker
             )
-            let decoded = tokenizer.decode(tokens: generated, skipSpecialTokens: true)
+            let answerTokens = QwenChatTemplate.truncatedAtFirstEndOfTurn(
+                generated,
+                eosTokenId: tokenizer.eosTokenId
+            )
+            let decoded = tokenizer.decode(tokens: answerTokens, skipSpecialTokens: true)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             answers.append(
                 SemanticGPQAAnswerCase(
@@ -1080,7 +1090,7 @@ private enum MLXFastCLI {
                     answerKey: testCase.answerKey,
                     referenceAnswer: referenceAnswer(for: testCase),
                     candidateAnswer: decoded,
-                    candidateTokens: generated,
+                    candidateTokens: answerTokens,
                     maxNewTokens: maxNewTokens
                 )
             )
@@ -1172,7 +1182,12 @@ private enum MLXFastCLI {
         tokenizer: any Tokenizer,
         maxNewTokens: Int
     ) throws -> GoldenBehaviorCase? {
-        let promptTokens = tokenizer.encode(text: testCase.prompt, addSpecialTokens: true)
+        // ChatML-framed, thinking pre-closed: see QwenChatTemplate. The raw
+        // question produced un-framed continuations that never answered.
+        let promptTokens = tokenizer.encode(
+            text: QwenChatTemplate.userTurnDisablingThinking(testCase.prompt),
+            addSpecialTokens: true
+        )
         guard !promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("\(testCase.identifier).prompt tokenized to zero tokens")
         }
