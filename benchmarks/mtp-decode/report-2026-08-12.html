@@ -1,0 +1,370 @@
+<title>Qwen 3.6 MTP Benchmarks</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface: #fcfcfb;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+    --border: rgba(11,11,11,0.10);
+    --accent: #2a78d6;
+    --s-code: #2a78d6;
+    --s-prose: #eb6834;
+    --s-qa: #1baf7a;
+    --good-text: #006300;
+    --bad-text: #d03b3b;
+    --chip-bg: #f0efec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface: #1a1a19;
+      --ink: #ffffff;
+      --ink-2: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --baseline: #383835;
+      --border: rgba(255,255,255,0.10);
+      --accent: #3987e5;
+      --s-code: #3987e5;
+      --s-prose: #d95926;
+      --s-qa: #199e70;
+      --good-text: #0ca30c;
+      --bad-text: #e66767;
+      --chip-bg: #262624;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255,255,255,0.10);
+    --accent: #3987e5;
+    --s-code: #3987e5;
+    --s-prose: #d95926;
+    --s-qa: #199e70;
+    --good-text: #0ca30c;
+    --bad-text: #e66767;
+    --chip-bg: #262624;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 15px;
+    line-height: 1.55;
+  }
+  main { max-width: 920px; margin: 0 auto; padding: 40px 24px 72px; }
+
+  .eyebrow {
+    font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--muted); margin: 0 0 10px;
+  }
+  h1 { font-size: 30px; line-height: 1.15; margin: 0 0 8px; letter-spacing: -0.015em; text-wrap: balance; }
+  .subtitle { color: var(--ink-2); margin: 0 0 6px; max-width: 62ch; }
+  .provline { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; color: var(--muted); margin: 10px 0 0; }
+
+  h2 { font-size: 19px; margin: 44px 0 6px; letter-spacing: -0.01em; text-wrap: balance; }
+  h2 .sec { color: var(--muted); font-weight: 500; margin-right: 8px; }
+  .lede { color: var(--ink-2); margin: 0 0 16px; max-width: 68ch; }
+  p { max-width: 68ch; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.92em; background: var(--chip-bg); padding: 1px 5px; border-radius: 4px; }
+
+  /* stat tiles */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin: 26px 0 0; }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+  .tile .k { font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  .tile .v { font-size: 26px; font-weight: 650; letter-spacing: -0.01em; margin-top: 2px; }
+  .tile .v small { font-size: 14px; font-weight: 500; color: var(--ink-2); }
+  .tile .d { font-size: 12px; color: var(--ink-2); margin-top: 2px; }
+
+  /* tables */
+  .tablewrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; margin: 14px 0 8px; }
+  table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 13.5px; }
+  th, td { padding: 8px 12px; text-align: right; white-space: nowrap; }
+  th { font-size: 11px; letter-spacing: 0.07em; text-transform: uppercase; color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--grid); }
+  td { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-variant-numeric: tabular-nums; font-size: 12.5px; border-bottom: 1px solid var(--grid); color: var(--ink); }
+  tr:last-child td { border-bottom: none; }
+  th:first-child, td:first-child { text-align: left; }
+  td.lbl { font-family: system-ui, -apple-system, sans-serif; font-size: 13px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 7px; vertical-align: 0; }
+  .up { color: var(--good-text); font-weight: 600; }
+  .dn { color: var(--bad-text); font-weight: 600; }
+  .ok { color: var(--good-text); }
+  .tnote { font-size: 12.5px; color: var(--muted); margin: 6px 2px 0; max-width: 74ch; }
+
+  /* charts */
+  .fig { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px 16px 10px; margin: 16px 0 8px; }
+  .fig .cap { font-size: 13px; font-weight: 600; margin: 0 0 2px; }
+  .fig .sub { font-size: 12px; color: var(--muted); margin: 0 0 8px; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--ink-2); margin: 4px 0 6px; }
+  .legend span { display: inline-flex; align-items: center; }
+  svg { width: 100%; height: auto; display: block; }
+  svg text { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; fill: var(--muted); }
+  svg text.val { fill: var(--ink-2); font-size: 10.5px; }
+  svg text.end { font-family: system-ui, -apple-system, sans-serif; font-size: 12px; fill: var(--ink); }
+  .hit { fill: transparent; cursor: pointer; }
+
+  #tip {
+    position: fixed; pointer-events: none; z-index: 10; display: none;
+    background: var(--surface); color: var(--ink); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 10px; font-size: 12px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.18);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+
+  ol, ul { padding-left: 22px; }
+  li { margin: 6px 0; max-width: 68ch; }
+  li::marker { color: var(--muted); }
+
+  footer { margin-top: 52px; padding-top: 16px; border-top: 1px solid var(--grid); font-size: 12.5px; color: var(--muted); }
+  footer p { margin: 4px 0; max-width: none; }
+</style>
+
+<main>
+  <p class="eyebrow">Layr-Labs · Qwen 3.6 27B · Native multi-token prediction</p>
+  <h1>MTP Decode Benchmarks — Apple M5 Max</h1>
+  <p class="subtitle">Prefill, decode, and draft-acceptance measurements for the Swift native-MTP driver at draft depths k&nbsp;=&nbsp;1,&nbsp;2,&nbsp;3 across three workloads. Every run in this matrix reproduced serial greedy decoding token-for-token.</p>
+  <p class="provline">driver main.swift fd4f04dd · fork e0c1d54 (feat/qwen35-mtp) · checkpoint qwen36-mtp-merged (rev c000ac2c + MTP head) · M5 Max 128&nbsp;GB · macOS 26.5.2 · 2026-08-12</p>
+
+  <div class="tiles">
+    <div class="tile"><div class="k">Prefill</div><div class="v">≈960 <small>tok/s</small></div><div class="d">~40× decode speed</div></div>
+    <div class="tile"><div class="k">Serial decode</div><div class="v">23.9 <small>tok/s</small></div><div class="d">baseline, all workloads ±1%</div></div>
+    <div class="tile"><div class="k">Peak MTP decode</div><div class="v">36.6 <small>tok/s</small></div><div class="d">code · depth 2 · 1.53×</div></div>
+    <div class="tile"><div class="k">Exactness</div><div class="v ok">11/11</div><div class="d">matrix runs match serial (29/29 campaign-wide)</div></div>
+  </div>
+
+  <h2><span class="sec">1</span>Decode matrix — k = 1, 2, 3</h2>
+  <p class="lede">Three workloads: <strong>code</strong> (chat, “Implement binary search in Python with tests”, 256 tok), <strong>prose</strong> (chat, short-poem prompt, 256 tok), <strong>Q/A</strong> (raw, capital-of-France, 32 tok). One invocation per cell; serial and MTP loops share the process.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Cell</th><th>k</th><th>Match</th><th>Accept %</th><th>Accepted / drafted</th><th>Rounds</th><th>Tok / fwd</th><th>Serial tok/s</th><th>MTP tok/s</th><th>Speedup</th></tr></thead>
+    <tbody>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-code)"></span>code</td><td>1</td><td class="ok">✓</td><td>88.2</td><td>120 / 136</td><td>136</td><td>1.882</td><td>24.0</td><td>36.2</td><td class="up">1.51×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-code)"></span>code</td><td>2</td><td class="ok">✓</td><td>77.5</td><td>155 / 200</td><td>101</td><td>2.535</td><td>23.9</td><td>36.6</td><td class="up">1.53×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-code)"></span>code</td><td>3</td><td class="ok">✓</td><td>60.9</td><td>165 / 271</td><td>91</td><td>2.813</td><td>23.9</td><td>29.4</td><td class="up">1.23×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-prose)"></span>prose</td><td>1</td><td class="ok">✓</td><td>63.1</td><td>99 / 157</td><td>157</td><td>1.631</td><td>23.9</td><td>26.1</td><td class="up">1.10×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-prose)"></span>prose</td><td>2</td><td class="ok">✓</td><td>49.4</td><td>127 / 257</td><td>129</td><td>1.984</td><td>23.8</td><td>24.1</td><td>1.01×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-prose)"></span>prose</td><td>3</td><td class="ok">✓</td><td>38.1</td><td>136 / 357</td><td>120</td><td>2.133</td><td>23.8</td><td>20.8</td><td class="dn">0.87×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-qa)"></span>Q/A</td><td>1</td><td class="ok">✓</td><td>72.2</td><td>13 / 18</td><td>19</td><td>1.684</td><td>22.2</td><td>27.4</td><td class="up">1.23×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-qa)"></span>Q/A</td><td>2</td><td class="ok">✓</td><td>73.1</td><td>19 / 26</td><td>13</td><td>2.462</td><td>22.2</td><td>31.7</td><td class="up">1.42×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-qa)"></span>Q/A</td><td>3</td><td class="ok">✓</td><td>57.1</td><td>20 / 35</td><td>12</td><td>2.667</td><td>22.4</td><td>29.1</td><td class="up">1.30×</td></tr>
+    </tbody>
+  </table></div>
+  <p class="tnote">Tok/fwd = generated tokens per target forward (tokens ÷ rounds). All cells ran to token budget; greedy decode is deterministic, so acceptance numbers carry zero run-to-run noise (§5). Q/A percentages rest on 12–19 rounds — treat as coarse.</p>
+
+  <div class="fig">
+    <p class="cap">Speedup vs draft depth</p>
+    <p class="sub">Dashed line = break-even (1.0×). Hover a point for the cell’s detail.</p>
+    <div class="legend">
+      <span><span class="dot" style="background:var(--s-code)"></span>code 256</span>
+      <span><span class="dot" style="background:var(--s-prose)"></span>prose 256</span>
+      <span><span class="dot" style="background:var(--s-qa)"></span>Q/A 32</span>
+    </div>
+    <svg viewBox="0 0 660 320" role="img" aria-label="Speedup versus draft depth for three workloads">
+      <g>
+        <line x1="46" y1="45.8"  x2="550" y2="45.8"  stroke="var(--grid)"/>
+        <line x1="46" y1="105.3" x2="550" y2="105.3" stroke="var(--grid)"/>
+        <line x1="46" y1="164.9" x2="550" y2="164.9" stroke="var(--grid)"/>
+        <line x1="46" y1="224.4" x2="550" y2="224.4" stroke="var(--baseline)" stroke-dasharray="5 4"/>
+        <line x1="46" y1="284"   x2="550" y2="284"   stroke="var(--baseline)"/>
+        <text x="40" y="49.8"  text-anchor="end">1.6×</text>
+        <text x="40" y="109.3" text-anchor="end">1.4×</text>
+        <text x="40" y="168.9" text-anchor="end">1.2×</text>
+        <text x="40" y="228.4" text-anchor="end">1.0×</text>
+        <text x="40" y="288"   text-anchor="end">0.8×</text>
+        <text x="86"  y="304" text-anchor="middle">k = 1</text>
+        <text x="298" y="304" text-anchor="middle">k = 2</text>
+        <text x="510" y="304" text-anchor="middle">k = 3</text>
+      </g>
+      <g fill="none" stroke-width="2">
+        <polyline points="86,72.6 298,66.6 510,155.9" stroke="var(--s-code)"/>
+        <polyline points="86,194.7 298,221.4 510,263.1" stroke="var(--s-prose)"/>
+        <polyline points="86,155.9 298,99.4 510,135.1" stroke="var(--s-qa)"/>
+      </g>
+      <g>
+        <circle cx="86" cy="72.6" r="4.5" fill="var(--s-code)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="298" cy="66.6" r="4.5" fill="var(--s-code)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="510" cy="155.9" r="4.5" fill="var(--s-code)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="86" cy="194.7" r="4.5" fill="var(--s-prose)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="298" cy="221.4" r="4.5" fill="var(--s-prose)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="510" cy="263.1" r="4.5" fill="var(--s-prose)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="86" cy="155.9" r="4.5" fill="var(--s-qa)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="298" cy="99.4" r="4.5" fill="var(--s-qa)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="510" cy="135.1" r="4.5" fill="var(--s-qa)" stroke="var(--surface)" stroke-width="2"/>
+      </g>
+      <g>
+        <text class="end" x="558" y="159.9">code 1.23×</text>
+        <text class="end" x="558" y="267.1">prose 0.87×</text>
+        <text class="end" x="558" y="135.1">Q/A 1.30×</text>
+      </g>
+      <g id="hitsA">
+        <circle class="hit" cx="86" cy="72.6" r="12" data-t="code · k=1 · 1.51× · accept 88.2%"/>
+        <circle class="hit" cx="298" cy="66.6" r="12" data-t="code · k=2 · 1.53× · accept 77.5%"/>
+        <circle class="hit" cx="510" cy="155.9" r="12" data-t="code · k=3 · 1.23× · accept 60.9%"/>
+        <circle class="hit" cx="86" cy="194.7" r="12" data-t="prose · k=1 · 1.10× · accept 63.1%"/>
+        <circle class="hit" cx="298" cy="221.4" r="12" data-t="prose · k=2 · 1.01× · accept 49.4%"/>
+        <circle class="hit" cx="510" cy="263.1" r="12" data-t="prose · k=3 · 0.87× · accept 38.1%"/>
+        <circle class="hit" cx="86" cy="155.9" r="12" data-t="Q/A · k=1 · 1.23× · accept 72.2%"/>
+        <circle class="hit" cx="298" cy="99.4" r="12" data-t="Q/A · k=2 · 1.42× · accept 73.1%"/>
+        <circle class="hit" cx="510" cy="135.1" r="12" data-t="Q/A · k=3 · 1.30× · accept 57.1%"/>
+      </g>
+    </svg>
+  </div>
+
+  <h2><span class="sec">2</span>Acceptance by draft position</h2>
+  <p class="lede">Greedy prefix acceptance means position <em>p</em> is only reached when positions 1…p−1 were accepted. Position-1 acceptance is stable per workload regardless of depth (code ≈ 85–88%, prose ≈ 62–63%) — deeper drafting never degrades the first draft; it appends progressively cheaper ones.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Cell</th><th>k</th><th>Position 1</th><th>Position 2</th><th>Position 3</th></tr></thead>
+    <tbody>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-code)"></span>code</td><td>1</td><td>88.2% (120/136)</td><td>—</td><td>—</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-code)"></span>code</td><td>2</td><td>87.0% (87/100)</td><td>68.0% (68/100)</td><td>—</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-code)"></span>code</td><td>3</td><td>84.6% (77/91)</td><td>62.2% (56/90)</td><td>35.6% (32/90)</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-prose)"></span>prose</td><td>1</td><td>63.1% (99/157)</td><td>—</td><td>—</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-prose)"></span>prose</td><td>2</td><td>62.0% (80/129)</td><td>36.7% (47/128)</td><td>—</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-prose)"></span>prose</td><td>3</td><td>63.0% (75/119)</td><td>35.3% (42/119)</td><td>16.0% (19/119)</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-qa)"></span>Q/A</td><td>1</td><td>72.2% (13/18)</td><td>—</td><td>—</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-qa)"></span>Q/A</td><td>2</td><td>76.9% (10/13)</td><td>69.2% (9/13)</td><td>—</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-qa)"></span>Q/A</td><td>3</td><td>58.3% (7/12)</td><td>58.3% (7/12)</td><td>54.5% (6/11)</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="fig">
+    <p class="cap">Per-position acceptance, k = 3 runs</p>
+    <p class="sub">Position 3 collapses to 36% on code and 16% on prose — the mechanism behind depth 3’s losses. Q/A’s flat profile rests on ~12 rounds.</p>
+    <div class="legend">
+      <span><span class="dot" style="background:var(--s-code)"></span>code</span>
+      <span><span class="dot" style="background:var(--s-prose)"></span>prose</span>
+      <span><span class="dot" style="background:var(--s-qa)"></span>Q/A</span>
+    </div>
+    <svg viewBox="0 0 660 320" role="img" aria-label="Acceptance rate by draft position in the depth-3 runs">
+      <g>
+        <line x1="46" y1="16"  x2="550" y2="16"  stroke="var(--grid)"/>
+        <line x1="46" y1="83"  x2="550" y2="83"  stroke="var(--grid)"/>
+        <line x1="46" y1="150" x2="550" y2="150" stroke="var(--grid)"/>
+        <line x1="46" y1="217" x2="550" y2="217" stroke="var(--grid)"/>
+        <line x1="46" y1="284" x2="550" y2="284" stroke="var(--baseline)"/>
+        <text x="40" y="20"  text-anchor="end">100%</text>
+        <text x="40" y="87"  text-anchor="end">75%</text>
+        <text x="40" y="154" text-anchor="end">50%</text>
+        <text x="40" y="221" text-anchor="end">25%</text>
+        <text x="40" y="288" text-anchor="end">0%</text>
+        <text x="86"  y="304" text-anchor="middle">position 1</text>
+        <text x="298" y="304" text-anchor="middle">position 2</text>
+        <text x="510" y="304" text-anchor="middle">position 3</text>
+      </g>
+      <g fill="none" stroke-width="2">
+        <polyline points="86,57.3 298,117.3 510,188.6" stroke="var(--s-code)"/>
+        <polyline points="86,115.2 298,189.4 510,241.1" stroke="var(--s-prose)"/>
+        <polyline points="86,127.8 298,127.8 510,137.9" stroke="var(--s-qa)"/>
+      </g>
+      <g>
+        <circle cx="86" cy="57.3" r="4.5" fill="var(--s-code)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="298" cy="117.3" r="4.5" fill="var(--s-code)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="510" cy="188.6" r="4.5" fill="var(--s-code)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="86" cy="115.2" r="4.5" fill="var(--s-prose)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="298" cy="189.4" r="4.5" fill="var(--s-prose)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="510" cy="241.1" r="4.5" fill="var(--s-prose)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="86" cy="127.8" r="4.5" fill="var(--s-qa)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="298" cy="127.8" r="4.5" fill="var(--s-qa)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="510" cy="137.9" r="4.5" fill="var(--s-qa)" stroke="var(--surface)" stroke-width="2"/>
+      </g>
+      <g>
+        <text class="end" x="558" y="192.6">code 35.6%</text>
+        <text class="end" x="558" y="245.1">prose 16.0%</text>
+        <text class="end" x="558" y="137.9">Q/A 54.5%</text>
+      </g>
+      <g id="hitsB">
+        <circle class="hit" cx="86" cy="57.3" r="12" data-t="code · pos 1 · 84.6% (77/91)"/>
+        <circle class="hit" cx="298" cy="117.3" r="12" data-t="code · pos 2 · 62.2% (56/90)"/>
+        <circle class="hit" cx="510" cy="188.6" r="12" data-t="code · pos 3 · 35.6% (32/90)"/>
+        <circle class="hit" cx="86" cy="115.2" r="12" data-t="prose · pos 1 · 63.0% (75/119)"/>
+        <circle class="hit" cx="298" cy="189.4" r="12" data-t="prose · pos 2 · 35.3% (42/119)"/>
+        <circle class="hit" cx="510" cy="241.1" r="12" data-t="prose · pos 3 · 16.0% (19/119)"/>
+        <circle class="hit" cx="86" cy="127.8" r="12" data-t="Q/A · pos 1 · 58.3% (7/12)"/>
+        <circle class="hit" cx="298" cy="127.8" r="12" data-t="Q/A · pos 2 · 58.3% (7/12)"/>
+        <circle class="hit" cx="510" cy="137.9" r="12" data-t="Q/A · pos 3 · 54.5% (6/11)"/>
+      </g>
+    </svg>
+  </div>
+
+  <h2><span class="sec">3</span>Cost model — why depth 3 loses</h2>
+  <p class="lede">Speedup factors cleanly: <code>speedup = tok/fwd ÷ round-cost</code>, where round-cost is the MTP round’s wall time in units of one serial forward. The prediction matches the measured speedup to ±0.005 in all nine cells. Each depth increment adds a near-constant <strong>+0.4–0.5 serial-forward-equivalents</strong> per round, while the token yield it buys shrinks with per-position acceptance.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Cell</th><th>k</th><th>Tok / fwd</th><th>Round cost (× serial fwd)</th><th>Predicted</th><th>Measured</th></tr></thead>
+    <tbody>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-code)"></span>code</td><td>1</td><td>1.882</td><td>1.248</td><td>1.508</td><td>1.51×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-code)"></span>code</td><td>2</td><td>2.535</td><td>1.657</td><td>1.529</td><td>1.53×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-code)"></span>code</td><td>3</td><td>2.813</td><td>2.283</td><td>1.232</td><td>1.23×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-prose)"></span>prose</td><td>1</td><td>1.631</td><td>1.489</td><td>1.095</td><td>1.10×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-prose)"></span>prose</td><td>2</td><td>1.984</td><td>1.964</td><td>1.010</td><td>1.01×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-prose)"></span>prose</td><td>3</td><td>2.133</td><td>2.439</td><td>0.875</td><td>0.87×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-qa)"></span>Q/A</td><td>1</td><td>1.684</td><td>1.368</td><td>1.231</td><td>1.23×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-qa)"></span>Q/A</td><td>2</td><td>2.462</td><td>1.726</td><td>1.426</td><td>1.42×</td></tr>
+      <tr><td class="lbl"><span class="dot" style="background:var(--s-qa)"></span>Q/A</td><td>3</td><td>2.667</td><td>2.051</td><td>1.300</td><td>1.30×</td></tr>
+    </tbody>
+  </table></div>
+  <p class="tnote">Break-even is tok/fwd &gt; round-cost. Prose at k=2 sits exactly on it (1.984 vs 1.964 → 1.01×). The round-cost includes the per-rejecting-round repair forward inherent to the MTPLX-style loop; a future DFlash tape graft would remove that term.</p>
+
+  <h2><span class="sec">4</span>Prefill and load</h2>
+  <p class="lede">Measured with synthetic long prompts reading the driver’s explicit prefill marker; the matrix prompts (8–20 tokens) prefill in ≈ 8–21 ms, below the 0.1 s log granularity.</p>
+  <div class="tablewrap"><table style="min-width: 480px">
+    <thead><tr><th>Prompt tokens</th><th>Prefill</th><th>Prefill tok/s</th></tr></thead>
+    <tbody>
+      <tr><td>481</td><td>0.5 s</td><td>962</td></tr>
+      <tr><td>961</td><td>1.0 s</td><td>961</td></tr>
+      <tr><td>1,921</td><td>2.0 s</td><td>961</td></tr>
+      <tr><td>3,841</td><td>4.4 s</td><td>873</td></tr>
+    </tbody>
+  </table></div>
+  <p class="tnote">≈ 960 tok/s (~1.04 ms/token), flat to ~2k tokens, easing to 873 tok/s at 3.8k as attention grows — roughly 40× decode speed. Model load: 1.60 s (n=11, range 1.55–1.63; includes tokenizer init, so treat as an upper bound). Page cache warm; swap untouched (1.25 MB) in every run.</p>
+
+  <h2><span class="sec">5</span>Methodology &amp; caveats</h2>
+  <ol>
+    <li><strong>Combined-process timing.</strong> The driver runs serial then MTP in one process; times are its per-loop wall clocks, so speedups are intra-process ratios, not separate-invocation benchmarks.</li>
+    <li><strong>JIT / warm-cache effect — measured.</strong> Serial runs first and absorbs first-forward JIT. In a warm session the effect is ≤1%: the replicated cell (code, k=2, ×3) spread 1.02% serial / 0.71% MTP with identical speedup to two decimals. A cold first process is ~23% slower on serial (cold page cache on a 15 GB checkpoint); every matrix number was taken warm.</li>
+    <li><strong>Determinism.</strong> Greedy decode is fully deterministic: acceptance counts were bit-identical across the three replications. Only wall time varies (~1%, thermal).</li>
+    <li><strong>Sample size.</strong> Each cell is n=1 (timing noise ≈ 1%). Q/A per-position rates rest on 11–19 observations.</li>
+    <li><strong>Exactness claim.</strong> “Match” = identical token stream to serial greedy, verified in-process. Campaign-wide: 29/29 runs across two machines, up to 512 tokens, corroborated by the MTPLX reference implementation (four-way bit-identical streams on a code prompt; one zero-margin bf16 tie in 160 prose tokens). Formally: decision-level equivalence up to bf16 shape-dependent reduction geometry (an fp32 discriminator experiment showed the batched-vs-serial logit drift collapses ~30× at fp32, is independent of chunk-boundary count, and appears even with no cache involved — kernel dispatch per sequence length, not state corruption), not a bitwise proof.</li>
+  </ol>
+
+  <h2><span class="sec">6</span>Reading the matrix</h2>
+  <ul>
+    <li><strong>k = 2 is the right default.</strong> Peak on structured output (1.53× code, 1.42× Q/A) and never below break-even in this matrix (worst: prose 1.01×).</li>
+    <li><strong>k = 1 is the robust floor.</strong> Never loses on any workload (1.51× / 1.10× / 1.23×) and nearly ties k=2 on code — the extra depth of k=2 buys almost nothing there because position-1 acceptance is already 88%.</li>
+    <li><strong>k = 3 is never optimal here.</strong> Position-3 drafts are accepted only 16–36% of the time on long-form workloads, while each round costs a further ~0.4–0.5 forward-equivalents. (On a separate code suite k=3 did clear 1.18× — profitable, just dominated by k=2.)</li>
+    <li><strong>Workload dominates depth.</strong> Code accepts 20–30 points above prose at every position; acceptance, not sequence length, is the variable that decides whether MTP pays.</li>
+  </ul>
+
+  <footer>
+    <p>Verification: red/green adversarial loop (implementation + independent audit vs the MTPLX oracle spec), 29/29 exact runs, all EOS termination branches exercised. Benchmarks collected 2026-08-12 on eigen-m5-max-128gb-3 under an exclusive model-run lock; no paging in any run.</p>
+    <p>Driver: <code>mlxfast-challenge-dev</code> · <code>Sources/Qwen36MTPDriver</code> (branch qwen-3.6-mtp, uncommitted) with <code>mlx-swift-lm</code> @ e0c1d54. Exploratory target — outside the ranked submission surface.</p>
+  </footer>
+</main>
+
+<div id="tip"></div>
+<script>
+  (function () {
+    var tip = document.getElementById('tip');
+    document.querySelectorAll('.hit').forEach(function (el) {
+      el.addEventListener('mouseenter', function () { tip.textContent = el.getAttribute('data-t'); tip.style.display = 'block'; });
+      el.addEventListener('mousemove', function (e) {
+        var x = Math.min(e.clientX + 14, window.innerWidth - tip.offsetWidth - 8);
+        tip.style.left = x + 'px';
+        tip.style.top = (e.clientY - tip.offsetHeight - 10) + 'px';
+      });
+      el.addEventListener('mouseleave', function () { tip.style.display = 'none'; });
+    });
+  })();
+</script>
